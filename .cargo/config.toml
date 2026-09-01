@@ -1,0 +1,6 @@
+# ignis is a Windows MSVC project: the kernel leaf is an MSVC/COFF static
+# library (nvcc + cl) linked into the Rust binaries, so builds must use the
+# MSVC target (x86_64-w64-mingw32-gcc cannot consume the MSVC CRT import
+# libs). Project-local: does not change the machine-wide rustup default.
+[build]
+target = "x86_64-pc-windows-msvc"

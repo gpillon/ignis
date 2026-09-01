@@ -6,4 +6,6 @@
 //! - paged KV cache in VRAM + block tables
 //! - GDN state management (resumable at checkpoint/frontier boundaries only)
 //! - request state machine (admit → prefill → decode → done / evict)
-//! - flat C ABI bindings to the kernel leaf (ADR 0001)
+//! - flat C ABI bindings to the kernel leaf (ADR 0001, `ffi.rs`)
+
+pub mod ffi;
