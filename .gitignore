@@ -1,0 +1,11 @@
+# build artifacts
+target/
+kernel/build/
+
+# webui (later phase)
+node_modules/
+dist/
+
+# logs
+*.log
+_bench_logs/
