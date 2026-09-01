@@ -1,0 +1,8 @@
+[package]
+name = "ignis-bench"
+description = "ignis: trace-replay benchmark harness + canary suite runner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ignis-artifact = { path = "../artifact" }

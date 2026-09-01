@@ -1,0 +1,14 @@
+# Provenance
+
+The kernel leaf (C++/CUDA, flat C ABI — see `docs/adr/0001-cpp-kernel-leaf-c-abi.md`)
+is ported from the reference stack:
+
+- reference fork: `gpillon/ninfer` (branch `feat/dflash2-local`)
+- lineage: `cometkim/ninfer` (kernel-perf, hyperquant KV, NVFP4-full target,
+  original DFlash2 port) → `natpate/ninfer-windows` (Windows port) →
+  `Neroued/ninfer` (original engine)
+
+Copied `.cu`/`.cuh` files carry the upstream lineage's license terms; upstream
+repo license headers are preserved where present. This project reuses that code
+by explicit decision (grilling session, 2026-09-02) and keeps the provenance
+recorded here so it is never silently dropped.

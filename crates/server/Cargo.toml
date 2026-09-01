@@ -1,0 +1,9 @@
+[package]
+name = "ignis-server"
+description = "ignis: OpenAI-compatible HTTP server entrypoint"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ignis-core = { path = "../core" }
+ignis-artifact = { path = "../artifact" }

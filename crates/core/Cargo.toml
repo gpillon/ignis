@@ -1,0 +1,8 @@
+[package]
+name = "ignis-core"
+description = "ignis: scheduler, paged KV, GDN state, request state machine, kernel FFI"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ignis-artifact = { path = "../artifact" }

@@ -1,0 +1,7 @@
+[package]
+name = "ignis-artifact"
+description = "ignis: .ninfer container reader (reader + binder + materializer port)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
