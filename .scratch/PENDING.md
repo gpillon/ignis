@@ -5,13 +5,6 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 
 ## Open
 
-- **server-03: wire `verify()` into the artifact loader path (GitHub #21).**
-  `checksum.rs` (18043b3) delivers a `ChecksumReport` with `is_clean()`, but
-  nothing in `crates/server` calls it yet. The call site needs both the
-  `Reader` and the sidecar; on `!is_clean()` the load should fail.
-  Spec: `.scratch/server/specs/03-checksum-wiring.md`.
-  Owner: server actor.
-
 - **bench-02: recorded reference baseline + 99% gate (ADR 0007, GitHub #20).**
   The `ignis-bench` harness (bench-01, 968a2c1) is in — `HttpEndpoint`
   transport, per-class metrics, canary self-consistency, 99% gate check —
@@ -33,4 +26,6 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 
 ## Resolved (pruned weekly)
 
-<!-- Move resolved items here temporarily; delete after 1 week. -->
+- **server-03: checksum wiring into the artifact loader (GitHub #21)** —
+  resolved 2026-09-02 (`loader` module in `crates/server`, verified load
+  path, descriptive refusal on a non-clean report or missing sidecar).

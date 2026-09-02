@@ -2,8 +2,9 @@
 
 GitHub: #21
 
-Wire the `verify()` / `is_clean()` call from `crates/core`'s `checksum.rs`
-(commit 18043b3) into the artifact loader path in `crates/server`. When the
+Wire the `verify()` / `is_clean()` call from `crates/artifact`'s
+`checksum.rs` (commit 18043b3) into the artifact loader path in
+`crates/server`. When the
 server loads an artifact, it must verify the checksum report and **fail the
 load** if `is_clean()` is false.
 
