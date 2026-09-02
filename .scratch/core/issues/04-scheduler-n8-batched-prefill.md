@@ -1,8 +1,9 @@
 # 04 — scheduler: N=8 decode lanes + batched prefill
 
-Status: in-progress (start — contract only, commit 0966eef; concrete N=8
-scheduler + batched-prefill experiment pending, blocked on the kernel-abi
-CUDA implementations; GitHub #13)
+Status: in-progress (concrete N=8 scheduler + batched-prefill scheduling
+logic + the `MockCompute` CPU stand-in are done and CPU-tested; the
+GPU-saturation *measurement* of batched prefill is still pending — it runs
+on the GPU through the bench harness, ADR 0006/0007; GitHub #13)
 GitHub: #13
 Blocked by: #12 (core-03), #5 (kernel-abi-01)
 

@@ -50,10 +50,18 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-04 remainder (concrete N=8 scheduler + Compute mock —
-blocked on the kernel-abi CUDA implementations), then core-05 … core-07,
-then server-01/02, then artifact-02/03. All CPU-testable; only the
-kernel-abi CUDA implementation + the 99% gate need the GPU (ADR 0006/0007).
+**Next up:** core-04 remainder — the **concrete N=8 scheduler + the
+`MockCompute`** are done and CPU-tested (this session): `ConcreteScheduler`
+(N=8 resident lanes, batched prefill in one compute call, batched decode,
+class-priority + FIFO lane deal, in-flight cap = N_DECODE_LANES until the
+host tier, ADR 0004 basic admission) + a deterministic, recording
+`MockCompute` behind the `Compute` seam (ADR 0006), with `DecodeParams`
+carried on the prefill/decode jobs. What remains on core-04 is the
+**GPU-saturation measurement** of batched prefill (a measure, not a
+guarantee — ADR 0007 re-gates it via the 99% gate on the GPU, ADR 0006
+exclusive-GPU rule), then core-05 … core-07, then server-01/02, then
+artifact-02/03. Only the kernel-abi CUDA implementation + the 99% gate need
+the GPU (ADR 0006/0007).
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
