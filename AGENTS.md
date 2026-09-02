@@ -4,8 +4,8 @@
 
 ### Issue tracker
 
-Issues and specs live as markdown files under `.scratch/` in this repo.
-See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues on `gpillon/ignis` (via the `gh` CLI); local
+specs/plans live under `.scratch/` in this repo. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

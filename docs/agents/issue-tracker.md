@@ -1,30 +1,29 @@
-# Issue tracker: Local Markdown
+# Issue tracker: GitHub (gpillon/ignis)
 
-Issues and specs for this repo live as markdown files in `.scratch/`.
+Issues for this repo live in **GitHub Issues** on `github.com/gpillon/ignis`,
+managed with the `gh` CLI. Local specs and work-in-progress plans live under
+`.scratch/<feature-slug>/` in this repo (one directory per feature: `spec.md`
++ `issues/`), and each GitHub issue links back to its local spec.
 
 ## Conventions
 
-- One feature per directory: `.scratch/<feature-slug>/`
-- The spec is `.scratch/<feature-slug>/spec.md`
-- Implementation issues are one file per ticket at `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01` — never a single combined tickets file
-- Triage state is recorded as a `Status:` line near the top of each issue file (see `triage-labels.md` for the role strings)
-- Comments and conversation history append to the bottom of the file under a `## Comments` heading
+- One issue per ticket; issue titles mirror the local ticket files in
+  `.scratch/`.
+- The five triage labels (see `triage-labels.md`) are applied at issue
+  creation; a ticket's local `Status:` line mirrors the label state.
+- "Publish to the issue tracker" = create a GitHub issue in `gpillon/ignis`
+  (`gh issue create`), with the local `.scratch/` spec as the issue body or a
+  linked file.
+- "Fetch the relevant ticket" = `gh issue view <n>`; read the linked
+  `.scratch/<feature-slug>/` files for the full spec.
 
-## When a skill says "publish to the issue tracker"
+## Auth
 
-Create a new file under `.scratch/<feature-slug>/` (creating the directory if needed).
+Repo-local git credential helper (see `.git/config`:
+`credential.https://github.com.helper = store --file ...`). The token lives in
+the user's credential file, **never** in URLs or committed files.
 
-## When a skill says "fetch the relevant ticket"
+## PRs as a request surface
 
-Read the file at the referenced path. The user will normally pass the path or the issue number directly.
-
-## Wayfinder operations
-
-Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
-
-- **Map**: `.scratch/<effort>/map.md` — the Notes / Decisions-so-far / Fog body.
-- **Child ticket**: `.scratch/<effort>/issues/NN-<slug>.md`, numbered from `01`, with the question in the body. A `Type:` line records the ticket type (`research`/`prototype`/`grilling`/`task`); a `Status:` line records `claimed`/`resolved`.
-- **Blocking**: a `Blocked by: NN, NN` line near the top. A ticket is unblocked when every file it lists is `resolved`.
-- **Frontier**: scan `.scratch/<effort>/issues/` for files that are open, unblocked, and unclaimed; first by number wins.
-- **Claim**: set `Status: claimed` and save before any work.
-- **Resolve**: append the answer under an `## Answer` heading, set `Status: resolved`, then append a context pointer (gist + link) to the map's Decisions-so-far in `map.md`.
+Disabled by default — external PRs are not part of the triage queue. A
+maintainer who wants that can enable it here.
