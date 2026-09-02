@@ -50,10 +50,11 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-06 resolved (7115251) → core-07
-(prefix reuse, #18 — unblocked), then server-02 (telemetry, #15),
-artifact-03 (tensor checksums, #8), then bench-01/02 once a reference
-baseline is recorded.
+**Next up:** core-07 (prefix reuse, #18 — in flight: `prefix.rs` WIP),
+then server-02 (telemetry, #15), artifact-03 (tensor checksums, #8),
+then bench-01/02 once a reference baseline is recorded. In parallel: the
+server-01 `TemplateProvider` wiring (blocked on core compiling, see
+follow-up above).
 core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
 scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
 *deferred* on core-04 — the **GPU-saturation measurement** of batched
@@ -107,6 +108,28 @@ wired through the same seam. 21/21 `ignis-server` CPU tests (ADR 0006),
 workspace `cargo test` green. Deferred: `/v1/responses` streaming
 (out of v1 scope), `Compute` backend is `MockCompute` (kernel-leaf
 adapter via the same scheduler-constructor injection).
+
+artifact-02 is **resolved** (2026-09-02, GitHub #7 closed): the frontend
+extraction is committed (d08759d) — the `frontend` module
+(`FrontendSet::from_reader` loads all 6 frontend resources, missing or
+ambiguous = load failure, ADR 0002; typed `Tokenizer` via HuggingFace
+`tokenizers` 0.21; `ChatTemplate` via minijinja 2.24 + `json` with the
+Qwen3.8-specific extensions registered: `raise_exception`, string
+`.startswith`/`.endswith`). 39 unit tests + real-artifact verification
+(`real_frontend.rs`, gated, CPU-only): all 6 resources present in the
+19 GB `qwen3_8_27b_nvfp4full-v2` container, real BPE tokenizer
+round-trips, the real Qwen3.8 template compiles + renders, and its
+`raise` path fires end-to-end. 42/42 `ignis-artifact` tests green.
+
+**Follow-up (tracked, uncommitted):** the last wiring step of server-01's
+template seam — a `FrontendSet`-backed `TemplateProvider` adapter in
+`crates/server` (replacing the built-in `SimpleTemplateProvider`;
+`apply_chat_template` = `render` + `encode`, `render_tokens` = `decode`).
+Blocked on `ignis-core` compiling — the in-flight core WIP (new
+`prefix.rs` + `request`/`scheduler`/`types`/`concrete` edits, 2026-09-02
+evening) is red at the time of writing. When core is green again: write
+the adapter + tests in `crates/server`, `cargo test -p ignis-server`,
+commit, and update the server-01 ticket note.
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
