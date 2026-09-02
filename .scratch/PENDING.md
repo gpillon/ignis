@@ -9,7 +9,7 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   `checksum.rs` (18043b3) delivers a `ChecksumReport` with `is_clean()`, but
   nothing in `crates/server` calls it yet. The call site needs both the
   `Reader` and the sidecar; on `!is_clean()` the load should fail.
-  Spec: `.scratch/server/specs/04-checksum-wiring.md`.
+  Spec: `.scratch/server/specs/03-checksum-wiring.md`.
   Owner: server actor.
 
 - **bench-02: recorded reference baseline + 99% gate (ADR 0007, GitHub #20).**

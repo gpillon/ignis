@@ -1,4 +1,4 @@
-# 04 — wire checksum verification into the artifact loader path
+# 03 — wire checksum verification into the artifact loader path
 
 GitHub: #21
 

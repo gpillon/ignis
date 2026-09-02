@@ -19,6 +19,9 @@ Per `docs/design/ignis-v1.md` §1 (OpenAI-compatible HTTP) and §5 (telemetry).
    counters: waiting / prefilling / running, kv_used_pct, kv_evictions) and
    `request` (admitted / ttft / done with tok-s). `class` field reserved
    (tagged lanes, v1.1+). `sibling_prefix_reused_tok` counter from v1.1.
+3. **Wire checksum verification into the artifact loader** — `server-03`.
+   On artifact load, verify the checksum report (artifact-03) and fail the
+   load with a descriptive error if `is_clean()` is false.
 
 ## Acceptance
 
@@ -28,6 +31,9 @@ Per `docs/design/ignis-v1.md` §1 (OpenAI-compatible HTTP) and §5 (telemetry).
 - `POST /v1/responses` works (OpenAI responses shape).
 - Telemetry emits one JSONL line per event + one per interval, matching the
   §5 schema.
+- The artifact load verifies the checksum report (artifact-03): a dirty
+  report fails the load with a descriptive error (no panic); a clean report
+  loads normally.
 
 ## References
 
