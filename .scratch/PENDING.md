@@ -52,9 +52,36 @@ carries the `RequestClass` (ADR 0004).
 
 **Next up:** server-02 (telemetry, #15) — in flight (background agent,
 `crates/server`); the coordinator integrates on report (verify +
-close-out). In flight: artifact-03 (tensor checksum vs sidecars, #8,
-`crates/artifact`). In flight → then bench-02 (recorded reference
-baseline + 99% gate, GPU) once a reference recording exists.
+close-out). Then bench-02 (recorded reference baseline + 99% gate, GPU)
+once a reference recording exists.
+
+**Follow-up (tracked, uncommitted):** making a sidecar checksum mismatch
+actually **fail the artifact load** — artifact-03's `checksum.rs`
+(18043b3) delivers an inspectable `ChecksumReport` (per-object
+`matched` / `mismatched` / `missing` + `flagged` / `global_flags`), but
+nothing in the loader path calls `verify()` / `ChecksumReport::is_clean()`
+yet. The call site needs both the `Reader` and the sidecar in the
+engine/loader path (`crates/server` territory) — the natural next step
+for the server actor, after server-02.
+
+artifact-03 is **resolved** (2026-09-02, GitHub #8 closed): the tensor
+checksum validation is committed (18043b3) — `Sidecar::load` (shared
+fields of the `graft.json` / `conversion.json` shapes; an absent
+`grafted_from` block is tolerated for the conversion shape) +
+`verify(reader, sidecar) -> ChecksumReport` (global invariants +
+per-parent checks; never panics, `is_clean()` is the load-failure
+surface). Key finding: the v2 sidecars carry **no per-tensor digests**
+(the contract requires none) — the per-tensor datum is the NVFP4
+`local_nvfp4.parents` table (`weight_scale_divisor` float +
+`relative_frobenius_error`), plus whole-file invariants
+(`artifact.bytes`, `objects.count`); "checksum match" = file size +
+object count hold, and each recorded parent's FP32 divisor word in the
+container value-matches the sidecar's recorded number (compared as
+promoted `f64` — no narrowing ULP shift). Gated real-artifact run: the
+19.4 GB `qwen3_8_27b_nvfp4full-v2` container verifies clean (1,325
+objects, 19,406,942,468 bytes, 34 parents all `divisor: null`, 281
+NVFP4 tensors — 34 covered by the graft, 247 inherited). 45 lib + 4
+integration `ignis-artifact` tests green.
 
 bench-01 is **resolved** (2026-09-02, GitHub #19 closed): the
 `HttpEndpoint` transport is committed (968a2c1) — a `reqwest` 0.21
