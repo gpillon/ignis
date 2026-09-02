@@ -1,8 +1,6 @@
 # 02 — frontend object extraction (tokenizer + chat template)
 
-Status: resolved (commit d08759d, 2026-09-02; GitHub #7)
 GitHub: #7
-Blocked by: #4 (artifact-01)
 
 Extract and verify the **frontend object set** carried inside the artifact
 container (confirming the `docs/design/ignis-v1.md` §7 risk that the

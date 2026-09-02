@@ -7,7 +7,7 @@
 //! `HttpEndpoint` (a `reqwest` blocking client) drives the running
 //! `ignis-server` endpoint (`POST /v1/chat/completions` — streaming SSE for
 //! per-token timing + non-streaming — and `GET /v1/models`) and measures the
-//! per-request timing (see `.scratch/bench/issues/01-trace-replay.md`).
+//! per-request timing (see `.scratch/bench/specs/01-trace-replay.md`).
 //!
 //! The replay driver runs a bounded-concurrency worker pool: jobs (requests
 //! with their arrival offsets) flow through an mpsc channel into

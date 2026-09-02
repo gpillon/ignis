@@ -1,8 +1,6 @@
 # 01 — paged KV cache + block table (VRAM)
 
-Status: resolved (commit 8a64a0d, 2026-09-02; GitHub #9)
 GitHub: #9
-Blocked by: #4 (artifact-01)
 
 The paged KV cache (VRAM) + block table for `ignis-core`
 (`docs/design/ignis-v1.md` §2):

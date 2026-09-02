@@ -10,7 +10,7 @@
 //! running server; the real HTTP endpoint (`client::HttpEndpoint`, a
 //! `reqwest` blocking client) drives the running `ignis-server`
 //! (`POST /v1/chat/completions` — streaming + non-streaming — and
-//! `GET /v1/models`) (see `.scratch/bench/issues/01-trace-replay.md`).
+//! `GET /v1/models`) (see `.scratch/bench/specs/01-trace-replay.md`).
 
 pub mod canary;
 pub mod client;

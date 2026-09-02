@@ -1,8 +1,6 @@
 # 03 — tensor checksum validation against sidecars
 
-Status: resolved (commit 18043b3, 2026-09-02; GitHub #8)
 GitHub: #8
-Blocked by: #4 (artifact-01)
 
 Offline verification step (carried over from the "Remaining" list of
 kernel-port 02): verify the materialized tensor checksums against the

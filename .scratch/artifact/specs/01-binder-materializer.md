@@ -1,8 +1,6 @@
 # 01 — binder + materializer (device materialization)
 
-Status: done (CPU path green; GPU verification pending — ADR 0006)
 GitHub: #4
-Blocked by: (none — the `.ninfer` reader is done, kernel-port 02)
 
 Port the reference's per-model **binder** (`binder.h`), **materializer**
 (`materializer.h`), and **typed binding** (`typed_binding.h`) into

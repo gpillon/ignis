@@ -1,8 +1,6 @@
 # 06 — KV-RAM host tier (probation / protected eviction)
 
-Status: resolved (commit 7115251, 2026-09-02; GitHub #17)
 GitHub: #17
-Blocked by: #13 (core-04)
 
 The **KV-RAM host tier** (`docs/design/ignis-v1.md` §2, `CONTEXT.md`
 "KV-RAM"):

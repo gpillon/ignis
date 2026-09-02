@@ -1,9 +1,6 @@
 # 01 — GQA prefill + GDN step C ABI (batched)
 
-Status: in-progress (start — C-ABI surface + Rust bindings, commit adb6ac9;
-CUDA implementation + 99% gate pending the GPU, ADR 0006/0007; GitHub #5)
 GitHub: #5
-Blocked by: #3 (kernel-port-03)
 
 `extern "C"` entry points in `kernel/include/` for the **GQA prefill**
 attention + the **GDN linear-attention step**, batched (concurrent) — the

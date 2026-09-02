@@ -4,8 +4,18 @@
 
 ### Issue tracker
 
-Issues live in GitHub Issues on `gpillon/ignis` (via the `gh` CLI); local
-specs/plans live under `.scratch/` in this repo. See `docs/agents/issue-tracker.md`.
+Issues live **exclusively on GitHub** (`gpillon/ignis`, via the `gh` CLI).
+GitHub is the single source of truth for issue tracking: status, blocking
+relationships, labels, and closure. Each GitHub issue body is short
+(1-3 lines of context) and links to the implementation spec.
+
+Implementation specs (acceptance criteria, seam description, ADR references)
+live under `.scratch/<feature>/specs/` in this repo. These are **specs, not
+issues** — they do not track status or blocking (that is GitHub's job).
+`.scratch/` is also used for temporary artifacts, experiments, and workflow
+output, but **never for issue tracking**.
+
+See `docs/agents/issue-tracker.md` for the full convention.
 
 ### Triage labels
 

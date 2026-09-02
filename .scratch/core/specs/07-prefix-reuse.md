@@ -1,8 +1,6 @@
 # 07 — prefix reuse (sibling prefix caching)
 
-Status: resolved (commit b481df8, 2026-09-02; GitHub #18)
 GitHub: #18
-Blocked by: #17 (core-06)
 
 **Prefix reuse** (`docs/design/ignis-v1.md` §2, `CONTEXT.md` "Prefix
 reuse"):

@@ -1,9 +1,6 @@
 # 03 — CUDA graph eager capture at startup
 
-Status: in-progress (start — C-ABI surface, commit adb6ac9; graph-capture
-implementation pending; GitHub #10)
 GitHub: #10
-Blocked by: #5 (kernel-abi-01), #6 (kernel-abi-02)
 
 Eager **CUDA graph capture** at startup (v1 decision; lazy capture = a later
 optimization, `docs/design/ignis-v1.md` §3). Capture the prefill + decode

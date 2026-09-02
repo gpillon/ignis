@@ -1,8 +1,6 @@
 # 01 — trace replay harness (JSONL load trace)
 
-Status: resolved (commit 968a2c1, 2026-09-02; GitHub #19)
 GitHub: #19
-Blocked by: #14 (server-01)
 
 Re-send a recorded "1 main agent + N subagents" load trace (JSONL) against
 the running engine (`docs/design/ignis-v1.md` §4, §6). Drive the scheduler

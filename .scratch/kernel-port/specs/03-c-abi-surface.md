@@ -1,9 +1,5 @@
 # 03 — C ABI surface: decode step
 
-Status: done (implementation complete; canonical .lib rebuilt so the gated
-tests link; only the GPU launch run + 99% acceptance gate remain, pending a
-free 5090 — see Pending)
-
 Define and implement the first C ABI surface:
 
 - `extern "C"` entry points in `kernel/include/` for the decode step:

@@ -1,8 +1,6 @@
 # 01 — OpenAI-compatible HTTP (models / chat / responses)
 
-Status: resolved (commit 84ada6d, 2026-09-02; GitHub #14)
 GitHub: #14
-Blocked by: #13 (core-04), #7 (artifact-02)
 
 OpenAI-compatible HTTP on **localhost, no auth, configurable bind**
 (`docs/design/ignis-v1.md` §1). Route requests into the core scheduler and

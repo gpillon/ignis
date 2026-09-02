@@ -1,8 +1,6 @@
 # 02 — telemetry (JSONL events + interval lines)
 
-Status: resolved (commit 992aea0, 2026-09-02; GitHub #15)
 GitHub: #15
-Blocked by: #13 (core-04)
 
 v1 telemetry (JSONL, `docs/design/ignis-v1.md` §5): one line per event, one
 line per interval.

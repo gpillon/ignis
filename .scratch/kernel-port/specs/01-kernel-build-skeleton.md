@@ -1,7 +1,5 @@
 # 01 — kernel build skeleton
 
-Status: resolved
-
 CMake build of the kernel leaf: `nvcc` (CUDA 13.1) targeting SM120a, producing
 the static library the Rust side links. Rust side: `build.rs` in `ignis-core`
 that locates the prebuilt `.lib`, plus a build script that drives CMake.
