@@ -10,6 +10,10 @@ edition = "2024"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["json"] }
+futures-core = "0.3"
+tower = { version = "0.5", features = ["util"] }
 # Target-specific, inherited by members via `workspace = true` under their own
 # `[target.'cfg(...)'.dependencies]` sections.
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }

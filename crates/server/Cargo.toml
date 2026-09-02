@@ -7,3 +7,11 @@ edition.workspace = true
 [dependencies]
 ignis-core = { path = "../core" }
 ignis-artifact = { path = "../artifact" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+futures-core = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
