@@ -120,7 +120,8 @@ impl Engine {
                 | SchedEvent::Admitted { request, .. }
                 | SchedEvent::Evicted { request }
                 | SchedEvent::Restored { request, .. }
-                | SchedEvent::Requeued { request } => *request,
+                | SchedEvent::Requeued { request }
+                | SchedEvent::PrefixReused { request, .. } => *request,
                 SchedEvent::Protected { .. } => continue,
             };
             let mut inner = self.inner.lock().unwrap();
@@ -376,6 +377,91 @@ mod tests {
         fn mode(&self) -> EngineMode {
             EngineMode::Serving
         }
+    }
+
+    /// A scheduler that emits a single `[PrefixReused, Token, Done]` batch
+    /// for one request on its first `advance()` (then nothing). Pins that a
+    /// `PrefixReused` (core-07) event is *routed* to the request's stream
+    /// (it carries a `request` id, unlike the `Protected` batch marker) and
+    /// does not drop the `Token`/`Done` events that follow it.
+    struct PrefixReuseBatchScheduler {
+        emitted: bool,
+    }
+
+    impl Scheduler for PrefixReuseBatchScheduler {
+        fn submit(
+            &mut self,
+            _input: RequestInput,
+            _class: RequestClass,
+        ) -> Result<RequestId, SubmitError> {
+            Ok(ProtectedBatchScheduler::ID)
+        }
+        fn advance(&mut self) -> Vec<SchedEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            // The `PrefixReused` event (a sibling's prefill skipped the
+            // cached prefix, core-07) carries the request's id, so the
+            // router forwards it to the request's stream (it is not a
+            // per-request *content* event, but it is per-request — unlike
+            // the `Protected` batch marker, which has no request and is
+            // skipped). The subsequent `Token`/`Done` must still route.
+            vec![
+                SchedEvent::PrefixReused {
+                    request: ProtectedBatchScheduler::ID,
+                    tokens: 32,
+                },
+                SchedEvent::Token {
+                    request: ProtectedBatchScheduler::ID,
+                    token: 7,
+                },
+                SchedEvent::Done {
+                    request: ProtectedBatchScheduler::ID,
+                    tokens: 1,
+                },
+            ]
+        }
+        fn is_idle(&self) -> bool {
+            self.emitted
+        }
+        fn model_id(&self) -> &str {
+            ProtectedBatchScheduler::MODEL
+        }
+        fn mode(&self) -> EngineMode {
+            EngineMode::Serving
+        }
+    }
+
+    #[test]
+    fn a_prefix_reused_event_is_routed_to_the_request_stream() {
+        let engine = Engine::new(Box::new(PrefixReuseBatchScheduler { emitted: false }));
+        let (id, mut rx) = engine
+            .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
+            .expect("submit");
+        assert_eq!(id, ProtectedBatchScheduler::ID);
+        engine.step();
+        // Drain the routed stream: the `PrefixReused` marker must have been
+        // forwarded to this request's stream (it carries the request's id),
+        // and the `Token`/`Done` that follow it must still arrive (the
+        // reuse marker does not drop the rest of the batch).
+        let mut saw_reused = false;
+        let mut saw_token = false;
+        let mut saw_done = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                SchedEvent::PrefixReused { request, .. } if request == id => saw_reused = true,
+                SchedEvent::Token { .. } => saw_token = true,
+                SchedEvent::Done { .. } => saw_done = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_reused,
+            "a PrefixReused event must be routed to the request's stream"
+        );
+        assert!(saw_token, "the batch's Token must be routed after a PrefixReused");
+        assert!(saw_done, "the batch's Done must be routed after a PrefixReused");
     }
 
     #[test]

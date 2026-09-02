@@ -22,7 +22,12 @@ use crate::types::{
 pub struct PrefillJob {
     /// The request being prefilled.
     pub request: RequestId,
-    /// The prompt tokens to warm the KV for.
+    /// The prompt tokens to warm the KV for. A request that reuses a
+    /// cached sibling prefix (core-07) carries only its *tail* — the
+    /// leading shared tokens are already warm in the pool (the shared
+    /// prefix's blocks are bound read-only by the kernel leaf). An empty
+    /// tail (a full-prompt match) warms nothing: the job only sets up the
+    /// decode state.
     pub tokens: Vec<TokenId>,
     /// The request's generation parameters (carried so the backend can set
     /// up the decode state; prefill only warms the KV).

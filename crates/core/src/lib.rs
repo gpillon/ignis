@@ -22,6 +22,7 @@ pub mod gdn;
 pub mod host;
 pub mod kv;
 pub mod mock;
+pub mod prefix;
 pub mod request;
 pub mod scheduler;
 pub mod types;
@@ -33,6 +34,7 @@ pub use admission::{
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;
+pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 pub use types::{

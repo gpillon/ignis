@@ -160,6 +160,12 @@ pub enum SchedEvent {
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.
     Requeued { request: RequestId },
+    /// A request's prefill reused a cached sibling prefix (core-07): the
+    /// `tokens` leading prompt tokens were skipped — the shared KV prefix
+    /// is already warm, so no redundant prefill. Telemetry accumulates
+    /// these into the `sibling_prefix_reused_tok` counter (design §5,
+    /// `server-02`).
+    PrefixReused { request: RequestId, tokens: u32 },
 }
 
 /// Errors from submitting a request.

@@ -10,7 +10,14 @@
 //!    saturate the GPU in prefill and cut burst TTFT. *An experiment to
 //!    verify* — we may be compute-bound, in which case it is useless (a
 //!    measure, not a guarantee; the 99% gate of ADR 0007 re-checks it on
-//!    the GPU).
+//!    the GPU). **Sibling prefix reuse** (core-07) runs here: before the
+//!    batch call, each request claims the longest cached prefix of its
+//!    prompt (skipping the redundant prefill — its job carries only the
+//!    tail); after a successful call, fresh requests register their now-
+//!    warm prompt in the prefix cache for siblings. The shared entry's
+//!    pages are charged to the pool once (the charge split), and the
+//!    admission machine runs against the pool minus the cache's pins
+//!    (consistent accounting — the cache never over-allocates).
 //! 2. **The admission state machine** (core-05) — lane assignment is
 //!    driven by the full fairness machinery (`admission.rs`, ported from
 //!    the reference stack per ADR 0004): *protection* (a blocked head
@@ -57,6 +64,7 @@ use crate::admission::{
     protection_frontier_distance,
 };
 use crate::host::{HostEntry, HostTier, Tier};
+use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 use crate::types::{
@@ -147,6 +155,11 @@ pub struct ConcreteScheduler {
     /// The scheduling tick (a per-advance counter; the LRU `use_tick` for
     /// retained-lane victim selection).
     tick: u64,
+    // ── core-07: the sibling prefix cache ──────────────────────────────
+    /// The sibling prefix cache (core-07): shared KV prefixes of prompt
+    /// heads (whole pages, refcounted); concurrent requests sharing a
+    /// prefix skip the redundant prefill.
+    prefix: PrefixCache,
 }
 
 impl ConcreteScheduler {
@@ -190,6 +203,7 @@ impl ConcreteScheduler {
             protection_epoch: 1,
             host: HostTier::new(config.host_capacity_pages),
             tick: 0,
+            prefix: PrefixCache::new(config.kv_page_tokens),
             config,
             compute,
             next_id: 0,
@@ -224,6 +238,65 @@ impl ConcreteScheduler {
     /// evicted (suspended) request snapshots (telemetry / tests).
     pub fn host_tier(&self) -> &HostTier {
         &self.host
+    }
+
+    /// The cumulative `sibling_prefix_reused_tok` counter (core-07, design
+    /// §5): every prompt token a sibling skipped through a cached prefix.
+    /// The telemetry writer (`server-02`) exposes this (and the per-request
+    /// [`SchedEvent::PrefixReused`] events).
+    pub fn sibling_prefix_reused_tok(&self) -> u64 {
+        self.prefix.reused_tok()
+    }
+
+    /// The KV pages the sibling prefix cache pins in the pool (core-07):
+    /// the shared prefixes' pages, charged to the pool exactly once (for
+    /// every claimant) — a `1 main + N subagents` load pins one shared
+    /// prefix, not `N` copies. Exposed for the pool-accounting invariant
+    /// (tests) and telemetry.
+    pub fn prefix_pinned_pages(&self) -> u32 {
+        self.prefix.pinned_pages()
+    }
+
+    /// The shared sibling prefix `request` reuses (core-07), if any: the
+    /// cached entry's id + the leading prompt tokens it skips. The FFI /
+    /// kernel leaf uses this to bind the shared prefix's blocks read-only
+    /// into the request's block table (the kernel-abi channel; ADR 0001).
+    pub fn shared_prefix_of(&self, request: RequestId) -> Option<(u64, u32)> {
+        self.requests
+            .iter()
+            .find(|r| r.id == request)
+            .and_then(|r| r.prefix_entry.map(|e| (e, r.shared_prefix_tokens)))
+    }
+
+    /// The main-pool pages available to the admission state machine
+    /// (core-07): the configured capacity minus the pages the sibling
+    /// prefix cache pins (core-07: the cache's pages are in the pool, so
+    /// the machine's feasibility arithmetic runs against the remainder —
+    /// consistent with [`Self::fits`]'s full accounting, which counts the
+    /// cache's charge in `kv_used_pages`). A cache that pins too many
+    /// pages cannot starve the machine: an entry drops as soon as its last
+    /// claimant is gone (the cache never pins pages no live request needs).
+    fn available_capacity(&self) -> AdmissionResources {
+        AdmissionResources {
+            lanes: self.capacity.lanes,
+            kv_pages: self.capacity.kv_pages.saturating_sub(self.prefix.pinned_pages()),
+            backend_pages: self.capacity.backend_pages,
+        }
+    }
+
+    /// Release one reference to the shared prefix `entry` (core-07), if
+    /// the claimant still holds it: when the last claimant releases, the
+    /// entry drops and its pages return to the pool (the charge that was
+    /// taken once at registration is now returned). `None` while other
+    /// claimants still pin the entry (nothing to release yet).
+    fn release_prefix_claim(&mut self, entry: Option<PrefixId>) {
+        let Some(entry) = entry else {
+            return;
+        };
+        let Some(freed) = self.prefix.release(entry) else {
+            return;
+        };
+        self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
     }
 
     /// The last hard compute error the most recent advance reported, if
@@ -362,12 +435,13 @@ impl ConcreteScheduler {
             // regime (protection / backfill class / temporal credit /
             // frontier distance — `admission.rs`, ADR 0004).
             if self.protection.is_none() {
+                let available = self.available_capacity();
                 let protection = match make_admission_protection(
                     self.protection_epoch,
                     self.requests[head].id,
                     self.requests[head].resources,
                     &active,
-                    &self.capacity,
+                    &available,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -393,10 +467,11 @@ impl ConcreteScheduler {
             // temporal borrowers, no new backfills are admitted — the
             // machine waits for the remaining donors / backfills, then
             // deals the head (the next advance's head-fits branch).
+            let available = self.available_capacity();
             if protected_head_safe_without_temporal(
                 self.protection.as_ref().unwrap(),
                 &active,
-                &self.capacity,
+                &available,
             ) {
                 self.protection.as_mut().unwrap().phase = ProtectionPhase::Drain;
             }
@@ -422,7 +497,7 @@ impl ConcreteScheduler {
                         p,
                         &active,
                         &self.requests[c].resources,
-                        &self.capacity,
+                        &self.available_capacity(),
                     ) {
                         self.try_admit(c, BackfillClass::Persistent, events);
                     } else if self.requests[c].remaining_work <= frontier
@@ -441,15 +516,20 @@ impl ConcreteScheduler {
 
     /// Complete request `idx` (its lane and KV reservation are released).
     fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
-        let (release_pages, lane, request_id, tokens) = {
+        let (release_pages, lane, request_id, tokens, prefix_entry) = {
             let r = &self.requests[idx];
-            (r.resources.kv_pages, r.lane, r.id, r.tokens)
+            (r.resources.kv_pages, r.lane, r.id, r.tokens, r.prefix_entry)
         };
         self.requests[idx].advance(RequestState::Done);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
             self.kv_used_pages = self.kv_used_pages.saturating_sub(release_pages);
         }
+        // core-07: release the request's shared-prefix claim (its
+        // completion frees its reference to the shared pages; the entry
+        // drops — and its pages return to the pool — when the last
+        // claimant releases).
+        self.release_prefix_claim(prefix_entry);
         // A protection exists to let its head in: if the protected head
         // itself completes (rather than being dealt), its protection is
         // stale — the next blocked head opens a fresh epoch.
@@ -468,7 +548,8 @@ impl ConcreteScheduler {
     /// The retained-lane candidates for victim selection (core-06): every
     /// running request's lane, excluding the protection's donors (donors
     /// are never evicted while the protection is open) and reserved lanes
-    /// (none in v1 — sibling-prefix reservation lands in core-07).
+    /// (a lane whose shared prefix is claimed by an earlier-queued
+    /// interactive request — core-07).
     fn retained_lane_candidates(&self) -> Vec<RetainedLaneCandidate> {
         let donors: std::collections::HashSet<RequestId> = self
             .protection
@@ -483,9 +564,30 @@ impl ConcreteScheduler {
                 lane: r.lane.expect("a running request holds a lane"),
                 owner: r.class,
                 use_tick: self.tick,
-                reserved_for_earlier_interactive: false, // core-07
+                reserved_for_earlier_interactive: self.reserved_for_earlier_interactive(r),
             })
             .collect()
+    }
+
+    /// Whether `r`'s lane is reserved for an earlier-queued interactive
+    /// request (core-07 wiring, ADR 0004): `r` holds a shared prefix
+    /// (its prompt head is a cached sibling prefix) that an *earlier-
+    /// queued* (smaller request id — submitted first) *interactive*
+    /// request still claims while it waits (Admitted / Prefilling, not
+    /// yet on a lane). Evicting `r`'s lane to the host tier would move
+    /// the warm shared prefix out of the pool while the earlier
+    /// interactive request still needs it — so the lane is not an
+    /// eviction victim (reference policy, ported per ADR 0004).
+    fn reserved_for_earlier_interactive(&self, r: &Request) -> bool {
+        let Some(entry) = r.prefix_entry else {
+            return false; // no shared prefix: nothing reserved
+        };
+        self.requests.iter().any(|c| {
+            c.prefix_entry == Some(entry)
+                && c.class == RequestClass::Interactive
+                && c.id < r.id
+                && (c.state == RequestState::Admitted || c.state == RequestState::Prefilling)
+        })
     }
 
     /// Re-queue a discarded (evicted) request for re-prefill (core-06): its
@@ -494,6 +596,10 @@ impl ConcreteScheduler {
     /// is gone) and its service-work counters are reset.
     fn requeue_request(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
         let r = &mut self.requests[idx];
+        // core-07: capture the shared-prefix claim (the `requeue()` below
+        // resets it; a re-queued request re-prefills from the start and
+        // may re-claim a live entry on its fresh prefill).
+        let prefix_entry = r.prefix_entry;
         r.requeue(); // Evicted → Admitted, lane released (there is none).
         r.tokens = 0;
         let effective_max = r
@@ -504,7 +610,18 @@ impl ConcreteScheduler {
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
         r.backfill_epoch = 0;
+        // core-07: restore the full (unshrunk) reservation — the re-queued
+        // request re-prefills its *entire* prompt (not just its tail), so
+        // its pool charge must cover `prompt + max` pages again (the claim
+        // loop shrinks it to the tail if a live entry is re-claimed).
+        let full_pages = ((r.input.tokens.len() as u64) + (effective_max as u64))
+            .div_ceil(self.config.kv_page_tokens as u64)
+            .min(u32::MAX as u64) as u32;
+        r.resources.kv_pages = full_pages;
         events.push(SchedEvent::Requeued { request: r.id });
+        // core-07: release the shared-prefix claim (its pages return to
+        // the pool when the last claimant releases).
+        self.release_prefix_claim(prefix_entry);
     }
 
     /// Make room in the host tier for `pages` pages (core-06): discard the
@@ -700,12 +817,64 @@ impl Scheduler for ConcreteScheduler {
             .collect();
         batch.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
         batch.truncate(self.config.max_prefill_batch);
+        // core-07 — sibling prefix claim: each batch request without a
+        // shared head claims the longest cached prefix of its prompt
+        // (skipping the redundant prefill — its job carries only the
+        // tail, and its own reservation shrinks to the tail + max: the
+        // shared entry's pages are charged to the pool once, for every
+        // claimant). The claim is established before the prefill call
+        // (the shared prefix is already warm in the pool); a failed
+        // prefill is retried next advance with the same claim.
+        for &i in &batch {
+            // A request that already holds a claim (from a prior advance,
+            // whose prefill failed and is retried) keeps it: re-claiming
+            // would double-count the entry's refcount and the
+            // `sibling_prefix_reused_tok` counter, and pin the entry
+            // forever (the release happens once, at completion).
+            if self.requests[i].prefix_entry.is_some() {
+                continue;
+            }
+            let claimed = self.prefix.claim(&self.requests[i].input.tokens);
+            if let Some(claim) = claimed {
+                let r = &mut self.requests[i];
+                r.prefix_entry = Some(claim.id);
+                r.shared_prefix_tokens = claim.tokens;
+                r.gdn = claim.gdn; // core-02: resume at the shared boundary
+                // Shrink the claimant's own reservation by the shared
+                // prefix's pages (the entry now owns them — charged once,
+                // for every claimant). `ceil((prompt + max) / pt) -
+                // shared_pages` equals `ceil((tail + max) / pt)`: the
+                // shared head is page-aligned, so subtracting its whole
+                // pages is exact.
+                r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
+                events.push(SchedEvent::PrefixReused {
+                    request: r.id,
+                    tokens: claim.tokens,
+                });
+            }
+        }
+        // A claimant carries only its tail (the shared head is already
+        // warm in the pool — the kernel leaf binds the shared prefix's
+        // blocks read-only); a fresh request carries its full prompt.
         let jobs: Vec<PrefillJob> = batch
             .iter()
-            .map(|&i| PrefillJob {
-                request: self.requests[i].id,
-                tokens: self.requests[i].input.tokens.clone(),
-                params: self.requests[i].input.params,
+            .map(|&i| {
+                let r = &self.requests[i];
+                let tokens = if r.shared_prefix_tokens > 0 {
+                    r.input
+                        .tokens
+                        .iter()
+                        .skip(r.shared_prefix_tokens as usize)
+                        .copied()
+                        .collect()
+                } else {
+                    r.input.tokens.clone()
+                };
+                PrefillJob {
+                    request: r.id,
+                    tokens,
+                    params: r.input.params,
+                }
             })
             .collect();
         if !jobs.is_empty() {
@@ -713,6 +882,33 @@ impl Scheduler for ConcreteScheduler {
                 Ok(()) => {
                     for &i in &batch {
                         self.requests[i].advance(RequestState::Prefilling);
+                        // core-07 — registration: only a fresh request
+                        // (no shared head — it claimed nothing) caches
+                        // its now-warm prompt for siblings. A claimant's
+                        // head is already the cached entry (registering
+                        // its full prompt would double-charge the shared
+                        // pages), and a same-batch duplicate's prompt is
+                        // already cached by the batch's first registrant
+                        // (register returns `None` — it keeps its own
+                        // charge, no re-registration). The entry's pages
+                        // are charged to the pool now (the charge split:
+                        // the registrant's own reservation keeps the
+                        // residual, the entry holds the shared pages).
+                        if self.requests[i].prefix_entry.is_none() {
+                            let registered = self.prefix
+                                .register(
+                                    &self.requests[i].input.tokens,
+                                    &self.requests[i].gdn,
+                                );
+                            if let Some((entry, pages)) = registered {
+                                let r = &mut self.requests[i];
+                                r.prefix_entry = Some(entry);
+                                r.resources.kv_pages =
+                                    r.resources.kv_pages.saturating_sub(pages);
+                                self.kv_used_pages =
+                                    self.kv_used_pages.saturating_add(pages);
+                            }
+                        }
                     }
                 }
                 Err(e) => {

@@ -18,6 +18,7 @@
 
 use crate::admission::AdmissionResources;
 use crate::gdn::GdnState;
+use crate::prefix::PrefixId;
 use crate::types::{
     BackfillClass, LaneId, RequestClass, RequestId, RequestInput, RequestState, TokenId,
 };
@@ -57,6 +58,14 @@ pub struct Request {
     /// a recorded boundary (a mid-prefill snapshot is invalid for GDN
     /// layers).
     pub gdn: GdnState,
+    /// The sibling prefix entry this request reuses (core-07): `Some(id)`
+    /// when the request's prefill skipped the cached shared head (the
+    /// claim pins the shared pages for the request's lifetime — released
+    /// on completion or re-queue).
+    pub prefix_entry: Option<PrefixId>,
+    /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
+    /// full prefill, nothing skipped).
+    pub shared_prefix_tokens: u32,
 }
 
 impl Request {
@@ -82,6 +91,8 @@ impl Request {
             backfill_epoch: 0,
             backfill_class: BackfillClass::None,
             gdn: GdnState::new(),
+            prefix_entry: None,
+            shared_prefix_tokens: 0,
         }
     }
 
@@ -181,6 +192,11 @@ impl Request {
         self.state = RequestState::Admitted;
         self.lane = None;
         self.gdn = GdnState::new(); // fresh recurrent state (re-prefill starts over)
+        // core-07: the re-prefilled stream starts over — the old prefix
+        // claim (released by the caller) is stale; a fresh prefill may
+        // re-claim a live entry.
+        self.prefix_entry = None;
+        self.shared_prefix_tokens = 0;
         true
     }
 
