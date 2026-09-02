@@ -4,9 +4,11 @@
 //! Rust port of the reference `materializer` (`ninfer`
 //! `materializer.h`/`.cpp`): device objects are read from the container
 //! via 4096-aligned direct I/O (bypassing the page cache), streamed
-//! through a per-object staging buffer, and uploaded to the plan's device
-//! arena at the reader-computed geometry. Host-retained resources keep
-//! their bytes in RAM (the reference `take_resource_bytes` pattern).
+//! through a bounded pool of reusable 4096-aligned staging slots (peak host
+//! memory = a few slots, not the sum of every object — the reference's
+//! streaming design), and uploaded to the plan's device arena at the
+//! reader-computed geometry. Host-retained resources keep their bytes in RAM
+//! (the reference `take_resource_bytes` pattern).
 //!
 //! The device arena is a single allocation (the reference `DeviceArena`
 //! sub-allocation pattern): one `allocate(capacity)`, each device object
@@ -34,8 +36,10 @@ pub struct MaterializationStats {
     /// Bytes of host-retained resources (decremented by
     /// [`MaterializedArtifact::take_resource_bytes`]).
     pub retained_resource_bytes: u64,
-    /// Largest single-object staging buffer (streaming: the max, not the
-    /// sum).
+    /// Largest single-object staging span (streaming: the max, not the sum).
+    /// The bounded pool holds up to [`STAGING_SLOTS`] such slots, so the
+    /// peak host-staging memory is at most [`STAGING_SLOTS`] × this value
+    /// (fewer when the plan has fewer than [`STAGING_SLOTS`] device objects).
     pub peak_staging_bytes: u64,
     /// Device tensors in the plan.
     pub tensor_count: usize,

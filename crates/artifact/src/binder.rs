@@ -264,12 +264,8 @@ mod tests {
         (artifact, reader)
     }
 
-    /// Consume + place all five fixture objects (the ADR 0002 happy path).
-    fn bind_all(binder: &mut Binder) {
-        let resource = binder
-            .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
-            .expect("resource");
-        binder.retain_on_host(resource).expect("retain resource");
+    /// Consume + place the four tensor objects (the resource is left alone).
+    fn bind_devices(binder: &mut Binder) {
         let bf16 = binder
             .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
             .expect("bf16");
@@ -286,6 +282,15 @@ mod tests {
             .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
             .expect("fp8");
         binder.materialize_on_device(fp8).expect("place fp8");
+    }
+
+    /// Consume + place all five fixture objects (the ADR 0002 happy path).
+    fn bind_all(binder: &mut Binder) {
+        let resource = binder
+            .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
+            .expect("resource");
+        binder.retain_on_host(resource).expect("retain resource");
+        bind_devices(binder);
     }
 
     /// ADR 0002 happy path: every object consumed and placed -> `finish`
@@ -307,22 +312,7 @@ mod tests {
         let (_artifact, reader) = fixture_reader("unconsumed");
         let mut binder = Binder::new(&reader);
         // Consume + place the four tensors, but never consume the resource.
-        let bf16 = binder
-            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
-            .expect("bf16");
-        binder.materialize_on_device(bf16).expect("place bf16");
-        let nvfp4 = binder
-            .require_tensor("w/nvfp4", NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1, &[128, 64])
-            .expect("nvfp4");
-        binder.materialize_on_device(nvfp4).expect("place nvfp4");
-        let q4 = binder
-            .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
-            .expect("q4");
-        binder.materialize_on_device(q4).expect("place q4");
-        let fp8 = binder
-            .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
-            .expect("fp8");
-        binder.materialize_on_device(fp8).expect("place fp8");
+        bind_devices(&mut binder);
         // The resource was never consumed -> finish must fail.
         let err = binder.finish().expect_err("finish must fail on an unconsumed object");
         assert!(err.to_string().contains("not consumed"), "{err}");
@@ -337,22 +327,7 @@ mod tests {
         let resource = binder
             .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
             .expect("resource");
-        let bf16 = binder
-            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
-            .expect("bf16");
-        binder.materialize_on_device(bf16).expect("place bf16");
-        let nvfp4 = binder
-            .require_tensor("w/nvfp4", NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1, &[128, 64])
-            .expect("nvfp4");
-        binder.materialize_on_device(nvfp4).expect("place nvfp4");
-        let q4 = binder
-            .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
-            .expect("q4");
-        binder.materialize_on_device(q4).expect("place q4");
-        let fp8 = binder
-            .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
-            .expect("fp8");
-        binder.materialize_on_device(fp8).expect("place fp8");
+        bind_devices(&mut binder);
         // The resource is consumed but has no placement -> finish must fail.
         let _ = resource;
         let err = binder.finish().expect_err("finish must fail on an unplanned object");
