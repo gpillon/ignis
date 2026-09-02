@@ -11,3 +11,5 @@
 pub mod ffi;
 pub mod gdn;
 pub mod kv;
+pub mod request;
+pub mod types;
