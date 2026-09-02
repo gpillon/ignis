@@ -1,7 +1,19 @@
 [package]
 name = "ignis-artifact"
-description = "ignis: .ninfer container reader (reader + binder + materializer port)"
+description = "ignis: .ninfer container reader (v2 framing, closed JSON directory, mmap + direct I/O)"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ignis-artifact-inspect"
+path = "src/bin/inspect.rs"
+
 [dependencies]
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

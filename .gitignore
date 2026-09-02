@@ -9,3 +9,7 @@ dist/
 # logs
 *.log
 _bench_logs/
+
+# python
+__pycache__/
+*.pyc
