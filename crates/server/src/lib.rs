@@ -21,6 +21,7 @@
 pub mod api;
 pub mod artifact_template;
 pub mod engine;
+pub mod telemetry;
 pub mod template;
 
 use std::time::Duration;
@@ -73,6 +74,13 @@ impl Server {
     /// 30 s).
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Route the server's telemetry through `sink` (the §5 JSONL sink — a
+    /// file or stdout in production, an in-memory sink in tests).
+    pub fn with_telemetry(mut self, sink: std::sync::Arc<dyn crate::telemetry::TelemetrySink>) -> Self {
+        self.engine = self.engine.with_telemetry(sink);
         self
     }
 

@@ -27,6 +27,8 @@ use ignis_core::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::telemetry::{NullSink, SystemClock, Telemetry, TelemetryClock, TelemetrySink};
+
 /// A per-request event stream: the `SchedEvent`s the engine routed to one
 /// request. The stream closes (the sender is dropped) when the request
 /// completes, so [`UnboundedReceiver::recv`] yielding `None` marks
@@ -44,6 +46,9 @@ struct EngineInner {
     /// removed when its request completes (the dropped sender closes the
     /// receiver, signalling end-of-stream to the handler).
     streams: HashMap<RequestId, EventRoute>,
+    /// The v1 telemetry (server-02): the interval + request JSONL lines the
+    /// engine emits from its routed events (design §5).
+    telemetry: Telemetry,
 }
 
 /// The server-side engine: owns the core [`Scheduler`] and routes its
@@ -61,14 +66,49 @@ impl Clone for Engine {
 }
 
 impl Engine {
-    /// Wrap a concrete scheduler in a server engine.
+    /// Wrap a concrete scheduler in a server engine (telemetry off — a no-op
+    /// sink, so no JSONL is written; use [`Engine::with_sinks`] to enable it).
     pub fn new(scheduler: Box<dyn Scheduler>) -> Self {
+        Self::with_sinks(
+            scheduler,
+            std::sync::Arc::new(NullSink),
+            std::sync::Arc::new(SystemClock),
+        )
+    }
+
+    /// Wrap a concrete scheduler in a server engine whose telemetry writes
+    /// through `sink`, with `clock` supplying the request-line `ms` /
+    /// `tok_s` (a fixed clock keeps tests deterministic — ADR 0006).
+    pub fn with_sinks(
+        scheduler: Box<dyn Scheduler>,
+        sink: std::sync::Arc<dyn TelemetrySink>,
+        clock: std::sync::Arc<dyn TelemetryClock>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(EngineInner {
                 scheduler,
                 streams: HashMap::new(),
+                telemetry: Telemetry::new(sink, clock),
             })),
         }
+    }
+
+    /// Route the engine's telemetry through `sink` (keeping the existing
+    /// clock and any live counter source).
+    pub fn with_telemetry(self, sink: std::sync::Arc<dyn TelemetrySink>) -> Self {
+        self.inner.lock().unwrap().telemetry.set_sink(sink);
+        self
+    }
+
+    /// Use `provider` as the live counter source for the interval line (the
+    /// §5 blocker seam: a real `Scheduler::stats` accessor, once core ships
+    /// it, overrides the event-derived estimator).
+    pub fn with_stats(
+        self,
+        provider: std::sync::Arc<dyn crate::telemetry::IntervalStatsProvider>,
+    ) -> Self {
+        self.inner.lock().unwrap().telemetry.with_stats(provider);
+        self
     }
 
     /// The loaded model id (for `GET /v1/models`).
@@ -93,6 +133,8 @@ impl Engine {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.scheduler.submit(input, class)?;
         inner.streams.insert(id, route);
+        // Telemetry: anchor this request's `ms` timeline (server-02).
+        inner.telemetry.note_submit(id);
         Ok((id, stream))
     }
 
@@ -135,7 +177,20 @@ impl Engine {
                 // the receiver — the `Done` itself was just delivered).
                 inner.streams.remove(&request);
             }
+            // Telemetry: record the lifecycle event (admitted / first token
+            // / done / evicted) so the interval + request lines reflect it
+            // (server-02, design §5).
+            match event {
+                SchedEvent::Admitted { .. } => inner.telemetry.on_admitted(request),
+                SchedEvent::Token { .. } => inner.telemetry.on_token(request),
+                SchedEvent::Evicted { .. } => inner.telemetry.on_evicted(request),
+                SchedEvent::Done { tokens, .. } => inner.telemetry.on_done(request, *tokens),
+                _ => {}
+            }
         }
+        // The interval line: one per scheduler step / driver tick
+        // (server-02, design §5).
+        self.inner.lock().unwrap().telemetry.emit_interval();
         events
     }
 

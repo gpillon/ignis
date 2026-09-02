@@ -23,6 +23,8 @@
 //! - `IGNIS_ARTIFACT` — the `.ninfer` container path (the real tokenizer
 //!   and chat template, artifact-02); unset = the built-in placeholder
 //!   template (its rendered `content` is not natural text).
+//! - `IGNIS_TELEMETRY` — the telemetry JSONL sink path (server-02, design
+//!   §5): one compact line per event; unset = stdout.
 
 use std::sync::Arc;
 
@@ -34,6 +36,7 @@ use ignis_core::{
 use ignis_server::{
     engine::Engine,
     template::SimpleTemplateProvider,
+    telemetry::{FileSink, StdoutSink, SystemClock, TelemetrySink},
     Server,
 };
 
@@ -72,7 +75,22 @@ async fn main() {
     // falls back to the built-in placeholder (its rendered `content` is
     // the token id-space, not natural text).
     let artifact = env("IGNIS_ARTIFACT", "");
-    let engine = Engine::new(Box::new(scheduler));
+    // The telemetry sink (server-02, design §5): a JSONL file named by
+    // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
+    let telemetry_sink: Arc<dyn TelemetrySink> = match env("IGNIS_TELEMETRY", "") {
+        path if path.is_empty() => Arc::new(StdoutSink),
+        path => match FileSink::open(&path) {
+            Ok(file) => {
+                eprintln!("ignis-server: telemetry → {path}");
+                Arc::new(file)
+            }
+            Err(err) => {
+                eprintln!("ignis-server: telemetry: {err} (falling back to stdout)");
+                Arc::new(StdoutSink)
+            }
+        },
+    };
+    let engine = Engine::with_sinks(Box::new(scheduler), telemetry_sink, Arc::new(SystemClock));
     let server = if artifact.is_empty() {
         eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text)");
         Server::new(engine, Box::new(SimpleTemplateProvider))
