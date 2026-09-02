@@ -22,6 +22,7 @@ use serde_json::Value;
 
 pub mod binding;
 pub mod binder;
+pub mod checksum;
 pub mod device;
 pub mod fixture;
 pub mod frontend;
@@ -35,6 +36,9 @@ mod ffi;
 pub use binding::{Binding, Bf16View, Nvfp4View};
 pub use binder::{
     Binder, DevicePlacement, HostPlacement, MaterializationPlan, ObjectHandle,
+};
+pub use checksum::{
+    verify, ChecksumReport, GraftedSource, Nvfp4Record, ObjectCheck, Outcome, Sidecar,
 };
 pub use device::{CpuDevice, Device, DeviceBuffer};
 #[cfg(feature = "cuda")]
