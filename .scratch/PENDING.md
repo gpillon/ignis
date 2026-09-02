@@ -4,6 +4,57 @@ Cross-cutting items that are intentionally deferred. Updated by the coordinator
 at each integration step; per-ticket details live in the ticket files under
 `.scratch/<feature>/issues/`.
 
+## Stopped subagents — WIP state (2026-09-02)
+
+Three subagents (core, server, artifact) were launched in parallel and then
+**stopped by the user** (to switch to the structured `/implement` workflow).
+What each left behind:
+
+- **Subagent A (artifact)** — stopped *before* producing any file. No partial
+  work in `crates/artifact/` (only pre-existing files; `git status` clean for
+  this crate). **Remaining: artifact-02 (frontend extraction, #7),
+  artifact-03 (tensor checksum vs sidecars, #8).**
+- **Subagent B (server)** — stopped *before* producing any file. No partial
+  work in `crates/server/` (only the pre-existing `main.rs` stub; `git status`
+  clean for this crate). **Remaining: server-01 (OpenAI HTTP, #14),
+  server-02 (JSONL telemetry, #15).**
+- **Subagent C (core)** — produced **`crates/core/src/kv.rs`** (core-01:
+  paged KV + block table) and stopped there. `kv.rs` is complete + green
+  (4 unit tests pass; one test bug was fixed and it was wired into `lib.rs`).
+  **core-02 … core-07 were NOT started by this subagent.**
+
+### Coordinator WIP — recovered (2026-09-02, this session)
+
+The coordinator's in-progress files (the uncommitted WIP above) were
+recovered through the `/implement` close-out: two-axis code review
+(Standards + Spec, parallel subagents) → findings fixed → workspace
+`cargo test` green → committed per ticket:
+
+- `core 01: paged KV + block table (GitHub #9)` — 8a64a0d
+- `core 02: GDN state (boundary-gated) (GitHub #11)` — 4e0d092
+- `core 03: request state machine + basic admission (GitHub #12)` — 5d13202
+  (the `request.rs` admission-test failure was fixed: the test pinned the
+  physical lane deal-order, which is not part of the contract; it now
+  asserts class-priority + FIFO properties, plus a single-lane FIFO
+  scenario)
+- `core 04 (start): scheduler contract + Compute seam (GitHub #13)` — 0966eef
+  (contract only; the concrete N=8 scheduler + the deterministic Compute
+  mock are the follow-up)
+- `kernel-abi 01-03 (start): C ABI surface (GitHub #5, #6, #10)` — adb6ac9
+  (surface only; CUDA implementations + the 99% gate deferred to the GPU,
+  ADR 0006/0007)
+
+Review-driven fixes folded into these commits: non-tautological geometry
+tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
+(double-free / out-of-range surfaced, not swallowed), `Request::advance`
+enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
+carries the `RequestClass` (ADR 0004).
+
+**Next up:** core-04 remainder (concrete N=8 scheduler + Compute mock —
+blocked on the kernel-abi CUDA implementations), then core-05 … core-07,
+then server-01/02, then artifact-02/03. All CPU-testable; only the
+kernel-abi CUDA implementation + the 99% gate need the GPU (ADR 0006/0007).
+
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
 On 2026-09-02 the user freed the RTX 5090 (stopping the reference

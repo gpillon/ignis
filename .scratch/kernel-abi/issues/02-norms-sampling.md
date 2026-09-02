@@ -1,6 +1,7 @@
 # 02 — norms / embeddings / sampling C ABI (greedy)
 
-Status: needs-triage
+Status: in-progress (start — C-ABI surface, commit adb6ac9; CUDA
+implementation pending; GitHub #6)
 GitHub: #6
 Blocked by: #3 (kernel-port-03)
 

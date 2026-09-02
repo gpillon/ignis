@@ -1,6 +1,8 @@
 # 04 — scheduler: N=8 decode lanes + batched prefill
 
-Status: needs-triage
+Status: in-progress (start — contract only, commit 0966eef; concrete N=8
+scheduler + batched-prefill experiment pending, blocked on the kernel-abi
+CUDA implementations; GitHub #13)
 GitHub: #13
 Blocked by: #12 (core-03), #5 (kernel-abi-01)
 

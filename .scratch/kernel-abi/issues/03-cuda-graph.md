@@ -1,6 +1,7 @@
 # 03 — CUDA graph eager capture at startup
 
-Status: needs-triage
+Status: in-progress (start — C-ABI surface, commit adb6ac9; graph-capture
+implementation pending; GitHub #10)
 GitHub: #10
 Blocked by: #5 (kernel-abi-01), #6 (kernel-abi-02)
 

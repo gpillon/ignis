@@ -1,6 +1,6 @@
 # 01 — paged KV cache + block table (VRAM)
 
-Status: needs-triage
+Status: resolved (commit 8a64a0d, 2026-09-02; GitHub #9)
 GitHub: #9
 Blocked by: #4 (artifact-01)
 

@@ -1,6 +1,6 @@
 # 03 — request state machine + basic admission
 
-Status: needs-triage
+Status: resolved (commit 5d13202, 2026-09-02; GitHub #12)
 GitHub: #12
 Blocked by: #9 (core-01)
 

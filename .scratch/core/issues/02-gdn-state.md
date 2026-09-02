@@ -1,6 +1,6 @@
 # 02 — GDN state management (resumable at frontier / checkpoint)
 
-Status: needs-triage
+Status: resolved (commit 4e0d092, 2026-09-02; GitHub #11)
 GitHub: #11
 Blocked by: #9 (core-01), #5 (kernel-abi-01)
 
