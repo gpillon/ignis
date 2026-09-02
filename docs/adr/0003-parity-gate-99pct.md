@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-09-02, grilling session).
+Superseded by ADR 0007 (2026-09-02): the 99% is a **performance** gate (≥ 99%
+of reference speed), not token-agreement. Correctness is self-checked (sane
+output, same model, greedy, fixed seed), not reference-matched.
 
 ## Context
 

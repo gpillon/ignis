@@ -1,5 +1,13 @@
 # Kernel leaf port — spec
 
+> **Status (2026-09-02, grilling):** policy revised per ADR 0005 / 0007 — we
+> port the proven CUDA "for now" (a temporary starting point), then
+> **re-implement** it later, guided by the north-star. The reference is
+> consulted **only in extreme necessity** (a problem someone already solved);
+> the 99% acceptance is a **performance gate (≥ 99% of reference speed), not
+> token-agreement**. Borrowing pieces from other inference engines is fine, as
+> long as we stay on the north-star.
+
 Bring the C++/CUDA compute leaf of the reference stack into `ignis/kernel/`
 behind the flat C ABI of ADR 0001, so `ignis-core` can drive the GPU.
 
