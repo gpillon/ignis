@@ -8,7 +8,11 @@
 
 $ErrorActionPreference = "Stop"
 $Kernel = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BuildPath = Join-Path $Kernel "build"
+# Optional -BuildDir override (default: the canonical kernel/build, which
+# crates/*/build.rs link). A second build dir lets a parallel workstream
+# verify new .cu files without contending on the canonical build.
+$BuildDir = if ($args -and $args[0] -and ($args[0] -notlike '-*')) { $args[0] } else { "build" }
+$BuildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $Kernel $BuildDir }
 
 function Import-Vcvars {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"

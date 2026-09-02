@@ -1,6 +1,8 @@
 # build artifacts
 target/
 kernel/build/
+kernel/build-a/
+kernel/build-b/
 
 # webui (later phase)
 node_modules/

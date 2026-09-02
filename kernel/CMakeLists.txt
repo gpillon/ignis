@@ -18,9 +18,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a)
 endif()
 
-add_library(ignis_kernel STATIC
-  src/hello.cu
+# All CUDA sources under kernel/src (ticket 01 smoke kernel today; decode-step
+# kernels and the device-surface module land here as tickets 03+ ship).
+# CONFIGURE_DEPENDS: CMake re-scans on each build, so newly added .cu files
+# are picked up without a manual re-configure.
+file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu
 )
+add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS})
 set_target_properties(ignis_kernel PROPERTIES
   PREFIX ""
   OUTPUT_NAME "ignis_kernel"
