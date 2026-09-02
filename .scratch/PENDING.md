@@ -50,7 +50,10 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-06 … core-07, then server-01/02, then artifact-02/03.
+**Next up:** core-06 resolved (7115251) → core-07
+(prefix reuse, #18 — unblocked), then server-02 (telemetry, #15),
+artifact-03 (tensor checksums, #8), then bench-01/02 once a reference
+baseline is recorded.
 core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
 scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
 *deferred* on core-04 — the **GPU-saturation measurement** of batched
@@ -72,6 +75,38 @@ deal, `Oversized` rejection, hard-cap completion). 11 unit tests +
 workspace `cargo test` green. The protection's **Drain** phase is
 unreachable in v1's resource model (documented in the ticket +
 `admission_machine.rs`); it ships for reference fidelity only.
+
+core-06 is **resolved** (2026-09-02, GitHub #17 closed): the KV-RAM
+host tier is committed (7115251) — a bounded `HostTier` in `host.rs`
+(probation → protected two-tier eviction, GDN-boundary check, LRU
+eviction) snapshots a lower-value GPU lane to host RAM so the evicted
+(suspended) request can later *restore* instead of re-prefilling; the
+`Running→Evicted→Running` (restore) and `Evicted→Admitted` (re-queue)
+transitions in `request.rs` reset the re-queued request's GDN state so a
+re-prefilled stream cannot accept a snapshot at a position it never
+reached; `gdn.rs` `checkpoint` now records at the current position (>=) +
+a new `advance` (mid-prefill progress, non-boundary); `concrete.rs`
+wiring (`host_capacity_pages` knob, `try_evict_for_head`, `restore_pass`,
+decode-phase GDN checkpoints, KV bookkeeping); `types.rs` `Evicted` /
+`Restored` / `Requeued` schedule events. 8 unit tests + 2 end-to-end
+scenarios (`host_tier.rs`), CPU-tested (ADR 0006), workspace `cargo test`
+green. Admission tests pin `host_capacity_pages: 0` so the core-05
+scenarios exercise the admission machine in isolation.
+
+server-01 is **resolved** (2026-09-02, GitHub #14 closed): the
+OpenAI-compatible HTTP surface is committed (84ada6d) — axum 0.8 +
+tokio; `GET /v1/models`, `POST /v1/chat/completions` (SSE + non-
+streaming), `POST /v1/responses` (non-streaming; `stream:true` → 400
+in v1); the `Engine` drives the core `Scheduler` behind a `Mutex` with
+per-request `SchedEvent` routing (review-caught bug fixed + regression-
+tested: a `Protected` batch event early-returned, dropping later
+`Token`/`Done` events). The chat template runs through the
+`TemplateProvider` seam + built-in provider; the real artifact frontend
+objects (tokenizer + chat template) arrive with artifact-02 (#7),
+wired through the same seam. 21/21 `ignis-server` CPU tests (ADR 0006),
+workspace `cargo test` green. Deferred: `/v1/responses` streaming
+(out of v1 scope), `Compute` backend is `MockCompute` (kernel-leaf
+adapter via the same scheduler-constructor injection).
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
@@ -106,20 +141,19 @@ Per ADR 0006, GPU workloads only run while the GPU is free.
    percentiles), canary self-consistency (sane + greedy-deterministic),
    performance report + 99% gate, and a bounded-concurrency replay driver +
    CLI (all tested, workspace `cargo test` green). Still remaining:
-   - the `HttpEndpoint` transport is a **stub** — it needs the `ignis-server`
-     OpenAI endpoint (ticket #14) + an HTTP client dependency (bench-01, #19).
+   - the `HttpEndpoint` transport is a **stub** — the `ignis-server`
+     OpenAI endpoint now exists (server-01, 84ada6d); what remains is
+     wiring the bench `HttpEndpoint` against it + an HTTP client
+     dependency (bench-01, #19).
    - a **recorded reference baseline** (trace JSONL + a reference run) to
      compare against — ADR 0007 gates against the reference's *speed*, so a
      reference recording is required before the gate can be evaluated.
 
-## Hygiene / deferred (user's deliberate "zozzata" — do NOT fix unilaterally)
+## Hygiene / deferred
 
-- The local `.git/config` remote URL has a token embedded (user's deliberate
-  choice, local-only, never pushed). Cleanup deferred; revisit with the user
-  before any push-related work.
 - `~/.bash_profile` PATH additions (cargo bin, CUDA 13.1 bin + bin/x64, ninja
-  at `F:/ai/q38/tools/ninja`) were handed to the user 2026-09-02; whether they
-  applied is unconfirmed. Check once the user confirms their shell setup.
+  at `F:/ai/q38/tools/ninja`) were handed to the user 2026-09-02; they
+  applied it.
 
 ## Known-stale local state (fixed)
 
