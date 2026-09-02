@@ -12,9 +12,9 @@
 //!       Compare two runs and print the performance report + the 99% gate
 //!       verdict (ADR 0007). Exits non-zero when the gate fails.
 //!
-//! `replay`/`canary` drive a live endpoint (the `HttpEndpoint` is a follow-on
-//! once `ignis-server` exists, ticket #14); `report` is fully functional on
-//! its own (it just compares two recorded runs).
+//! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
+//! (the `ignis-server`'s OpenAI-compatible API); `report` is fully
+//! functional on its own (it just compares two recorded runs).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -89,7 +89,17 @@ fn cmd_replay(args: &[String]) -> ExitCode {
         }
     };
 
-    let ep: Arc<dyn Endpoint> = Arc::new(HttpEndpoint::new(endpoint));
+    let ep = HttpEndpoint::new(&endpoint);
+    // Pre-flight: the engine must be reachable and have a model loaded — a
+    // clean error beats N failed requests in the run file.
+    match ep.list_models() {
+        Ok(models) => eprintln!("engine {endpoint}: {}", models.join(", ")),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let ep: Arc<dyn Endpoint> = Arc::new(ep);
     let cfg = ReplayConfig {
         max_concurrency: conc,
         time_scale: scale,
@@ -120,7 +130,17 @@ fn cmd_canary(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep: Arc<dyn Endpoint> = Arc::new(HttpEndpoint::new(endpoint));
+    let ep = HttpEndpoint::new(&endpoint);
+    // Pre-flight: the engine must be reachable and have a model loaded — a
+    // clean error beats a full canary run that fails on every request.
+    match ep.list_models() {
+        Ok(models) => eprintln!("engine {endpoint}: {}", models.join(", ")),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let ep: Arc<dyn Endpoint> = Arc::new(ep);
     let results = canary::run_canaries(&*ep);
     let consistent = canary::suite_consistent(&results);
     for r in &results {

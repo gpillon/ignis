@@ -5,10 +5,12 @@
 //! reference) + a **self-consistency check** (ADR 0007: ≥ 99% of the
 //! reference's *speed* — a performance gate, not a token-parity gate).
 //!
-//! The I/O is isolated behind the `client::Endpoint` trait, so the core logic
-//! (trace, metrics, canary, report) is fully testable with **no** running
-//! server; the real HTTP endpoint is a thin follow-on (see
-//! `.scratch/bench/issues/01-trace-replay.md`, blocked by #14).
+//! The I/O is isolated behind the `client::Endpoint` trait, so the core
+//! logic (trace, metrics, canary, report) is fully testable with **no**
+//! running server; the real HTTP endpoint (`client::HttpEndpoint`, a
+//! `reqwest` blocking client) drives the running `ignis-server`
+//! (`POST /v1/chat/completions` — streaming + non-streaming — and
+//! `GET /v1/models`) (see `.scratch/bench/issues/01-trace-replay.md`).
 
 pub mod canary;
 pub mod client;

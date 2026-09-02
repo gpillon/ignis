@@ -2,11 +2,12 @@
 //! metrics.
 //!
 //! The harness talks to an OpenAI-compatible engine over HTTP. The I/O is
-//! isolated behind the `Endpoint` trait so the replay driver + metrics logic is
-//! testable against a `MockEndpoint` with **no** running server. The real
-//! `HttpEndpoint` is a thin follow-on that gets wired once the `ignis-server`
-//! endpoint (ticket #14) and an HTTP client dependency exist (see
-//! `.scratch/bench/issues/01-trace-replay.md` — blocked by #14).
+//! isolated behind the `Endpoint` trait so the replay driver + metrics logic
+//! is testable against a `MockEndpoint` with **no** running server. The real
+//! `HttpEndpoint` (a `reqwest` blocking client) drives the running
+//! `ignis-server` endpoint (`POST /v1/chat/completions` — streaming SSE for
+//! per-token timing + non-streaming — and `GET /v1/models`) and measures the
+//! per-request timing (see `.scratch/bench/issues/01-trace-replay.md`).
 //!
 //! The replay driver runs a bounded-concurrency worker pool: jobs (requests
 //! with their arrival offsets) flow through an mpsc channel into
@@ -15,8 +16,11 @@
 //! so the scheduler sees a realistic concurrency profile.
 
 use std::collections::VecDeque;
+use std::io::BufRead;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use reqwest::blocking::{Client, Response};
 
 use crate::metrics::RequestMetrics;
 use crate::trace::{RequestClass, Trace};
@@ -120,31 +124,171 @@ impl Endpoint for MockEndpoint {
     }
 }
 
-/// A thin placeholder for the real HTTP endpoint. It is wired to
-/// `ignis-server`'s OpenAI-compatible API once that exists (ticket #14);
-/// until then it returns a clear error so the build stays green and the seam
-/// (`Endpoint`) is in place for the follow-on.
+/// The real HTTP transport: drives the running engine (the `ignis-server`'s
+/// OpenAI-compatible API) and measures the per-request timing.
+///
+/// `POST /v1/chat/completions` (streaming SSE for per-token timing when the
+/// trace line is streaming, a single JSON body otherwise) + `GET /v1/models`
+/// (a readiness probe). One `reqwest::blocking::Client` is shared across the
+/// driver's worker threads (`Client` is cheap to share), so
+/// `HttpEndpoint` is `Send + Sync` and fits the `Endpoint` seam as-is.
 #[derive(Debug, Clone)]
 pub struct HttpEndpoint {
+    /// The engine's base URL (e.g. `http://127.0.0.1:8080`).
     pub base_url: String,
+    /// The shared HTTP client (cheap to share across the driver's worker
+    /// threads).
+    client: Client,
 }
 
 impl HttpEndpoint {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client: Client::new(),
         }
+    }
+
+    /// `GET /v1/models` — a readiness probe: the loaded model id(s)
+    /// (v1: a single model).
+    pub fn list_models(&self) -> Result<Vec<String>, String> {
+        let url = format!("{}/v1/models", self.base_url);
+        let value: serde_json::Value = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("GET {url} failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("GET {url} -> {e}"))?
+            .json()
+            .map_err(|e| format!("GET {url}: parse: {e}"))?;
+        value
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| format!("GET {url}: no models in the list"))
     }
 }
 
 impl Endpoint for HttpEndpoint {
-    fn complete(&self, _req: &Request) -> Result<Outcome, String> {
-        Err(format!(
-            "HTTP endpoint not wired yet ({}): needs the ignis-server OpenAI \
-             endpoint (ticket #14) + an HTTP client dependency",
-            self.base_url
-        ))
+    fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        // The trace line's prompt becomes a single user message (the trace
+        // format is prompt-based; the shared "system + tools" prefix is
+        // carried inside the prompt text). `temperature: 0` + `seed: 0` pin
+        // the greedy + fixed-seed contract of the v1 gate (ADR 0007 — the
+        // server's defaults, sent explicitly).
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": req.prompt }],
+            "max_tokens": req.max_tokens,
+            "temperature": 0,
+            "seed": 0,
+            "stream": req.stream,
+        });
+        let start = Instant::now();
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("POST {url} failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().unwrap_or_default();
+            return Err(format!("POST {url} -> {status}: {detail}"));
+        }
+        if req.stream {
+            self.read_sse(resp, start)
+        } else {
+            self.read_json(resp, start)
+        }
     }
+}
+
+impl HttpEndpoint {
+    /// The non-streaming half: a single JSON body (the server's
+    /// `chat.completion` shape). ttft == total (no per-token timing — the
+    /// metrics model reports tok_s = 0 for a non-streaming request).
+    fn read_json(&self, resp: Response, start: Instant) -> Result<Outcome, String> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let value: serde_json::Value =
+            resp.json()
+                .map_err(|e| format!("POST {url}: parse: {e}"))?;
+        let total_ms = ms_since(start);
+        Ok(Outcome {
+            ttft_ms: total_ms,
+            total_ms,
+            n_tokens: value
+                .pointer("/usage/completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            output: value
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    /// The streaming half: the SSE `chat.completion.chunk` framing — a
+    /// content chunk per token (a token's delta), a finish chunk (an empty
+    /// delta + `finish_reason`), a terminal `[DONE]` marker. ttft is the
+    /// first content chunk; the token count is the non-empty deltas.
+    fn read_sse(&self, resp: Response, start: Instant) -> Result<Outcome, String> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let reader = std::io::BufReader::new(resp);
+        let mut n_tokens: u32 = 0;
+        let mut output = String::new();
+        let mut first_token_ms: Option<f64> = None;
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
+            // The SSE framing: `data: <payload>` lines (empty lines
+            // separate the events — skipped).
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                break;
+            }
+            let chunk = serde_json::from_str::<serde_json::Value>(data)
+                .map_err(|e| format!("POST {url}: bad SSE chunk {data}: {e}"))?;
+            // `choices[0].delta.content` (an empty delta = the finish
+            // chunk, not a token).
+            let delta = chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !delta.is_empty() {
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(ms_since(start));
+                }
+                output.push_str(delta);
+                n_tokens += 1;
+            }
+        }
+        let total_ms = ms_since(start);
+        // No content chunk: nothing to measure (ttft = total, tok_s = 0).
+        let ttft_ms = first_token_ms.unwrap_or(total_ms);
+        Ok(Outcome {
+            ttft_ms,
+            total_ms,
+            n_tokens,
+            output,
+        })
+    }
+}
+
+/// Elapsed milliseconds since `start` (the timing unit of an `Outcome`).
+fn ms_since(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 /// Replay configuration.
@@ -342,20 +486,6 @@ mod tests {
         let results = replay(ep, &trace, &cfg);
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|m| !m.ok && m.n_tokens == 0));
-    }
-
-    #[test]
-    fn http_endpoint_is_a_clear_stub() {
-        let ep = HttpEndpoint::new("http://127.0.0.1:8080");
-        let req = Request {
-            id: "r".into(),
-            class: RequestClass::Sub,
-            prompt: "p".into(),
-            max_tokens: 8,
-            stream: false,
-        };
-        let err = ep.complete(&req).expect_err("stub must not succeed");
-        assert!(err.contains("ticket #14"));
     }
 
     #[test]

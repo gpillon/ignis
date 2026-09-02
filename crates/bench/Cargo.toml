@@ -7,3 +7,18 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The real HTTP transport (the `HttpEndpoint`): drives the running engine's
+# OpenAI-compatible API. http-only (the engine is a localhost endpoint, no
+# auth/TLS), so the default TLS features are dropped. `blocking` fits the
+# synchronous `Endpoint::complete` seam (one `Client` is shared across the
+# driver's worker threads; `Client` is cheap to share). Inline dependency:
+# a parallel actor owns the workspace manifest (the root `Cargo.toml` is not
+# edited by this ticket).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[dev-dependencies]
+# The in-process mock engine (the tests): a small axum router mimicking the
+# server's wire shape, served on a local port by a tokio runtime.
+axum = { workspace = true }
+tokio = { workspace = true }
+futures-core = { workspace = true }
