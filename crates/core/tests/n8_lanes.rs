@@ -29,11 +29,15 @@ fn holds_eight_resident_lanes_and_rejects_the_ninth() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute.clone());
 
+    // 8 requests with a 2-token budget: after one advance each has one
+    // generated token left to go (the KV reservation is a hard cap: a
+    // request completes on its final reserved token, core-05), so the 8
+    // resident lanes are held for two steps.
     for _ in 0..N_DECODE_LANES {
         assert!(
             sched
                 .submit(
-                    input("qwen3.8-27b", &[1, 2, 3], Some(1)),
+                    input("qwen3.8-27b", &[1, 2, 3], Some(2)),
                     RequestClass::Agent
                 )
                 .is_ok()
@@ -59,7 +63,8 @@ fn holds_eight_resident_lanes_and_rejects_the_ninth() {
     assert_eq!(lanes, (0..N_DECODE_LANES).collect::<BTreeSet<_>>());
     assert!(!sched.is_idle());
 
-    // Next step: every request reached max_tokens → all Done, lanes released.
+    // Next step: every request reaches its reservation (2 tokens) → all
+    // Done, lanes released.
     let ev = sched.advance();
     assert_eq!(
         ev.iter()

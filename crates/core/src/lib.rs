@@ -15,6 +15,7 @@
 //! state, request state machine, scheduler, KV-RAM host tier, prefix
 //! reuse) are implemented on top of this contract.
 
+pub mod admission;
 pub mod concrete;
 pub mod ffi;
 pub mod gdn;
@@ -24,10 +25,15 @@ pub mod request;
 pub mod scheduler;
 pub mod types;
 
+pub use admission::{
+    ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
+    ProtectionPhase, RetainedLaneCandidate,
+};
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use mock::MockCompute;
+pub use request::{admit_candidates, basic_admission, Request};
 pub use scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 pub use types::{
-    ComputeError, EngineMode, N_DECODE_LANES, RequestClass, RequestId, RequestInput,
-    RequestState, SchedEvent, SubmitError, TokenId,
+    BackfillClass, ComputeError, DecodeParams, EngineMode, LaneId, N_DECODE_LANES, RequestClass,
+    RequestId, RequestInput, RequestState, SchedEvent, SubmitError, TokenId,
 };

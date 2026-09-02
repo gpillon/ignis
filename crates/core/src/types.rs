@@ -91,6 +91,32 @@ pub enum RequestClass {
     Agent,
 }
 
+/// The backfill class a request was admitted under by the admission state
+/// machine (ADR 0004: "the port must preserve invariant behavior
+/// (protection promotion, credit decay, frontier distance)").
+///
+/// A request is only admitted with a non-`None` class while a protection is
+/// active (the protected head is blocked by the active set): the class says
+/// *how* the request may use the donor's future capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum BackfillClass {
+    /// Admitted without borrowing a protection's future — a normal lane
+    /// deal (the head of a blocked queue, or any deal with no protection).
+    #[default]
+    None,
+    /// A *permanent* backfill: it fits the protected head's **future**
+    /// capacity (head + non-donor incumbents + all persistent backfills
+    /// admitted under this protection + this candidate ≤ pool capacity).
+    /// It never borrows the donor's reserved pages.
+    Persistent,
+    /// A *temporary* borrower: it does not fit the head's future capacity,
+    /// but its own service work fits within the protected head's
+    /// **frontier distance** (the projected distance to the last still-active
+    /// frozen donor) and the protection's **temporal credit**, so it
+    /// completes before the donor's future capacity is needed.
+    Temporal,
+}
+
 /// An event emitted by a scheduler step. This is what the server streams to
 /// clients and what the telemetry writer logs (ADR 0007: the telemetry
 /// counters are derived from these events).
@@ -100,8 +126,26 @@ pub enum SchedEvent {
     Token { request: RequestId, token: TokenId },
     /// A request completed (`tokens` = total generated this request).
     Done { request: RequestId, tokens: u32 },
-    /// A request was admitted onto a decode lane.
-    Admitted { request: RequestId, lane: LaneId },
+    /// A request was admitted onto a decode lane. `backfill` is the class
+    /// the admission state machine admitted it under (ADR 0004): `None` for
+    /// a normal deal, `Persistent` / `Temporal` for a backfill admitted
+    /// while a protection is active (see [`BackfillClass`]).
+    Admitted {
+        request: RequestId,
+        lane: LaneId,
+        backfill: BackfillClass,
+    },
+    /// The admission state machine froze a protection (ADR 0004): the
+    /// `head` request is blocked by the active set, so the machine froze
+    /// the active incumbents and selected `donors` — the earliest-completion
+    /// prefix whose release makes the head feasible. No donor is evicted
+    /// while the protection is open; backfills admitted under it may not
+    /// borrow the donor's reserved pages (see [`BackfillClass`]).
+    Protected {
+        epoch: u64,
+        head: RequestId,
+        donors: Vec<RequestId>,
+    },
     /// A request was evicted from a decode lane to the host KV-RAM tier
     /// (sibling prefix reuse will restore it instead of re-prefilling).
     Evicted { request: RequestId },
@@ -115,6 +159,10 @@ pub enum SubmitError {
     Full,
     /// The request named a model the engine does not load.
     UnknownModel(String),
+    /// The request's KV reservation (prompt + token budget in pages)
+    /// exceeds the whole pool — it can never be admitted, even alone.
+    /// Rejected at submit rather than left to block the queue forever.
+    Oversized,
 }
 
 impl std::fmt::Display for SubmitError {
@@ -122,6 +170,10 @@ impl std::fmt::Display for SubmitError {
         match self {
             SubmitError::Full => write!(f, "engine cannot admit the request (full)"),
             SubmitError::UnknownModel(m) => write!(f, "unknown model: {m}"),
+            SubmitError::Oversized => write!(
+                f,
+                "request KV reservation exceeds the whole pool (oversized)"
+            ),
         }
     }
 }

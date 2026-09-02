@@ -3,12 +3,22 @@
 //! The request lifecycle is `admitted → prefilling → running → done`
 //! (`CONTEXT.md`). This module models a request in flight: its lifecycle
 //! state, its class (for admission / backfill), the decode lane it holds, and
-//! its token count. The **full** admission state machine (protection,
-//! backfill class, temporal credit, frontier distance) is core-05; this
-//! module carries the *basic* lane assignment it builds on.
+//! its token count, plus — since `core-05` — the admission state
+//! machine's bookkeeping: the KV resources the request reserves, its
+//! remaining service work (the protection's donor ordering, temporal
+//! credit, and frontier distance all run on these quanta), and the
+//! backfill class / protection epoch it was admitted under.
+//!
+//! [`admit_candidates`] / [`basic_admission`] below carry the *basic*
+//! lane assignment (class priority + FIFO) that `core-03` shipped; the
+//! **full** admission state machine (protection, backfill class, temporal
+//! credit, frontier distance — `core-05`, ADR 0004) drives lane
+//! assignment in the concrete scheduler (`concrete.rs` + `admission.rs`)
+//! and supersedes them there.
 
+use crate::admission::AdmissionResources;
 use crate::types::{
-    LaneId, RequestClass, RequestId, RequestInput, RequestState, TokenId,
+    BackfillClass, LaneId, RequestClass, RequestId, RequestInput, RequestState, TokenId,
 };
 
 /// A request in flight in the engine: its lifecycle state, its class (for
@@ -26,11 +36,33 @@ pub struct Request {
     pub lane: Option<LaneId>,
     /// Tokens generated so far for this request.
     pub tokens: u32,
+    /// The resources this request reserves while it holds a lane (core-05:
+    /// the admission state machine's KV reservation, charged at deal and
+    /// released at completion — the pool never over-allocates).
+    pub resources: AdmissionResources,
+    /// Remaining service work (quanta; 1 quantum per decode token): drives
+    /// the protection's donor ordering, temporal credit, and frontier
+    /// distance (core-05).
+    pub remaining_work: u64,
+    /// The protection epoch this request was admitted under as a backfill
+    /// (core-05; 0 = a plain deal, no protection involved).
+    pub backfill_epoch: u64,
+    /// The class this request was admitted under by the admission state
+    /// machine (core-05; [`BackfillClass::None`] for plain deals).
+    pub backfill_class: BackfillClass,
 }
 
 impl Request {
     /// A freshly-admitted request: state `Admitted`, no lane yet.
-    pub fn new(id: RequestId, class: RequestClass, input: RequestInput) -> Self {
+    /// `resources` is the request's KV reservation (the admission state
+    /// machine, core-05) and `remaining_work` its service work in quanta.
+    pub fn new(
+        id: RequestId,
+        class: RequestClass,
+        input: RequestInput,
+        resources: AdmissionResources,
+        remaining_work: u64,
+    ) -> Self {
         Self {
             id,
             class,
@@ -38,6 +70,10 @@ impl Request {
             state: RequestState::Admitted,
             lane: None,
             tokens: 0,
+            resources,
+            remaining_work,
+            backfill_epoch: 0,
+            backfill_class: BackfillClass::None,
         }
     }
 
@@ -124,8 +160,9 @@ pub fn admit_candidates(
 /// A `Prefilling` request that gets a lane transitions to `Running`.
 ///
 /// Returns the number of lanes assigned. This is the *basic* lane
-/// assignment — the full admission state machine (protection, backfill,
-/// temporal credit, frontier distance) is core-05.
+/// assignment — the full admission state machine (protection, backfill
+/// class, temporal credit, frontier distance — core-05, ADR 0004) drives
+/// lane assignment in the concrete scheduler and supersedes it there.
 pub fn basic_admission(requests: &mut [Request], free_lanes: &mut Vec<LaneId>) -> usize {
     admit_candidates(requests, free_lanes).len()
 }
@@ -144,6 +181,8 @@ mod tests {
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
             },
+            AdmissionResources::default(),
+            4,
         );
         r.state = state;
         r
