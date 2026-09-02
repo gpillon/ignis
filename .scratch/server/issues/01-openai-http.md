@@ -26,13 +26,19 @@ early-returned, dropping `Token`/`Done` events later in the same batch —
 now skipped and pinned by a regression test. CPU-tested (ADR 0006):
 21/21 `ignis-server` tests green, workspace `cargo test` green.
 
-Note: the chat template currently runs through the built-in
-`SimpleTemplateProvider` behind the `TemplateProvider` seam — the real
-tokenizer + chat template are the artifact-02 frontend objects (#7);
-wiring them through the seam is tracked under #7. `/v1/responses`
-streaming is out of v1 scope (non-streaming only). The `Compute` backend
-is `MockCompute`; the kernel-leaf adapter replaces it via the same
-scheduler-constructor injection (ADR 0001/0006).
+Note: the template seam is fully wired (follow-up, commit 217a0bd) — the
+`FrontendSet`-backed `ArtifactTemplateProvider` (`artifact_template.rs`)
+implements the `TemplateProvider` trait with the container's real chat
+template + HuggingFace tokenizer: `apply_chat_template` = template
+`render` + tokenizer `encode`, `render_tokens` = `decode`. The entrypoint
+reads `IGNIS_ARTIFACT` and uses `Server::with_artifact_template` when set;
+unset/unreadable falls back to the built-in `SimpleTemplateProvider`
+(rendered `content` is the token id-space, not natural text). A role that
+does not parse to an artifact `Role` templates as `user` (infallible by
+design — logged, not panicked). `/v1/responses` streaming is out of v1
+scope (non-streaming only). The `Compute` backend is `MockCompute`; the
+kernel-leaf adapter replaces it via the same scheduler-constructor
+injection (ADR 0001/0006).
 
 ## Acceptance
 

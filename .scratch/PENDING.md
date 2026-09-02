@@ -50,11 +50,13 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-07 (prefix reuse, #18 — in flight: `prefix.rs` WIP),
-then server-02 (telemetry, #15), artifact-03 (tensor checksums, #8),
-then bench-01/02 once a reference baseline is recorded. In parallel: the
-server-01 `TemplateProvider` wiring (blocked on core compiling, see
-follow-up above).
+**Next up:** server-02 (telemetry, #15) — launched once the server-01
+follow-up wiring (217a0bd) landed. In flight (background agents,
+2026-09-02): bench-01 (HttpEndpoint transport + trace replay, #19,
+`crates/bench`) and artifact-03 (tensor checksum vs sidecars, #8,
+`crates/artifact`); the coordinator integrates each on report
+(verify + close-out), then bench-02 once a reference baseline is
+recorded.
 core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
 scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
 *deferred* on core-04 — the **GPU-saturation measurement** of batched
@@ -121,15 +123,21 @@ Qwen3.8-specific extensions registered: `raise_exception`, string
 round-trips, the real Qwen3.8 template compiles + renders, and its
 `raise` path fires end-to-end. 42/42 `ignis-artifact` tests green.
 
-**Follow-up (tracked, uncommitted):** the last wiring step of server-01's
-template seam — a `FrontendSet`-backed `TemplateProvider` adapter in
-`crates/server` (replacing the built-in `SimpleTemplateProvider`;
-`apply_chat_template` = `render` + `encode`, `render_tokens` = `decode`).
-Blocked on `ignis-core` compiling — the in-flight core WIP (new
-`prefix.rs` + `request`/`scheduler`/`types`/`concrete` edits, 2026-09-02
-evening) is red at the time of writing. When core is green again: write
-the adapter + tests in `crates/server`, `cargo test -p ignis-server`,
-commit, and update the server-01 ticket note.
+**Follow-up (resolved 2026-09-02, commit 217a0bd):** the last wiring
+step of server-01's template seam is in — the `FrontendSet`-backed
+`ArtifactTemplateProvider` in `crates/server` (`artifact_template.rs`):
+`apply_chat_template` = the container's chat-template `render` + the
+container's tokenizer `encode`, `render_tokens` = `decode`; a role that
+does not parse to an artifact `Role` templates as `user` (infallible by
+design — the request completes, logged, not panicked). `Server::with_artifact_template`
+takes the `FrontendSet`; the entrypoint reads `IGNIS_ARTIFACT` and falls
+back to the built-in placeholder when unset/unreadable (rendered
+`content` is the token id-space, not natural text). 17 unit + 8
+integration `ignis-server` tests green (3 new fixture-based
+`artifact_template` tests: template+tokenizer determinism, tokenizer
+decode round-trip, unknown-role fallback); the fixture's
+`tokenizer.json` follows the `tokenizers` 0.21 schema (`unk_token`
+lives inside the `model` object, not top-level).
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
