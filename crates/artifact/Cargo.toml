@@ -8,6 +8,13 @@ edition.workspace = true
 name = "ignis-artifact-inspect"
 path = "src/bin/inspect.rs"
 
+# The `cuda` feature links the kernel leaf's flat C device surface
+# (`kernel/include/ignis_device.h`) and enables the `CudaDevice` backend.
+# Off by default: the CPU mock (`CpuDevice`) is always available (ADR 0006,
+# the RTX 5090 is held by the reference runner).
+[features]
+cuda = []
+
 [dependencies]
 memmap2 = { workspace = true }
 serde_json = { workspace = true }

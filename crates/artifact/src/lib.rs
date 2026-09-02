@@ -20,6 +20,26 @@ use std::path::Path;
 use memmap2::Mmap;
 use serde_json::Value;
 
+pub mod binding;
+pub mod binder;
+pub mod device;
+pub mod fixture;
+pub mod materializer;
+
+/// FFI declarations for the kernel leaf's device surface (feature `cuda`
+/// only — the default build is pure Rust).
+#[cfg(feature = "cuda")]
+mod ffi;
+
+pub use binding::{Binding, Bf16View, Nvfp4View};
+pub use binder::{
+    Binder, DevicePlacement, HostPlacement, MaterializationPlan, ObjectHandle,
+};
+pub use device::{CpuDevice, Device, DeviceBuffer};
+#[cfg(feature = "cuda")]
+pub use device::CudaDevice;
+pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -938,6 +958,15 @@ impl Reader {
     /// Look up an object by exact name.
     pub fn find(&self, name: &str) -> Option<&Object> {
         self.index.get(name).map(|&i| &self.objects[i])
+    }
+
+    /// The index of `name` in the object directory (its position in
+    /// [`Reader::objects()`]), or None if unknown.
+    ///
+    /// This is what the binder's `ObjectHandle`s carry: a handle names a
+    /// directory slot, not an object.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.index.get(name).copied()
     }
 
     /// Total file size in bytes.
