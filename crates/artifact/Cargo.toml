@@ -19,6 +19,15 @@ cuda = []
 memmap2 = { workspace = true }
 serde_json = { workspace = true }
 
+# The frontend extraction (artifact-02) parses the container-carried
+# `frontend/tokenizer.json` (the HuggingFace `tokenizers` format) and
+# renders `frontend/chat_template.jinja` (a Jinja template). Both are
+# pure-Rust, CPU-only, and idiomatic for their formats.
+tokenizers = "0.21"
+# The `json` feature (not a minijinja default) provides the `tojson`
+# filter the container chat template uses for tool definitions.
+minijinja = { version = "2", features = ["json"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 

@@ -24,6 +24,7 @@ pub mod binding;
 pub mod binder;
 pub mod device;
 pub mod fixture;
+pub mod frontend;
 pub mod materializer;
 
 /// FFI declarations for the kernel leaf's device surface (feature `cuda`
@@ -38,6 +39,10 @@ pub use binder::{
 pub use device::{CpuDevice, Device, DeviceBuffer};
 #[cfg(feature = "cuda")]
 pub use device::CudaDevice;
+pub use frontend::{
+    ChatMessage, ChatTemplate, ContentPart, FRONTEND_RESOURCES, FrontendSet, MessageContent,
+    Role, ToolCall, Tokenizer,
+};
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
 
 // ---------------------------------------------------------------------------
