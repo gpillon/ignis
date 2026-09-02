@@ -50,7 +50,7 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-05 … core-07, then server-01/02, then artifact-02/03.
+**Next up:** core-06 … core-07, then server-01/02, then artifact-02/03.
 core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
 scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
 *deferred* on core-04 — the **GPU-saturation measurement** of batched
@@ -59,6 +59,19 @@ on the GPU, ADR 0006 exclusive-GPU rule) — now sits with the bench harness
 (bench-01/02, GitHub #19/#20); it runs once the harness `HttpEndpoint` +
 a reference baseline are in place. Only the kernel-abi CUDA implementation
 + the 99% gate need the GPU (ADR 0006/0007).
+
+core-05 is **resolved** (2026-09-02, GitHub #16 closed): the full
+admission state machine (ADR 0004) is committed (e582621) — `admission.rs`
+(pure Rust port of the reference policy: protection freeze, donor-prefix
+selection, persistent-vs-temporal backfill, temporal-credit decay,
+frontier distance, retained-lane victim policy) wired into
+`ConcreteScheduler` as the lane-deal driver, plus the KV resource
+dimension (per-request page reservation, over-reservation charged at
+deal, `Oversized` rejection, hard-cap completion). 11 unit tests +
+4 end-to-end scenarios (`admission_machine.rs`), CPU-tested (ADR 0006),
+workspace `cargo test` green. The protection's **Drain** phase is
+unreachable in v1's resource model (documented in the ticket +
+`admission_machine.rs`); it ships for reference fidelity only.
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
