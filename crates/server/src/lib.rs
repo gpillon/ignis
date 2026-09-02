@@ -19,6 +19,7 @@
 //! wires the kernel-leaf adapter when it lands.
 
 pub mod api;
+pub mod artifact_template;
 pub mod engine;
 pub mod template;
 
@@ -53,6 +54,19 @@ impl Server {
             template: std::sync::Arc::from(template),
             request_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// A server over `engine`'s scheduler with the artifact's real
+    /// tokenizer + chat template (the [`FrontendSet`] extracted by
+    /// artifact-02, GitHub #7) in place of the built-in placeholder: the
+    /// conversation is templated by the container's chat template and
+    /// tokenized by the container's HuggingFace tokenizer
+    /// (`artifact_template.rs`).
+    pub fn with_artifact_template(engine: Engine, frontend: ignis_artifact::FrontendSet) -> Self {
+        Self::new(
+            engine,
+            Box::new(artifact_template::ArtifactTemplateProvider::new(frontend)),
+        )
     }
 
     /// Set the non-streaming completion timeout (test knob; the default is

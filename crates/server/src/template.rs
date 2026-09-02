@@ -6,14 +6,15 @@
 //! prompt tokens the scheduler consumes) and renders the generated tokens
 //! back into the `content` / `text` fields of the responses.
 //!
-//! v1 ships a **minimal built-in provider** ([`SimpleTemplateProvider`]): a
-//! deterministic, tokenizer-free stand-in so the endpoints are fully
+//! v1 ships a **minimal built-in provider** ([`SimpleTemplateProvider`]):
+//! a deterministic, tokenizer-free stand-in so the endpoints stay fully
 //! functional and testable without the artifact's frontend object set.
-//! **artifact-02** (frontend extraction, GitHub #7) replaces this with the
-//! real tokenizer + chat template read from the `.ninfer` artifact — same
-//! seam, injected through the [`crate::Server`] constructor. Until then the
-//! rendered text is the token id-space (a decimal id per token), not
-//! human language; clients of a dev build should not treat `content` as
+//! The artifact's real tokenizer + chat template (artifact-02, GitHub
+//! #7) plug into the same seam through the [`crate::artifact_template`]
+//! module (`Server::with_artifact_template`). When no artifact is
+//! available the built-in placeholder is used instead, and its rendered
+//! text is the token id-space (a decimal id per token), not human
+//! language; clients of a dev build should not treat `content` as
 //! natural text.
 
 use ignis_core::TokenId;

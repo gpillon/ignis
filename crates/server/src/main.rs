@@ -20,9 +20,13 @@
 //!   `GET /v1/models` reports and what submissions must name).
 //! - `IGNIS_BIND` — the bind address (default `127.0.0.1:8000`;
 //!   localhost-only by design — no network exposure, no auth, v1).
+//! - `IGNIS_ARTIFACT` — the `.ninfer` container path (the real tokenizer
+//!   and chat template, artifact-02); unset = the built-in placeholder
+//!   template (its rendered `content` is not natural text).
 
 use std::sync::Arc;
 
+use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::{
     mock::MockCompute,
     ConcreteScheduler, SchedulerConfig,
@@ -62,13 +66,30 @@ async fn main() {
         compute,
     );
 
-    // The template seam: the built-in provider for now; artifact-02
-    // (the artifact's frontend object set, GitHub #7) swaps in the
-    // artifact-backed tokenizer through the same `Server::new` injection.
-    let server = Server::new(
-        Engine::new(Box::new(scheduler)),
-        Box::new(SimpleTemplateProvider),
-    );
+    // The template seam (artifact-02 wiring, GitHub #7 follow-up): the
+    // `.ninfer` container named by `IGNIS_ARTIFACT` carries the real
+    // tokenizer + chat template. Without a usable artifact the server
+    // falls back to the built-in placeholder (its rendered `content` is
+    // the token id-space, not natural text).
+    let artifact = env("IGNIS_ARTIFACT", "");
+    let engine = Engine::new(Box::new(scheduler));
+    let server = if artifact.is_empty() {
+        eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text)");
+        Server::new(engine, Box::new(SimpleTemplateProvider))
+    } else {
+        match Reader::open(std::path::Path::new(&artifact)).and_then(|reader| {
+            FrontendSet::from_reader(&reader)
+        }) {
+            Ok(frontend) => {
+                eprintln!("ignis-server: tokenizer + chat template from {artifact}");
+                Server::with_artifact_template(engine, frontend)
+            }
+            Err(err) => {
+                eprintln!("ignis-server: {artifact}: {err} — placeholder template (content is not natural text)");
+                Server::new(engine, Box::new(SimpleTemplateProvider))
+            }
+        }
+    };
 
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the
