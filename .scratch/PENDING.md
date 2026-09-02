@@ -50,13 +50,26 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** server-02 (telemetry, #15) — launched once the server-01
-follow-up wiring (217a0bd) landed. In flight (background agents,
-2026-09-02): bench-01 (HttpEndpoint transport + trace replay, #19,
-`crates/bench`) and artifact-03 (tensor checksum vs sidecars, #8,
-`crates/artifact`); the coordinator integrates each on report
-(verify + close-out), then bench-02 once a reference baseline is
-recorded.
+**Next up:** server-02 (telemetry, #15) — in flight (background agent,
+`crates/server`); the coordinator integrates on report (verify +
+close-out). In flight: artifact-03 (tensor checksum vs sidecars, #8,
+`crates/artifact`). In flight → then bench-02 (recorded reference
+baseline + 99% gate, GPU) once a reference recording exists.
+
+bench-01 is **resolved** (2026-09-02, GitHub #19 closed): the
+`HttpEndpoint` transport is committed (968a2c1) — a `reqwest` 0.21
+blocking client (one shared `Client`, `Send + Sync` for the existing
+`Endpoint` seam) driving `POST /v1/chat/completions` (SSE per-token
+timing for streaming trace lines; non-streaming bodies where ttft ==
+total) + a `GET /v1/models` readiness probe, with the "1 main + N
+subagents" load reusing the existing bounded-concurrency `replay`
+driver. CPU-only, in-process tests (axum mock engine on a random local
+port): 37/37 `ignis-bench` green, asserting per-request ttft > 0 /
+tok_s > 0 and the driver's concurrency bound. No recorded trace existed
+in the repo, so the fixture is a documented synthetic
+`main_plus_10.jsonl` (realistic load shape, **not** a reference
+recording — the ADR 0007 99% gate still needs a recorded reference
+run; that is bench-02, GPU-driven).
 core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
 scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
 *deferred* on core-04 — the **GPU-saturation measurement** of batched
