@@ -17,3 +17,8 @@ See `docs/agents/triage-labels.md`.
 
 Single-context — root `CONTEXT.md` for the glossary, `docs/adr/` for ADRs.
 See `docs/agents/domain.md`.
+
+### Testing
+
+Every code change ships with a test, and the task is not complete until
+`cargo test` passes workspace-wide. See `docs/agents/testing.md`.
