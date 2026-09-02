@@ -15,3 +15,6 @@ _bench_logs/
 # python
 __pycache__/
 *.pyc
+
+# local agent state
+.qwen/
