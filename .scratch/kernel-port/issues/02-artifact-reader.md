@@ -1,6 +1,6 @@
 # 02 — artifact reader port
 
-Status: in progress
+Status: resolved (commit f941ef3; GitHub #2 closed 2026-09-02)
 
 Port the reference stack's `src/artifact/*` module (reader, binder,
 materializer, storage layouts) into `ignis-artifact`:

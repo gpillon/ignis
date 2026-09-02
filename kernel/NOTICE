@@ -12,3 +12,32 @@ Copied `.cu`/`.cuh` files carry the upstream lineage's license terms; upstream
 repo license headers are preserved where present. This project reuses that code
 by explicit decision (grilling session, 2026-09-02) and keeps the provenance
 recorded here so it is never silently dropped.
+
+## Per-file provenance
+
+### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)
+NVFP4 decode GEMM (GEMV path). Adapted from the reference
+`ops/linear/nvfp4/nvfp4_gemv.cuh` (plus the `nvfp4_codec.cuh` E2M1/E4M3
+decode helpers and the `nvfp4_output.cuh` epilogue). The reference kernel is a
+warp-MMA, shared-staged rowsplit machine templated on a per-shape
+Geometry/Schedule and driven by the engine's Tensor/Weight dispatch. That
+dispatch layer is C++ state, which the flat C ABI of ADR 0001 forbids across
+the boundary, so it is not ported. The NVFP4 math (E2M1 codes, per-group-16
+E4M3 scales, group-scaled dot) and the code/scale plane layouts ARE ported
+1:1; the tensor-core micro-optimization is deferred to the parity-gate
+ticket. Self-contained; compiles standalone in the leaf.
+
+### `kernel/src/gqa_attention_decode.cuh` (ticket 03)
+GQA attention decode (single token, paged bf16 KV cache). Adapted from the
+reference `ops/kernel/gqa_attention_decode_bf16.cuh` (plus
+`ops/kernel/paged_kv_address.cuh` paged addressing and
+`ops/kernel/softmax.cuh` online softmax). PDL (Programmatic Dependent Launch)
+is stripped in favor of plain `<<<>>>` launches; the paged KV addressing and
+online-softmax math are ported 1:1.
+
+### `kernel/src/decode_surface.cu` (ticket 03)
+The flat C ABI decode-step wrapper (ADR 0001): `extern "C"` functions
+(`ignis_nvfp4_gemm_decode`, `ignis_gqa_attention_decode`) that take explicit
+host pointers + sizes + a stream handle and launch the two ported kernels.
+There is no reference equivalent (the reference's driver was the engine's
+Tensor/Weight dispatch); this is the new C ABI surface for the decode step.
