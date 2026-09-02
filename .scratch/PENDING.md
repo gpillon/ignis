@@ -50,18 +50,15 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** core-04 remainder — the **concrete N=8 scheduler + the
-`MockCompute`** are done and CPU-tested (this session): `ConcreteScheduler`
-(N=8 resident lanes, batched prefill in one compute call, batched decode,
-class-priority + FIFO lane deal, in-flight cap = N_DECODE_LANES until the
-host tier, ADR 0004 basic admission) + a deterministic, recording
-`MockCompute` behind the `Compute` seam (ADR 0006), with `DecodeParams`
-carried on the prefill/decode jobs. What remains on core-04 is the
-**GPU-saturation measurement** of batched prefill (a measure, not a
-guarantee — ADR 0007 re-gates it via the 99% gate on the GPU, ADR 0006
-exclusive-GPU rule), then core-05 … core-07, then server-01/02, then
-artifact-02/03. Only the kernel-abi CUDA implementation + the 99% gate need
-the GPU (ADR 0006/0007).
+**Next up:** core-05 … core-07, then server-01/02, then artifact-02/03.
+core-04 is **resolved** (2026-09-02, GitHub #13 closed): the concrete N=8
+scheduler + `MockCompute` are committed (32cb738) and CPU-tested. What was
+*deferred* on core-04 — the **GPU-saturation measurement** of batched
+prefill (a measure, not a guarantee — ADR 0007 re-gates it via the 99% gate
+on the GPU, ADR 0006 exclusive-GPU rule) — now sits with the bench harness
+(bench-01/02, GitHub #19/#20); it runs once the harness `HttpEndpoint` +
+a reference baseline are in place. Only the kernel-abi CUDA implementation
++ the 99% gate need the GPU (ADR 0006/0007).
 
 ## GPU-verification items (ADR 0006: exclusive GPU testing)
 
