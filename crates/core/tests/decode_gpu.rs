@@ -3,13 +3,12 @@
 //! These launch the two decode C ABI functions (NVFP4 GEMM + GQA attention) on
 //! the RTX 5090 with small *synthetic* inputs (no model weights) and compare
 //! the kernel output against a CPU reference computed in Rust. They are gated:
-//! `#[ignore]` by default (ADR 0006 — the GPU is occupied by ninfer-serve), and
-//! they also self-skip (treat a non-zero return as "GPU busy, skip") so a busy
-//! GPU never turns the suite red.
+//! `#[ignore]` by default, and they also self-skip (treat a non-zero return as
+//! "GPU busy, skip") so a busy GPU never turns the suite red.
 //!
-//! Revisit once the GPU is free and the canonical `kernel/build/ignis_kernel.lib`
-//! has been rebuilt with the ticket-03 symbols (kernel/src/decode_surface.cu).
-//! Run with: `cargo test -p ignis-core --test decode_gpu -- --ignored`.
+//! They fit in a few MB of VRAM, so they can run even with the model loaded
+//! (the ADR 0006 nuance). Run with:
+//! `cargo test -p ignis-core --test decode_gpu -- --ignored`.
 //!
 //! Build precondition: this test links the kernel .lib, so it only builds once
 //! `ignis-artifact` compiles (a different ticket) AND the canonical
@@ -228,7 +227,7 @@ fn skip_if_busy(rc: i32, what: &str) -> bool {
 }
 
 #[test]
-#[ignore = "GPU launch test — run once the 5090 is free (ADR 0006): -- --ignored"]
+#[ignore = "GPU launch test — a few MB of VRAM, runs even with the model loaded (ADR 0006 nuance): -- --ignored"]
 fn nvfp4_gemm_decode_gpu() {
     let (x, wt_codes, wt_scales, bias, m, k) = synthetic_gemm();
     let x_bf16 = to_bf16(&x);
@@ -259,7 +258,7 @@ fn nvfp4_gemm_decode_gpu() {
 }
 
 #[test]
-#[ignore = "GPU launch test — run once the 5090 is free (ADR 0006): -- --ignored"]
+#[ignore = "GPU launch test — a few MB of VRAM, runs even with the model loaded (ADR 0006 nuance): -- --ignored"]
 fn gqa_attention_decode_gpu() {
     let (q, kv, block_table, nq, nkv, hd, seq, bs, nb, scale) = synthetic_gqa();
     let q_bf16 = to_bf16(&q);

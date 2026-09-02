@@ -35,15 +35,6 @@ namespace ignis {
 //                  + head_dim * block_offset + d
 // i.e. [physical_page][kv_head][block_offset][d] with d fastest. `page` is a
 // physical page id taken from the block table (logical block -> physical page).
-inline std::int64_t paged_kv_element_offset_host(std::int64_t head_dim, std::int64_t num_kv_heads,
-                                                 std::int64_t block_size, int physical_page,
-                                                 int kv_head, int block_offset, int d) {
-  return head_dim * block_size *
-             (static_cast<std::int64_t>(kv_head) +
-              static_cast<std::int64_t>(num_kv_heads) * physical_page) +
-         static_cast<std::int64_t>(head_dim) * block_offset + d;
-}
-
 __device__ __forceinline__ std::int64_t paged_kv_element_offset(std::int64_t head_dim,
                                                                 std::int64_t num_kv_heads,
                                                                 std::int64_t block_size,

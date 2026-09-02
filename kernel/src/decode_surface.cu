@@ -96,6 +96,7 @@ extern "C" int ignis_gqa_attention_decode(const void* q, const void* kv_cache,
   // [num_q_heads][head_dim].
   if (num_q_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || block_size <= 0 ||
       num_blocks <= 0 || seq_len <= 0 || (num_q_heads % num_kv_heads) != 0 ||
+      seq_len > num_blocks * block_size ||
       out == nullptr) {
     return -1;
   }

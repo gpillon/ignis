@@ -7,9 +7,11 @@
 //!
 //! The formulas mirror the reference (ninfer) index math:
 //!   - `paged_kv_element_offset` : ops/kernel/paged_kv_address.cuh
-//!   - `nvfp4_scale_offset`      : ops/linear/nvfp4/nvfp4_codec.cuh
 //!   - E2M1 / E4M3 decode        : ops/linear/nvfp4/nvfp4_codec.cuh
 //!   - GQA head grouping          : ops/kernel/gqa_attention_geometry.cuh
+//! The NVFP4 scale-plane layout is the one deliberate exception: the leaf GEMV
+//! consumes a plain row-major [m][k/16] scale plane (the reference's swizzled
+//! tile layout was not ported — see kernel/src/nvfp4_gemm_decode.cuh).
 //!
 //! The leaf kernels (kernel/src/nvfp4_gemm_decode.cuh,
 //! kernel/src/gqa_attention_decode.cuh) use these same formulas, so these tests
@@ -32,21 +34,14 @@ fn paged_kv_element_offset(
         + d as i64
 }
 
-/// 1:1 with the reference `ops/linear/nvfp4/nvfp4_codec.cuh::nvfp4_scale_offset`.
-/// Blockscale-K16 scale-plane addressing shared by every reader of an NVFP4
-/// weight: group `g` of parent row `p` maps to a position in a 512-element
-/// scale tile (the E4M3 group-scale plane), swizzled by 32-row quartiles.
-fn nvfp4_scale_offset(parent_row: i32, group: i32, scale_tiles_per_row: i32) -> i64 {
-    let m_tile = parent_row / 128;
-    let row_inner = parent_row - m_tile * 128;
-    let scale_tile = group / 4;
-    let scale_lane = group & 3;
-    let row_mod32 = row_inner & 31;
-    let row_quartile = row_inner >> 5;
-    (m_tile as i64 * scale_tiles_per_row as i64 + scale_tile as i64) * 512
-        + row_mod32 as i64 * 16
-        + row_quartile as i64 * 4
-        + scale_lane as i64
+/// 1:1 with kernel/src/nvfp4_gemm_decode.cuh::`nvfp4_gemm_decode_kernel` scale
+/// addressing. The leaf GEMV consumes a plain row-major E4M3 scale plane
+/// [m][k/16] (one byte per 16-element group): group `g` of parent row `p`
+/// lives at `p * groups_per_row + g`. (The reference's swizzled 512-element
+/// tile layout was not ported — it belongs to the stripped dispatch layer,
+/// see the provenance block in kernel/src/nvfp4_gemm_decode.cuh.)
+fn nvfp4_scale_offset_row_major(parent_row: i32, group: i32, groups_per_row: i32) -> i64 {
+    parent_row as i64 * groups_per_row as i64 + group as i64
 }
 
 /// 1:1 with kernel/src/nvfp4_gemm_decode.cuh::`decode_nvfp4_e2m1`.
@@ -105,18 +100,17 @@ fn paged_kv_offset_matches_reference_layout() {
 }
 
 #[test]
-fn nvfp4_scale_offset_matches_reference_layout() {
-    // A 5120-input problem has scale_tiles_per_row = 5120/64 = 80.
+fn nvfp4_scale_offset_matches_kernel_layout() {
+    // k = 5120 -> groups_per_row = k/16 = 320 (one E4M3 scale byte per 16).
+    let groups_per_row: i32 = 5120 / 16;
     // (parent_row 0, group 0) is the origin of the scale plane.
-    assert_eq!(nvfp4_scale_offset(0, 0, 80), 0);
-    // group 4 -> scale_tile 1 (lane 0) -> one 512-element tile.
-    assert_eq!(nvfp4_scale_offset(0, 4, 80), 512);
-    // parent_row 1 -> row_mod32 1 -> +16 within the tile.
-    assert_eq!(nvfp4_scale_offset(1, 0, 80), 16);
-    // parent_row 32 -> row_quartile 1, row_mod32 0 -> +4.
-    assert_eq!(nvfp4_scale_offset(32, 0, 80), 4);
-    // parent_row 128 -> m_tile 1 -> one full row (80 tiles * 512).
-    assert_eq!(nvfp4_scale_offset(128, 0, 80), 80 * 512);
+    assert_eq!(nvfp4_scale_offset_row_major(0, 0, groups_per_row), 0);
+    // row 1, group 0 -> one full row (k/16 scale bytes per row).
+    assert_eq!(nvfp4_scale_offset_row_major(1, 0, groups_per_row), 320);
+    // row 1, group 3 -> one row + 3 groups.
+    assert_eq!(nvfp4_scale_offset_row_major(1, 3, groups_per_row), 323);
+    // row 4, group 319 (last group of row 4) -> 4*320 + 319.
+    assert_eq!(nvfp4_scale_offset_row_major(4, 319, groups_per_row), 4 * 320 + 319);
 }
 
 #[test]

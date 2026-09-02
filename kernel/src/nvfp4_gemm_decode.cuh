@@ -7,10 +7,12 @@
  * on a per-shape Geometry/Schedule and driven by the engine's Tensor/Weight
  * dispatch. That dispatch layer is C++ state, which the flat C ABI of ADR 0001
  * forbids across the boundary, so it is not ported. The NVFP4 math (E2M1 codes,
- * per-group-16 E4M3 scales, group-scaled dot) and the code/scale plane layouts
- * ARE ported 1:1; the tensor-core micro-optimization is deferred (parity-gate
- * ticket), so this is a faithful, self-contained decode GEMV that compiles
- * standalone in the leaf.
+ * per-group-16 E4M3 scales, group-scaled dot product) is ported 1:1; the
+ * code/scale plane layouts are simplified to plain row-major [m][k/2] and
+ * [m][k/16] (the reference's swizzled 512-element tile layouts belong to the
+ * stripped dispatch layer); the tensor-core micro-optimization is deferred
+ * (parity-gate ticket). This is a faithful, self-contained decode GEMV that
+ * compiles standalone in the leaf.
  *
  * Device-only header. Instantiated by decode_surface.cu.
  */
