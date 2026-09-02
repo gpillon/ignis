@@ -13,9 +13,10 @@
  * compiles standalone in the leaf.
  *
  * KV layout: `kv_cache` is a single buffer of TWO paged planes (K first, V
- * second), each paged as [num_blocks][block_size][num_kv_heads][head_dim]
- * (d fastest). The V plane starts `num_blocks*block_size*num_kv_heads*
- * head_dim` bf16 elements after the K plane base.
+ * second), each paged as [num_blocks][num_kv_heads][block_size][head_dim]
+ * (kv_head-major within a page; head_dim fastest). The V plane starts
+ * `num_blocks*num_kv_heads*block_size*head_dim` bf16 elements after the K
+ * plane base.
  *
  * Device-only header. Instantiated by decode_surface.cu.
  */

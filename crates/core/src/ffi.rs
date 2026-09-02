@@ -44,7 +44,8 @@ unsafe extern "C" {
 
     /// GQA attention decode (single token, paged bf16 KV cache).
     /// `q`: bf16 [num_q_heads][head_dim]. `kv_cache`: bf16, two paged planes (K
-    /// then V), each [num_blocks][block_size][num_kv_heads][head_dim].
+    /// then V), each [num_blocks][num_kv_heads][block_size][head_dim]
+    /// (kv_head-major within a page; head_dim fastest).
     /// `block_table`: i32 [num_blocks] (logical block -> physical page id).
     /// `out`: bf16 [num_q_heads][head_dim]. `seq_len` <= num_blocks*block_size.
     /// `stream`: null = stream 0. Returns 0 on success, -1 on error.
@@ -68,17 +69,20 @@ unsafe extern "C" {
     // path, and eager CUDA-graph capture. Mirrors
     // `kernel/include/ignis_kernel.h` 1:1.
     //
-    // NOTE (GPU-blocked, ADR 0006): these surface declarations + geometry
-    // are CPU-verifiable; the CUDA kernel implementations (.cu) and the GPU
-    // verification (the 99% performance gate, ADR 0007) are pending the GPU
-    // (the RTX 5090 is held by the reference runner). No test below calls
-    // these symbols, so the build stays linkable without them.
+    // NOTE (ADR 0006 / 0007): these surface declarations + geometry are
+    // CPU-verifiable. The ticket-05 kernels (GQA prefill + GDN step) are now
+    // implemented (kernel/src/gqa_attention_prefill.cuh, gdn_step.cuh,
+    // prefill_gdn_surface.cu) and GPU-verified (tests/kernel_abi01_gpu launches
+    // them on the GPU even with the model loaded, ADR 0006 nuance). The
+    // pointwise/output (06) and CUDA-graph (10) .cu, and the 99% performance
+    // gate (ADR 0007) driven by ignis-bench, remain pending.
     // ------------------------------------------------------------------
 
     /// GQA prefill attention (batched, multi-token), the prefill path.
     /// `q`: bf16 [batch][seq_len][num_q_heads][head_dim]. `kv_cache`: bf16,
-    /// two paged planes (K then V), each [batch][num_blocks][block_size]
-    /// [num_kv_heads][head_dim]. `block_table`: i32 [batch][num_blocks].
+    /// two paged planes (K then V), each [batch][num_blocks][num_kv_heads]
+    /// [block_size][head_dim] (kv_head-major within a page; head_dim fastest).
+    /// `block_table`: i32 [batch][num_blocks].
     /// `out`: bf16 [batch][seq_len][num_q_heads][head_dim]. `seq_len` <=
     /// num_blocks*block_size. `softmax_scale` <= 0 selects 1/sqrt(head_dim).
     /// `stream`: null = stream 0. Returns 0 on success, -1 on error.
@@ -197,8 +201,9 @@ mod tests {
     // CPU-verifiable geometry for the kernel-abi C-ABI surface (tickets
     // 05/06/10). Pure Rust, no FFI calls — these pin the expected output
     // sizes for the flat-C-ABI kernels so the contract is testable on CPU.
-    // The CUDA kernel implementations + GPU verification (the 99% gate,
-    // ADR 0007) are pending the GPU (ADR 0006).
+    // The ticket-05 .cu (prefill + GDN step) are now implemented and
+    // GPU-verified (tests/kernel_abi01_gpu); the 99% performance gate
+    // (ADR 0007) driven by ignis-bench remains pending.
     // -------------------------------------------------------------------------
 
     /// GQA prefill output element count: `[batch][seq_len][num_q_heads][head_dim]`.

@@ -41,3 +41,47 @@ The flat C ABI decode-step wrapper (ADR 0001): `extern "C"` functions
 host pointers + sizes + a stream handle and launch the two ported kernels.
 There is no reference equivalent (the reference's driver was the engine's
 Tensor/Weight dispatch); this is the new C ABI surface for the decode step.
+
+### `kernel/src/gqa_attention_prefill.cuh` (ticket 05, kernel-abi-01)
+GQA prefill attention (batched, multi-token). Adapted from the reference causal
+GQA prefill `ops/kernel/gqa_attention_prefill_bf16.cuh` (shared scaffolding in
+`gqa_attention_prefill_common.cuh`, paged addressing in
+`ops/kernel/paged_kv_address.cuh`). The reference kernel is a tensor-core
+FlashAttention-2 forward (cp.async K/V staging, m16n8k16 MMA, online-softmax
+in exp2, the hq-e8-2b rotated-frame variant) templated on the engine's
+Geometry/Metadata dispatch. That dispatch layer is C++ state, which the flat C
+ABI of ADR 0001 forbids across the boundary, so it is not ported; the
+tensor-core micro-optimization is likewise deferred to the performance gate
+(ADR 0007). The bottom-right causal mask, the paged-KV element-offset math
+(paged_kv_element_offset, shared with ticket 03) and the online-softmax
+(value-weighted running max/sum) are ported 1:1; this is a faithful,
+self-contained (non-tensor-core) causal prefill that compiles standalone in
+the leaf. The batched layout (K plane per batch, V plane following all
+batches' K) is the 1:1 extension of the ticket-03 single-batch paged layout.
+
+### `kernel/src/gdn_step.cuh` (ticket 05, kernel-abi-01)
+GDN (Gated DeltaNet / Gated Delta Rule) linear-attention step, batched.
+Adapted from the reference recurrent transition
+`ops/linear_attention/gated_delta_net/recurrent.cuh` (apply_gdn_transition;
+the fp32-state invariant in core/linear_attention_state.cpp, the 128-dim
+state / chunk constants in gated_delta_net/common.h). The reference kernel is
+a warp-tiled FP32-state machine driven by the engine's per-layer GEMM/Geometry
+dispatch (separate q/k/v/g/beta tensors, slot-indexed state pool, a
+1/sqrt(128) readout). That dispatch layer is C++ state, which the flat C ABI
+of ADR 0001 forbids across the boundary, so it is not ported; the readout is
+out of the step's contract (the ABI updates the state, it does not emit a
+readout). The core recurrence -- the gated delta rule
+`S <- alpha*S + beta*(v - alpha*S^T k) outer k^T, alpha = exp(g)` -- is ported
+1:1; the state is carried as bf16 in/out per the ABI contract (the full
+FP32-state pool is a later precision/perf gate) with fp32 internal math. The
+flat ABI's single `x` feature is decomposed (k, v, g, beta) as documented in
+the header, and shared across the GDN layers of a batch.
+
+### `kernel/src/prefill_gdn_surface.cu` (ticket 05, kernel-abi-01)
+The flat C ABI prefill + GDN wrapper (ADR 0001): `extern "C"` functions
+(`ignis_gqa_attention_prefill`, `ignis_gdn_step`) that take explicit host
+pointers + sizes + a stream handle and launch the two ported kernels, with
+internal H2D/D2H copies and a 0/-1 int return code (the same style as
+ticket-03's decode surface). There is no reference equivalent (the reference's
+driver was the engine's op dispatch); this is the new C ABI surface for the
+prefill + GDN step.

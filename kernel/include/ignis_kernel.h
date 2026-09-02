@@ -44,8 +44,8 @@ int ignis_nvfp4_gemm_decode(const void *act, const void *wt_codes,
  *   out[h,d] = attention over seq_len keys for query head h,
  *   kv head = h / (num_q_heads / num_kv_heads).
  * q is bf16 [num_q_heads][head_dim]. kv_cache is bf16, TWO paged planes (K
- * first, V second), each laid out as [num_blocks][block_size][num_kv_heads]
- * [head_dim] (head_dim fastest). block_table is i32 [num_blocks], mapping a
+ * first, V second), each laid out as [num_blocks][num_kv_heads][block_size]
+ * [head_dim] (kv_head-major within a page; head_dim fastest). block_table is i32 [num_blocks], mapping a
  * logical block to its physical page id. out is bf16 [num_q_heads][head_dim].
  * seq_len must be <= num_blocks * block_size. softmax_scale is 1/sqrt(head_dim)
  * by convention (pass 0.0 to use the default). stream: null = stream 0.
@@ -67,18 +67,22 @@ int ignis_gqa_attention_decode(const void *q, const void *kv_cache,
  * boundary. All buffer pointers are host memory; the leaf does the H2D/D2H
  * copies internally.
  *
- * NOTE (GPU-blocked, ADR 0006): the C-ABI surface + geometry are declared
- * here (and mirrored in crates/core/src/ffi.rs) so the contract is pinned and
- * CPU-verifiable. The CUDA kernel implementations (.cu) and the GPU
- * verification (the 99% performance gate, ADR 0007) are pending the GPU —
- * the RTX 5090 is held by the reference runner.
+ * NOTE (ADR 0006 / 0007): the C-ABI surface + geometry are declared here (and
+ * mirrored in crates/core/src/ffi.rs) so the contract is pinned and
+ * CPU-verifiable. The ticket-05 kernels (GQA prefill + GDN step) are now
+ * implemented (kernel/src/gqa_attention_prefill.cuh, gdn_step.cuh,
+ * prefill_gdn_surface.cu) and GPU-verified (crates/core/tests/kernel_abi01_gpu
+ * launches them on the GPU even with the model loaded, ADR 0006 nuance). The
+ * pointwise/output (06) and CUDA-graph (10) .cu, and the 99% performance gate
+ * (ADR 0007) driven by ignis-bench, remain pending.
  * ------------------------------------------------------------------------ */
 
 /* Ticket 05 (kernel-abi-01): GQA prefill attention (batched, multi-token).
  * Attends a batch of queries over their sequences (the prefill path,
  * seq_len > 1). q is bf16 [batch][seq_len][num_q_heads][head_dim]. kv_cache
  * is bf16, two paged planes (K first, V second), each [batch][num_blocks]
- * [block_size][num_kv_heads][head_dim]. block_table is i32
+ * [num_kv_heads][block_size][head_dim] (kv_head-major within a page; head_dim
+ * fastest). block_table is i32
  * [batch][num_blocks] (logical block -> physical page). out is bf16
  * [batch][seq_len][num_q_heads][head_dim]. seq_len must be <=
  * num_blocks * block_size. softmax_scale <= 0 selects the default

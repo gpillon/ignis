@@ -91,7 +91,8 @@ extern "C" int ignis_gqa_attention_decode(const void* q, const void* kv_cache,
                                           float softmax_scale, void* stream) {
   // GQA decode attention, single token. q: bf16 [num_q_heads][head_dim].
   // kv_cache: bf16, two paged planes (K first, V second), each
-  // [num_blocks][block_size][num_kv_heads][head_dim]. block_table: i32
+  // [num_blocks][num_kv_heads][block_size][head_dim] (kv_head-major within a
+  // page; head_dim fastest). block_table: i32
   // [num_blocks], logical block -> physical page id. out: bf16
   // [num_q_heads][head_dim].
   if (num_q_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0 || block_size <= 0 ||
