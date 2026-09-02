@@ -50,10 +50,21 @@ tests in `ffi.rs` (independent literals), `KvPool::free` returns `bool`
 enforces the "Running ⇒ holds a lane" invariant, and `Scheduler::submit`
 carries the `RequestClass` (ADR 0004).
 
-**Next up:** server-02 (telemetry, #15) — in flight (background agent,
-`crates/server`); the coordinator integrates on report (verify +
-close-out). Then bench-02 (recorded reference baseline + 99% gate, GPU)
+**Next up:** bench-02 (recorded reference baseline + 99% gate, GPU)
 once a reference recording exists.
+
+**Follow-up (tracked, pending on core):** server-02's interval line
+stubs `prefilling` / `kv_used_pct` to 0 — the live counters are not on
+core's public API (the `Scheduler` trait exposes no stats accessor, so
+the engine's `Box<dyn Scheduler>` cannot reach `ConcreteScheduler`'s
+`kv_used_pages` / `host_tier` / request-state counts). Once core ships
+a `Scheduler::stats()` accessor (`waiting` / `prefilling` / `running` =
+counts by `RequestState`; `kv_used_pct` = `kv_used_pages / capacity *
+100`; `kv_evictions` = a cumulative counter at the evict/restore
+paths), the server's ready-made `IntervalStatsProvider` seam wires the
+live counters and the interval line becomes authoritative. A core
+follow-up (the user's territory) — the server side is already wired
+(`Engine::with_stats` + `IntervalStatsProvider`).
 
 **Follow-up (tracked, uncommitted):** making a sidecar checksum mismatch
 actually **fail the artifact load** — artifact-03's `checksum.rs`
@@ -63,6 +74,24 @@ nothing in the loader path calls `verify()` / `ChecksumReport::is_clean()`
 yet. The call site needs both the `Reader` and the sidecar in the
 engine/loader path (`crates/server` territory) — the natural next step
 for the server actor, after server-02.
+
+server-02 is **resolved** (2026-09-02, GitHub #15 closed): the JSONL
+telemetry is committed (992aea0) — a `Telemetry` emitter in
+`crates/server` (`telemetry.rs`) with injectable sink (null / memory /
+stdout / file via `IGNIS_TELEMETRY`) + injectable clock (a `FixedClock`
+keeps tests deterministic, ADR 0006), wired into the engine's
+`submit()` / `step()`: the `interval` line once per `Engine::step()`
+(driver tick), `request:admitted` on `Admitted`, `request:ttft` on the
+request's first `Token`, `request:done` on `Done` (`n` = total tokens,
+`tok_s` = n / elapsed_ms), `kv_evictions` bumped on `Evicted`; the sink
+is a lock-protected buffer (non-blocking on the request path). 9 new
+unit + 4 integration tests (line shapes, clock determinism, sink
+injection, no-deadlock under 4-thread concurrent `submit`/`step`);
+38/38 `ignis-server` green, clippy clean. `id` is the numeric
+`RequestId` (the §5 example's string id is not in the ticket); request
+lines uniformly carry `ms` / `n` / `tok_s` (the ticket's field set
+wins over the §5 example). `class` / `sibling_prefix_reused_tok`
+reserved for v1.1.
 
 artifact-03 is **resolved** (2026-09-02, GitHub #8 closed): the tensor
 checksum validation is committed (18043b3) — `Sidecar::load` (shared
