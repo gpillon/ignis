@@ -32,9 +32,16 @@ Per ADR 0006, GPU workloads only run while the GPU is free.
    whole-file read; CPU, no GPU needed). **Verified 2026-09-02** (13.7 s).
 5. **Ticket #3 — 99% performance gate acceptance (ADR 0007)**: single-step
    decode logits within 99% of the reference on the canary suite, driven by
-   `ignis-bench`. **Still blocked**: the GPU is no longer the blocker (free
-   since 2026-09-02); the blocker is the `ignis-bench` harness, which is
-   still a stub (bench-01/02, #19/#20 — not yet implemented).
+   `ignis-bench`. **Partially unblocked (2026-09-02):** the `ignis-bench`
+   harness core now exists — trace loader, per-class metrics (tok-s, ttft
+   percentiles), canary self-consistency (sane + greedy-deterministic),
+   performance report + 99% gate, and a bounded-concurrency replay driver +
+   CLI (all tested, workspace `cargo test` green). Still remaining:
+   - the `HttpEndpoint` transport is a **stub** — it needs the `ignis-server`
+     OpenAI endpoint (ticket #14) + an HTTP client dependency (bench-01, #19).
+   - a **recorded reference baseline** (trace JSONL + a reference run) to
+     compare against — ADR 0007 gates against the reference's *speed*, so a
+     reference recording is required before the gate can be evaluated.
 
 ## Hygiene / deferred (user's deliberate "zozzata" — do NOT fix unilaterally)
 
