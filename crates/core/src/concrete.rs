@@ -303,9 +303,12 @@ impl ConcreteScheduler {
         if self.fits(&self.requests[head]) {
             // The head fits: a plain deal (class priority + FIFO).
             self.try_admit(head, BackfillClass::None, events);
-            // `clear_protection_if_head`: once the protected head is
-            // dealt, its protection is cleared (the next blocked head
-            // opens a fresh epoch).
+            // `clear_protection_if_head`: when the protected head itself is
+            // the dealt queue-head, its protection is cleared (the next
+            // blocked head opens a fresh epoch). If a higher-priority
+            // request overtakes and the protected head is dealt in the
+            // trailing loop instead, the stale protection self-heals via
+            // `mark_done` when that request completes.
             let protected_head = self.protection.as_ref().map(|p| p.head_request_id);
             if protected_head == Some(self.requests[head].id) {
                 self.protection = None;
@@ -335,9 +338,12 @@ impl ConcreteScheduler {
                 ) {
                     Ok(p) => p,
                     Err(e) => {
-                        // Broken invariants are a bug, surfaced (not
-                        // swallowed): skip this step's backfill path,
-                        // the next advance retries the same step.
+                        // A broken invariant here is a caller bug (an
+                        // inconsistent active-set snapshot). Debug builds
+                        // trap on it; release builds skip this step's
+                        // backfill path — the step is retried on the next
+                        // advance and no invalid state is written, so the
+                        // machine stays consistent.
                         debug_assert!(false, "invalid protection frontier: {e}");
                         return;
                     }

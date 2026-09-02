@@ -98,7 +98,7 @@ pub enum RequestClass {
 /// A request is only admitted with a non-`None` class while a protection is
 /// active (the protected head is blocked by the active set): the class says
 /// *how* the request may use the donor's future capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackfillClass {
     /// Admitted without borrowing a protection's future — a normal lane
     /// deal (the head of a blocked queue, or any deal with no protection).

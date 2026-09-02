@@ -364,6 +364,11 @@ pub fn protected_head_safe_without_temporal(
 /// *temporal*: it exists only while an earlier-queued Interactive request
 /// has exact reusable state on the lane; reserved lanes are never victims,
 /// all other retained state remains reclaimable.
+///
+/// v1 ships this policy (and its unit tests) for ADR 0004 reference
+/// fidelity, but the concrete scheduler does **not** invoke it: retained
+/// lanes only exist once the KV-RAM host tier (core-06) can snapshot a
+/// lane to host RAM. The wiring lands with core-06.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedLaneCandidate {
     /// The lane holding the retained state.
@@ -375,7 +380,7 @@ pub struct RetainedLaneCandidate {
     pub use_tick: u64,
     /// Reserved for an earlier-queued Interactive request's exact
     /// reusable state — reserved lanes are not victims.
-    pub reserved_for_earlier_main: bool,
+    pub reserved_for_earlier_interactive: bool,
 }
 
 /// Lowest-value eligible retained state: Agent before Interactive, LRU
@@ -387,10 +392,10 @@ pub fn retained_lane_is_better_victim(
     candidate: &RetainedLaneCandidate,
     incumbent: &RetainedLaneCandidate,
 ) -> bool {
-    if candidate.reserved_for_earlier_main != incumbent.reserved_for_earlier_main {
-        return !candidate.reserved_for_earlier_main;
+    if candidate.reserved_for_earlier_interactive != incumbent.reserved_for_earlier_interactive {
+        return !candidate.reserved_for_earlier_interactive;
     }
-    if candidate.reserved_for_earlier_main {
+    if candidate.reserved_for_earlier_interactive {
         return false;
     }
     let priority = |owner: &RequestClass| match owner {
@@ -419,7 +424,7 @@ pub fn choose_retained_lane_victim(
 ) -> Option<LaneId> {
     let mut selected: Option<&RetainedLaneCandidate> = None;
     for candidate in candidates {
-        if candidate.reserved_for_earlier_main {
+        if candidate.reserved_for_earlier_interactive {
             continue;
         }
         match selected {
@@ -680,25 +685,25 @@ mod tests {
                 lane: 0,
                 owner: RequestClass::Interactive,
                 use_tick: 1,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
             RetainedLaneCandidate {
                 lane: 1,
                 owner: RequestClass::Agent,
                 use_tick: 9,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
             RetainedLaneCandidate {
                 lane: 2,
                 owner: RequestClass::Agent,
                 use_tick: 4,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
             RetainedLaneCandidate {
                 lane: 3,
                 owner: RequestClass::Agent,
                 use_tick: 6,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
         ];
         assert_eq!(
@@ -708,20 +713,20 @@ mod tests {
         );
         // Reserving a lane pins it: the victim moves to the next-eligible
         // Agent lane, in LRU order.
-        retained[2].reserved_for_earlier_main = true;
+        retained[2].reserved_for_earlier_interactive = true;
         assert_eq!(
             choose_retained_lane_victim(&retained),
             Some(3),
             "a reserved lane is not a victim"
         );
-        retained[3].reserved_for_earlier_main = true;
+        retained[3].reserved_for_earlier_interactive = true;
         assert_eq!(
             choose_retained_lane_victim(&retained),
             Some(1),
             "after the Agent reservations the last Agent lane is the victim"
         );
-        retained[1].reserved_for_earlier_main = true;
-        retained[0].reserved_for_earlier_main = true;
+        retained[1].reserved_for_earlier_interactive = true;
+        retained[0].reserved_for_earlier_interactive = true;
         assert_eq!(
             choose_retained_lane_victim(&retained),
             None,
@@ -736,13 +741,13 @@ mod tests {
                 lane: 5,
                 owner: RequestClass::Agent,
                 use_tick: 7,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
             RetainedLaneCandidate {
                 lane: 3,
                 owner: RequestClass::Agent,
                 use_tick: 7,
-                reserved_for_earlier_main: false,
+                reserved_for_earlier_interactive: false,
             },
         ];
         assert_eq!(
