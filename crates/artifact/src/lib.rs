@@ -64,12 +64,22 @@ impl std::fmt::Display for ArtifactError {
     }
 }
 
+impl ArtifactError {
+    /// Construct an error with a preformatted message (the error's
+    /// payload) — the public half of the crate's private `fail` helper,
+    /// for callers outside the crate (the server's loader path,
+    /// server-03, refuses a failed checksum report with one).
+    pub fn new(message: impl std::fmt::Display) -> Self {
+        Self(message.to_string())
+    }
+}
+
 impl std::error::Error for ArtifactError {}
 
 type Result<T> = std::result::Result<T, ArtifactError>;
 
 fn fail(message: impl std::fmt::Display) -> ArtifactError {
-    ArtifactError(message.to_string())
+    ArtifactError::new(message)
 }
 
 // ---------------------------------------------------------------------------

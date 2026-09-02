@@ -21,6 +21,7 @@
 pub mod api;
 pub mod artifact_template;
 pub mod engine;
+pub mod loader;
 pub mod telemetry;
 pub mod template;
 

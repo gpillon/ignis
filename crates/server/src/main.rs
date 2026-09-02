@@ -22,19 +22,22 @@
 //!   localhost-only by design — no network exposure, no auth, v1).
 //! - `IGNIS_ARTIFACT` — the `.ninfer` container path (the real tokenizer
 //!   and chat template, artifact-02); unset = the built-in placeholder
-//!   template (its rendered `content` is not natural text).
+//!   template (its rendered `content` is not natural text). A configured
+//!   artifact is loaded through the verified loader path (server-03):
+//!   its sidecar must be present and its checksum report clean, or the
+//!   server refuses to start (no silent fallback to the placeholder).
 //! - `IGNIS_TELEMETRY` — the telemetry JSONL sink path (server-02, design
 //!   §5): one compact line per event; unset = stdout.
 
 use std::sync::Arc;
 
-use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::{
     mock::MockCompute,
     ConcreteScheduler, SchedulerConfig,
 };
 use ignis_server::{
     engine::Engine,
+    loader,
     template::SimpleTemplateProvider,
     telemetry::{FileSink, StdoutSink, SystemClock, TelemetrySink},
     Server,
@@ -69,11 +72,13 @@ async fn main() {
         compute,
     );
 
-    // The template seam (artifact-02 wiring, GitHub #7 follow-up): the
-    // `.ninfer` container named by `IGNIS_ARTIFACT` carries the real
-    // tokenizer + chat template. Without a usable artifact the server
-    // falls back to the built-in placeholder (its rendered `content` is
-    // the token id-space, not natural text).
+    // The loader path (server-03, GitHub #21): the `.ninfer` container
+    // named by `IGNIS_ARTIFACT` is loaded through the verified loader —
+    // open the reader, load the sidecar (ADR 0002), verify the checksum
+    // report, and only then extract the frontend set. A missing sidecar
+    // or a report that is not clean is a load failure: serving a broken
+    // artifact would silently degrade to the placeholder, so the server
+    // refuses to start instead.
     let artifact = env("IGNIS_ARTIFACT", "");
     // The telemetry sink (server-02, design §5): a JSONL file named by
     // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
@@ -95,16 +100,22 @@ async fn main() {
         eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text)");
         Server::new(engine, Box::new(SimpleTemplateProvider))
     } else {
-        match Reader::open(std::path::Path::new(&artifact)).and_then(|reader| {
-            FrontendSet::from_reader(&reader)
-        }) {
+        let artifact_path = std::path::Path::new(&artifact);
+        let sidecar = match loader::find_sidecar(artifact_path) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("ignis-server: {artifact}: {err} — refusing to start");
+                std::process::exit(1);
+            }
+        };
+        match loader::load_artifact(artifact_path, &sidecar) {
             Ok(frontend) => {
-                eprintln!("ignis-server: tokenizer + chat template from {artifact}");
+                eprintln!("ignis-server: {artifact} verified (checksum clean) — tokenizer + chat template loaded");
                 Server::with_artifact_template(engine, frontend)
             }
             Err(err) => {
-                eprintln!("ignis-server: {artifact}: {err} — placeholder template (content is not natural text)");
-                Server::new(engine, Box::new(SimpleTemplateProvider))
+                eprintln!("ignis-server: {artifact}: {err} — refusing to start");
+                std::process::exit(1);
             }
         }
     };
