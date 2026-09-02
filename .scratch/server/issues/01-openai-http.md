@@ -1,7 +1,8 @@
 # 01 — OpenAI-compatible HTTP (models / chat / responses)
 
 Status: needs-triage
-Blocked by: core-04, artifact-02
+GitHub: #14
+Blocked by: #13 (core-04), #7 (artifact-02)
 
 OpenAI-compatible HTTP on **localhost, no auth, configurable bind**
 (`docs/design/ignis-v1.md` §1). Route requests into the core scheduler and

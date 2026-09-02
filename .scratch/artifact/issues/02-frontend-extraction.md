@@ -1,7 +1,8 @@
 # 02 — frontend object extraction (tokenizer + chat template)
 
 Status: needs-triage
-Blocked by: artifact-01
+GitHub: #7
+Blocked by: #4 (artifact-01)
 
 Extract and verify the **frontend object set** carried inside the artifact
 container (confirming the `docs/design/ignis-v1.md` §7 risk that the

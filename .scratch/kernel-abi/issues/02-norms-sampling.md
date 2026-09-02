@@ -1,7 +1,8 @@
 # 02 — norms / embeddings / sampling C ABI (greedy)
 
 Status: needs-triage
-Blocked by: kernel-port-03
+GitHub: #6
+Blocked by: #3 (kernel-port-03)
 
 `extern "C"` entry points in `kernel/include/` for the pointwise / output
 path: **RMSNorm / LayerNorm**, **embeddings**, and **greedy sampling**.

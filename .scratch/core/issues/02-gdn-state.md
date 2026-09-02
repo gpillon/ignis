@@ -1,7 +1,8 @@
 # 02 — GDN state management (resumable at frontier / checkpoint)
 
 Status: needs-triage
-Blocked by: core-01, kernel-abi-01
+GitHub: #11
+Blocked by: #9 (core-01), #5 (kernel-abi-01)
 
 GDN (linear-attention) state management in `ignis-core`
 (`docs/design/ignis-v1.md` §2, `CONTEXT.md` "GDN state"):

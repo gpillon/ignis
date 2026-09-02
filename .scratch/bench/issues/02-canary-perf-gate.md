@@ -1,8 +1,8 @@
 # 02 — canary suite + performance report + v1 gate (99%)
 
 Status: needs-triage
-Blocked by: bench-01 (and the full v1 set: core-05, core-07, server-02,
-kernel-abi-03)
+GitHub: #20
+Blocked by: #19 (bench-01) (and the full v1 set: #16 (core-05), #18 (core-07), #15 (server-02), #10 (kernel-abi-03))
 
 Run the **canary suite** (fixed, high-signal prompts) for divergence
 detection; produce the **performance report** (tok-s, ttft vs reference) +

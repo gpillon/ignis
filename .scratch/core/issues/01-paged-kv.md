@@ -1,7 +1,8 @@
 # 01 — paged KV cache + block table (VRAM)
 
 Status: needs-triage
-Blocked by: artifact-01
+GitHub: #9
+Blocked by: #4 (artifact-01)
 
 The paged KV cache (VRAM) + block table for `ignis-core`
 (`docs/design/ignis-v1.md` §2):

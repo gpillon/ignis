@@ -1,7 +1,8 @@
 # 02 — telemetry (JSONL events + interval lines)
 
 Status: needs-triage
-Blocked by: core-04
+GitHub: #15
+Blocked by: #13 (core-04)
 
 v1 telemetry (JSONL, `docs/design/ignis-v1.md` §5): one line per event, one
 line per interval.

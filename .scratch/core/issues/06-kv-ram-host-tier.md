@@ -1,7 +1,8 @@
 # 06 — KV-RAM host tier (probation / protected eviction)
 
 Status: needs-triage
-Blocked by: core-04
+GitHub: #17
+Blocked by: #13 (core-04)
 
 The **KV-RAM host tier** (`docs/design/ignis-v1.md` §2, `CONTEXT.md`
 "KV-RAM"):

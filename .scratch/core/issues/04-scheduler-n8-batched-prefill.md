@@ -1,7 +1,8 @@
 # 04 — scheduler: N=8 decode lanes + batched prefill
 
 Status: needs-triage
-Blocked by: core-03, kernel-abi-01
+GitHub: #13
+Blocked by: #12 (core-03), #5 (kernel-abi-01)
 
 The v1 scheduler (`docs/design/ignis-v1.md` §2):
 

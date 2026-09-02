@@ -1,6 +1,7 @@
 # 01 — binder + materializer (device materialization)
 
 Status: ready-for-agent
+GitHub: #4
 Blocked by: (none — the `.ninfer` reader is done, kernel-port 02)
 
 Port the reference's per-model **binder** (`binder.h`), **materializer**

@@ -1,7 +1,8 @@
 # 01 — trace replay harness (JSONL load trace)
 
 Status: needs-triage
-Blocked by: server-01
+GitHub: #19
+Blocked by: #14 (server-01)
 
 Re-send a recorded "1 main agent + N subagents" load trace (JSONL) against
 the running engine (`docs/design/ignis-v1.md` §4, §6). Drive the scheduler

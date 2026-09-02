@@ -1,7 +1,8 @@
 # 05 — full admission state machine
 
 Status: needs-triage
-Blocked by: core-04
+GitHub: #16
+Blocked by: #13 (core-04)
 
 The full **admission state machine** (`docs/design/ignis-v1.md` §2,
 `CONTEXT.md` "Admission state machine") — the fairness machinery that

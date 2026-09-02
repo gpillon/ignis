@@ -1,7 +1,8 @@
 # 03 — CUDA graph eager capture at startup
 
 Status: needs-triage
-Blocked by: kernel-abi-01, kernel-abi-02
+GitHub: #10
+Blocked by: #5 (kernel-abi-01), #6 (kernel-abi-02)
 
 Eager **CUDA graph capture** at startup (v1 decision; lazy capture = a later
 optimization, `docs/design/ignis-v1.md` §3). Capture the prefill + decode
