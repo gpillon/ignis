@@ -1,6 +1,6 @@
 # 01 — OpenAI-compatible HTTP (models / chat / responses)
 
-Status: needs-triage
+Status: resolved (commit 84ada6d, 2026-09-02; GitHub #14)
 GitHub: #14
 Blocked by: #13 (core-04), #7 (artifact-02)
 
@@ -13,6 +13,26 @@ stream tokens back:
   streaming); the chat template is applied from the artifact's frontend
   object set (`artifact-02`).
 - `POST /v1/responses` — the responses API.
+
+Delivered (commit 84ada6d): `crates/server` (axum 0.8 + tokio) —
+`Server` (engine + injected `TemplateProvider` + request timeout) with
+`app()`/`serve()`; `GET /v1/models`; `POST /v1/chat/completions`
+(streaming SSE `ChunkStream` + non-streaming); `POST /v1/responses`
+(non-streaming; `stream:true` → 400 in v1). The `Engine` drives the core
+`Scheduler` behind a `Mutex`: atomic `submit` + a driver loop that steps
+the scheduler and routes `SchedEvent`s into each request's unbounded
+stream. Review-caught bug fixed: a `Protected` (admission-batch) event
+early-returned, dropping `Token`/`Done` events later in the same batch —
+now skipped and pinned by a regression test. CPU-tested (ADR 0006):
+21/21 `ignis-server` tests green, workspace `cargo test` green.
+
+Note: the chat template currently runs through the built-in
+`SimpleTemplateProvider` behind the `TemplateProvider` seam — the real
+tokenizer + chat template are the artifact-02 frontend objects (#7);
+wiring them through the seam is tracked under #7. `/v1/responses`
+streaming is out of v1 scope (non-streaming only). The `Compute` backend
+is `MockCompute`; the kernel-leaf adapter replaces it via the same
+scheduler-constructor injection (ADR 0001/0006).
 
 ## Acceptance
 
