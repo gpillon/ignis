@@ -12,7 +12,8 @@
 //!   without a GPU (ADR 0006).
 
 use crate::types::{
-    ComputeError, LaneId, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError, TokenId,
+    ComputeError, DecodeParams, LaneId, RequestClass, RequestId, RequestInput, SchedEvent,
+    SubmitError, TokenId,
 };
 
 /// One prefill job handed to the compute backend (batched prefill groups
@@ -23,6 +24,9 @@ pub struct PrefillJob {
     pub request: RequestId,
     /// The prompt tokens to warm the KV for.
     pub tokens: Vec<TokenId>,
+    /// The request's generation parameters (carried so the backend can set
+    /// up the decode state; prefill only warms the KV).
+    pub params: DecodeParams,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -32,6 +36,9 @@ pub struct DecodeJob {
     pub request: RequestId,
     /// The resident lane it holds (used for KV block mapping).
     pub lane: LaneId,
+    /// The request's generation parameters (sampler setup, `max_tokens` /
+    /// EOS handling, fixed seed — ADR 0007).
+    pub params: DecodeParams,
 }
 
 /// The compute seam the scheduler drives for actual token generation.

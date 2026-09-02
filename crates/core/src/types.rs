@@ -129,7 +129,7 @@ impl std::fmt::Display for SubmitError {
 impl std::error::Error for SubmitError {}
 
 /// Errors from a compute step (prefill / decode) driven by the scheduler.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeError {
     /// The kernel leaf reported a CUDA / argument error (return code).
     Kernel(i32),

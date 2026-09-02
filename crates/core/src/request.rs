@@ -91,14 +91,15 @@ impl Request {
 }
 
 /// **Basic admission** (core-03): assign free decode lanes to `Prefilling`
-/// requests. Requests are ordered by class priority (Interactive before
-/// Agent — the derived `Ord` on [`RequestClass`]) then FIFO by request id.
-/// A `Prefilling` request that gets a lane transitions to `Running`.
-///
-/// Returns the number of lanes assigned. This is the *basic* lane assignment
-/// — the full admission state machine (protection, backfill, temporal credit,
-/// frontier distance) is core-05.
-pub fn basic_admission(requests: &mut [Request], free_lanes: &mut Vec<LaneId>) -> usize {
+/// requests, returning the (request, lane) pairs dealt, ordered by class
+/// priority (Interactive before Agent — the derived `Ord` on
+/// [`RequestClass`]) then FIFO by request id. The lane pool is consumed in
+/// the order the caller provides it (the concrete scheduler sorts it
+/// ascending so the deal order is deterministic).
+pub fn admit_candidates(
+    requests: &mut [Request],
+    free_lanes: &mut Vec<LaneId>,
+) -> Vec<(RequestId, LaneId)> {
     // Candidate requests: those that have finished prefill and need a lane.
     let mut pending: Vec<usize> = (0..requests.len())
         .filter(|&i| requests[i].state == RequestState::Prefilling)
@@ -106,15 +107,27 @@ pub fn basic_admission(requests: &mut [Request], free_lanes: &mut Vec<LaneId>) -
     // Class priority first (Interactive < Agent), then FIFO by id.
     pending.sort_by_key(|&i| (requests[i].class, requests[i].id));
 
-    let mut assigned = 0;
+    let mut dealt = Vec::new();
     for &i in &pending {
-        if let Some(lane) = free_lanes.pop() {
-            if requests[i].assign_lane(lane) {
-                assigned += 1;
-            }
+        if let Some(lane) = free_lanes.pop()
+            && requests[i].assign_lane(lane)
+        {
+            dealt.push((requests[i].id, lane));
         }
     }
-    assigned
+    dealt
+}
+
+/// **Basic admission** (core-03): assign free decode lanes to `Prefilling`
+/// requests. Requests are ordered by class priority (Interactive before
+/// Agent — the derived `Ord` on [`RequestClass`]) then FIFO by request id.
+/// A `Prefilling` request that gets a lane transitions to `Running`.
+///
+/// Returns the number of lanes assigned. This is the *basic* lane
+/// assignment — the full admission state machine (protection, backfill,
+/// temporal credit, frontier distance) is core-05.
+pub fn basic_admission(requests: &mut [Request], free_lanes: &mut Vec<LaneId>) -> usize {
+    admit_candidates(requests, free_lanes).len()
 }
 
 #[cfg(test)]

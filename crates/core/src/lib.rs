@@ -15,15 +15,19 @@
 //! state, request state machine, scheduler, KV-RAM host tier, prefix
 //! reuse) are implemented on top of this contract.
 
+pub mod concrete;
 pub mod ffi;
 pub mod gdn;
 pub mod kv;
+pub mod mock;
 pub mod request;
 pub mod scheduler;
 pub mod types;
 
+pub use concrete::{ConcreteScheduler, SchedulerConfig};
+pub use mock::MockCompute;
 pub use scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 pub use types::{
-    ComputeError, N_DECODE_LANES, RequestClass, RequestId, RequestInput, RequestState,
-    SchedEvent, SubmitError, TokenId,
+    ComputeError, EngineMode, N_DECODE_LANES, RequestClass, RequestId, RequestInput,
+    RequestState, SchedEvent, SubmitError, TokenId,
 };
