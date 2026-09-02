@@ -57,6 +57,95 @@ int ignis_gqa_attention_decode(const void *q, const void *kv_cache,
                                int64_t block_size, int64_t num_blocks,
                                float softmax_scale, void *stream);
 
+/* --------------------------------------------------------------------------
+ * kernel-abi (tickets 05/06/10): prefill + GDN, pointwise / output path, and
+ * eager CUDA-graph capture.
+ *
+ * Same flat-C-ABI conventions as the decode step above: explicit pointers +
+ * sizes, a stream handle (null = stream 0), and an int return code
+ * (0 = ok, -1 = CUDA error / invalid argument). No C++ types across the
+ * boundary. All buffer pointers are host memory; the leaf does the H2D/D2H
+ * copies internally.
+ *
+ * NOTE (GPU-blocked, ADR 0006): the C-ABI surface + geometry are declared
+ * here (and mirrored in crates/core/src/ffi.rs) so the contract is pinned and
+ * CPU-verifiable. The CUDA kernel implementations (.cu) and the GPU
+ * verification (the 99% performance gate, ADR 0007) are pending the GPU —
+ * the RTX 5090 is held by the reference runner.
+ * ------------------------------------------------------------------------ */
+
+/* Ticket 05 (kernel-abi-01): GQA prefill attention (batched, multi-token).
+ * Attends a batch of queries over their sequences (the prefill path,
+ * seq_len > 1). q is bf16 [batch][seq_len][num_q_heads][head_dim]. kv_cache
+ * is bf16, two paged planes (K first, V second), each [batch][num_blocks]
+ * [block_size][num_kv_heads][head_dim]. block_table is i32
+ * [batch][num_blocks] (logical block -> physical page). out is bf16
+ * [batch][seq_len][num_q_heads][head_dim]. seq_len must be <=
+ * num_blocks * block_size. softmax_scale <= 0 selects the default
+ * 1/sqrt(head_dim). stream: null = stream 0. Returns 0 on success, -1 on
+ * error. */
+int ignis_gqa_attention_prefill(const void *q, const void *kv_cache,
+                                const void *block_table, void *out,
+                                int64_t batch, int64_t seq_len,
+                                int64_t num_q_heads, int64_t num_kv_heads,
+                                int64_t head_dim, int64_t block_size,
+                                int64_t num_blocks, float softmax_scale,
+                                void *stream);
+
+/* Ticket 05 (kernel-abi-01): GDN (linear-attention) recurrent step, batched.
+ * Updates the per-request recurrent state of the linear-attention (GDN)
+ * layers. x is bf16 [batch][state_dim] (the current-step input feature).
+ * state_in / state_out are bf16
+ * [batch][num_gdn_layers][state_rows][state_cols] (the carried-forward
+ * recurrent state; state_out receives the updated state, state_in may alias
+ * state_out). Returns 0 on success, -1 on error. */
+int ignis_gdn_step(const void *x, const void *state_in, void *state_out,
+                   int64_t batch, int64_t num_gdn_layers, int64_t state_rows,
+                   int64_t state_cols, int64_t state_dim, void *stream);
+
+/* Ticket 06 (kernel-abi-02): RMSNorm (or LayerNorm when `center` is
+ * non-null). out = x / rms(x) * weight, optionally centered first. x is bf16
+ * [n]. weight (nullable): bf16 [n]. center (nullable): bf16 [n] (present =>
+ * LayerNorm, absent => RMSNorm). out: bf16 [n]. eps: numerical epsilon
+ * (<= 0 selects 1e-6). Returns 0 on success, -1 on error. */
+int ignis_rmsnorm(const void *x, const void *weight, const void *center,
+                  void *out, int64_t n, float eps, void *stream);
+
+/* Ticket 06 (kernel-abi-02): embedding lookup. out[row] = table[id[row]].
+ * table: bf16 [vocab][hidden]. id: i32 [batch]. out: bf16 [batch][hidden].
+ * id values must be in [0, vocab). Returns 0 on success, -1 on error. */
+int ignis_embedding(const void *table, const void *id, void *out,
+                    int64_t batch, int64_t vocab, int64_t hidden,
+                    void *stream);
+
+/* Ticket 06 (kernel-abi-02): greedy sampling. out[i] = argmax over
+ * logits[i]. logits: f32 [batch][vocab]. out: i32 [batch]. Ties resolve to
+ * the lowest index (deterministic — the v1 correctness floor, ADR 0007:
+ * greedy + fixed seed). Returns 0 on success, -1 on error. */
+int ignis_greedy_sample(const void *logits, void *out, int64_t batch,
+                        int64_t vocab, void *stream);
+
+/* Ticket 10 (kernel-abi-03): eager CUDA-graph capture at startup. One opaque
+ * graph handle, captured at startup and replayed on each step (v1 decision;
+ * lazy capture is a later optimization). */
+struct ignis_graph;
+
+/* Begin a CUDA graph capture on `stream` (null = stream 0). The caller
+ * issues the prefill/decode kernel launches (the entry points above) while
+ * the capture is active, then calls ignis_graph_end_capture to materialize
+ * the graph. Returns 0 on success, -1 on error. */
+int ignis_graph_begin_capture(void *stream);
+
+/* End the capture, materializing the graph into *out (a graph-executable).
+ * Returns 0 on success, -1 on error. */
+int ignis_graph_end_capture(void *stream, struct ignis_graph **out);
+
+/* Launch a captured graph on `stream`. Returns 0 on success, -1 on error. */
+int ignis_graph_launch(struct ignis_graph *g, void *stream);
+
+/* Destroy a captured graph. NULL is a no-op. */
+void ignis_graph_destroy(struct ignis_graph *g);
+
 #ifdef __cplusplus
 }
 #endif

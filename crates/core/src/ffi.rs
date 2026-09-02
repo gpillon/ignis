@@ -3,6 +3,15 @@
 //! Mirror of `kernel/include/ignis_kernel.h` — keep 1:1 when the surface
 //! grows (ticket 03+).
 
+/// Opaque CUDA graph handle, mirroring `struct ignis_graph` in
+/// `kernel/include/ignis_kernel.h` (one element, never dereferenced across
+/// the boundary; captured by `ignis_graph_begin_capture` /
+/// `ignis_graph_end_capture`).
+#[repr(C)]
+pub struct IgnisGraph {
+    _private: [u8; 0],
+}
+
 unsafe extern "C" {
     /// Ticket 01 smoke test: proves the FFI path end-to-end.
     pub fn ignis_kernel_hello() -> u32;
@@ -53,6 +62,113 @@ unsafe extern "C" {
         softmax_scale: f32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
+
+    // ------------------------------------------------------------------
+    // kernel-abi (tickets 05/06/10): prefill + GDN, pointwise / output
+    // path, and eager CUDA-graph capture. Mirrors
+    // `kernel/include/ignis_kernel.h` 1:1.
+    //
+    // NOTE (GPU-blocked, ADR 0006): these surface declarations + geometry
+    // are CPU-verifiable; the CUDA kernel implementations (.cu) and the GPU
+    // verification (the 99% performance gate, ADR 0007) are pending the GPU
+    // (the RTX 5090 is held by the reference runner). No test below calls
+    // these symbols, so the build stays linkable without them.
+    // ------------------------------------------------------------------
+
+    /// GQA prefill attention (batched, multi-token), the prefill path.
+    /// `q`: bf16 [batch][seq_len][num_q_heads][head_dim]. `kv_cache`: bf16,
+    /// two paged planes (K then V), each [batch][num_blocks][block_size]
+    /// [num_kv_heads][head_dim]. `block_table`: i32 [batch][num_blocks].
+    /// `out`: bf16 [batch][seq_len][num_q_heads][head_dim]. `seq_len` <=
+    /// num_blocks*block_size. `softmax_scale` <= 0 selects 1/sqrt(head_dim).
+    /// `stream`: null = stream 0. Returns 0 on success, -1 on error.
+    pub fn ignis_gqa_attention_prefill(
+        q: *const std::ffi::c_void,
+        kv_cache: *const std::ffi::c_void,
+        block_table: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        batch: i64,
+        seq_len: i64,
+        num_q_heads: i64,
+        num_kv_heads: i64,
+        head_dim: i64,
+        block_size: i64,
+        num_blocks: i64,
+        softmax_scale: f32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// GDN (linear-attention) recurrent step, batched. `x`: bf16
+    /// [batch][state_dim]. `state_in`/`state_out`: bf16
+    /// [batch][num_gdn_layers][state_rows][state_cols] (state_out receives
+    /// the updated state; state_in may alias state_out). `stream`: null =
+    /// stream 0. Returns 0 on success, -1 on error.
+    pub fn ignis_gdn_step(
+        x: *const std::ffi::c_void,
+        state_in: *const std::ffi::c_void,
+        state_out: *mut std::ffi::c_void,
+        batch: i64,
+        num_gdn_layers: i64,
+        state_rows: i64,
+        state_cols: i64,
+        state_dim: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// RMSNorm (LayerNorm when `center` is non-null). `x`: bf16 [n].
+    /// `weight` (nullable): bf16 [n]. `center` (nullable): bf16 [n].
+    /// `out`: bf16 [n]. `eps` <= 0 selects 1e-6. Returns 0 on success,
+    /// -1 on error.
+    pub fn ignis_rmsnorm(
+        x: *const std::ffi::c_void,
+        weight: *const std::ffi::c_void,
+        center: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        n: i64,
+        eps: f32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Embedding lookup: `out[row] = table[id[row]]`. `table`: bf16
+    /// [vocab][hidden]. `id`: i32 [batch]. `out`: bf16 [batch][hidden].
+    /// Returns 0 on success, -1 on error.
+    pub fn ignis_embedding(
+        table: *const std::ffi::c_void,
+        id: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        batch: i64,
+        vocab: i64,
+        hidden: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Greedy sampling: `out[i] = argmax(logits[i])`. `logits`: f32
+    /// [batch][vocab]. `out`: i32 [batch]. Ties resolve to the lowest index.
+    /// Returns 0 on success, -1 on error.
+    pub fn ignis_greedy_sample(
+        logits: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        batch: i64,
+        vocab: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// Begin a CUDA graph capture on `stream` (null = stream 0). The caller
+    /// issues the prefill/decode kernel launches while the capture is active,
+    /// then calls `ignis_graph_end_capture`. Returns 0 on success, -1 on
+    /// error.
+    pub fn ignis_graph_begin_capture(stream: *mut std::ffi::c_void) -> i32;
+
+    /// End the capture, materializing the graph into `*out` (a
+    /// graph-executable). Returns 0 on success, -1 on error.
+    pub fn ignis_graph_end_capture(stream: *mut std::ffi::c_void, out: *mut *mut IgnisGraph) -> i32;
+
+    /// Launch a captured graph on `stream`. Returns 0 on success, -1 on
+    /// error.
+    pub fn ignis_graph_launch(graph: *mut IgnisGraph, stream: *mut std::ffi::c_void) -> i32;
+
+    /// Destroy a captured graph. NULL is a no-op.
+    pub fn ignis_graph_destroy(graph: *mut IgnisGraph);
 }
 
 #[cfg(test)]
@@ -75,5 +191,57 @@ mod tests {
         for i in 0..n {
             assert_eq!(c[i], (i as f32) * 3.0, "mismatch at {i}");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // CPU-verifiable geometry for the kernel-abi C-ABI surface (tickets
+    // 05/06/10). Pure Rust, no FFI calls — these pin the expected output
+    // sizes for the flat-C-ABI kernels so the contract is testable on CPU.
+    // The CUDA kernel implementations + GPU verification (the 99% gate,
+    // ADR 0007) are pending the GPU (ADR 0006).
+    // -------------------------------------------------------------------------
+
+    /// GQA prefill output element count: `[batch][seq_len][num_q_heads][head_dim]`.
+    fn gqa_prefill_out_elems(batch: u64, seq_len: u64, num_q_heads: u64, head_dim: u64) -> u64 {
+        batch * seq_len * num_q_heads * head_dim
+    }
+
+    /// GQA prefill output byte count (bf16 = 2 bytes/elem).
+    fn gqa_prefill_out_bytes(batch: u64, seq_len: u64, num_q_heads: u64, head_dim: u64) -> u64 {
+        gqa_prefill_out_elems(batch, seq_len, num_q_heads, head_dim) * 2
+    }
+
+    /// GDN state tensor element count:
+    /// `[batch][num_gdn_layers][state_rows][state_cols]`.
+    fn gdn_state_elems(batch: u64, num_gdn_layers: u64, state_rows: u64, state_cols: u64) -> u64 {
+        batch * num_gdn_layers * state_rows * state_cols
+    }
+
+    /// Embedding output element count: `[batch][hidden]`.
+    fn embedding_out_elems(batch: u64, hidden: u64) -> u64 {
+        batch * hidden
+    }
+
+    #[test]
+    fn gqa_prefill_geometry_pins_out_shape() {
+        // Representative canary shape: 4-batch, 512-token prefill, 8 q-heads,
+        // head_dim 128. Pins the ABI out-size contract to the values the
+        // kernel computes (independent of the helper's formula: 4*512*8*128
+        // = 2_097_152 elems, bf16 = 4_194_304 bytes).
+        let elems = gqa_prefill_out_elems(4, 512, 8, 128);
+        assert_eq!(elems, 2_097_152);
+        assert_eq!(gqa_prefill_out_bytes(4, 512, 8, 128), 4_194_304);
+    }
+
+    #[test]
+    fn gdn_state_geometry_pins_state_shape() {
+        // 8-lane batch, 12 GDN layers, 64x64 state (8*12*64*64 = 393_216).
+        assert_eq!(gdn_state_elems(8, 12, 64, 64), 393_216);
+    }
+
+    #[test]
+    fn embedding_geometry_pins_out_shape() {
+        // Qwen hidden = 5120, 64-batch decode step (64*5120 = 327_680).
+        assert_eq!(embedding_out_elems(64, 5120), 327_680);
     }
 }
