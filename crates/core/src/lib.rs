@@ -9,4 +9,5 @@
 //! - flat C ABI bindings to the kernel leaf (ADR 0001, `ffi.rs`)
 
 pub mod ffi;
+pub mod gdn;
 pub mod kv;
