@@ -243,3 +243,151 @@ impl<'a> Binder<'a> {
         Ok(ObjectHandle { index })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests (the binder is pure Rust — ADR 0002 failure paths, ADR 0006 stand-in)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture;
+
+    /// A fixture reader (five objects: four tensors + one resource); the temp
+    /// artifact is kept alive so the file persists for the reader's mapping.
+    fn fixture_reader(tag: &str) -> (fixture::TempArtifact, Reader) {
+        let objects = fixture::all_layout_objects();
+        let payload = fixture::all_layout_payload();
+        let artifact =
+            fixture::write_fixture(&objects, &payload, tag).expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+        (artifact, reader)
+    }
+
+    /// Consume + place all five fixture objects (the ADR 0002 happy path).
+    fn bind_all(binder: &mut Binder) {
+        let resource = binder
+            .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
+            .expect("resource");
+        binder.retain_on_host(resource).expect("retain resource");
+        let bf16 = binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect("bf16");
+        binder.materialize_on_device(bf16).expect("place bf16");
+        let nvfp4 = binder
+            .require_tensor("w/nvfp4", NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1, &[128, 64])
+            .expect("nvfp4");
+        binder.materialize_on_device(nvfp4).expect("place nvfp4");
+        let q4 = binder
+            .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
+            .expect("q4");
+        binder.materialize_on_device(q4).expect("place q4");
+        let fp8 = binder
+            .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
+            .expect("fp8");
+        binder.materialize_on_device(fp8).expect("place fp8");
+    }
+
+    /// ADR 0002 happy path: every object consumed and placed -> `finish`
+    /// succeeds and the plan covers all five objects.
+    #[test]
+    fn finish_succeeds_when_every_object_is_consumed_and_placed() {
+        let (_artifact, reader) = fixture_reader("all-placed");
+        let mut binder = Binder::new(&reader);
+        bind_all(&mut binder);
+        let plan = binder.finish().expect("every object consumed and placed");
+        assert_eq!(plan.object_count, 5);
+        assert_eq!(plan.device_objects.len(), 4);
+        assert_eq!(plan.host_objects.len(), 1);
+    }
+
+    /// ADR 0002: an object left unconsumed is a load failure.
+    #[test]
+    fn finish_fails_when_an_object_is_unconsumed() {
+        let (_artifact, reader) = fixture_reader("unconsumed");
+        let mut binder = Binder::new(&reader);
+        // Consume + place the four tensors, but never consume the resource.
+        let bf16 = binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect("bf16");
+        binder.materialize_on_device(bf16).expect("place bf16");
+        let nvfp4 = binder
+            .require_tensor("w/nvfp4", NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1, &[128, 64])
+            .expect("nvfp4");
+        binder.materialize_on_device(nvfp4).expect("place nvfp4");
+        let q4 = binder
+            .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
+            .expect("q4");
+        binder.materialize_on_device(q4).expect("place q4");
+        let fp8 = binder
+            .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
+            .expect("fp8");
+        binder.materialize_on_device(fp8).expect("place fp8");
+        // The resource was never consumed -> finish must fail.
+        let err = binder.finish().expect_err("finish must fail on an unconsumed object");
+        assert!(err.to_string().contains("not consumed"), "{err}");
+    }
+
+    /// ADR 0002: a consumed object with no placement is a load failure.
+    #[test]
+    fn finish_fails_when_an_object_has_no_placement() {
+        let (_artifact, reader) = fixture_reader("unplanned");
+        let mut binder = Binder::new(&reader);
+        // Consume every object, but leave the resource consumed-but-unplaced.
+        let resource = binder
+            .require_resource("frontend/tokenizer.json", ResourceEncoding::RawBytesV1)
+            .expect("resource");
+        let bf16 = binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect("bf16");
+        binder.materialize_on_device(bf16).expect("place bf16");
+        let nvfp4 = binder
+            .require_tensor("w/nvfp4", NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1, &[128, 64])
+            .expect("nvfp4");
+        binder.materialize_on_device(nvfp4).expect("place nvfp4");
+        let q4 = binder
+            .require_tensor("w/q4", NumericFormat::Q4G64F16S, StorageLayout::RowSplitK128V1, &[128, 128])
+            .expect("q4");
+        binder.materialize_on_device(q4).expect("place q4");
+        let fp8 = binder
+            .require_tensor("w/fp8", NumericFormat::Fp8E4M3FnRowBf16S, StorageLayout::RowScaleV1, &[128, 64])
+            .expect("fp8");
+        binder.materialize_on_device(fp8).expect("place fp8");
+        // The resource is consumed but has no placement -> finish must fail.
+        let _ = resource;
+        let err = binder.finish().expect_err("finish must fail on an unplanned object");
+        assert!(err.to_string().contains("no materialization placement"), "{err}");
+    }
+
+    /// A second bind of the same object is an error (consume-once contract).
+    #[test]
+    fn a_second_bind_of_the_same_object_is_rejected() {
+        let (_artifact, reader) = fixture_reader("double-bind");
+        let mut binder = Binder::new(&reader);
+        binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect("first bind");
+        let err = binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect_err("a second bind must fail");
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    /// A second placement of the same object is an error.
+    #[test]
+    fn a_second_placement_of_the_same_object_is_rejected() {
+        let (_artifact, reader) = fixture_reader("double-place");
+        let mut binder = Binder::new(&reader);
+        let bf16 = binder
+            .require_tensor("w/bf16", NumericFormat::Bf16, StorageLayout::ContiguousLeV1, &[4, 8])
+            .expect("bf16");
+        binder.materialize_on_device(bf16).expect("first placement");
+        let err = binder
+            .materialize_on_device(bf16)
+            .expect_err("a second placement must fail");
+        assert!(
+            err.to_string().contains("more than one materialization placement"),
+            "{err}"
+        );
+    }
+}

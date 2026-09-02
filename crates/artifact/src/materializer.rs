@@ -222,17 +222,44 @@ pub fn materialize<D: Device>(
         objects[host.handle.index] = MaterializedObject::Resource(bytes);
     }
 
-    // --- device objects: direct I/O -> staging -> device -------------------
+    // --- device objects: direct I/O -> bounded staging pool -> device ------
+    // The reference materializer streams through a small pool of pinned
+    // staging slots (peak host memory = a few slots, not the sum of every
+    // object). We mirror that: N reusable 4096-aligned slots, assigned
+    // round-robin. The CUDA H2D copies are asynchronous on the load stream,
+    // so a slot's bytes must stay valid until its copy completes. We keep at
+    // most N copies in flight; when N are pending we drain once
+    // (`synchronize`) so every slot is free before reuse. The pool lives
+    // until the final `synchronize`, so no in-flight copy ever reads freed
+    // memory.
     let mut total_h2d = 0u64;
     for p in &plan.device_objects {
         total_h2d = checked_add(total_h2d, p.bytes, "h2d total overflow u64")?;
     }
     let mut h2d_done = 0u64;
-    // Staging buffers stay alive until `synchronize` (the CUDA copies are
-    // asynchronous on the load stream).
-    let mut staging_pool: Vec<AlignedStaging> = Vec::new();
 
+    // Pre-size the bounded slot pool to the largest aligned direct-read span
+    // (every span is 4096-aligned, so any object fits without growth).
+    let mut max_staging_len = 0usize;
     for dev in &plan.device_objects {
+        let object = reader
+            .objects()
+            .get(dev.handle.index)
+            .ok_or_else(|| fail("device placement handle is out of range"))?;
+        let span = reader.payload_at(object)?;
+        let source_end =
+            checked_add(span.absolute_offset, dev.bytes, "artifact tensor source range overflow u64")?;
+        let read_begin = span.absolute_offset & !(DIRECT_IO_ALIGNMENT - 1);
+        let read_end = (source_end + (DIRECT_IO_ALIGNMENT - 1)) & !(DIRECT_IO_ALIGNMENT - 1);
+        max_staging_len = max_staging_len.max((read_end - read_begin) as usize);
+    }
+    let staging_slots = STAGING_SLOTS.min(plan.device_objects.len());
+    let mut slots: Vec<AlignedStaging> = (0..staging_slots)
+        .map(|_| AlignedStaging::new(max_staging_len.max(DIRECT_IO_ALIGNMENT as usize)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut pending = 0usize;
+
+    for (k, dev) in plan.device_objects.iter().enumerate() {
         let object = reader
             .objects()
             .get(dev.handle.index)
@@ -283,8 +310,16 @@ pub fn materialize<D: Device>(
         let read_begin = span.absolute_offset & !(DIRECT_IO_ALIGNMENT - 1);
         let read_end = (source_end + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
         let staging_len = (read_end - read_begin) as usize;
-        let mut staging = AlignedStaging::new(staging_len)?;
-        let read = reader.read_direct(read_begin, staging.as_slice())?;
+
+        // Round-robin slot; once N copies are pending, drain so every slot
+        // is free (its in-flight copy done) before reuse.
+        let s = k % staging_slots;
+        if pending == staging_slots {
+            device.synchronize()?;
+            pending = 0;
+        }
+        let buf = slots[s].as_slice();
+        let read = reader.read_direct(read_begin, &mut buf[0..staging_len])?;
         let head = (span.absolute_offset - read_begin) as usize;
         let needed = checked_add(head as u64, dev.bytes, "staging head overflow u64")? as usize;
         if read < needed {
@@ -293,11 +328,12 @@ pub fn materialize<D: Device>(
                 object.name()
             )));
         }
-        let payload = &staging.as_slice()[head..needed];
+        let payload = &buf[head..needed];
 
         if let Some(a) = &arena {
             device.copy_h2d(a, dev.offset, payload)?;
         }
+        pending += 1;
         h2d_done = checked_add(h2d_done, dev.bytes, "copied byte count overflows u64")?;
         stats.h2d_bytes = h2d_done;
         stats.file_bytes =
@@ -310,11 +346,10 @@ pub fn materialize<D: Device>(
         if let Some(callback) = &mut progress {
             callback(object.name(), h2d_done, total_h2d);
         }
-
-        staging_pool.push(staging);
     }
-    drop(staging_pool);
 
+    // The pool lives until here: the final drain means no in-flight copy is
+    // still reading a slot when the buffers are dropped (at end of scope).
     device.synchronize()?;
     stats.upload_seconds = start.elapsed().as_secs_f64();
 
@@ -324,6 +359,11 @@ pub fn materialize<D: Device>(
         stats,
     })
 }
+
+/// Number of reusable staging slots (the reference `Materializer` streams
+/// through four pinned slots; peak host staging = `STAGING_SLOTS` x the
+/// largest aligned span, not the sum of every object).
+const STAGING_SLOTS: usize = 4;
 
 /// A 4096-aligned staging buffer for direct I/O (page-aligned allocation:
 /// the reader's direct path requires 4096-aligned offsets, lengths, *and*

@@ -42,6 +42,28 @@ host pointers + sizes + a stream handle and launch the two ported kernels.
 There is no reference equivalent (the reference's driver was the engine's
 Tensor/Weight dispatch); this is the new C ABI surface for the decode step.
 
+### `kernel/src/device.cu` (ticket 04, artifact-01, GitHub #4)
+The flat C ABI device-surface (ADR 0001): `extern "C"` functions
+(`ignis_device_create/alloc/copy_h2d/copy_d2h/sync/mem_info/destroy`) that
+take explicit host pointers + sizes and a device handle and enqueue
+asynchronous H2D/D2H copies on a dedicated non-blocking load stream, with
+0/-1 int return codes. The `DeviceContext` pattern (a non-blocking load
+stream + a blocking-sync event so `synchronize()` sleeps instead of
+CPU-spinning — the fix for the 100% CPU observed during loads) is adapted
+from the reference `DeviceContext`. The C ABI surface itself (the opaque
+`struct ignis_device` handle wrapper with explicit pointers + sizes) is new —
+the reference's driver was the engine's op dispatch, which the flat C ABI of
+ADR 0001 forbids across the boundary. Self-contained; linked only under the
+`cuda` feature (the default build stays pure Rust).
+
+### `kernel/include/ignis_device.h` (ticket 04, artifact-01, GitHub #4)
+The flat C ABI declarations for the device surface (ADR 0001): the opaque
+`struct ignis_device` handle + the `ignis_device_*` prototypes (explicit
+pointers + sizes, `int32_t` return codes, no C++ types across the boundary).
+Companion header to `device.cu`; the Rust bindings in
+`crates/artifact/src/ffi.rs` are kept 1:1. New C ABI surface (no reference
+equivalent for the driver wrapper).
+
 ### `kernel/src/gqa_attention_prefill.cuh` (ticket 05, kernel-abi-01)
 GQA prefill attention (batched, multi-token). Adapted from the reference causal
 GQA prefill `ops/kernel/gqa_attention_prefill_bf16.cuh` (shared scaffolding in

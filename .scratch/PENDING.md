@@ -18,6 +18,17 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   free and a reference baseline exists (see bench-02 above). Owner: kernel
   actor. Blocker: GPU.
 
+- **artifact-01: `CudaDevice` real-artifact VRAM materialization (GitHub #4, ADR 0006).**
+  The binder + materializer + typed binding (`3299a2e`) are committed and
+  CPU-verified: `IGNIS_TEST_FULL_MATERIALIZE=1` full `CpuDevice`
+  materialization green, ADR 0002 failure paths tested, and a bounded 4-slot
+  staging pool (peak = 4 x largest aligned span, not the sum of every
+  object). The `CudaDevice` real-artifact VRAM upload — `IGNIS_TEST_CUDA=1
+  cargo test -p ignis-artifact --features cuda -- real_nvfp4full_cuda_device`
+  (~19 GB H2D of all ~1,319 device tensors) — is GPU-gated (needs a free RTX
+  5090 with ~19 GB headroom, ADR 0006) and is deferred until the GPU is
+  free. Owner: artifact actor. Blocker: GPU.
+
 ## Blocked (external)
 
 - **GPU availability (ADR 0006).** All GPU-gated items above require the
