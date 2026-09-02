@@ -13,8 +13,9 @@
 /// Holds the set of checkpoint / frontier boundaries at which the state is
 /// resumable, and the state's current position. This is the CPU-side model of
 /// the invariant "GDN state is resumable only at checkpoint / frontier
-/// boundaries" — the host tier (core-06) consults [`GdnState::can_resume_at`]
-/// before snapshotting a lane to host RAM.
+/// boundaries" — the host tier (core-06) consults
+/// [`GdnState::is_valid_snapshot_point`] before snapshotting a lane to host
+/// RAM.
 #[derive(Debug, Clone, Default)]
 pub struct GdnState {
     /// Token positions at which the state is resumable (checkpoint /
@@ -35,11 +36,24 @@ impl GdnState {
     }
 
     /// Record a checkpoint / frontier boundary: the state becomes resumable
-    /// at `position`. The frontier only moves forward — duplicate or
-    /// backwards checkpoints are ignored.
+    /// at `position`. The frontier only moves forward — a checkpoint at or
+    /// past the current position is recorded (checking the current position
+    /// makes it resumable); backwards checkpoints are ignored.
     pub fn checkpoint(&mut self, position: usize) {
-        if position > self.position {
+        if position >= self.position {
             self.boundaries.push(position);
+            self.position = position;
+        }
+    }
+
+    /// Advance the state's position without recording a boundary (mid-
+    /// prefill / mid-decode progress): the state moves forward but is **not
+    /// resumable** at the new position — a snapshot taken mid-prefill (at an
+    /// un-checkpointed position) is invalid for GDN layers (core-06: the
+    /// host tier may only snapshot at a recorded boundary). The frontier
+    /// only moves forward — duplicate or backwards advances are ignored.
+    pub fn advance(&mut self, position: usize) {
+        if position > self.position {
             self.position = position;
         }
     }
@@ -114,5 +128,63 @@ mod tests {
         assert!(state.is_valid_snapshot_point(256));
         // A snapshot mid-prefill (not a boundary) is invalid.
         assert!(!state.is_valid_snapshot_point(128));
+    }
+
+    #[test]
+    fn checkpoint_at_current_position_records_a_boundary() {
+        // core-06: `checkpoint` uses `>=` (not `>`), so recording a
+        // checkpoint at the *current* position makes that position resumable
+        // (a decode step lands exactly on the current position and records a
+        // boundary there, so the host tier can snapshot a lane at it).
+        let mut state = GdnState::new();
+        state.checkpoint(64); // position 0 -> 64 (a boundary at 64)
+        assert_eq!(state.position(), 64);
+        // A checkpoint at the current position (64) is accepted (>=, not >):
+        // it records 64 as a boundary and leaves the position unchanged.
+        state.checkpoint(64);
+        assert!(state.is_valid_snapshot_point(64), "the current position is a boundary");
+        assert_eq!(state.position(), 64);
+        // A checkpoint *ahead* of the current position also records a
+        // boundary and moves the position forward.
+        state.checkpoint(128);
+        assert!(state.is_valid_snapshot_point(128));
+        assert_eq!(state.position(), 128);
+    }
+
+    #[test]
+    fn advance_moves_without_recording_a_boundary() {
+        // core-02: `advance` moves the position forward without recording a
+        // boundary (mid-prefill / mid-decode progress). The new position is
+        // *not* resumable — a snapshot taken there is invalid for GDN layers.
+        let mut state = GdnState::new();
+        state.advance(128); // mid-prefill: position 0 -> 128 (no boundary at 128)
+        assert_eq!(state.position(), 128);
+        assert!(
+            !state.is_valid_snapshot_point(128),
+            "a mid-prefill (advanced) position is not a snapshot point"
+        );
+        // The initial boundary (0) is still resumable.
+        assert!(state.is_valid_snapshot_point(0));
+        // A checkpoint *after* the advance records a new boundary.
+        state.checkpoint(256);
+        assert!(state.is_valid_snapshot_point(256));
+        assert_eq!(state.position(), 256);
+    }
+
+    #[test]
+    fn advance_is_monotonic() {
+        // The frontier only moves forward: duplicate or backwards advances
+        // are ignored (the position never moves backwards).
+        let mut state = GdnState::new();
+        state.advance(64);
+        assert_eq!(state.position(), 64);
+        // A duplicate (64) or backwards (32) advance is ignored.
+        state.advance(64);
+        assert_eq!(state.position(), 64);
+        state.advance(32);
+        assert_eq!(state.position(), 64, "a backwards advance is ignored");
+        // A forward advance (128) is applied.
+        state.advance(128);
+        assert_eq!(state.position(), 128);
     }
 }

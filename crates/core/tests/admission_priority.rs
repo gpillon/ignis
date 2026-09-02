@@ -35,6 +35,8 @@ fn lanes_are_dealt_by_class_priority_then_fifo() {
         model: "qwen3.8-27b".into(),
         max_in_flight: 14, // 8 filler lanes + 6 queued (pre-host-tier knob)
         max_prefill_batch: 8,
+        host_capacity_pages: 0, // host tier disabled: class-priority + FIFO
+        // is the constraint (core-05).
         ..SchedulerConfig::default()
     };
     let mut sched = ConcreteScheduler::with_config(cfg, compute.clone());

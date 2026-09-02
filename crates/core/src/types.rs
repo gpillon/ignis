@@ -75,6 +75,10 @@ pub enum RequestState {
     Prefilling,
     /// Holds a resident decode lane, generating.
     Running,
+    /// Evicted from its lane to the host KV-RAM tier (core-06): suspended
+    /// with its state retained in host RAM; it can be restored to a lane
+    /// without re-prefilling.
+    Evicted,
     /// Finished (reached `max_tokens` / EOS).
     Done,
 }
@@ -149,6 +153,13 @@ pub enum SchedEvent {
     /// A request was evicted from a decode lane to the host KV-RAM tier
     /// (sibling prefix reuse will restore it instead of re-prefilling).
     Evicted { request: RequestId },
+    /// A request was restored from the host KV-RAM tier onto a decode lane
+    /// (its KV + GDN state came back from host RAM — no re-prefill, core-06).
+    Restored { request: RequestId, lane: LaneId },
+    /// A request was re-queued for re-prefill (core-06): its host-tier
+    /// snapshot was discarded (the tier was full), so it goes back to
+    /// `Admitted` and re-prefills from the start.
+    Requeued { request: RequestId },
 }
 
 /// Errors from submitting a request.

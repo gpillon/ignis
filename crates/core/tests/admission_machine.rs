@@ -15,9 +15,7 @@ use std::sync::Arc;
 use ignis_core::types::{
     BackfillClass, DecodeParams, RequestClass, RequestInput, SchedEvent, SubmitError,
 };
-use ignis_core::{
-    ConcreteScheduler, MockCompute, ProtectionPhase, Scheduler, SchedulerConfig,
-};
+use ignis_core::{ConcreteScheduler, MockCompute, ProtectionPhase, Scheduler, SchedulerConfig};
 
 /// A request with the test model's prompt (`tokens`) and an explicit
 /// generation cap of `max` tokens.
@@ -43,6 +41,10 @@ fn small_pool() -> SchedulerConfig {
         kv_page_tokens: 16,
         max_sequence_tokens: 1024,
         kv_capacity_pages: 16,
+        // The core-05 scenarios exercise the admission machine in isolation:
+        // the host tier is disabled (no overflow), so a blocked head waits
+        // for its donors instead of being admitted via a lane eviction.
+        host_capacity_pages: 0,
     }
 }
 
@@ -96,12 +98,8 @@ fn blocked_head_freezes_protection_and_classifies_backfills() {
 
     // Phase A: two incumbents (4 pages each, work 63) fill 8 of the 12
     // pool pages.
-    let n1 = sched
-        .submit(input(&[1], 63), RequestClass::Agent)
-        .unwrap(); // ceil(64/16) = 4 pages
-    let n2 = sched
-        .submit(input(&[1], 63), RequestClass::Agent)
-        .unwrap(); // 4 pages
+    let n1 = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // ceil(64/16) = 4 pages
+    let n2 = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
     sched.advance(); // step 1: both prefilled + dealt (8 pages in use)
 
     // Phase B: the Interactive head (5 pages) and two 4-page temporal
@@ -109,12 +107,8 @@ fn blocked_head_freezes_protection_and_classifies_backfills() {
     let head = sched
         .submit(input(&[1], 79), RequestClass::Interactive)
         .unwrap(); // ceil(80/16) = 5 pages
-    let t1 = sched
-        .submit(input(&[1], 61), RequestClass::Agent)
-        .unwrap(); // ceil(62/16) = 4 pages, work 61
-    let t2 = sched
-        .submit(input(&[1], 61), RequestClass::Agent)
-        .unwrap(); // 4 pages, work 61
+    let t1 = sched.submit(input(&[1], 61), RequestClass::Agent).unwrap(); // ceil(62/16) = 4 pages, work 61
+    let t2 = sched.submit(input(&[1], 61), RequestClass::Agent).unwrap(); // 4 pages, work 61
     let ev2 = sched.advance(); // step 2: prefill all three; admission below
 
     // Step 2: the head (8 + 5 = 13 > 12 pages) is blocked → a protection
@@ -229,6 +223,8 @@ fn lane_pressure_holds_head_and_backfills_until_a_lane_frees() {
         model: "qwen3.8-27b".into(),
         max_in_flight: 16,
         max_prefill_batch: 8,
+        host_capacity_pages: 0, // host tier disabled: lane pressure is the
+        // constraint (the head waits for a lane to free, core-05).
         ..SchedulerConfig::default() // 4096-page pool: pages are never tight
     };
     let mut sched = ConcreteScheduler::with_config(cfg, compute);
@@ -248,9 +244,7 @@ fn lane_pressure_holds_head_and_backfills_until_a_lane_frees() {
     let head = sched
         .submit(input(&[1], 30), RequestClass::Interactive)
         .unwrap();
-    let t1 = sched
-        .submit(input(&[1], 15), RequestClass::Agent)
-        .unwrap();
+    let t1 = sched.submit(input(&[1], 15), RequestClass::Agent).unwrap();
 
     // Step 2: the head (9th request, 8 lanes) is blocked on lanes. The
     // backfill candidate t1 is held too: no free lane for it to fit into.
@@ -347,12 +341,8 @@ fn persistent_backfill_fits_the_protected_future() {
     // blocked. A 1-page backfill fits the pool now (8 + 1 = 9 ≤ 12) and the
     // head's future (head 5 + the non-donor 4 + 1 = 10 ≤ 12) → it is
     // admitted as **persistent**.
-    let a = sched
-        .submit(input(&[1], 63), RequestClass::Agent)
-        .unwrap(); // 4 pages
-    let b = sched
-        .submit(input(&[1], 63), RequestClass::Agent)
-        .unwrap(); // 4 pages
+    let a = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
+    let b = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
     let ev1 = sched.advance(); // step 1: the two incumbents are dealt (8 pages)
 
     // The head and the backfill are submitted *after* the pool is loaded,
@@ -361,9 +351,7 @@ fn persistent_backfill_fits_the_protected_future() {
     let head = sched
         .submit(input(&[1], 79), RequestClass::Interactive)
         .unwrap(); // ceil(80/16) = 5 pages — blocked
-    let p = sched
-        .submit(input(&[1], 8), RequestClass::Agent)
-        .unwrap(); // ceil(9/16) = 1 page
+    let p = sched.submit(input(&[1], 8), RequestClass::Agent).unwrap(); // ceil(9/16) = 1 page
     let ev2 = sched.advance(); // step 2: head blocked → protection; p dealt
 
     assert_eq!(

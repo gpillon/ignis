@@ -28,23 +28,35 @@
 //!    zero) completes in that step — the pool can never grow past the
 //!    reservations (no OOM under the N=8 load, core-01).
 //!
+//! 4. **KV-RAM host tier** (core-06) — the overflow path: when a request
+//!    is blocked by the active set (all lanes / pages in use), the
+//!    scheduler evicts a retained lane (driven by
+//!    [`crate::admission::choose_retained_lane_victim`]) into the
+//!    host-RAM KV tier ([`crate::host::HostTier`]), freeing its lane +
+//!    pages so the blocked head can be dealt. The evicted request is
+//!    suspended (not done) and **restored** to a lane (instead of
+//!    re-prefilling) when a lane frees. The tier's two-tier eviction
+//!    (probation → protected) keeps evictions bounded; a snapshot whose
+//!    GDN position is mid-prefill is rejected (core-02's boundary).
+//!
 //! Lane capacity: the scheduler holds [`N_DECODE_LANES`] (8) resident
 //! lanes and a KV page capacity (`kv_capacity_pages`, auto-sized from
 //! the pool in production; the machine's resource dimension). In-flight
-//! admission is capped at `max_in_flight` — host-tier overflow
-//! (admitting beyond 8 via the KV-RAM host tier, with retained-lane
-//! eviction driven by [`crate::admission::choose_retained_lane_victim`])
-//! lands in core-06; until then `submit` fails with
-//! [`SubmitError::Full`] at the cap, and a request whose KV reservation
-//! exceeds the whole pool is rejected with [`SubmitError::Oversized`].
+//! admission is capped at `max_in_flight`; beyond N=8 the KV-RAM host
+//! tier (core-06) provides overflow — a blocked head is admitted by
+//! evicting a retained lane to the host tier, and a request whose KV
+//! reservation exceeds the whole pool is rejected with
+//! [`SubmitError::Oversized`].
 
 use std::sync::Arc;
 
 use crate::admission::{
-    admission_resources_fit, make_admission_protection, persistent_backfill_is_safe,
-    protection_frontier_distance, protected_head_safe_without_temporal,
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
+    RetainedLaneCandidate, admission_resources_fit, choose_retained_lane_victim,
+    make_admission_protection, persistent_backfill_is_safe, protected_head_safe_without_temporal,
+    protection_frontier_distance,
 };
+use crate::host::{HostEntry, HostTier, Tier};
 use crate::request::Request;
 use crate::scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 use crate::types::{
@@ -77,6 +89,11 @@ pub struct SchedulerConfig {
     /// resource dimension; production auto-sizes this from the pool,
     /// tests pass small values to drive contention).
     pub kv_capacity_pages: u32,
+    /// The KV-RAM host tier capacity in pages (core-06: the host-RAM
+    /// budget for evicted (suspended) request snapshots; production
+    /// auto-sizes this from host RAM, tests pass small values to drive
+    /// contention).
+    pub host_capacity_pages: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -91,6 +108,9 @@ impl Default for SchedulerConfig {
             // of the admission machine is dormant unless the capacity is
             // tightened (or the pool is auto-sized smaller in production).
             kv_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
+            // Eight full sequences fit in host RAM by default: the
+            // host-tier overflow budget matches the KV pool (core-06).
+            host_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
         }
     }
 }
@@ -119,6 +139,14 @@ pub struct ConcreteScheduler {
     protection: Option<AdmissionProtection>,
     /// The next protection epoch (protections start at epoch 1).
     protection_epoch: u64,
+    // ── core-06: the KV-RAM host tier ──────────────────────────────────
+    /// The host-RAM KV tier (core-06): holds evicted (suspended) request
+    /// snapshots in two tiers (probation → protected); evictions are
+    /// bounded by `host_capacity_pages`.
+    host: HostTier,
+    /// The scheduling tick (a per-advance counter; the LRU `use_tick` for
+    /// retained-lane victim selection).
+    tick: u64,
 }
 
 impl ConcreteScheduler {
@@ -137,10 +165,7 @@ impl ConcreteScheduler {
     /// A scheduler with explicit knobs (tests; the host tier will set
     /// `max_in_flight > N_DECODE_LANES` in core-06).
     pub fn with_config(config: SchedulerConfig, compute: Arc<dyn Compute>) -> Self {
-        assert!(
-            config.max_in_flight > 0,
-            "in-flight cap must be non-zero"
-        );
+        assert!(config.max_in_flight > 0, "in-flight cap must be non-zero");
         assert!(
             config.max_prefill_batch > 0,
             "prefill batch size must be non-zero"
@@ -163,6 +188,8 @@ impl ConcreteScheduler {
             kv_used_pages: 0,
             protection: None,
             protection_epoch: 1,
+            host: HostTier::new(config.host_capacity_pages),
+            tick: 0,
             config,
             compute,
             next_id: 0,
@@ -191,6 +218,12 @@ impl ConcreteScheduler {
     /// (core-05; telemetry: the `kv_used` dimension).
     pub fn kv_used_pages(&self) -> u32 {
         self.kv_used_pages
+    }
+
+    /// The KV-RAM host tier (core-06): the bounded host-RAM budget for
+    /// evicted (suspended) request snapshots (telemetry / tests).
+    pub fn host_tier(&self) -> &HostTier {
+        &self.host
     }
 
     /// The last hard compute error the most recent advance reported, if
@@ -365,18 +398,19 @@ impl ConcreteScheduler {
                 &active,
                 &self.capacity,
             ) {
-                self.protection
-                    .as_mut()
-                    .unwrap()
-                    .phase = ProtectionPhase::Drain;
+                self.protection.as_mut().unwrap().phase = ProtectionPhase::Drain;
             }
-            if self
-                .protection
-                .as_ref()
-                .unwrap()
-                .phase
-                == ProtectionPhase::Open
-            {
+            // core-06: try to free a lane by evicting a retained lane to
+            // the host tier (the overflow path). When a victim is evicted
+            // and the head now fits, deal the head normally (clearing the
+            // protection) and skip the backfill classification for this
+            // step.
+            if self.try_evict_for_head(head, events) {
+                self.try_admit(head, BackfillClass::None, events);
+                self.protection = None; // the head is dealt: clear it
+                return;
+            }
+            if self.protection.as_ref().unwrap().phase == ProtectionPhase::Open {
                 let frontier =
                     protection_frontier_distance(self.protection.as_ref().unwrap(), &active);
                 for &c in &queue[1..] {
@@ -396,10 +430,8 @@ impl ConcreteScheduler {
                     {
                         // Credit decay: a temporal backfill spends its
                         // own service work out of the frozen credit.
-                        self.protection
-                            .as_mut()
-                            .unwrap()
-                            .temporal_credit -= self.requests[c].remaining_work;
+                        self.protection.as_mut().unwrap().temporal_credit -=
+                            self.requests[c].remaining_work;
                         self.try_admit(c, BackfillClass::Temporal, events);
                     }
                 }
@@ -411,12 +443,7 @@ impl ConcreteScheduler {
     fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
         let (release_pages, lane, request_id, tokens) = {
             let r = &self.requests[idx];
-            (
-                r.resources.kv_pages,
-                r.lane,
-                r.id,
-                r.tokens,
-            )
+            (r.resources.kv_pages, r.lane, r.id, r.tokens)
         };
         self.requests[idx].advance(RequestState::Done);
         if let Some(lane) = lane {
@@ -434,6 +461,175 @@ impl ConcreteScheduler {
             request: request_id,
             tokens,
         });
+    }
+
+    // ── core-06: the KV-RAM host tier ───────────────────────────────────
+
+    /// The retained-lane candidates for victim selection (core-06): every
+    /// running request's lane, excluding the protection's donors (donors
+    /// are never evicted while the protection is open) and reserved lanes
+    /// (none in v1 — sibling-prefix reservation lands in core-07).
+    fn retained_lane_candidates(&self) -> Vec<RetainedLaneCandidate> {
+        let donors: std::collections::HashSet<RequestId> = self
+            .protection
+            .as_ref()
+            .map(|p| p.donor_ids.iter().copied().collect())
+            .unwrap_or_default();
+        self.requests
+            .iter()
+            .filter(|r| r.state == RequestState::Running)
+            .filter(|r| !donors.contains(&r.id))
+            .map(|r| RetainedLaneCandidate {
+                lane: r.lane.expect("a running request holds a lane"),
+                owner: r.class,
+                use_tick: self.tick,
+                reserved_for_earlier_interactive: false, // core-07
+            })
+            .collect()
+    }
+
+    /// Re-queue a discarded (evicted) request for re-prefill (core-06): its
+    /// host-tier snapshot was discarded (the tier was full), so the request
+    /// goes back to `Admitted` (re-prefills from the start — its warmed KV
+    /// is gone) and its service-work counters are reset.
+    fn requeue_request(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+        let r = &mut self.requests[idx];
+        r.requeue(); // Evicted → Admitted, lane released (there is none).
+        r.tokens = 0;
+        let effective_max = r
+            .input
+            .params
+            .max_tokens
+            .unwrap_or(self.config.max_sequence_tokens);
+        r.remaining_work = effective_max as u64;
+        r.backfill_class = BackfillClass::None;
+        r.backfill_epoch = 0;
+        events.push(SchedEvent::Requeued { request: r.id });
+    }
+
+    /// Make room in the host tier for `pages` pages (core-06): discard the
+    /// lowest-value entries (probation LRU) while the tier is over budget,
+    /// re-queueing each discarded request (its snapshot was lost — it
+    /// re-prefills from the start). Returns `true` when the tier can hold
+    /// `pages` (there is room, or it was made).
+    fn make_room_for(&mut self, pages: u32, events: &mut Vec<SchedEvent>) -> bool {
+        while self.host.used_pages() + pages > self.host.capacity_pages() {
+            match self.host.evict_one() {
+                Some(discarded) => {
+                    if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request)
+                    {
+                        self.requeue_request(idx, events);
+                    }
+                }
+                None => return false, // the tier is empty (nothing to evict)
+            }
+        }
+        true
+    }
+
+    /// Try to admit a blocked head by evicting a retained lane to the host
+    /// tier (core-06): while the head does not fit, pick the lowest-value
+    /// non-donor running lane (`choose_retained_lane_victim`), make room in
+    /// the host tier (re-queueing any discarded snapshot), snapshot the
+    /// victim into the tier, and release its lane + pages. Returns `true`
+    /// once the head fits (the caller deals it), `false` when no evictable
+    /// victim remains (the head is held — the backfill / donor wait path).
+    fn try_evict_for_head(&mut self, head_idx: usize, events: &mut Vec<SchedEvent>) -> bool {
+        loop {
+            if self.fits(&self.requests[head_idx]) {
+                return true;
+            }
+            // No free lane / the head still does not fit: try to evict a
+            // retained lane (a running request other than the donors).
+            let candidates = self.retained_lane_candidates();
+            let Some(victim_lane) = choose_retained_lane_victim(&candidates) else {
+                return false; // no evictable victim (all reserved / none)
+            };
+            let Some(v_idx) = self
+                .requests
+                .iter()
+                .position(|r| r.lane == Some(victim_lane))
+            else {
+                return false;
+            };
+            // Copy the request's state (avoid a borrow conflict with the
+            // mutation below).
+            let (v_id, v_class, v_pages, v_tokens, v_work, v_gdn) = {
+                let v = &self.requests[v_idx];
+                (
+                    v.id,
+                    v.class,
+                    v.resources.kv_pages,
+                    v.tokens,
+                    v.remaining_work,
+                    v.gdn.clone(),
+                )
+            };
+            // Make room in the host tier (re-queueing any discarded
+            // snapshot).
+            if !self.make_room_for(v_pages, events) {
+                return false; // the host tier cannot hold the snapshot
+            }
+            let entry = HostEntry {
+                request: v_id,
+                lane: victim_lane,
+                owner: v_class,
+                pages: v_pages,
+                tokens: v_tokens,
+                remaining_work: v_work,
+                gdn: v_gdn,
+                tier: Tier::Probation,
+                use_tick: self.tick,
+            };
+            // Capture the snapshot (rejects a mid-prefill GDN position,
+            // core-02).
+            if self.host.capture(entry).is_err() {
+                return false; // the snapshot is invalid (e.g. mid-prefill)
+            }
+            // Evict the request (Running → Evicted; the lane is released).
+            self.requests[v_idx].evict();
+            self.free_lanes.push(victim_lane);
+            self.kv_used_pages = self.kv_used_pages.saturating_sub(v_pages);
+            events.push(SchedEvent::Evicted { request: v_id });
+            // Loop: re-check whether the head now fits.
+        }
+    }
+
+    /// Restore evicted (suspended) requests to free lanes (core-06): a
+    /// restored request resumes from where it was evicted (no re-prefill),
+    /// taking priority over a fresh prefill. Restores as many evicted
+    /// requests as there are free lanes + page headroom, in the host
+    /// tier's victim order (the entries closest to being discarded).
+    fn restore_pass(&mut self, events: &mut Vec<SchedEvent>) {
+        loop {
+            if self.free_lanes.is_empty() {
+                break;
+            }
+            let victim = match self.host.victim() {
+                Some(v) => v.clone(),
+                None => break, // no evicted request to restore
+            };
+            // The restored request's pages must fit the GPU pool.
+            if self.kv_used_pages + victim.pages > self.capacity.kv_pages {
+                break; // no page headroom: leave it (retry next advance)
+            }
+            let lane = self.free_lanes.pop().expect("checked non-empty above");
+            let snap = self
+                .host
+                .restore(victim.request)
+                .expect("the victim is a tier entry");
+            let idx = self
+                .requests
+                .iter()
+                .position(|r| r.id == snap.request)
+                .expect("a host-tier snapshot always maps to a request");
+            self.requests[idx].restore_lane(lane);
+            self.kv_used_pages += snap.pages;
+            events.push(SchedEvent::Restored {
+                request: snap.request,
+                lane,
+            });
+        }
     }
 }
 
@@ -456,11 +652,8 @@ impl Scheduler for ConcreteScheduler {
             .params
             .max_tokens
             .unwrap_or(self.config.max_sequence_tokens);
-        let reserved_tokens =
-            (input.tokens.len() as u64).saturating_add(effective_max as u64);
-        let kv_pages = ((reserved_tokens
-            + self.config.kv_page_tokens as u64
-            - 1)
+        let reserved_tokens = (input.tokens.len() as u64).saturating_add(effective_max as u64);
+        let kv_pages = ((reserved_tokens + self.config.kv_page_tokens as u64 - 1)
             / self.config.kv_page_tokens as u64)
             .min(u32::MAX as u64) as u32;
         let resources = AdmissionResources {
@@ -486,6 +679,9 @@ impl Scheduler for ConcreteScheduler {
     fn advance(&mut self) -> Vec<SchedEvent> {
         let mut events: Vec<SchedEvent> = Vec::new();
         self.last_error = None;
+        // core-06: advance the scheduling tick (the LRU `use_tick` for
+        // retained-lane victim selection).
+        self.tick += 1;
 
         // Phase 1 — batched prefill: the queued requests go to the
         // compute backend in ONE batched call, not one call per
@@ -530,7 +726,11 @@ impl Scheduler for ConcreteScheduler {
         }
 
         // Phase 2 — the admission state machine drives the lane deal
-        // (core-05; see `run_admission`).
+        // (core-05; see `run_admission`). Restored (suspended) requests
+        // take a free lane before a fresh prefill (core-06: a sibling
+        // request restores instead of re-prefilling), so the restore pass
+        // runs first.
+        self.restore_pass(&mut events);
         self.run_admission(&mut events);
 
         // Phase 3 — batched decode: one compute call spanning every
@@ -581,6 +781,12 @@ impl Scheduler for ConcreteScheduler {
                                     request: self.requests[i].id,
                                     token: *token,
                                 });
+                                // core-06: record a GDN checkpoint at the
+                                // new position (the host tier may snapshot
+                                // the request at this boundary — the GDN
+                                // state is resumable there).
+                                let new_pos = self.requests[i].tokens as usize;
+                                self.requests[i].checkpoint(new_pos);
                                 // The reservation cap: the request
                                 // completes on its final reserved token.
                                 if self.requests[i].remaining_work == 0 {
@@ -598,6 +804,12 @@ impl Scheduler for ConcreteScheduler {
                 Err(e) => self.last_error = Some(e),
             }
         }
+
+        // Phase 4 — restore (core-06): lanes freed by this step's
+        // completions (and the eviction above) go to suspended (host-
+        // tier) requests before a fresh prefill — a sibling request
+        // restores instead of re-prefilling.
+        self.restore_pass(&mut events);
 
         events
     }

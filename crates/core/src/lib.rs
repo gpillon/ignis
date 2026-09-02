@@ -19,6 +19,7 @@ pub mod admission;
 pub mod concrete;
 pub mod ffi;
 pub mod gdn;
+pub mod host;
 pub mod kv;
 pub mod mock;
 pub mod request;
@@ -30,8 +31,9 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
+pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;
-pub use request::{admit_candidates, basic_admission, Request};
+pub use request::{Request, admit_candidates, basic_admission};
 pub use scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
 pub use types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, LaneId, N_DECODE_LANES, RequestClass,
