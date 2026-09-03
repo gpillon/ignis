@@ -160,3 +160,29 @@ and a 0/-1 int return code (the same style as ticket-03's decode surface
 and ticket-05's prefill/GDN surface). There is no reference equivalent
 (the reference's driver was the engine's op dispatch); this is the new C
 ABI surface for the pointwise / output path.
+
+### `kernel/src/graph_capture.cu` (ticket 10, kernel-abi-03, GitHub #10)
+Eager CUDA-graph capture at startup (design §1/§2): the `extern "C"`
+functions `ignis_graph_begin_capture`, `ignis_graph_end_capture`,
+`ignis_graph_launch`, `ignis_graph_destroy` (the flat C ABI capture
+surface — an opaque `struct ignis_graph` handle owning the captured graph,
+its instantiated executable, and, when the leaf created the capture
+stream, the stream itself) plus `ignis_graph_startup_check` (the startup
+verification: capture a representative prefill + decode kernel sequence —
+the ticket-05 GQA prefill attention + GDN step and the ticket-03 GQA
+decode attention, a few KB of VRAM — into a CUDA graph, replay it, and
+confirm the replayed outputs match the eager outputs bit-exactly; the
+99% performance gate on the canary suite is ADR 0007 / ignis-bench,
+ticket 20). Built on the CUDA runtime stream-capture API
+(`cudaStreamBeginCapture` / `cudaStreamEndCapture` /
+`cudaGraphInstantiate` / `cudaGraphLaunch`); the captured launches are
+the ported kernels from the sibling .cuh files, launched directly with
+`<<<>>>` on the capture stream (the host-pointer surfaces do their H2D/
+D2H on the legacy stream, which cannot be captured — the v1 serving loop
+keeps activations device-resident, so the graph holds only kernel nodes).
+The launch configurations mirror the ticket-05/03 surfaces 1:1. There is
+no reference equivalent (the reference's driver was the engine's op
+dispatch, and its graph capture was engine-internals C++ state the flat C
+ABI of ADR 0001 forbids across the boundary); this is new C ABI surface
+for the v1 eager-graph decision (self-contained; provenance in
+kernel/NOTICE, as with the sibling surfaces).

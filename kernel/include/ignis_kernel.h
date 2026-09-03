@@ -75,9 +75,12 @@ int ignis_gqa_attention_decode(const void *q, const void *kv_cache,
  * greedy sampling, kernel/src/rmsnorm.cuh, embed_gather.cuh, argmax.cuh,
  * norms_sampling_surface.cu) are now implemented and GPU-verified (the
  * crates/core/tests/kernel_abi01_gpu + kernel_abi02_gpu launch them on the
- * GPU even with the model loaded, ADR 0006 nuance). The CUDA-graph (10) .cu
- * and the 99% performance gate (ADR 0007) driven by ignis-bench remain
- * pending.
+ * GPU even with the model loaded, ADR 0006 nuance). The ticket-10 CUDA-graph
+ * capture code (kernel/src/graph_capture.cu: the ignis_graph_* primitives +
+ * the ignis_graph_startup_check startup verification) is now implemented —
+ * the capture run is GPU-gated and self-skips (crates/core/tests/
+ * kernel_abi03_gpu, ADR 0006); the 99% performance gate (ADR 0007) driven
+ * by ignis-bench remains pending (ticket 20).
  * ------------------------------------------------------------------------ */
 
 /* Ticket 05 (kernel-abi-01): GQA prefill attention (batched, multi-token).
@@ -132,26 +135,61 @@ int ignis_embedding(const void *table, const void *id, void *out,
 int ignis_greedy_sample(const void *logits, void *out, int64_t batch,
                         int64_t vocab, void *stream);
 
-/* Ticket 10 (kernel-abi-03): eager CUDA-graph capture at startup. One opaque
- * graph handle, captured at startup and replayed on each step (v1 decision;
- * lazy capture is a later optimization). */
+/* Ticket 10 (kernel-abi-03): eager CUDA-graph capture at startup. One
+ * opaque graph handle, captured at startup and replayed on each step (v1
+ * decision; lazy capture is a later optimization, design §1).
+ *
+ * Capture-stream note: a CUDA graph cannot be captured on the legacy
+ * default stream. When a null stream is passed to ignis_graph_begin_capture,
+ * the leaf creates a non-blocking capture stream owned by the graph handle
+ * (destroyed by ignis_graph_destroy); a non-null stream is the caller's
+ * (it must not be the legacy default stream, which cannot be captured, and
+ * the leaf does not own it).
+ * A null stream to ignis_graph_launch selects the graph's own capture
+ * stream (the legacy default stream is avoided for graph launches). */
 struct ignis_graph;
 
-/* Begin a CUDA graph capture on `stream` (null = stream 0). The caller
- * issues the prefill/decode kernel launches (the entry points above) while
- * the capture is active, then calls ignis_graph_end_capture to materialize
- * the graph. Returns 0 on success, -1 on error. */
+/* Begin a CUDA graph capture on `stream` (null = a leaf-owned non-blocking
+ * stream — the legacy default stream cannot be captured). The caller
+ * issues the prefill/decode kernel launches (the entry points above, or
+ * raw kernel launches on this stream) while the capture is active, then
+ * calls ignis_graph_end_capture to materialize the graph. One capture at a
+ * time (v1 startup capture is single-shot; the launch happens on the
+ * capturing thread, thread-local capture mode). Returns 0 on success,
+ * -1 on error (a capture already in progress, a stream mismatch, or a
+ * CUDA error — e.g. no GPU, the caller self-skips, ADR 0006). */
 int ignis_graph_begin_capture(void *stream);
 
 /* End the capture, materializing the graph into *out (a graph-executable).
- * Returns 0 on success, -1 on error. */
+ * `stream` must match the stream passed to ignis_graph_begin_capture
+ * (null = the leaf-owned stream). Returns 0 on success, -1 on error (no
+ * active capture, a stream mismatch, or a CUDA error). */
 int ignis_graph_end_capture(void *stream, struct ignis_graph **out);
 
-/* Launch a captured graph on `stream`. Returns 0 on success, -1 on error. */
+/* Launch a captured graph on `stream` (null = the graph's own capture
+ * stream — the legacy default stream is avoided for graph launches).
+ * Returns 0 on success, -1 on error (a null graph handle is a clean -1,
+ * before any CUDA call). */
 int ignis_graph_launch(struct ignis_graph *g, void *stream);
 
-/* Destroy a captured graph. NULL is a no-op. */
+/* Destroy a captured graph (and, when the leaf created the capture stream,
+ * the stream). NULL is a no-op (no CUDA calls). */
 void ignis_graph_destroy(struct ignis_graph *g);
+
+/* Ticket 10 (kernel-abi-03): the startup verification. Captures a
+ * representative prefill + decode kernel sequence (GQA prefill attention +
+ * GDN step + GQA decode attention, the per-step structure; a few KB of
+ * VRAM — runs even with the model loaded, the ADR 0006 nuance) into a CUDA
+ * graph, runs the same sequence eagerly and via graph replay, and confirms
+ * the replayed outputs match the eager outputs bit-exactly. The canary-
+ * suite 99% performance gate (ADR 0007) is driven by ignis-bench
+ * (ticket 20), not here. stream: null = stream 0 for the eager phase (the
+ * capture itself runs on the leaf-owned non-blocking stream). Returns 0 if
+ * the capture verified and replay matches eager, -1 on a CUDA error (GPU
+ * unavailable / busy — the caller self-skips, ADR 0006), -2 if the capture
+ * succeeded but the replayed result diverged from the eager result (a real
+ * failure — the graph path is broken; not a skip condition). */
+int ignis_graph_startup_check(void *stream);
 
 #ifdef __cplusplus
 }

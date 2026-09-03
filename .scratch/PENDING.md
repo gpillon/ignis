@@ -12,18 +12,6 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   against. The synthetic `main_plus_10.jsonl` fixture is not a reference.
   Owner: bench actor. Blocker: GPU + a recorded reference recording.
 
-- **kernel-abi: CUDA-graph capture + 99% performance gate (ADR 0006/0007, GitHub #10).**
-  The C ABI surface (kernel-abi 01-03, adb6ac9) is committed. Ticket-05's
-  (GitHub #5) GQA-prefill + GDN-step kernels are implemented and GPU-verified
-  — `kernel_abi01_gpu` (`gqa_attention_prefill_gpu` + `gdn_step_gpu`) passed
-  on a free GPU on 2026-09-03 — and ticket-06's (GitHub #6) norms /
-  embedding / greedy-sampling kernels are implemented and GPU-verified —
-  `kernel_abi02_gpu` (`rmsnorm_gpu` + `layernorm_gpu` + `embedding_gpu` +
-  `greedy_sample_gpu`) passed on 2026-09-03 — so #5 and #6 are done. The
-  remaining CUDA work (GitHub #10: the CUDA-graph capture .cu) and the 99%
-  gate (ADR 0007) are GPU-gated and deferred until a reference baseline
-  exists (see bench-02 above). Owner: kernel actor. Blocker: GPU.
-
 ## Blocked (external)
 
 - **GPU availability (ADR 0006).** All GPU-gated items above require the
@@ -31,6 +19,19 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   GPU test run). Re-check before scheduling GPU work.
 
 ## Resolved (pruned weekly)
+
+- **kernel-abi-03: CUDA-graph eager capture at startup (GitHub #10, ADR 0006/0007)** —
+  resolved 2026-09-03: `kernel/src/graph_capture.cu` implements the four
+  `ignis_graph_*` primitives + `ignis_graph_startup_check` (captures a
+  representative GQA-prefill + GDN-step + GQA-decode kernel sequence into a
+  CUDA graph, replays it, and verifies replay ≡ eager bit-exactly). The
+  kernels are forward-declared in the .cu (defined in the sibling surface .cu
+  files) to avoid LNK4006 duplicate definitions. `kernel_abi03_gpu`
+  (`graph_primitives_roundtrip_gpu` + `graph_startup_check_gpu` + the CPU
+  null-handle pin) passed on 2026-09-03; the startup check confirmed on the
+  GPU that replay ≡ eager. The 99% performance gate (ADR 0007) remains
+  pending under bench-02 (GitHub #20, a recorded reference baseline is
+  required).
 
 - **artifact-01: `CudaDevice` real-artifact VRAM materialization (GitHub #4, ADR 0006)** —
   resolved 2026-09-03: `real_nvfp4full_cuda_device` passed on a free RTX 5090

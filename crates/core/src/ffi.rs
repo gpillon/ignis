@@ -76,8 +76,12 @@ unsafe extern "C" {
     // greedy sampling, kernel/src/rmsnorm.cuh, embed_gather.cuh, argmax.cuh,
     // norms_sampling_surface.cu) — both GPU-verified (tests/kernel_abi01_gpu +
     // kernel_abi02_gpu launch them on the GPU even with the model loaded,
-    // ADR 0006 nuance). The CUDA-graph (10) .cu and the 99% performance gate
-    // (ADR 0007) driven by ignis-bench remain pending.
+    // ADR 0006 nuance). The ticket-10 CUDA-graph capture code
+    // (kernel/src/graph_capture.cu: the `ignis_graph_*` primitives +
+    // `ignis_graph_startup_check`) is now implemented — the capture run is
+    // GPU-gated and self-skips (tests/kernel_abi03_gpu, ADR 0006); the 99%
+    // performance gate (ADR 0007) driven by ignis-bench remains pending
+    // (ticket 20).
     // ------------------------------------------------------------------
 
     /// GQA prefill attention (batched, multi-token), the prefill path.
@@ -159,22 +163,48 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
-    /// Begin a CUDA graph capture on `stream` (null = stream 0). The caller
-    /// issues the prefill/decode kernel launches while the capture is active,
-    /// then calls `ignis_graph_end_capture`. Returns 0 on success, -1 on
-    /// error.
+    /// Begin a CUDA graph capture on `stream` (null = a leaf-owned
+    /// non-blocking stream — the legacy default stream cannot be captured).
+    /// One capture at a time (v1 startup capture is single-shot; the launch
+    /// happens on the capturing thread, thread-local capture mode). The
+    /// caller issues the prefill/decode kernel launches while the capture is
+    /// active, then calls `ignis_graph_end_capture`. Returns 0 on success,
+    /// -1 on error (a capture already in progress, a stream mismatch, or a
+    /// CUDA error — e.g. no GPU, the caller self-skips, ADR 0006).
     pub fn ignis_graph_begin_capture(stream: *mut std::ffi::c_void) -> i32;
 
     /// End the capture, materializing the graph into `*out` (a
-    /// graph-executable). Returns 0 on success, -1 on error.
+    /// graph-executable). `stream` must match the stream passed to
+    /// `ignis_graph_begin_capture` (null = the leaf-owned stream). Returns 0
+    /// on success, -1 on error (no active capture, a stream mismatch, or a
+    /// CUDA error).
     pub fn ignis_graph_end_capture(stream: *mut std::ffi::c_void, out: *mut *mut IgnisGraph) -> i32;
 
-    /// Launch a captured graph on `stream`. Returns 0 on success, -1 on
-    /// error.
+    /// Launch a captured graph on `stream` (null = the graph's own capture
+    /// stream — the legacy default stream is avoided for graph launches).
+    /// Returns 0 on success, -1 on error (a null graph handle is a clean -1,
+    /// before any CUDA call).
     pub fn ignis_graph_launch(graph: *mut IgnisGraph, stream: *mut std::ffi::c_void) -> i32;
 
-    /// Destroy a captured graph. NULL is a no-op.
+    /// Destroy a captured graph (and, when the leaf created the capture
+    /// stream, the stream). NULL is a no-op (no CUDA calls).
     pub fn ignis_graph_destroy(graph: *mut IgnisGraph);
+
+    /// The startup verification (ticket 10, kernel-abi-03): capture a
+    /// representative prefill + decode kernel sequence (GQA prefill
+    /// attention + GDN step + GQA decode attention — a few KB of VRAM, runs
+    /// even with the model loaded, the ADR 0006 nuance) into a CUDA graph,
+    /// run the same sequence eagerly and via graph replay, and confirm the
+    /// replayed outputs match the eager outputs bit-exactly. The canary-
+    /// suite 99% performance gate (ADR 0007) is driven by ignis-bench
+    /// (ticket 20), not here. `stream`: null = stream 0 for the eager phase
+    /// (the capture itself runs on the leaf-owned non-blocking stream).
+    /// Returns 0 if the capture verified and replay matches eager, -1 on a
+    /// CUDA error (GPU unavailable / busy — the caller self-skips, ADR
+    /// 0006), -2 if the capture succeeded but the replayed result diverged
+    /// from the eager result (a real failure — the graph path is broken;
+    /// not a skip condition).
+    pub fn ignis_graph_startup_check(stream: *mut std::ffi::c_void) -> i32;
 }
 
 #[cfg(test)]
@@ -203,9 +233,12 @@ mod tests {
     // CPU-verifiable geometry for the kernel-abi C-ABI surface (tickets
     // 05/06/10). Pure Rust, no FFI calls — these pin the expected output
     // sizes for the flat-C-ABI kernels so the contract is testable on CPU.
-    // The ticket-05 .cu (prefill + GDN step) are now implemented and
-    // GPU-verified (tests/kernel_abi01_gpu); the 99% performance gate
-    // (ADR 0007) driven by ignis-bench remains pending.
+    // The ticket-05 .cu (prefill + GDN step) are implemented and
+    // GPU-verified (tests/kernel_abi01_gpu); the ticket-10 CUDA-graph
+    // capture code (kernel/src/graph_capture.cu) is implemented — the
+    // capture run is GPU-gated and self-skips (tests/kernel_abi03_gpu);
+    // the 99% performance gate (ADR 0007) driven by ignis-bench remains
+    // pending (ticket 20).
     // -------------------------------------------------------------------------
 
     /// GQA prefill output element count: `[batch][seq_len][num_q_heads][head_dim]`.
