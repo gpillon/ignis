@@ -21,24 +21,19 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   is free and a reference baseline exists (see bench-02 above). Owner: kernel
   actor. Blocker: GPU.
 
-- **artifact-01: `CudaDevice` real-artifact VRAM materialization (GitHub #4, ADR 0006).**
-  The binder + materializer + typed binding (`3299a2e`) are committed and
-  CPU-verified: `IGNIS_TEST_FULL_MATERIALIZE=1` full `CpuDevice`
-  materialization green, ADR 0002 failure paths tested, and a bounded 4-slot
-  staging pool (peak = 4 x largest aligned span, not the sum of every
-  object). The `CudaDevice` real-artifact VRAM upload — `IGNIS_TEST_CUDA=1
-  cargo test -p ignis-artifact --features cuda -- real_nvfp4full_cuda_device`
-  (~19 GB H2D of all ~1,319 device tensors) — is GPU-gated (needs a free RTX
-  5090 with ~19 GB headroom, ADR 0006) and is deferred until the GPU is
-  free. Owner: artifact actor. Blocker: GPU.
-
 ## Blocked (external)
 
 - **GPU availability (ADR 0006).** All GPU-gated items above require the
-  RTX 5090 to be free. Last freed 2026-09-02 (stopped `ninfer-serve`).
-  Re-check before scheduling GPU work.
+  RTX 5090 to be free. Last freed 2026-09-03 (GPU verified free, artifact-01
+  GPU test run). Re-check before scheduling GPU work.
 
 ## Resolved (pruned weekly)
+
+- **artifact-01: `CudaDevice` real-artifact VRAM materialization (GitHub #4, ADR 0006)** —
+  resolved 2026-09-03: `real_nvfp4full_cuda_device` passed on a free RTX 5090
+  (9.42 s, 1,319 tensors H2D, ~19 GB VRAM). Build fix: `CMAKE_MSVC_RUNTIME_LIBRARY`
+  set to `MultiThreaded` in `kernel/build.ps1` to force `/MT` static CRT (Rust
+  MSVC target requires it; CMake default `/MD` caused LNK2038).
 
 - **server-03: checksum wiring into the artifact loader (GitHub #21)** —
   resolved 2026-09-02 (`loader` module in `crates/server`, verified load
