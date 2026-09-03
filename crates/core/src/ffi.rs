@@ -149,6 +149,46 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    /// NVFP4 decode GEMV with DEVICE-RESIDENT weights (ticket 26, GitHub #26,
+    /// the compute-adapter's production path). `act` (host bf16 [k]), `bias`
+    /// (host bf16 [m], nullable) and `out` (host bf16 [m]) are H2D/D2H'd
+    /// (small); `wt_codes` (device E2M1 [m][k/2] bytes) and `wt_scales`
+    /// (device E4M3 [m][k/16] bytes) are DEVICE pointers (the artifact's
+    /// materialized arena) — the leaf does NOT H2D them (no per-call weight
+    /// upload, the #26 fix). `k` must be a multiple of 16; `m`, `k` > 0.
+    /// `stream`: null = stream 0. Returns 0 on success, -1 on error.
+    pub fn ignis_nvfp4_gemm_decode_device(
+        act: *const std::ffi::c_void,
+        wt_codes: *const std::ffi::c_void,
+        wt_scales: *const std::ffi::c_void,
+        bias: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        m: i64,
+        k: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// NVFP4 multi-token GEMM with DEVICE-RESIDENT weights (ticket 26,
+    /// GitHub #26, the compute-adapter's production path). `act` (host bf16
+    /// [tokens][k]), `bias` (host bf16 [m], nullable) and `out` (host bf16
+    /// [tokens][m]) are H2D/D2H'd (small); `wt_codes` (device E2M1 [m][k/2]
+    /// bytes) and `wt_scales` (device E4M3 [m][k/16] bytes) are DEVICE
+    /// pointers (the artifact's materialized arena) — the leaf does NOT H2D
+    /// them (no per-call weight upload, the #26 fix). `k` must be a multiple
+    /// of 16; `tokens`, `m`, `k` > 0. `stream`: null = stream 0. Returns 0
+    /// on success, -1 on error.
+    pub fn ignis_nvfp4_gemm_prefill_device(
+        act: *const std::ffi::c_void,
+        wt_codes: *const std::ffi::c_void,
+        wt_scales: *const std::ffi::c_void,
+        bias: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        tokens: i64,
+        m: i64,
+        k: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     /// RMSNorm (LayerNorm when `center` is non-null). `x`: bf16 [n].
     /// `weight` (nullable): bf16 [n]. `center` (nullable): bf16 [n].
     /// `out`: bf16 [n]. `eps` <= 0 selects 1e-6. Returns 0 on success,

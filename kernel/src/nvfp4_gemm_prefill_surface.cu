@@ -107,3 +107,65 @@ extern "C" int ignis_nvfp4_gemm_prefill(const void* act, const void* wt_codes,
   cudaFree(d_out);
   return gemm_prefill_report(err);
 }
+
+// Ticket 26 (GitHub #26): NVFP4 multi-token GEMM with DEVICE-RESIDENT weights.
+// `wt_codes` / `wt_scales` are device pointers (the artifact's materialized
+// arena, ADR 0002); the leaf does NOT H2D them (no per-call weight upload —
+// the #26 fix). `act` (host bf16 [tokens][k]) + `bias` (host bf16 [m],
+// nullable) are H2D'd (small); `out` (host bf16 [tokens][m]) is D2H'd. Runs
+// on the current CUDA device (device 0 in the single-GPU v1; the caller sets
+// it via the artifact CudaDevice).
+extern "C" int ignis_nvfp4_gemm_prefill_device(const void* act, const void* wt_codes,
+                                               const void* wt_scales, const void* bias,
+                                               void* out, std::int64_t tokens,
+                                               std::int64_t m, std::int64_t k,
+                                               void* stream) {
+  if (tokens <= 0 || m <= 0 || k <= 0 || (k % 16) != 0 || act == nullptr ||
+      wt_codes == nullptr || wt_scales == nullptr || out == nullptr) {
+    return -1;
+  }
+
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);  // null = stream 0
+  const std::int64_t act_elems = tokens * k;
+  const std::int64_t out_elems = tokens * m;
+
+  __nv_bfloat16* d_act = nullptr;
+  __nv_bfloat16* d_bias = nullptr;
+  __nv_bfloat16* d_out = nullptr;
+
+  cudaError_t err = cudaMalloc(&d_out, static_cast<size_t>(out_elems) * sizeof(__nv_bfloat16));
+  if (err == cudaSuccess) {
+    err = cudaMalloc(&d_act, static_cast<size_t>(act_elems) * sizeof(__nv_bfloat16));
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(d_act, act, static_cast<size_t>(act_elems) * sizeof(__nv_bfloat16),
+                     cudaMemcpyHostToDevice);
+  }
+  if (err == cudaSuccess && bias != nullptr) {
+    err = cudaMalloc(&d_bias, m * sizeof(__nv_bfloat16));
+    if (err == cudaSuccess) {
+      err = cudaMemcpy(d_bias, bias, m * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    }
+  }
+  if (err == cudaSuccess) {
+    // The weights (wt_codes / wt_scales) are DEVICE pointers (the materialized
+    // arena); they are passed straight to the kernel (no H2D).
+    const std::uint8_t* d_codes = static_cast<const std::uint8_t*>(wt_codes);
+    const std::uint8_t* d_scales = static_cast<const std::uint8_t*>(wt_scales);
+    dim3 grid(static_cast<unsigned>((m + 15) / 16), static_cast<unsigned>((tokens + 15) / 16));
+    dim3 block(16, 16);
+    ignis::nvfp4_gemm_prefill_kernel<<<grid, block, 0, s>>>(
+        d_act, d_codes, d_scales, d_bias, d_out, static_cast<std::int32_t>(tokens),
+        static_cast<std::int32_t>(m), static_cast<std::int32_t>(k));
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(out, d_out, static_cast<size_t>(out_elems) * sizeof(__nv_bfloat16),
+                     cudaMemcpyDeviceToHost);
+  }
+  if (err == cudaSuccess) err = cudaStreamSynchronize(s);
+  cudaFree(d_act);
+  cudaFree(d_bias);
+  cudaFree(d_out);
+  return gemm_prefill_report(err);
+}

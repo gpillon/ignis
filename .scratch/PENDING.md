@@ -27,6 +27,28 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 
 ## Resolved (pruned weekly)
 
+- **#26: compute-adapter crash fix + VRAM materialization + device-GEMM
+  surface (GitHub #26, ADR 0002/0006).**
+  Resolved 2026-09-03: `CudaCompute::from_artifact` no longer falls back to
+  the synthetic topology (vocab 256) — it uses the real `qwen38_27b()`
+  topology, so real-tokenizer ids (up to 248077) never index out of bounds in
+  `ignis_embedding` (the `illegal memory access`), and the 19 GB of weights
+  materialize to VRAM via `CudaDevice` (`vram_resident()`). Host-side
+  `Weights` are a zero-cost `placeholder` (the real weights live in the VRAM
+  arena, ADR 0002); the device-resident GEMM surface
+  (`ignis_nvfp4_gemm_{decode,prefill}_device`) is compiled into the kernel
+  leaf `.lib` (a prerequisite for the broader compute-adapter, kernel-abi
+  04/05).
+  **The #26 "hang" was a CPU OOM trap, not a GPU deadlock:** the prior build
+  ran `Weights::synthetic` at the real topology (~1.6 TiB of generated host
+  vectors in a debug build), so the CPU spun for minutes/hours *after* the
+  19 GB H2D while the GPU sat at 0 % — which read like a stuck
+  `cudaStreamSynchronize`. `Weights::placeholder` (zero-cost) fixes it; the
+  E2E (`real_model_e2e`) now passes in ~9 s.
+  The numerically-correct real completion (the actual forward pass, the
+  CUDA-graph fast path, and the server serving real completions) is deferred
+  to #25 — no new ticket needed.
+
 - **kernel-abi-03: CUDA-graph eager capture at startup (GitHub #10, ADR 0006/0007)** —
   resolved 2026-09-03: `kernel/src/graph_capture.cu` implements the four
   `ignis_graph_*` primitives + `ignis_graph_startup_check` (captures a

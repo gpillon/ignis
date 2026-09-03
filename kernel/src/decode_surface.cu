@@ -83,6 +83,57 @@ extern "C" int ignis_nvfp4_gemm_decode(const void* act, const void* wt_codes,
   return decode_report(err);
 }
 
+// Ticket 26 (GitHub #26): NVFP4 decode GEMV with DEVICE-RESIDENT weights.
+// `wt_codes` / `wt_scales` are device pointers (the artifact's materialized
+// arena, ADR 0002); the leaf does NOT H2D them (no per-call weight upload —
+// the #26 fix). `act` (host bf16 [k]) + `bias` (host bf16 [m], nullable) are
+// H2D'd (small); `out` (host bf16 [m]) is D2H'd. Runs on the current CUDA
+// device (device 0 in the single-GPU v1; the caller sets it via the artifact
+// CudaDevice).
+extern "C" int ignis_nvfp4_gemm_decode_device(const void* act, const void* wt_codes,
+                                              const void* wt_scales, const void* bias,
+                                              void* out, std::int64_t m, std::int64_t k,
+                                              void* stream) {
+  if (m <= 0 || k <= 0 || (k % 2) != 0 || (k % 16) != 0) return -1;
+  if (out == nullptr) return -1;
+  if (act == nullptr || wt_codes == nullptr || wt_scales == nullptr) return -1;
+
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);  // null = stream 0
+
+  __nv_bfloat16* d_act = nullptr;
+  __nv_bfloat16* d_bias = nullptr;
+  __nv_bfloat16* d_out = nullptr;
+
+  cudaError_t err = cudaMalloc(&d_out, m * sizeof(__nv_bfloat16));
+  if (err == cudaSuccess) err = cudaMalloc(&d_act, k * sizeof(__nv_bfloat16));
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(d_act, act, k * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+  }
+  if (err == cudaSuccess && bias != nullptr) {
+    err = cudaMalloc(&d_bias, m * sizeof(__nv_bfloat16));
+    if (err == cudaSuccess) {
+      err = cudaMemcpy(d_bias, bias, m * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    }
+  }
+  if (err == cudaSuccess) {
+    // The weights (wt_codes / wt_scales) are DEVICE pointers (the materialized
+    // arena); they are passed straight to the kernel (no H2D).
+    const std::uint8_t* d_codes = static_cast<const std::uint8_t*>(wt_codes);
+    const std::uint8_t* d_scales = static_cast<const std::uint8_t*>(wt_scales);
+    ignis::nvfp4_gemm_decode_kernel<<<static_cast<unsigned>(m), kGemmThreads, 0, s>>>(
+        d_act, d_codes, d_scales, d_bias, d_out, static_cast<int>(m), static_cast<int>(k));
+    err = cudaGetLastError();
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(out, d_out, m * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+  }
+  if (err == cudaSuccess) err = cudaStreamSynchronize(s);
+  cudaFree(d_act);
+  cudaFree(d_bias);
+  cudaFree(d_out);
+  return decode_report(err);
+}
+
 extern "C" int ignis_gqa_attention_decode(const void* q, const void* kv_cache,
                                           const void* block_table, void* out,
                                           std::int64_t num_q_heads, std::int64_t num_kv_heads,

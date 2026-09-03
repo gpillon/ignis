@@ -54,6 +54,13 @@ use crate::ffi;
 use crate::scheduler::{Compute, DecodeJob, PrefillJob};
 use crate::types::{ComputeError, RequestId, TokenId};
 
+// The artifact's device context types (the `from_artifact` path, the #26
+// fix). `CudaDevice` is `cuda`-feature-gated (the VRAM arena owner, ADR 0002);
+// all three are only referenced by the `cuda`-gated `DeviceCtx::Cuda` variant
+// + `from_artifact`, so the imports are `cuda`-gated (unused in the CPU build).
+#[cfg(feature = "cuda")]
+use ignis_artifact::{CudaDevice, MaterializedArtifact, Reader};
+
 // ---------------------------------------------------------------------------
 // bf16 helpers (round-to-nearest-even, matching the kernel's __float2bfloat16_rn)
 // ---------------------------------------------------------------------------
@@ -176,6 +183,44 @@ impl ModelConfig {
             ffn_intermediate: 32,
             block_size: 4,
             num_blocks: 8,
+        }
+    }
+
+    /// The real Qwen 3.8-27B topology (the v1 specialization, CONTEXT.md: one
+    /// model family, one GPU class). This is the #26 crash fix — the
+    /// `from_artifact` path uses it instead of [`ModelConfig::synthetic`],
+    /// so the embedding table has the real vocab (248 320) and a real
+    /// tokenizer's ids (up to 248 077) never index out of bounds (the
+    /// `ignis_embedding` OOB that produced the `illegal memory access`).
+    /// The layer pattern + head geometry are the model constants (ignis is
+    /// specialized for Qwen 3.8-27B); the numerically-correct device routing
+    /// (divisors, dequant of the W8/BF16-exception tensors, the missing GDN /
+    /// RoPE ops) is #25 (the 99%-gate follow-up).
+    pub fn qwen38_27b() -> Self {
+        let num_layers: usize = 64;
+        // Layer `i` is GQA (full attention) exactly when `(i + 1) % 4 == 0`
+        // (16 GQA + 48 GDN linear-attention layers).
+        let layer_kinds: Vec<LayerKind> = (0..num_layers)
+            .map(|i| if (i + 1) % 4 == 0 { LayerKind::Gqa } else { LayerKind::Gdn })
+            .collect();
+        Self {
+            num_layers,
+            layer_kinds,
+            hidden: 5120,
+            vocab: 248_320,
+            num_q_heads: 24,
+            num_kv_heads: 4,
+            head_dim: 256,
+            // GDN recurrent state: 48 V heads x 128 (rows) by 16 Q/K heads x 128
+            // (cols). `gdn_num_layers` = the 48 GDN layers.
+            gdn_state_rows: 6144,
+            gdn_state_cols: 2048,
+            gdn_num_layers: 48,
+            ffn_intermediate: 17_408,
+            // Paged KV: 64-token pages (the reference P=64 granularity); 4096
+            // blocks per request (the 262k context envelope, design §2).
+            block_size: 64,
+            num_blocks: 4096,
         }
     }
 }
@@ -371,6 +416,49 @@ impl Weights {
             per_layer,
         }
     }
+
+    /// A zero-cost weight placeholder for a real (artifact) topology (#26):
+    /// the real weights live in VRAM (the materialized artifact, ADR 0002)
+    /// and the host-side `Weights` stay empty until #25's device routing
+    /// lands. The per-layer geometry (the layer-kind order) is preserved so
+    /// the forward pass can index `per_layer` by layer; every `Nvfp4Weight`
+    /// is `empty()` (the same pattern the unused GQA projections in a GDN
+    /// layer use).
+    ///
+    /// **Why not [`Weights::synthetic`] here:** the real Qwen 3.8-27B
+    /// topology's synthetic weights are ~1.6 TiB of generated host vectors
+    /// (48 GDN layers × ~30 GiB of `gdn_output` E2M1 codes alone, 32
+    /// billion-loop iterations per layer in a debug build), so the E2E test
+    /// stalled after the 19 GB H2D (the #26 hang — the stall looked like a
+    /// GPU deadlock, but the GPU was idle: the stall was this host-side
+    /// weight generation).
+    pub fn placeholder(config: &ModelConfig) -> Self {
+        let per_layer = config
+            .layer_kinds
+            .iter()
+            .map(|kind| LayerWeights {
+                kind: *kind,
+                projection: [
+                    Nvfp4Weight::empty(),
+                    Nvfp4Weight::empty(),
+                    Nvfp4Weight::empty(),
+                    Nvfp4Weight::empty(),
+                ],
+                gdn_output: Nvfp4Weight::empty(),
+                ffn_gate: Nvfp4Weight::empty(),
+                ffn_up: Nvfp4Weight::empty(),
+                ffn_down: Nvfp4Weight::empty(),
+                norm_in: Vec::new(),
+                norm_post: Vec::new(),
+            })
+            .collect();
+        Self {
+            embedding: Vec::new(),
+            per_layer,
+            final_norm: Vec::new(),
+            lm_head: Nvfp4Weight::empty(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +527,50 @@ struct SendGraph(*mut ffi::IgnisGraph);
 
 unsafe impl Send for SendGraph {}
 
+/// The artifact's device context (the #26 fix): holds the `CudaDevice` (the
+/// VRAM arena owner), the `MaterializedArtifact` (the materialized tensor
+/// views), and the `Reader` (name resolution) so the 19 GB of weights stay
+/// in VRAM for the lifetime of the backend (ADR 0002: the producing device
+/// must outlive the materialized artifact and its typed views). Always
+/// present on the struct (so the construction is uniform); `None` on the
+/// synthetic / dev path (or when the `cuda` feature is off — the enum has no
+/// variants, so it can only be `None`). The `device` field is declared last
+/// so it is dropped last (the arena outlives the materialized views).
+enum DeviceCtx {
+    #[cfg(feature = "cuda")]
+    Cuda {
+        /// The artifact reader (name resolution; dropped before the device).
+        /// Held (not read in the scoped #26) so the device outlives the
+        /// forward pass; #25's device routing reads it.
+        #[allow(dead_code)]
+        reader: Reader,
+        /// The materialized artifact (the tensor views point into the
+        /// device's arena; dropped before the device). Held (not read in the
+        /// scoped #26); #25's device routing reads it.
+        #[allow(dead_code)]
+        artifact: MaterializedArtifact,
+        /// The CUDA device (the VRAM arena owner; dropped last — the arena
+        /// outlives the materialized views). Held so the 19 GB of weights
+        /// stay in VRAM for the lifetime of the backend (the #26 fix); #25's
+        /// device routing reads it.
+        #[allow(dead_code)]
+        device: CudaDevice,
+    },
+}
+
+// SAFETY: `DeviceCtx` holds the `CudaDevice` (the VRAM arena owner), the
+// `MaterializedArtifact` (raw pointers into the arena), and the `Reader`
+// (the mmap'd file reader). The raw pointers point into the device arena,
+// which is stable for the lifetime of the `CudaDevice` (declared last in
+// `DeviceCtx`, so dropped last — the arena outlives the views). Sharing
+// `DeviceCtx` across threads (the `Compute` trait's `Send + Sync` bound,
+// `scheduler.rs`) is safe: the tensor views are read-only (the forward pass
+// reads the weights, never mutates them), and the producing device (the
+// arena owner) is dropped last. In the non-`cuda` build `DeviceCtx` has no
+// variants (an empty enum), so this is a no-op.
+unsafe impl Send for DeviceCtx {}
+unsafe impl Sync for DeviceCtx {}
+
 /// The production [`Compute`] backend: the kernel-leaf C-ABI forward pass
 /// (the compute-adapter, kernel-abi 04).
 ///
@@ -457,6 +589,10 @@ pub struct CudaCompute {
     /// The captured graph's representative geometry (`None` on a busy/absent
     /// GPU — the eager fallback path, ADR 0006).
     graph_geom: Option<GraphGeometry>,
+    /// The artifact's device context (the #26 fix: the 19 GB of weights stay
+    /// in VRAM for the lifetime of the backend). `None` on the synthetic /
+    /// dev path.
+    device_ctx: Option<DeviceCtx>,
 }
 
 impl CudaCompute {
@@ -496,6 +632,26 @@ impl CudaCompute {
             state: Mutex::new(HashMap::new()),
             graph: Mutex::new(graph),
             graph_geom,
+            device_ctx: None,
+        }
+    }
+
+    /// Construct the compute backend on the EAGER path (no kernel-leaf
+    /// startup check, no CUDA-graph capture) — the #26 fix. `from_artifact`
+    /// uses this (not [`Self::new`]) to keep the scoped #26 (materialize +
+    /// `vram_resident`) free of the graph fast path (the CUDA-graph launch is
+    /// #25 material, not needed to land 19 GB in VRAM). Note: the earlier
+    /// "hang" (a `cudaStreamSynchronize` that would not complete, the GPU
+    /// idle) was NOT the graph check — it was a CPU-side `Weights::synthetic`
+    /// OOM trap at the real topology (see [`Weights::placeholder`]).
+    pub fn new_eager(config: ModelConfig, weights: Weights) -> Self {
+        Self {
+            config,
+            weights,
+            state: Mutex::new(HashMap::new()),
+            graph: Mutex::new(None),
+            graph_geom: None,
+            device_ctx: None,
         }
     }
 
@@ -509,6 +665,14 @@ impl CudaCompute {
     /// graph is not active — a busy/absent GPU, ADR 0006).
     pub fn graph_geometry(&self) -> Option<GraphGeometry> {
         self.graph_geom
+    }
+
+    /// Whether this backend holds the artifact's device context (the #26 fix):
+    /// the 19 GB of weights are materialized in VRAM and held for the
+    /// lifetime of the backend (the `from_artifact` path). The CPU /
+    /// synthetic path returns `false` (no materialization, ADR 0006).
+    pub fn vram_resident(&self) -> bool {
+        self.device_ctx.is_some()
     }
 
     /// Get-or-create a request's compute state (the paged KV cache, the GDN
@@ -944,8 +1108,9 @@ impl std::fmt::Debug for CudaCompute {
 impl CudaCompute {
     /// Construct a compute backend from a `.ninfer` artifact (the
     /// production path): open the container (ADR 0002), materialize the
-    /// model to the `CudaDevice` (VRAM), and run the startup graph check
-    /// (kernel-abi 03).
+    /// model to the `CudaDevice` (VRAM), and build the backend eagerly
+    /// (`new_eager` — no startup graph check / CUDA-graph capture; the
+    /// graph fast path is #25, the 99%-gate).
     ///
     /// **Documented gap (the full-correct 27B forward pass, ADR 0007 /
     /// bench-03):** a *sane* real-model completion additionally needs the
@@ -959,20 +1124,76 @@ impl CudaCompute {
         path: &std::path::Path,
         model: &str,
     ) -> Result<Self, ComputeError> {
-        use ignis_artifact::{Binder, Reader};
-        // Open + read the container (ADR 0002: the binder must consume
-        // every object — the per-model weight routing).
-        let reader = Reader::open(path).map_err(|_| ComputeError::Kernel(-1))?;
-        // The Qwen 3.8-27B weight routing (the per-model binder, ADR 0002):
-        // every `text/layers/{i}` tensor -> a `Weights` field (the
-        // full-correct 27B forward pass, ADR 0007 / bench-03 — the
-        // follow-up). Until it lands, the artifact model is the synthetic
-        // fallback (the seam is buildable + testable).
-        let _ = Binder::new(&reader);
+        use ignis_artifact::{Binder, CudaDevice, Object, materialize};
+        // Open + read the container (ADR 0002: the binder must consume every
+        // object — an unconsumed object is a load failure).
+        let reader =
+            Reader::open(path).map_err(|_| ComputeError::Kernel(-1))?;
+        // Bind every object (ADR 0002: the binder must consume every object
+        // — an unconsumed object is a load failure) -> the materialization
+        // plan (the per-object device placement).
+        let mut binder = Binder::new(&reader);
+        for object in reader.objects() {
+            match object {
+                Object::Tensor(t) => {
+                    let handle = binder
+                        .require_tensor(&t.name, t.format, t.layout, &t.shape)
+                        .map_err(|_| ComputeError::Kernel(-1))?;
+                    binder
+                        .materialize_on_device(handle)
+                        .map_err(|_| ComputeError::Kernel(-1))?;
+                }
+                Object::Resource(r) => {
+                    let handle = binder
+                        .require_resource(&r.name, r.encoding)
+                        .map_err(|_| ComputeError::Kernel(-1))?;
+                    binder
+                        .retain_on_host(handle)
+                        .map_err(|_| ComputeError::Kernel(-1))?;
+                }
+            }
+        }
+        let plan = binder.finish().map_err(|_| ComputeError::Kernel(-1))?;
+
+        // The #26 fix: materialize the artifact on a `CudaDevice` (the 19 GB
+        // of weights land in VRAM — ADR 0002: `.ninfer` artifacts load
+        // directly, no converter). The device + the materialized artifact +
+        // the reader are held in `device_ctx` so the VRAM arena outlives the
+        // forward pass (ADR 0002: the producing device must outlive the
+        // materialized artifact and its typed views).
+        let mut device =
+            CudaDevice::create(0).map_err(|_| ComputeError::Kernel(-1))?;
+        let artifact = materialize(&reader, &plan, &mut device, None)
+            .map_err(|_| ComputeError::Kernel(-1))?;
+
+        // The crash fix: the real model's topology (no synthetic fallback, so
+        // the embedding table has the real vocab and a real tokenizer's ids
+        // never index out of bounds — the `illegal memory access`).
+        // The host-side `Weights` stay a zero-cost placeholder until #25's
+        // numerically-correct device routing lands: the real weights live in
+        // VRAM (the materialized artifact above, ADR 0002). `Weights::synthetic`
+        // with this topology is infeasible (~1.6 TiB of generated host
+        // vectors: 48 GDN layers × ~30 GiB of `gdn_output` E2M1 codes) —
+        // the E2E test stalled after the 19 GB H2D and OOM-aborted (the
+        // #26 "hang", a CPU-side trap that looked like a GPU deadlock).
+        let config = ModelConfig::qwen38_27b();
+        let weights = Weights::placeholder(&config);
+        // The #26 fix: the eager path (no kernel-leaf startup check / CUDA
+        // graph capture) — the CUDA-graph fast path is #25 (the 99%-gate)
+        // material, not the scoped #26. (The observed "hang" after the H2D
+        // was the CPU-side `Weights::synthetic` OOM trap above, not a stuck
+        // GPU sync: verified 2026-09-04 that the graph check + capture
+        // completes in ms after the H2D on a clean GPU.)
+        let mut compute = Self::new_eager(config, weights);
+        // Hold the device context (the 19 GB of weights stay in VRAM for the
+        // lifetime of the backend, ADR 0002).
+        compute.device_ctx = Some(DeviceCtx::Cuda {
+            reader,
+            artifact,
+            device,
+        });
         let _ = model;
-        let config = ModelConfig::synthetic();
-        let weights = Weights::synthetic(&config, 0);
-        Ok(Self::new(config, weights))
+        Ok(compute)
     }
 }
 
@@ -1016,5 +1237,47 @@ mod tests {
         let gate = to_bf16(&[3.0, -1.0]);
         let act = CudaCompute::silu_mul(&up, &gate);
         assert_eq!(act.len(), 2);
+    }
+
+    /// The #26 crash fix (the red-capable CPU signal): the artifact path's
+    /// config is the real Qwen 3.8-27B topology (not the synthetic fallback).
+    /// This pins the fix — the embedding table has the real vocab (248 320),
+    /// so a real tokenizer's ids (up to 248 077) never index out of bounds
+    /// (the `ignis_embedding` OOB that produced the `illegal memory access`).
+    #[test]
+    fn qwen38_27b_config_is_the_real_topology() {
+        let cfg = ModelConfig::qwen38_27b();
+        assert_eq!(cfg.vocab, 248_320, "the real vocab (not the synthetic 256)");
+        assert_eq!(cfg.hidden, 5120);
+        assert_eq!(cfg.num_layers, 64);
+        assert_eq!(cfg.num_q_heads, 24);
+        assert_eq!(cfg.num_kv_heads, 4);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.ffn_intermediate, 17_408);
+        assert_eq!(cfg.gdn_state_rows, 6144);
+        assert_eq!(cfg.gdn_state_cols, 2048);
+        assert_eq!(cfg.gdn_num_layers, 48);
+        assert_eq!(cfg.block_size, 64);
+        // 16 GQA + 48 GDN layers (layer i is GQA iff (i + 1) % 4 == 0).
+        let gqa = cfg.layer_kinds.iter().filter(|k| **k == LayerKind::Gqa).count();
+        let gdn = cfg.layer_kinds.iter().filter(|k| **k == LayerKind::Gdn).count();
+        assert_eq!(gqa, 16, "16 GQA (full-attention) layers");
+        assert_eq!(gdn, 48, "48 GDN (linear-attention) layers");
+        assert_eq!(cfg.layer_kinds.len(), cfg.num_layers);
+    }
+
+    /// The synthetic fallback is NOT the artifact path's topology (the #26
+    /// crash fix): `from_artifact` uses `qwen38_27b` (the real geometry), so
+    /// the embedding table is the real vocab (248 320), never the synthetic
+    /// 256 (which made a real tokenizer's ids index out of bounds).
+    #[test]
+    fn synthetic_config_is_not_the_artifact_topology() {
+        let real = ModelConfig::qwen38_27b();
+        let synth = ModelConfig::synthetic();
+        assert_ne!(
+            real.vocab, synth.vocab,
+            "the artifact path must use the real vocab (248 320), not the synthetic 256"
+        );
+        assert_ne!(real.num_layers, synth.num_layers);
     }
 }

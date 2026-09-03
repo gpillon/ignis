@@ -128,6 +128,25 @@ int ignis_nvfp4_gemm_prefill(const void *act, const void *wt_codes,
                             const void *wt_scales, const void *bias, void *out,
                             int64_t tokens, int64_t m, int64_t k, void *stream);
 
+/* Ticket 26 (GitHub #26, the compute-adapter's production path): NVFP4 GEMM /
+ * GEMV with DEVICE-RESIDENT weights. `wt_codes` / `wt_scales` are DEVICE
+ * pointers (the artifact's materialized arena, ADR 0002); the leaf does NOT
+ * H2D them (the #26 fix: the 19 GB of weights stay in VRAM, no per-call H2D).
+ * `act` (host bf16) and `out` (host bf16) are H2D/D2H'd (small); `bias`
+ * (nullable, host bf16) is H2D'd. The kernel runs on the current CUDA device
+ * (device 0 in the single-GPU v1; the caller sets it via the artifact
+ * CudaDevice). `k` must be a multiple of 16 (the NVFP4 group scale); `m`, `k`
+ * (decode) / `tokens`, `m`, `k` (prefill) must be positive. stream: null =
+ * stream 0. Returns 0 on success, -1 on error. */
+int ignis_nvfp4_gemm_decode_device(const void *act, const void *wt_codes,
+                                   const void *wt_scales, const void *bias,
+                                   void *out, int64_t m, int64_t k, void *stream);
+
+int ignis_nvfp4_gemm_prefill_device(const void *act, const void *wt_codes,
+                                    const void *wt_scales, const void *bias,
+                                    void *out, int64_t tokens, int64_t m,
+                                    int64_t k, void *stream);
+
 /* Ticket 06 (kernel-abi-02): RMSNorm (or LayerNorm when `center` is
  * non-null). out = x / rms(x) * weight, optionally centered first. x is bf16
  * [n]. weight (nullable): bf16 [n]. center (nullable): bf16 [n] (present =>
