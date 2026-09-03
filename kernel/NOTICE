@@ -186,3 +186,34 @@ dispatch, and its graph capture was engine-internals C++ state the flat C
 ABI of ADR 0001 forbids across the boundary); this is new C ABI surface
 for the v1 eager-graph decision (self-contained; provenance in
 kernel/NOTICE, as with the sibling surfaces).
+
+### `kernel/src/nvfp4_gemm_prefill.cuh` (ticket 22, kernel-abi-05, GitHub #22)
+Multi-token NVFP4 GEMM (the prefill / FFN-projection path). Adapted from the
+reference bf16-activation small-tokens NVFP4 GEMM
+(`ops/linear/nvfp4/nvfp4_small_t.cuh` — the rowsplit "rows-of-W × tokens"
+tiling with fp32 FMA accumulation, bf16 activations × dequantized NVFP4
+weights) and its large-tokens rowsplit grid structure
+(`nvfp4_w4a4_mma.cuh`: grid.x over m-rows, grid.y over token tiles). The
+reference kernels are driven by the engine's Geometry/Schedule/RowPolicy/
+Epilogue dispatch and use Programmatic Dependent Launch (PDL); the
+large-tokens path is a tensor-core W4A4 MMA that requires FP4-quantized
+*activations*. That dispatch layer is C++ state, which the flat C ABI of
+ADR 0001 forbids across the boundary, so it is not ported; the PDL syncs are
+stripped in favor of plain `<<<>>>` launches; and the tensor-core W4A4 MMA
+(which needs FP4 activations, not the bf16 activations of this ABI) is
+deferred to the performance gate (ADR 0007). The math (bf16 activations ×
+E2M1/E4M3-dequantized NVFP4 weights, fp32 FMA accumulation, the rowsplit
+grid, and the plain row-major [m][k/2] / [m][k/16] code/scale layouts) is
+ported 1:1; the E2M1/E4M3 decode helpers are ported 1:1 (inlined in the header
+with a `gemm_prefill_` prefix, to keep it self-contained and avoid pulling the
+ticket-03 GEMV kernel into this translation unit), so a `tokens == 1` call
+matches the single-token GEMV. Self-contained; compiles standalone in the leaf.
+
+### `kernel/src/nvfp4_gemm_prefill_surface.cu` (ticket 22, kernel-abi-05, GitHub #22)
+The flat C ABI multi-token GEMM wrapper (ADR 0001): the `extern "C"`
+function `ignis_nvfp4_gemm_prefill` that takes explicit host pointers +
+sizes + a stream handle and launches the ported kernel, with internal
+H2D/D2H copies and a 0/-1 int return code (the same style as ticket-03's
+decode surface and the kernel-abi-01 prefill surface). There is no reference
+equivalent (the reference's driver was the engine's op dispatch); this is
+the new C ABI surface for the prefill FFN-projection GEMM.

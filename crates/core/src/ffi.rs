@@ -125,6 +125,30 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    /// Multi-token NVFP4 GEMM (the prefill / FFN-projection path):
+    /// `out[tokens][m] = bias[m] + sum_k act[tokens][k] * W[m][k]`, where
+    /// `W[m][k] = e2m1(code[m][k]) * e4m3(scale[m][k/16])` is the
+    /// dequantized NVFP4 weight. `act`: bf16 [tokens][k]. `wt_codes`: E2M1
+    /// [m][k/2] bytes (2 codes per byte). `wt_scales`: E4M3 [m][k/16] bytes
+    /// (one scale per 16-element group). `bias` (nullable) and `out`: bf16
+    /// [m] and bf16 [tokens][m]. `k` must be a multiple of 16 (the NVFP4
+    /// group scale); `m` and `tokens` must be positive. The rowsplit tiling
+    /// (rows-of-W x tokens, fp32 FMA accumulation, no tensor cores / no
+    /// cuBLASLt) is a temporary starting point per ADR 0005; the
+    /// tensor-core W4A4 MMA is the later performance-gate material (ADR
+    /// 0007). `stream`: null = stream 0. Returns 0 on success, -1 on error.
+    pub fn ignis_nvfp4_gemm_prefill(
+        act: *const std::ffi::c_void,
+        wt_codes: *const std::ffi::c_void,
+        wt_scales: *const std::ffi::c_void,
+        bias: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        tokens: i64,
+        m: i64,
+        k: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     /// RMSNorm (LayerNorm when `center` is non-null). `x`: bf16 [n].
     /// `weight` (nullable): bf16 [n]. `center` (nullable): bf16 [n].
     /// `out`: bf16 [n]. `eps` <= 0 selects 1e-6. Returns 0 on success,
@@ -262,6 +286,16 @@ mod tests {
         batch * hidden
     }
 
+    /// Multi-token NVFP4 GEMM output element count: `[tokens][m]`.
+    fn gemm_prefill_out_elems(tokens: u64, m: u64) -> u64 {
+        tokens * m
+    }
+
+    /// Multi-token NVFP4 GEMM output byte count (bf16 = 2 bytes/elem).
+    fn gemm_prefill_out_bytes(tokens: u64, m: u64) -> u64 {
+        gemm_prefill_out_elems(tokens, m) * 2
+    }
+
     #[test]
     fn gqa_prefill_geometry_pins_out_shape() {
         // Representative canary shape: 4-batch, 512-token prefill, 8 q-heads,
@@ -283,5 +317,15 @@ mod tests {
     fn embedding_geometry_pins_out_shape() {
         // Qwen hidden = 5120, 64-batch decode step (64*5120 = 327_680).
         assert_eq!(embedding_out_elems(64, 5120), 327_680);
+    }
+
+    #[test]
+    fn gemm_prefill_geometry_pins_out_shape() {
+        // Representative canary shape: 8-token prefill, hidden 5120
+        // (8*5120 = 40_960 elems, bf16 = 81_920 bytes). Pins the ABI
+        // out-size contract for `ignis_nvfp4_gemm_prefill` to the values the
+        // kernel computes (independent of the helper's formula: [tokens][m]).
+        assert_eq!(gemm_prefill_out_elems(8, 5120), 40_960);
+        assert_eq!(gemm_prefill_out_bytes(8, 5120), 81_920);
     }
 }

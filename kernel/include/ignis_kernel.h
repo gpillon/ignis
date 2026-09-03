@@ -113,6 +113,21 @@ int ignis_gdn_step(const void *x, const void *state_in, void *state_out,
                    int64_t batch, int64_t num_gdn_layers, int64_t state_rows,
                    int64_t state_cols, int64_t state_dim, void *stream);
 
+/* Ticket 22 (kernel-abi 05, GitHub #22): multi-token NVFP4 GEMM (the prefill
+ * / FFN-projection path):
+ *   out[tokens][m] = bias[m] + sum_k act[tokens][k] * W[m][k]
+ * `act` is bf16 [tokens][k]. Weights are NVFP4-quantized: E2M1 codes (2 packed
+ * per byte) [m][k/2] and a per-group-16 E4M3 scale [m][k/16]. `bias`
+ * (nullable) is bf16 [m]; `out` is bf16 [tokens][m]. `k` must be a multiple
+ * of 16 (the NVFP4 group scale); `m` and `tokens` must be positive. The
+ * rowsplit tiling (rows-of-W x tokens, fp32 FMA accumulation, no tensor cores
+ * / no cuBLASLt) is a temporary starting point per ADR 0005; the tensor-core
+ * W4A4 MMA is the later performance-gate material (ADR 0007). stream: null =
+ * stream 0. Returns 0 on success, -1 on error. */
+int ignis_nvfp4_gemm_prefill(const void *act, const void *wt_codes,
+                            const void *wt_scales, const void *bias, void *out,
+                            int64_t tokens, int64_t m, int64_t k, void *stream);
+
 /* Ticket 06 (kernel-abi-02): RMSNorm (or LayerNorm when `center` is
  * non-null). out = x / rms(x) * weight, optionally centered first. x is bf16
  * [n]. weight (nullable): bf16 [n]. center (nullable): bf16 [n] (present =>
