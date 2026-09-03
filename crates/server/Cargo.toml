@@ -15,3 +15,11 @@ futures-core = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+
+[features]
+# The CUDA build (ADR 0001): enables the `CudaCompute` production backend
+# (the kernel-leaf forward pass, kernel-abi 04) + the `ignis-core` `cuda`
+# feature (the `CudaCompute::from_artifact` constructor). Without it, the
+# entrypoint always drives the deterministic `MockCompute` (the ADR 0006
+# dev mode, CPU-only).
+cuda = ["ignis-core/cuda"]

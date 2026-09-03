@@ -33,8 +33,10 @@ use std::sync::Arc;
 
 use ignis_core::{
     mock::MockCompute,
-    ConcreteScheduler, SchedulerConfig,
+    Compute, ConcreteScheduler, SchedulerConfig,
 };
+#[cfg(feature = "cuda")]
+use ignis_core::CudaCompute;
 use ignis_server::{
     engine::Engine,
     loader,
@@ -59,11 +61,28 @@ async fn main() {
     let model = env("IGNIS_MODEL", DEFAULT_MODEL);
     let bind = env("IGNIS_BIND", DEFAULT_BIND);
 
-    // The compute seam: the kernel-leaf `Compute` adapter (C ABI, ADR
-    // 0001) plugs in here when it lands; until then the deterministic
-    // mock drives the scheduler (CPU-only — ADR 0006, the GPU is held by
-    // the reference runner).
-    let compute = Arc::new(MockCompute::new());
+    // The compute seam (kernel-abi 04): the production `CudaCompute`
+    // (the kernel-leaf forward pass) when the `cuda` feature is on + an
+    // artifact is configured; the deterministic `MockCompute` (CPU-only,
+    // ADR 0006 dev mode) otherwise.
+    let artifact = env("IGNIS_ARTIFACT", "");
+    #[cfg(feature = "cuda")]
+    let compute: Arc<dyn Compute> = if artifact.is_empty() {
+        Arc::new(MockCompute::new())
+    } else {
+        match CudaCompute::from_artifact(std::path::Path::new(&artifact), &model) {
+            Ok(c) => {
+                eprintln!("ignis-server: {artifact} — CUDA compute backend loaded (kernel-abi 04)");
+                Arc::new(c)
+            }
+            Err(e) => {
+                eprintln!("ignis-server: {artifact}: compute init failed: {e} — refusing to start");
+                std::process::exit(1);
+            }
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: model.clone(),
@@ -79,7 +98,6 @@ async fn main() {
     // or a report that is not clean is a load failure: serving a broken
     // artifact would silently degrade to the placeholder, so the server
     // refuses to start instead.
-    let artifact = env("IGNIS_ARTIFACT", "");
     // The telemetry sink (server-02, design §5): a JSONL file named by
     // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
     let telemetry_sink: Arc<dyn TelemetrySink> = match env("IGNIS_TELEMETRY", "") {

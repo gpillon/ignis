@@ -16,6 +16,7 @@
 //! reuse) are implemented on top of this contract.
 
 pub mod admission;
+pub mod compute;
 pub mod concrete;
 pub mod ffi;
 pub mod gdn;
@@ -31,6 +32,7 @@ pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
     ProtectionPhase, RetainedLaneCandidate,
 };
+pub use compute::{CudaCompute, GraphGeometry, LayerKind, ModelConfig, Nvfp4Weight, Weights};
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;

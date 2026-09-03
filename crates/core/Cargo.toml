@@ -6,3 +6,9 @@ edition.workspace = true
 
 [dependencies]
 ignis-artifact = { path = "../artifact" }
+
+[features]
+# The CUDA build (ADR 0001): enables the kernel-leaf device surface (the
+# artifact's `cuda` feature) + the `CudaCompute::from_artifact` constructor
+# (the compute-adapter's production path, kernel-abi 04).
+cuda = ["ignis-artifact/cuda"]
