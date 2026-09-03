@@ -72,10 +72,12 @@ unsafe extern "C" {
     // NOTE (ADR 0006 / 0007): these surface declarations + geometry are
     // CPU-verifiable. The ticket-05 kernels (GQA prefill + GDN step) are now
     // implemented (kernel/src/gqa_attention_prefill.cuh, gdn_step.cuh,
-    // prefill_gdn_surface.cu) and GPU-verified (tests/kernel_abi01_gpu launches
-    // them on the GPU even with the model loaded, ADR 0006 nuance). The
-    // pointwise/output (06) and CUDA-graph (10) .cu, and the 99% performance
-    // gate (ADR 0007) driven by ignis-bench, remain pending.
+    // prefill_gdn_surface.cu) and the ticket-06 kernels (norms / embeddings /
+    // greedy sampling, kernel/src/rmsnorm.cuh, embed_gather.cuh, argmax.cuh,
+    // norms_sampling_surface.cu) — both GPU-verified (tests/kernel_abi01_gpu +
+    // kernel_abi02_gpu launch them on the GPU even with the model loaded,
+    // ADR 0006 nuance). The CUDA-graph (10) .cu and the 99% performance gate
+    // (ADR 0007) driven by ignis-bench remain pending.
     // ------------------------------------------------------------------
 
     /// GQA prefill attention (batched, multi-token), the prefill path.

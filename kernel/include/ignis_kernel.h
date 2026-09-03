@@ -69,12 +69,15 @@ int ignis_gqa_attention_decode(const void *q, const void *kv_cache,
  *
  * NOTE (ADR 0006 / 0007): the C-ABI surface + geometry are declared here (and
  * mirrored in crates/core/src/ffi.rs) so the contract is pinned and
- * CPU-verifiable. The ticket-05 kernels (GQA prefill + GDN step) are now
- * implemented (kernel/src/gqa_attention_prefill.cuh, gdn_step.cuh,
- * prefill_gdn_surface.cu) and GPU-verified (crates/core/tests/kernel_abi01_gpu
- * launches them on the GPU even with the model loaded, ADR 0006 nuance). The
- * pointwise/output (06) and CUDA-graph (10) .cu, and the 99% performance gate
- * (ADR 0007) driven by ignis-bench, remain pending.
+ * CPU-verifiable. The ticket-05 kernels (GQA prefill + GDN step,
+ * kernel/src/gqa_attention_prefill.cuh, gdn_step.cuh,
+ * prefill_gdn_surface.cu) and the ticket-06 kernels (norms / embeddings /
+ * greedy sampling, kernel/src/rmsnorm.cuh, embed_gather.cuh, argmax.cuh,
+ * norms_sampling_surface.cu) are now implemented and GPU-verified (the
+ * crates/core/tests/kernel_abi01_gpu + kernel_abi02_gpu launch them on the
+ * GPU even with the model loaded, ADR 0006 nuance). The CUDA-graph (10) .cu
+ * and the 99% performance gate (ADR 0007) driven by ignis-bench remain
+ * pending.
  * ------------------------------------------------------------------------ */
 
 /* Ticket 05 (kernel-abi-01): GQA prefill attention (batched, multi-token).

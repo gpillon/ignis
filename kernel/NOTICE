@@ -107,3 +107,56 @@ internal H2D/D2H copies and a 0/-1 int return code (the same style as
 ticket-03's decode surface). There is no reference equivalent (the reference's
 driver was the engine's op dispatch); this is the new C ABI surface for the
 prefill + GDN step.
+
+### `kernel/src/rmsnorm.cuh` (ticket 06, kernel-abi-02)
+RMSNorm / LayerNorm for the pointwise path. Adapted from the reference
+RMSNorm math (`ops/kernel/rmsnorm.cuh`: the per-vector sum-of-squares ->
+rsqrtf(mean + eps) -> scaled-epilogue pipeline; the PDL-synced bf16x2
+row-geometry variants and the engine's Tensor dispatch are not ported —
+C++ state the flat C ABI of ADR 0001 forbids, and the PDL calls are
+stripped in favor of plain `<<<>>>` launches) and its LayerNorm sibling
+(`ops/kernel/layer_norm.cuh`: the center-then-normalize form). The
+normalization math is ported 1:1 for the ABI's 1-D vector contract: the
+sum of squares, the rsqrtf reciprocal, and the out = value * inv * weight
+epilogue. The ABI's `center` argument centers first (base[i] = x[i] -
+center[i], the "LayerNorm mode"); the reference's data-dependent Welford
+mean/m2 dispatch is not ported (the ABI centers with an explicit vector,
+per the header contract). A single 1024-thread block grid-strides over n
+(the reference's bf16x2 / warp-tiled row variants are the performance-gate
+material, ADR 0007); fp32 internal math, bf16 in/out. Self-contained;
+compiles standalone in the leaf.
+
+### `kernel/src/embed_gather.cuh` (ticket 06, kernel-abi-02)
+Dense embedding gather. 1:1 port of the reference's dense embedding gather
+(`ops/kernel/embed_gather.cuh`: `embed_gather_dense_kernel` — the grid-
+stride row copy `out[i] = table[ids[i/d] * d + i % d]`). The quantized
+table variants (Q6 / W8 / FP8 code + scale planes, the grouped per-token
+launchers) and the shape-specific route dispatch are not part of the v1
+ABI contract — the ABI table is a dense bf16 [vocab][hidden] matrix, so
+only the dense gather's math (the row selection and the grid-stride copy)
+is ported; the quantized paths are later-ticket material. Self-contained;
+compiles standalone in the leaf.
+
+### `kernel/src/argmax.cuh` (ticket 06, kernel-abi-02)
+Greedy (argmax) sampling. Adapted from the reference argmax kernel
+(`ops/kernel/argmax.cuh`: `argmax_kernel` — the per-row block reduce with
+the value/lower-index winner rule, plus the shared-memory
+`argmax_block_reduce` aggregation; the winner rule
+`value > best || (value == best && index < best_index)` is ported 1:1).
+The reference reads bf16 logits with a physical/valid row pair for padded
+rows, and the launcher dispatches a tiled atomic-cas route for wide
+vocabularies; the ABI contract is an f32 [batch][vocab] matrix with no
+padding (vocab == the valid row count), so the single-tile finite route is
+ported 1:1 with the input typed to f32, and the tiled-atomic route is
+deferred to the performance gate (ADR 0007). Self-contained; compiles
+standalone in the leaf.
+
+### `kernel/src/norms_sampling_surface.cu` (ticket 06, kernel-abi-02)
+The flat C ABI norms / embedding / sampling wrapper (ADR 0001):
+`extern "C"` functions (`ignis_rmsnorm`, `ignis_embedding`,
+`ignis_greedy_sample`) that take explicit host pointers + sizes + a stream
+handle and launch the three ported kernels, with internal H2D/D2H copies
+and a 0/-1 int return code (the same style as ticket-03's decode surface
+and ticket-05's prefill/GDN surface). There is no reference equivalent
+(the reference's driver was the engine's op dispatch); this is the new C
+ABI surface for the pointwise / output path.
