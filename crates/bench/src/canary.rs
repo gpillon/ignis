@@ -10,6 +10,8 @@
 //! This module is pure (no I/O) so it is unit-testable without a running
 //! engine; the endpoint plumbing lives in `client.rs`.
 
+use serde::{Deserialize, Serialize};
+
 use crate::client::{Endpoint, Outcome, Request};
 use crate::trace::RequestClass;
 
@@ -42,11 +44,19 @@ pub const CANARIES: &[Canary] = &[
 ];
 
 /// The result of running one canary (sent twice for the determinism check).
-#[derive(Debug, Clone)]
+///
+/// Serializable: the canary results *are* the divergence report, which is
+/// shipped as JSON alongside the performance report (spec 02, ADR 0007 —
+/// `ignis-bench canary --out`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanaryResult {
-    pub id: &'static str,
+    pub id: String,
     /// `true` when the first output passed the sanity check.
     pub sane: bool,
+    /// Why the output is not sane (the `is_sane` error), when `sane` is
+    /// `false`; kept so the shipped divergence report is actionable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sane_reason: Option<String>,
     /// `true` when the two greedy runs produced identical output.
     pub deterministic: bool,
     /// The two greedy outputs (kept for the divergence report).
@@ -103,11 +113,15 @@ pub fn is_deterministic(first: &str, second: &str) -> bool {
 
 /// Evaluate one canary from its two greedy outputs (the harness sends each
 /// prompt twice and passes both outputs here).
-pub fn evaluate(id: &'static str, first: &str, second: &str) -> CanaryResult {
-    let sane = is_sane(first).is_ok();
+pub fn evaluate(id: &str, first: &str, second: &str) -> CanaryResult {
+    let sane_reason = match is_sane(first) {
+        Ok(()) => None,
+        Err(reason) => Some(reason),
+    };
     CanaryResult {
-        id,
-        sane,
+        id: id.to_string(),
+        sane: sane_reason.is_none(),
+        sane_reason,
         deterministic: is_deterministic(first, second),
         first: first.to_string(),
         second: second.to_string(),
@@ -197,5 +211,39 @@ mod tests {
         for c in CANARIES {
             assert!(!c.prompt.is_empty());
         }
+    }
+
+    #[test]
+    fn a_canary_result_round_trips_through_json() {
+        // The divergence report is shipped as JSON (`canary --out`), so a
+        // `CanaryResult` must survive a JSON round-trip (spec 02: the
+        // divergence report is *shipped*, ADR 0007).
+        let r = evaluate("math-greedy", "the answer is 10", "the answer is 10");
+        let json = serde_json::to_string(&r).expect("serialize the canary result");
+        let back: CanaryResult = serde_json::from_str(&json).expect("parse the canary result");
+        assert_eq!(back.id, "math-greedy");
+        assert!(back.sane);
+        assert!(back.deterministic);
+        assert_eq!(back.first, "the answer is 10");
+        assert_eq!(back.second, "the answer is 10");
+    }
+
+    #[test]
+    fn an_unsane_canary_keeps_the_sanity_reason() {
+        // The shipped divergence report must say *why* a canary is unsane —
+        // a bare "sane: false" is not actionable.
+        let stuck = "x".repeat(40);
+        let divergent = evaluate("stuck", &stuck, &stuck);
+        assert!(!divergent.sane);
+        assert!(
+            divergent.sane_reason.is_some(),
+            "an unsane canary must carry the sanity reason"
+        );
+        let healthy = evaluate("ok", "a sane answer", "a sane answer");
+        assert!(healthy.sane);
+        assert!(
+            healthy.sane_reason.is_none(),
+            "a sane canary has no sanity reason"
+        );
     }
 }

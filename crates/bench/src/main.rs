@@ -1,28 +1,35 @@
-//! ignis-bench CLI: trace-replay harness + canary suite + performance report.
+//! ignis-bench CLI: trace-replay harness + canary suite + v1 gate.
 //!
 //! Subcommands:
 //!   `replay  --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F]
 //!             [--out <run.json>] [--label L]`
 //!       Re-send the JSONL trace against a running endpoint and write the run
 //!       (per-request metrics) as JSON.
-//!   `canary  --endpoint <url>`
+//!   `canary  --endpoint <url> [--out <canary.json>]`
 //!       Run the canary suite (self-consistency: sane + greedy-deterministic)
-//!       against a running endpoint.
+//!       against a running endpoint; ship the divergence report as JSON.
 //!   `report  --ours <ours.json> --ref <ref.json>`
 //!       Compare two runs and print the performance report + the 99% gate
 //!       verdict (ADR 0007). Exits non-zero when the gate fails.
+//!   `gate    --ours <ours.json> --ref <ref.json> --canary <canary.json>
+//!             [--out <gate.json>]`
+//!       The v1 acceptance artifact (ADR 0007): the performance report (the
+//!       99% gate, per class) + the divergence report (canary
+//!       self-consistency — the v1 verdict is their conjunction), shipped
+//!       as a single JSON file. Exits non-zero when the v1 verdict fails.
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
-//! (the `ignis-server`'s OpenAI-compatible API); `report` is fully
-//! functional on its own (it just compares two recorded runs).
+//! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
+//! functional on their own (they compare recorded runs and canary results).
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use ignis_bench::{
-    canary,
+    canary::{self, CanaryResult},
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
+    gate::GateReport,
     metrics::Run,
     report::PerformanceReport,
     trace::Trace,
@@ -34,6 +41,7 @@ fn main() -> ExitCode {
         Some("replay") => cmd_replay(&args[1..]),
         Some("canary") => cmd_canary(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
+        Some("gate") => cmd_gate(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -45,16 +53,21 @@ fn print_usage() {
     eprintln!(
         "usage:
   ignis-bench replay --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F] [--out <run.json>] [--label L]
-  ignis-bench canary --endpoint <url>
-  ignis-bench report --ours <ours.json> --ref <ref.json>"
+  ignis-bench canary --endpoint <url> [--out <canary.json>]
+  ignis-bench report --ours <ours.json> --ref <ref.json>
+  ignis-bench gate --ours <ours.json> --ref <ref.json> --canary <canary.json> [--out <gate.json>]"
     );
 }
 
-/// Return the value following `key` in an argument list, or `None`.
+/// Return the value following the `--key` flag in an argument list, or
+/// `None` (the flag is absent, or it has no value). Flags are spelled
+/// `--key` in argv (e.g. `--ours <path>`), so the `key` argument is the
+/// flag name *without* the `--` prefix.
 fn opt(args: &[String], key: &str) -> Option<String> {
+    let flag = format!("--{key}");
     let mut i = 0;
     while i < args.len() {
-        if args[i] == key {
+        if args[i] == flag {
             return args.get(i + 1).cloned();
         }
         i += 1;
@@ -130,6 +143,7 @@ fn cmd_canary(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let out = opt(args, "out");
     let ep = HttpEndpoint::new(&endpoint);
     // Pre-flight: the engine must be reachable and have a model loaded — a
     // clean error beats a full canary run that fails on every request.
@@ -149,10 +163,26 @@ fn cmd_canary(args: &[String]) -> ExitCode {
             r.id,
             r.sane,
             r.deterministic,
-            if r.consistent() { "" } else {"  <-- DIVERGENT"}
+            if r.consistent() { "" } else { "  <-- DIVERGENT" },
         );
+        // An unsane canary carries the sanity reason (the divergence report
+        // must say *why*, not just *what*).
+        if let Some(reason) = &r.sane_reason {
+            println!("             why: {reason}");
+        }
     }
     println!("self-consistency: {}", if consistent { "PASS" } else { "FAIL" });
+    // Ship the divergence report as JSON (`--out`, spec 02 / ADR 0007).
+    if let Some(path) = out {
+        let json = serde_json::to_string_pretty(&results).expect("serialize canary results");
+        match std::fs::write(&path, &json) {
+            Ok(()) => eprintln!("wrote {path}"),
+            Err(e) => {
+                eprintln!("error: write {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     if consistent {
         ExitCode::SUCCESS
     } else {
@@ -201,7 +231,154 @@ fn cmd_report(args: &[String]) -> ExitCode {
     }
 }
 
+fn cmd_gate(args: &[String]) -> ExitCode {
+    let ours_path = match require(args, "ours") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let ref_path = match require(args, "ref") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let canary_path = match require(args, "canary") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = opt(args, "out");
+
+    let ours = match load_run(&ours_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference = match load_run(&ref_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The canary (divergence) results (`canary --out`): the
+    // self-consistency half of the v1 verdict (ADR 0007). The v1 gate is
+    // the *conjunction* of the performance gate and the self-consistency
+    // check (spec 02), so the canary file is required; the performance-
+    // only comparison lives in `report`.
+    let canary = match load_canaries(&canary_path) {
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The v1 acceptance artifact (ADR 0007): the performance report (the
+    // 99% gate, per class) + the divergence report (canary
+    // self-consistency), a single overall verdict.
+    let artifact = GateReport::new(PerformanceReport::new(&ours, &reference), canary);
+    print!("{}", artifact.render());
+
+    // Ship the artifact as JSON (`--out`, spec 02).
+    if let Some(path) = out {
+        let json =
+            serde_json::to_string_pretty(&artifact).expect("serialize the gate artifact");
+        match std::fs::write(&path, &json) {
+            Ok(()) => eprintln!("wrote {path}"),
+            Err(e) => {
+                eprintln!("error: write {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if artifact.passed() {
+        ExitCode::SUCCESS
+    } else {
+        // Which half of the v1 verdict failed (report both when both
+        // failed — a bare "the gate failed" would hide one of the two).
+        let perf = artifact.performance.gate_passed();
+        let consistent = canary::suite_consistent(&artifact.canary);
+        let detail = match (perf, consistent) {
+            (false, false) => {
+                "the 99% performance gate failed AND the self-consistency check failed (a canary diverged)"
+            }
+            (false, true) => "the 99% performance gate failed",
+            (true, false) => "the self-consistency check failed (a canary diverged)",
+            (true, true) => unreachable!("gate_passed() && consistent but passed() is false"),
+        };
+        eprintln!("v1 gate FAILED (ADR 0007): {detail}");
+        ExitCode::FAILURE
+    }
+}
+
 fn load_run(path: &str) -> Result<Run, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+fn load_canaries(path: &str) -> Result<Vec<CanaryResult>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn opt_reads_the_value_following_a_flag() {
+        // Flags are spelled `--key` in argv (the `opt`/`require` seam the
+        // subcommands parse with).
+        let args = argv(&["--trace", "t.jsonl", "--conc", "4", "--label", "ignis"]);
+        assert_eq!(opt(&args, "trace").as_deref(), Some("t.jsonl"));
+        assert_eq!(opt(&args, "conc").as_deref(), Some("4"));
+        assert_eq!(opt(&args, "label").as_deref(), Some("ignis"));
+        // An absent flag is `None` (a default applies, or `require` fails).
+        assert_eq!(opt(&args, "out"), None);
+    }
+
+    #[test]
+    fn require_reads_a_present_flag() {
+        let args = argv(&["--ours", "a.json", "--ref", "b.json"]);
+        assert_eq!(require(&args, "ours").ok().as_deref(), Some("a.json"));
+        assert_eq!(require(&args, "ref").ok().as_deref(), Some("b.json"));
+    }
+
+    #[test]
+    fn require_rejects_an_absent_flag() {
+        let args = argv(&["--ours", "a.json"]);
+        assert!(require(&args, "ours").is_ok(), "the flag is present");
+        assert!(
+            require(&args, "ref").is_err(),
+            "an absent flag must be rejected (not silently defaulted)"
+        );
+    }
+
+    #[test]
+    fn a_flag_without_a_value_is_missing() {
+        // A trailing `--ref` with no value reads as `None` (the value is
+        // missing, not the flag).
+        let args = argv(&["--ours", "a.json", "--ref"]);
+        assert!(
+            opt(&args, "ref").is_none(),
+            "a flag at the end of argv has no value"
+        );
+        assert!(require(&args, "ref").is_err());
+    }
 }

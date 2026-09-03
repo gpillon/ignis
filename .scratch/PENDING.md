@@ -6,11 +6,18 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 ## Open
 
 - **bench-02: recorded reference baseline + 99% gate (ADR 0007, GitHub #20).**
-  The `ignis-bench` harness (bench-01, 968a2c1) is in — `HttpEndpoint`
-  transport, per-class metrics, canary self-consistency, 99% gate check —
-  but it needs a **recorded** trace (JSONL) + a reference run to compare
-  against. The synthetic `main_plus_10.jsonl` fixture is not a reference.
-  Owner: bench actor. Blocker: GPU + a recorded reference recording.
+  The `ignis-bench` harness is code-complete — `HttpEndpoint` transport,
+  per-class metrics, canary self-consistency, 99% gate check (bench-01,
+  968a2c1), plus the shipped v1 gate artifact (this bench-02 work:
+  `ignis-bench gate` composes the performance report + the divergence
+  report into a single shippable JSON artifact; `canary --out` ships the
+  divergence report; `CanaryResult` is serializable with the sanity
+  reason; the CLI flag parsing is fixed). What remains is the **recorded**
+  side: a trace (JSONL) recorded against the reference stack + a reference
+  run recorded with the *same harness* — the synthetic
+  `main_plus_10.jsonl` fixture is not a reference. Procedure + file
+  layout: `bench/traces/README.md`. Then `ignis-bench gate` runs the 99%
+  gate. Owner: bench actor. Blocker: GPU + a recorded reference recording.
 
 ## Blocked (external)
 

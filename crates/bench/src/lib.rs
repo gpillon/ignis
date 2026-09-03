@@ -14,6 +14,7 @@
 
 pub mod canary;
 pub mod client;
+pub mod gate;
 pub mod metrics;
 pub mod report;
 pub mod trace;
