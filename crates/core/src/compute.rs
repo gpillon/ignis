@@ -56,19 +56,34 @@
 //! token thereafter) — the real-model autoregressive wiring (a fresh
 //! request without a prefill uses token 0).
 //!
-//! **Documented gaps (the 99%-gate performance material, ADR 0005 / 0007
-//! / bench-03 — not the A3 correctness floor):** the CUDA-graph **launch**
-//! (the per-decode-step replay, B2 / #32), the **batched prefill** (the
-//! multi-token attention + the multi-token GEMM, the `prefill_step`
-//! seam's performance path, B1 / #31), and the *re-implementation* of the
-//! "for now" ported kernels (the tensor-core NVFP4 / bf16 GEMMs, the
-//! fused qk-norm+RoPE, the fused readout — the later performance gate, the
-//! 99% material, #20). The A3 / #30 correctness floor (the full-correct
-//! forward pass — a *sane*, reproducible real-model output, ADR 0005 /
-//! 0007) is complete in this module.
+//! **The batched prefill (the multi-token forward path, B1 / #31):** the
+//! `prefill` seam's dispatch — a `seq > 1` fresh-prompt prefill runs the
+//! layer stack in one multi-token pass (`prefill_batched` +
+//! `forward_layers_multi`: the multi-token GEMM, kernel-abi 05, + the
+//! multi-token attention, kernel-abi 01, + the per-token GDN recurrence
+//! / RoPE / KV writeback); `seq == 1` (the GEMV special case, ADR 0001)
+//! and a warm-KV (prefix-reuse tail) prefill keep the per-token loop
+//! (the ADR 0003 eager fallback — a busy/absent multi-token kernel also
+//! falls back to the per-token loop after the fresh state is restored).
+//! The batched path's accumulation order differs from the per-token loop
+//! (spec 08's design §7 caveat), so the acceptance is a *sane*,
+//! reproducible output (the correctness floor, ADR 0005 / 0007) — not a
+//! bit-exact agreement with the per-token loop (the 99% gate, #20, is
+//! the re-check).
+//!
+//! **Documented gaps (the 99%-gate performance material, ADR 0005 /
+//! 0007 / bench-03 — not the correctness floor):** the CUDA-graph
+//! **launch** (the per-decode-step replay, B2 / #32), and the
+//! *re-implementation* of the "for now" ported kernels (the tensor-core
+//! NVFP4 / bf16 GEMMs, the fused qk-norm+RoPE, the fused readout, the
+//! fused multi-token norms — the later performance gate, the 99%
+//! material, #20). The correctness floor (the full-correct forward pass —
+//! a *sane*, reproducible output, ADR 0005 / 0007) is complete in this
+//! module.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::ffi;
@@ -272,7 +287,11 @@ impl ModelConfig {
     /// (one GDN + one GQA layer, small dims, a small paged KV) — exercises
     /// every kernel primitive (embedding, GEMM/GEMV, GQA, GDN step, norms,
     /// sample, the CUDA-graph primitives) with a deterministic synthetic
-    /// model.
+    /// model. All NVFP4 GEMM shapes satisfy the kernel's `k % 16 == 0`
+    /// group-scale validation (kernel-abi 05: the GDN readout GEMM's
+    /// `k` = the readout width `state_rows` is a multiple of 16 — a
+    /// `k` that violates it is rejected by the kernel *before* any CUDA
+    /// call, so the synthetic forward pass would fault on it, B1 / #31).
     pub fn synthetic() -> Self {
         Self {
             num_layers: 2,
@@ -282,7 +301,11 @@ impl ModelConfig {
             num_q_heads: 4,
             num_kv_heads: 2,
             head_dim: 16,
-            gdn_state_rows: 8,
+            // A multiple of 16 (the NVFP4 GEMM's `k` group-scale
+            // validation — the GDN readout GEMM's `k` = `state_rows`,
+            // kernel-abi 05 — the synthetic forward pass's kernels all
+            // pass validation, B1 / #31).
+            gdn_state_rows: 16,
             gdn_state_cols: 8,
             gdn_num_layers: 1,
             // The synthetic model has no separate GDN q / z / a-b parts
@@ -1344,6 +1367,15 @@ pub struct CudaCompute {
     /// in VRAM for the lifetime of the backend). `None` on the synthetic /
     /// dev path.
     device_ctx: Option<DeviceCtx>,
+    /// The prefill jobs completed through the multi-token (batched) forward
+    /// path (B1 / #31): incremented once per `prefill` that runs the
+    /// multi-token layer-stack pass (`prefill_batched`). The eager per-token
+    /// loop (the `seq == 1` GEMV special case, the prefix-reuse tail
+    /// prefill, the ADR 0003 busy/absent-kernel fallback) never increments —
+    /// the observation surface for the `prefill_step` dispatch (spec 08
+    /// acceptance: the GPU test asserts a multi-token prefill took the
+    /// multi-token path, a single-token one did not).
+    batched_prefills: AtomicU64,
 }
 
 impl CudaCompute {
@@ -1391,6 +1423,7 @@ impl CudaCompute {
             graph_geom,
             rope_inv_freq,
             device_ctx: None,
+            batched_prefills: AtomicU64::new(0),
         }
     }
 
@@ -1417,6 +1450,7 @@ impl CudaCompute {
             graph_geom: None,
             rope_inv_freq,
             device_ctx: None,
+            batched_prefills: AtomicU64::new(0),
         }
     }
 
@@ -1438,6 +1472,21 @@ impl CudaCompute {
     /// synthetic path returns `false` (no materialization, ADR 0006).
     pub fn vram_resident(&self) -> bool {
         self.device_ctx.is_some()
+    }
+
+    /// The number of prefill jobs completed through the multi-token
+    /// (batched) forward path (B1 / #31 — the `prefill_step` dispatch's
+    /// observation surface, spec 08): a prefill runs the multi-token path
+    /// only when `seq > 1` (the `seq == 1` GEMV special case stays on the
+    /// single-token path, ADR 0001) on a fresh (empty-KV) request (the
+    /// multi-token attention's fresh-prompt causal mask — base_pos = 0 —
+    /// a warm-KV tail prefill stays on the per-token loop), and the
+    /// multi-token kernels were available (a busy/absent kernel falls back
+    /// to the per-token eager loop, ADR 0003 — a fallback that ran never
+    /// increments this counter). The GPU tests (the `batched_prefill_gpu`
+    /// integration) assert the dispatch through this counter.
+    pub fn batched_prefill_count(&self) -> u64 {
+        self.batched_prefills.load(Ordering::Relaxed)
     }
 
     /// Get-or-create a request's compute state (the paged KV cache, the GDN
@@ -1719,15 +1768,20 @@ impl CudaCompute {
     /// `[4][channels]` tap-major conv weight (the artifact's
     /// `gdn/convolution`); `state_in` / `state_out` are the per-layer
     /// rolling 3-tap state (`[channels][3]`, channel-major — the
-    /// `state_out` receives the updated state). `projected` is the
-    /// conv'd part of the input projection (`[channels]` bf16, a
-    /// single-token step), the output the conv'd + SiLU'd rows.
+    /// `state_out` receives the updated state — the last 3 consumed taps;
+    /// `state_in` may alias `state_out`). `projected` is the conv'd part
+    /// of the input projection (`[tokens][channels]` bf16), the output
+    /// the conv'd + SiLU'd rows. The `tokens` param serves the single-
+    /// token step (`tokens` = 1) and the multi-token batched prefill
+    /// (the B1 / #31 pass — the rolling conv state advances over the
+    /// whole chunk in one call).
     fn gdn_causal_conv(
         &self,
         w: &Bf16Weight,
         projected: &[u16],
         state_in: &[u16],
         state_out: &mut [u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let ch = w.k as usize;
         debug_assert_eq!(
@@ -1737,8 +1791,8 @@ impl CudaCompute {
         );
         debug_assert_eq!(
             projected.len(),
-            ch,
-            "the conv'd part must be the conv channel count"
+            (tokens as usize) * ch,
+            "the conv'd part must be [tokens][channels]"
         );
         debug_assert_eq!(
             state_in.len(),
@@ -1754,7 +1808,7 @@ impl CudaCompute {
             !w.data.is_empty(),
             "the GDN layer needs a causal-conv weight (the artifact's gdn/convolution)"
         );
-        let mut out = vec![0u16; ch];
+        let mut out = vec![0u16; (tokens as usize) * ch];
         let rc = unsafe {
             ffi::ignis_gdn_causal_conv(
                 projected.as_ptr() as *const c_void,
@@ -1762,8 +1816,7 @@ impl CudaCompute {
                 state_in.as_ptr() as *const c_void,
                 state_out.as_mut_ptr() as *mut c_void,
                 out.as_mut_ptr() as *mut c_void,
-                1, // tokens = 1 (the single-token step; the multi-token
-                   // prefill is B1, A3 / #30).
+                tokens as i64,
                 ch as i64,
                 std::ptr::null_mut(),
             )
@@ -1968,14 +2021,74 @@ impl CudaCompute {
 
     // ── the forward pass ───────────────────────────────────────────────────
 
+    /// The batched (multi-token) prefill dispatch rule (B1 / #31 — spec
+    /// 08's acceptance criterion 1 + 3): a prefill runs the multi-token
+    /// path only when the prompt is `seq > 1` tokens (the `seq == 1` GEMV
+    /// special case stays on the single-token path, ADR 0001) and the
+    /// request's KV state is fresh (`kv_len == 0` — the multi-token
+    /// attention's fresh-prompt causal mask (base_pos = 0) is only valid
+    /// on an empty cache; a prefix-reuse tail prefill (a warm KV) keeps
+    /// the per-token loop). Pure + CPU-testable (the `batched_prefill`
+    /// integration's dispatch pins); the `prefill` dispatch consults it.
+    pub fn batched_prefill_eligible(seq: u64, kv_len: u64) -> bool {
+        seq > 1 && kv_len == 0
+    }
+
     /// The compute-adapter's prefill step: warm a request's KV cache + GDN
     /// state (the `prefill_step` seam, `scheduler.rs`). Composes the
-    /// kernel-leaf primitives (embedding, the multi-token NVFP4 GEMM —
-    /// `ignis_nvfp4_gemm_prefill`, the GQA/GDN attention, the norms) over
-    /// the prompt tokens.
+    /// kernel-leaf primitives (embedding, the NVFP4 GEMM, the GQA/GDN
+    /// attention, the norms) over the prompt tokens.
+    ///
+    /// The dispatch (B1 / #31 — the multi-token forward path, spec 08):
+    /// a `seq > 1` fresh (empty-KV) prompt runs the layer stack in **one
+    /// multi-token pass** (`prefill_batched` — the multi-token GEMM,
+    /// kernel-abi 05 + the multi-token attention, kernel-abi 01);
+    /// `seq == 1` (the GEMV special case, ADR 0001) and a non-fresh
+    /// (prefix-reuse tail) prefill keep the **per-token loop**
+    /// (`prefill_eager` — the ADR 0003 eager fallback); a busy/absent
+    /// multi-token kernel (a kernel-rc error mid-pass) falls back to the
+    /// per-token loop too (the fresh state is restored first — the
+    /// correctness floor is unchanged, a non-GPU host still gets a
+    /// (correct, eager) prefill).
     fn prefill(&self, job: &PrefillJob) -> Result<(), ComputeError> {
-        let cfg = &self.config;
         self.ensure_state(job.request, job.params.max_tokens);
+        let seq = job.tokens.len() as u64;
+        // The dispatch decision (the `batched_prefill_eligible` rule — the
+        // request's KV state before this prefill; a fresh (never-prefilled)
+        // request has `kv_len == 0` by construction).
+        let kv_len = self
+            .state
+            .lock()
+            .unwrap()
+            .get(&job.request)
+            .map(|s| s.kv_len)
+            .unwrap_or(0);
+        if Self::batched_prefill_eligible(seq, kv_len) {
+            if let Err(e) = self.prefill_batched(job, seq) {
+                // A busy/absent multi-token kernel (the ADR 0003 eager
+                // fallback — spec 08's acceptance criterion 3): restore
+                // the fresh state invariant (a failed batched pass may
+                // have left partial state) and run the per-token loop
+                // (the correctness floor is unchanged).
+                if matches!(e, ComputeError::Kernel(_)) {
+                    self.reset_fresh_state(job.request);
+                    return self.prefill_eager(job);
+                }
+                return Err(e);
+            }
+            return Ok(());
+        }
+        self.prefill_eager(job)
+    }
+
+    /// The per-token (eager) prefill loop (the ADR 0003 eager fallback —
+    /// the `seq == 1` GEMV special case, the prefix-reuse tail prefill,
+    /// and the busy/absent-kernel fallback of the batched pass, B1 /
+    /// #31): run the layer stack over the prompt one token at a time
+    /// (the single-token GEMV `ignis_nvfp4_gemm_decode` + the single-
+    /// token `ignis_gqa_attention_decode`, ADR 0001).
+    fn prefill_eager(&self, job: &PrefillJob) -> Result<(), ComputeError> {
+        let cfg = &self.config;
         let ids: Vec<i32> = job.tokens.iter().map(|&t| t as i32).collect();
         let emb = self.embed(&ids)?;
         let hid = cfg.hidden as usize;
@@ -1983,7 +2096,8 @@ impl CudaCompute {
         // Run the layer stack over the prompt (the GQA layers warm the KV
         // cache — the rotated k / v; the GDN layers warm the GDN state +
         // the rolling conv state). Per-token (the RoPE `pos` contract —
-        // the multi-token prefill is B1, A3 / #30).
+        // the multi-token prefill is B1, A3 / #30; this is the per-token
+        // loop it falls back to).
         let mut acc = vec![0u16; hid];
         for pos in 0..seq {
             let h_in = &emb[pos * hid..(pos + 1) * hid];
@@ -2005,6 +2119,96 @@ impl CudaCompute {
             });
         let _ = acc; // the decode query is the lm-head GEMM input (below).
         Ok(())
+    }
+
+    /// The multi-token (batched) prefill pass (B1 / #31 — spec 08's
+    /// performance path): a `seq`-token prompt through the layer stack in
+    /// one pass — the embedding (the `ignis_embedding` batch, the
+    /// `[seq][hidden]` activation), the multi-token layer-stack forward
+    /// (`forward_layers_multi` — the multi-token GEMM, kernel-abi 05, +
+    /// the multi-token attention, kernel-abi 01, + the per-token GDN
+    /// recurrence + the per-token RoPE / KV writeback, spec 08), the
+    /// final RMSNorm (the per-token pointwise glue, ADR 0005) + the
+    /// lm_head multi-token GEMM (`ignis_nvfp4_gemm_prefill` — the
+    /// synthetic path — / the `ignis_bf16_gemm` logits path, A2b / #29)
+    /// + the greedy sample (`ignis_greedy_sample`) over the last token's
+    /// logits (the sane-output self-check, ADR 0007). The prefill itself
+    /// emits no token to the scheduler (the `prefill_step` contract) —
+    /// the decode query stays the last prompt token (the A3 / #30 decode
+    /// convention).
+    fn prefill_batched(&self, job: &PrefillJob, seq: u64) -> Result<(), ComputeError> {
+        let cfg = &self.config;
+        // The embedding lookup (the kernel-leaf `ignis_embedding` — the
+        // `[seq][hidden]` activation, the multi-token pass's input).
+        let ids: Vec<i32> = job.tokens.iter().map(|&t| t as i32).collect();
+        let emb = self.embed(&ids)?;
+        // The multi-token layer-stack forward (the batched prefill pass,
+        // B1 / #31 — the KV + GDN state + the rolling conv state are warm
+        // after it; the GQA layers' KV writeback filled the paged cache
+        // with all `seq` tokens' K / V, spec 08).
+        let acc = self.forward_layers_multi(job.request, &emb, seq)?;
+        // The final RMSNorm (the per-token pointwise glue — the
+        // `ignis_rmsnorm` over the `[seq][hidden]` plane, ADR 0005) +
+        // the lm_head multi-token GEMM (kernel-abi 05 / the A2b / #29
+        // bf16 logits path) + the greedy sample (`ignis_greedy_sample`)
+        // over the last token's logits (the sane-output self-check, ADR
+        // 0007 — the prefill's emitted logits are in-vocabulary).
+        let hid = cfg.hidden as usize;
+        let seq_us = seq as usize;
+        let mut final_in = vec![0u16; seq_us * hid];
+        for i in 0..seq_us {
+            let n = self.rmsnorm(&acc[i * hid..(i + 1) * hid], &self.weights.final_norm)?;
+            final_in[i * hid..(i + 1) * hid].copy_from_slice(&n);
+        }
+        let logits = self.head_gemm(&self.weights.lm_head, &final_in, seq)?;
+        let vocab = cfg.vocab as usize;
+        let last_logits = &logits[(seq_us - 1) * vocab..seq_us * vocab];
+        let _sampled = self.sample(&bf16_to_f32s(last_logits))?;
+        // The prefill is complete (the KV + GDN state + the conv state
+        // are warm); the decode query is the last prompt token (the
+        // autoregressive decode — the real model threads the actually-
+        // generated token back into the next step, A3 / #30).
+        self.state
+            .lock()
+            .unwrap()
+            .get_mut(&job.request)
+            .map(|s| {
+                s.kv_len = seq.min(cfg.num_blocks * cfg.block_size);
+                if let Some(last) = job.tokens.last() {
+                    s.last_generated = Some(*last);
+                }
+            });
+        // The batched prefill completed (the `prefill_step` dispatch's
+        // observation surface, spec 08 — the GPU tests assert the multi-
+        // token path ran through this counter).
+        self.batched_prefills.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Restore a fresh (never-prefilled) request's state invariant after a
+    /// failed multi-token (batched) prefill (B1 / #31 — the ADR 0003
+    /// eager fallback's precondition): the failed pass may have left
+    /// partial state (K / V written into some paged slots, the GDN state
+    /// / the rolling conv state advanced mid-chunk, `kv_len` / `seq_pos`
+    /// advanced), so the per-token fallback loop runs from a clean fresh
+    /// state (the `RequestState::new` values — the zeroed GDN / conv
+    /// state, the zero `kv_len` / `seq_pos` / `generated`, no `last_
+    /// generated`). The K / V cache slots the fallback writes are a
+    /// superset of the failed pass's write set (both use the same
+    /// `store_kv` placement from `kv_len = 0` — the fallback's full
+    /// per-token store set subsumes the failed pass's partial one), so
+    /// the cache planes need no zeroing (the stale partial values are
+    /// overwritten by the fallback's deterministic placement).
+    fn reset_fresh_state(&self, request: RequestId) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(s) = st.get_mut(&request) {
+            s.kv_len = 0;
+            s.seq_pos = 0;
+            s.generated = 0;
+            s.last_generated = None;
+            s.gdn_state.fill(0);
+            s.gdn_conv_state.fill(0);
+        }
     }
 
     /// The compute-adapter's decode step: generate one token per lane (the
@@ -2081,7 +2285,9 @@ impl CudaCompute {
             .collect()
     }
 
-    /// The GQA q / k / v projection GEMMs (A3 / #30 — the GEMM dispatch):
+    /// The GQA q / k / v projection GEMMs (A3 / #30 — the GEMM dispatch;
+    /// the `tokens` param serves the single-token decode (`tokens` = 1)
+    /// and the multi-token batched prefill (the B1 / #31 pass)):
     /// the fused NVFP4 device plane (the `from_artifact` routing — the
     /// artifact's `attention/query_key_gate_value`, the slot's row slice) /
     /// the BF16-exception plane (the artifact's early GQA layers, A1's
@@ -2094,6 +2300,7 @@ impl CudaCompute {
         lw: &LayerWeights,
         slot: u64,
         pre: &[u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         let (row_off, m) = match slot {
@@ -2102,17 +2309,19 @@ impl CudaCompute {
             _ => (cfg.gqa_width() + cfg.gqa_kv_width(), cfg.gqa_kv_width()),
         };
         if let Some(plane) = lw.dev.qkv {
-            return self.nvfp4_gemm_device(&plane, row_off, m, pre, 1);
+            return self.nvfp4_gemm_device(&plane, row_off, m, pre, tokens);
         }
         if !lw.qkv_bf16.data.is_empty() {
-            return self.bf16_gemm(&lw.qkv_bf16, row_off, m, pre, 1);
+            return self.bf16_gemm(&lw.qkv_bf16, row_off, m, pre, tokens);
         }
         // The synthetic / dev path: the separate per-slot host weights
         // (no slice — the synthetic q / k / v are individual weights).
-        self.nvfp4_gemm(&lw.projection[slot as usize], pre, 1)
+        self.nvfp4_gemm(&lw.projection[slot as usize], pre, tokens)
     }
 
-    /// The GQA output projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// The GQA output projection GEMM (A3 / #30 — the GEMM dispatch;
+    /// the `tokens` param serves the single-token decode (`tokens` = 1)
+    /// and the multi-token batched prefill (the B1 / #31 pass)):
     /// the NVFP4 device plane (the artifact's `attention/output`, m =
     /// `hidden`, k = `gqa_width`) / the BF16-exception plane (the early
     /// GQA layers, A1's `ATTENTION_OUT_BF16_LAYERS`) / the synthetic host
@@ -2121,31 +2330,41 @@ impl CudaCompute {
         &self,
         lw: &LayerWeights,
         attn_out: &[u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         if let Some(plane) = lw.dev.attn_out {
-            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, attn_out, 1);
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, attn_out, tokens);
         }
         if !lw.attn_out_bf16.data.is_empty() {
-            return self.bf16_gemm(&lw.attn_out_bf16, 0, cfg.hidden, attn_out, 1);
+            return self.bf16_gemm(&lw.attn_out_bf16, 0, cfg.hidden, attn_out, tokens);
         }
-        self.nvfp4_gemm(&lw.projection[3], attn_out, 1)
+        self.nvfp4_gemm(&lw.projection[3], attn_out, tokens)
     }
 
-    /// The GDN input projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// The GDN input projection GEMM (A3 / #30 — the GEMM dispatch;
+    /// the `tokens` param serves the single-token decode (`tokens` = 1)
+    /// and the multi-token batched prefill (the B1 / #31 pass)):
     /// the NVFP4 device plane (the artifact's `gdn/query_key_value_z`,
     /// the q / k / v / z rows, m = `gdn_in_proj_m`) / the synthetic host
     /// `Nvfp4Weight`.
-    fn gdn_in_gemm(&self, lw: &LayerWeights, pre: &[u16]) -> Result<Vec<u16>, ComputeError> {
+    fn gdn_in_gemm(
+        &self,
+        lw: &LayerWeights,
+        pre: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         if let Some(plane) = lw.dev.gdn_in {
-            return self.nvfp4_gemm_device(&plane, 0, cfg.gdn_in_proj_m(), pre, 1);
+            return self.nvfp4_gemm_device(&plane, 0, cfg.gdn_in_proj_m(), pre, tokens);
         }
-        self.nvfp4_gemm(&lw.projection[0], pre, 1)
+        self.nvfp4_gemm(&lw.projection[0], pre, tokens)
     }
 
-    /// The GDN state readout GEMM (A3 / #30 — the GEMM dispatch): the
-    /// NVFP4 device plane (the artifact's `gdn/output`, m = `hidden`, k =
+    /// The GDN state readout GEMM (A3 / #30 — the GEMM dispatch;
+    /// the `tokens` param serves the single-token decode (`tokens` = 1)
+    /// and the multi-token batched prefill (the B1 / #31 pass)):
+    /// the NVFP4 device plane (the artifact's `gdn/output`, m = `hidden`, k =
     /// the readout width `state_rows`) / the BF16-exception plane (the
     /// layer-4 quirk, A1's `GDN_OUT_BF16_LAYERS`) / the synthetic host
     /// `Nvfp4Weight`.
@@ -2153,19 +2372,22 @@ impl CudaCompute {
         &self,
         lw: &LayerWeights,
         gated: &[u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         if let Some(plane) = lw.dev.gdn_out {
-            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, gated, 1);
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, gated, tokens);
         }
         if !lw.gdn_out_bf16.data.is_empty() {
-            return self.bf16_gemm(&lw.gdn_out_bf16, 0, cfg.hidden, gated, 1);
+            return self.bf16_gemm(&lw.gdn_out_bf16, 0, cfg.hidden, gated, tokens);
         }
-        self.nvfp4_gemm(&lw.gdn_output, gated, 1)
+        self.nvfp4_gemm(&lw.gdn_output, gated, tokens)
     }
 
     /// The gated-FFN gate / up projection GEMMs (A3 / #30 — the GEMM
-    /// dispatch): the fused NVFP4 device plane (the artifact's
+    /// dispatch; the `tokens` param serves the single-token decode
+    /// (`tokens` = 1) and the multi-token batched prefill (the B1 / #31
+    /// pass)): the fused NVFP4 device plane (the artifact's
     /// `mlp/gate_up` — the gate slot is row 0, the up slot is
     /// `ffn_intermediate` within the fused plane) / the synthetic host
     /// `Nvfp4Weight`s (the separate gate / up weights).
@@ -2174,32 +2396,36 @@ impl CudaCompute {
         lw: &LayerWeights,
         is_up: bool,
         post: &[u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         if let Some(plane) = lw.dev.mlp_gate_up {
             let row_off = if is_up { cfg.ffn_intermediate } else { 0 };
-            return self.nvfp4_gemm_device(&plane, row_off, cfg.ffn_intermediate, post, 1);
+            return self.nvfp4_gemm_device(&plane, row_off, cfg.ffn_intermediate, post, tokens);
         }
         if is_up {
-            self.nvfp4_gemm(&lw.ffn_up, post, 1)
+            self.nvfp4_gemm(&lw.ffn_up, post, tokens)
         } else {
-            self.nvfp4_gemm(&lw.ffn_gate, post, 1)
+            self.nvfp4_gemm(&lw.ffn_gate, post, tokens)
         }
     }
 
-    /// The gated-FFN down projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// The gated-FFN down projection GEMM (A3 / #30 — the GEMM dispatch;
+    /// the `tokens` param serves the single-token decode (`tokens` = 1)
+    /// and the multi-token batched prefill (the B1 / #31 pass)):
     /// the NVFP4 device plane (the artifact's `mlp/down`, m = `hidden`,
     /// k = `ffn_intermediate`) / the synthetic host `Nvfp4Weight`.
     fn ffn_down_gemm(
         &self,
         lw: &LayerWeights,
         act: &[u16],
+        tokens: u64,
     ) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         if let Some(plane) = lw.dev.mlp_down {
-            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, act, 1);
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, act, tokens);
         }
-        self.nvfp4_gemm(&lw.ffn_down, act, 1)
+        self.nvfp4_gemm(&lw.ffn_down, act, tokens)
     }
 
     /// Run the layer stack (GQA / GDN + gated-FFN, the compute-adapter's
@@ -2262,9 +2488,9 @@ impl CudaCompute {
                     // A3 / #30) + the GQA attention (the kernel-leaf
                     // `ignis_gqa_attention_decode`, the paged KV) + the
                     // output projection.
-                    let q = self.gqa_proj(lw, 0, &pre)?;
-                    let k = self.gqa_proj(lw, 1, &pre)?;
-                    let v = self.gqa_proj(lw, 2, &pre)?;
+                    let q = self.gqa_proj(lw, 0, &pre, 1)?;
+                    let k = self.gqa_proj(lw, 1, &pre, 1)?;
+                    let v = self.gqa_proj(lw, 2, &pre, 1)?;
                     // The q / k RMSNorm (the per-head — the real model's
                     // `attention/query_norm` / `key_norm` weights, a
                     // parameter-free RMS when empty, A3 / #30) + the
@@ -2307,7 +2533,7 @@ impl CudaCompute {
                         return Err(ComputeError::Kernel(rc));
                     }
                     // The attention output projection (GQA_width -> hidden).
-                    self.gqa_out_gemm(lw, &attn_out)?
+                    self.gqa_out_gemm(lw, &attn_out, 1)?
                 }
                 LayerKind::Gdn => {
                     // GDN: the input projection (the NVFP4 GEMM — the
@@ -2323,7 +2549,7 @@ impl CudaCompute {
                     // GEMV, the "for now" readout, ADR 0005) gated by
                     // the z part + the state -> output projection (the
                     // recurrent-state readout GEMM, the `gdn/output`).
-                    let feat = self.gdn_in_gemm(lw, &pre)?;
+                    let feat = self.gdn_in_gemm(lw, &pre, 1)?;
                     // The GDN causal conv (the kernel-leaf
                     // `ignis_gdn_causal_conv`, kernel-abi 06, A2 / #28 —
                     // the GDN layer's input, A3 / #30): the 4-tap
@@ -2340,6 +2566,7 @@ impl CudaCompute {
                         &feat[..conv_ch],
                         conv_state_in,
                         &mut conv_state_out,
+                        1, // the single-token step (the per-token eager loop)
                     )?;
                     // Commit the updated rolling conv state (in-place;
                     // the next token's conv reads the updated state).
@@ -2422,7 +2649,7 @@ impl CudaCompute {
                     // The GDN state -> output projection (the readout;
                     // the fused readout kernel is the later performance
                     // material, ADR 0005, the GEMM dispatch, A3 / #30).
-                    self.gdn_out_gemm(lw, &gated)?
+                    self.gdn_out_gemm(lw, &gated, 1)?
                 }
             };
             // The residual (host pointwise glue, the correctness floor).
@@ -2436,10 +2663,10 @@ impl CudaCompute {
             };
             // ── the gated-FFN block (gate / up GEMV + the gated-SiLU
             // activation (host pointwise, ADR 0005) + the down GEMV) ───
-            let gate = self.ffn_gemm(lw, false, &post)?;
-            let up = self.ffn_gemm(lw, true, &post)?;
+            let gate = self.ffn_gemm(lw, false, &post, 1)?;
+            let up = self.ffn_gemm(lw, true, &post, 1)?;
             let act = Self::silu_mul(&up, &gate);
-            let ffn_out = self.ffn_down_gemm(lw, &act)?;
+            let ffn_out = self.ffn_down_gemm(lw, &act, 1)?;
             Self::residual(&mut acc, &ffn_out);
             // This token has been consumed: the sequence position
             // advances (the RoPE `pos` contract, A3 / #30).
@@ -2447,6 +2674,355 @@ impl CudaCompute {
         }
         // The final RMSNorm is the caller's (the decode step's lm-head
         // input, A3 / #30).
+        drop(st);
+        Ok(acc)
+    }
+
+    /// Run the layer stack (GQA / GDN + gated-FFN, the compute-adapter's
+    /// core) over a `seq`-token hidden state `h_in` (bf16
+    /// `[seq][hidden]`) in **one pass** (the multi-token batched-prefill
+    /// forward, B1 / #31 — spec 08's performance path): every
+    /// projection is a multi-token GEMM (the `ignis_nvfp4_gemm_prefill`
+    /// family, kernel-abi 05 — the eager per-token loop's single-token
+    /// GEMV, ADR 0001, is the `seq == 1` special case), every GQA layer
+    /// is the multi-token `ignis_gqa_attention_prefill` (kernel-abi 01 —
+    /// the batched query attends over the whole sequence, its K / V
+    /// written back into the paged cache first, spec 08), and the GDN
+    /// layers' projections are multi-token while the GDN recurrence is
+    /// per-token (the Gated-DeltaNet state update is a per-token
+    /// recurrence — the GDN step runs per token within the chunk, the
+    /// kernel-leaf `ignis_gdn_step`, kernel-abi 01; the projections are
+    /// batched, the recurrence is not (inherently sequential) — the
+    /// fused GDN-prefill kernel is a later optimization, spec 08's
+    /// non-goal).
+    ///
+    /// The per-token sub-loops (the GDN recurrence, the GQA RoPE / q / k
+    /// RMSNorm, the KV writeback, the norms) are the "for now" per-token
+    /// composition of the multi-token pass (the pointwise glue is the
+    /// correctness floor, ADR 0005: the fused-SiLU / fused qk-norm+RoPE
+    /// / fused readout kernels are the later 99%-gate performance
+    /// material, ADR 0007).
+    ///
+    /// The per-token GQA RoPE positions mirror the eager per-token loop's
+    /// `pos` contract (kernel-abi 06 — token `i` of layer `l` rotates at
+    /// `i * num_layers + l`): the multi-token pass leaves the request
+    /// state (the KV cache's rotated K / V, the GDN state, the rolling
+    /// conv state, `seq_pos`) exactly where the per-token loop would
+    /// have left it, so the subsequent decode step continues the same
+    /// position sequence (the self-consistency invariant is unchanged —
+    /// the batched path's *accumulation order* differs from the per-
+    /// token loop (the multi-token GEMM / attention, spec 08's design §7
+    /// caveat), but the state layout + the decode query are identical).
+    ///
+    /// Returns the residual stream after the layer stack (bf16
+    /// `[seq][hidden]` — the caller's final-RMSNorm / lm-head input, the
+    /// prefill's multi-token logits, B1 / #31).
+    fn forward_layers_multi(
+        &self,
+        request: RequestId,
+        h_in: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        let seq = tokens as usize;
+        let hid = cfg.hidden as usize;
+        let layers = self.weights.per_layer.len();
+        debug_assert_eq!(
+            h_in.len(),
+            seq * hid,
+            "the multi-token input must be [seq][hidden]"
+        );
+        let mut acc: Vec<u16> = h_in.to_vec();
+        // Hold the state lock for the layer loop (the GDN state, the GDN
+        // conv state, + the KV cache are mutated in place; no
+        // re-locking, no deadlock).
+        let mut st = self.state.lock().unwrap();
+        let req_state = st.get_mut(&request).ok_or(ComputeError::Kernel(-1))?;
+        for (l, lw) in self.weights.per_layer.iter().enumerate() {
+            // ── attention block (the per-token RMSNorm glue, ADR 0005) ─
+            // The pre-attention RMSNorm (Qwen pre-norm: the attention /
+            // FFN blocks operate on the normalized residual stream — the
+            // real model's `input_norm` weight, the identity in the
+            // synthetic convention, A3 / #30): the per-token
+            // `ignis_rmsnorm` over the `[seq][hidden]` plane (the fused
+            // multi-token norm is the later 99%-gate material, ADR 0007).
+            let pre: Vec<u16> = if lw.norm_in.is_empty() {
+                acc.clone()
+            } else {
+                let mut pre = vec![0u16; seq * hid];
+                for i in 0..seq {
+                    let n = self.rmsnorm(&acc[i * hid..(i + 1) * hid], &lw.norm_in)?;
+                    pre[i * hid..(i + 1) * hid].copy_from_slice(&n);
+                }
+                pre
+            };
+            let attn: Vec<u16> = match lw.kind {
+                LayerKind::Gqa => {
+                    // The QKV projection (the multi-token NVFP4 GEMM —
+                    // kernel-abi 05 — the fused device plane / the
+                    // BF16-exception plane / the synthetic host plane,
+                    // A3 / #30) + the per-token q / k RMSNorm (the
+                    // per-head, A3 / #30) + the per-token RoPE (the GQA
+                    // layer's q / k at the token's sequence position,
+                    // A3 / #30) + the KV writeback (all `seq` tokens'
+                    // K / V into the paged cache — the multi-token
+                    // attention reads its K / V from the cache, spec
+                    // 08) + the multi-token attention (`ignis_gqa_
+                    // attention_prefill`, kernel-abi 01 — the batched
+                    // query attends over the whole sequence, the fresh-
+                    // prompt causal mask) + the output projection (the
+                    // multi-token GEMM).
+                    let q = self.gqa_proj(lw, 0, &pre, tokens)?;
+                    let k = self.gqa_proj(lw, 1, &pre, tokens)?;
+                    let v = self.gqa_proj(lw, 2, &pre, tokens)?;
+                    let qw = cfg.gqa_width() as usize;
+                    let kw = cfg.gqa_kv_width() as usize;
+                    let mut q = q;
+                    let mut k = k;
+                    for i in 0..seq {
+                        // The per-token q / k RMSNorm (the per-head — the
+                        // real model's `attention/query_norm` / `key_
+                        // norm` weights, a parameter-free RMS when empty,
+                        // A3 / #30).
+                        let qn = self.per_head_rmsnorm(
+                            &q[i * qw..(i + 1) * qw],
+                            cfg.num_q_heads,
+                            &lw.qk_norm[0],
+                        )?;
+                        q[i * qw..(i + 1) * qw].copy_from_slice(&qn);
+                        let kn = self.per_head_rmsnorm(
+                            &k[i * kw..(i + 1) * kw],
+                            cfg.num_kv_heads,
+                            &lw.qk_norm[1],
+                        )?;
+                        k[i * kw..(i + 1) * kw].copy_from_slice(&kn);
+                        // The RoPE (the GQA layer's q / k — the split-
+                        // half NeoX rotation at the token's sequence
+                        // position, in-place on q / k, A3 / #30 — the
+                        // eager per-token `pos` contract: token `i` of
+                        // layer `l` rotates at `i * num_layers + l`,
+                        // kernel-abi 06).
+                        let pos = (i as u64) * (layers as u64) + (l as u64);
+                        self.rope_qk(
+                            &mut q[i * qw..(i + 1) * qw],
+                            &mut k[i * kw..(i + 1) * kw],
+                            pos,
+                        )?;
+                        // The KV writeback (the GQA layer's paged-KV
+                        // store, ADR 0001) — the rotated k (the cache
+                        // holds the rotated keys; the attention's
+                        // queries are rotated at the same `pos`).
+                        self.store_kv(
+                            req_state,
+                            &k[i * kw..(i + 1) * kw],
+                            &v[i * kw..(i + 1) * kw],
+                        );
+                    }
+                    // The multi-token attention (`ignis_gqa_attention_
+                    // prefill`, kernel-abi 01 — the batched query
+                    // attends over the whole sequence: `q` is
+                    // `[batch = 1][seq][num_q_heads][head_dim]`, the K /
+                    // V read from the paged cache's two planes, the
+                    // fresh-prompt causal mask — query `i` attends to
+                    // keys `[0..=i]`).
+                    let qk = cfg.gqa_width() as usize;
+                    let mut attn_out = vec![0u16; seq * qk];
+                    let rc = unsafe {
+                        ffi::ignis_gqa_attention_prefill(
+                            q.as_ptr() as *const c_void,
+                            req_state.kv_cache.as_ptr() as *const c_void,
+                            req_state.block_table.as_ptr() as *const c_void,
+                            attn_out.as_mut_ptr() as *mut c_void,
+                            1, // batch = 1 (a single request's prompt)
+                            seq as i64,
+                            cfg.num_q_heads as i64,
+                            cfg.num_kv_heads as i64,
+                            cfg.head_dim as i64,
+                            cfg.block_size as i64,
+                            cfg.num_blocks as i64,
+                            0.0, // default 1/sqrt(head_dim)
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if rc != 0 {
+                        return Err(ComputeError::Kernel(rc));
+                    }
+                    // The attention output projection (the multi-token
+                    // GEMM, `gqa_width` -> hidden).
+                    self.gqa_out_gemm(lw, &attn_out, tokens)?
+                }
+                LayerKind::Gdn => {
+                    // GDN: the input projection (the multi-token NVFP4
+                    // GEMM — the `gdn/query_key_value_z` q / k / v / z
+                    // rows, A3 / #30) + the GDN causal conv (the kernel-
+                    // leaf `ignis_gdn_causal_conv`, the conv'd q / k / v
+                    // part over the whole chunk — the rolling 3-tap
+                    // state advances across the `seq` tokens in one
+                    // call, A2 / #28 — the z rows bypass it) + the GDN a
+                    // / b (gate / beta) projection (the multi-token bf16
+                    // GEMM, the `gdn/a_b_projection`, A3 / #30) + the
+                    // GDN step (the kernel-leaf `ignis_gdn_step`, the
+                    // Gated-DeltaNet recurrence — the per-token state
+                    // update within the chunk, spec 08) + the state
+                    // readout (the host-side `S^T k` GEMV, the "for now"
+                    // readout, ADR 0005) gated by the z part + the
+                    // state -> output projection (the multi-token NVFP4
+                    // GEMM, the `gdn/output`).
+                    let feat = self.gdn_in_gemm(lw, &pre, tokens)?;
+                    // The GDN causal conv (the kernel-leaf
+                    // `ignis_gdn_causal_conv`, kernel-abi 06, A2 / #28 —
+                    // the GDN layer's input, A3 / #30): the 4-tap
+                    // depthwise causal conv + SiLU over the conv'd q / k
+                    // / v part (the z rows bypass it, the kernel's
+                    // contract), the rolling 3-tap state over the whole
+                    // chunk (one call — the `seq`-token `projected`).
+                    let conv_ch = cfg.gdn_conv_channels() as usize;
+                    let m_in = cfg.gdn_in_proj_m() as usize;
+                    let conv_base = (lw.gdn_index * conv_ch * 3) as usize;
+                    let conv_state_in =
+                        &req_state.gdn_conv_state[conv_base..conv_base + conv_ch * 3];
+                    let mut conv_state_out = vec![0u16; conv_ch * 3];
+                    let conv_out = self.gdn_causal_conv(
+                        &lw.gdn_conv,
+                        &feat[..seq * conv_ch],
+                        conv_state_in,
+                        &mut conv_state_out,
+                        tokens,
+                    )?;
+                    // Commit the updated rolling conv state (in-place —
+                    // the state after the whole chunk; the next layer's /
+                    // request's conv reads it).
+                    req_state
+                        .gdn_conv_state[conv_base..conv_base + conv_ch * 3]
+                        .copy_from_slice(&conv_state_out);
+                    // The GDN a / b (gate / beta) projection (the
+                    // multi-token bf16 GEMM — the artifact's
+                    // `gdn/a_b_projection`, the first half is the gate
+                    // `a`, the second the beta `b`; 0 when the model has
+                    // no a / b projection, the step's g / beta are 0, A3
+                    // / #30).
+                    let ab = if lw.gdn_ab.m > 0 {
+                        self.bf16_gemm(&lw.gdn_ab, 0, lw.gdn_ab.m, &pre, tokens)?
+                    } else {
+                        Vec::new()
+                    };
+                    // The GDN step's feature x = [k, v, g, beta] (the
+                    // conv'd k / v parts + the a / b's gate / beta — the
+                    // `ignis_gdn_step` contract, kernel-abi 01). The
+                    // Gated-DeltaNet recurrence is per-token (the state
+                    // update `S <- αS + δk^T` is a per-token recurrence —
+                    // within a prefill chunk the GDN step runs per token,
+                    // the `ignis_gdn_step` kernel, kernel-abi 01 — the
+                    // projections are batched, the recurrence is not,
+                    // spec 08).
+                    let cols = cfg.gdn_state_cols as usize;
+                    let rows = cfg.gdn_state_rows as usize;
+                    let q_w = cfg.gdn_q_width as usize;
+                    let z_w = cfg.gdn_z_width as usize;
+                    let ab_w = lw.gdn_ab.m as usize;
+                    let state_mat = rows * cols;
+                    let state_base = (lw.gdn_index * state_mat) as usize;
+                    let state_slice =
+                        &mut req_state.gdn_state[state_base..state_base + state_mat];
+                    let mut state_out = vec![0u16; state_mat];
+                    let mut gated = vec![0u16; seq * rows];
+                    for i in 0..seq {
+                        // The token's GDN step feature x = [k_i, v_i,
+                        // g_i, beta_i] (the conv'd k / v parts + the a /
+                        // b's gate / beta — the `ignis_gdn_step`
+                        // contract, kernel-abi 01).
+                        let conv_row = &conv_out[i * conv_ch..(i + 1) * conv_ch];
+                        let k_part = &conv_row[q_w..q_w + cols];
+                        let mut x = vec![0u16; cfg.gdn_state_dim() as usize];
+                        x[..cols].copy_from_slice(k_part);
+                        x[cols..cols + rows]
+                            .copy_from_slice(&conv_row[q_w + cols..q_w + cols + rows]);
+                        if !ab.is_empty() {
+                            let ab_row = &ab[i * ab_w..(i + 1) * ab_w];
+                            x[cols + rows] = ab_row[0]; // the gate (a) — the first half.
+                            x[cols + rows + 1] = ab_row[ab_row.len() / 2]; // the beta (b) — the second half.
+                        }
+                        // The GDN step (the kernel-leaf `ignis_gdn_step`,
+                        // the Gated-DeltaNet recurrence — the per-token
+                        // state update, A3 / #30: this layer's state
+                        // slice, the flat-ABI per-layer semantics).
+                        let rc = unsafe {
+                            ffi::ignis_gdn_step(
+                                x.as_ptr() as *const c_void,
+                                state_slice.as_ptr() as *const c_void,
+                                state_out.as_mut_ptr() as *mut c_void,
+                                1, // batch = 1 (the per-token recurrence)
+                                1, // num_gdn_layers = 1 (this layer's state slice)
+                                cfg.gdn_state_rows as i64,
+                                cfg.gdn_state_cols as i64,
+                                cfg.gdn_state_dim() as i64,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if rc != 0 {
+                            return Err(ComputeError::Kernel(rc));
+                        }
+                        // Commit the updated GDN state (in-place — the
+                        // next token's step reads the updated state, the
+                        // per-token recurrence within the chunk).
+                        state_slice.copy_from_slice(&state_out);
+                        // The token's state readout (the per-token
+                        // readout `y[dv] = sum_d S[dv][d] · k[d]` — the
+                        // host-side GEMV, the "for now" readout, ADR
+                        // 0005) + the z (output-gate) part of the input
+                        // projection (the z rows bypass the conv, they
+                        // gate the readout, A3 / #30).
+                        let readout = Self::state_readout(&state_out, k_part);
+                        if z_w > 0 {
+                            let z = &feat[i * m_in + conv_ch..i * m_in + conv_ch + z_w];
+                            for (j, (y, zv)) in readout.iter().zip(z.iter()).enumerate() {
+                                gated[i * rows + j] = f32_to_bf16(*y * bf16_to_f32(*zv));
+                            }
+                        } else {
+                            for (j, y) in readout.iter().enumerate() {
+                                gated[i * rows + j] = f32_to_bf16(*y);
+                            }
+                        }
+                    }
+                    // The GDN state -> output projection (the multi-
+                    // token readout GEMM — the fused readout kernel is
+                    // the later performance material, ADR 0005, the GEMM
+                    // dispatch, A3 / #30).
+                    self.gdn_out_gemm(lw, &gated, tokens)?
+                }
+            };
+            // The residual (host pointwise glue, the correctness floor —
+            // the elementwise `[seq][hidden]` add).
+            Self::residual(&mut acc, &attn);
+            // The post-attention RMSNorm (the `ignis_rmsnorm` — the FFN's
+            // input, the pre-norm convention, A3 / #30): the per-token
+            // pointwise glue over the `[seq][hidden]` plane (ADR 0005).
+            let post = if lw.norm_post.is_empty() {
+                acc.clone()
+            } else {
+                let mut post = vec![0u16; seq * hid];
+                for i in 0..seq {
+                    let n = self.rmsnorm(&acc[i * hid..(i + 1) * hid], &lw.norm_post)?;
+                    post[i * hid..(i + 1) * hid].copy_from_slice(&n);
+                }
+                post
+            };
+            // ── the gated-FFN block (the multi-token gate / up GEMM +
+            // the gated-SiLU activation (host pointwise glue, ADR 0005)
+            // + the multi-token down GEMM) ─
+            let gate = self.ffn_gemm(lw, false, &post, tokens)?;
+            let up = self.ffn_gemm(lw, true, &post, tokens)?;
+            let act = Self::silu_mul(&up, &gate);
+            let ffn_out = self.ffn_down_gemm(lw, &act, tokens)?;
+            Self::residual(&mut acc, &ffn_out);
+            // These `seq` tokens have been consumed at this layer: the
+            // sequence position advances by `seq` (the eager per-token
+            // loop advances it by one per token-per-layer — the same
+            // total after the pass, the RoPE `pos` contract, A3 / #30).
+            req_state.seq_pos += tokens;
+        }
+        // The final RMSNorm is the caller's (the prefill's multi-token
+        // logits, B1 / #31).
         drop(st);
         Ok(acc)
     }
