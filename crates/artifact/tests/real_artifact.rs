@@ -12,8 +12,8 @@
 use std::path::Path;
 
 use ignis_artifact::{
-    materialize, Binder, CpuDevice, MaterializationPlan, NumericFormat, Object, Reader,
-    StorageLayout,
+    materialize, text_scope_27b, Binder, CpuDevice, MaterializationPlan, NumericFormat, Object,
+    OUT_OF_SCOPE_TEXT_NAMES, Reader, StorageLayout,
 };
 #[cfg(feature = "cuda")]
 use ignis_artifact::CudaDevice;
@@ -120,6 +120,62 @@ fn real_nvfp4full_inventory_and_bind_all() {
     assert_eq!(plan.device_objects.len(), 1319);
     assert_eq!(plan.host_objects.len(), 6);
     assert!(plan.device_capacity_bytes > 0);
+}
+
+/// The 27B text-scope inventory (the A1 normalization's input table,
+/// `inventory.rs`) matches the container's actual directory (ADR 0002:
+/// the container is the authority — the generated table must project
+/// exactly the in-scope text objects: the same names, formats, and
+/// shapes). Tier 1 (cheap: a directory walk, no payload I/O).
+#[test]
+fn real_nvfp4full_text_scope_inventory_matches() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+
+    // The artifact's in-scope text tensors (the `text/*` objects minus the
+    // out-of-scope draft-head pair — spec 04's v1 text scope).
+    let mut actual: Vec<(String, NumericFormat, Vec<u64>)> = reader
+        .objects()
+        .iter()
+        .filter_map(|o| match o {
+            Object::Tensor(t)
+                if t.name.starts_with("text/")
+                    && !OUT_OF_SCOPE_TEXT_NAMES.iter().any(|n| t.name == *n) =>
+            {
+                Some((t.name.clone(), t.format, t.shape.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    actual.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // The generated inventory (906 in-scope tensors, spec 04).
+    let mut expected: Vec<(String, NumericFormat, Vec<u64>)> = text_scope_27b()
+        .iter()
+        .map(|e| (e.name.to_string(), e.format, e.shape.to_vec()))
+        .collect();
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        expected.len(),
+        actual.len(),
+        "the in-scope text tensor count (the 906-tensor table)"
+    );
+    for (e, a) in expected.iter().zip(actual.iter()) {
+        let (e_name, e_fmt, e_shape) = e;
+        let (a_name, a_fmt, a_shape) = a;
+        assert_eq!(e_name, a_name, "the name sets match");
+        assert_eq!(
+            e_fmt, a_fmt,
+            "{a_name}: the format (the container's authority, ADR 0002)"
+        );
+        assert_eq!(
+            e_shape, a_shape,
+            "{a_name}: the shape (the container's authority, ADR 0002)"
+        );
+    }
 }
 
 /// Full `CpuDevice` materialization of the whole artifact. Gated: it

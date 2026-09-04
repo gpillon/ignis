@@ -26,7 +26,9 @@ pub mod checksum;
 pub mod device;
 pub mod fixture;
 pub mod frontend;
+pub mod inventory;
 pub mod materializer;
+pub mod normalize;
 
 /// FFI declarations for the kernel leaf's device surface (feature `cuda`
 /// only — the default build is pure Rust).
@@ -48,6 +50,8 @@ pub use frontend::{
     Role, ToolCall, Tokenizer,
 };
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
+pub use normalize::{normalize_tensor, NormalizedTensor};
+pub use inventory::{InventoryEntry, OUT_OF_SCOPE_TEXT_NAMES, text_scope_27b};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -132,7 +136,7 @@ const V1_MAGIC: [u8; 8] = *b"NINFER\x00\x01";
 // ---------------------------------------------------------------------------
 
 /// Persistent numeric formats (the closed v2 registry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NumericFormat {
     Bf16,
     Fp32,
