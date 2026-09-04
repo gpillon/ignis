@@ -54,12 +54,17 @@ use crate::ffi;
 use crate::scheduler::{Compute, DecodeJob, PrefillJob};
 use crate::types::{ComputeError, RequestId, TokenId};
 
+// The A1 normalization's host-side dequant endpoint (the `from_artifact`'s
+// W8 -> bf16, the `Weights::with_w8_endpoints` seam; the artifact crate is a
+// non-optional dep, so `W8Endpoints` is available in the CPU build too).
+use ignis_artifact::W8Endpoints;
+
 // The artifact's device context types (the `from_artifact` path, the #26
 // fix). `CudaDevice` is `cuda`-feature-gated (the VRAM arena owner, ADR 0002);
-// all three are only referenced by the `cuda`-gated `DeviceCtx::Cuda` variant
+// all are only referenced by the `cuda`-gated `DeviceCtx::Cuda` variant
 // + `from_artifact`, so the imports are `cuda`-gated (unused in the CPU build).
 #[cfg(feature = "cuda")]
-use ignis_artifact::{CudaDevice, MaterializedArtifact, Reader};
+use ignis_artifact::{dequant_w8_endpoints, CudaDevice, MaterializedArtifact, Reader};
 
 // ---------------------------------------------------------------------------
 // bf16 helpers (round-to-nearest-even, matching the kernel's __float2bfloat16_rn)
@@ -284,6 +289,63 @@ impl Nvfp4Weight {
             scales: Vec::new(),
         }
     }
+
+    /// A geometry-only NVFP4 GEMM weight (the #27 A1 normalization seam):
+    /// the real (m, k) with empty code/scale planes — the content is the
+    /// artifact's normalized NVFP4 buffers (the device-resident
+    /// materialization, ADR 0002), consumed by the forward pass (A3).
+    pub fn geometry_only(m: u64, k: u64) -> Self {
+        Self {
+            m,
+            k,
+            codes: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
+}
+
+/// The logits GEMM weight (the model's `lm_head`): either a preserved NVFP4
+/// GEMM weight (the synthetic path, the `ignis_nvfp4_gemm_*` kernels — the
+/// content is the device-resident materialization, ADR 0002) or a dequantized
+/// bf16 weight (the artifact path: the `text/output_head` W8G32 dequantized to
+/// bf16, ADR 0005 host-side dequant — the correctness floor; the fused bf16
+/// GEMM kernel is kernel-abi 10, the later performance material). The
+/// (m, k) follows the kernel's convention (m = output dim = vocab, k = input
+/// dim = hidden), per the `Nvfp4Weight` doc and the `ignis_nvfp4_gemm_*` FFI
+/// (out[tokens][m] = sum_k act[tokens][k] * W[m][k]).
+#[derive(Debug, Clone)]
+pub enum HeadWeight {
+    /// A preserved NVFP4 GEMM weight (the synthetic / device-resident path;
+    /// the `ignis_nvfp4_gemm_*` kernels consume the codes + scales).
+    Nvfp4(Nvfp4Weight),
+    /// A dequantized bf16 GEMM weight (the artifact's W8 `text/output_head`,
+    /// ADR 0005 host-side dequant). `data` is `[m][k]` bf16 (row-major),
+    /// `m` = output dim (vocab), `k` = input dim (hidden).
+    DequantBf16 {
+        data: Vec<u16>,
+        m: u64,
+        k: u64,
+    },
+}
+
+impl HeadWeight {
+    /// The GEMM weight's (m, k) (the output rows, the input dim), for every
+    /// variant (`(0, 0)` is unused here — both variants carry the real (m, k)).
+    pub fn dims(&self) -> (u64, u64) {
+        match self {
+            HeadWeight::Nvfp4(w) => (w.m, w.k),
+            HeadWeight::DequantBf16 { m, k, .. } => (*m, *k),
+        }
+    }
+
+    /// The NVFP4 weight, if this is the (preserved / device-resident) NVFP4
+    /// variant (the synthetic / geometry-only path).
+    pub fn as_nvfp4(&self) -> Option<&Nvfp4Weight> {
+        match self {
+            HeadWeight::Nvfp4(w) => Some(w),
+            HeadWeight::DequantBf16 { .. } => None,
+        }
+    }
 }
 
 /// A deterministic synthetic NVFP4 weight of shape `[m][k]` (a fixed pattern
@@ -352,8 +414,118 @@ pub struct Weights {
     pub per_layer: Vec<LayerWeights>,
     /// The final-norm weight: bf16 `[hidden]` (`ignis_rmsnorm`).
     pub final_norm: Vec<u16>,
-    /// The lm_head weight: NVFP4 `[vocab][hidden]` (the logits GEMM).
-    pub lm_head: Nvfp4Weight,
+    /// The lm_head weight (the logits GEMM): a preserved NVFP4 GEMM weight
+    /// (the synthetic / device-resident path) or a dequantized bf16 weight
+    /// (the artifact's W8 `text/output_head`, ADR 0005 host-side dequant).
+    pub lm_head: HeadWeight,
+}
+
+/// A decoder layer's GEMM weight geometries (the (m, k) pairs the forward
+/// pass's `nvfp4_gemm` consumes — the same derivation
+/// [`Weights::synthetic`] uses for its content, minus the content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerGeometry {
+    /// The layer's kind (GQA / GDN).
+    pub kind: LayerKind,
+    /// The attention/GDN projections' (m, k) pairs (`[4]`: GQA's
+    /// q / k / v / output projections; GDN's input projection + the
+    /// three unused slots, (0, 0)).
+    pub projection: [(u64, u64); 4],
+    /// The GDN state readout (m, k) (the GDN layers only; (0, 0) for
+    /// GQA layers).
+    pub gdn_output: (u64, u64),
+    /// The gated-FFN (m, k) pairs (the same for every layer kind): the
+    /// gate + up projections (m = ffn, k = hidden) + the down projection
+    /// (m = hidden, k = ffn).
+    pub ffn_gate: (u64, u64),
+    pub ffn_up: (u64, u64),
+    pub ffn_down: (u64, u64),
+    /// The pre-attention + post-attention norm sizes (bf16 `[hidden]`).
+    pub norm_in: u64,
+    pub norm_post: u64,
+}
+
+/// The kernel-expected weight geometry (sizes only, no content): the
+/// `Weights` layout a [`ModelConfig`] demands — pure, config-derived,
+/// CPU-testable (the #27 A1 normalization seam, spec 04).
+///
+/// It replaces the zero geometry of [`Weights::placeholder`] on the
+/// `from_artifact` path (via [`Weights::from_geometry`]): the GEMM
+/// `Nvfp4Weight`s carry the real (m, k) (the code/scale planes are the
+/// artifact's normalized NVFP4 buffers — the device-resident
+/// materialization, ADR 0002), and every field's size matches the 27B
+/// topology (spec 04's acceptance: the `Weights` geometry matches
+/// `ModelConfig::qwen38_27b`). The forward-pass *consumption* of the
+/// normalized content (the W8 -> bf16 embedding / lm_head dequants, the
+/// GEMM routing) is A3 (#30), not A1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightsGeometry {
+    /// The token-embedding table: (rows, cols) = (vocab, hidden) bf16.
+    pub embedding: (u64, u64),
+    /// The per-layer GEMM geometries (in the `layer_kinds` order).
+    pub per_layer: Vec<LayerGeometry>,
+    /// The final-norm size (bf16 `[hidden]`).
+    pub final_norm: u64,
+    /// The lm_head GEMM (m, k) (the logits GEMM; the artifact's
+    /// `text/output_head` is W8G32 — dequantized to bf16 by the A1
+    /// normalize step, spec 04).
+    pub lm_head: (u64, u64),
+}
+
+impl WeightsGeometry {
+    /// Derive the geometry from a topology (the [`Weights::synthetic`]
+    /// (m, k) derivation, minus the content — pure, config-derived).
+    pub fn from_config(config: &ModelConfig) -> Self {
+        let per_layer = config
+            .layer_kinds
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Gqa => LayerGeometry {
+                    kind: LayerKind::Gqa,
+                    projection: [
+                        (config.hidden, config.gqa_width()),
+                        (config.hidden, config.gqa_kv_width()),
+                        (config.hidden, config.gqa_kv_width()),
+                        (config.gqa_width(), config.hidden),
+                    ],
+                    gdn_output: (0, 0),
+                    ffn_gate: (config.hidden, config.ffn_intermediate),
+                    ffn_up: (config.hidden, config.ffn_intermediate),
+                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    norm_in: config.hidden,
+                    norm_post: config.hidden,
+                },
+                LayerKind::Gdn => LayerGeometry {
+                    kind: LayerKind::Gdn,
+                    projection: [
+                        (config.hidden, config.gdn_state_dim()),
+                        (0, 0),
+                        (0, 0),
+                        (0, 0),
+                    ],
+                    gdn_output: (config.gdn_state_mat(), config.hidden),
+                    ffn_gate: (config.hidden, config.ffn_intermediate),
+                    ffn_up: (config.hidden, config.ffn_intermediate),
+                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    norm_in: config.hidden,
+                    norm_post: config.hidden,
+                },
+            })
+            .collect();
+        Self {
+            embedding: (config.vocab, config.hidden),
+            per_layer,
+            final_norm: config.hidden,
+            // The logits GEMM (m, k): m = output dim (vocab), k = input dim
+            // (hidden). Derived from the artifact descriptor's
+            // `text/output_head` shape `[vocab, hidden]` (the W8G32 lm_head,
+            // A1 normalization, spec 04) — the kernel's (m, k) convention is
+            // (m = output rows, k = input dim) per the `Nvfp4Weight` doc and
+            // the `ignis_nvfp4_gemm_*` FFI (out[tokens][m] = sum_k
+            // act[tokens][k] * W[m][k]).
+            lm_head: (config.vocab, config.hidden),
+        }
+    }
 }
 
 impl Weights {
@@ -442,18 +614,17 @@ impl Weights {
                     .collect::<Vec<_>>(),
             ),
             final_norm: ones,
-            lm_head: nvfp4_weight(config.hidden, config.vocab, seed.wrapping_add(7)),
+            lm_head: HeadWeight::Nvfp4(nvfp4_weight(config.hidden, config.vocab, seed.wrapping_add(7))),
             per_layer,
         }
     }
 
     /// A zero-cost weight placeholder for a real (artifact) topology (#26):
     /// the real weights live in VRAM (the materialized artifact, ADR 0002)
-    /// and the host-side `Weights` stay empty until #25's device routing
-    /// lands. The per-layer geometry (the layer-kind order) is preserved so
-    /// the forward pass can index `per_layer` by layer; every `Nvfp4Weight`
-    /// is `empty()` (the same pattern the unused GQA projections in a GDN
-    /// layer use).
+    /// and the host-side `Weights` stay empty. Superseded on the
+    /// `from_artifact` path by #27's [`Weights::from_geometry`] (the real
+    /// (m, k) geometry, not the zero geometry); retained as the dev-path
+    /// zero-cost construction.
     ///
     /// **Why not [`Weights::synthetic`] here:** the real Qwen 3.8-27B
     /// topology's synthetic weights are ~1.6 TiB of generated host vectors
@@ -486,8 +657,75 @@ impl Weights {
             embedding: Vec::new(),
             per_layer,
             final_norm: Vec::new(),
-            lm_head: Nvfp4Weight::empty(),
+            lm_head: HeadWeight::Nvfp4(Nvfp4Weight::empty()),
         }
+    }
+
+    /// A `Weights` with the real (non-zero) geometry for a real (artifact)
+    /// topology (the #27 A1 normalization seam, spec 04 — the replacement
+    /// of [`Weights::placeholder`] on the `from_artifact` path):
+    ///
+    /// - The GEMM `Nvfp4Weight`s carry the real (m, k) (the
+    ///   [`WeightsGeometry`] derivation, the `synthetic` convention) with
+    ///   **empty** code/scale planes — the content is the artifact's
+    ///   normalized NVFP4 buffers (the device-resident materialization,
+    ///   ADR 0002), consumed by the forward pass (A3).
+    /// - The norm vectors are sized (identity 1.0, the `synthetic`
+    ///   convention — a neutral, numerically-sane placeholder value).
+    /// - The `embedding` content is the `text/token_embedding` W8 -> bf16
+    ///   dequant buffer (the A1 normalize step's output, the
+    ///   `text/output_head` lm_head dequant the same), routed by the
+    ///   forward pass (A3) — not zero-filled here (the #26 lesson: no
+    ///   host-side weight explosion on the load path).
+    pub fn from_geometry(config: &ModelConfig) -> Self {
+        let geometry = WeightsGeometry::from_config(config);
+        let ones = to_bf16(&vec![1.0f32; config.hidden as usize]);
+        let per_layer = geometry
+            .per_layer
+            .iter()
+            .map(|lg| LayerWeights {
+                kind: lg.kind,
+                projection: [
+                    Nvfp4Weight::geometry_only(lg.projection[0].0, lg.projection[0].1),
+                    Nvfp4Weight::geometry_only(lg.projection[1].0, lg.projection[1].1),
+                    Nvfp4Weight::geometry_only(lg.projection[2].0, lg.projection[2].1),
+                    Nvfp4Weight::geometry_only(lg.projection[3].0, lg.projection[3].1),
+                ],
+                gdn_output: Nvfp4Weight::geometry_only(lg.gdn_output.0, lg.gdn_output.1),
+                ffn_gate: Nvfp4Weight::geometry_only(lg.ffn_gate.0, lg.ffn_gate.1),
+                ffn_up: Nvfp4Weight::geometry_only(lg.ffn_up.0, lg.ffn_up.1),
+                ffn_down: Nvfp4Weight::geometry_only(lg.ffn_down.0, lg.ffn_down.1),
+                norm_in: ones.clone(),
+                norm_post: ones.clone(),
+            })
+            .collect();
+        Self {
+            embedding: Vec::new(),
+            per_layer,
+            final_norm: ones,
+            lm_head: HeadWeight::Nvfp4(Nvfp4Weight::geometry_only(
+                geometry.lm_head.0,
+                geometry.lm_head.1,
+            )),
+        }
+    }
+
+    /// Populate the `Weights` with the A1 host-side dequantized W8 endpoints
+    /// (the `text/token_embedding` + the `text/output_head`, ADR 0005): the
+    /// embedding table + the lm_head carry the real dequantized bf16 content
+    /// (the "real normalized buffers", spec 04 criterion 3 — the artifact's
+    /// two W8 endpoints, dequantized host-side). The NVFP4 GEMM planes stay
+    /// device-resident (the `from_geometry`'s geometry-only content — not
+    /// host-copied, the #26 lesson: no host weight explosion on the load
+    /// path; the whole-text-scope copy is A3's, not A1's).
+    pub fn with_w8_endpoints(mut self, endpoints: W8Endpoints) -> Self {
+        self.embedding = endpoints.embedding;
+        self.lm_head = HeadWeight::DequantBf16 {
+            data: endpoints.lm_head,
+            m: endpoints.lm_head_shape.0,
+            k: endpoints.lm_head_shape.1,
+        };
+        self
     }
 }
 
@@ -797,6 +1035,55 @@ impl CudaCompute {
         Ok(out)
     }
 
+    /// The logits GEMM (the mixed-quant, A1 / #27): `out = act @ W^T`,
+    /// dispatching on the weight's kernel-expected format (the
+    /// [`HeadWeight`]). The NVFP4 variant (the preserved / device-resident
+    /// path, ADR 0002) uses the kernel-leaf `ignis_nvfp4_gemm_*`; the
+    /// dequantized bf16 variant (the W8 `text/output_head`, ADR 0005
+    /// host-side dequant) uses a host-side scalar bf16 GEMM (the correctness
+    /// floor — the fused bf16 GEMM kernel is kernel-abi 10, the later
+    /// performance material). `act` is a bf16 `[tokens][k]` buffer, the
+    /// output a bf16 `[tokens][m]`.
+    fn head_gemm(
+        &self,
+        w: &HeadWeight,
+        act: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
+        match w {
+            // The preserved NVFP4 GEMM weight (the synthetic / device-resident
+            // path): the kernel-leaf `ignis_nvfp4_gemm_*`.
+            HeadWeight::Nvfp4(nv) => self.nvfp4_gemm(nv, act, tokens),
+            // The dequantized bf16 GEMM weight (the W8 `text/output_head`,
+            // ADR 0005 host-side dequant): the host-side scalar bf16 GEMM
+            // (the correctness floor — the fused bf16 GEMM kernel is
+            // kernel-abi 10, the later performance material).
+            HeadWeight::DequantBf16 { data, m, k } => {
+                let m = *m as usize;
+                let k = *k as usize;
+                let tokens = tokens as usize;
+                debug_assert_eq!(
+                    act.len(),
+                    tokens * k,
+                    "activation width must match the weight's input dim (a caller bug)"
+                );
+                let mut out = vec![0u16; tokens * m];
+                for t in 0..tokens {
+                    for o in 0..m {
+                        // out[t][o] = sum_j act[t][j] * W[o][j] (the bf16
+                        // GEMM, `out = act @ W^T`; the scalar FMA floor).
+                        let mut acc = 0.0f32;
+                        for j in 0..k {
+                            acc += bf16_to_f32(act[t * k + j]) * bf16_to_f32(data[o * k + j]);
+                        }
+                        out[t * m + o] = f32_to_bf16(acc);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// The RMSNorm (`ignis_rmsnorm`, the kernel-leaf pointwise op):
     /// `out = (x / rms(x)) * weight` (bf16, `[n]`).
     fn rmsnorm(&self, x: &[u16], weight: &[u16]) -> Result<Vec<u16>, ComputeError> {
@@ -953,7 +1240,7 @@ impl CudaCompute {
         // The final RMSNorm + the lm-head GEMM (the logits) + the greedy
         // sample (the deterministic token, ADR 0007).
         acc = self.rmsnorm(&acc, &self.weights.final_norm)?;
-        let logits = self.nvfp4_gemm(&self.weights.lm_head, &acc, 1)?;
+        let logits = self.head_gemm(&self.weights.lm_head, &acc, 1)?;
         let token = self.sample(&bf16_to_f32s(&logits))?;
         // The soft-stop: the request reached `max_tokens` / EOS.
         let stop = {
@@ -1199,15 +1486,23 @@ impl CudaCompute {
         // The crash fix: the real model's topology (no synthetic fallback, so
         // the embedding table has the real vocab and a real tokenizer's ids
         // never index out of bounds — the `illegal memory access`).
-        // The host-side `Weights` stay a zero-cost placeholder until #25's
-        // numerically-correct device routing lands: the real weights live in
-        // VRAM (the materialized artifact above, ADR 0002). `Weights::synthetic`
-        // with this topology is infeasible (~1.6 TiB of generated host
-        // vectors: 48 GDN layers × ~30 GiB of `gdn_output` E2M1 codes) —
-        // the E2E test stalled after the 19 GB H2D and OOM-aborted (the
-        // #26 "hang", a CPU-side trap that looked like a GPU deadlock).
+        // The #27 A1 normalization seam: the `from_artifact` `Weights` are the
+        // real normalized buffers (spec 04 criterion 3) — the two W8 text-
+        // scope endpoints (`text/token_embedding` + the `text/output_head`)
+        // are host-dequantized to bf16 (ADR 0005, ~5 GB) and routed into the
+        // `Weights` (the embedding table + the lm_head), while the NVFP4 GEMM
+        // planes stay device-resident (the `from_geometry`'s geometry-only
+        // content — not host-copied, the #26 lesson: no host weight explosion
+        // on the load path; the whole-text-scope copy is A3's, #30).
+        // `Weights::synthetic` with this topology is infeasible (~1.6 TiB of
+        // generated host vectors: 48 GDN layers × ~30 GiB of `gdn_output`
+        // E2M1 codes) — the E2E test stalled after the 19 GB H2D and
+        // OOM-aborted (the #26 "hang", a CPU-side trap that looked like a
+        // GPU deadlock).
         let config = ModelConfig::qwen38_27b();
-        let weights = Weights::placeholder(&config);
+        let endpoints =
+            dequant_w8_endpoints(&reader).map_err(|_| ComputeError::Kernel(-1))?;
+        let weights = Weights::from_geometry(&config).with_w8_endpoints(endpoints);
         // The #26 fix: the eager path (no kernel-leaf startup check / CUDA
         // graph capture) — the CUDA-graph fast path is #25 (the 99%-gate)
         // material, not the scoped #26. (The observed "hang" after the H2D
@@ -1245,8 +1540,11 @@ mod tests {
         let cfg = ModelConfig::synthetic();
         let a = Weights::synthetic(&cfg, 7);
         let b = Weights::synthetic(&cfg, 7);
-        assert_eq!(a.lm_head.m, b.lm_head.m);
-        assert_eq!(a.lm_head.codes.len(), b.lm_head.codes.len());
+        assert_eq!(a.lm_head.dims(), b.lm_head.dims());
+        assert_eq!(
+            a.lm_head.as_nvfp4().unwrap().codes.len(),
+            b.lm_head.as_nvfp4().unwrap().codes.len()
+        );
         assert_eq!(a.embedding.len(), b.embedding.len());
         assert_eq!(a.embedding.len(), (cfg.vocab * cfg.hidden) as usize);
         assert_eq!(a.per_layer.len(), cfg.num_layers);
@@ -1333,5 +1631,147 @@ mod tests {
             freqs.windows(2).all(|w| w[0] > w[1]),
             "the inv_freq table must be strictly decreasing"
         );
+    }
+    /// The #27 A1 normalization seam (spec 04's acceptance: "the
+    /// `from_artifact` `Weights` are the real normalized buffers — a
+    /// non-GPU / CPU test verifies the `Weights` geometry matches the 27B
+    /// topology"): the geometry is pure, config-derived, and matches
+    /// `ModelConfig::qwen38_27b` — the embedding / lm_head dims are the
+    /// real vocab × hidden, the 16 GQA + 48 GDN layer-kind order is
+    /// preserved, and the GEMM (m, k) pairs follow the `synthetic`
+    /// derivation (the forward pass's established convention).
+    #[test]
+    fn weights_geometry_matches_27b_topology() {
+        let cfg = ModelConfig::qwen38_27b();
+        let g = WeightsGeometry::from_config(&cfg);
+        // The 27B topology's endpoints (spec 04: the W8 embedding /
+        // lm_head dequants are `[vocab][hidden]` = [248 320][5 120]).
+        assert_eq!(g.embedding, (248_320, 5_120), "the real embedding table dims");
+        assert_eq!(g.lm_head, (cfg.vocab, cfg.hidden), "the logits GEMM (m, k) = the artifact's text/output_head shape [vocab, hidden] (m = output dim, k = input dim)");
+        assert_eq!(g.final_norm, cfg.hidden);
+        assert_eq!(g.per_layer.len(), cfg.num_layers, "one geometry per layer");
+        // The 27B layer-kind mix (16 GQA + 48 GDN, the `(i + 1) % 4` rule).
+        let gqa = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa).count();
+        let gdn = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn).count();
+        assert_eq!((gqa, gdn), (16, 48), "the 27B layer-kind mix");
+        // Every GDN layer's state readout (m = state_mat = 6144*2048,
+        // k = hidden) + input projection (m = hidden, k = the GDN step's
+        // feature dim) — the forward pass's (m, k) contract.
+        for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn) {
+            assert_eq!(lg.gdn_output, (cfg.gdn_state_mat(), cfg.hidden));
+            assert_eq!(lg.projection[0], (cfg.hidden, cfg.gdn_state_dim()));
+            assert_eq!(lg.projection[1], (0, 0), "the unused GDN slots are (0, 0)");
+        }
+        // The GQA layers' projections (the `synthetic`'s (m, k) convention:
+        // q / k / v map hidden -> the head widths; the output projection
+        // maps gqa_width -> hidden).
+        for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa) {
+            assert_eq!(lg.projection[3], (cfg.gqa_width(), cfg.hidden));
+            assert_eq!(lg.ffn_gate, (cfg.hidden, cfg.ffn_intermediate));
+            assert_eq!(lg.ffn_down, (cfg.ffn_intermediate, cfg.hidden));
+            assert_eq!(lg.norm_in, cfg.hidden);
+        }
+        // The `from_artifact` path's `Weights` (via `from_geometry`) carry
+        // this same geometry (the non-zero (m, k), the sized norms) — the
+        // zero-geometry `placeholder` is no longer the artifact path's
+        // construction.
+        let w = Weights::from_geometry(&cfg);
+        assert_eq!(w.lm_head.dims(), (cfg.vocab, cfg.hidden));
+        assert!(
+            w.lm_head.as_nvfp4().unwrap().codes.is_empty(),
+            "the GEMM planes are device-resident (A3)"
+        );
+        for lw in &w.per_layer {
+            assert_eq!(lw.norm_in.len(), cfg.hidden as usize);
+            assert_eq!(lw.norm_post.len(), cfg.hidden as usize);
+        }
+        assert_eq!(w.final_norm.len(), cfg.hidden as usize);
+        // The norms are identity (1.0, the `synthetic` convention).
+        assert!(w.final_norm.iter().all(|&w| w == 0x3F80), "the identity norms");
+    }
+
+    /// `from_geometry` on a small topology: the `Weights` carry the real
+    /// (m, k) geometry (not the `placeholder`'s zeros), the GEMM planes
+    /// are empty (device-resident content, A3), and the embedding content
+    /// is the W8 -> bf16 dequant buffer (A3's routing — not zero-filled
+    /// here, the #26 lesson).
+    #[test]
+    fn from_geometry_weights_carry_real_geometry() {
+        let cfg = ModelConfig::synthetic();
+        let w = Weights::from_geometry(&cfg);
+        assert_eq!(w.per_layer.len(), cfg.num_layers);
+        for lw in &w.per_layer {
+            match lw.kind {
+                LayerKind::Gdn => {
+                    assert_eq!((lw.gdn_output.m, lw.gdn_output.k), (cfg.gdn_state_mat(), cfg.hidden));
+                    assert!(lw.gdn_output.codes.is_empty(), "the GEMM planes are device-resident (A3)");
+                }
+                LayerKind::Gqa => {
+                    assert_eq!(lw.projection[0].m, cfg.hidden, "the q projection's m");
+                    assert!(lw.projection[3].m > 0, "the output projection's m");
+                    assert!(lw.projection[3].codes.is_empty());
+                }
+            }
+            assert_eq!(lw.ffn_gate.m, cfg.hidden);
+            assert_eq!(lw.ffn_gate.k, cfg.ffn_intermediate);
+            assert_eq!(lw.ffn_down.m, cfg.ffn_intermediate);
+            assert_eq!(lw.ffn_down.k, cfg.hidden);
+            assert_eq!(lw.norm_in.len(), cfg.hidden as usize);
+        }
+        assert_eq!(w.lm_head.dims(), (cfg.vocab, cfg.hidden));
+        // The embedding content is A3's dequant buffer (not zero-filled).
+        assert!(w.embedding.is_empty());
+    }
+
+    /// The A1 / #27 normalization (spec 04 criterion 3): the `from_artifact`
+    /// `Weights` are the real normalized buffers — the two W8 endpoints are
+    /// host-dequantized to bf16 (the [`ignis_artifact::W8Endpoints`], ADR
+    /// 0005) and routed into the `Weights` (the embedding table + the
+    /// lm_head). The lm_head's (m, k) is the artifact's `text/output_head`
+    /// shape (m = rows = vocab, k = cols = hidden, the kernel's
+    /// (m = output, k = input) convention — not transposed). The NVFP4 GEMM
+    /// planes stay device-resident (the `from_geometry`'s geometry-only
+    /// content — not host-copied, the #26 lesson: no host weight explosion
+    /// on the load path).
+    #[test]
+    fn weights_with_w8_endpoints_carry_the_dequant_content() {
+        // A small `W8Endpoints` (the A1 host-side dequant of the two W8
+        // endpoints, ADR 0005): the embedding + the lm_head content are
+        // deterministic (the dequant of the W8 payloads).
+        let endpoints = ignis_artifact::W8Endpoints {
+            embedding: vec![0x3F80; 4 * 8], // bf16 1.0, the embedding table [4][8]
+            embedding_shape: (4, 8),
+            lm_head: vec![0x40C0; 8 * 16],  // bf16 6.0, the lm_head [8][16]
+            lm_head_shape: (8, 16),
+        };
+        let cfg = ModelConfig::synthetic();
+        let w = Weights::from_geometry(&cfg).with_w8_endpoints(endpoints);
+        // The embedding carries the W8 dequant content (not empty —
+        // criterion 3's "the real normalized buffers, not a placeholder").
+        assert_eq!(w.embedding.len(), 4 * 8);
+        assert!(
+            w.embedding.iter().all(|&v| v == 0x3F80),
+            "the W8 embedding content is carried (not a placeholder)"
+        );
+        // The lm_head is the dequantized bf16 (the W8 `text/output_head`),
+        // with the artifact's `text/output_head` shape (m = rows, k = cols,
+        // the kernel's (m = output, k = input) convention — not transposed).
+        match &w.lm_head {
+            HeadWeight::DequantBf16 { data, m, k } => {
+                assert_eq!(
+                    (*m, *k),
+                    (8, 16),
+                    "the lm_head (m, k) = the text/output_head shape [rows][cols]"
+                );
+                assert_eq!(data.len(), 8 * 16);
+                assert!(
+                    data.iter().all(|&v| v == 0x40C0),
+                    "the W8 lm_head content is carried"
+                );
+            }
+            other => panic!(
+                "the lm_head must be the dequantized bf16 (the W8 endpoint), got {other:?}"
+            ),
+        }
     }
 }
