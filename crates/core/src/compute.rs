@@ -476,6 +476,10 @@ impl WeightsGeometry {
     /// Derive the geometry from a topology (the [`Weights::synthetic`]
     /// (m, k) derivation, minus the content — pure, config-derived).
     pub fn from_config(config: &ModelConfig) -> Self {
+        // The per-layer GEMM (m, k) pairs follow the kernel's convention
+        // (m = output rows, k = input dim — the `Nvfp4Weight` doc + the
+        // `ignis_nvfp4_gemm_*` FFI, GitHub #33): a projection that maps
+        // `input_dim -> output_dim` is (m = output_dim, k = input_dim).
         let per_layer = config
             .layer_kinds
             .iter()
@@ -483,30 +487,30 @@ impl WeightsGeometry {
                 LayerKind::Gqa => LayerGeometry {
                     kind: LayerKind::Gqa,
                     projection: [
-                        (config.hidden, config.gqa_width()),
-                        (config.hidden, config.gqa_kv_width()),
-                        (config.hidden, config.gqa_kv_width()),
                         (config.gqa_width(), config.hidden),
+                        (config.gqa_kv_width(), config.hidden),
+                        (config.gqa_kv_width(), config.hidden),
+                        (config.hidden, config.gqa_width()),
                     ],
                     gdn_output: (0, 0),
-                    ffn_gate: (config.hidden, config.ffn_intermediate),
-                    ffn_up: (config.hidden, config.ffn_intermediate),
-                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    ffn_gate: (config.ffn_intermediate, config.hidden),
+                    ffn_up: (config.ffn_intermediate, config.hidden),
+                    ffn_down: (config.hidden, config.ffn_intermediate),
                     norm_in: config.hidden,
                     norm_post: config.hidden,
                 },
                 LayerKind::Gdn => LayerGeometry {
                     kind: LayerKind::Gdn,
                     projection: [
-                        (config.hidden, config.gdn_state_dim()),
+                        (config.gdn_state_dim(), config.hidden),
                         (0, 0),
                         (0, 0),
                         (0, 0),
                     ],
-                    gdn_output: (config.gdn_state_mat(), config.hidden),
-                    ffn_gate: (config.hidden, config.ffn_intermediate),
-                    ffn_up: (config.hidden, config.ffn_intermediate),
-                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    gdn_output: (config.hidden, config.gdn_state_mat()),
+                    ffn_gate: (config.ffn_intermediate, config.hidden),
+                    ffn_up: (config.ffn_intermediate, config.hidden),
+                    ffn_down: (config.hidden, config.ffn_intermediate),
                     norm_in: config.hidden,
                     norm_post: config.hidden,
                 },
@@ -544,26 +548,41 @@ impl Weights {
                     let gqa_kv_w = config.gqa_kv_width();
                     LayerWeights {
                         kind: LayerKind::Gqa,
+                        // (m, k) = (output dim, input dim) — the kernel's
+                        // GEMM convention (the `Nvfp4Weight` doc + the
+                        // `ignis_nvfp4_gemm_*` FFI, GitHub #33).
                         projection: [
-                            nvfp4_weight(config.hidden, gqa_w, seed),
-                            nvfp4_weight(config.hidden, gqa_kv_w, seed.wrapping_add(1)),
-                            nvfp4_weight(config.hidden, gqa_kv_w, seed.wrapping_add(2)),
-                            nvfp4_weight(gqa_w, config.hidden, seed.wrapping_add(3)),
+                            nvfp4_weight(gqa_w, config.hidden, seed),
+                            nvfp4_weight(
+                                gqa_kv_w,
+                                config.hidden,
+                                seed.wrapping_add(1),
+                            ),
+                            nvfp4_weight(
+                                gqa_kv_w,
+                                config.hidden,
+                                seed.wrapping_add(2),
+                            ),
+                            nvfp4_weight(
+                                config.hidden,
+                                gqa_w,
+                                seed.wrapping_add(3),
+                            ),
                         ],
                         gdn_output: Nvfp4Weight::empty(),
                         ffn_gate: nvfp4_weight(
-                            config.hidden,
                             config.ffn_intermediate,
+                            config.hidden,
                             seed.wrapping_add(4),
                         ),
                         ffn_up: nvfp4_weight(
-                            config.hidden,
                             config.ffn_intermediate,
+                            config.hidden,
                             seed.wrapping_add(5),
                         ),
                         ffn_down: nvfp4_weight(
-                            config.ffn_intermediate,
                             config.hidden,
+                            config.ffn_intermediate,
                             seed.wrapping_add(6),
                         ),
                         norm_in: ones.clone(),
@@ -575,30 +594,34 @@ impl Weights {
                     let gdn_state_mat = config.gdn_state_mat();
                     LayerWeights {
                         kind: LayerKind::Gdn,
+                        // The GDN input projection (m = the GDN feature dim,
+                        // k = hidden) + the state readout (m = hidden,
+                        // k = the state matrix) — the kernel's (m, k)
+                        // convention (GitHub #33).
                         projection: [
-                            nvfp4_weight(config.hidden, gdn_state_dim, seed),
+                            nvfp4_weight(gdn_state_dim, config.hidden, seed),
                             Nvfp4Weight::empty(),
                             Nvfp4Weight::empty(),
                             Nvfp4Weight::empty(),
                         ],
                         gdn_output: nvfp4_weight(
-                            gdn_state_mat,
                             config.hidden,
+                            gdn_state_mat,
                             seed.wrapping_add(1),
                         ),
                         ffn_gate: nvfp4_weight(
-                            config.hidden,
                             config.ffn_intermediate,
+                            config.hidden,
                             seed.wrapping_add(2),
                         ),
                         ffn_up: nvfp4_weight(
-                            config.hidden,
                             config.ffn_intermediate,
+                            config.hidden,
                             seed.wrapping_add(3),
                         ),
                         ffn_down: nvfp4_weight(
-                            config.ffn_intermediate,
                             config.hidden,
+                            config.ffn_intermediate,
                             seed.wrapping_add(4),
                         ),
                         norm_in: ones.clone(),
@@ -614,7 +637,15 @@ impl Weights {
                     .collect::<Vec<_>>(),
             ),
             final_norm: ones,
-            lm_head: HeadWeight::Nvfp4(nvfp4_weight(config.hidden, config.vocab, seed.wrapping_add(7))),
+            // The logits GEMM (m, k): m = vocab (output rows), k = hidden
+            // (input dim) — the kernel's convention (the `Nvfp4Weight` doc
+            // + the `ignis_nvfp4_gemm_*` FFI), the same (vocab, hidden)
+            // the `from_config` derivation uses (GitHub #27 / #33).
+            lm_head: HeadWeight::Nvfp4(nvfp4_weight(
+                config.vocab,
+                config.hidden,
+                seed.wrapping_add(7),
+            )),
             per_layer,
         }
     }
@@ -1609,6 +1640,162 @@ mod tests {
         assert_ne!(real.num_layers, synth.num_layers);
     }
 
+    /// (GitHub #33) The kernel's GEMM convention (m = output rows, k = input
+    /// dim — per the `Nvfp4Weight` doc, the `ignis_nvfp4_gemm_*` FFI, and
+    /// the artifact's shape table) is pinned on an **asymmetric** topology:
+    /// every GEMM (m, k) pair is (output dim, input dim), never
+    /// (input, output). The synthetic config's coincident dimensions
+    /// (hidden = 64 = gqa_width) hid the #33 transposition (the tests
+    /// asserted determinism, not semantics); here every width is distinct,
+    /// so any transposed construction is caught. The pin covers both
+    /// derivations: `Weights::synthetic` (the content) and
+    /// `WeightsGeometry::from_config` (the artifact path's geometry),
+    /// which must agree.
+    #[test]
+    fn gemm_pairs_follow_the_kernel_output_by_input_convention() {
+        // An asymmetric topology: distinct GEMM widths (hidden 96, q 48,
+        // kv 16, ffn 32, the GDN feature 42 / state matrix 384, vocab
+        // 256) — a transposed (input, output) pair always mismatches.
+        let cfg = ModelConfig {
+            num_layers: 2,
+            layer_kinds: vec![LayerKind::Gdn, LayerKind::Gqa],
+            hidden: 96,
+            vocab: 256,
+            num_q_heads: 3,
+            num_kv_heads: 1,
+            head_dim: 16,
+            gdn_state_rows: 24,
+            gdn_state_cols: 16,
+            gdn_num_layers: 1,
+            ffn_intermediate: 32,
+            block_size: 4,
+            num_blocks: 8,
+        };
+        // ── the synthetic weights (the content + the (m, k) geometry) ──
+        let w = Weights::synthetic(&cfg, 1);
+        let (gdn, gqa) = (&w.per_layer[0], &w.per_layer[1]);
+        // GDN: the input projection (m = the GDN feature dim, k = hidden) +
+        // the state readout (m = hidden, k = the state matrix).
+        assert_eq!(
+            (gdn.projection[0].m, gdn.projection[0].k),
+            (cfg.gdn_state_dim(), cfg.hidden),
+            "the GDN input projection (m = output, k = input)"
+        );
+        assert_eq!(
+            (gdn.gdn_output.m, gdn.gdn_output.k),
+            (cfg.hidden, cfg.gdn_state_mat()),
+            "the GDN state readout (m = output, k = input)"
+        );
+        // GQA: q / k / v map hidden -> the head widths (m = output,
+        // k = input); the output projection maps gqa_width -> hidden.
+        assert_eq!(
+            (gqa.projection[0].m, gqa.projection[0].k),
+            (cfg.gqa_width(), cfg.hidden),
+            "the q projection (m = output, k = input)"
+        );
+        assert_eq!(
+            (gqa.projection[1].m, gqa.projection[1].k),
+            (cfg.gqa_kv_width(), cfg.hidden),
+            "the k projection (m = output, k = input)"
+        );
+        assert_eq!(
+            (gqa.projection[2].m, gqa.projection[2].k),
+            (cfg.gqa_kv_width(), cfg.hidden),
+            "the v projection (m = output, k = input)"
+        );
+        assert_eq!(
+            (gqa.projection[3].m, gqa.projection[3].k),
+            (cfg.hidden, cfg.gqa_width()),
+            "the attention-output projection (m = output, k = input)"
+        );
+        // The gated-FFN: gate / up map hidden -> ffn, down maps
+        // ffn -> hidden (both layer kinds).
+        for lw in [gdn, gqa] {
+            assert_eq!(
+                (lw.ffn_gate.m, lw.ffn_gate.k),
+                (cfg.ffn_intermediate, cfg.hidden),
+                "the ffn gate projection (m = output, k = input)"
+            );
+            assert_eq!(
+                (lw.ffn_up.m, lw.ffn_up.k),
+                (cfg.ffn_intermediate, cfg.hidden),
+                "the ffn up projection (m = output, k = input)"
+            );
+            assert_eq!(
+                (lw.ffn_down.m, lw.ffn_down.k),
+                (cfg.hidden, cfg.ffn_intermediate),
+                "the ffn down projection (m = output, k = input)"
+            );
+        }
+        // The logits GEMM (the lm_head): m = vocab (output), k = hidden
+        // (input) — the same (vocab, hidden) the #27 `from_config` fix
+        // established (the artifact's `text/output_head` shape).
+        assert_eq!(
+            w.lm_head.dims(),
+            (cfg.vocab, cfg.hidden),
+            "the lm_head (m = output, k = input)"
+        );
+        // The code / scale planes are sized to the weight's own (m, k)
+        // (rows = m; a code row = k/2 bytes, a scale row = k/16) — these
+        // check the planes agree with the geometry; the convention pin is
+        // the (m, k) field asserts above (a plane-size product is
+        // orientation-symmetric, so it alone would not catch a
+        // transposition).
+        assert_eq!(
+            gqa.projection[0].codes.len(),
+            gqa.projection[0].m as usize * (gqa.projection[0].k as usize) / 2,
+            "the codes plane is sized [m][k/2] to the weight's geometry"
+        );
+        assert_eq!(
+            gqa.projection[0].scales.len(),
+            gqa.projection[0].m as usize * (gqa.projection[0].k as usize) / 16,
+            "the scales plane is sized [m][k/16] to the weight's geometry"
+        );
+        // ── the geometry derivation (the artifact path, `from_config`) ──
+        let g = WeightsGeometry::from_config(&cfg);
+        let (gl, gw) = (&g.per_layer[0], &g.per_layer[1]);
+        assert_eq!(gl.gdn_output, (cfg.hidden, cfg.gdn_state_mat()));
+        assert_eq!(gl.projection[0], (cfg.gdn_state_dim(), cfg.hidden));
+        assert_eq!(
+            gw.projection,
+            [
+                (cfg.gqa_width(), cfg.hidden),
+                (cfg.gqa_kv_width(), cfg.hidden),
+                (cfg.gqa_kv_width(), cfg.hidden),
+                (cfg.hidden, cfg.gqa_width()),
+            ],
+            "the GQA projections (m = output, k = input)"
+        );
+        for lg in [gl, gw] {
+            assert_eq!(
+                (lg.ffn_gate, lg.ffn_up),
+                (
+                    (cfg.ffn_intermediate, cfg.hidden),
+                    (cfg.ffn_intermediate, cfg.hidden)
+                ),
+                "the ffn gate / up (m = output, k = input)"
+            );
+            assert_eq!(
+                lg.ffn_down,
+                (cfg.hidden, cfg.ffn_intermediate),
+                "the ffn down (m = output, k = input)"
+            );
+        }
+        assert_eq!(g.lm_head, (cfg.vocab, cfg.hidden));
+        // The geometry agrees with the synthetic content's (m, k) pairs
+        // (the `from_config` doc: the same derivation, minus the content).
+        assert_eq!(
+            (gw.projection[0].0, gw.projection[0].1),
+            (gqa.projection[0].m, gqa.projection[0].k),
+            "the geometry + the synthetic content agree"
+        );
+        assert_eq!(
+            (gl.gdn_output.0, gl.gdn_output.1),
+            (gdn.gdn_output.m, gdn.gdn_output.k),
+            "the geometry + the synthetic content agree"
+        );
+    }
+
     /// (kernel-abi 06, GitHub #28) The RoPE inverse-frequency table (θ = 1e7,
     /// rotary_dim = 64 — the Qwen 3.8-27B GQA geometry) is pinned to the
     /// deterministic values the `ignis_rope_qk` kernel consumes: pair `p` is
@@ -1654,21 +1841,23 @@ mod tests {
         let gqa = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa).count();
         let gdn = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn).count();
         assert_eq!((gqa, gdn), (16, 48), "the 27B layer-kind mix");
-        // Every GDN layer's state readout (m = state_mat = 6144*2048,
-        // k = hidden) + input projection (m = hidden, k = the GDN step's
-        // feature dim) — the forward pass's (m, k) contract.
+        // Every GDN layer's state readout (m = hidden, k = state_mat =
+        // 6144*2048) + input projection (m = the GDN step's feature dim,
+        // k = hidden) — the forward pass's (m, k) contract (m = output
+        // rows, k = input dim, the kernel convention, GitHub #33).
         for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn) {
-            assert_eq!(lg.gdn_output, (cfg.gdn_state_mat(), cfg.hidden));
-            assert_eq!(lg.projection[0], (cfg.hidden, cfg.gdn_state_dim()));
+            assert_eq!(lg.gdn_output, (cfg.hidden, cfg.gdn_state_mat()));
+            assert_eq!(lg.projection[0], (cfg.gdn_state_dim(), cfg.hidden));
             assert_eq!(lg.projection[1], (0, 0), "the unused GDN slots are (0, 0)");
         }
         // The GQA layers' projections (the `synthetic`'s (m, k) convention:
-        // q / k / v map hidden -> the head widths; the output projection
-        // maps gqa_width -> hidden).
+        // q / k / v map hidden -> the head widths (m = output, k = input);
+        // the output projection maps gqa_width -> hidden (m = hidden,
+        // k = gqa_width) — the kernel's (m, k) orientation, GitHub #33).
         for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa) {
-            assert_eq!(lg.projection[3], (cfg.gqa_width(), cfg.hidden));
-            assert_eq!(lg.ffn_gate, (cfg.hidden, cfg.ffn_intermediate));
-            assert_eq!(lg.ffn_down, (cfg.ffn_intermediate, cfg.hidden));
+            assert_eq!(lg.projection[3], (cfg.hidden, cfg.gqa_width()));
+            assert_eq!(lg.ffn_gate, (cfg.ffn_intermediate, cfg.hidden));
+            assert_eq!(lg.ffn_down, (cfg.hidden, cfg.ffn_intermediate));
             assert_eq!(lg.norm_in, cfg.hidden);
         }
         // The `from_artifact` path's `Weights` (via `from_geometry`) carry
@@ -1703,19 +1892,35 @@ mod tests {
         for lw in &w.per_layer {
             match lw.kind {
                 LayerKind::Gdn => {
-                    assert_eq!((lw.gdn_output.m, lw.gdn_output.k), (cfg.gdn_state_mat(), cfg.hidden));
-                    assert!(lw.gdn_output.codes.is_empty(), "the GEMM planes are device-resident (A3)");
+                    // The state readout (m = hidden, k = the state matrix) —
+                    // the kernel's (m, k) orientation (GitHub #33).
+                    assert_eq!(
+                        (lw.gdn_output.m, lw.gdn_output.k),
+                        (cfg.hidden, cfg.gdn_state_mat())
+                    );
+                    assert!(
+                        lw.gdn_output.codes.is_empty(),
+                        "the GEMM planes are device-resident (A3)"
+                    );
                 }
                 LayerKind::Gqa => {
-                    assert_eq!(lw.projection[0].m, cfg.hidden, "the q projection's m");
+                    assert_eq!(
+                        lw.projection[0].m,
+                        cfg.gqa_width(),
+                        "the q projection's m (the output rows)"
+                    );
                     assert!(lw.projection[3].m > 0, "the output projection's m");
                     assert!(lw.projection[3].codes.is_empty());
                 }
             }
-            assert_eq!(lw.ffn_gate.m, cfg.hidden);
-            assert_eq!(lw.ffn_gate.k, cfg.ffn_intermediate);
-            assert_eq!(lw.ffn_down.m, cfg.ffn_intermediate);
-            assert_eq!(lw.ffn_down.k, cfg.hidden);
+            assert_eq!(lw.ffn_gate.m, cfg.ffn_intermediate, "the ffn gate's m (output rows)");
+            assert_eq!(lw.ffn_gate.k, cfg.hidden, "the ffn gate's k (input dim)");
+            assert_eq!(lw.ffn_down.m, cfg.hidden, "the ffn down's m (output rows)");
+            assert_eq!(
+                lw.ffn_down.k,
+                cfg.ffn_intermediate,
+                "the ffn down's k (input dim)"
+            );
             assert_eq!(lw.norm_in.len(), cfg.hidden as usize);
         }
         assert_eq!(w.lm_head.dims(), (cfg.vocab, cfg.hidden));
