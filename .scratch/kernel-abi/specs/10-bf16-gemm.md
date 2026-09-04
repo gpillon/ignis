@@ -1,6 +1,6 @@
 # 10 — bf16 logits GEMM (the W8-dequantized lm_head)
 
-GitHub: #TBD (the #25 follow-up — A2b, "bf16 logits GEMM")
+GitHub: #29 (the #25 follow-up — A2b, "bf16 logits GEMM")
 
 The full-correct 27B model (A3) needs a **bf16 GEMM** for the logits: the
 lm_head (`text/output_head`) is W8G32 in the artifact (A1 dequants it to bf16),

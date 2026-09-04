@@ -1,6 +1,6 @@
 # 06 — GDN causal-conv + RoPE kernel ports
 
-GitHub: #TBD (the #25 follow-up — A2, "GDN causal-conv + RoPE kernel ports")
+GitHub: #28 (the #25 follow-up — A2, "GDN causal-conv + RoPE kernel ports")
 
 The full-correct 27B model (A3) needs two kernel ops the current C-ABI surface
 (kernel-abi 01–05) does **not** have:

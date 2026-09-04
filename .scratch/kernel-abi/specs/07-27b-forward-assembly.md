@@ -1,6 +1,6 @@
 # 07 — full-correct Qwen 3.8-27B forward assembly
 
-GitHub: #TBD (the #25 follow-up — A3, "full-correct 27B forward assembly")
+GitHub: #30 (the #25 follow-up — A3, "full-correct 27B forward assembly")
 
 The compute-adapter (kernel-abi 04) has the forward-pass *seam* (the
 `prefill` / `decode` / `forward_layers` methods) + a **synthetic** model

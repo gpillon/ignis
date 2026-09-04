@@ -1,6 +1,6 @@
 # 09 — CUDA-graph decode replay (the decode hot path)
 
-GitHub: #TBD (the #25 follow-up — B2, "CUDA-graph decode replay")
+GitHub: #32 (the #25 follow-up — B2, "CUDA-graph decode replay")
 
 The compute-adapter (kernel-abi 04) captures a *representative* decode graph at
 construction (the `new` path) but **never launches it** — every `decode_step`

@@ -1,6 +1,6 @@
 # 08 — batched prefill (the multi-token forward path)
 
-GitHub: #TBD (the #25 follow-up — B1, "batched prefill")
+GitHub: #31 (the #25 follow-up — B1, "batched prefill")
 
 The compute-adapter's `prefill` (kernel-abi 04, `crates/core/src/compute.rs`)
 runs the layer stack **per token**: `for pos in 0..seq { forward_layers(pos) }`,

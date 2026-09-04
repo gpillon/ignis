@@ -1,6 +1,6 @@
 # 04 — mixed-quant materialization / normalization (artifact tensors → kernel formats)
 
-GitHub: #TBD (the #25 follow-up — A1, "mixed-quant materialization/normalization")
+GitHub: #27 (the #25 follow-up — A1, "mixed-quant materialization/normalization")
 
 The artifact (`.ninfer`, ADR 0002) carries a **per-tensor `format` + `layout`**
 (the container is the authority — each tensor entry is
