@@ -33,8 +33,8 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use compute::{
-    CudaCompute, GraphGeometry, LayerGeometry, LayerKind, ModelConfig, Nvfp4Weight, Weights,
-    WeightsGeometry,
+    CudaCompute, GraphGeometry, HeadWeight, LayerGeometry, LayerKind, ModelConfig, Nvfp4Weight,
+    Weights, WeightsGeometry,
 };
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use host::{HostEntry, HostError, HostTier, Tier};
