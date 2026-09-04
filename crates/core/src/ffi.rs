@@ -227,6 +227,68 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    // ------------------------------------------------------------------
+    // kernel-abi 06 (ticket 28, GitHub #28): GDN causal conv + GQA RoPE.
+    // 1:1 mirror of `kernel/include/ignis_kernel.h` (ADR 0001). The two
+    // kernel ops the full-correct 27B forward (A3) needs, 1:1 ports of
+    // the proven reference kernels (ADR 0005; provenance via
+    // kernel/NOTICE). The v1 does the norms + RoPE as two steps (the
+    // `ignis_rmsnorm`, kernel-abi 02, then the `ignis_rope_qk` below) —
+    // the fused qk_norm_rope kernel is a later performance item (ADR
+    // 0005).
+    // ------------------------------------------------------------------
+
+    /// The GDN 4-tap depthwise causal conv + SiLU (the `gdn/convolution`
+    /// tensor). `projected`: bf16 [tokens][channels] (the projected q/k/v
+    /// rows, the GEMM output — the `z` rows are NOT part of `channels`,
+    /// they bypass the conv entirely). `conv_weight`: bf16 [4][channels]
+    /// (the 4 taps w0..w3, tap-major). `state_in`/`state_out`: bf16
+    /// [channels][3] (the rolling 3-tap conv state s0,s1,s2 per channel,
+    /// channel-major; `state_out` receives the updated state — the last 3
+    /// consumed taps — and `state_in` may alias `state_out`). `out`: bf16
+    /// [tokens][channels] (the conv'd + SiLU'd q/k/v). One thread per
+    /// channel, the 3-tap rolling state s0,s1,s2 + the current tap w3·p,
+    /// the SiLU epilogue. `stream`: null = stream 0. Returns 0 on
+    /// success, -1 on error.
+    pub fn ignis_gdn_causal_conv(
+        projected: *const std::ffi::c_void,
+        conv_weight: *const std::ffi::c_void,
+        state_in: *const std::ffi::c_void,
+        state_out: *mut std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        tokens: i64,
+        channels: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// The GQA split-half NeoX RoPE (in-place on q/k). For a pair
+    /// (a = x[p], b = x[p + rotary_dim/2]): out[p] = a·cos − b·sin,
+    /// out[p + rotary_dim/2] = b·cos + a·sin (cos/sin = sincosf(pos ·
+    /// inv_freq[p]), the fp32 unscaled route — the reference's
+    /// attention_factor 1.0 bit-stable path; v1 is unscaled, factor 1.0).
+    /// `q`: bf16 [batch][seq][num_q_heads][head_dim]. `k`: bf16
+    /// [batch][seq][num_kv_heads][head_dim]. `inv_freq`: fp32 [rotary_dim/2]
+    /// (the per-pair frequencies — the reference's `rope_linear_frequencies`
+    /// table, θ^(-2p/rotary_dim); θ = 1e7, rotary_dim = 64 of head_dim =
+    /// 256 (32 pairs) in the Qwen 3.8-27B GQA geometry; computed once at
+    /// construction, host-side, a deterministic table — a non-goal is the
+    /// per-step table recompute). The un-rotated dims [rotary_dim,
+    /// head_dim) are never written. `stream`: null = stream 0. Returns 0
+    /// on success, -1 on error.
+    pub fn ignis_rope_qk(
+        q: *mut std::ffi::c_void,
+        k: *mut std::ffi::c_void,
+        inv_freq: *const std::ffi::c_void,
+        batch: i64,
+        seq: i64,
+        num_q_heads: i64,
+        num_kv_heads: i64,
+        head_dim: i64,
+        rotary_dim: i64,
+        pos: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     /// Begin a CUDA graph capture on `stream` (null = a leaf-owned
     /// non-blocking stream — the legacy default stream cannot be captured).
     /// One capture at a time (v1 startup capture is single-shot; the launch

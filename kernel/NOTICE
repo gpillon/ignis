@@ -217,3 +217,53 @@ H2D/D2H copies and a 0/-1 int return code (the same style as ticket-03's
 decode surface and the kernel-abi-01 prefill surface). There is no reference
 equivalent (the reference's driver was the engine's op dispatch); this is
 the new C ABI surface for the prefill FFN-projection GEMM.
+
+### `kernel/src/gdn_causal_conv.cuh` (ticket 28, kernel-abi 06, GitHub #28)
+GDN 4-tap depthwise causal conv + SiLU (the `gdn/convolution` tensor).
+Adapted from the reference GDN projected-input conv
+(`ops/gdn_input_proj/gdn_projected_conv.cu`: `gdn_projected_conv_kernel` —
+one thread per channel; the rolling 3-tap state s0,s1,s2 + the current tap
+p; the 4-tap fma chain `w0*s0 + w1*s1 + w2*s2 + w3*p`; the SiLU epilogue
+`x / (1 + exp(-x))` from `ops/common/math.cuh`). The reference kernel is a
+per-(channel, batch) machine driven by the engine's Tensor dispatch
+(separate query/key/value output tensors, a per-batch valid-column count,
+a slot-indexed state pool, and the `Publish` snapshot/record templates).
+That dispatch layer is C++ state, which the flat C ABI of ADR 0001 forbids
+across the boundary, so it is not ported; the per-channel rolling conv math
+(the fma chain, the SiLU, the 3-tap state shift) is ported 1:1 to the flat
+C ABI geometry (the single-sequence [tokens][channels] projection, the
+per-channel state [channels][3], the single `out` buffer — the `z` rows are
+not part of `channels`, they bypass the conv entirely). Self-contained;
+compiles standalone in the leaf.
+
+### `kernel/src/rope_qk.cuh` (ticket 28, kernel-abi 06, GitHub #28)
+GQA split-half NeoX RoPE (in-place on Q and K). Adapted from the reference
+rope (`ops/kernel/rope.cuh`: `apply_rope_head` — the split-half pair
+rotation `out[p] = a*cos − b*sin`, `out[p + R/2] = b*cos + a·s`, with the
+per-block shared cos/sin cache — the fixed-sincos pattern — and the legacy
+unscaled route: the fp32 product + `sincosf`, the bit-stable engine
+history, `attention_factor` 1.0), plus its inv_freq table
+(`ops/wrapper/rope.cpp`: `rope_linear_frequencies`,
+`inv_freq[p] = θ^(-2p/rotary_dim)`; the table is computed once at
+construction, host-side, a deterministic table — the Rust builder
+`rope_inv_frequencies` in `crates/core/src/compute.rs`, passed to the
+kernel as the f32 `inv_freq` argument). The reference fuses
+rope(rmsnorm(x)) (`ops/launcher/qk_norm_rope.cu`); the v1 does the
+`ignis_rmsnorm` (kernel-abi 02) + this RoPE as two steps (the fused kernel
+is the later performance item, ADR 0005). The reference's RopeKernelMode /
+QHeads / KHeads template dispatch, the PDL syncs, and the attention-factor
+(YaRN) scaling are not ported (C++ state the flat C ABI of ADR 0001
+forbids; v1 is unscaled, factor 1.0 — the attention-factor scaling is a
+later performance item, ADR 0005); the pair-rotation math is ported 1:1.
+Self-contained; compiles standalone in the leaf.
+
+### `kernel/src/gdn_conv_rope_surface.cu` (ticket 28, kernel-abi 06,
+GitHub #28)
+The flat C ABI GDN-conv + RoPE wrapper (ADR 0001): the `extern "C"`
+functions `ignis_gdn_causal_conv` and `ignis_rope_qk` that take explicit
+host pointers + sizes + a stream handle and launch the two ported kernels,
+with internal H2D/D2H copies and a 0/-1 int return code (the same style as
+the ticket-03 decode surface, the kernel-abi-01 prefill surface, and the
+kernel-abi-02 norms surface). There is no reference equivalent (the
+reference's driver was the engine's op dispatch); this is the new C ABI
+surface for the GDN causal conv + GQA RoPE.
