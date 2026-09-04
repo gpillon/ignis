@@ -267,3 +267,25 @@ the ticket-03 decode surface, the kernel-abi-01 prefill surface, and the
 kernel-abi-02 norms surface). There is no reference equivalent (the
 reference's driver was the engine's op dispatch); this is the new C ABI
 surface for the GDN causal conv + GQA RoPE.
+### `kernel/src/bf16_gemm.cuh` (ticket 29, kernel-abi-10, GitHub #29)
+bf16 GEMM (the logits path for the W8-dequantized lm_head). No reference
+equivalent in the reference fork's ABI surface: the reference engine
+consumes the dequantized lm_head through its own tensor-core GEMM dispatch
+(C++ state the flat C ABI of ADR 0001 does not carry). This kernel follows
+the proven rowsplit FMA pattern of the ticket-22 NVFP4 prefill GEMM
+(nvfp4_gemm_prefill.cuh — the rowsplit "rows-of-W x tokens" tiling, fp32
+FMA accumulation, shared-memory k-chunk staging, bf16 store) with the NVFP4
+dequant staging replaced by a plain bf16 weight read (the A1 artifact
+dequant produces a bf16 lm_head). The tensor-core MMA (the later
+performance-gate material, ADR 0005/0007) is deliberately not used: v1 is
+the correctness-first scalar-FMA baseline. Self-contained; compiles
+standalone in the leaf.
+
+### `kernel/src/bf16_gemm_surface.cu` (ticket 29, kernel-abi-10, GitHub #29)
+The flat C ABI bf16 GEMM wrapper (ADR 0001): the `extern "C"` function
+`ignis_bf16_gemm` that takes explicit host pointers + sizes + a stream
+handle and launches the rowsplit kernel, with internal H2D/D2H copies and a
+0/-1 int return code (the same style as ticket-03's decode surface and the
+kernel-abi-05 prefill surface). There is no reference equivalent (the
+reference's driver was the engine's op dispatch); this is the new C ABI
+surface for the bf16 logits GEMM (the W8-dequantized lm_head path).

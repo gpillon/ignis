@@ -189,6 +189,30 @@ unsafe extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+    /// bf16 GEMM (the logits path for the W8-dequantized lm_head, ticket 29,
+    /// GitHub #29 — the third 27B-fidelity kernel).
+    /// `out[tokens][m] = bias[m] + sum_k act[tokens][k] * W[m][k]`.
+    /// `act`: bf16 [tokens][k] (k contiguous per token). `wt`: bf16 [m][k]
+    /// (the W8-dequantized lm_head, k contiguous per m-row). `bias`
+    /// (nullable): bf16 [m]. `out`: bf16 [tokens][m]. A rowsplit FMA GEMM
+    /// (no tensor cores / no cuBLASLt, ADR 0001/0005); the tensor-core MMA
+    /// is the later performance-gate material (ADR 0007). `tokens == 1` is
+    /// the GEMV special case (the decode logits path); `tokens > 1` serves
+    /// the batched-prefill logits path (B1). `m`, `k` and `tokens` must be
+    /// positive (no alignment constraint — plain bf16 planes, no NVFP4
+    /// group scales). `stream`: null = stream 0. Returns 0 on success, -1
+    /// on error.
+    pub fn ignis_bf16_gemm(
+        act: *const std::ffi::c_void,
+        wt: *const std::ffi::c_void,
+        bias: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        tokens: i64,
+        m: i64,
+        k: i64,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
     /// RMSNorm (LayerNorm when `center` is non-null). `x`: bf16 [n].
     /// `weight` (nullable): bf16 [n]. `center` (nullable): bf16 [n].
     /// `out`: bf16 [n]. `eps` <= 0 selects 1e-6. Returns 0 on success,
@@ -398,6 +422,20 @@ mod tests {
         gemm_prefill_out_elems(tokens, m) * 2
     }
 
+    /// bf16 GEMM (the logits path, ticket 29) output element count:
+    /// `[tokens][m]` (the same shape contract as the multi-token NVFP4 GEMM —
+    /// `out[tokens][m]` — but with a plain bf16 weight plane, no NVFP4 code /
+    /// scale layout).
+    fn bf16_gemm_out_elems(tokens: u64, m: u64) -> u64 {
+        tokens * m
+    }
+
+    /// bf16 GEMM (the logits path, ticket 29) output byte count (bf16 =
+    /// 2 bytes/elem).
+    fn bf16_gemm_out_bytes(tokens: u64, m: u64) -> u64 {
+        bf16_gemm_out_elems(tokens, m) * 2
+    }
+
     #[test]
     fn gqa_prefill_geometry_pins_out_shape() {
         // Representative canary shape: 4-batch, 512-token prefill, 8 q-heads,
@@ -429,5 +467,17 @@ mod tests {
         // kernel computes (independent of the helper's formula: [tokens][m]).
         assert_eq!(gemm_prefill_out_elems(8, 5120), 40_960);
         assert_eq!(gemm_prefill_out_bytes(8, 5120), 81_920);
+    }
+
+    #[test]
+    fn bf16_gemm_geometry_pins_out_shape() {
+        // Representative logits canary shape: 8-token prefill against the
+        // full Qwen 3.8-27B vocab (8*248_320 = 1_986_560 elems, bf16 =
+        // 3_973_120 bytes). Pins the ABI out-size contract for
+        // `ignis_bf16_gemm` (the W8-dequantized lm_head logits path, ticket
+        // 29) to the values the kernel computes (independent of the helper's
+        // formula: [tokens][m]).
+        assert_eq!(bf16_gemm_out_elems(8, 248_320), 1_986_560);
+        assert_eq!(bf16_gemm_out_bytes(8, 248_320), 3_973_120);
     }
 }

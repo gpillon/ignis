@@ -147,6 +147,24 @@ int ignis_nvfp4_gemm_prefill_device(const void *act, const void *wt_codes,
                                     void *out, int64_t tokens, int64_t m,
                                     int64_t k, void *stream);
 
+/* Ticket 29 (kernel-abi 10, GitHub #29): bf16 GEMM (the logits path for the
+ * W8-dequantized lm_head — the A1 artifact dequant produces a bf16 lm_head
+ * weight, which the NVFP4 GEMM surface (kernel-abi 01/05) cannot consume;
+ * this is the third 27B-fidelity kernel):
+ *   out[tokens][m] = bias[m] + sum_k act[tokens][k] * W[m][k]
+ * `act` is bf16 [tokens][k]; `wt` is bf16 [m][k] (the W8-dequantized
+ * lm_head); `bias` (nullable) is bf16 [m]; `out` is bf16 [tokens][m]. A
+ * rowsplit FMA GEMM (no tensor cores / no cuBLASLt, ADR 0001/0005); the
+ * tensor-core MMA is the later performance-gate material (ADR 0005/0007).
+ * `tokens == 1` is the GEMV special case (the decode logits path);
+ * `tokens > 1` serves the batched-prefill logits path (B1, kernel-abi 08).
+ * `m`, `k` and `tokens` must be positive (no alignment constraint — plain
+ * bf16 planes, no NVFP4 group scales). stream: null = stream 0. Returns 0
+ * on success, -1 on error. */
+int ignis_bf16_gemm(const void *act, const void *wt, const void *bias,
+                    void *out, int64_t tokens, int64_t m, int64_t k,
+                    void *stream);
+
 /* Ticket 06 (kernel-abi-02): RMSNorm (or LayerNorm when `center` is
  * non-null). out = x / rms(x) * weight, optionally centered first. x is bf16
  * [n]. weight (nullable): bf16 [n]. center (nullable): bf16 [n] (present =>
