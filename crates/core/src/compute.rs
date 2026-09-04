@@ -3,19 +3,41 @@
 //! A topology-driven forward pass that composes the kernel-leaf C-ABI
 //! primitives (ADR 0001) into the engine's `prefill_step` / `decode_step`
 //! (the [`Compute`] seam, `scheduler.rs`). The heavy ops run on the GPU via
-//! the FFI (NVFP4 GEMM/GEMV, GQA attention, GDN step, RMSNorm, embedding,
-//! greedy sample, the CUDA-graph primitives); the pointwise glue (residual
-//! add, the gated-SiLU activation, the gate·up multiply) runs on the host as
-//! the **correctness floor** (ADR 0005: correctness is the non-negotiable
-//! floor; the fused-SiLU / fused-residual kernels are the later 99%-gate
-//! performance material, ADR 0007 / bench-03).
+//! the FFI (NVFP4 GEMM/GEMV, GQA attention, GDN step, the GDN causal conv,
+//! the GQA RoPE / q / k RMSNorm, the bf16 GEMM, RMSNorm, embedding, greedy
+//! sample, the CUDA-graph primitives); the pointwise glue (residual add,
+//! the gated-SiLU activation, the gate·up multiply, the GDN state readout)
+//! runs on the host as the **correctness floor** (ADR 0005: correctness is
+//! the non-negotiable floor; the fused-SiLU / fused-residual / fused-
+//! readout kernels are the later 99%-gate performance material, ADR 0007 /
+//! bench-03).
 //!
 //! **Topology-driven:** the forward pass is parameterized by a
 //! [`ModelConfig`] (layer count, per-layer kind (GQA / GDN), head geometry,
-//! GDN state dims, FFN width, vocab, block geometry). The [`Weights`] hold
-//! the model's weights in the kernel-expected formats (bf16 activations,
-//! NVFP4 E2M1 codes + E4M3 scales for the GEMM weights), so the same code
-//! serves a *synthetic* (test) model and a real (artifact) model.
+//! GDN state dims, the GDN feature layout (q / z / a-b widths), the rotary
+//! geometry, FFN width, vocab, block geometry). The [`Weights`] hold the
+//! model's weights in the kernel-expected formats (bf16 activations, NVFP4
+//! E2M1 codes + E4M3 scales for the GEMM weights, the bf16 exception
+//! tensors, the device-resident NVFP4 planes for the `from_artifact`
+//! routing), so the same code serves a *synthetic* (test) model and a real
+//! (artifact) model.
+//!
+//! **The full-correct forward assembly (A3 / #30, spec 07):** the real
+//! (artifact) model's forward pass runs the *full* layer stack — the GDN
+//! layers' causal conv (`ignis_gdn_causal_conv`, kernel-abi 06, A2 / #28)
+//! + the GDN a / b (gate / beta) projection + the GDN step + the state
+//! readout (the "for now" host-side `S^T k` GEMV, ADR 0005) + the z
+//! (output-gate) gating; the GQA layers' QKV projection + the q / k
+//! RMSNorm (`ignis_rmsnorm`, the per-head) + the RoPE (`ignis_rope_qk`,
+//! kernel-abi 06) + the GQA attention + the output projection; the
+//! gated-FFN block (the NVFP4 GEMMs + the host gated-SiLU); the bf16
+//! logits GEMM (`ignis_bf16_gemm`, kernel-abi 10, A2b / #29) for the
+//! W8-dequantized lm_head; and the real `qwen38_27b` topology + the
+//! device-resident NVFP4 routing (the artifact's normalized tensors, A1 /
+//! #27 — the NVFP4 fused planes stay in VRAM (the `*_device` kernels, no
+//! per-call H2D, the #26 fix), the BF16 tensors are host-copied (the
+//! bounded text-scope copy), the W8 endpoints are the A1 host-side
+//! dequants).
 //!
 //! **The CUDA-graph fast path (kernel-abi 03):** at construction the
 //! kernel-leaf startup check (`ignis_graph_startup_check` — a few KB of
@@ -25,26 +47,25 @@
 //! The graph **launch** (`ignis_graph_launch` per decode step) is the
 //! performance material (the 99% gate, ADR 0007 / bench-03) — **not
 //! implemented in this ticket** (the eager sequence is always used; the
-//! graph is captured but never launched, the documented follow-up).
+//! graph is captured but never launched, the documented follow-up, B2 /
+//! #32).
 //!
-//! **The decode query (the non-autoregressive limitation):** the synthetic
-//! model's decode query is a deterministic placeholder (the `last_token`
-//! method); a real model threads the actually-generated token back into the
-//! next step (the autoregressive decode, the documented follow-up).
+//! **The decode query (the autoregressive decode, A3 / #30):** the decode
+//! step threads the actually-generated token back into the next step (the
+//! prefill's last prompt token on the first decode, the previous decode's
+//! token thereafter) — the real-model autoregressive wiring (a fresh
+//! request without a prefill uses token 0).
 //!
-//! **Documented gaps (the full-correct 27B forward pass, driven by the 99%
-//! gate, ADR 0007 / bench-03):** the Qwen 3.8-27B hybrid GQA+GDN model
-//! additionally needs the GDN short **causal convolution**
-//! (`gdn/convolution`), **RoPE** on the GQA projections, the
-//! CUDA-graph **launch** (the per-decode-step replay), the **batched
-//! prefill** (the multi-token attention + the multi-token GEMM, the
-//! `prefill_step` seam's performance path), and full dequant of the
-//! mixed-quantization weight set (NVFP4 / BF16 / W8 / Q4-Q5) to the kernel
-//! formats. These are host-side (or fused-kernel) work the 99% gate drives
-//! — the compute-adapter *seam* (the FFI composition + the error mapping +
-//! the server wiring + the self-consistency test, this module) is complete;
-//! the performance material (the graph launch, the batched prefill, the 27B
-//! forward pass) is the documented follow-up.
+//! **Documented gaps (the 99%-gate performance material, ADR 0005 / 0007
+//! / bench-03 — not the A3 correctness floor):** the CUDA-graph **launch**
+//! (the per-decode-step replay, B2 / #32), the **batched prefill** (the
+//! multi-token attention + the multi-token GEMM, the `prefill_step`
+//! seam's performance path, B1 / #31), and the *re-implementation* of the
+//! "for now" ported kernels (the tensor-core NVFP4 / bf16 GEMMs, the
+//! fused qk-norm+RoPE, the fused readout — the later performance gate, the
+//! 99% material, #20). The A3 / #30 correctness floor (the full-correct
+//! forward pass — a *sane*, reproducible real-model output, ADR 0005 /
+//! 0007) is complete in this module.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -168,6 +189,27 @@ pub struct ModelConfig {
     pub gdn_state_cols: u64,
     /// The GDN step's `num_gdn_layers` argument (per-layer GDN state count).
     pub gdn_num_layers: u64,
+    /// The GDN input-projection `q` rows (the GDN feature's query part,
+    /// before the k / v parts — `0` for a model without a separate GDN q
+    /// part; the Qwen 3.8-27B real model's `gdn/query_key_value_z` is
+    /// q 2048 + k 2048 + v 6144 + z 6144 = 16 384 rows, A3 / #30).
+    pub gdn_q_width: u64,
+    /// The GDN input-projection `z` (output-gate) rows (the rows that
+    /// bypass the causal conv and gate the state readout; `0` for a model
+    /// without a z part).
+    pub gdn_z_width: u64,
+    /// The GDN a/b (gate / beta) projection width (`gdn/a_b_projection`,
+    /// a bf16 GEMM: the first half is the gate `a`, the second half the
+    /// beta `b` — `0` = no a/b projection, the step's g / beta are 0;
+    /// the Qwen 3.8-27B real model is 96 = 48 a + 48 b, A3 / #30).
+    pub gdn_ab_width: u64,
+    /// The GQA RoPE rotary dim (of `head_dim` — the first `rotary_dim`
+    /// dims of each q / k head are rotated; `rotary_dim / 2` pairs,
+    /// kernel-abi 06, GitHub #28).
+    pub rotary_dim: u64,
+    /// The RoPE base θ (the `inv_freq[pair] = θ^(-2·pair/rotary_dim)`
+    /// table, kernel-abi 06 — the Qwen 3.8-27B GQA geometry θ = 1e7).
+    pub rope_theta: f64,
     /// The FFN (gated-SiLU) intermediate width.
     pub ffn_intermediate: u64,
     /// The paged KV block size (keys per block).
@@ -198,6 +240,34 @@ impl ModelConfig {
         self.gdn_state_rows * self.gdn_state_cols
     }
 
+    /// The GDN input-projection GEMM width (`m` = the GDN feature rows:
+    /// the q / k / v / z parts — `gdn_q_width + state_cols + state_rows +
+    /// gdn_z_width`; the artifact's `gdn/query_key_value_z` tensor is
+    /// exactly this wide, A3 / #30).
+    pub fn gdn_in_proj_m(&self) -> u64 {
+        self.gdn_q_width + self.gdn_state_cols + self.gdn_state_rows + self.gdn_z_width
+    }
+
+    /// The GDN causal-conv channel count (the conv'd q / k / v part of the
+    /// input projection — `gdn_q_width + state_cols + state_rows`; the
+    /// z rows bypass the conv, the `ignis_gdn_causal_conv` contract,
+    /// kernel-abi 06, A3 / #30).
+    pub fn gdn_conv_channels(&self) -> u64 {
+        self.gdn_q_width + self.gdn_state_cols + self.gdn_state_rows
+    }
+
+    /// The GDN state readout GEMM input dim (`k` = the per-token readout
+    /// width `state_rows` — the artifact's `gdn/output` tensor is
+    /// `[hidden][state_rows]`, A3 / #30).
+    pub fn gdn_readout_k(&self) -> u64 {
+        self.gdn_state_rows
+    }
+
+    /// The GQA RoPE inverse-frequency pair count (`rotary_dim / 2`).
+    pub fn rope_pairs(&self) -> u64 {
+        self.rotary_dim / 2
+    }
+
     /// A small, fast synthetic topology for the self-consistency GPU test
     /// (one GDN + one GQA layer, small dims, a small paged KV) — exercises
     /// every kernel primitive (embedding, GEMM/GEMV, GQA, GDN step, norms,
@@ -215,6 +285,17 @@ impl ModelConfig {
             gdn_state_rows: 8,
             gdn_state_cols: 8,
             gdn_num_layers: 1,
+            // The synthetic model has no separate GDN q / z / a-b parts
+            // (the input projection is the k / v / g / beta feature
+            // directly — the `gdn_state_dim` layout, A3 / #30).
+            gdn_q_width: 0,
+            gdn_z_width: 0,
+            gdn_ab_width: 0,
+            // The RoPE geometry: `rotary_dim` 8 of `head_dim` 16 (4
+            // pairs), θ = 1e7 (the real-model base, a deterministic
+            // synthetic table, A3 / #30).
+            rotary_dim: 8,
+            rope_theta: 1e7,
             ffn_intermediate: 32,
             block_size: 4,
             num_blocks: 8,
@@ -228,9 +309,13 @@ impl ModelConfig {
     /// tokenizer's ids (up to 248 077) never index out of bounds (the
     /// `ignis_embedding` OOB that produced the `illegal memory access`).
     /// The layer pattern + head geometry are the model constants (ignis is
-    /// specialized for Qwen 3.8-27B); the numerically-correct device routing
-    /// (divisors, dequant of the W8/BF16-exception tensors, the missing GDN /
-    /// RoPE ops) is #25 (the 99%-gate follow-up).
+    /// specialized for Qwen 3.8-27B); the full-correct device routing
+    /// (the W8 / BF16-exception dequants, the GDN causal conv / RoPE /
+    /// q / k RMSNorm ops, the bf16 logits GEMM, the per-layer tensor
+    /// routing) is the A3 / #30 assembly (spec 07) — the forward pass
+    /// runs the *real* model (the correctness floor, ADR 0005: a *sane*,
+    /// reproducible output — the 99%-gate performance material is #20,
+    /// not this ticket).
     pub fn qwen38_27b() -> Self {
         let num_layers: usize = 64;
         // Layer `i` is GQA (full attention) exactly when `(i + 1) % 4 == 0`
@@ -251,6 +336,21 @@ impl ModelConfig {
             gdn_state_rows: 6144,
             gdn_state_cols: 2048,
             gdn_num_layers: 48,
+            // The GDN input projection's `gdn/query_key_value_z` layout
+            // (the artifact's directory, A1 inventory, A3 / #30): q 2048
+            // + k 2048 + v 6144 + z 6144 = 16 384 rows — the causal conv
+            // covers the first 10 240 channels (q / k / v), the z rows
+            // bypass it. The a/b (gate / beta) projection is 96 rows
+            // (`gdn/a_b_projection`: 48 gate + 48 beta, one per v-head).
+            gdn_q_width: 2048,
+            gdn_z_width: 6144,
+            gdn_ab_width: 96,
+            // The GQA RoPE geometry (kernel-abi 06, GitHub #28): the
+            // split-half NeoX rotary of `rotary_dim` = 64 of
+            // `head_dim` = 256 (32 pairs), base θ = 1e7 (the reference's
+            // `rope_linear_frequencies` table).
+            rotary_dim: 64,
+            rope_theta: 1e7,
             ffn_intermediate: 17_408,
             // Paged KV: 64-token pages (the reference P=64 granularity); 4096
             // blocks per request (the 262k context envelope, design §2).
@@ -378,6 +478,143 @@ fn nvfp4_weight(m: u64, k: u64, seed: u64) -> Nvfp4Weight {
     }
 }
 
+/// A bf16 GEMM / pointwise weight: row-major `[m][k]` bf16 (m output rows,
+/// k input dim). A1 preserves the artifact's BF16 tensors as-is (spec 04:
+/// the `gdn/convolution`, the norms, the BF16-exception projections stay
+/// contiguous bf16), so the host tier carries them as plain bf16 buffers
+/// the `ignis_bf16_gemm` kernel (kernel-abi 10) + the
+/// `ignis_gdn_causal_conv` kernel (kernel-abi 06) consume directly
+/// (A3 / #30): the artifact's BF16 tensors (the early GQA layers'
+/// `attention/query_key_gate_value` + `attention/output`, the layer-4
+/// `gdn/output`, every GDN layer's `gdn/a_b_projection` +
+/// `gdn/convolution`) are host-copied on the `from_artifact` path (the
+/// bounded text-scope copy — the #26 lesson is the unbounded NVFP4 host
+/// generation, not the bf16 endpoints).
+#[derive(Debug, Clone)]
+pub struct Bf16Weight {
+    /// The bf16 content, `[m][k]` row-major.
+    pub data: Vec<u16>,
+    /// The output dim `m` (rows of W).
+    pub m: u64,
+    /// The input dim `k` (columns of W).
+    pub k: u64,
+}
+
+impl Bf16Weight {
+    /// A zero-sized (unused) bf16 weight.
+    pub fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            m: 0,
+            k: 0,
+        }
+    }
+
+    /// A geometry-only bf16 weight (the `from_geometry`'s real (m, k) with
+    /// empty content — the content is the artifact's bf16 buffer, consumed
+    /// by the forward pass, A3 / #30).
+    pub fn geometry_only(m: u64, k: u64) -> Self {
+        Self {
+            data: Vec::new(),
+            m,
+            k,
+        }
+    }
+
+    /// A deterministic synthetic bf16 weight (a pure function of `seed` +
+    /// the geometry). Values are bf16-exact multiples of 1/8 within
+    /// `[-1, 1)` (a bounded, numerically-sane pattern, like the
+    /// `nvfp4_weight` helper).
+    fn bf16_weight(m: u64, k: u64, seed: u64) -> Self {
+        if m == 0 || k == 0 {
+            return Self::empty();
+        }
+        let m = m as usize;
+        let k = k as usize;
+        let data: Vec<u16> = (0..m * k)
+            .map(|i| {
+                let r = i / k;
+                let c = i % k;
+                // A bounded deterministic value in [-1.0, 1.0)
+                // (bf16-exact multiples of 1/8).
+                let v = ((r as u64)
+                    .wrapping_mul(7)
+                    .wrapping_add((c as u64).wrapping_mul(3))
+                    .wrapping_add(seed))
+                    % 16;
+                f32_to_bf16(v as f32 / 8.0 - 1.0)
+            })
+            .collect();
+        Self {
+            data,
+            m: m as u64,
+            k: k as u64,
+        }
+    }
+}
+
+/// A device-resident NVFP4 GEMM plane (the artifact's materialized arena,
+/// ADR 0002): the raw pointers into the `CudaDevice` arena the
+/// `ignis_nvfp4_gemm_*_device` kernels (ticket 26, GitHub #26) consume
+/// (no per-call weight H2D, the #26 fix). Set on the `from_artifact` path
+/// (A3 / #30); empty on the synthetic / dev path (the host `Nvfp4Weight`
+/// carries the content there). The plane is the artifact's *fused* tensor
+/// (`attention/query_key_gate_value`, `gdn/query_key_value_z`,
+/// `mlp/gate_up`, …) — the per-slot GEMM (q / k / v / gate / up) is a row
+/// slice of it (the GEMM dispatch's `row_off` argument; the slot's row
+/// start within the fused tensor).
+///
+/// The plane's code / scale layout is the artifact's (the materialized
+/// payload's planes, ADR 0002); the ported GEMM kernels read them as
+/// plain row-major `[m][k/2]` / `[m][k/16]` planes (the "for now"
+/// starting point, ADR 0005 — the container plane layout + the
+/// `weight_divisor` application are the later re-implementation
+/// material, not this assembly's).
+#[derive(Debug, Clone, Copy)]
+pub struct Nvfp4DevicePlane {
+    /// The E2M1 codes plane (device, `[m][k/2]` bytes, 2 codes per byte).
+    pub codes: *const u8,
+    /// The E4M3 group-scales plane (device, `[m][k/16]` bytes).
+    pub scales: *const u8,
+    /// The plane's output rows `m` (the fused tensor's rows).
+    pub m: u64,
+    /// The plane's input dim `k`.
+    pub k: u64,
+}
+
+// SAFETY: an `Nvfp4DevicePlane` is a pair of raw pointers into the
+// artifact's VRAM arena (the `CudaDevice` owner, the `DeviceCtx` —
+// dropped last in the `CudaCompute`, after the `Weights` that hold the
+// planes). Sharing the planes across threads is safe: the forward pass
+// reads the planes (read-only); the producing arena outlives the views
+// (the `DeviceCtx` drop order, ADR 0002).
+unsafe impl Send for Nvfp4DevicePlane {}
+unsafe impl Sync for Nvfp4DevicePlane {}
+
+/// The per-layer device-resident NVFP4 planes (the `from_artifact` path's
+/// routing table, A3 / #30): which artifact tensor each GEMM slot
+/// consumes (a plane + the slot's row slice within it). A `None` slot
+/// falls back to the host `Nvfp4Weight` (the synthetic / dev path) or
+/// the layer's bf16 exception weight (the artifact's BF16-exception
+/// layers).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayerDeviceSlots {
+    /// The GQA fused qkvz projection (`attention/query_key_gate_value`;
+    /// the q / k / v slots are row slices of it).
+    pub qkv: Option<Nvfp4DevicePlane>,
+    /// The GQA output projection (`attention/output`).
+    pub attn_out: Option<Nvfp4DevicePlane>,
+    /// The GDN input projection (`gdn/query_key_value_z`).
+    pub gdn_in: Option<Nvfp4DevicePlane>,
+    /// The GDN state readout (`gdn/output`).
+    pub gdn_out: Option<Nvfp4DevicePlane>,
+    /// The fused FFN gate+up projection (`mlp/gate_up`; the gate / up
+    /// slots are row slices of it).
+    pub mlp_gate_up: Option<Nvfp4DevicePlane>,
+    /// The FFN down projection (`mlp/down`).
+    pub mlp_down: Option<Nvfp4DevicePlane>,
+}
+
 /// A decoder layer's GEMM weights (the projections + the gated-FFN weights).
 #[derive(Debug, Clone)]
 pub struct LayerWeights {
@@ -399,6 +636,43 @@ pub struct LayerWeights {
     /// The pre-attention + post-attention RMSNorm weights: bf16 `[hidden]`.
     pub norm_in: Vec<u16>,
     pub norm_post: Vec<u16>,
+    /// The GDN causal-conv weight (A3 / #30, kernel-abi 06): bf16
+    /// `[4][conv_channels]` (the 4 taps w0..w3, tap-major — the
+    /// artifact's `gdn/convolution` tensor, the GDN layers only; empty
+    /// for a GQA layer / a model without a conv).
+    pub gdn_conv: Bf16Weight,
+    /// The GDN a/b (gate / beta) projection (A3 / #30): bf16
+    /// `[gdn_ab_width][hidden]` (the artifact's `gdn/a_b_projection`;
+    /// the first half is the gate `a`, the second the beta `b` — empty
+    /// when the model has no a/b projection, `gdn_ab_width` = 0).
+    pub gdn_ab: Bf16Weight,
+    /// The GQA q / k RMSNorm weights (A3 / #30): bf16 `[head_dim]` each
+    /// (the artifact's `attention/query_norm` + `attention/key_norm`,
+    /// per-head RMSNorm weights — empty = a parameter-free RMSNorm, the
+    /// synthetic / no-weight convention).
+    pub qk_norm: [Vec<u16>; 2],
+    /// The GQA fused qkvz projection's BF16-exception content (A3 / #30):
+    /// the artifact's early GQA layers store `attention/query_key_gate_value`
+    /// in bf16 (the A1 inventory's `QKGV_BF16_LAYERS`) — the q / k / v
+    /// slots are row slices of this buffer (the `ignis_bf16_gemm`
+    /// kernel, A2b). Empty on the synthetic / NVFP4 paths.
+    pub qkv_bf16: Bf16Weight,
+    /// The GQA output projection's BF16-exception content (the artifact's
+    /// early GQA layers store `attention/output` in bf16 — the
+    /// A1 inventory's `ATTENTION_OUT_BF16_LAYERS`). Empty otherwise.
+    pub attn_out_bf16: Bf16Weight,
+    /// The GDN state readout's BF16-exception content (the artifact's
+    /// layer-4 `gdn/output` quirk, the A1 inventory's
+    /// `GDN_OUT_BF16_LAYERS`). Empty otherwise.
+    pub gdn_out_bf16: Bf16Weight,
+    /// The device-resident NVFP4 planes (the `from_artifact` routing,
+    /// A3 / #30 — set on the cuda path; `Default` on the synthetic / dev
+    /// path, the host `Nvfp4Weight`s carry the content there).
+    pub dev: LayerDeviceSlots,
+    /// This layer's index within the model's GDN layers (the GDN
+    /// recurrent-state + causal-conv-state slice, the request state's
+    /// per-layer planes; `0` for a GQA layer).
+    pub gdn_index: usize,
 }
 
 /// The model's weights, in the kernel-expected host formats. A synthetic
@@ -443,6 +717,24 @@ pub struct LayerGeometry {
     /// The pre-attention + post-attention norm sizes (bf16 `[hidden]`).
     pub norm_in: u64,
     pub norm_post: u64,
+    /// The GDN causal-conv geometry (m = the 4 taps, k = the conv
+    /// channels) — the GDN layers only; (0, 0) for a GQA layer
+    /// (A3 / #30, kernel-abi 06).
+    pub gdn_conv: (u64, u64),
+    /// The GDN a/b (gate / beta) projection (m, k) — the GDN layers
+    /// with a `gdn_ab_width` > 0; (0, 0) otherwise (A3 / #30).
+    pub gdn_ab: (u64, u64),
+    /// The GQA q / k RMSNorm weight width (bf16 `[head_dim]` each) — the
+    /// GQA layers only; 0 for a GDN layer (A3 / #30).
+    pub qk_norm: u64,
+    /// The GDN causal-conv channel count (the conv'd q / k / v part —
+    /// `gdn_q_width + state_cols + state_rows`, the z rows bypass it;
+    /// 0 when there is no conv, A3 / #30).
+    pub gdn_conv_channels: u64,
+    /// The GDN input-projection (m, k) (the `gdn_in_proj_m` rows: the
+    /// q / k / v / z parts — the artifact's `gdn/query_key_value_z`
+    /// width, A3 / #30).
+    pub gdn_in_proj: (u64, u64),
 }
 
 /// The kernel-expected weight geometry (sizes only, no content): the
@@ -484,36 +776,79 @@ impl WeightsGeometry {
             .layer_kinds
             .iter()
             .map(|kind| match kind {
-                LayerKind::Gqa => LayerGeometry {
-                    kind: LayerKind::Gqa,
-                    projection: [
-                        (config.gqa_width(), config.hidden),
-                        (config.gqa_kv_width(), config.hidden),
-                        (config.gqa_kv_width(), config.hidden),
-                        (config.hidden, config.gqa_width()),
-                    ],
-                    gdn_output: (0, 0),
-                    ffn_gate: (config.ffn_intermediate, config.hidden),
-                    ffn_up: (config.ffn_intermediate, config.hidden),
-                    ffn_down: (config.hidden, config.ffn_intermediate),
-                    norm_in: config.hidden,
-                    norm_post: config.hidden,
-                },
-                LayerKind::Gdn => LayerGeometry {
-                    kind: LayerKind::Gdn,
-                    projection: [
-                        (config.gdn_state_dim(), config.hidden),
-                        (0, 0),
-                        (0, 0),
-                        (0, 0),
-                    ],
-                    gdn_output: (config.hidden, config.gdn_state_mat()),
-                    ffn_gate: (config.ffn_intermediate, config.hidden),
-                    ffn_up: (config.ffn_intermediate, config.hidden),
-                    ffn_down: (config.hidden, config.ffn_intermediate),
-                    norm_in: config.hidden,
-                    norm_post: config.hidden,
-                },
+                LayerKind::Gqa => {
+                    let gqa_w = config.gqa_width();
+                    let gqa_kv_w = config.gqa_kv_width();
+                    LayerGeometry {
+                        kind: LayerKind::Gqa,
+                        projection: [
+                            (gqa_w, config.hidden),
+                            (gqa_kv_w, config.hidden),
+                            (gqa_kv_w, config.hidden),
+                            (config.hidden, gqa_w),
+                        ],
+                        gdn_output: (0, 0),
+                        ffn_gate: (config.ffn_intermediate, config.hidden),
+                        ffn_up: (config.ffn_intermediate, config.hidden),
+                        ffn_down: (config.hidden, config.ffn_intermediate),
+                        norm_in: config.hidden,
+                        norm_post: config.hidden,
+                        // The GQA layer has no GDN conv / a-b / input
+                        // projection (the GDN-only geometry fields,
+                        // A3 / #30).
+                        gdn_conv: (0, 0),
+                        gdn_ab: (0, 0),
+                        // The q / k RMSNorm weights are `[head_dim]`
+                        // each (the per-head RMSNorm, A3 / #30).
+                        qk_norm: config.head_dim,
+                        gdn_conv_channels: 0,
+                        gdn_in_proj: (0, 0),
+                    }
+                }
+                LayerKind::Gdn => {
+                    let conv_ch = config.gdn_conv_channels();
+                    LayerGeometry {
+                        kind: LayerKind::Gdn,
+                        // The GDN input projection's (m, k): the q / k /
+                        // v / z parts (the `gdn_in_proj_m` rows — the
+                        // artifact's `gdn/query_key_value_z` width,
+                        // A3 / #30).
+                        projection: [
+                            (config.gdn_in_proj_m(), config.hidden),
+                            (0, 0),
+                            (0, 0),
+                            (0, 0),
+                        ],
+                        // The state readout (m = hidden, k = the
+                        // per-token readout width `state_rows` — the
+                        // artifact's `gdn/output` tensor is
+                        // `[hidden][state_rows]`, A3 / #30).
+                        gdn_output: (config.hidden, config.gdn_readout_k()),
+                        ffn_gate: (config.ffn_intermediate, config.hidden),
+                        ffn_up: (config.ffn_intermediate, config.hidden),
+                        ffn_down: (config.hidden, config.ffn_intermediate),
+                        norm_in: config.hidden,
+                        norm_post: config.hidden,
+                        // The GDN causal-conv geometry (the 4 taps ×
+                        // the conv channels, A3 / #30).
+                        gdn_conv: if conv_ch > 0 {
+                            (4, conv_ch)
+                        } else {
+                            (0, 0)
+                        },
+                        // The GDN a/b (gate / beta) projection (the
+                        // `gdn_ab_width` rows — `gdn/a_b_projection`,
+                        // A3 / #30).
+                        gdn_ab: if config.gdn_ab_width > 0 {
+                            (config.gdn_ab_width, config.hidden)
+                        } else {
+                            (0, 0)
+                        },
+                        qk_norm: 0,
+                        gdn_conv_channels: conv_ch,
+                        gdn_in_proj: (config.gdn_in_proj_m(), config.hidden),
+                    }
+                }
             })
             .collect();
         Self {
@@ -539,6 +874,10 @@ impl Weights {
     /// self-consistency invariant, ADR 0007: greedy + fixed seed).
     pub fn synthetic(config: &ModelConfig, seed: u64) -> Self {
         let ones = to_bf16(&vec![1.0f32; config.hidden as usize]);
+        // The synthetic q / k RMSNorm weights (the identity convention —
+        // the synthetic model's per-head RMSNorm is a plain RMS, A3 / #30).
+        let head_ones = to_bf16(&vec![1.0f32; config.head_dim as usize]);
+        let mut gdn_index = 0usize;
         let per_layer = config
             .layer_kinds
             .iter()
@@ -587,26 +926,45 @@ impl Weights {
                         ),
                         norm_in: ones.clone(),
                         norm_post: ones.clone(),
+                        // The GQA layer has no GDN conv / a-b (the GDN-
+                        // only fields, A3 / #30); the q / k RMSNorm
+                        // weights are the identity (the synthetic
+                        // convention — a plain per-head RMS).
+                        gdn_conv: Bf16Weight::empty(),
+                        gdn_ab: Bf16Weight::empty(),
+                        qk_norm: [head_ones.clone(), head_ones.clone()],
+                        // The synthetic path's GEMM content is the host
+                        // NVFP4 plane (the BF16-exception + the device
+                        // slots are the `from_artifact` path's, A3 / #30).
+                        qkv_bf16: Bf16Weight::empty(),
+                        attn_out_bf16: Bf16Weight::empty(),
+                        gdn_out_bf16: Bf16Weight::empty(),
+                        dev: LayerDeviceSlots::default(),
+                        gdn_index: 0,
                     }
                 }
                 LayerKind::Gdn => {
-                    let gdn_state_dim = config.gdn_state_dim();
-                    let gdn_state_mat = config.gdn_state_mat();
+                    let in_proj_m = config.gdn_in_proj_m();
+                    let conv_ch = config.gdn_conv_channels();
+                    let gdn_idx = gdn_index;
+                    gdn_index += 1;
                     LayerWeights {
                         kind: LayerKind::Gdn,
-                        // The GDN input projection (m = the GDN feature dim,
+                        // The GDN input projection (m = the GDN feature
+                        // rows — the q / k / v / z parts, `gdn_in_proj_m` —
                         // k = hidden) + the state readout (m = hidden,
-                        // k = the state matrix) — the kernel's (m, k)
-                        // convention (GitHub #33).
+                        // k = the per-token readout width `state_rows`,
+                        // A3 / #30) — the kernel's (m, k) convention
+                        // (GitHub #33).
                         projection: [
-                            nvfp4_weight(gdn_state_dim, config.hidden, seed),
+                            nvfp4_weight(in_proj_m, config.hidden, seed),
                             Nvfp4Weight::empty(),
                             Nvfp4Weight::empty(),
                             Nvfp4Weight::empty(),
                         ],
                         gdn_output: nvfp4_weight(
                             config.hidden,
-                            gdn_state_mat,
+                            config.gdn_readout_k(),
                             seed.wrapping_add(1),
                         ),
                         ffn_gate: nvfp4_weight(
@@ -626,6 +984,19 @@ impl Weights {
                         ),
                         norm_in: ones.clone(),
                         norm_post: ones.clone(),
+                        // The GDN causal-conv weight (the 4 taps × the
+                        // conv channels — the synthetic pattern, A3 / #30).
+                        gdn_conv: Bf16Weight::bf16_weight(4, conv_ch, seed.wrapping_add(8)),
+                        // The a/b projection (the model's `gdn_ab_width`
+                        // rows — 0 for the synthetic model: the step's
+                        // g / beta are 0, A3 / #30).
+                        gdn_ab: Bf16Weight::bf16_weight(config.gdn_ab_width, config.hidden, seed.wrapping_add(9)),
+                        qk_norm: [Vec::new(), Vec::new()],
+                        qkv_bf16: Bf16Weight::empty(),
+                        attn_out_bf16: Bf16Weight::empty(),
+                        gdn_out_bf16: Bf16Weight::empty(),
+                        dev: LayerDeviceSlots::default(),
+                        gdn_index: gdn_idx,
                     }
                 }
             })
@@ -665,23 +1036,44 @@ impl Weights {
     /// GPU deadlock, but the GPU was idle: the stall was this host-side
     /// weight generation).
     pub fn placeholder(config: &ModelConfig) -> Self {
+        let mut gdn_index = 0usize;
         let per_layer = config
             .layer_kinds
             .iter()
-            .map(|kind| LayerWeights {
-                kind: *kind,
-                projection: [
-                    Nvfp4Weight::empty(),
-                    Nvfp4Weight::empty(),
-                    Nvfp4Weight::empty(),
-                    Nvfp4Weight::empty(),
-                ],
-                gdn_output: Nvfp4Weight::empty(),
-                ffn_gate: Nvfp4Weight::empty(),
-                ffn_up: Nvfp4Weight::empty(),
-                ffn_down: Nvfp4Weight::empty(),
-                norm_in: Vec::new(),
-                norm_post: Vec::new(),
+            .map(|kind| {
+                let gdn_idx = if matches!(kind, LayerKind::Gdn) {
+                    let idx = gdn_index;
+                    gdn_index += 1;
+                    idx
+                } else {
+                    0
+                };
+                LayerWeights {
+                    kind: *kind,
+                    projection: [
+                        Nvfp4Weight::empty(),
+                        Nvfp4Weight::empty(),
+                        Nvfp4Weight::empty(),
+                        Nvfp4Weight::empty(),
+                    ],
+                    gdn_output: Nvfp4Weight::empty(),
+                    ffn_gate: Nvfp4Weight::empty(),
+                    ffn_up: Nvfp4Weight::empty(),
+                    ffn_down: Nvfp4Weight::empty(),
+                    norm_in: Vec::new(),
+                    norm_post: Vec::new(),
+                    // The A3 / #30 fields: all empty on the zero-cost
+                    // placeholder (the dev path — the content is the
+                    // synthetic / `from_geometry` construction's).
+                    gdn_conv: Bf16Weight::empty(),
+                    gdn_ab: Bf16Weight::empty(),
+                    qk_norm: [Vec::new(), Vec::new()],
+                    qkv_bf16: Bf16Weight::empty(),
+                    attn_out_bf16: Bf16Weight::empty(),
+                    gdn_out_bf16: Bf16Weight::empty(),
+                    dev: LayerDeviceSlots::default(),
+                    gdn_index: gdn_idx,
+                }
             })
             .collect();
         Self {
@@ -711,23 +1103,53 @@ impl Weights {
     pub fn from_geometry(config: &ModelConfig) -> Self {
         let geometry = WeightsGeometry::from_config(config);
         let ones = to_bf16(&vec![1.0f32; config.hidden as usize]);
+        let head_ones = to_bf16(&vec![1.0f32; config.head_dim as usize]);
+        let mut gdn_index = 0usize;
         let per_layer = geometry
             .per_layer
             .iter()
-            .map(|lg| LayerWeights {
-                kind: lg.kind,
-                projection: [
-                    Nvfp4Weight::geometry_only(lg.projection[0].0, lg.projection[0].1),
-                    Nvfp4Weight::geometry_only(lg.projection[1].0, lg.projection[1].1),
-                    Nvfp4Weight::geometry_only(lg.projection[2].0, lg.projection[2].1),
-                    Nvfp4Weight::geometry_only(lg.projection[3].0, lg.projection[3].1),
-                ],
-                gdn_output: Nvfp4Weight::geometry_only(lg.gdn_output.0, lg.gdn_output.1),
-                ffn_gate: Nvfp4Weight::geometry_only(lg.ffn_gate.0, lg.ffn_gate.1),
-                ffn_up: Nvfp4Weight::geometry_only(lg.ffn_up.0, lg.ffn_up.1),
-                ffn_down: Nvfp4Weight::geometry_only(lg.ffn_down.0, lg.ffn_down.1),
-                norm_in: ones.clone(),
-                norm_post: ones.clone(),
+            .map(|lg| {
+                let gdn_idx = if lg.kind == LayerKind::Gdn {
+                    let idx = gdn_index;
+                    gdn_index += 1;
+                    idx
+                } else {
+                    0
+                };
+                LayerWeights {
+                    kind: lg.kind,
+                    projection: [
+                        Nvfp4Weight::geometry_only(lg.projection[0].0, lg.projection[0].1),
+                        Nvfp4Weight::geometry_only(lg.projection[1].0, lg.projection[1].1),
+                        Nvfp4Weight::geometry_only(lg.projection[2].0, lg.projection[2].1),
+                        Nvfp4Weight::geometry_only(lg.projection[3].0, lg.projection[3].1),
+                    ],
+                    gdn_output: Nvfp4Weight::geometry_only(lg.gdn_output.0, lg.gdn_output.1),
+                    ffn_gate: Nvfp4Weight::geometry_only(lg.ffn_gate.0, lg.ffn_gate.1),
+                    ffn_up: Nvfp4Weight::geometry_only(lg.ffn_up.0, lg.ffn_up.1),
+                    ffn_down: Nvfp4Weight::geometry_only(lg.ffn_down.0, lg.ffn_down.1),
+                    norm_in: ones.clone(),
+                    norm_post: ones.clone(),
+                    // The A3 / #30 fields (the real (m, k) geometry, the
+                    // content is the artifact's normalized buffers — the
+                    // GEMM planes are device-resident (the `dev` slots,
+                    // the `from_artifact` routing), the bf16 buffers are
+                    // host-copied, the norms are identity (the
+                    // `synthetic` convention — a neutral, numerically-
+                    // sane placeholder value)).
+                    gdn_conv: Bf16Weight::geometry_only(lg.gdn_conv.0, lg.gdn_conv.1),
+                    gdn_ab: Bf16Weight::geometry_only(lg.gdn_ab.0, lg.gdn_ab.1),
+                    qk_norm: if lg.qk_norm > 0 {
+                        [head_ones.clone(), head_ones.clone()]
+                    } else {
+                        [Vec::new(), Vec::new()]
+                    },
+                    qkv_bf16: Bf16Weight::empty(),
+                    attn_out_bf16: Bf16Weight::empty(),
+                    gdn_out_bf16: Bf16Weight::empty(),
+                    dev: LayerDeviceSlots::default(),
+                    gdn_index: gdn_idx,
+                }
             })
             .collect();
         Self {
@@ -775,10 +1197,24 @@ struct RequestState {
     /// The GDN recurrent state (per GDN layer): `[num_gdn_layers]
     /// [state_rows][state_cols]` bf16.
     gdn_state: Vec<u16>,
+    /// The GDN causal-conv rolling state (per GDN layer, A3 / #30,
+    /// kernel-abi 06): `[num_gdn_layers][conv_channels][3]` bf16 (the
+    /// 3-tap rolling state s0, s1, s2 per channel — zero until the
+    /// first token).
+    gdn_conv_state: Vec<u16>,
     /// The logical block -> physical page table (`[num_blocks]` i32).
     block_table: Vec<i32>,
     /// The current paged-KV fill (keys placed so far; the GQA seq_len).
     kv_len: u64,
+    /// The sequence position of the next token to place (the RoPE `pos`
+    /// contract, kernel-abi 06: every (batch, seq) token rotates at
+    /// `pos` — the per-token prefill / decode position, A3 / #30).
+    seq_pos: u64,
+    /// The last generated token (the autoregressive decode query — the
+    /// real model threads the actually-generated token back into the next
+    /// step, A3 / #30; `None` until the first decode, a fresh request
+    /// prefills then decodes from the last prompt token).
+    last_generated: Option<TokenId>,
     /// Tokens generated so far (the `max_tokens` / EOS soft-stop counter).
     generated: u32,
     /// The request's `max_tokens` cap (from its prefill `params`).
@@ -794,11 +1230,20 @@ impl RequestState {
         let gdn_mat = (config.gdn_num_layers
             * config.gdn_state_rows
             * config.gdn_state_cols) as usize;
+        // The GDN causal-conv rolling state (A3 / #30): per GDN layer,
+        // the 3-tap rolling state per conv channel (`[channels][3]`,
+        // channel-major — the `ignis_gdn_causal_conv` contract).
+        let conv_state = (config.gdn_num_layers
+            * config.gdn_conv_channels()
+            * 3) as usize;
         Self {
             kv_cache: vec![0u16; kv_plane * 2],
             gdn_state: vec![0u16; gdn_mat],
+            gdn_conv_state: vec![0u16; conv_state],
             block_table: (0..config.num_blocks).map(|b| b as i32).collect(),
             kv_len: 0,
+            seq_pos: 0,
+            last_generated: None,
             generated: 0,
             max_tokens,
         }
@@ -888,6 +1333,13 @@ pub struct CudaCompute {
     /// The captured graph's representative geometry (`None` on a busy/absent
     /// GPU — the eager fallback path, ADR 0006).
     graph_geom: Option<GraphGeometry>,
+    /// The GQA RoPE inverse-frequency table (kernel-abi 06, A3 / #30):
+    /// `inv_freq[pair] = θ^(-2·pair/rotary_dim)` (θ = `rope_theta`,
+    /// `rotary_dim/2` pairs) — computed once at construction (host-side,
+    /// a deterministic table; a non-goal is the per-step table recompute),
+    /// consumed by the `ignis_rope_qk` kernel (the GQA layers' q / k,
+    /// the forward assembly, A3 / #30).
+    rope_inv_freq: Vec<f32>,
     /// The artifact's device context (the #26 fix: the 19 GB of weights stay
     /// in VRAM for the lifetime of the backend). `None` on the synthetic /
     /// dev path.
@@ -925,12 +1377,19 @@ impl CudaCompute {
         } else {
             (None, None)
         };
+        // The GQA RoPE inverse-frequency table (kernel-abi 06, A3 / #30):
+        // computed once at construction (host-side, a deterministic table;
+        // a non-goal is the per-step table recompute), consumed by the
+        // `ignis_rope_qk` kernel (the GQA layers' q / k, the forward
+        // assembly).
+        let rope_inv_freq = rope_inv_frequencies(config.rope_theta, config.rotary_dim as i64);
         Self {
             config,
             weights,
             state: Mutex::new(HashMap::new()),
             graph: Mutex::new(graph),
             graph_geom,
+            rope_inv_freq,
             device_ctx: None,
         }
     }
@@ -944,12 +1403,19 @@ impl CudaCompute {
     /// idle) was NOT the graph check — it was a CPU-side `Weights::synthetic`
     /// OOM trap at the real topology (see [`Weights::placeholder`]).
     pub fn new_eager(config: ModelConfig, weights: Weights) -> Self {
+        // The GQA RoPE inverse-frequency table (kernel-abi 06, A3 / #30):
+        // computed once at construction (host-side, a deterministic table;
+        // a non-goal is the per-step table recompute), consumed by the
+        // `ignis_rope_qk` kernel (the GQA layers' q / k, the forward
+        // assembly).
+        let rope_inv_freq = rope_inv_frequencies(config.rope_theta, config.rotary_dim as i64);
         Self {
             config,
             weights,
             state: Mutex::new(HashMap::new()),
             graph: Mutex::new(None),
             graph_geom: None,
+            rope_inv_freq,
             device_ctx: None,
         }
     }
@@ -1066,14 +1532,15 @@ impl CudaCompute {
         Ok(out)
     }
 
-    /// The logits GEMM (the mixed-quant, A1 / #27): `out = act @ W^T`,
-    /// dispatching on the weight's kernel-expected format (the
-    /// [`HeadWeight`]). The NVFP4 variant (the preserved / device-resident
-    /// path, ADR 0002) uses the kernel-leaf `ignis_nvfp4_gemm_*`; the
-    /// dequantized bf16 variant (the W8 `text/output_head`, ADR 0005
-    /// host-side dequant) uses a host-side scalar bf16 GEMM (the correctness
-    /// floor — the fused bf16 GEMM kernel is kernel-abi 10, the later
-    /// performance material). `act` is a bf16 `[tokens][k]` buffer, the
+    /// The logits GEMM (the mixed-quant, A1 / #27 + A2b / #29):
+    /// `out = act @ W^T`, dispatching on the weight's kernel-expected
+    /// format (the [`HeadWeight`]). The NVFP4 variant (the synthetic /
+    /// device-resident path) uses the kernel-leaf `ignis_nvfp4_gemm_*`;
+    /// the dequantized bf16 variant (the W8 `text/output_head`, ADR 0005
+    /// host-side dequant) uses the kernel-leaf `ignis_bf16_gemm` kernel
+    /// (kernel-abi 10, A2b / #29 — the third 27B-fidelity kernel; the
+    /// host-side scalar fallback is the pre-kernel seam, replaced on the
+    /// real path, A3 / #30). `act` is a bf16 `[tokens][k]` buffer, the
     /// output a bf16 `[tokens][m]`.
     fn head_gemm(
         &self,
@@ -1086,33 +1553,316 @@ impl CudaCompute {
             // path): the kernel-leaf `ignis_nvfp4_gemm_*`.
             HeadWeight::Nvfp4(nv) => self.nvfp4_gemm(nv, act, tokens),
             // The dequantized bf16 GEMM weight (the W8 `text/output_head`,
-            // ADR 0005 host-side dequant): the host-side scalar bf16 GEMM
-            // (the correctness floor — the fused bf16 GEMM kernel is
-            // kernel-abi 10, the later performance material).
+            // ADR 0005 host-side dequant): the kernel-leaf `ignis_bf16_gemm`
+            // (kernel-abi 10, A2b / #29 — the third 27B-fidelity kernel;
+            // the logits path on the real model, A3 / #30).
             HeadWeight::DequantBf16 { data, m, k } => {
-                let m = *m as usize;
-                let k = *k as usize;
-                let tokens = tokens as usize;
-                debug_assert_eq!(
-                    act.len(),
-                    tokens * k,
-                    "activation width must match the weight's input dim (a caller bug)"
-                );
-                let mut out = vec![0u16; tokens * m];
-                for t in 0..tokens {
-                    for o in 0..m {
-                        // out[t][o] = sum_j act[t][j] * W[o][j] (the bf16
-                        // GEMM, `out = act @ W^T`; the scalar FMA floor).
-                        let mut acc = 0.0f32;
-                        for j in 0..k {
-                            acc += bf16_to_f32(act[t * k + j]) * bf16_to_f32(data[o * k + j]);
-                        }
-                        out[t * m + o] = f32_to_bf16(acc);
-                    }
-                }
-                Ok(out)
+                self.bf16_gemm_rows(
+                    data.as_ptr(),
+                    *m,
+                    *k,
+                    0,
+                    *m,
+                    act,
+                    tokens,
+                )
             }
         }
+    }
+
+    /// The bf16 GEMM (`ignis_bf16_gemm`, kernel-abi 10, A2b / #29 — the
+    /// logits path for the W8-dequantized lm_head + the artifact's BF16
+    /// tensors): `out[tokens][m] = sum_k act[tokens][k] * W[m][k]`.
+    /// `wt` is the row-major `[m][k]` bf16 plane (row 0), the GEMM
+    /// consumes the row slice `[row_off, row_off + m_slice)` (the fused
+    /// tensor's per-slot slices, A3 / #30 — the q / k / v slots of the
+    /// fused qkvz plane, the gate / up slots of the fused `mlp/gate_up`).
+    fn bf16_gemm_rows(
+        &self,
+        wt: *const u16,
+        m: u64,
+        k: u64,
+        row_off: u64,
+        m_slice: u64,
+        act: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
+        debug_assert_eq!(
+            act.len(),
+            (tokens as usize) * (k as usize),
+            "activation width must match the weight's input dim (a caller bug)"
+        );
+        debug_assert!(
+            row_off + m_slice <= m,
+            "the slot slice must fit within the plane"
+        );
+        // The row slice's plane offset (row-major `[m][k]` bf16: a row is
+        // `k` bf16 words).
+        let wt_ptr = unsafe { wt.add((row_off as usize) * (k as usize)) };
+        let mut out = vec![0u16; (tokens as usize) * (m_slice as usize)];
+        let rc = unsafe {
+            ffi::ignis_bf16_gemm(
+                act.as_ptr() as *const c_void,
+                wt_ptr as *const c_void,
+                std::ptr::null(),
+                out.as_mut_ptr() as *mut c_void,
+                tokens as i64,
+                m_slice as i64,
+                k as i64,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(out)
+    }
+
+    /// The bf16 GEMM over a [`Bf16Weight`] (the artifact's preserved BF16
+    /// tensor — the `gdn/a_b_projection` / the BF16-exception projections,
+    /// A3 / #30).
+    fn bf16_gemm(
+        &self,
+        w: &Bf16Weight,
+        row_off: u64,
+        m_slice: u64,
+        act: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
+        self.bf16_gemm_rows(
+            w.data.as_ptr(),
+            w.m,
+            w.k,
+            row_off,
+            m_slice,
+            act,
+            tokens,
+        )
+    }
+
+    /// The NVFP4 GEMM with a DEVICE-RESIDENT plane (the artifact's
+    /// materialized arena, ADR 0002 — the `ignis_nvfp4_gemm_*_device`
+    /// kernels, ticket 26 / GitHub #26: no per-call weight H2D, the #26
+    /// fix). `plane` is the artifact's fused tensor's planes (the
+    /// `Nvfp4DevicePlane`, the `from_artifact` routing, A3 / #30); the
+    /// GEMM consumes the row slice `[row_off, row_off + m_slice)` (the
+    /// slot's rows within the fused plane — the q / k / v slots of the
+    /// qkvz plane, the gate / up slots of the `mlp/gate_up` plane).
+    /// `act` is a bf16 `[tokens][k]` buffer (host, H2D'd), the output a
+    /// bf16 `[tokens][m_slice]` (D2H'd).
+    fn nvfp4_gemm_device(
+        &self,
+        plane: &Nvfp4DevicePlane,
+        row_off: u64,
+        m_slice: u64,
+        act: &[u16],
+        tokens: u64,
+    ) -> Result<Vec<u16>, ComputeError> {
+        let k = plane.k as usize;
+        debug_assert_eq!(
+            act.len(),
+            (tokens as usize) * k,
+            "activation width must match the plane's input dim (a caller bug)"
+        );
+        debug_assert!(
+            row_off + m_slice <= plane.m,
+            "the slot slice must fit within the plane"
+        );
+        // The row slice's plane offsets (the planes are the artifact's
+        // `[m][k/2]` / `[m][k/16]` layout — the "for now" row-major
+        // starting point, ADR 0005).
+        let codes_ptr = unsafe { plane.codes.add((row_off as usize) * (k / 2)) };
+        let scales_ptr = unsafe { plane.scales.add((row_off as usize) * (k / 16)) };
+        let mut out = vec![0u16; (tokens as usize) * (m_slice as usize)];
+        let rc = if tokens == 1 {
+            // The single-token GEMV (the decode case, ADR 0001): the
+            // kernel-leaf `ignis_nvfp4_gemm_decode_device`.
+            unsafe {
+                ffi::ignis_nvfp4_gemm_decode_device(
+                    act.as_ptr() as *const c_void,
+                    codes_ptr as *const c_void,
+                    scales_ptr as *const c_void,
+                    std::ptr::null(),
+                    out.as_mut_ptr() as *mut c_void,
+                    m_slice as i64,
+                    plane.k as i64,
+                    std::ptr::null_mut(),
+                )
+            }
+        } else {
+            // The multi-token GEMM (kernel-abi 05): the kernel-leaf
+            // `ignis_nvfp4_gemm_prefill_device`.
+            unsafe {
+                ffi::ignis_nvfp4_gemm_prefill_device(
+                    act.as_ptr() as *const c_void,
+                    codes_ptr as *const c_void,
+                    scales_ptr as *const c_void,
+                    std::ptr::null(),
+                    out.as_mut_ptr() as *mut c_void,
+                    tokens as i64,
+                    m_slice as i64,
+                    plane.k as i64,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(out)
+    }
+
+    /// The GDN causal conv (`ignis_gdn_causal_conv`, kernel-abi 06, A2 /
+    /// #28 — the GDN layer's input, A3 / #30): the 4-tap depthwise causal
+    /// conv + SiLU over the projected q / k / v rows (the conv'd part of
+    /// the GDN input projection — the z rows bypass it). `w` is the
+    /// `[4][channels]` tap-major conv weight (the artifact's
+    /// `gdn/convolution`); `state_in` / `state_out` are the per-layer
+    /// rolling 3-tap state (`[channels][3]`, channel-major — the
+    /// `state_out` receives the updated state). `projected` is the
+    /// conv'd part of the input projection (`[channels]` bf16, a
+    /// single-token step), the output the conv'd + SiLU'd rows.
+    fn gdn_causal_conv(
+        &self,
+        w: &Bf16Weight,
+        projected: &[u16],
+        state_in: &[u16],
+        state_out: &mut [u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let ch = w.k as usize;
+        debug_assert_eq!(
+            w.m,
+            4,
+            "the GDN causal conv has 4 taps (the artifact's gdn/convolution)"
+        );
+        debug_assert_eq!(
+            projected.len(),
+            ch,
+            "the conv'd part must be the conv channel count"
+        );
+        debug_assert_eq!(
+            state_in.len(),
+            ch * 3,
+            "the rolling conv state is [channels][3]"
+        );
+        debug_assert_eq!(
+            state_out.len(),
+            ch * 3,
+            "the rolling conv state is [channels][3]"
+        );
+        debug_assert!(
+            !w.data.is_empty(),
+            "the GDN layer needs a causal-conv weight (the artifact's gdn/convolution)"
+        );
+        let mut out = vec![0u16; ch];
+        let rc = unsafe {
+            ffi::ignis_gdn_causal_conv(
+                projected.as_ptr() as *const c_void,
+                w.data.as_ptr() as *const c_void,
+                state_in.as_ptr() as *const c_void,
+                state_out.as_mut_ptr() as *mut c_void,
+                out.as_mut_ptr() as *mut c_void,
+                1, // tokens = 1 (the single-token step; the multi-token
+                   // prefill is B1, A3 / #30).
+                ch as i64,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(out)
+    }
+
+    /// The GQA RoPE (`ignis_rope_qk`, kernel-abi 06, A2 / #28 — the GQA
+    /// layers' q / k, A3 / #30): the split-half NeoX rotation of the first
+    /// `rotary_dim` dims of each q / k head (in-place on `q` / `k`), at
+    /// the token's sequence position `pos` (the per-token `pos` contract —
+    /// every (batch, seq) token rotates at `pos`, the multi-token prefill
+    /// is per-token, kernel-abi 06). `q` is bf16 `[num_q_heads][head_dim]`
+    /// (batch = 1, seq = 1), `k` is bf16 `[num_kv_heads][head_dim]`.
+    fn rope_qk(&self, q: &mut [u16], k: &mut [u16], pos: u64) -> Result<(), ComputeError> {
+        let cfg = &self.config;
+        debug_assert_eq!(
+            q.len(),
+            (cfg.num_q_heads as usize) * (cfg.head_dim as usize),
+            "the q plane must be [num_q_heads][head_dim]"
+        );
+        debug_assert_eq!(
+            k.len(),
+            (cfg.num_kv_heads as usize) * (cfg.head_dim as usize),
+            "the k plane must be [num_kv_heads][head_dim]"
+        );
+        let rc = unsafe {
+            ffi::ignis_rope_qk(
+                q.as_mut_ptr() as *mut c_void,
+                k.as_mut_ptr() as *mut c_void,
+                self.rope_inv_freq.as_ptr() as *const c_void,
+                1, // batch = 1
+                1, // seq = 1 (the single-token step)
+                cfg.num_q_heads as i64,
+                cfg.num_kv_heads as i64,
+                cfg.head_dim as i64,
+                cfg.rotary_dim as i64,
+                pos as i32,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(())
+    }
+
+    /// The q / k RMSNorm (the `ignis_rmsnorm`, kernel-abi 02 — the
+    /// per-head RMSNorm, the reference's `qk_norm` step, A3 / #30):
+    /// `out = (x / rms(x)) * weight` over each head's `head_dim` slice.
+    /// `weight` is the `[head_dim]` per-head RMSNorm weight (the
+    /// artifact's `attention/query_norm` / `key_norm`); an empty
+    /// `weight` is a parameter-free RMS (a null weight, the synthetic /
+    /// no-weight convention).
+    fn per_head_rmsnorm(
+        &self,
+        x: &[u16],
+        num_heads: u64,
+        weight: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let hd = self.config.head_dim as usize;
+        debug_assert_eq!(
+            x.len(),
+            (num_heads as usize) * hd,
+            "the q / k plane must be [num_heads][head_dim]"
+        );
+        let weight_ptr = if weight.is_empty() {
+            std::ptr::null()
+        } else {
+            debug_assert_eq!(
+                weight.len(),
+                hd,
+                "the q / k RMSNorm weight is [head_dim] (the per-head norm)"
+            );
+            weight.as_ptr() as *const c_void
+        };
+        let mut out = x.to_vec();
+        for h in 0..num_heads as usize {
+            let xs = &x[h * hd..(h + 1) * hd];
+            let os = &mut out[h * hd..(h + 1) * hd];
+            let rc = unsafe {
+                ffi::ignis_rmsnorm(
+                    xs.as_ptr() as *const c_void,
+                    weight_ptr,
+                    std::ptr::null(),
+                    os.as_mut_ptr() as *mut c_void,
+                    hd as i64,
+                    0.0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != 0 {
+                return Err(ComputeError::Kernel(rc));
+            }
+        }
+        Ok(out)
     }
 
     /// The RMSNorm (`ignis_rmsnorm`, the kernel-leaf pointwise op):
@@ -1231,22 +1981,27 @@ impl CudaCompute {
         let hid = cfg.hidden as usize;
         let seq = job.tokens.len();
         // Run the layer stack over the prompt (the GQA layers warm the KV
-        // cache; the GDN layers warm the GDN state). The multi-token FFN
-        // projections use `ignis_nvfp4_gemm_prefill` (the multi-token
-        // NVFP4 GEMM, kernel-abi 05).
+        // cache — the rotated k / v; the GDN layers warm the GDN state +
+        // the rolling conv state). Per-token (the RoPE `pos` contract —
+        // the multi-token prefill is B1, A3 / #30).
         let mut acc = vec![0u16; hid];
         for pos in 0..seq {
             let h_in = &emb[pos * hid..(pos + 1) * hid];
             acc = self.forward_layers(job.request, h_in)?;
         }
-        // The prefill is complete (the KV + GDN state are warm); the last
-        // token's hidden state (`acc`) is the decode starting point.
+        // The prefill is complete (the KV + GDN state + the conv state
+        // are warm); the decode query is the last prompt token (the
+        // autoregressive decode — the real model threads the actually-
+        // generated token back into the next step, A3 / #30).
         self.state
             .lock()
             .unwrap()
             .get_mut(&job.request)
             .map(|s| {
                 s.kv_len = (seq as u64).min(cfg.num_blocks * cfg.block_size);
+                if let Some(last) = job.tokens.last() {
+                    s.last_generated = Some(*last);
+                }
             });
         let _ = acc; // the decode query is the lm-head GEMM input (below).
         Ok(())
@@ -1254,29 +2009,46 @@ impl CudaCompute {
 
     /// The compute-adapter's decode step: generate one token per lane (the
     /// `decode_step` seam, `scheduler.rs`). A request that reaches
-    /// `max_tokens` / EOS soft-stops (a per-job `None`, not a fault).
+    /// `max_tokens` / EOS soft-stops (a per-job `None`, not a fault). The
+    /// decode query is the autoregressive one (A3 / #30): the last
+    /// generated token (the prefill's last prompt token on the first
+    /// decode, the previous decode's token thereafter) — the real model
+    /// threads the actually-generated token back into the next step.
     fn decode(&self, job: &DecodeJob) -> Result<Option<TokenId>, ComputeError> {
         let cfg = &self.config;
         // Ensure the request's state (the scheduler always prefills before
         // decoding; a missing state is a caller bug).
         self.ensure_state(job.request, job.params.max_tokens);
-        // The current token (the last generated; a fresh request uses 0).
-        let cur = self.last_token(job.request);
+        // The decode query: the last generated token (the autoregressive
+        // decode, A3 / #30 — the prefill's last prompt token on the first
+        // decode, the previous decode's token thereafter; a fresh
+        // request without a prefill uses 0).
+        let cur = self
+            .state
+            .lock()
+            .unwrap()
+            .get(&job.request)
+            .and_then(|s| s.last_generated)
+            .unwrap_or(0);
         // Embed the current token (the decode query; the single-token case).
         let ids = vec![cur as i32];
         let emb = self.embed(&ids)?;
         let h_in = &emb[..cfg.hidden as usize];
         // The layer stack over the current token.
         let mut acc = self.forward_layers(job.request, h_in)?;
-        // The final RMSNorm + the lm-head GEMM (the logits) + the greedy
+        // The final RMSNorm + the lm-head GEMM (the logits — the real
+        // path is the `ignis_bf16_gemm` kernel, A2b / #29) + the greedy
         // sample (the deterministic token, ADR 0007).
         acc = self.rmsnorm(&acc, &self.weights.final_norm)?;
         let logits = self.head_gemm(&self.weights.lm_head, &acc, 1)?;
         let token = self.sample(&bf16_to_f32s(&logits))?;
         // The soft-stop: the request reached `max_tokens` / EOS.
+        // The autoregressive bookkeeping: the generated token threads
+        // into the next decode step's query (A3 / #30).
         let stop = {
-            let st = self.state.lock().unwrap();
-            let s = st.get(&job.request).ok_or(ComputeError::Kernel(-1))?;
+            let mut st = self.state.lock().unwrap();
+            let s = st.get_mut(&job.request).ok_or(ComputeError::Kernel(-1))?;
+            s.last_generated = Some(token);
             let mt = s.max_tokens.or(job.params.max_tokens);
             s.generated + 1 >= mt.unwrap_or(u32::MAX)
         };
@@ -1290,44 +2062,228 @@ impl CudaCompute {
         Ok(if stop { None } else { Some(token) })
     }
 
-    /// The request's last generated token (the decode query; a fresh
-    /// request uses token 0). A deterministic placeholder (the synthetic
-    /// model); a real model carries the generated-token stream.
-    fn last_token(&self, request: RequestId) -> TokenId {
-        let st = self.state.lock().unwrap();
-        match st.get(&request) {
-            Some(s) if s.generated > 0 => {
-                (request.wrapping_mul(0x9E37_79B9).wrapping_add((s.generated - 1) as u64))
-                    .wrapping_rem(self.config.vocab) as u32
-            }
-            _ => 0,
+    /// The per-token GDN state readout (the host-side GEMV, the "for now"
+    /// readout, ADR 0005): `y[dv] = sum_d S[dv][d] · k[d]` (the current
+    /// key's `S^T k` readout, f32 precision — the ported `ignis_gdn_step`
+    /// contract updates the state, it does not emit a readout; the caller
+    /// assembles it, A3 / #30). `state` is the updated per-layer state
+    /// (`[state_rows][state_cols]` bf16), `k` is the conv'd key part
+    /// (`[state_cols]` bf16).
+    fn state_readout(state: &[u16], k: &[u16]) -> Vec<f32> {
+        let cols = k.len();
+        let rows = state.len() / cols;
+        let k_f: Vec<f32> = k.iter().map(|&v| bf16_to_f32(v)).collect();
+        (0..rows)
+            .map(|dv| {
+                let row = &state[dv * cols..dv * cols + cols];
+                row.iter().zip(k_f.iter()).map(|(s, kf)| bf16_to_f32(*s) * kf).sum()
+            })
+            .collect()
+    }
+
+    /// The GQA q / k / v projection GEMMs (A3 / #30 — the GEMM dispatch):
+    /// the fused NVFP4 device plane (the `from_artifact` routing — the
+    /// artifact's `attention/query_key_gate_value`, the slot's row slice) /
+    /// the BF16-exception plane (the artifact's early GQA layers, A1's
+    /// `QKGV_BF16_LAYERS`) / the synthetic host `Nvfp4Weight` (the
+    /// separate per-slot weights). `slot` is 0 (q), 1 (k), 2 (v) — the
+    /// slot's row slice within the fused plane (q: 0, k: `gqa_width`,
+    /// v: `gqa_width + gqa_kv_width`).
+    fn gqa_proj(
+        &self,
+        lw: &LayerWeights,
+        slot: u64,
+        pre: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        let (row_off, m) = match slot {
+            0 => (0, cfg.gqa_width()),
+            1 => (cfg.gqa_width(), cfg.gqa_kv_width()),
+            _ => (cfg.gqa_width() + cfg.gqa_kv_width(), cfg.gqa_kv_width()),
+        };
+        if let Some(plane) = lw.dev.qkv {
+            return self.nvfp4_gemm_device(&plane, row_off, m, pre, 1);
         }
+        if !lw.qkv_bf16.data.is_empty() {
+            return self.bf16_gemm(&lw.qkv_bf16, row_off, m, pre, 1);
+        }
+        // The synthetic / dev path: the separate per-slot host weights
+        // (no slice — the synthetic q / k / v are individual weights).
+        self.nvfp4_gemm(&lw.projection[slot as usize], pre, 1)
+    }
+
+    /// The GQA output projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// the NVFP4 device plane (the artifact's `attention/output`, m =
+    /// `hidden`, k = `gqa_width`) / the BF16-exception plane (the early
+    /// GQA layers, A1's `ATTENTION_OUT_BF16_LAYERS`) / the synthetic host
+    /// `Nvfp4Weight`.
+    fn gqa_out_gemm(
+        &self,
+        lw: &LayerWeights,
+        attn_out: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        if let Some(plane) = lw.dev.attn_out {
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, attn_out, 1);
+        }
+        if !lw.attn_out_bf16.data.is_empty() {
+            return self.bf16_gemm(&lw.attn_out_bf16, 0, cfg.hidden, attn_out, 1);
+        }
+        self.nvfp4_gemm(&lw.projection[3], attn_out, 1)
+    }
+
+    /// The GDN input projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// the NVFP4 device plane (the artifact's `gdn/query_key_value_z`,
+    /// the q / k / v / z rows, m = `gdn_in_proj_m`) / the synthetic host
+    /// `Nvfp4Weight`.
+    fn gdn_in_gemm(&self, lw: &LayerWeights, pre: &[u16]) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        if let Some(plane) = lw.dev.gdn_in {
+            return self.nvfp4_gemm_device(&plane, 0, cfg.gdn_in_proj_m(), pre, 1);
+        }
+        self.nvfp4_gemm(&lw.projection[0], pre, 1)
+    }
+
+    /// The GDN state readout GEMM (A3 / #30 — the GEMM dispatch): the
+    /// NVFP4 device plane (the artifact's `gdn/output`, m = `hidden`, k =
+    /// the readout width `state_rows`) / the BF16-exception plane (the
+    /// layer-4 quirk, A1's `GDN_OUT_BF16_LAYERS`) / the synthetic host
+    /// `Nvfp4Weight`.
+    fn gdn_out_gemm(
+        &self,
+        lw: &LayerWeights,
+        gated: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        if let Some(plane) = lw.dev.gdn_out {
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, gated, 1);
+        }
+        if !lw.gdn_out_bf16.data.is_empty() {
+            return self.bf16_gemm(&lw.gdn_out_bf16, 0, cfg.hidden, gated, 1);
+        }
+        self.nvfp4_gemm(&lw.gdn_output, gated, 1)
+    }
+
+    /// The gated-FFN gate / up projection GEMMs (A3 / #30 — the GEMM
+    /// dispatch): the fused NVFP4 device plane (the artifact's
+    /// `mlp/gate_up` — the gate slot is row 0, the up slot is
+    /// `ffn_intermediate` within the fused plane) / the synthetic host
+    /// `Nvfp4Weight`s (the separate gate / up weights).
+    fn ffn_gemm(
+        &self,
+        lw: &LayerWeights,
+        is_up: bool,
+        post: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        if let Some(plane) = lw.dev.mlp_gate_up {
+            let row_off = if is_up { cfg.ffn_intermediate } else { 0 };
+            return self.nvfp4_gemm_device(&plane, row_off, cfg.ffn_intermediate, post, 1);
+        }
+        if is_up {
+            self.nvfp4_gemm(&lw.ffn_up, post, 1)
+        } else {
+            self.nvfp4_gemm(&lw.ffn_gate, post, 1)
+        }
+    }
+
+    /// The gated-FFN down projection GEMM (A3 / #30 — the GEMM dispatch):
+    /// the NVFP4 device plane (the artifact's `mlp/down`, m = `hidden`,
+    /// k = `ffn_intermediate`) / the synthetic host `Nvfp4Weight`.
+    fn ffn_down_gemm(
+        &self,
+        lw: &LayerWeights,
+        act: &[u16],
+    ) -> Result<Vec<u16>, ComputeError> {
+        let cfg = &self.config;
+        if let Some(plane) = lw.dev.mlp_down {
+            return self.nvfp4_gemm_device(&plane, 0, cfg.hidden, act, 1);
+        }
+        self.nvfp4_gemm(&lw.ffn_down, act, 1)
     }
 
     /// Run the layer stack (GQA / GDN + gated-FFN, the compute-adapter's
     /// core) over one token's hidden state `h_in` (bf16), returning the
-    /// next-layer hidden state (bf16). Composes the kernel-leaf primitives
-    /// (GEMM, GQA, GDN, norms) + the pointwise glue (residual, gated-SiLU,
+    /// residual stream after the layer stack (bf16 — the next layer's /
+    /// the lm-head's input; the final RMSNorm is the caller's, the
+    /// decode step's lm-head input, A3 / #30). Composes the kernel-leaf
+    /// primitives (GEMM, GQA, GDN, the GDN causal conv, the GQA RoPE,
+    /// the norms — A3 / #30) + the pointwise glue (residual, gated-SiLU,
     /// the correctness floor, ADR 0005).
+    ///
+    /// The per-layer stack (the full-correct assembly, spec 07):
+    /// - **GQA layer:** the QKV projection (the NVFP4 GEMM) → the q / k
+    ///   RMSNorm (`ignis_rmsnorm`, the per-head, the
+    ///   `attention/query_norm` / `key_norm` weights) + the RoPE
+    ///   (`ignis_rope_qk`, the GQA layers' q / k at the token's sequence
+    ///   position) → the GQA attention (`ignis_gqa_attention_decode`,
+    ///   the paged KV) → the output projection (the NVFP4 GEMM) → the
+    ///   residual.
+    /// - **GDN layer:** the input projection (the NVFP4 GEMM, the
+    ///   `gdn/query_key_value_z` q / k / v / z rows) → the GDN causal
+    ///   conv (`ignis_gdn_causal_conv`, the conv'd q / k / v part — the
+    ///   z rows bypass it) → the GDN a / b (gate / beta) projection (the
+    ///   bf16 GEMM, the `gdn/a_b_projection`) → the GDN step
+    ///   (`ignis_gdn_step`, the Gated-DeltaNet recurrence — the
+    ///   per-layer state update) → the state readout (the host-side `S^T
+    ///   k` GEMV, the "for now" readout, ADR 0005) gated by the z part →
+    ///   the output projection (the NVFP4 GEMM, the `gdn/output`) → the
+    ///   residual.
+    /// - **FFN (every layer):** the gate / up projections (the NVFP4
+    ///   GEMM, the fused `mlp/gate_up`) → the gated SiLU (the host
+    ///   pointwise glue, ADR 0005) → the down projection (the NVFP4
+    ///   GEMM, `mlp/down`) → the residual.
     fn forward_layers(&self, request: RequestId, h_in: &[u16]) -> Result<Vec<u16>, ComputeError> {
         let cfg = &self.config;
         let mut acc: Vec<u16> = h_in.to_vec();
-        // Hold the state lock for the layer loop (the GDN state + the KV
-        // cache are mutated in place; no re-locking, no deadlock).
+        // Hold the state lock for the layer loop (the GDN state, the GDN
+        // conv state, + the KV cache are mutated in place; no
+        // re-locking, no deadlock).
         let mut st = self.state.lock().unwrap();
         let req_state = st.get_mut(&request).ok_or(ComputeError::Kernel(-1))?;
         for lw in self.weights.per_layer.iter() {
-            // ── attention block ─────────────────────────────────────────
+            // ── attention block ─────────────────────────────────
+            // The pre-attention RMSNorm (Qwen pre-norm: the attention /
+            // FFN blocks operate on the normalized residual stream —
+            // the real model's `input_norm` weight, the identity in the
+            // synthetic convention, A3 / #30).
+            let pre = if lw.norm_in.is_empty() {
+                acc.clone()
+            } else {
+                self.rmsnorm(&acc, &lw.norm_in)?
+            };
             let attn: Vec<u16> = match lw.kind {
                 LayerKind::Gqa => {
-                    // q/k/v projections (GEMV) + the GQA attention (the
-                    // kernel-leaf `ignis_gqa_attention_decode`) + the
+                    // The QKV projection (the NVFP4 GEMM — the fused
+                    // device plane / the BF16-exception plane / the
+                    // synthetic host plane, A3 / #30) + the q / k RMSNorm
+                    // (the per-head, A3 / #30) + the RoPE (the GQA
+                    // layer's q / k at the token's sequence position,
+                    // A3 / #30) + the GQA attention (the kernel-leaf
+                    // `ignis_gqa_attention_decode`, the paged KV) + the
                     // output projection.
-                    let q = self.nvfp4_gemm(&lw.projection[0], h_in, 1)?;
-                    let k = self.nvfp4_gemm(&lw.projection[1], h_in, 1)?;
-                    let v = self.nvfp4_gemm(&lw.projection[2], h_in, 1)?;
-                    // Store k/v into the paged KV cache (the GQA layer's
-                    // block-table addressing, ADR 0001).
+                    let q = self.gqa_proj(lw, 0, &pre)?;
+                    let k = self.gqa_proj(lw, 1, &pre)?;
+                    let v = self.gqa_proj(lw, 2, &pre)?;
+                    // The q / k RMSNorm (the per-head — the real model's
+                    // `attention/query_norm` / `key_norm` weights, a
+                    // parameter-free RMS when empty, A3 / #30) + the
+                    // RoPE (the GQA layer's q / k, the split-half NeoX
+                    // rotation at the token's sequence position, A3 /
+                    // #30).
+                    let q = self.per_head_rmsnorm(&q, cfg.num_q_heads, &lw.qk_norm[0])?;
+                    let k = self.per_head_rmsnorm(&k, cfg.num_kv_heads, &lw.qk_norm[1])?;
+                    // The RoPE (the GQA layer's q / k — the split-half NeoX
+                    // rotation at the token's sequence position, in-place
+                    // on q / k, A3 / #30).
+                    let mut q = q;
+                    let mut k = k;
+                    let pos = req_state.seq_pos;
+                    self.rope_qk(&mut q, &mut k, pos)?;
+                    // Store k / v into the paged KV cache (the GQA
+                    // layer's block-table addressing, ADR 0001) — the
+                    // rotated k (the cache holds the rotated keys; the
+                    // attention's queries are rotated at the same `pos`).
                     self.store_kv(req_state, &k, &v);
                     let qk = cfg.gqa_width() as usize;
                     let mut attn_out = vec![0u16; qk];
@@ -1351,24 +2307,84 @@ impl CudaCompute {
                         return Err(ComputeError::Kernel(rc));
                     }
                     // The attention output projection (GQA_width -> hidden).
-                    self.nvfp4_gemm(&lw.projection[3], &attn_out, 1)?
+                    self.gqa_out_gemm(lw, &attn_out)?
                 }
                 LayerKind::Gdn => {
-                    // GDN: the input projection (hidden -> GDN feature) +
-                    // the GDN step (the kernel-leaf `ignis_gdn_step`, the
-                    // Gated-DeltaNet recurrence) + the state -> output
-                    // projection (the recurrent-state readout).
-                    let feat = self.nvfp4_gemm(&lw.projection[0], h_in, 1)?;
-                    // The GDN step: reads the current state, writes the
-                    // updated state (the recurrent-state update).
-                    let mut state_out = req_state.gdn_state.clone();
+                    // GDN: the input projection (the NVFP4 GEMM — the
+                    // `gdn/query_key_value_z` q / k / v / z rows, A3 /
+                    // #30) + the GDN causal conv (the kernel-leaf
+                    // `ignis_gdn_causal_conv`, the conv'd q / k / v part
+                    // — the z rows bypass it, A3 / #30) + the GDN a / b
+                    // (gate / beta) projection (the bf16 GEMM, the
+                    // `gdn/a_b_projection`, A3 / #30) + the GDN step
+                    // (the kernel-leaf `ignis_gdn_step`, the
+                    // Gated-DeltaNet recurrence, the per-layer state
+                    // update) + the state readout (the host-side `S^T k`
+                    // GEMV, the "for now" readout, ADR 0005) gated by
+                    // the z part + the state -> output projection (the
+                    // recurrent-state readout GEMM, the `gdn/output`).
+                    let feat = self.gdn_in_gemm(lw, &pre)?;
+                    // The GDN causal conv (the kernel-leaf
+                    // `ignis_gdn_causal_conv`, kernel-abi 06, A2 / #28 —
+                    // the GDN layer's input, A3 / #30): the 4-tap
+                    // depthwise causal conv + SiLU over the conv'd q / k
+                    // / v part (the z rows bypass it, the kernel's
+                    // contract), the rolling 3-tap state per layer.
+                    let conv_ch = cfg.gdn_conv_channels() as usize;
+                    let conv_base = (lw.gdn_index * conv_ch * 3) as usize;
+                    let conv_state_in =
+                        &req_state.gdn_conv_state[conv_base..conv_base + conv_ch * 3];
+                    let mut conv_state_out = vec![0u16; conv_ch * 3];
+                    let conv_out = self.gdn_causal_conv(
+                        &lw.gdn_conv,
+                        &feat[..conv_ch],
+                        conv_state_in,
+                        &mut conv_state_out,
+                    )?;
+                    // Commit the updated rolling conv state (in-place;
+                    // the next token's conv reads the updated state).
+                    req_state
+                        .gdn_conv_state[conv_base..conv_base + conv_ch * 3]
+                        .copy_from_slice(&conv_state_out);
+                    // The GDN a / b (gate / beta) projection (the bf16
+                    // GEMM — the artifact's `gdn/a_b_projection`, the
+                    // first half is the gate `a`, the second the beta
+                    // `b`; 0 when the model has no a / b projection, the
+                    // step's g / beta are 0, A3 / #30).
+                    let ab = if lw.gdn_ab.m > 0 {
+                        self.bf16_gemm(&lw.gdn_ab, 0, lw.gdn_ab.m, &pre, 1)?
+                    } else {
+                        Vec::new()
+                    };
+                    // The GDN step's feature x = [k, v, g, beta] (the
+                    // conv'd k / v parts + the a / b's gate / beta — the
+                    // `ignis_gdn_step` contract, kernel-abi 01).
+                    let cols = cfg.gdn_state_cols as usize;
+                    let rows = cfg.gdn_state_rows as usize;
+                    let q_w = cfg.gdn_q_width as usize;
+                    let mut x = vec![0u16; cfg.gdn_state_dim() as usize];
+                    x[..cols].copy_from_slice(&conv_out[q_w..q_w + cols]);
+                    x[cols..cols + rows]
+                        .copy_from_slice(&conv_out[q_w + cols..q_w + cols + rows]);
+                    if !ab.is_empty() {
+                        x[cols + rows] = ab[0]; // the gate (a) — the first half.
+                        x[cols + rows + 1] = ab[ab.len() / 2]; // the beta (b) — the second half.
+                    }
+                    // The GDN step (the kernel-leaf `ignis_gdn_step`, the
+                    // Gated-DeltaNet recurrence — the per-layer state
+                    // update, A3 / #30: this layer's state slice, the
+                    // flat-ABI per-layer semantics).
+                    let state_mat = rows * cols;
+                    let state_base = (lw.gdn_index * state_mat) as usize;
+                    let state_in = &req_state.gdn_state[state_base..state_base + state_mat];
+                    let mut state_out = vec![0u16; state_mat];
                     let rc = unsafe {
                         ffi::ignis_gdn_step(
-                            feat.as_ptr() as *const c_void,
-                            req_state.gdn_state.as_ptr() as *const c_void,
+                            x.as_ptr() as *const c_void,
+                            state_in.as_ptr() as *const c_void,
                             state_out.as_mut_ptr() as *mut c_void,
                             1, // batch = 1
-                            cfg.gdn_num_layers as i64,
+                            1, // num_gdn_layers = 1 (this layer's state slice)
                             cfg.gdn_state_rows as i64,
                             cfg.gdn_state_cols as i64,
                             cfg.gdn_state_dim() as i64,
@@ -1378,30 +2394,59 @@ impl CudaCompute {
                     if rc != 0 {
                         return Err(ComputeError::Kernel(rc));
                     }
-                    // Commit the updated GDN state (in-place; the next step
-                    // reads the updated state).
-                    req_state.gdn_state = state_out;
-                    // The GDN state -> output projection (the readout; the
-                    // fused readout kernel is the later performance
-                    // material, ADR 0005).
-                    self.nvfp4_gemm(&lw.gdn_output, &req_state.gdn_state, 1)?
+                    // Commit the updated GDN state (in-place; the next
+                    // step reads the updated state).
+                    req_state
+                        .gdn_state[state_base..state_base + state_mat]
+                        .copy_from_slice(&state_out);
+                    // The state readout (the per-token readout `y[dv] =
+                    // sum_d S[dv][d] · k[d]` — the host-side GEMV, the
+                    // "for now" readout, ADR 0005: the ported step's
+                    // contract updates the state, it does not emit a
+                    // readout) + the z (output-gate) part of the input
+                    // projection (the z rows bypass the conv, they gate
+                    // the readout, A3 / #30).
+                    let k_part = &conv_out[q_w..q_w + cols];
+                    let readout = Self::state_readout(&state_out, k_part);
+                    let gated: Vec<u16> = if cfg.gdn_z_width > 0 {
+                        let z_w = cfg.gdn_z_width as usize;
+                        let z = &feat[conv_ch..conv_ch + z_w];
+                        readout
+                            .iter()
+                            .zip(z.iter())
+                            .map(|(y, z)| f32_to_bf16(*y * bf16_to_f32(*z)))
+                            .collect()
+                    } else {
+                        readout.iter().map(|&y| f32_to_bf16(y)).collect()
+                    };
+                    // The GDN state -> output projection (the readout;
+                    // the fused readout kernel is the later performance
+                    // material, ADR 0005, the GEMM dispatch, A3 / #30).
+                    self.gdn_out_gemm(lw, &gated)?
                 }
             };
             // The residual (host pointwise glue, the correctness floor).
             Self::residual(&mut acc, &attn);
-            // The post-attention RMSNorm (`ignis_rmsnorm`).
-            let post = self.rmsnorm(&acc, &lw.norm_post)?;
-            // ── the gated-FFN block (gate/up GEMV + the fused-SiLU
-            // activation (host pointwise, ADR 0005) + the down GEMV) ─────
-            let gate = self.nvfp4_gemm(&lw.ffn_gate, &post, 1)?;
-            let up = self.nvfp4_gemm(&lw.ffn_up, &post, 1)?;
+            // The post-attention RMSNorm (`ignis_rmsnorm` — the FFN's
+            // input, the pre-norm convention, A3 / #30).
+            let post = if lw.norm_post.is_empty() {
+                acc.clone()
+            } else {
+                self.rmsnorm(&acc, &lw.norm_post)?
+            };
+            // ── the gated-FFN block (gate / up GEMV + the gated-SiLU
+            // activation (host pointwise, ADR 0005) + the down GEMV) ───
+            let gate = self.ffn_gemm(lw, false, &post)?;
+            let up = self.ffn_gemm(lw, true, &post)?;
             let act = Self::silu_mul(&up, &gate);
-            let ffn_out = self.nvfp4_gemm(&lw.ffn_down, &act, 1)?;
+            let ffn_out = self.ffn_down_gemm(lw, &act)?;
             Self::residual(&mut acc, &ffn_out);
+            // This token has been consumed: the sequence position
+            // advances (the RoPE `pos` contract, A3 / #30).
+            req_state.seq_pos += 1;
         }
-        // The pre-final RMSNorm (`ignis_rmsnorm`) — the next layer's (or
-        // the lm-head's) input.
-        let acc = self.rmsnorm(&acc, &self.weights.final_norm)?;
+        // The final RMSNorm is the caller's (the decode step's lm-head
+        // input, A3 / #30).
         drop(st);
         Ok(acc)
     }
@@ -1455,24 +2500,34 @@ impl std::fmt::Debug for CudaCompute {
 #[cfg(feature = "cuda")]
 impl CudaCompute {
     /// Construct a compute backend from a `.ninfer` artifact (the
-    /// production path): open the container (ADR 0002), materialize the
-    /// model to the `CudaDevice` (VRAM), and build the backend eagerly
-    /// (`new_eager` — no startup graph check / CUDA-graph capture; the
-    /// graph fast path is #25, the 99%-gate).
+    /// production path, A3 / #30): open the container (ADR 0002),
+    /// materialize the model to the `CudaDevice` (VRAM), route the real
+    /// normalized tensors into the `Weights` (the full-correct forward
+    /// assembly — the NVFP4 GEMM planes stay device-resident (the
+    /// `*_device` kernels, no per-call H2D, the #26 fix), the BF16
+    /// tensors are host-copied (the bounded text-scope copy — the
+    /// artifact's `gdn/convolution` + `gdn/a_b_projection` + the
+    /// norms + the BF16-exception projections), the W8 endpoints are
+    /// the A1 host-side dequants (the embedding table + the lm_head)),
+    /// and build the backend eagerly (`new_eager` — no startup graph
+    /// check / CUDA-graph capture; the graph fast path is #25's 99%-gate
+    /// material).
     ///
-    /// **Documented gap (the full-correct 27B forward pass, ADR 0007 /
-    /// bench-03):** a *sane* real-model completion additionally needs the
-    /// GDN short causal convolution, RoPE on the GQA projections, and the
-    /// full mixed-quant dequant of every artifact tensor (NVFP4 / BF16 / W8
-    /// / Q4-Q5) to the kernel formats — the host-side (or fused-kernel)
-    /// work the 99% gate drives. The seam (this constructor + the forward
-    /// pass) is complete; the Qwen 3.8-27B weight routing (every
-    /// `text/layers/{i}` tensor -> a `Weights` field) is the follow-up.
+    /// The forward pass (the `forward_layers` assembly, A3 / #30) runs
+    /// the *real* model (the `qwen38_27b` topology — the 16 GQA + 48
+    /// GDN layers, the real head geometry + the GDN state dims + the
+    /// rotary geometry): the GDN layers' causal conv + the GQA layers'
+    /// q / k RMSNorm + RoPE (kernel-abi 06, A2 / #28), the bf16 logits
+    /// GEMM (kernel-abi 10, A2b / #29), and the device-resident NVFP4
+    /// routing (the #26 `_device` surface) — the numerically-correct
+    /// forward pass (the correctness floor, ADR 0005: a *sane*,
+    /// reproducible output — the "for now" ported kernels, re-implemented
+    /// later, ADR 0005 / 0007).
     pub fn from_artifact(
         path: &std::path::Path,
         model: &str,
     ) -> Result<Self, ComputeError> {
-        use ignis_artifact::{Binder, CudaDevice, Object, materialize};
+        use ignis_artifact::{Binding, Binder, CudaDevice, Object, materialize};
         // Open + read the container (ADR 0002: the binder must consume every
         // object — an unconsumed object is a load failure).
         let reader =
@@ -1514,26 +2569,161 @@ impl CudaCompute {
         let artifact = materialize(&reader, &plan, &mut device, None)
             .map_err(|_| ComputeError::Kernel(-1))?;
 
-        // The crash fix: the real model's topology (no synthetic fallback, so
-        // the embedding table has the real vocab and a real tokenizer's ids
-        // never index out of bounds — the `illegal memory access`).
-        // The #27 A1 normalization seam: the `from_artifact` `Weights` are the
-        // real normalized buffers (spec 04 criterion 3) — the two W8 text-
-        // scope endpoints (`text/token_embedding` + the `text/output_head`)
-        // are host-dequantized to bf16 (ADR 0005, ~5 GB) and routed into the
-        // `Weights` (the embedding table + the lm_head), while the NVFP4 GEMM
-        // planes stay device-resident (the `from_geometry`'s geometry-only
-        // content — not host-copied, the #26 lesson: no host weight explosion
-        // on the load path; the whole-text-scope copy is A3's, #30).
-        // `Weights::synthetic` with this topology is infeasible (~1.6 TiB of
-        // generated host vectors: 48 GDN layers × ~30 GiB of `gdn_output`
-        // E2M1 codes) — the E2E test stalled after the 19 GB H2D and
-        // OOM-aborted (the #26 "hang", a CPU-side trap that looked like a
-        // GPU deadlock).
+        // The crash fix: the real model's topology (no synthetic fallback,
+        // so the embedding table has the real vocab and a real tokenizer's
+        // ids never index out of bounds — the `illegal memory access`).
+        // The #27 A1 normalization seam: the `from_artifact` `Weights` are
+        // the real normalized buffers (spec 04 criterion 3) — the two W8
+        // text-scope endpoints (`text/token_embedding` + the
+        // `text/output_head`) are host-dequantized to bf16 (ADR 0005,
+        // ~5 GB) and routed into the `Weights` (the embedding table + the
+        // lm_head), while the NVFP4 GEMM planes stay device-resident
+        // (the `from_geometry`'s geometry-only content — not host-copied,
+        // the #26 lesson: no host weight explosion on the load path).
+        // The A3 / #30 assembly: the full-correct forward routing — the
+        // per-layer GEMM slots are routed to the artifact's real tensors
+        // (the NVFP4 fused tensors' device planes via the `*_device`
+        // kernels, the BF16 tensors host-copied — the artifact's
+        // directory facts, A1's inventory: the early GQA layers'
+        // `attention/query_key_gate_value` + `attention/output` are
+        // BF16, the layer-4 `gdn/output` quirk, the GDN layers'
+        // `gdn/convolution` + `gdn/a_b_projection` + the norms).
         let config = ModelConfig::qwen38_27b();
         let endpoints =
             dequant_w8_endpoints(&reader).map_err(|_| ComputeError::Kernel(-1))?;
-        let weights = Weights::from_geometry(&config).with_w8_endpoints(endpoints);
+        let mut weights = Weights::from_geometry(&config).with_w8_endpoints(endpoints);
+        // The artifact's device views (the NVFP4 planes' raw pointers,
+        // the `Nvfp4DevicePlane`'s routing, A3 / #30) + the host-side
+        // reads (the BF16 tensors' bounded copies — the container's
+        // mmap'd bytes, the `Reader`'s payload spans, ADR 0002).
+        let binding = Binding::new(&reader, &artifact);
+        // The per-layer routing (the A1 inventory's directory facts —
+        // layer `i` is GQA iff `(i + 1) % 4 == 0`, the model constant).
+        for (i, lw) in weights.per_layer.iter_mut().enumerate() {
+            let prefix = format!("text/layers/{i}/");
+            if (i + 1) % 4 == 0 {
+                // ── the GQA layer: the fused qkvz + the output
+                // projections (the NVFP4 device plane / the BF16
+                // exception — the A1 inventory's directory facts,
+                // A3 / #30).
+                let qkv_name = format!("{prefix}attention/query_key_gate_value");
+                match binding.nvfp4(&qkv_name) {
+                    Ok(v) => lw.dev.qkv = Some(Nvfp4DevicePlane {
+                        codes: v.code,
+                        scales: v.scale,
+                        m: v.rows,
+                        k: v.cols,
+                    }),
+                    // The BF16-exception (the early GQA layers — the
+                    // A1 inventory's `QKGV_BF16_LAYERS`): the host copy
+                    // (the `ignis_bf16_gemm` kernel, A2b / #29).
+                    Err(_) => {
+                        lw.qkv_bf16 =
+                            Self::host_bf16_matrix(&reader, &qkv_name)?;
+                    }
+                }
+                let out_name = format!("{prefix}attention/output");
+                match binding.nvfp4(&out_name) {
+                    Ok(v) => lw.dev.attn_out = Some(Nvfp4DevicePlane {
+                        codes: v.code,
+                        scales: v.scale,
+                        m: v.rows,
+                        k: v.cols,
+                    }),
+                    // The BF16-exception (the early GQA layers — the
+                    // A1 inventory's `ATTENTION_OUT_BF16_LAYERS`).
+                    Err(_) => {
+                        lw.attn_out_bf16 =
+                            Self::host_bf16_matrix(&reader, &out_name)?;
+                    }
+                }
+                // The q / k RMSNorm weights (the artifact's
+                // `attention/query_norm` + `attention/key_norm`, the
+                // per-head `[head_dim]` bf16, A3 / #30).
+                let qn = format!("{prefix}attention/query_norm");
+                let kn = format!("{prefix}attention/key_norm");
+                let q_norm = Self::host_bf16_vector(&reader, &qn)?;
+                let k_norm = Self::host_bf16_vector(&reader, &kn)?;
+                lw.qk_norm = [q_norm, k_norm];
+            } else {
+                // ── the GDN layer: the input projection (the NVFP4
+                // `gdn/query_key_value_z`) + the causal conv + the a / b
+                // (gate / beta) projection + the state readout (the
+                // NVFP4 / the layer-4 BF16 quirk, A3 / #30).
+                let in_name = format!("{prefix}gdn/query_key_value_z");
+                match binding.nvfp4(&in_name) {
+                    Ok(v) => lw.dev.gdn_in = Some(Nvfp4DevicePlane {
+                        codes: v.code,
+                        scales: v.scale,
+                        m: v.rows,
+                        k: v.cols,
+                    }),
+                    Err(_) => {
+                        return Err(ComputeError::Kernel(-1));
+                    }
+                }
+                let out_name = format!("{prefix}gdn/output");
+                match binding.nvfp4(&out_name) {
+                    Ok(v) => lw.dev.gdn_out = Some(Nvfp4DevicePlane {
+                        codes: v.code,
+                        scales: v.scale,
+                        m: v.rows,
+                        k: v.cols,
+                    }),
+                    // The layer-4 quirk (the A1 inventory's
+                    // `GDN_OUT_BF16_LAYERS`): the host copy.
+                    Err(_) => {
+                        lw.gdn_out_bf16 =
+                            Self::host_bf16_matrix(&reader, &out_name)?;
+                    }
+                }
+                // The GDN causal-conv weight (the artifact's
+                // `gdn/convolution`, bf16 `[4][channels]` tap-major,
+                // A3 / #30).
+                let conv_name = format!("{prefix}gdn/convolution");
+                lw.gdn_conv  = Self::host_bf16_matrix(&reader, &conv_name)?;
+                // The GDN a / b (gate / beta) projection (the artifact's
+                // `gdn/a_b_projection`, bf16 `[ab][hidden]`, A3 / #30).
+                let ab_name = format!("{prefix}gdn/a_b_projection");
+                lw.gdn_ab  = Self::host_bf16_matrix(&reader, &ab_name)?;
+            }
+            // The per-layer RMSNorm weights (the artifact's
+            // `input_norm` / `post_attention_norm`, bf16 `[hidden]`,
+            // A3 / #30).
+            lw.norm_in = Self::host_bf16_vector(&reader, &format!("{prefix}input_norm"))?;
+            lw.norm_post =
+                Self::host_bf16_vector(&reader, &format!("{prefix}post_attention_norm"))?;
+            // The fused FFN gate+up projection (the NVFP4 device plane —
+            // the gate / up slots are row slices, A3 / #30).
+            let gate_up = format!("{prefix}mlp/gate_up");
+            match binding.nvfp4(&gate_up) {
+                Ok(v) => lw.dev.mlp_gate_up = Some(Nvfp4DevicePlane {
+                    codes: v.code,
+                    scales: v.scale,
+                    m: v.rows,
+                    k: v.cols,
+                }),
+                Err(_) => {
+                    return Err(ComputeError::Kernel(-1));
+                }
+            }
+            // The FFN down projection (the NVFP4 device plane, A3 / #30).
+            let down = format!("{prefix}mlp/down");
+            match binding.nvfp4(&down) {
+                Ok(v) => lw.dev.mlp_down = Some(Nvfp4DevicePlane {
+                    codes: v.code,
+                    scales: v.scale,
+                    m: v.rows,
+                    k: v.cols,
+                }),
+                Err(_) => {
+                    return Err(ComputeError::Kernel(-1));
+                }
+            }
+        }
+        // The final-norm weight (the artifact's `text/final_norm`, bf16
+        // `[hidden]`, A3 / #30).
+        weights.final_norm = Self::host_bf16_vector(&reader, "text/final_norm")?;
         // The #26 fix: the eager path (no kernel-leaf startup check / CUDA
         // graph capture) — the CUDA-graph fast path is #25 (the 99%-gate)
         // material, not the scoped #26. (The observed "hang" after the H2D
@@ -1550,6 +2740,65 @@ impl CudaCompute {
         });
         let _ = model;
         Ok(compute)
+    }
+
+    /// The artifact's host-side bf16 copy of a rank-2 tensor (A3 / #30):
+    /// the container's raw bf16 bytes (the `contiguous-le-v1` layout,
+    /// row-major `[m][k]` bf16 words) copied to the host (the bounded
+    /// text-scope copy — the BF16-exception projections + the GDN conv /
+    /// a-b tensors + the norms; the `ignis_bf16_gemm` kernel, A2b / #29,
+    /// consumes the host buffers). `name`'s shape is `[m][k]` (the
+    /// artifact's directory, ADR 0002).
+    fn host_bf16_matrix(reader: &Reader, name: &str) -> Result<Bf16Weight, ComputeError> {
+        use ignis_artifact::{NumericFormat, Object};
+        let tensor = reader
+            .find(name)
+            .ok_or(ComputeError::Kernel(-1))?;
+        let tensor = match tensor {
+            Object::Tensor(t) => t,
+            Object::Resource(_) => return Err(ComputeError::Kernel(-1)),
+        };
+        if tensor.format != NumericFormat::Bf16 || tensor.shape.len() != 2 {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let (m, k) = (tensor.shape[0], tensor.shape[1]);
+        let span = reader.payload(name).map_err(|_| ComputeError::Kernel(-1))?;
+        if span.data.len() != (m * k * 2) as usize {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let mut data = vec![0u16; (m * k) as usize];
+        for i in 0..data.len() {
+            data[i] = u16::from_le_bytes([span.data[2 * i], span.data[2 * i + 1]]);
+        }
+        Ok(Bf16Weight { data, m, k })
+    }
+
+    /// The artifact's host-side bf16 copy of a rank-1 vector (A3 / #30):
+    /// the norm weights (`input_norm` / `post_attention_norm` /
+    /// `text/final_norm` / the q / k RMSNorm weights — the artifact's
+    /// bf16 `[width]` vectors, the `contiguous-le-v1` layout).
+    fn host_bf16_vector(reader: &Reader, name: &str) -> Result<Vec<u16>, ComputeError> {
+        use ignis_artifact::{NumericFormat, Object};
+        let tensor = reader
+            .find(name)
+            .ok_or(ComputeError::Kernel(-1))?;
+        let tensor = match tensor {
+            Object::Tensor(t) => t,
+            Object::Resource(_) => return Err(ComputeError::Kernel(-1)),
+        };
+        if tensor.format != NumericFormat::Bf16 || tensor.shape.len() != 1 {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let n = tensor.shape[0] as usize;
+        let span = reader.payload(name).map_err(|_| ComputeError::Kernel(-1))?;
+        if span.data.len() != n * 2 {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let mut data = vec![0u16; n];
+        for i in 0..n {
+            data[i] = u16::from_le_bytes([span.data[2 * i], span.data[2 * i + 1]]);
+        }
+        Ok(data)
     }
 }
 
@@ -1617,6 +2866,32 @@ mod tests {
         assert_eq!(cfg.gdn_state_cols, 2048);
         assert_eq!(cfg.gdn_num_layers, 48);
         assert_eq!(cfg.block_size, 64);
+        // The A3 / #30 real-model geometry: the GDN input projection's
+        // q / z / a-b parts (the artifact's `gdn/query_key_value_z`
+        // layout — q 2048 + k 2048 + v 6144 + z 6144 = 16 384 rows, the
+        // `gdn/a_b_projection` is 96 rows), the rotary geometry (the
+        // GQA RoPE — `rotary_dim` 64 of `head_dim` 256, θ = 1e7,
+        // kernel-abi 06, A2 / #28).
+        assert_eq!(cfg.gdn_q_width, 2048, "the GDN q part (the GDN q rows)");
+        assert_eq!(cfg.gdn_z_width, 6144, "the GDN z (output-gate) part");
+        assert_eq!(cfg.gdn_ab_width, 96, "the GDN a / b (gate / beta) projection (48 a + 48 b)");
+        assert_eq!(cfg.rotary_dim, 64, "the GQA rotary dim (64 of 256)");
+        assert_eq!(cfg.rope_theta, 1e7, "the RoPE base θ (1e7)");
+        // The derived A3 / #30 geometry: the GDN in-projection rows
+        // (q + k + v + z), the conv channels (q + k + v), the state
+        // readout width (state_rows), the RoPE pair count.
+        assert_eq!(
+            cfg.gdn_in_proj_m(),
+            16_384,
+            "the GDN in-projection (16 384 rows = q + k + v + z)"
+        );
+        assert_eq!(
+            cfg.gdn_conv_channels(),
+            10_240,
+            "the GDN conv channels (10 240 = q + k + v)"
+        );
+        assert_eq!(cfg.gdn_readout_k(), 6144, "the GDN readout width (state_rows)");
+        assert_eq!(cfg.rope_pairs(), 32, "the RoPE pair count (rotary_dim / 2)");
         // 16 GQA + 48 GDN layers (layer i is GQA iff (i + 1) % 4 == 0).
         let gqa = cfg.layer_kinds.iter().filter(|k| **k == LayerKind::Gqa).count();
         let gdn = cfg.layer_kinds.iter().filter(|k| **k == LayerKind::Gdn).count();
@@ -1638,6 +2913,136 @@ mod tests {
             "the artifact path must use the real vocab (248 320), not the synthetic 256"
         );
         assert_ne!(real.num_layers, synth.num_layers);
+    }
+
+    /// (A3 / #30, spec 07 acceptance criterion 4) the full layer-stack
+    /// composition: a synthetic-model CPU test verifying the GQA + GDN +
+    /// FFN layer composition (the causal conv + the RoPE + the q / k
+    /// RMSNorm + the a / b projection are on the *right* layers — the
+    /// GDN layers' conv / a-b, the GQA layers' q / k norms + RoPE — and
+    /// the per-layer GEMM geometry matches the config). The runtime
+    /// *call* of the conv / RoPE / qk-norm primitives is exercised by
+    /// the GPU e2e test (`kernel_abi04_gpu`, ADR 0006 — the CPU cannot
+    /// launch kernels); this pins the composition + the geometry at the
+    /// weights level (CPU-runnable, the "conv + RoPE are called for the
+    /// right layers, the geometry matches" acceptance).
+    #[test]
+    fn full_stack_synthetic_composition() {
+        let cfg = ModelConfig::synthetic(); // [Gdn, Gqa] — both layer kinds
+        let w = Weights::synthetic(&cfg, 1);
+        let (gdn, gqa) = (&w.per_layer[0], &w.per_layer[1]);
+        assert_eq!(gdn.kind, LayerKind::Gdn);
+        assert_eq!(gqa.kind, LayerKind::Gqa);
+        // ── the GDN layer: the causal conv + the a / b projection are
+        // GDN-only (the conv'd q / k / v part — the z rows bypass it).
+        assert!(
+            !gdn.gdn_conv.data.is_empty(),
+            "the GDN layer carries the causal-conv weight (4 taps × the conv channels)"
+        );
+        assert_eq!(gdn.gdn_conv.m, 4, "the conv has 4 taps (the artifact's gdn/convolution)");
+        assert_eq!(
+            gdn.gdn_conv.k,
+            cfg.gdn_conv_channels(),
+            "the conv channels = the conv'd q / k / v part (the z rows bypass it)"
+        );
+        assert_eq!(
+            gdn.gdn_ab.m,
+            cfg.gdn_ab_width,
+            "the a / b projection width (0 for the synthetic model — the step's g / beta are 0)"
+        );
+        // The GDN layer has no q / k RMSNorm (the GQA-only op, A3 / #30).
+        assert!(
+            gdn.qk_norm[0].is_empty() && gdn.qk_norm[1].is_empty(),
+            "the GDN layer has no q / k RMSNorm"
+        );
+        // The GDN layer's per-layer index (the state / conv-state slice,
+        // the request state's per-layer planes).
+        assert_eq!(gdn.gdn_index, 0, "the synthetic model's single GDN layer is index 0");
+        // ── the GQA layer: the q / k RMSNorm + the RoPE geometry are
+        // GQA-only (the causal conv / the a / b are GDN-only).
+        assert!(
+            gqa.gdn_conv.data.is_empty(),
+            "the GQA layer has no causal conv (the GDN-only op)"
+        );
+        assert_eq!(gqa.gdn_ab.m, 0, "the GQA layer has no a / b projection");
+        assert_eq!(
+            gqa.qk_norm[0].len(),
+            cfg.head_dim as usize,
+            "the GQA q RMSNorm weight is [head_dim] (the per-head norm)"
+        );
+        assert_eq!(
+            gqa.qk_norm[1].len(),
+            cfg.head_dim as usize,
+            "the GQA k RMSNorm weight is [head_dim] (the per-head norm)"
+        );
+        // ── the RoPE geometry: the inv-freq table = `rotary_dim / 2`
+        // pairs (the kernel's `ignis_rope_qk` contract, A3 / #30).
+        let freqs = rope_inv_frequencies(cfg.rope_theta, cfg.rotary_dim as i64);
+        assert_eq!(
+            freqs.len(),
+            cfg.rope_pairs() as usize,
+            "the RoPE inv-freq table has `rotary_dim / 2` pairs"
+        );
+        // ── the per-layer GEMM geometry (config-driven, A3 / #30):
+        // GDN: the in-projection (m = the q/k/v/z feature rows, k =
+        // hidden) + the state readout (m = hidden, k = the readout
+        // width `state_rows`); GQA: q / k / v + the output projection.
+        assert_eq!(
+            (gdn.projection[0].m, gdn.projection[0].k),
+            (cfg.gdn_in_proj_m(), cfg.hidden),
+            "the GDN in-projection geometry (m = the feature rows, k = hidden)"
+        );
+        assert_eq!(
+            (gdn.gdn_output.m, gdn.gdn_output.k),
+            (cfg.hidden, cfg.gdn_readout_k()),
+            "the GDN state readout geometry (m = hidden, k = the readout width)"
+        );
+        assert_eq!(
+            (gqa.projection[0].m, gqa.projection[0].k),
+            (cfg.gqa_width(), cfg.hidden),
+            "the GQA q projection geometry (m = the q width, k = hidden)"
+        );
+        assert_eq!(
+            (gqa.projection[1].m, gqa.projection[1].k),
+            (cfg.gqa_kv_width(), cfg.hidden),
+            "the GQA k projection geometry (m = the kv width, k = hidden)"
+        );
+        assert_eq!(
+            (gqa.projection[3].m, gqa.projection[3].k),
+            (cfg.hidden, cfg.gqa_width()),
+            "the GQA output projection geometry (m = hidden, k = the q width)"
+        );
+        // The real-model geometry matches `qwen38_27b` (the 27B
+        // topology's per-layer A3 geometry — the `weights_geometry_
+        // matches_27b_topology` test pins it; here: the synthetic and
+        // the real share the *same* per-layer-kind geometry *rule* —
+        // the conv / a-b / qk-norm are present exactly for the right
+        // layer kind).
+        let real = ModelConfig::qwen38_27b();
+        let g = WeightsGeometry::from_config(&real);
+        let real_gdn = g.per_layer.iter().find(|l| l.kind == LayerKind::Gdn).unwrap();
+        let real_gqa = g.per_layer.iter().find(|l| l.kind == LayerKind::Gqa).unwrap();
+        assert_eq!(
+            real_gdn.gdn_conv,
+            (4, real.gdn_conv_channels()),
+            "the 27B GDN conv geometry (4 taps × 10 240 channels)"
+        );
+        assert_eq!(
+            real_gdn.gdn_ab,
+            (real.gdn_ab_width, real.hidden),
+            "the 27B GDN a / b projection geometry (96 × 5 120)"
+        );
+        assert_eq!(real_gqa.qk_norm, real.head_dim, "the 27B GQA q / k RMSNorm width (256)");
+        assert_eq!(
+            real_gdn.gdn_in_proj,
+            (real.gdn_in_proj_m(), real.hidden),
+            "the 27B GDN in-projection (16 384 × 5 120)"
+        );
+        assert_eq!(
+            real_gdn.gdn_output,
+            (real.hidden, real.gdn_readout_k()),
+            "the 27B GDN state readout (5 120 × 6 144)"
+        );
     }
 
     /// (GitHub #33) The kernel's GEMM convention (m = output rows, k = input
@@ -1667,6 +3072,14 @@ mod tests {
             gdn_state_rows: 24,
             gdn_state_cols: 16,
             gdn_num_layers: 1,
+            // The A3 / #30 geometry: no GDN q / z / a-b parts (the
+            // synthetic in-projection is the k / v / g / beta feature
+            // directly), the RoPE geometry (rotary_dim 8 of 16, θ = 1e7).
+            gdn_q_width: 0,
+            gdn_z_width: 0,
+            gdn_ab_width: 0,
+            rotary_dim: 8,
+            rope_theta: 1e7,
             ffn_intermediate: 32,
             block_size: 4,
             num_blocks: 8,
@@ -1674,16 +3087,18 @@ mod tests {
         // ── the synthetic weights (the content + the (m, k) geometry) ──
         let w = Weights::synthetic(&cfg, 1);
         let (gdn, gqa) = (&w.per_layer[0], &w.per_layer[1]);
-        // GDN: the input projection (m = the GDN feature dim, k = hidden) +
-        // the state readout (m = hidden, k = the state matrix).
+        // GDN: the input projection (m = the GDN feature rows — the
+        // q / k / v / z parts, `gdn_in_proj_m` — k = hidden) + the state
+        // readout (m = hidden, k = the per-token readout width
+        // `state_rows`, A3 / #30).
         assert_eq!(
             (gdn.projection[0].m, gdn.projection[0].k),
-            (cfg.gdn_state_dim(), cfg.hidden),
+            (cfg.gdn_in_proj_m(), cfg.hidden),
             "the GDN input projection (m = output, k = input)"
         );
         assert_eq!(
             (gdn.gdn_output.m, gdn.gdn_output.k),
-            (cfg.hidden, cfg.gdn_state_mat()),
+            (cfg.hidden, cfg.gdn_readout_k()),
             "the GDN state readout (m = output, k = input)"
         );
         // GQA: q / k / v map hidden -> the head widths (m = output,
@@ -1754,8 +3169,45 @@ mod tests {
         // ── the geometry derivation (the artifact path, `from_config`) ──
         let g = WeightsGeometry::from_config(&cfg);
         let (gl, gw) = (&g.per_layer[0], &g.per_layer[1]);
-        assert_eq!(gl.gdn_output, (cfg.hidden, cfg.gdn_state_mat()));
-        assert_eq!(gl.projection[0], (cfg.gdn_state_dim(), cfg.hidden));
+        // The GDN state readout (m = hidden, k = the per-token readout
+        // width `state_rows`) + the input projection (m = the GDN feature
+        // rows — the q / k / v / z parts, `gdn_in_proj_m` — k = hidden),
+        // A3 / #30.
+        assert_eq!(gl.gdn_output, (cfg.hidden, cfg.gdn_readout_k()));
+        assert_eq!(gl.projection[0], (cfg.gdn_in_proj_m(), cfg.hidden));
+        // The A3 / #30 geometry: the GDN causal-conv (m = 4 taps,
+        // k = the conv channels), the a / b projection (0 when the
+        // model has no a-b), the GQA q / k RMSNorm width (`head_dim`),
+        // the conv channel count + the in-projection (m, k).
+        assert_eq!(
+            gl.gdn_conv,
+            (4, cfg.gdn_conv_channels()),
+            "the GDN causal-conv geometry (4 taps × the conv channels)"
+        );
+        assert_eq!(
+            gl.gdn_ab,
+            (0, 0),
+            "no a / b projection (gdn_ab_width = 0) — (0, 0)"
+        );
+        assert_eq!(gl.qk_norm, 0, "the GDN layer has no q / k RMSNorm");
+        assert_eq!(
+            gl.gdn_conv_channels,
+            cfg.gdn_conv_channels(),
+            "the GDN conv channel count"
+        );
+        assert_eq!(
+            gl.gdn_in_proj,
+            (cfg.gdn_in_proj_m(), cfg.hidden),
+            "the GDN input-projection (m, k)"
+        );
+        assert_eq!(
+            gw.qk_norm,
+            cfg.head_dim,
+            "the GQA q / k RMSNorm weights are [head_dim] each"
+        );
+        assert_eq!(gw.gdn_conv, (0, 0), "the GQA layer has no GDN conv");
+        assert_eq!(gw.gdn_conv_channels, 0, "the GQA layer has no conv");
+        assert_eq!(gw.gdn_in_proj, (0, 0), "the GQA layer has no GDN in-proj");
         assert_eq!(
             gw.projection,
             [
@@ -1841,24 +3293,66 @@ mod tests {
         let gqa = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa).count();
         let gdn = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn).count();
         assert_eq!((gqa, gdn), (16, 48), "the 27B layer-kind mix");
-        // Every GDN layer's state readout (m = hidden, k = state_mat =
-        // 6144*2048) + input projection (m = the GDN step's feature dim,
-        // k = hidden) — the forward pass's (m, k) contract (m = output
-        // rows, k = input dim, the kernel convention, GitHub #33).
+        // Every GDN layer's state readout (m = hidden, k = the per-token readout
+        // width `state_rows` = 6144 — the artifact's `gdn/output` shape
+        // `[hidden][state_rows]`, A3 / #30) + the input projection
+        // (m = the GDN feature rows — the q / k / v / z parts,
+        // `gdn_in_proj_m` = 16 384 — k = hidden — the artifact's
+        // `gdn/query_key_value_z` shape, A3 / #30) — the forward pass's
+        // (m, k) contract (m = output rows, k = input dim, the kernel
+        // convention, GitHub #33).
         for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn) {
-            assert_eq!(lg.gdn_output, (cfg.hidden, cfg.gdn_state_mat()));
-            assert_eq!(lg.projection[0], (cfg.gdn_state_dim(), cfg.hidden));
+            assert_eq!(
+                lg.gdn_output,
+                (cfg.hidden, cfg.gdn_readout_k()),
+                "the GDN state readout (m = hidden, k = the readout width state_rows)"
+            );
+            assert_eq!(
+                lg.projection[0],
+                (cfg.gdn_in_proj_m(), cfg.hidden),
+                "the GDN input projection (m = the q/k/v/z feature rows, k = hidden)"
+            );
             assert_eq!(lg.projection[1], (0, 0), "the unused GDN slots are (0, 0)");
+            // The A3 / #30 GDN geometry: the causal-conv (4 taps × the
+            // conv channels — the artifact's `gdn/convolution`), the a / b
+            // (gate / beta) projection (the `gdn/a_b_projection`), the
+            // conv channel count, the in-projection (m, k).
+            assert_eq!(
+                lg.gdn_conv,
+                (4, cfg.gdn_conv_channels()),
+                "the GDN causal-conv geometry (4 taps × the conv channels)"
+            );
+            assert_eq!(
+                lg.gdn_ab,
+                (cfg.gdn_ab_width, cfg.hidden),
+                "the GDN a / b (gate / beta) projection (m = ab rows, k = hidden)"
+            );
+            assert_eq!(
+                lg.gdn_conv_channels,
+                cfg.gdn_conv_channels(),
+                "the GDN conv channel count"
+            );
+            assert_eq!(
+                lg.gdn_in_proj,
+                (cfg.gdn_in_proj_m(), cfg.hidden),
+                "the GDN in-projection (m, k)"
+            );
         }
         // The GQA layers' projections (the `synthetic`'s (m, k) convention:
         // q / k / v map hidden -> the head widths (m = output, k = input);
         // the output projection maps gqa_width -> hidden (m = hidden,
         // k = gqa_width) — the kernel's (m, k) orientation, GitHub #33).
+        // + the A3 / #30 GQA geometry (the q / k RMSNorm width =
+        // `head_dim`, the artifact's `attention/query_norm` /
+        // `attention/key_norm` shape).
         for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa) {
             assert_eq!(lg.projection[3], (cfg.hidden, cfg.gqa_width()));
             assert_eq!(lg.ffn_gate, (cfg.ffn_intermediate, cfg.hidden));
             assert_eq!(lg.ffn_down, (cfg.hidden, cfg.ffn_intermediate));
             assert_eq!(lg.norm_in, cfg.hidden);
+            assert_eq!(lg.qk_norm, cfg.head_dim, "the GQA q / k RMSNorm width (head_dim)");
+            assert_eq!(lg.gdn_conv, (0, 0), "the GQA layer has no GDN conv");
+            assert_eq!(lg.gdn_in_proj, (0, 0), "the GQA layer has no GDN in-proj");
         }
         // The `from_artifact` path's `Weights` (via `from_geometry`) carry
         // this same geometry (the non-zero (m, k), the sized norms) — the
@@ -1892,11 +3386,19 @@ mod tests {
         for lw in &w.per_layer {
             match lw.kind {
                 LayerKind::Gdn => {
-                    // The state readout (m = hidden, k = the state matrix) —
-                    // the kernel's (m, k) orientation (GitHub #33).
+                    // The state readout (m = hidden, k = the per-token
+                    // readout width `state_rows` — A3 / #30) + the
+                    // input projection (m = the GDN feature rows,
+                    // `gdn_in_proj_m`, k = hidden) — the kernel's
+                    // (m, k) orientation (GitHub #33).
                     assert_eq!(
                         (lw.gdn_output.m, lw.gdn_output.k),
-                        (cfg.hidden, cfg.gdn_state_mat())
+                        (cfg.hidden, cfg.gdn_readout_k())
+                    );
+                    assert_eq!(
+                        (lw.projection[0].m, lw.projection[0].k),
+                        (cfg.gdn_in_proj_m(), cfg.hidden),
+                        "the GDN input projection (m = output, k = input)"
                     );
                     assert!(
                         lw.gdn_output.codes.is_empty(),
