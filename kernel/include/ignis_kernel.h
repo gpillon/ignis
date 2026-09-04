@@ -187,18 +187,20 @@ int ignis_greedy_sample(const void *logits, void *out, int64_t batch,
  * ------------------------------------------------------------------------ */
 
 /* (1) The GDN causal conv. `projected` is bf16 [tokens][channels] (the
- * projected q/k/v+z, the GEMM output; the `z` rows are NOT part of
- * `channels` — they bypass the conv entirely); `conv_weight` is bf16
+ * GEMM output over the query+key+value rows); `conv_weight` is bf16
  * [4][channels] (the 4 taps w0..w3, tap-major — the artifact's
  * `gdn/convolution` tensor {4, channels}); `state_in` / `state_out` are
  * bf16 [channels][3] (the 3-tap rolling conv state s0,s1,s2 per channel,
  * channel-major; `state_out` receives the updated state — the last 3
  * consumed taps — and `state_in` may alias `state_out`); `out` is bf16
- * [tokens][channels] (the conv'd + SiLU'd q/k/v). channels = the GDN
- * feature width (the query+key+value rows — NVFP4 10240 = 2048q+2048k+
- * 6144v in the full model; one thread per channel, the 3-tap rolling
- * state s0,s1,s2 + the current tap w3·p, the SiLU epilogue). stream:
- * null = stream 0. Returns 0 on success, -1 on error. */
+ * [tokens][channels] (the conv'd + SiLU'd q/k/v). The z-row contract:
+ * `channels` covers q+k+v only (NVFP4 10240 = 2048q+2048k+6144v in the
+ * full model); the `z` rows are a separate GEMM output assembled by the
+ * caller and never pass through the conv (they bypass it entirely — no
+ * z-size parameter exists in this ABI, and a caller feeding a
+ * z-inclusive width would convolve those rows). One thread per channel:
+ * the 3-tap rolling state s0,s1,s2 + the current tap w3·p, the SiLU
+ * epilogue. stream: null = stream 0. Returns 0 on success, -1 on error. */
 int ignis_gdn_causal_conv(const void *projected, const void *conv_weight,
                           const void *state_in, void *state_out, void *out,
                           int64_t tokens, int64_t channels, void *stream);
@@ -216,8 +218,12 @@ int ignis_gdn_causal_conv(const void *projected, const void *conv_weight,
  * (32 pairs) in the Qwen 3.8-27B GQA geometry; the table is computed
  * once at construction, host-side, a deterministic table — a non-goal is
  * the per-step table recompute). The un-rotated dims [rotary_dim,
- * head_dim) are never written. stream: null = stream 0. Returns 0 on
- * success, -1 on error. */
+ * head_dim) are never written. The pos contract: `pos` is a single
+ * uniform position for the whole call (every (batch, seq) token rotates
+ * at `pos`); a multi-token prefill must therefore invoke the kernel per
+ * token (seq = 1) — a per-token `positions` array or a `pos_base + t`
+ * mode would be an ABI extension, not current behaviour. stream: null =
+ * stream 0. Returns 0 on success, -1 on error. */
 int ignis_rope_qk(void *q, void *k, const void *inv_freq, int64_t batch,
                   int64_t seq, int64_t num_q_heads, int64_t num_kv_heads,
                   int64_t head_dim, int64_t rotary_dim, int32_t pos,

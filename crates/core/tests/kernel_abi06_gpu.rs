@@ -364,7 +364,7 @@ fn rope_qk_pos_sweep_gpu() {
     let k_bf16_in = to_bf16(&k);
     let ref_inv_freq = cpu_rope_inv_freqs(THETA, rotary); // the fp64 oracle table
 
-    for &pos in &[0i32, 1, 5, 17] {
+    for &pos in &[0i32, 1, 5, 17, 255, 4095] {
         let mut q_bf16 = q_bf16_in.clone();
         let mut k_bf16 = k_bf16_in.clone();
         let rc = unsafe {
