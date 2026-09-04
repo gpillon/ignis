@@ -186,8 +186,9 @@ fn real_model_e2e() {
     }
     // Load the artifact (the Qwen 3.8-27B weight routing, ADR 0002): the
     // binder consumes every object, the 19 GB of tensors land in VRAM
-    // (the `CudaDevice` arena), the host weights stay a zero-cost
-    // placeholder (the real weights live in VRAM — #25 routes them).
+    // (the `CudaDevice` arena), the host weights stay the zero-cost
+    // geometry (the real weights live in VRAM — #27's A1 normalization
+    // seam; the forward-pass routing is A3, #30).
     let compute = match CudaCompute::from_artifact(std::path::Path::new(&path), "qwen3.8-27b") {
         Ok(c) => c,
         Err(e) => {

@@ -32,7 +32,10 @@ pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
     ProtectionPhase, RetainedLaneCandidate,
 };
-pub use compute::{CudaCompute, GraphGeometry, LayerKind, ModelConfig, Nvfp4Weight, Weights};
+pub use compute::{
+    CudaCompute, GraphGeometry, LayerGeometry, LayerKind, ModelConfig, Nvfp4Weight, Weights,
+    WeightsGeometry,
+};
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;

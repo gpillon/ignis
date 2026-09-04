@@ -254,6 +254,19 @@ impl Nvfp4Weight {
             scales: Vec::new(),
         }
     }
+
+    /// A geometry-only NVFP4 GEMM weight (the #27 A1 normalization seam):
+    /// the real (m, k) with empty code/scale planes — the content is the
+    /// artifact's normalized NVFP4 buffers (the device-resident
+    /// materialization, ADR 0002), consumed by the forward pass (A3).
+    pub fn geometry_only(m: u64, k: u64) -> Self {
+        Self {
+            m,
+            k,
+            codes: Vec::new(),
+            scales: Vec::new(),
+        }
+    }
 }
 
 /// A deterministic synthetic NVFP4 weight of shape `[m][k]` (a fixed pattern
@@ -324,6 +337,107 @@ pub struct Weights {
     pub final_norm: Vec<u16>,
     /// The lm_head weight: NVFP4 `[vocab][hidden]` (the logits GEMM).
     pub lm_head: Nvfp4Weight,
+}
+
+/// A decoder layer's GEMM weight geometries (the (m, k) pairs the forward
+/// pass's `nvfp4_gemm` consumes — the same derivation
+/// [`Weights::synthetic`] uses for its content, minus the content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerGeometry {
+    /// The layer's kind (GQA / GDN).
+    pub kind: LayerKind,
+    /// The attention/GDN projections' (m, k) pairs (`[4]`: GQA's
+    /// q / k / v / output projections; GDN's input projection + the
+    /// three unused slots, (0, 0)).
+    pub projection: [(u64, u64); 4],
+    /// The GDN state readout (m, k) (the GDN layers only; (0, 0) for
+    /// GQA layers).
+    pub gdn_output: (u64, u64),
+    /// The gated-FFN (m, k) pairs (the same for every layer kind): the
+    /// gate + up projections (m = ffn, k = hidden) + the down projection
+    /// (m = hidden, k = ffn).
+    pub ffn_gate: (u64, u64),
+    pub ffn_up: (u64, u64),
+    pub ffn_down: (u64, u64),
+    /// The pre-attention + post-attention norm sizes (bf16 `[hidden]`).
+    pub norm_in: u64,
+    pub norm_post: u64,
+}
+
+/// The kernel-expected weight geometry (sizes only, no content): the
+/// `Weights` layout a [`ModelConfig`] demands — pure, config-derived,
+/// CPU-testable (the #27 A1 normalization seam, spec 04).
+///
+/// It replaces the zero geometry of [`Weights::placeholder`] on the
+/// `from_artifact` path (via [`Weights::from_geometry`]): the GEMM
+/// `Nvfp4Weight`s carry the real (m, k) (the code/scale planes are the
+/// artifact's normalized NVFP4 buffers — the device-resident
+/// materialization, ADR 0002), and every field's size matches the 27B
+/// topology (spec 04's acceptance: the `Weights` geometry matches
+/// `ModelConfig::qwen38_27b`). The forward-pass *consumption* of the
+/// normalized content (the W8 -> bf16 embedding / lm_head dequants, the
+/// GEMM routing) is A3 (#30), not A1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightsGeometry {
+    /// The token-embedding table: (rows, cols) = (vocab, hidden) bf16.
+    pub embedding: (u64, u64),
+    /// The per-layer GEMM geometries (in the `layer_kinds` order).
+    pub per_layer: Vec<LayerGeometry>,
+    /// The final-norm size (bf16 `[hidden]`).
+    pub final_norm: u64,
+    /// The lm_head GEMM (m, k) (the logits GEMM; the artifact's
+    /// `text/output_head` is W8G32 — dequantized to bf16 by the A1
+    /// normalize step, spec 04).
+    pub lm_head: (u64, u64),
+}
+
+impl WeightsGeometry {
+    /// Derive the geometry from a topology (the [`Weights::synthetic`]
+    /// (m, k) derivation, minus the content — pure, config-derived).
+    pub fn from_config(config: &ModelConfig) -> Self {
+        let per_layer = config
+            .layer_kinds
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Gqa => LayerGeometry {
+                    kind: LayerKind::Gqa,
+                    projection: [
+                        (config.hidden, config.gqa_width()),
+                        (config.hidden, config.gqa_kv_width()),
+                        (config.hidden, config.gqa_kv_width()),
+                        (config.gqa_width(), config.hidden),
+                    ],
+                    gdn_output: (0, 0),
+                    ffn_gate: (config.hidden, config.ffn_intermediate),
+                    ffn_up: (config.hidden, config.ffn_intermediate),
+                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    norm_in: config.hidden,
+                    norm_post: config.hidden,
+                },
+                LayerKind::Gdn => LayerGeometry {
+                    kind: LayerKind::Gdn,
+                    projection: [
+                        (config.hidden, config.gdn_state_dim()),
+                        (0, 0),
+                        (0, 0),
+                        (0, 0),
+                    ],
+                    gdn_output: (config.gdn_state_mat(), config.hidden),
+                    ffn_gate: (config.hidden, config.ffn_intermediate),
+                    ffn_up: (config.hidden, config.ffn_intermediate),
+                    ffn_down: (config.ffn_intermediate, config.hidden),
+                    norm_in: config.hidden,
+                    norm_post: config.hidden,
+                },
+            })
+            .collect();
+        Self {
+            embedding: (config.vocab, config.hidden),
+            per_layer,
+            final_norm: config.hidden,
+            lm_head: (config.hidden, config.vocab),
+        }
+    }
 }
 
 impl Weights {
@@ -419,11 +533,10 @@ impl Weights {
 
     /// A zero-cost weight placeholder for a real (artifact) topology (#26):
     /// the real weights live in VRAM (the materialized artifact, ADR 0002)
-    /// and the host-side `Weights` stay empty until #25's device routing
-    /// lands. The per-layer geometry (the layer-kind order) is preserved so
-    /// the forward pass can index `per_layer` by layer; every `Nvfp4Weight`
-    /// is `empty()` (the same pattern the unused GQA projections in a GDN
-    /// layer use).
+    /// and the host-side `Weights` stay empty. Superseded on the
+    /// `from_artifact` path by #27's [`Weights::from_geometry`] (the real
+    /// (m, k) geometry, not the zero geometry); retained as the dev-path
+    /// zero-cost construction.
     ///
     /// **Why not [`Weights::synthetic`] here:** the real Qwen 3.8-27B
     /// topology's synthetic weights are ~1.6 TiB of generated host vectors
@@ -457,6 +570,52 @@ impl Weights {
             per_layer,
             final_norm: Vec::new(),
             lm_head: Nvfp4Weight::empty(),
+        }
+    }
+
+    /// A `Weights` with the real (non-zero) geometry for a real (artifact)
+    /// topology (the #27 A1 normalization seam, spec 04 — the replacement
+    /// of [`Weights::placeholder`] on the `from_artifact` path):
+    ///
+    /// - The GEMM `Nvfp4Weight`s carry the real (m, k) (the
+    ///   [`WeightsGeometry`] derivation, the `synthetic` convention) with
+    ///   **empty** code/scale planes — the content is the artifact's
+    ///   normalized NVFP4 buffers (the device-resident materialization,
+    ///   ADR 0002), consumed by the forward pass (A3).
+    /// - The norm vectors are sized (identity 1.0, the `synthetic`
+    ///   convention — a neutral, numerically-sane placeholder value).
+    /// - The `embedding` content is the `text/token_embedding` W8 -> bf16
+    ///   dequant buffer (the A1 normalize step's output, the
+    ///   `text/output_head` lm_head dequant the same), routed by the
+    ///   forward pass (A3) — not zero-filled here (the #26 lesson: no
+    ///   host-side weight explosion on the load path).
+    pub fn from_geometry(config: &ModelConfig) -> Self {
+        let geometry = WeightsGeometry::from_config(config);
+        let ones = to_bf16(&vec![1.0f32; config.hidden as usize]);
+        let per_layer = geometry
+            .per_layer
+            .iter()
+            .map(|lg| LayerWeights {
+                kind: lg.kind,
+                projection: [
+                    Nvfp4Weight::geometry_only(lg.projection[0].0, lg.projection[0].1),
+                    Nvfp4Weight::geometry_only(lg.projection[1].0, lg.projection[1].1),
+                    Nvfp4Weight::geometry_only(lg.projection[2].0, lg.projection[2].1),
+                    Nvfp4Weight::geometry_only(lg.projection[3].0, lg.projection[3].1),
+                ],
+                gdn_output: Nvfp4Weight::geometry_only(lg.gdn_output.0, lg.gdn_output.1),
+                ffn_gate: Nvfp4Weight::geometry_only(lg.ffn_gate.0, lg.ffn_gate.1),
+                ffn_up: Nvfp4Weight::geometry_only(lg.ffn_up.0, lg.ffn_up.1),
+                ffn_down: Nvfp4Weight::geometry_only(lg.ffn_down.0, lg.ffn_down.1),
+                norm_in: ones.clone(),
+                norm_post: ones.clone(),
+            })
+            .collect();
+        Self {
+            embedding: Vec::new(),
+            per_layer,
+            final_norm: ones,
+            lm_head: Nvfp4Weight::geometry_only(geometry.lm_head.0, geometry.lm_head.1),
         }
     }
 }
@@ -1169,15 +1328,19 @@ impl CudaCompute {
         // The crash fix: the real model's topology (no synthetic fallback, so
         // the embedding table has the real vocab and a real tokenizer's ids
         // never index out of bounds — the `illegal memory access`).
-        // The host-side `Weights` stay a zero-cost placeholder until #25's
-        // numerically-correct device routing lands: the real weights live in
-        // VRAM (the materialized artifact above, ADR 0002). `Weights::synthetic`
-        // with this topology is infeasible (~1.6 TiB of generated host
-        // vectors: 48 GDN layers × ~30 GiB of `gdn_output` E2M1 codes) —
-        // the E2E test stalled after the 19 GB H2D and OOM-aborted (the
-        // #26 "hang", a CPU-side trap that looked like a GPU deadlock).
+        // The #27 A1 normalization seam: the host-side `Weights` carry the
+        // real 27B geometry (not the `placeholder`'s zero geometry) — the
+        // GEMM `Nvfp4Weight`s' (m, k) match the artifact's normalized NVFP4
+        // buffers (the device-resident materialization above, ADR 0002), and
+        // the norm vectors are sized. `Weights::synthetic` with this
+        // topology is infeasible (~1.6 TiB of generated host vectors: 48 GDN
+        // layers × ~30 GiB of `gdn_output` E2M1 codes) — the E2E test
+        // stalled after the 19 GB H2D and OOM-aborted (the #26 "hang", a
+        // CPU-side trap that looked like a GPU deadlock). The forward-pass
+        // routing of the normalized buffers (the W8 -> bf16 embedding /
+        // lm_head dequants, the GEMM weight planes) is A3 (#30).
         let config = ModelConfig::qwen38_27b();
-        let weights = Weights::placeholder(&config);
+        let weights = Weights::from_geometry(&config);
         // The #26 fix: the eager path (no kernel-leaf startup check / CUDA
         // graph capture) — the CUDA-graph fast path is #25 (the 99%-gate)
         // material, not the scoped #26. (The observed "hang" after the H2D
@@ -1279,5 +1442,95 @@ mod tests {
             "the artifact path must use the real vocab (248 320), not the synthetic 256"
         );
         assert_ne!(real.num_layers, synth.num_layers);
+    }
+
+    /// The #27 A1 normalization seam (spec 04's acceptance: "the
+    /// `from_artifact` `Weights` are the real normalized buffers — a
+    /// non-GPU / CPU test verifies the `Weights` geometry matches the 27B
+    /// topology"): the geometry is pure, config-derived, and matches
+    /// `ModelConfig::qwen38_27b` — the embedding / lm_head dims are the
+    /// real vocab × hidden, the 16 GQA + 48 GDN layer-kind order is
+    /// preserved, and the GEMM (m, k) pairs follow the `synthetic`
+    /// derivation (the forward pass's established convention).
+    #[test]
+    fn weights_geometry_matches_27b_topology() {
+        let cfg = ModelConfig::qwen38_27b();
+        let g = WeightsGeometry::from_config(&cfg);
+        // The 27B topology's endpoints (spec 04: the W8 embedding /
+        // lm_head dequants are `[vocab][hidden]` = [248 320][5 120]).
+        assert_eq!(g.embedding, (248_320, 5_120), "the real embedding table dims");
+        assert_eq!(g.lm_head, (cfg.hidden, cfg.vocab), "the logits GEMM (m, k) (the synthetic convention)");
+        assert_eq!(g.final_norm, cfg.hidden);
+        assert_eq!(g.per_layer.len(), cfg.num_layers, "one geometry per layer");
+        // The 27B layer-kind mix (16 GQA + 48 GDN, the `(i + 1) % 4` rule).
+        let gqa = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa).count();
+        let gdn = g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn).count();
+        assert_eq!((gqa, gdn), (16, 48), "the 27B layer-kind mix");
+        // Every GDN layer's state readout (m = state_mat = 6144*2048,
+        // k = hidden) + input projection (m = hidden, k = the GDN step's
+        // feature dim) — the forward pass's (m, k) contract.
+        for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gdn) {
+            assert_eq!(lg.gdn_output, (cfg.gdn_state_mat(), cfg.hidden));
+            assert_eq!(lg.projection[0], (cfg.hidden, cfg.gdn_state_dim()));
+            assert_eq!(lg.projection[1], (0, 0), "the unused GDN slots are (0, 0)");
+        }
+        // The GQA layers' projections (the `synthetic`'s (m, k) convention:
+        // q / k / v map hidden -> the head widths; the output projection
+        // maps gqa_width -> hidden).
+        for lg in g.per_layer.iter().filter(|l| l.kind == LayerKind::Gqa) {
+            assert_eq!(lg.projection[3], (cfg.gqa_width(), cfg.hidden));
+            assert_eq!(lg.ffn_gate, (cfg.hidden, cfg.ffn_intermediate));
+            assert_eq!(lg.ffn_down, (cfg.ffn_intermediate, cfg.hidden));
+            assert_eq!(lg.norm_in, cfg.hidden);
+        }
+        // The `from_artifact` path's `Weights` (via `from_geometry`) carry
+        // this same geometry (the non-zero (m, k), the sized norms) — the
+        // zero-geometry `placeholder` is no longer the artifact path's
+        // construction.
+        let w = Weights::from_geometry(&cfg);
+        assert_eq!(w.lm_head.m, cfg.hidden);
+        assert_eq!(w.lm_head.k, cfg.vocab);
+        assert!(w.lm_head.codes.is_empty(), "the GEMM planes are device-resident (A3)");
+        for lw in &w.per_layer {
+            assert_eq!(lw.norm_in.len(), cfg.hidden as usize);
+            assert_eq!(lw.norm_post.len(), cfg.hidden as usize);
+        }
+        assert_eq!(w.final_norm.len(), cfg.hidden as usize);
+        // The norms are identity (1.0, the `synthetic` convention).
+        assert!(w.final_norm.iter().all(|&w| w == 0x3F80), "the identity norms");
+    }
+
+    /// `from_geometry` on a small topology: the `Weights` carry the real
+    /// (m, k) geometry (not the `placeholder`'s zeros), the GEMM planes
+    /// are empty (device-resident content, A3), and the embedding content
+    /// is the W8 -> bf16 dequant buffer (A3's routing — not zero-filled
+    /// here, the #26 lesson).
+    #[test]
+    fn from_geometry_weights_carry_real_geometry() {
+        let cfg = ModelConfig::synthetic();
+        let w = Weights::from_geometry(&cfg);
+        assert_eq!(w.per_layer.len(), cfg.num_layers);
+        for lw in &w.per_layer {
+            match lw.kind {
+                LayerKind::Gdn => {
+                    assert_eq!((lw.gdn_output.m, lw.gdn_output.k), (cfg.gdn_state_mat(), cfg.hidden));
+                    assert!(lw.gdn_output.codes.is_empty(), "the GEMM planes are device-resident (A3)");
+                }
+                LayerKind::Gqa => {
+                    assert_eq!(lw.projection[0].m, cfg.hidden, "the q projection's m");
+                    assert!(lw.projection[3].m > 0, "the output projection's m");
+                    assert!(lw.projection[3].codes.is_empty());
+                }
+            }
+            assert_eq!(lw.ffn_gate.m, cfg.hidden);
+            assert_eq!(lw.ffn_gate.k, cfg.ffn_intermediate);
+            assert_eq!(lw.ffn_down.m, cfg.ffn_intermediate);
+            assert_eq!(lw.ffn_down.k, cfg.hidden);
+            assert_eq!(lw.norm_in.len(), cfg.hidden as usize);
+        }
+        assert_eq!(w.lm_head.m, cfg.hidden);
+        assert_eq!(w.lm_head.k, cfg.vocab);
+        // The embedding content is A3's dequant buffer (not zero-filled).
+        assert!(w.embedding.is_empty());
     }
 }
