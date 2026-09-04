@@ -90,6 +90,36 @@ fn bf16_to_f32s(values: &[u16]) -> Vec<f32> {
     values.iter().map(|&v| bf16_to_f32(v)).collect()
 }
 
+/// The RoPE (split-half NeoX) inverse-frequency table (kernel-abi 06,
+/// GitHub #28): `inv_freq[pair] = θ^(-2·pair/rotary_dim)` (pair ∈
+/// `[0, rotary_dim/2)`), computed in f64 and rounded to f32 (the
+/// reference's `rope_linear_frequencies` table, `ops/wrapper/rope.cpp`).
+///
+/// Host-side, deterministic, and computed **once at construction** (the
+/// v1 table: θ = 1e7, rotary_dim = 64 — the Qwen 3.8-27B GQA geometry);
+/// it is uploaded once per `ignis_rope_qk` call (a non-goal is the
+/// per-step table recompute). The caller (the A3 forward assembly) builds
+/// it and passes it to the kernel (the kernel consumes the f32 table and
+/// never recomputes it).
+pub fn rope_inv_frequencies(theta: f64, rotary_dim: i64) -> Vec<f32> {
+    assert!(
+        theta > 0.0 && theta.is_finite(),
+        "rope_inv_frequencies: theta must be positive and finite"
+    );
+    assert!(
+        rotary_dim > 0 && rotary_dim % 2 == 0,
+        "rope_inv_frequencies: rotary_dim must be a positive even value"
+    );
+    let pairs = (rotary_dim / 2) as usize;
+    (0..pairs)
+        .map(|pair| {
+            theta
+                .powf(-2.0 * (pair as f64) / (rotary_dim as f64))
+                as f32
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Topology (ADR 0001: the model config the forward pass is parameterized by)
 // ---------------------------------------------------------------------------
@@ -1279,5 +1309,29 @@ mod tests {
             "the artifact path must use the real vocab (248 320), not the synthetic 256"
         );
         assert_ne!(real.num_layers, synth.num_layers);
+    }
+
+    /// (kernel-abi 06, GitHub #28) The RoPE inverse-frequency table (θ = 1e7,
+    /// rotary_dim = 64 — the Qwen 3.8-27B GQA geometry) is pinned to the
+    /// deterministic values the `ignis_rope_qk` kernel consumes: pair `p` is
+    /// θ^(-2p/64) (the reference's `rope_linear_frequencies` table, computed
+    /// in f64 and rounded to f32). The table is computed once at construction
+    /// (host-side, a deterministic table — a non-goal is the per-step
+    /// recompute), so its values are pinned here by exact f32 bits (the
+    /// independently computed literals: θ=1e7, R=64 → 32 pairs).
+    #[test]
+    fn rope_inv_frequencies_pins_the_theta_1e7_table() {
+        let freqs = rope_inv_frequencies(1e7, 64);
+        assert_eq!(freqs.len(), 32, "rotary_dim 64 -> 32 pairs");
+        assert_eq!(freqs[0], 1.0f32, "pair 0: θ^0 = 1 (the exact 1.0f32 bits)");
+        // The table endpoints + a mid-table pin (independent f32 literals).
+        assert_eq!(freqs[1].to_bits(), 0x3f1ab32b, "pair 1: θ^(-1/32)");
+        assert_eq!(freqs[15].to_bits(), 0x3a092e02, "pair 15: θ^(-15/32)");
+        assert_eq!(freqs[31].to_bits(), 0x3431af44, "pair 31: θ^(-31/32)");
+        // The table is strictly decreasing (θ^(-2p/R), p increasing).
+        assert!(
+            freqs.windows(2).all(|w| w[0] > w[1]),
+            "the inv_freq table must be strictly decreasing"
+        );
     }
 }
