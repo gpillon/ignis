@@ -351,8 +351,11 @@ fn f16_to_f32(v: u16) -> f32 {
             // Subnormal half: value = mant * 2^-24, normalized to an f32.
             // `p` = the 10-bit mantissa's leading-zero count (0..9, so
             // `mant` is in [2^(9-p), 2^(10-p))): E = 112 - p,
-            // M23 = (mant - 2^(9-p)) << (14 + p).
-            let p = 32 - mant.leading_zeros() - 22;
+            // M23 = (mant - 2^(9-p)) << (14 + p). (`p` is the
+            // leading-zero count in the 10-bit field — the u32
+            // `leading_zeros` counts the 22 leading zeros of the 10-bit
+            // value's zero-extension, so `p = leading_zeros - 22`.)
+            let p = mant.leading_zeros() - 22;
             let e = 112 - p;
             let m = (mant - (1u32 << (9 - p))) << (14 + p);
             (sign << 31) | (e << 23) | m
@@ -774,6 +777,19 @@ mod tests {
         assert_eq!(f16_to_f32(0x3800), 0.5f32);
         assert_eq!(f16_to_f32(0x0000), 0.0f32);
         assert_eq!(f16_to_f32(0x8000), 0.0f32); // -0.0 (the sign bit)
+        // f16 subnormals (exp = 0, `mant` in 1..1023): the rowsplit scale
+        // planes carry small magnitudes, so subnormal F16 words are a
+        // real case (the W8 dequant's group scales). Value =
+        // `mant * 2^-24` (the subnormal convention), hand-derived:
+        //   0x0001 = 1 * 2^-24        -> 5.960464477539063e-8
+        //   0x0200 = 512 * 2^-24      -> 2^-15 = 3.0517578125e-5
+        //   0x03FF = 1023 * 2^-24     -> 6.10351562499e-5 (the max subnormal)
+        assert_eq!(f16_to_f32(0x0001), 1.0f32 * 2f32.powi(-24));
+        assert_eq!(f16_to_f32(0x0200), 2.0f32.powi(-15));
+        assert_eq!(f16_to_f32(0x03FF), 1023.0 * 2f32.powi(-24));
+        // The subnormal boundary (the smallest normal, 0x0400 = 2^-14,
+        // must match the largest subnormal's successor).
+        assert_eq!(f16_to_f32(0x0400), 2.0f32.powi(-14));
         // f32 -> bf16 (RNE): the hand-derived words (the exact f32 bit
         // patterns: 11.0 = 0x41300000, -11.0 = 0xC1300000, -16.0 =
         // 0xC1800000 — the top 16 bits, no rounding needed).
