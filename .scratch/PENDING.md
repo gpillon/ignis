@@ -46,8 +46,9 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   `cudaStreamSynchronize`. `Weights::placeholder` (zero-cost) fixes it; the
   E2E (`real_model_e2e`) now passes in ~9 s.
   The numerically-correct real completion (the actual forward pass, the
-  CUDA-graph fast path, and the server serving real completions) is deferred
-  to #25 — no new ticket needed.
+  CUDA-graph fast path, and the server serving real completions) is the #25
+  split — A3 (#30, the forward pass), B1 (#31, batched prefill), B2 (#32, the
+  graph replay) — dependency `A1 ∥ A2 ∥ A2b → A3 → (B1 ∥ B2) → #20`.
 
 - **kernel-abi-03: CUDA-graph eager capture at startup (GitHub #10, ADR 0006/0007)** —
   resolved 2026-09-03: `kernel/src/graph_capture.cu` implements the four
