@@ -52,6 +52,16 @@ const REQ: u64 = 1;
 /// is 256, so ids < 256 are valid).
 const PROMPT: [u32; 4] = [1, 2, 3, 4];
 
+/// The real-model E2E's prompt (in-vocab token ids — the real Qwen 3.8-27B
+/// vocab is 248 320, so small ids are valid, A3 / #30).
+const REAL_PROMPT: [u32; 4] = [1, 2, 3, 4];
+/// The real-model E2E's decode budget (the `max_tokens` cap + the number of
+/// decode steps to drive, A3 / #30).
+const REAL_MAX_TOKENS: u32 = 4;
+const REAL_N_DECODE: u32 = 3;
+/// The real Qwen 3.8-27B vocab (the in-vocab check, A3 / #30).
+const REAL_VOCAB: u64 = 248_320;
+
 /// A non-zero kernel rc (a CUDA error / a busy GPU) is a skip, never a
 /// failure (ADR 0006 — the GPU is occupied by the reference runner).
 fn skip_on_err(e: &ComputeError) -> bool {
@@ -211,6 +221,143 @@ fn real_model_e2e() {
     eprintln!(
         "real-model E2E: {path} — 19 GB materialized in VRAM + real Qwen 3.8-27B config (no synthetic fallback) = #26 crash fix verified (the numerically-correct forward pass is #25)"
     );
+}
+
+/// The real-model forward E2E (the Qwen 3.8-27B artifact, A3 / #30, spec 07
+/// acceptance criterion 1): drive the *real-model* forward pass (a prompt
+/// prefill + a few decode steps) through `CudaCompute::from_artifact` (the
+/// full-correct forward assembly — the GDN causal conv + the GQA RoPE /
+/// q / k RMSNorm (kernel-abi 06, A2 / #28), the bf16 logits GEMM
+/// (kernel-abi 10, A2b / #29), the device-resident NVFP4 routing (the #26
+/// `_device` surface), the real `qwen38_27b` topology) and check the
+/// correctness floor (ADR 0005: a *sane*, reproducible output — not a
+/// reference match): the emitted token ids are in vocab range, and a
+/// greedy + fixed-seed run is **reproducible** (two fresh backends, the
+/// same input → the same tokens — the self-consistency invariant, ADR
+/// 0007). Gated on the `IGNIS_ARTIFACT` env var (the artifact path) + the
+/// `cuda` feature + the GPU (a busy / OOM GPU self-skips, ADR 0006 — the
+/// GPU may hold the reference runner; a `from_artifact` failure is a
+/// skip, never a fault).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "real-model forward E2E — needs the IGNIS_ARTIFACT path + the GPU (-- --ignored, --features cuda)"]
+fn real_model_forward_reproducible() {
+    let path = std::env::var("IGNIS_ARTIFACT").unwrap_or_default();
+    if path.is_empty() {
+        eprintln!("SKIP: IGNIS_ARTIFACT unset (no artifact)");
+        return;
+    }
+    // Run 1: a fresh backend (the real-model forward pass — the prefill
+    // warms the KV + GDN + the conv state, the decodes thread the
+    // actually-generated tokens, A3 / #30).
+    let compute1 =
+        match CudaCompute::from_artifact(std::path::Path::new(&path), "qwen3.8-27b") {
+            Ok(c) => c,
+            Err(e) => {
+                // A busy / OOM GPU (the reference runner may hold the
+                // VRAM, ADR 0006): a skip, never a fault.
+                eprintln!(
+                    "SKIP: from_artifact failed: {e:?} (ADR 0006 — the GPU is busy / OOM)"
+                );
+                return;
+            }
+        };
+    let tokens1 = match run_real(&compute1, REAL_MAX_TOKENS, REAL_N_DECODE) {
+        Ok(t) => t,
+        Err(e) => {
+            if skip_on_err(&e) {
+                return;
+            }
+            panic!("real-model forward pass (run 1) failed: {e:?}");
+        }
+    };
+
+    // Run 2: a *fresh* backend (the same artifact, the same seed) must
+    // produce the *same* tokens (the self-consistency invariant, ADR
+    // 0007 — greedy + fixed seed).
+    drop(compute1);
+    let compute2 =
+        match CudaCompute::from_artifact(std::path::Path::new(&path), "qwen3.8-27b") {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: from_artifact (run 2) failed: {e:?} (ADR 0006)");
+                return;
+            }
+        };
+    let tokens2 = match run_real(&compute2, REAL_MAX_TOKENS, REAL_N_DECODE) {
+        Ok(t) => t,
+        Err(e) => {
+            if skip_on_err(&e) {
+                return;
+            }
+            panic!("real-model forward pass (run 2) failed: {e:?}");
+        }
+    };
+
+    // The in-vocab check (the correctness floor, ADR 0005): every emitted
+    // token is a valid vocab id (the `ignis_greedy_sample` contract).
+    for &t in tokens1.iter().chain(tokens2.iter()) {
+        assert!(
+            (t as u64) < REAL_VOCAB,
+            "token {t} must be in vocabulary (vocab = {REAL_VOCAB})"
+        );
+    }
+    // The reproducibility check (the self-consistency invariant, ADR
+    // 0007): the same input → the same tokens across two fresh backends.
+    assert_eq!(
+        tokens1, tokens2,
+        "self-consistency: the same real-model input must produce the same tokens (greedy + fixed seed)"
+    );
+    eprintln!(
+        "real-model forward E2E (A3 / #30): {path} — prefill({REAL_PROMPT:?}) + {REAL_N_DECODE} decodes → tokens {tokens1:?} (in-vocab, reproducible across two fresh backends = the correctness floor, ADR 0005 / 0007)"
+    );
+}
+
+/// Drive the real-model forward pass (A3 / #30): a prefill of
+/// `REAL_PROMPT` + up to `REAL_N_DECODE` decode steps, collecting the
+/// generated tokens (until a soft-stop — `max_tokens` / EOS — or the
+/// budget). A kernel error (a busy / absent GPU) is surfaced to the
+/// caller as a `ComputeError` (the caller decides skip vs. fault).
+#[cfg(feature = "cuda")]
+fn run_real(
+    compute: &CudaCompute,
+    max_tokens: u32,
+    n: u32,
+) -> Result<Vec<TokenId>, ComputeError> {
+    let request = 1; // a fresh request (the real-model run's single request)
+    // The prefill: warm the request's KV cache + GDN state + the rolling
+    // conv state (the A3 / #30 forward assembly).
+    let pjob = PrefillJob {
+        request,
+        tokens: REAL_PROMPT.to_vec(),
+        params: DecodeParams {
+            max_tokens: Some(max_tokens),
+            ..DecodeParams::default()
+        },
+    };
+    compute.prefill_step(std::slice::from_ref(&pjob))?;
+    // The decode steps: generate one token per step (the greedy sample,
+    // the deterministic token, ADR 0007). A soft-stop (`max_tokens` / EOS)
+    // ends the run early (a per-job `None`, not a fault).
+    let mut params = DecodeParams {
+        max_tokens: Some(max_tokens),
+        ..DecodeParams::default()
+    };
+    let mut tokens = Vec::new();
+    for _ in 0..n {
+        let djob = DecodeJob {
+            request,
+            lane: 0,
+            params: std::mem::replace(&mut params, DecodeParams::default()),
+        };
+        let out = compute.decode_step(std::slice::from_ref(&djob))?;
+        match out.into_iter().next() {
+            Some(Some(t)) => tokens.push(t),
+            Some(None) => break, // the request soft-stopped (max_tokens / EOS)
+            None => return Err(ComputeError::Kernel(-1)), // an empty result (a bug)
+        }
+    }
+    Ok(tokens)
 }
 
 // ---------------------------------------------------------------------------

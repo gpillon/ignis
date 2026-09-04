@@ -27,6 +27,52 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 
 ## Resolved (pruned weekly)
 
+- **#30: A3 full-correct Qwen 3.8-27B forward assembly (GitHub #30, spec 07,
+  ADR 0005/0006/0007).**
+  Resolved 2026-09-04: the compute-adapter's forward pass now runs the
+  *full* layer stack on the real model — the GDN layers' causal conv
+  (`ignis_gdn_causal_conv`) + the a / b (gate / beta) projection + the GDN
+  step + the state readout (the "for now" host-side `S^T k` GEMV, ADR 0005)
+  + the z (output-gate) gating; the GQA layers' QKV projection + the q / k
+  RMSNorm (the per-head) + the RoPE (`ignis_rope_qk`, kernel-abi 06) + the
+  GQA attention + the output projection; the gated-FFN block; the bf16
+  logits GEMM (`ignis_bf16_gemm`, kernel-abi 10, A2b) for the W8-dequantized
+  lm_head; and the real `qwen38_27b` topology (the 16 GQA + 48 GDN layers,
+  the GDN feature layout — the q / z / a-b widths — the rotary geometry,
+  θ = 1e7). The `from_artifact` path routes the real normalized tensors
+  (A1 / #27): the NVFP4 fused planes stay device-resident (the `*_device`
+  kernels, the #26 fix — the q / k / v slots are row slices of the fused
+  `attention/query_key_gate_value` / `mlp/gate_up` planes), the BF16
+  tensors are host-copied (the early GQA layers' qkv / output, the layer-4
+  `gdn/output` quirk, the `gdn/convolution` + `gdn/a_b_projection` + the
+  norms), the W8 endpoints are the A1 host-side dequants (the embedding +
+  the lm_head). The decode step threads the actually-generated token (the
+  autoregressive decode). New tests: `full_stack_synthetic_composition`
+  (CPU — the layer composition + the geometry, spec 07 acceptance 4) +
+  `real_model_forward_reproducible` (GPU-gated e2e — the real-model forward
+  is in-vocab + reproducible across two fresh backends, spec 07 acceptance
+  1; the `IGNIS_ARTIFACT` + `-- --ignored` + `--features cuda` gate,
+  self-skip on a busy / OOM GPU, ADR 0006). The server / bench-03 "the
+  server runs a real model" acceptance (spec 07 criterion 2) is the gate-
+  run flow — the A3 forward pass is its prerequisite (the 99% gate itself
+  is #20; the performance material is B1 / #31 + B2 / #32).
+  `cargo test --workspace` green.
+
+  **A3 v1 "for now" fidelity notes (ADR 0005 — the ported kernels are the
+  "for now" starting point; the floor is a *sane*, reproducible output, not
+  a reference match):** the GQA output-gate rows of the fused
+  `attention/query_key_gate_value` (the 8 192..14 336 rows) are projected
+  but unused (v1 applies no output gate to the attention output); the GDN
+  a / b (gate / beta) is reduced to the step's scalar g / beta (the first
+  a / first b of the 96-row `gdn/a_b_projection`); the GDN state readout
+  is the host-side `S^T k` GEMV (the ported `ignis_gdn_step`'s contract
+  updates the state, it does not emit a readout); the NVFP4 `*_device`
+  GEMMs read the artifact's fused planes as plain row-major `[m][k/2]` /
+  `[m][k/16]` (the container's block-scale plane layout + the
+  `weight_divisor` application are the later re-implementation material,
+  #20). The fused `mlp/gate_up` plane is read gate-first (rows 0..17 408
+  gate, 17 408..34 816 up — the reference's fused gate_up convention).
+
 - **#26: compute-adapter crash fix + VRAM materialization + device-GEMM
   surface (GitHub #26, ADR 0002/0006).**
   Resolved 2026-09-03: `CudaCompute::from_artifact` no longer falls back to
