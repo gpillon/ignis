@@ -14,13 +14,14 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   reference (ninfer) stack (`F:\ai\q38`), `ignis-server` + the reference
   running *sequentially* (never both — the 5090 cannot hold two full
   engines), a real "1 main + ~10 subagents" live agent session, and the 99%
-  performance-gate verdict (ADR 0007). Remaining **autonomous coding
-  piece**: the `ignis-bench record` capture tool (a new `crates/bench`
-  subcommand — a capture-proxy that records a live agent session into a
-  bench trace, CPU-testable against a mock target per spec 03). That piece
-  is implementable; the operational run itself is a human/external
-  prerequisite. Owner: bench actor. Blocker: human operational run (GPU
-  exclusivity + reference stack + live agent session).
+  performance-gate verdict (ADR 0007). The **autonomous coding piece is now
+  in place**: the `ignis-bench record` capture tool (bench-04, GitHub #34 —
+  the capture-proxy subcommand that records a live agent session into a valid
+  bench trace, CPU-testable against a mock target per spec 03) has landed on
+  `main` as `fdba7ab` and is verified (workspace-wide `cargo test` green).
+  What remains is **only the operational run itself** — a human/external
+  prerequisite (ADR 0006 / ADR 0007). Owner: bench actor. Blocker: human
+  operational run (GPU exclusivity + reference stack + live agent session).
 
 - **bench-02: recorded reference baseline + 99% gate (ADR 0007, GitHub #20).**
   The `ignis-bench` harness is code-complete — `HttpEndpoint` transport,
@@ -73,6 +74,29 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   stale pre-#32 `.lib` was a transient LNK2019 on `ignis_decode_graph_*`).
   Push to `origin/main` pending (the orchestrator does not push without an
   explicit request).
+
+- **#34: bench-04 `ignis-bench record` — the capture-proxy harness piece
+  (GitHub #34, spec 03, ADR 0005/0006/0007).**
+  Resolved 2026-09-05: the `ignis-bench record` subcommand (a transparent
+  OpenAI capture proxy in `crates/bench`) now ships — it accepts
+  chat-completions from a live agent client, records each request as a
+  `TraceLine` (`id`, `class` main|sub, `t_arrive_ms`, `prompt`, `max_tokens`,
+  `stream`), forwards it byte-for-byte to `--target`, and finalizes on
+  `POST /v1/session/end`. Class policy: `first-is-main` (default) or
+  `marker`; a second `main` is demoted to `sub` (the `replay` driver rejects
+  >1 main — the "1 main + N subagents" load shape). The recorded file is
+  valid bench-trace JSONL — `Trace::from_jsonl` (the shape `replay` consumes)
+  round-trips it (asserted in `record_capture.rs`: "the recorded trace loads
+  and replays"). CPU-testable: `record_capture.rs` records a live session
+  against a mock target (no GPU, no live engine). New: `crates/bench/src/
+  record.rs` (the capture-proxy module), `crates/bench/tests/record_capture.rs`
+  (the mock-target integration tests), the `record` CLI subcommand in
+  `crates/bench/src/main.rs`. Landed on `main` as `fdba7ab` (fast-forward
+  integration); `cargo test --workspace` green. Push to `origin/main`
+  pending (the orchestrator does not push without an explicit request —
+  consistent with #32). This is the harness piece of the bench-03 gate-run
+  (GitHub #24); the operational run itself remains #24, PARKed for human
+  execution.
 
 - **#30: A3 full-correct Qwen 3.8-27B forward assembly (GitHub #30, spec 07,
   ADR 0005/0006/0007).**
