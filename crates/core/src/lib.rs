@@ -17,6 +17,9 @@
 //!   ADR 0009): embedding -> final norm -> output head -> argmax with every
 //!   decoder layer skipped (test-only until P1-21/P1-22 add the layer
 //!   bodies)
+//! - the sequence handle step ABI call (`seq`, feature `cuda`, GitHub #55 /
+//!   ADR 0009): KV page + GDN slot alloc/release, zeroed on allocation;
+//!   snapshot/restore declared, not implemented until G4
 //!
 //! The **public contract** (what `ignis-server` and tests code against) is
 //! [`types`] + [`scheduler`]: the [`Scheduler`] trait is driven by the
@@ -38,6 +41,8 @@ pub mod model_load;
 pub mod prefix;
 pub mod request;
 pub mod scheduler;
+#[cfg(feature = "cuda")]
+pub mod seq;
 #[cfg(feature = "cuda")]
 pub mod step;
 pub mod types;

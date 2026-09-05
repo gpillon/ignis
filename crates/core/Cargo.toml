@@ -9,7 +9,8 @@ ignis-artifact = { path = "../artifact" }
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization
-# path, ADR 0002) and gates this crate's own `model_load` module (the
-# step ABI's model-load call, GitHub #53 / ADR 0009) so `ignis-server`'s
-# `cuda` feature reaches both.
+# path, ADR 0002) and gates this crate's own `model_load` (the step ABI's
+# model-load call, GitHub #53 / ADR 0009) and `seq` (the sequence handle
+# step ABI, GitHub #55) modules so `ignis-server`'s `cuda` feature reaches
+# both.
 cuda = ["ignis-artifact/cuda"]

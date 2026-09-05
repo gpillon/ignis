@@ -25,6 +25,23 @@ pub struct KvPool {
 }
 
 impl KvPool {
+    /// Create a pool sized from the runtime's reported page geometry
+    /// (GitHub #55, P1-19) instead of a constant: `page_count` physical
+    /// pages of `page_bytes` each — the leaf's `ignis_paged_kv_page_budget`
+    /// query (`kernel/include/ignis_paged_kv_budget.h`) already picked
+    /// `page_count` to fit the VRAM left after weights, so this pool's
+    /// block count exactly matches the device-resident pool's page count.
+    ///
+    /// Scope note: this sizes `ignis-core`'s own [`KvPool`] from real
+    /// numbers, as P1-19 requires. Wiring a real budget query result into
+    /// [`crate::concrete::SchedulerConfig::kv_capacity_pages`] (a
+    /// differently-grained admission-accounting page, `kv_page_tokens`
+    /// wide, not the device's fixed 64-token physical page) needs the real
+    /// `Compute` adapter and is P1-24's job (GitHub #60), not this one's.
+    pub fn from_page_geometry(page_count: u32, page_bytes: u64) -> Self {
+        Self::new(page_count as usize * page_bytes as usize, page_bytes as usize)
+    }
+
     /// Create a pool holding `budget` bytes of KV, in blocks of
     /// `bytes_per_block` bytes each. The block count auto-sizes from the
     /// budget: `budget / bytes_per_block`.
@@ -180,6 +197,18 @@ impl BlockTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_sizes_from_runtime_reported_page_geometry() {
+        // A stub of what `ignis_paged_kv_page_budget` reports (no GPU
+        // needed here — this is the sizing math, not the query itself):
+        // 12 physical pages of 2048 bytes each fit the budget.
+        let pool = KvPool::from_page_geometry(12, 2048);
+        assert_eq!(pool.block_count(), 12, "block count matches the reported page count");
+        assert_eq!(pool.bytes_per_block(), 2048, "block size matches the reported page bytes");
+        assert_eq!(pool.budget(), 12 * 2048);
+        assert_eq!(pool.free_blocks(), 12);
+    }
 
     #[test]
     fn pool_sizes_from_budget() {

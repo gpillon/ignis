@@ -61,3 +61,29 @@ unsafe extern "C" {
     /// Destroy the context (drains the load stream first). NULL is a no-op.
     pub fn ignis_device_destroy(d: *mut IgnisDevice);
 }
+
+/// 1:1 with `struct ignis_paged_kv_plane` (`kernel/include/ignis_paged_kv_budget.h`).
+///
+/// `dtype` mirrors `ninfer::DType` (`kernel/vendor/src/core/dtype.h`): 0
+/// BF16, 1 FP32, 2 I32, 3 U8, 4 I64, 5 I8, 6 FP16, 7 FP8_E4M3FN.
+#[repr(C)]
+pub struct IgnisPagedKvPlane {
+    pub dtype: i32,
+    pub leading_extent: i32,
+    pub head_extent: i32,
+}
+
+unsafe extern "C" {
+    /// Host-only: reports the largest page count fitting `vram_budget_bytes`
+    /// for a pool built from `planes` (`plane_count` entries), and the bytes
+    /// that count of pages consumes. No CUDA device needed (pure arithmetic
+    /// over the vendored planner). Returns 0 on success, -1 on a bad
+    /// argument.
+    pub fn ignis_paged_kv_page_budget(
+        planes: *const IgnisPagedKvPlane,
+        plane_count: i32,
+        vram_budget_bytes: u64,
+        out_page_count: *mut u32,
+        out_page_bytes: *mut u64,
+    ) -> i32;
+}

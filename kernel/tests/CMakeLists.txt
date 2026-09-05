@@ -228,3 +228,14 @@ add_test(NAME ignis_kernel_kv_cache_append_prefix_tests COMMAND ignis_kernel_kv_
 add_executable(ignis_kernel_paged_kv_budget_test test_paged_kv_page_budget.cpp)
 target_link_libraries(ignis_kernel_paged_kv_budget_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_paged_kv_budget_test COMMAND ignis_kernel_paged_kv_budget_test)
+
+# --- P1-19 (GitHub #55): the sequence handle ABI ----------------------------
+#
+# Ours, not vendored: exercises ignis_seq_alloc/release through the public
+# ABI plus a direct device-memory zero-state check via
+# kernel/include/ignis_seq_internal.h. Real device work (cudaMalloc,
+# cudaMemset), so it follows the same no-SKIP_RETURN_CODE rule as the
+# P1-16/#52 pool tests above.
+add_executable(ignis_kernel_seq_alloc_test test_seq_alloc.cpp)
+target_link_libraries(ignis_kernel_seq_alloc_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_alloc_test COMMAND ignis_kernel_seq_alloc_test)
