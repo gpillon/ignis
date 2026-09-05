@@ -72,8 +72,8 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   `main` as `7c5e893` (fast-forward integration); `cargo test --workspace`
   green after rebuilding the kernel `.lib` to pick up the new `.cu` (the
   stale pre-#32 `.lib` was a transient LNK2019 on `ignis_decode_graph_*`).
-  Push to `origin/main` pending (the orchestrator does not push without an
-  explicit request).
+  Pushed to `origin/main` 2026-09-05 (the user authorized the push;
+  `7c5e893`, part of `575f5d5..d724c36`).
 
 - **#34: bench-04 `ignis-bench record` — the capture-proxy harness piece
   (GitHub #34, spec 03, ADR 0005/0006/0007).**
@@ -92,9 +92,9 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   record.rs` (the capture-proxy module), `crates/bench/tests/record_capture.rs`
   (the mock-target integration tests), the `record` CLI subcommand in
   `crates/bench/src/main.rs`. Landed on `main` as `fdba7ab` (fast-forward
-  integration); `cargo test --workspace` green. Push to `origin/main`
-  pending (the orchestrator does not push without an explicit request —
-  consistent with #32). This is the harness piece of the bench-03 gate-run
+  integration); `cargo test --workspace` green. Pushed to `origin/main`
+  2026-09-05 (the user authorized the push; `fdba7ab`, part of
+  `575f5d5..d724c36`). This is the harness piece of the bench-03 gate-run
   (GitHub #24); the operational run itself remains #24, PARKed for human
   execution.
 
