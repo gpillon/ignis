@@ -119,6 +119,22 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  # P1-12 (GitHub #48): the fused GDN input projection (NVFP4 arm; the conv
+  # snapshot/record kernels are vendored so they compile now but are only
+  # exercised at G3/G5) and the fused GDN gating projection (BF16 only, the
+  # reference registers no other format for it) with its own reference tests.
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/gdn_projected_conv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gdn_gating_proj.cpp
   # P1-14 (GitHub #50): the GDN family — causal_conv1d_silu, gdn_gating, and
   # the gated_delta_net recurrence (recurrent + chunked routes, the snapshot
   # form, and the replay-record entry point). gated_delta_net's replay.cpp and
