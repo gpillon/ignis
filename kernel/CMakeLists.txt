@@ -31,15 +31,16 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
 # CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44; also
-# needed by the P1-10/#46 bf16/w8 dispatch below): the vendored op wrappers'
-# public headers declare host-callable functions taking a `cudaStream_t`, and
-# the op-test harness calls the CUDA runtime API (cudaMemcpyAsync, stream
-# sync) directly from plain .cpp translation units — unlike the .cu sources,
-# MSVC's cl.exe does not see the CUDA toolkit's include/lib dirs on its own
-# for those.
+# needed by the P1-10/#46 bf16/w8 dispatch below, and by P1-16/#52's
+# paged_kv_cache/linear_attention_state, which pull cudaStream_t in through
+# core/device.h): the vendored op wrappers' public headers declare
+# host-callable functions taking a `cudaStream_t`, and the op-test harness
+# calls the CUDA runtime API (cudaMemcpyAsync, stream sync) directly from
+# plain .cpp translation units — unlike the .cu sources, MSVC's cl.exe does
+# not see the CUDA toolkit's include/lib dirs on its own for those.
 find_package(CUDAToolkit REQUIRED)
 
-# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44, #46) -
+# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44, #46, #52) -
 #
 # Verbatim copies of the reference's core, ops-common headers and (from P1-07)
 # the norm/glue op families, pinned by kernel/vendor/manifest.json and
@@ -56,7 +57,10 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/arena.cu
   ${IGNIS_VENDOR_DIR}/src/core/device.cu
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/kv_ring_bits.cu
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/linear_attention_state.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/paged_kv_cache.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/argmax.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/embed_gather.cu
@@ -105,6 +109,10 @@ target_include_directories(ignis_vendor PUBLIC
   ${IGNIS_VENDOR_DIR}/include
 )
 target_link_libraries(ignis_vendor PUBLIC CUDA::cudart)
+# CUDA::cudart above is a PUBLIC usage requirement, so its include dir
+# already covers the P1-16/#52 cl.exe .cpp problem (paged_kv_cache.cpp,
+# linear_attention_state.cpp, and their vendored tests) — no separate
+# include-only find_package needed for that.
 
 # nvfp4_w4a4_tma.cu is the warp-specialized SM120 W4A4 GEMM: it uses the CUDA
 # driver API directly (cuTensorMapEncodeTiled, for the TMA tensor-map
