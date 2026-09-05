@@ -4,10 +4,20 @@ A high-throughput inference engine for **Qwen 3.8-27B** on a single **NVIDIA
 RTX 5090** (SM120a), serving an **OpenAI-compatible HTTP API** from a Rust core
 backed by a C++/CUDA kernel leaf.
 
-**Status:** in development. v1 (the expanded single release) is code-complete;
-the next milestone is the 99% performance gate. The CUDA kernel leaf is a
-proven port used as a starting point and is re-implemented later (see ADR
-0005/0007 in `docs/adr/`).
+**Status:** early development — **the engine does not yet produce a real
+completion.** The Rust core above the step (HTTP + OpenAI surface, artifact
+reader/binder/materializer, scheduler, admission, paged-KV accounting, host
+tier, prefix index, bench harness) works and is CPU-tested; the forward pass
+does not, and is being rebuilt device-resident behind a step-level C ABI
+(ADR 0009) on top of verbatim-vendored reference kernels (ADR 0010).
+
+**Next milestone: gate G1** — a correct, device-resident forward pass at
+batch 1 with bf16 KV: coherent greedy completions on the canary suite, per-layer
+activations within bf16 tolerance of an f64 reference, ≥ 95% first-32-token
+agreement with the canary oracle, EOS honored, reproducible across loads.
+The 99% performance gate (ADR 0007) sits behind G4. The full phase/gate plan
+is `.scratch/ROADMAP.md`; the review that reset it is
+`.scratch/REVIEW-2026-09-05.md`.
 
 ---
 
@@ -21,8 +31,10 @@ new architecture that borrows proven kernel work where it helps.
   non-negotiable floor; above it, performance is the #1 objective. The
   north-star is *"the best local coding engine"* — maximum throughput **and**
   agent parallelism that saturates the GPU in prefill *and* decode.
-- **Rust core + C++/CUDA leaf.** Rust owns scheduling, KV, and serving; all GPU
-  compute lives in a static C++/CUDA library behind a flat C ABI.
+- **Rust core + C++/CUDA leaf.** Rust owns everything above the *step* —
+  scheduling, KV accounting, serving; the forward pass and all GPU compute live
+  in a static C++/CUDA library behind a flat, device-resident step-level C ABI
+  (ADR 0009).
 
 The engine is also its own dogfood target: good enough to run a developer's own
 concurrent coding agent (a "1 main agent + N subagents" load).
@@ -30,46 +42,52 @@ concurrent coding agent (a "1 main agent + N subagents" load).
 ## Architecture
 
 Two layers, plus the artifact that carries the weights and the frontend
-objects:
+objects. Items marked *(planned)* are the G1–G4 build-out, not shipped code:
 
 ```
 HTTP (OpenAI-compatible: /v1/models, /v1/chat/completions, /v1/responses)
   │
 Rust core (crates/core)
-  ├── Scheduler: batched (concurrent) prefill + N=8 decode lanes (host-tier overflow)
+  ├── Scheduler: prefill + N=8 decode lanes (host-tier overflow)
   │              + full admission state machine (protection / backfill class /
   │              temporal credit / frontier distance)
-  ├── Paged KV cache (VRAM) + block tables
-  ├── KV-RAM host tier (probation / protected eviction) + prefix reuse
-  ├── GDN (linear-attention) state
-  ├── Artifact loader (.ninfer reader + binder + materializer)
+  ├── Paged KV page accounting + block tables (device pages reported by the leaf)
+  ├── KV-RAM host tier (probation / protected eviction) + prefix reuse *(planned: G4)*
+  ├── Artifact loader (.ninfer reader + binder + materializer + device views)
   ├── Telemetry (JSONL events + interval lines)
-  └── FFI (flat C ABI, checked boundary)
+  └── crates/runtime: safe wrapper over the step ABI *(planned: G1)*
+        │
+Step-level C ABI (device-resident, opaque handles — ADR 0009)
+  model load · sequence alloc/release/snapshot · prefill(span, pos)
+  · decode round(batch) · sampling params · stats
         │
 Kernel leaf (kernel/, C++/CUDA static lib — CMake + nvcc, SM120a)
-  ├── NVFP4 GEMM / GEMV (rowsplit / grouped)
-  ├── GQA attention (prefill + decode, MRoPE)
-  ├── GDN linear-attention step
-  ├── norms / embeddings / sampling
-  └── eager CUDA-graph capture
+  ├── program: device arena, streams, the 64-layer op sequence,
+  │            sequence state (KV pages, fp32 GDN slots, conv taps)
+  └── vendored ops (verbatim from the reference, ADR 0010)
+      ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T; W4A4 + TMA at G2)
+      ├── GQA attention (bf16 paged decode + prefill; i8/hq at G4)
+      ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked at G2)
+      ├── norms / embedding / sampling
+      └── per-width decode CUDA graphs *(planned: G3)*
 ```
 
 **The model lifecycle is decoupled from the server lifecycle** (hot-reload-ready
 by construction): the KV pool, CUDA graphs, and scheduler state are regenerable
-per model. The default context envelope is 262k (the KV pool is auto-sized from
-free VRAM); the default max concurrency is N=8 (resident lanes with host-tier
-overflow, sized for a ~10-subagent concurrent workload).
+per model. The target context envelope is 262k (the KV pool auto-sized from free
+VRAM); the target max concurrency is N=8 (resident lanes with host-tier overflow,
+sized for a ~10-subagent concurrent workload).
 
 ## Repo layout
 
 ```
 ignis/
 ├── crates/
-│   ├── core/        # scheduler, paged KV, GDN state, request state machine, kernel FFI
+│   ├── core/        # scheduler, paged KV accounting, request state machine, host tier
 │   ├── artifact/    # .ninfer reader (reader / binder / materializer)
 │   ├── server/      # HTTP + OpenAI schemas + telemetry
 │   └── bench/       # trace-replay harness + canary-suite runner
-├── kernel/          # C++/CUDA leaf (CMake + nvcc) + build.ps1
+├── kernel/          # C++/CUDA leaf: program + vendored ops (CMake + nvcc) + build.ps1
 ├── bench/traces/    # recorded load traces (JSONL)
 ├── docs/            # adr/, design/, agents/
 ├── CONTEXT.md       # glossary (domain vocabulary only)
@@ -127,14 +145,26 @@ time. The resulting binary lands in the workspace target dir — on the MSVC
 triple, `target/x86_64-pc-windows-msvc/debug/ignis-server`.
 
 ```
-cargo test          # workspace-wide (GPU-bound tests are gated behind --features cuda + the artifact)
+cargo test          # workspace-wide, CPU-only and fast — never touches the GPU
 ```
+
+GPU work is checked by a separate, **explicit** suite (the GPU profile): it
+requires the 5090 to be free and **fails** — never skips — when the GPU is busy
+or a kernel errors (ADR 0006; a skip is not green for compute work). The kernel
+leaf additionally has its own CTest executable running each vendored op's
+reference test at real 27B geometry (ADR 0010).
 
 ## Usage (in development)
 
 The server is an **OpenAI-compatible** HTTP server on localhost (no auth,
 localhost-only by design). The current API surface is the v1 OpenAI API and will
 evolve as the engine matures.
+
+> **The protocol works; the model does not yet.** Until gate G1, completions
+> come from the deterministic CPU mock (`MockCompute`) — the endpoints,
+> streaming, telemetry and scheduler behavior are real, the generated text is
+> not. `--features cuda` with a real artifact loads and verifies the 19 GB of
+> weights into VRAM, but the forward pass behind it is being rebuilt.
 
 ### Configuration (environment)
 
@@ -153,7 +183,7 @@ target\x86_64-pc-windows-msvc\debug\ignis-server.exe
 ```
 
 At startup the server verifies the artifact, loads the real tokenizer + chat
-template, initializes the CUDA compute backend, then binds and serves. It prints
+template, initializes the compute backend, then binds and serves. It prints
 a one-line readiness note (`model <id> on http://<bind>`) when ready.
 
 ### API
@@ -216,10 +246,12 @@ scheduler behavior (admissions, evictions, throughput) while load runs:
 ## Credits
 
 The `.ninfer` model artifact (weights, tokenizer, and chat-template frontend
-objects) and the CUDA kernel design originate from the **NInfer** project — a
-lineage of Windows-oriented local-inference forks. The ignis kernel leaf is a
-port of that work, used as a proven starting point (ADR 0005) and re-implemented
-later.
+objects) and the CUDA ops originate from the **NInfer** project — a lineage of
+Windows-oriented local-inference forks. The ignis kernel leaf **vendors those
+ops verbatim** (Apache-2.0, under a pinned-commit manifest — ADR 0010; see
+`kernel/NOTICE`) as a proven starting point (ADR 0005); our own kernels come
+later, per op family and gated by measurement. The program layer above them
+(the forward pass, the sequence state, the step ABI) is ours.
 
 With thanks to the NInfer project and its contributors:
 

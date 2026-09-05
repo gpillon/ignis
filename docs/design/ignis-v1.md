@@ -3,12 +3,21 @@
 Grilled and settled 2026-09-02. This document is the shared understanding;
 ADRs in `docs/adr/` carry the decisions that are hard to reverse.
 
+> **Status note (2026-09-05).** The goals, the architecture *shape* and the
+> acceptance philosophy below still hold. What changed after the project
+> review (`.scratch/REVIEW-2026-09-05.md`): the engine has never produced a
+> real completion, the ABI moved from the operator level to the **step** level
+> with the forward pass in the leaf (ADR 0009), ops are **vendored verbatim**
+> under a manifest (ADR 0010), and the "one expanded v1 release" milestone
+> plan is replaced by the **phase / gate plan** in §3. Read §2 as the target
+> architecture, not as shipped code.
+
 ## 1. Goals / non-goals
 
 **Goal:** a Rust inference engine (`ignis`) specialized for Qwen 3.8-27B on a
-single RTX 5090 (SM120a), serving OpenAI-compatible HTTP, reaching reference-parity
-performance and architected for the later performance features (lazy CUDA graph,
-hot reload, tagged lanes).
+single RTX 5090 (SM120a), serving OpenAI-compatible HTTP, reaching ≥ 99% of the
+reference's performance and architected for the later performance features
+(per-width CUDA graphs, hot reload, tagged lanes).
 
 **Performance-first (ADR 0005) + north-star:** ignis is **our engine — a new
 architecture, not a recreation of the reference (ninfer)**. The reference is a
@@ -37,19 +46,28 @@ Rust core
   │               backfill class / temporal credit / frontier distance)
   ├── Paged KV cache (VRAM) + block tables
   ├── KV-RAM host tier (probation/protected eviction; pulled into v1, not v1.1)
-  ├── GDN state management (resumable at checkpoint/frontier boundaries only)
-  ├── Artifact loader (.ninfer reader: reader + binder + materializer, Rust)
+  ├── Artifact loader (.ninfer reader: reader + binder + materializer + device views)
   ├── Telemetry (JSONL events + interval lines)
-  └── FFI (flat C ABI, checked boundary)
+  └── Runtime wrapper (safe Rust over the step ABI; handles + Drop)
+        │
+Step-level C ABI (ADR 0009): device-resident, opaque handles, flat C
+  model load · sequence alloc/release/snapshot/restore · prefill(span, pos)
+  · decode round(batch) · sampling params · stats
         │
 Kernel leaf (C++/CUDA static library, CMake + nvcc, SM120a)
-  ├── NVFP4 GEMM (rowsplit/grouped MMA, cp.async pipelines)
-  ├── GQA attention (prefill + decode, MRoPE 3-axis)
-  ├── GDN linear-attention step
-  ├── sampling, embeddings, norms
-  └── CUDA graph capture (eager at startup in v1; lazy = later optimization)
+  ├── program (ours): device arena + streams + the 64-layer op sequence
+  │                   + sequence state (KV pages, fp32 GDN slots, conv taps)
+  └── vendored ops (verbatim, ADR 0010)
+      ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T, W4A4 + TMA)
+      ├── GQA attention (prefill + decode, paged KV) + RoPE + q/k norm
+      ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked)
+      ├── sampling, embeddings, norms
+      └── decode CUDA graphs, captured per batch width
 ```
 
+- **Rust owns everything above the step; the leaf owns the step** (ADR 0009).
+  No host activation pointer crosses the ABI; activations, KV and GDN state
+  live in VRAM for the lifetime of a sequence.
 - **Model lifecycle is decoupled from server lifecycle** (hot-reload-ready by
   construction): KV pool, CUDA graphs, and scheduler state are regenerable per
   model; in-flight requests finish or restart per a defined policy.
@@ -58,19 +76,35 @@ Kernel leaf (C++/CUDA static library, CMake + nvcc, SM120a)
 - **Default N (max concurrency) 8** (resident lanes, with host-tier overflow;
   sized for a ~10-subagent concurrent coding workload).
 
-## 3. Milestones
+## 3. Milestones — the phase / gate plan
 
-| Milestone | Scope |
-|---|---|
-| v1 | core: **batched (concurrent) prefill** + **N=8** decode lanes (host-tier overflow), paged KV + **KV-RAM host tier** (probation/protected eviction) + **prefix reuse**, full admission state machine, OpenAI API (minimal + responses), `.ninfer` loader, eager CUDA graph, telemetry, trace-replay bench harness, **performance gate (99%, not parity)**, hot-reload-ready architecture. *One release — max feature throughput, max risk (chosen deliberately).* |
-| v1.1 | *(KV-RAM host tier + prefix reuse pulled into v1)* — empty for now |
-| v1.2 | DFlash2 speculative decoding (draft tokens 1..7) |
-| v1.3 | MTP (adaptive verification width) |
-| v1.4 | vision/multimodal |
-| later | **re-implement the CUDA kernels** (guided by the north-star; ADR 0005), lazy CUDA graph capture, web UI (React+Vite+TS, same repo, CLI-disableable), hot reload, tagged lanes, other SM120a quantization formats |
+Replaces the original "one expanded v1 release" table (2026-09-05, after the
+project review). Every phase ends in a **GPU-measured gate**; no phase is done
+on CPU tests. Tickets and blocking live on GitHub; the decomposition lives in
+`.scratch/ROADMAP.md`.
+
+| Phase | Gate | Scope |
+|---|---|---|
+| **0 — reset the ground truth** (done) | — | The review; the step ABI and vendoring decisions (ADR 0009 / 0010); this docs reset; the GPU test profile; deleting the superseded forward, toy graphs and scalar kernels. |
+| **1 — correct device-resident forward** | **G1**: coherent greedy completions on the canary suite; per-layer output within bf16 tolerance of the f64 layer reference; ≥ 95% first-32-token agreement with the canary oracle; EOS honored; reproducible across loads. | The leaf program (arena, streams, layer sequence, sequence state); the vendored op families (linear, norms, endpoints, GQA attention + RoPE, GDN); the step ABI; the Rust runtime crate; server end-to-end on one request. Batch 1, bf16 KV, per-token prefill. |
+| **2 — real prefill** | **G2**: TTFT at 8K / 32K ≤ 1.5× the reference's MTP0. | Chunked prefill (1024) with W4A4 activation quant + the TMA GEMM, tensor-core prefill attention with KV append, the GDN chunked kernels. |
+| **3 — serving loop** | **G3**: C=1 decode ≥ 99% of the reference (75–76 tok/s); C=4 aggregate ≥ 99%. | One batched decode round for all decode-ready lanes; a decode CUDA graph per batch width with eager fallback; sampling (temperature / top-p / top-k / penalties, seed); the KV pool bound to real device pages; request-log JSONL. |
+| **4 — the reference feature floor** | **G4**: the **99% performance gate** (ADR 0007) — the bench trace-replay gate on a recorded "1 main + N subagents" load, hq-e8-2b on both sides. | hq-e8-2b KV + exact-key side store; device prefix reuse (page refcount, shared boundary); the KV-RAM host tier's real snapshot/restore; tagged lanes; preserve-thinking and tool-call stream hardening; warmup/readiness split. |
+| **5 — speculative decoding** | **G5**: ≥ 99% of the reference's MTP7-adaptive / DFlash2-7 committed tok/s at 24K / 98K / 196K. | MTP (round, pack, adaptive width, ReplaySSM records) first; DFlash2 (drafter module + draft kernels + RAM-tier carry) second. |
+| **6 — beyond the reference** (north star) | per-item | Concurrent prefill across requests / prefill-decode overlap, fusion + PDL everywhere, lazy graph capture, hot reload, our own NVFP4 artifact recipe, lane QoS, **our own kernels per measured family** (ADR 0010). Vision and a web UI sit here too. |
+
+The KV-RAM host tier, prefix reuse and the full admission state machine were
+pulled into "v1"; they exist as a CPU-tested control plane and are bound to
+real device state at G3 / G4. Kernel re-implementation stays where ADR 0005
+put it: after the engine works and dogfoods, per family, gated by measurement.
 
 ## 4. Acceptance (v1)
 
+- **The correctness floor comes first (G1), the performance gate after (G4).**
+  The floor is measured, not eyeballed: per-layer output within bf16 tolerance
+  of an f64 layer reference, and ≥ 95% first-32-token agreement with the canary
+  oracle. That is a *self-check that the model is computed*, not a parity
+  target.
 - **Greedy + fixed seed.** **Performance gate (ADR 0007): ≥ 99% of the
   reference's performance** (throughput / latency) on the trace-replay load,
   with a per-class ttft/tok-s check. **Not** token-agreement — correctness is
@@ -102,11 +136,12 @@ Kernel leaf (C++/CUDA static library, CMake + nvcc, SM120a)
 ```
 ignis/
 ├── crates/
-│   ├── core/          # scheduler, paged KV, GDN state, request state machine
-│   ├── artifact/      # .ninfer reader (reader/binder/materializer port)
+│   ├── core/          # scheduler, paged KV accounting, request state machine
+│   ├── artifact/      # .ninfer reader (reader/binder/materializer/device views)
+│   ├── runtime/       # (G1) safe Rust wrapper over the step ABI
 │   ├── server/        # HTTP + OpenAI schemas + telemetry
 │   └── bench/        # trace-replay harness + canary suite runner
-├── kernel/            # C++/CUDA leaf (CMake + nvcc; NOTICE for provenance)
+├── kernel/            # C++/CUDA leaf: program + vendored ops (CMake + nvcc; NOTICE + manifest)
 ├── bench/traces/      # recorded load traces (JSONL)
 ├── docs/              # adr/, design/ (this file), agents/
 ├── webui/             # (v1.4+ / later phase) React+Vite+TS, same repo
@@ -120,9 +155,10 @@ ignis/
   batched prefill is useless; measure (north-star) before relying on it. It
   changes the kernel's accumulation order, so it is re-gated by the 99%
   performance gate (ADR 0007).
-- **GEMM / kernel port (proven starting point):** the ported CUDA kernels are a
-  *temporary* starting point; we re-implement them later (ADR 0005). The 99%
-  performance gate (not byte-parity) measures residual drift vs the reference.
+- **Vendored ops (proven starting point):** the ops are vendored verbatim from
+  the reference under a manifest (ADR 0010) as a *temporary* starting point; we
+  write our own later, per measured family (ADR 0005). Hand-written stand-ins
+  carrying a port claim are what the 2026-09-05 review found and deleted.
 - **Expanded v1 (one release):** max feature throughput, max risk — the
   scheduler (admission + batched prefill + N=8 + host tier) is the
   highest-risk module and gets the most test coverage.
