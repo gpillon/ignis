@@ -121,8 +121,20 @@ op family with a public API:
   cannot share a binary with another. Cases already exercise real 27B widths
   (hidden 5120, GDN norm 128/head, MLP intermediate 17408).
 
+P1-08 (GitHub #44) adds the second op family: **embedding** (dense BF16,
+Q6G64_F16S, W8G32_F16S, FP8_E4M3FN_ROW_BF16S gather —
+`ops/kernel/embed_gather.cuh`, `ops/launcher/embed_gather.{h,cu}`,
+`ops/wrapper/embedding.cpp`, its `ninfer/ops/embedding.h` public header, and
+the FP8 geometry validator `ops/linear/fp8/fp8_format.{h,cpp}` the wrapper
+dispatches through) and **argmax** (`ops/kernel/argmax.cuh`,
+`ops/launcher/argmax.{h,cu}`, `ops/wrapper/argmax.cpp`, `ninfer/ops/argmax.h`),
+each with its reference op test (`tests/ops/test_embedding.cpp`,
+`tests/ops/test_argmax.cpp`) built by the same `ignis_<op>_test` CTest loop as
+P1-07 (`ignis_embedding_test`, `ignis_argmax_test`) — without the reference's
+`SKIP_RETURN_CODE 77` (ADR 0006: a missing GPU fails here, never skips).
+
 The remaining op families (NVFP4 / BF16 / W8G32 linear, the fused
-projections, attention, GDN, the state pools) arrive with P1-08..P1-16, each
+projections, attention, GDN, the state pools) arrive with P1-09..P1-16, each
 adding its files to this manifest and its reference op test to the leaf's
 test suite.
 

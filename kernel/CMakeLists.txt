@@ -30,14 +30,15 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
-# CUDA::cudart (P1-07, GitHub #43): the vendored op wrappers' public headers
-# declare host-callable functions taking a `cudaStream_t`, and the op-test
-# harness calls the CUDA runtime API (cudaMemcpyAsync, stream sync) directly
-# from plain .cpp translation units — unlike the .cu sources, MSVC's cl.exe
-# does not see the CUDA toolkit's include/lib dirs on its own for those.
+# CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44): the
+# vendored op wrappers' public headers declare host-callable functions taking
+# a `cudaStream_t`, and the op-test harness calls the CUDA runtime API
+# (cudaMemcpyAsync, stream sync) directly from plain .cpp translation units —
+# unlike the .cu sources, MSVC's cl.exe does not see the CUDA toolkit's
+# include/lib dirs on its own for those.
 find_package(CUDAToolkit REQUIRED)
 
-# --- the vendored reference substrate (ADR 0010, GitHub #42, #43) ----------
+# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44) -----
 #
 # Verbatim copies of the reference's core, ops-common headers and (from P1-07)
 # the norm/glue op families, pinned by kernel/vendor/manifest.json and
@@ -56,11 +57,16 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/argmax.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/embed_gather.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/l2norm.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/residual_add.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/rmsnorm.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/sigmoid_gate_mul.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/silu_and_mul.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/fp8/fp8_format.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/argmax.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/embedding.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/l2norm.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/residual_add.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/rmsnorm.cpp

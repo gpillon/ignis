@@ -12,6 +12,14 @@
       "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
     {
+      "path": "include/ninfer/ops/argmax.h",
+      "sha256": "ada7a7b8db39b487e6f650fffff6334ecdfa9f9d723e3a4e74bf09eb3d0c8b37"
+    },
+    {
+      "path": "include/ninfer/ops/embedding.h",
+      "sha256": "dc5d91ed6e179dbf20c21f8753ff7519267e1af31224b6bc948e33c508608651"
+    },
+    {
       "path": "include/ninfer/ops/gated_rmsnorm.h",
       "sha256": "0ed6fc49679522326ae0209367b4f9230afea301a3e74adaa38a9aa1904e5661"
     },
@@ -132,6 +140,14 @@
       "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
     },
     {
+      "path": "src/ops/kernel/argmax.cuh",
+      "sha256": "4923d9f8c61d5c0f412247fc2a8e33547149d9c7018fdaadeb4969bf1603eacc"
+    },
+    {
+      "path": "src/ops/kernel/embed_gather.cuh",
+      "sha256": "041e27ca7dad3cd329a163ca3e9b36a1020b6487637d3833dbc53fb941087a7c"
+    },
+    {
       "path": "src/ops/kernel/l2norm.cuh",
       "sha256": "e22ab6c5eff579edb2f13f9667364ade066f3e4dc7cd480cd29e315fe8d2fcf6"
     },
@@ -150,6 +166,22 @@
     {
       "path": "src/ops/kernel/silu_and_mul.cuh",
       "sha256": "9cc30898b56c15c306bef81fda881b8da59020a141e24bac7291408b267e6a61"
+    },
+    {
+      "path": "src/ops/launcher/argmax.cu",
+      "sha256": "8d121df0d405311e0fe82a6bb7260ca5494f20b5e208575ae4e5466e9bc81981"
+    },
+    {
+      "path": "src/ops/launcher/argmax.h",
+      "sha256": "6e8786c5987878bf8edd782e4cacd9d8baa68eec61de67be3ab33e68b156d6b8"
+    },
+    {
+      "path": "src/ops/launcher/embed_gather.cu",
+      "sha256": "c4da1ee6de08c7f4c814930bfee52b089eb488a48f4a1c0eddc9182c9be58e1f"
+    },
+    {
+      "path": "src/ops/launcher/embed_gather.h",
+      "sha256": "777f68c7ff272320e7cf2a7515f844d01aeb560039908d4138ade7f3175f0b5a"
     },
     {
       "path": "src/ops/launcher/l2norm.cu",
@@ -192,12 +224,28 @@
       "sha256": "f281da090dd508eedd54f0de117cef30b286be34cbec139a4125b2209d7e3ccf"
     },
     {
+      "path": "src/ops/linear/fp8/fp8_format.cpp",
+      "sha256": "43aebfe72e458f5ec00a042d1e95b824c5fa26591eaa64e5514744a31ee54077"
+    },
+    {
+      "path": "src/ops/linear/fp8/fp8_format.h",
+      "sha256": "1af9c3aac5a1c4dbd20613cdc9fb26a58955b5b4f212abc7957f89fe0efceebe"
+    },
+    {
       "path": "src/ops/linear/q4/q4_rowsplit_storage.cuh",
       "sha256": "c3443c5a913c5711c78c8039e6dd1b71d16bbd9dcbece705d761f58f4961847a"
     },
     {
       "path": "src/ops/linear/q5/q5_rowsplit_storage.cuh",
       "sha256": "f0258cfddad24f99372b474858fbc7605101d24202a865adba16614ae63ee93a"
+    },
+    {
+      "path": "src/ops/wrapper/argmax.cpp",
+      "sha256": "d28b3b2f52432fbe059ad097052c7343bb9bf170dd0b5ca322e2f675dbadbfa7"
+    },
+    {
+      "path": "src/ops/wrapper/embedding.cpp",
+      "sha256": "58d3638f0e25207ed917a4388260390336707de455bcbf37488e13bcabd58060"
     },
     {
       "path": "src/ops/wrapper/l2norm.cpp",
@@ -230,6 +278,14 @@
     {
       "path": "tests/ops/op_tester.h",
       "sha256": "2db18a2461ec11744225ec16c605061738b9c1da2f6bf64a9cfdd325139e06fa"
+    },
+    {
+      "path": "tests/ops/test_argmax.cpp",
+      "sha256": "1f6e8daef75487637c5ed96b5e3dddf1d53c195e73dc6e38bced50f77563f272"
+    },
+    {
+      "path": "tests/ops/test_embedding.cpp",
+      "sha256": "a262a90b83b3ec9e5cda1ee889231eb30bf84264dc20d04ab441d04dca2dd44c"
     },
     {
       "path": "tests/ops/test_gated_rmsnorm.cpp",

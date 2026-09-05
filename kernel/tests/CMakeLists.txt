@@ -24,7 +24,8 @@ target_link_libraries(ignis_kernel_op_tests PRIVATE ignis_vendor)
 
 add_test(NAME ignis_kernel_op_tests COMMAND ignis_kernel_op_tests)
 
-# --- vendored reference op tests (P1-07, GitHub #43: norms + glue) ---------
+# --- vendored reference op tests (P1-07 GitHub #43: norms + glue; P1-08
+# GitHub #44: embedding + argmax) ---------------------------------------
 #
 # Each entry is a reference `tests/ops/test_<op>.cpp`, vendored verbatim
 # (kernel/vendor/manifest.json) and built here as its own CTest executable.
@@ -38,6 +39,8 @@ set(ignis_vendored_op_tests
   residual_add
   silu_mul
   sigmoid_mul
+  embedding
+  argmax
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)
