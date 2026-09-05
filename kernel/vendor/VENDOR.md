@@ -166,11 +166,6 @@ file brings its own `main()`, so it cannot be another source in
 `ignis_vendor` but are not exercised by this test; their own reference test
 (`test_nvfp4_a4.cpp`) is out of scope until G2.
 
-The remaining op families (BF16 / W8G32 linear, the fused projections,
-attention, GDN, the state pools) arrive with P1-10..P1-16, each adding its
-files to this manifest and its reference op test to the leaf's test
-executable.
-
 P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
 
 - **BF16 linear** — `src/ops/linear/bf16/` in full (GEMV, small-T, MMA) plus
@@ -239,6 +234,30 @@ linear+residual output projection, NVFP4 and BF16 arms only:
   for every other qtype; the Q4/Q5 dual-weight `attn_input_proj` overload and
   the W8 single/companion overloads declared in the vendored header are never
   defined, matching that nothing in the trimmed test calls them.
+
+P1-16 (GitHub #52) adds the sequence-state pools:
+
+- **paged KV pool** — `core/paged_kv_cache.{h,cpp}`: pages, entitlements,
+  block-table rows, selective zeroing, multi-pool reserve/resize bundles.
+- **linear-attention state pool** — `core/linear_attention_state.{h,cpp}`:
+  per-slot recurrent fp32 state + BF16/FP32 conv taps, copy/zero/pack/unpack.
+- **ring bits** — `core/kv_ring_bits.{h,cu}`: the hq-e8-2b residual-ring
+  validity-word helper, vendored with its public header even though no
+  current op enables the feature (kept dangling-include-free like q4/q5
+  above).
+- their reference tests, `tests/test_kv_cache.cpp` and
+  `tests/test_state_store.cpp`, each its own CTest executable
+  (`ignis_vendor_kv_cache_test`, `ignis_vendor_state_store_test`) since each
+  is its own `main()`.
+- the leaf's own `ignis_paged_kv_page_budget` (`kernel/include/ignis_paged_kv_budget.h`,
+  `kernel/src/paged_kv_budget.cu`) — not vendored, ours: reports page count /
+  bytes for a VRAM budget and plane geometry, routed through
+  `plan_paged_kv_pool` so it can't drift from what the pool itself allocates.
+
+The remaining op families (the fused GDN projections, SwiGLU MLP, GQA
+attention, the GDN recurrence family) arrive with P1-12..P1-15, each adding
+its files to this manifest and its reference op test to the leaf's test
+suite.
 
 ## Updating to a newer reference commit
 

@@ -50,8 +50,10 @@ pub use frontend::{
     Role, ToolCall, Tokenizer,
 };
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
-pub use normalize::{dequant_w8_endpoints, normalize_tensor, NormalizedTensor, W8Endpoints};
-pub use inventory::{InventoryEntry, OUT_OF_SCOPE_TEXT_NAMES, text_scope_27b};
+pub use normalize::{normalize_tensor, NormalizedTensor};
+pub use inventory::{
+    bind_text_scope_27b, InventoryEntry, OUT_OF_SCOPE_TEXT_NAMES, text_scope_27b,
+};
 
 // ---------------------------------------------------------------------------
 // Errors

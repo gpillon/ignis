@@ -80,6 +80,14 @@
       "sha256": "13ab4e833debe24baf9294a9d8eefc3f61a182b914e8a128d1725be3d93574ed"
     },
     {
+      "path": "src/core/kv_ring_bits.cu",
+      "sha256": "ca4548f5a3d5eb1fd0302ca5767e01498d91cdfe320cd0570a2baf319be51416"
+    },
+    {
+      "path": "src/core/kv_ring_bits.h",
+      "sha256": "dccf31e22b14ffc555a3dfb1a7e802be3dbb574bcffd21d2cc634d8cb6945445"
+    },
+    {
       "path": "src/core/layout.cpp",
       "sha256": "ee9f6cf62eb6aa4d27b0b946e3ca3a62eeb70c3a1f7b8b696b3fd2158b7d45aa"
     },
@@ -88,12 +96,28 @@
       "sha256": "1e5ef267fd354444795c830f16f9e5b7a6fe59845a59c5b0a6e008fbd2c9ee47"
     },
     {
+      "path": "src/core/linear_attention_state.cpp",
+      "sha256": "97f61d6d85a8bafa2ea924c412e3e0dd3f7b5b2b2c3659162edccb02b09147fc"
+    },
+    {
+      "path": "src/core/linear_attention_state.h",
+      "sha256": "912f63b74941e5534c994058a0f1821bef67652895d1c61d3ae14f7ef51e72a5"
+    },
+    {
       "path": "src/core/nvtx.h",
       "sha256": "608429a6e1c297635e075ec619bceba1622bf7f71878bf95e8e9f78741d79957"
     },
     {
       "path": "src/core/nvtx_range.h",
       "sha256": "5a0d72018262be74900327c8521c8780e19ed9f1ad52ba98c1c0d8f29094961f"
+    },
+    {
+      "path": "src/core/paged_kv_cache.cpp",
+      "sha256": "d608a0ddab480412cfeac1543186f140b33e3369d743011f4cb9cdb574b4c8a0"
+    },
+    {
+      "path": "src/core/paged_kv_cache.h",
+      "sha256": "9b02339d37a22ced1979d1f0bdbc44c75f92cf565bc8834577356f282c8664a8"
     },
     {
       "path": "src/core/pdl.cuh",
@@ -647,6 +671,14 @@
     {
       "path": "tests/ops/test_silu_mul.cpp",
       "sha256": "6dc32f21bfa2dbc041762110771bbe5e98069e8735dd39cdf125c7630a45a0a6"
+    },
+    {
+      "path": "tests/test_kv_cache.cpp",
+      "sha256": "f8429a1ee6a9f6f77140381705a6a4f26b8656236cae4f43e21526a4f5b7450e"
+    },
+    {
+      "path": "tests/test_state_store.cpp",
+      "sha256": "f5b6c3dd1efd624649dfbaccbaa4200a3ebc7f65a022acd5a00b2c579d4ed210"
     }
   ]
 }

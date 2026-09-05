@@ -10,6 +10,9 @@
 //!   will be parameterized by, once the vendored compute adapter lands
 //!   (GitHub #39 deleted the superseded flat-C-ABI forward; the
 //!   replacement is tracked at `.scratch/ROADMAP.md`, P1-24 / #60)
+//! - the model-load step ABI call (`model_load`, feature `cuda`, GitHub
+//!   #53 / ADR 0009): builds the bound-tensor + topology descriptors the
+//!   kernel leaf's `ignis_model_load` consumes
 //!
 //! The **public contract** (what `ignis-server` and tests code against) is
 //! [`types`] + [`scheduler`]: the [`Scheduler`] trait is driven by the
@@ -26,6 +29,8 @@ pub mod gpu_profile;
 pub mod host;
 pub mod kv;
 pub mod mock;
+#[cfg(feature = "cuda")]
+pub mod model_load;
 pub mod prefix;
 pub mod request;
 pub mod scheduler;
