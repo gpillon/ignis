@@ -13,7 +13,9 @@
 //! artifact-02's artifact-backed tokenizer replaces it through the same
 //! constructor injection. The compute backend is injected through the
 //! scheduler: this entrypoint drives the deterministic mock (CPU-only,
-//! ADR 0006) until the kernel-leaf `Compute` adapter lands.
+//! ADR 0006) until the vendored `Compute` adapter lands (GitHub #39
+//! deleted the superseded flat-C-ABI forward; the replacement is tracked
+//! at `.scratch/ROADMAP.md`, P1-24 / #60).
 //!
 //! Configuration (environment):
 //! - `IGNIS_MODEL` — the loaded model id (default `qwen3.8-27b`; what
@@ -35,8 +37,6 @@ use ignis_core::{
     mock::MockCompute,
     Compute, ConcreteScheduler, SchedulerConfig,
 };
-#[cfg(feature = "cuda")]
-use ignis_core::CudaCompute;
 use ignis_server::{
     engine::Engine,
     loader,
@@ -61,27 +61,11 @@ async fn main() {
     let model = env("IGNIS_MODEL", DEFAULT_MODEL);
     let bind = env("IGNIS_BIND", DEFAULT_BIND);
 
-    // The compute seam (kernel-abi 04): the production `CudaCompute`
-    // (the kernel-leaf forward pass) when the `cuda` feature is on + an
-    // artifact is configured; the deterministic `MockCompute` (CPU-only,
-    // ADR 0006 dev mode) otherwise.
+    // The compute seam: the deterministic `MockCompute` (CPU-only, ADR 0006
+    // dev mode) — the production adapter (the vendored `Compute` backend,
+    // P1-24 / #60) is not landed yet (GitHub #39 deleted the superseded
+    // flat-C-ABI forward it replaces).
     let artifact = env("IGNIS_ARTIFACT", "");
-    #[cfg(feature = "cuda")]
-    let compute: Arc<dyn Compute> = if artifact.is_empty() {
-        Arc::new(MockCompute::new())
-    } else {
-        match CudaCompute::from_artifact(std::path::Path::new(&artifact), &model) {
-            Ok(c) => {
-                eprintln!("ignis-server: {artifact} — CUDA compute backend loaded (kernel-abi 04)");
-                Arc::new(c)
-            }
-            Err(e) => {
-                eprintln!("ignis-server: {artifact}: compute init failed: {e} — refusing to start");
-                std::process::exit(1);
-            }
-        }
-    };
-    #[cfg(not(feature = "cuda"))]
     let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {

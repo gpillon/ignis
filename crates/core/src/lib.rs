@@ -6,7 +6,10 @@
 //! - paged KV cache in VRAM + block tables
 //! - GDN state management (resumable at checkpoint/frontier boundaries only)
 //! - request state machine (admit → prefill → decode → done / evict)
-//! - flat C ABI bindings to the kernel leaf (ADR 0001, `ffi.rs`)
+//! - the model topology config (`compute::ModelConfig`) the forward pass
+//!   will be parameterized by, once the vendored compute adapter lands
+//!   (GitHub #39 deleted the superseded flat-C-ABI forward; the
+//!   replacement is tracked at `.scratch/ROADMAP.md`, P1-24 / #60)
 //!
 //! The **public contract** (what `ignis-server` and tests code against) is
 //! [`types`] + [`scheduler`]: the [`Scheduler`] trait is driven by the
@@ -18,8 +21,8 @@
 pub mod admission;
 pub mod compute;
 pub mod concrete;
-pub mod ffi;
 pub mod gdn;
+pub mod gpu_profile;
 pub mod host;
 pub mod kv;
 pub mod mock;
@@ -32,11 +35,7 @@ pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
     ProtectionPhase, RetainedLaneCandidate,
 };
-pub use compute::{
-    CudaCompute, GraphGeometry, Weights,
-    rope_inv_frequencies, HeadWeight, LayerGeometry, LayerKind, ModelConfig, Nvfp4Weight,
-    WeightsGeometry,
-};
+pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{ConcreteScheduler, SchedulerConfig};
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;

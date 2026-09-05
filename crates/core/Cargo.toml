@@ -1,6 +1,6 @@
 [package]
 name = "ignis-core"
-description = "ignis: scheduler, paged KV, GDN state, request state machine, kernel FFI"
+description = "ignis: scheduler, paged KV, GDN state, request state machine, model topology config"
 version.workspace = true
 edition.workspace = true
 
@@ -8,7 +8,8 @@ edition.workspace = true
 ignis-artifact = { path = "../artifact" }
 
 [features]
-# The CUDA build (ADR 0001): enables the kernel-leaf device surface (the
-# artifact's `cuda` feature) + the `CudaCompute::from_artifact` constructor
-# (the compute-adapter's production path, kernel-abi 04).
+# Forwards to the artifact crate's `cuda` feature (the VRAM materialization
+# path, ADR 0002). ignis-core itself has no CUDA-coupled code since GitHub
+# #39 deleted the superseded compute adapter; this flag exists so
+# `ignis-server`'s `cuda` feature can still reach `ignis-artifact/cuda`.
 cuda = ["ignis-artifact/cuda"]
