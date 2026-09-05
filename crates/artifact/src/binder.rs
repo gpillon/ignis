@@ -201,6 +201,22 @@ impl<'a> Binder<'a> {
         Ok(())
     }
 
+    /// Build a plan from the placements made so far, without requiring
+    /// every directory object to be consumed.
+    ///
+    /// For a binder scoped to less than the whole directory (e.g. the
+    /// text-scope model load, which leaves vision / MTP / frontend objects
+    /// untouched) — [`Binder::finish`] stays the ADR 0002 contract for a
+    /// binder that owns the whole artifact.
+    pub fn plan(&self) -> MaterializationPlan {
+        MaterializationPlan {
+            object_count: self.consumed.iter().filter(|&&c| c).count(),
+            device_capacity_bytes: self.capacity,
+            device_objects: self.device_objects.clone(),
+            host_objects: self.host_objects.clone(),
+        }
+    }
+
     /// Finish binding: every object consumed, every object placed.
     ///
     /// ADR 0002 — an unconsumed object is a load failure: `finish()` errors

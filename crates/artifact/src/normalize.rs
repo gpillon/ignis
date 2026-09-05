@@ -15,9 +15,12 @@
 //!   params `a_log` / `dt_bias`, the `*_input_scale_divisor` scalars — the
 //!   kernels consume the format directly).
 //! - **W8 / Q4 / Q5 / Q6** (`row-split-k128-v1`): the *exceptional* formats
-//!   — **dequantized to bf16** (the `text/token_embedding` +
-//!   `text/output_head` W8G32 endpoints, the mtp weights, the vision
-//!   backbone).
+//!   — **dequantized to bf16** by [`normalize_tensor`] (not yet wired to a
+//!   consumer for the mtp weights / vision backbone). The two W8G32 text
+//!   endpoints (`text/token_embedding` + `text/output_head`) are the one
+//!   case this rule no longer applies to: P1-17 (GitHub #53) exports them
+//!   as device views like every other text-scope tensor instead of a
+//!   host-side dequant — see [`crate::bind_text_scope_27b`].
 //!
 //! The dequant math is the reference's rowsplit decode atoms
 //! (`linear/{w8,q4,q5,q6}/*_rowsplit_storage.cuh`): per-group F16 scale
@@ -32,8 +35,8 @@
 //! for v1 text; see the [`crate::inventory`] scope rule).
 
 use crate::{
-    block_scale_geometry, fail, row_split_geometry, tensor_encoded_size, NumericFormat, Object,
-    Result, StorageLayout, Reader,
+    block_scale_geometry, fail, row_split_geometry, tensor_encoded_size, NumericFormat, Result,
+    StorageLayout,
 };
 
 // ---------------------------------------------------------------------------
@@ -271,66 +274,6 @@ fn dequant_row_split_bf16(
         cols: g.columns,
         data,
     })
-}
-
-// ---------------------------------------------------------------------------
-// The W8 endpoint dequant (the A1 exceptional formats, host-side, ADR 0005)
-// ---------------------------------------------------------------------------
-
-/// The two W8 text-scope endpoints dequantized to host-side bf16 (the A1
-/// exceptional formats, ADR 0005): the `text/token_embedding` (the embedding
-/// table) + the `text/output_head` (the lm_head). Only these two tensors are
-/// materialized to the host — the NVFP4 GEMM planes stay device-resident (not
-/// host-copied; the #26 lesson: no host-weight explosion on the load path).
-#[derive(Debug, Clone)]
-pub struct W8Endpoints {
-    /// The `text/token_embedding` (W8G32 -> bf16, the embedding table
-    /// `[vocab][hidden]`).
-    pub embedding: Vec<u16>,
-    /// The embedding's stored shape (the `text/token_embedding`'s
-    /// `[rows][cols]` = `[vocab][hidden]`).
-    pub embedding_shape: (u64, u64),
-    /// The `text/output_head` (W8G32 -> bf16, the lm_head `[vocab][hidden]`).
-    pub lm_head: Vec<u16>,
-    /// The lm_head's stored shape (the `text/output_head`'s `[rows][cols]`
-    /// = `[vocab][hidden]`).
-    pub lm_head_shape: (u64, u64),
-}
-
-/// Dequantize the two W8 text-scope endpoints (the `text/token_embedding` +
-/// the `text/output_head`, the A1 exceptional formats) to host-side bf16
-/// (ADR 0005). Only these two tensors are read + copied to the host (the
-/// NVFP4 GEMM planes stay device-resident — the #26 lesson: no host weight
-/// explosion on the load path; the whole-text-scope copy is A3's, not A1's).
-pub fn dequant_w8_endpoints(reader: &Reader) -> Result<W8Endpoints> {
-    let (embedding, embedding_shape) = dequant_w8_endpoint(reader, "text/token_embedding")?;
-    let (lm_head, lm_head_shape) = dequant_w8_endpoint(reader, "text/output_head")?;
-    Ok(W8Endpoints {
-        embedding,
-        embedding_shape,
-        lm_head,
-        lm_head_shape,
-    })
-}
-
-/// One W8 endpoint's dequant (the reader's `name` -> the dequantized bf16
-/// buffer + the stored shape, the `normalize_tensor` result's `DequantBf16`
-/// variant).
-fn dequant_w8_endpoint(reader: &Reader, name: &str) -> Result<(Vec<u16>, (u64, u64))> {
-    let object = reader
-        .find(name)
-        .ok_or_else(|| fail(format!("the W8 endpoint `{name}` is absent from the artifact")))?;
-    let Object::Tensor(desc) = object else {
-        return Err(fail(format!("`{name}` is not a tensor object")));
-    };
-    let span = reader.payload_at(object)?;
-    match normalize_tensor(&desc.shape, desc.format, desc.layout, span.data)? {
-        NormalizedTensor::DequantBf16 { rows, cols, data } => Ok((data, (rows, cols))),
-        other => Err(fail(format!(
-            "`{name}` must normalize to the dequantized bf16 (the W8 exceptional format), \
-             got {other:?}"
-        ))),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -812,85 +755,4 @@ mod tests {
         }
     }
 
-    /// A fixture holding the two W8 endpoints (`text/token_embedding` +
-    /// `text/output_head`, the `dequant_w8_endpoints` input). Each endpoint's
-    /// W8 payload is filled with a known code (int8 3) + scale (F16 2.0), so
-    /// the dequant is hand-computable (3 × 2.0 = 6.0 -> bf16 0x40C0).
-    fn w8_endpoint_fixture(tag: &str) -> (fixture::TempArtifact, Reader) {
-        // (name, shape) — the two W8 endpoints (small, CPU-friendly).
-        let spec: [(&str, Vec<u64>); 2] = [
-            ("text/token_embedding", vec![2, 32]),
-            ("text/output_head", vec![4, 64]),
-        ];
-        // The W8 (W8G32) geometry per shape (the encoded size + the plane
-        // offsets, the reader's invariants).
-        let geoms: Vec<_> = spec
-            .iter()
-            .map(|(_, shape)| crate::row_split_geometry(NumericFormat::W8G32F16S, shape).unwrap())
-            .collect();
-        // 256-aligned ascending offsets (the reader's invariant).
-        let mut objects = Vec::with_capacity(2);
-        let mut offsets: Vec<u64> = Vec::with_capacity(2);
-        let mut offset = 0u64;
-        for (i, (name, shape)) in spec.iter().enumerate() {
-            if !offsets.is_empty() {
-                offset = (offset + 255) / 256 * 256;
-            }
-            offsets.push(offset);
-            objects.push(fixture::FixtureObject::Tensor {
-                name: *name,
-                shape: shape.clone(),
-                format: "W8G32_F16S",
-                layout: "row-split-k128-v1",
-                offset,
-                bytes: geoms[i].encoded_bytes,
-            });
-            offset += geoms[i].encoded_bytes;
-        }
-        let total = (offset + 255) / 256 * 256;
-        let mut payload = vec![0u8; total as usize];
-        // Each endpoint's W8 payload: the code plane (int8 3) + the scale
-        // plane (F16 2.0 = 0x4000) -> the dequant is 3 * 2.0 = 6.0
-        // (bf16 0x40C0).
-        for (i, _) in spec.iter().enumerate() {
-            let g = &geoms[i];
-            let base = offsets[i] as usize;
-            payload[base..base + g.low_plane_bytes as usize].fill(3i8 as u8);
-            let scale_off = base + g.scale_plane_offset as usize;
-            let scale_count = (g.scale_plane_bytes / 2) as usize;
-            for gi in 0..scale_count {
-                payload[scale_off + gi * 2..scale_off + gi * 2 + 2]
-                    .copy_from_slice(&0x4000u16.to_le_bytes());
-            }
-        }
-        let artifact = fixture::write_fixture(&objects, &payload, tag).expect("fixture");
-        let reader = Reader::open(&artifact.path).expect("open fixture");
-        (artifact, reader)
-    }
-
-    /// The two W8 endpoints (the A1 exceptional formats, ADR 0005 host-side
-    /// dequant) dequantize to the hand-computed bf16 (code 3 × scale 2.0 =
-    /// 6.0 -> 0x40C0), and `dequant_w8_endpoints` returns only the two W8
-    /// buffers (the NVFP4 / other tensors are not copied — the #26 lesson:
-    /// the NVFP4 planes stay device-resident, not host-copied).
-    #[test]
-    fn dequant_w8_endpoints_returns_only_the_two_w8_endpoints() {
-        let (_art, reader) = w8_endpoint_fixture("w8-endpoints");
-        let endpoints = dequant_w8_endpoints(&reader).expect("dequant the W8 endpoints");
-        // The endpoint shapes (the stored `[rows][cols]`).
-        assert_eq!(endpoints.embedding_shape, (2, 32));
-        assert_eq!(endpoints.lm_head_shape, (4, 64));
-        // The dequant content (the hand-derived value: 3 * 2.0 = 6.0 ->
-        // bf16 0x40C0), carried to the host buffer (not empty / not zero).
-        assert_eq!(endpoints.embedding.len(), 2 * 32);
-        assert!(
-            endpoints.embedding.iter().all(|&v| v == 0x40C0),
-            "the W8 embedding dequants to bf16 6.0"
-        );
-        assert_eq!(endpoints.lm_head.len(), 4 * 64);
-        assert!(
-            endpoints.lm_head.iter().all(|&v| v == 0x40C0),
-            "the W8 lm_head dequants to bf16 6.0"
-        );
-    }
 }

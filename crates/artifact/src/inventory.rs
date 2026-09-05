@@ -19,7 +19,8 @@
 //! FP32, 247 NVFP4 (the 27B model's GEMM weights + the norms / GDN
 //! params / `*_input_scale_divisor` scalars).
 
-use crate::{NumericFormat, StorageLayout};
+use crate::binder::{Binder, MaterializationPlan, ObjectHandle};
+use crate::{NumericFormat, Reader, Result, StorageLayout};
 
 // ---------------------------------------------------------------------------
 // The entry
@@ -180,6 +181,35 @@ pub fn text_scope_27b() -> Vec<InventoryEntry> {
     entries
 }
 
+/// Bind every text-scope tensor ([`text_scope_27b`]) against `reader`,
+/// materializing each on the device (P1-17, GitHub #53).
+///
+/// Loudly rejects a missing or mis-shaped text-scope object (a
+/// [`Binder::require_tensor`] mismatch): the exact (format, layout, shape)
+/// this function requires is the model's contract, not the container's, so
+/// a container that stores a different shape under the same name is a load
+/// failure, never a silent reinterpretation.
+///
+/// Scoped to the text objects: the artifact's non-text objects (frontend
+/// resources, vision / MTP tensors) are left unconsumed — [`Binder::plan`]
+/// (not [`Binder::finish`]) builds the plan, since this binder does not own
+/// the whole directory (ADR 0002's "every object consumed" contract is
+/// [`Binder::finish`]'s, for a binder that does).
+///
+/// Returns the plan (in [`text_scope_27b`] order) alongside the matching
+/// handles, so a caller can zip them with the inventory's names / formats
+/// when building the model-load descriptors.
+pub fn bind_text_scope_27b(reader: &Reader) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
+    let mut binder = Binder::new(reader);
+    let mut handles = Vec::with_capacity(906);
+    for entry in text_scope_27b() {
+        let handle = binder.require_tensor(entry.name, entry.format, entry.layout, entry.shape)?;
+        binder.materialize_on_device(handle)?;
+        handles.push(handle);
+    }
+    Ok((binder.plan(), handles))
+}
+
 /// Build an entry, leaking the (templated) name into a `'static` string
 /// (the generator runs once; the leak is bounded by the table size).
 fn mk(name: &str, format: NumericFormat, layout: StorageLayout, shape: &'static [u64]) -> InventoryEntry {
@@ -273,5 +303,67 @@ mod tests {
         }
         let dups: Vec<_> = names.iter().filter(|(_, c)| **c > 1).collect();
         assert!(dups.is_empty(), "duplicate names: {dups:?}");
+    }
+
+    // -- bind_text_scope_27b: the model-load binder's loud failures (P1-17,
+    // GitHub #53). `text_scope_27b()` is bound in directory order, so a
+    // fixture missing (or mis-shaping) only the first entry
+    // (`text/token_embedding`) fails immediately — no need to fabricate all
+    // 906 production-scale tensors just to exercise the failure path.
+
+    /// A minimal one-resource fixture: satisfies the reader's "objects must
+    /// be nonempty" rule without carrying any text-scope tensor.
+    fn empty_of_text_tensors(tag: &str) -> (crate::fixture::TempArtifact, Reader) {
+        let objects = vec![crate::fixture::FixtureObject::Resource {
+            name: "frontend/tokenizer.json",
+            encoding: "raw-bytes-v1",
+            offset: 0,
+            bytes: 4,
+        }];
+        let artifact =
+            crate::fixture::write_fixture(&objects, &[0u8; 4], tag).expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+        (artifact, reader)
+    }
+
+    #[test]
+    fn bind_text_scope_27b_rejects_a_missing_object() {
+        let (_artifact, reader) = empty_of_text_tensors("missing-object");
+        let err = bind_text_scope_27b(&reader)
+            .expect_err("no text-scope tensor is present")
+            .to_string();
+        assert!(err.contains("is missing"), "{err}");
+        assert!(err.contains("text/token_embedding"), "{err}");
+    }
+
+    #[test]
+    fn bind_text_scope_27b_rejects_a_mis_shaped_object() {
+        // The first entry (`text/token_embedding`) is present, but with a
+        // tiny stand-in shape instead of the model's `[248320, 5120]`.
+        let objects = vec![crate::fixture::FixtureObject::Tensor {
+            name: "text/token_embedding",
+            shape: vec![2, 32],
+            format: "W8G32_F16S",
+            layout: "row-split-k128-v1",
+            offset: 0,
+            bytes: crate::row_split_geometry(NumericFormat::W8G32F16S, &[2, 32])
+                .unwrap()
+                .encoded_bytes,
+        }];
+        let payload = vec![
+            0u8;
+            crate::row_split_geometry(NumericFormat::W8G32F16S, &[2, 32])
+                .unwrap()
+                .encoded_bytes as usize
+        ];
+        let artifact = crate::fixture::write_fixture(&objects, &payload, "mis-shaped")
+            .expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+
+        let err = bind_text_scope_27b(&reader)
+            .expect_err("the stored shape does not match the model's contract")
+            .to_string();
+        assert!(err.contains("does not match target contract"), "{err}");
+        assert!(err.contains("text/token_embedding"), "{err}");
     }
 }

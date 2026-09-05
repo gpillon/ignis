@@ -9,7 +9,7 @@ ignis-artifact = { path = "../artifact" }
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization
-# path, ADR 0002). ignis-core itself has no CUDA-coupled code since GitHub
-# #39 deleted the superseded compute adapter; this flag exists so
-# `ignis-server`'s `cuda` feature can still reach `ignis-artifact/cuda`.
+# path, ADR 0002) and gates this crate's own `model_load` module (the
+# step ABI's model-load call, GitHub #53 / ADR 0009) so `ignis-server`'s
+# `cuda` feature reaches both.
 cuda = ["ignis-artifact/cuda"]
