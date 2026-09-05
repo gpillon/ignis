@@ -73,3 +73,22 @@ target_link_libraries(ignis_kernel_nvfp4_linear_tests PRIVATE ignis_kernel ignis
 # nonzero exit — 77 included — as FAILED, never as a skip, so a busy or
 # missing GPU cannot read as green.
 add_test(NAME ignis_kernel_nvfp4_linear_tests COMMAND ignis_kernel_nvfp4_linear_tests)
+
+# P1-10 (GitHub #46): the reference's own BF16 and W8G32 a16 linear tests, run
+# unmodified, same pattern as the NVFP4 block above — each links ignis_kernel
+# so it drives the leaf's real ops::linear dispatch (kernel/src/linear.cu),
+# and neither sets SKIP_RETURN_CODE (ADR 0006: a missing/busy GPU fails here).
+add_executable(ignis_kernel_bf16_linear_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_bf16_a16.cpp
+)
+target_include_directories(ignis_kernel_bf16_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_bf16_linear_tests PRIVATE ignis_kernel)
+add_test(NAME ignis_kernel_bf16_linear_tests COMMAND ignis_kernel_bf16_linear_tests)
+
+add_executable(ignis_kernel_w8_linear_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_w8_a16.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_w8_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_w8_linear_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_w8_linear_tests COMMAND ignis_kernel_w8_linear_tests)

@@ -30,15 +30,16 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
-# CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44): the
-# vendored op wrappers' public headers declare host-callable functions taking
-# a `cudaStream_t`, and the op-test harness calls the CUDA runtime API
-# (cudaMemcpyAsync, stream sync) directly from plain .cpp translation units —
-# unlike the .cu sources, MSVC's cl.exe does not see the CUDA toolkit's
-# include/lib dirs on its own for those.
+# CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44; also
+# needed by the P1-10/#46 bf16/w8 dispatch below): the vendored op wrappers'
+# public headers declare host-callable functions taking a `cudaStream_t`, and
+# the op-test harness calls the CUDA runtime API (cudaMemcpyAsync, stream
+# sync) directly from plain .cpp translation units — unlike the .cu sources,
+# MSVC's cl.exe does not see the CUDA toolkit's include/lib dirs on its own
+# for those.
 find_package(CUDAToolkit REQUIRED)
 
-# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44) -----
+# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44, #46) -
 #
 # Verbatim copies of the reference's core, ops-common headers and (from P1-07)
 # the norm/glue op families, pinned by kernel/vendor/manifest.json and
@@ -82,6 +83,18 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_small_t.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+  # P1-10 (GitHub #46): the BF16 linear op family (GEMV, small-T, MMA).
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_small_t.cu
+  # P1-10 (GitHub #46): the W8G32 linear op family (GEMV, small-T, MMA/split-K).
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""

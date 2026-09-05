@@ -12,20 +12,25 @@
 // because it has no dependency on any op family
 // (`kernel/vendor/include/ninfer/ops/linear.h`): same namespace, same
 // `ops::linear` / `ops::LinearPolicy` / `ops::linear_workspace_capacity_bytes`
-// signatures, so the vendored reference test (`test_nvfp4_a16.cpp` and its
-// harness) links against this and never notices the split.
+// signatures, so the vendored reference tests (`test_nvfp4_a16.cpp`,
+// `test_bf16_a16.cpp`, `test_w8_a16.cpp` and their harness) link against this
+// and never notice the split.
 //
 // P1-09 (GitHub #45) vendors NVFP4 (codec/format/config/dispatch/GEMV/
-// small-T; the large-T W4A4/TMA sources compile but are verified only at G2)
-// and wires it in below. P1-10 (GitHub #46) adds the BF16 and W8G32 arms.
-// Q4/Q5/Q6/FP8 are in the reference's registry but never used by this
-// model's artifact (`.scratch/runtime/specs/01-device-resident-forward.md`),
-// so they stay unsupported here rather than being vendored for nothing.
+// small-T; the large-T W4A4/TMA sources compile but are verified only at G2).
+// P1-10 (GitHub #46) adds the BF16 and W8G32 arms (their dispatch headers
+// need no workspace, so `dispatch_linear`'s `workspace` parameter stays
+// NVFP4-only). Q4/Q5/Q6/FP8 are in the reference's registry but never used by
+// this model's artifact
+// (`.scratch/runtime/specs/01-device-resident-forward.md`), so they stay
+// unsupported here rather than being vendored for nothing.
 
 #include "ninfer/ops/linear.h"
 
+#include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstdint>
 #include <limits>
@@ -94,12 +99,21 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
-    if (w.qtype == QType::NVFP4) {
+    switch (w.qtype) {
+    case QType::NVFP4:
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::BF16_CTRL:
+        detail::bf16_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::W8G32_F16S:
+        detail::w8_dispatch(x, w, out, policy, stream);
+        return;
+    default:
+        break;
     }
     throw std::invalid_argument(
-        "linear: unsupported weight qtype (only NVFP4 is vendored here; P1-10/#46 adds BF16/W8G32)");
+        "linear: unsupported weight qtype (only NVFP4/BF16/W8G32 are vendored here)");
 }
 
 } // namespace
@@ -111,17 +125,27 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
     }
-    if (qtype == QType::NVFP4) {
+    switch (qtype) {
+    case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
+    case QType::BF16_CTRL:
+        (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::W8G32_F16S:
+        (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    default:
+        break;
     }
     throw std::invalid_argument(
-        "linear workspace: unsupported weight qtype (only NVFP4 is vendored here; "
-        "P1-10/#46 adds BF16/W8G32)");
+        "linear workspace: unsupported weight qtype (only NVFP4/BF16/W8G32 are vendored here)");
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
