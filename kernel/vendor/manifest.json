@@ -12,6 +12,30 @@
       "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
     {
+      "path": "include/ninfer/ops/gated_rmsnorm.h",
+      "sha256": "0ed6fc49679522326ae0209367b4f9230afea301a3e74adaa38a9aa1904e5661"
+    },
+    {
+      "path": "include/ninfer/ops/l2norm.h",
+      "sha256": "69a8062843a8d42b427f26ff918d89e66c5777de11135e4ac09a48d4bb43e6a4"
+    },
+    {
+      "path": "include/ninfer/ops/residual_add.h",
+      "sha256": "f9ffa1dca7fbaaf7c0e91d1c4cdda0eabd818a3bb15a2e7d92aa3eacd40f7be2"
+    },
+    {
+      "path": "include/ninfer/ops/rmsnorm.h",
+      "sha256": "21e7bd906df3410579de1cbc7a276170001a25d165333f9747fdb17f6e641120"
+    },
+    {
+      "path": "include/ninfer/ops/sigmoid_mul.h",
+      "sha256": "c1f21ef9cebae0808419c49cf894b76bed890cc10fed15ec4b6c1cbd7b3c29cd"
+    },
+    {
+      "path": "include/ninfer/ops/silu_mul.h",
+      "sha256": "e467069b7d303f94459af55830db9051d62643e90c7a48e7179ade99c448fc59"
+    },
+    {
       "path": "src/core/arena.cu",
       "sha256": "53a1d7ac6ec55e8ba8806897cd3cc21fd9aac2d4c9f737c7518a2fd64c254957"
     },
@@ -108,6 +132,66 @@
       "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
     },
     {
+      "path": "src/ops/kernel/l2norm.cuh",
+      "sha256": "e22ab6c5eff579edb2f13f9667364ade066f3e4dc7cd480cd29e315fe8d2fcf6"
+    },
+    {
+      "path": "src/ops/kernel/residual_add.cuh",
+      "sha256": "fc8b3571bafdb797fa298896db79f9155fd2126e307aa2307fc0161966c5dac1"
+    },
+    {
+      "path": "src/ops/kernel/rmsnorm.cuh",
+      "sha256": "dcb07eaebec28134e0a7afb70a782f9cec2c7264f74d2e00bb29214472aba38d"
+    },
+    {
+      "path": "src/ops/kernel/sigmoid_gate_mul.cuh",
+      "sha256": "d9aad5219f7c471b00f468d2c0e1c0aa7615dda783110028311aa69056a8e217"
+    },
+    {
+      "path": "src/ops/kernel/silu_and_mul.cuh",
+      "sha256": "9cc30898b56c15c306bef81fda881b8da59020a141e24bac7291408b267e6a61"
+    },
+    {
+      "path": "src/ops/launcher/l2norm.cu",
+      "sha256": "c950db6bbbba3a9ed9247f915928bb40ceeead783fc781d3b1fdad9903f13db6"
+    },
+    {
+      "path": "src/ops/launcher/l2norm.h",
+      "sha256": "a51b9fd3c2a7fe8684bb7b821c98d7356566a7f4ba9755c8effffd57d701670d"
+    },
+    {
+      "path": "src/ops/launcher/residual_add.cu",
+      "sha256": "d04e6e25e1d1c699ed9e8dfdf7c70fff4481e9cc7a311f6ea095fd534702f1af"
+    },
+    {
+      "path": "src/ops/launcher/residual_add.h",
+      "sha256": "869e3bd1a8217ed4bd3e1e65ebabbae0b04345ecf65deb0fbb87cc3cd0bdb41f"
+    },
+    {
+      "path": "src/ops/launcher/rmsnorm.cu",
+      "sha256": "3ddb73f8ff3a887770f70125eab864b06ad6936c8d0772c3f13a40f09163bed0"
+    },
+    {
+      "path": "src/ops/launcher/rmsnorm.h",
+      "sha256": "f6549e610e528f6ed2aa355096737a82f95ed1ffbf783c408df10b319c9f4f1d"
+    },
+    {
+      "path": "src/ops/launcher/sigmoid_gate_mul.cu",
+      "sha256": "d14c00c0ba08405616c7591398ba372f52c106da2cd3f137a252d8c32cce26f6"
+    },
+    {
+      "path": "src/ops/launcher/sigmoid_gate_mul.h",
+      "sha256": "77f70c568648e92beba257c0113c4593b397a14fae648eec8574fa804a01bb74"
+    },
+    {
+      "path": "src/ops/launcher/silu_and_mul.cu",
+      "sha256": "46c59d7410c2c6a301cace06aabcf6288bbf15ff946e60868c40db69063dfb50"
+    },
+    {
+      "path": "src/ops/launcher/silu_and_mul.h",
+      "sha256": "f281da090dd508eedd54f0de117cef30b286be34cbec139a4125b2209d7e3ccf"
+    },
+    {
       "path": "src/ops/linear/q4/q4_rowsplit_storage.cuh",
       "sha256": "c3443c5a913c5711c78c8039e6dd1b71d16bbd9dcbece705d761f58f4961847a"
     },
@@ -116,12 +200,60 @@
       "sha256": "f0258cfddad24f99372b474858fbc7605101d24202a865adba16614ae63ee93a"
     },
     {
+      "path": "src/ops/wrapper/l2norm.cpp",
+      "sha256": "ed556f216e2b127210cdfd1952a2e147038e7c3b8f09241c7127307585d14783"
+    },
+    {
+      "path": "src/ops/wrapper/residual_add.cpp",
+      "sha256": "c593cea9aff0d014e08daa4e3ea49ca36c48921c1a378723c1712c2437bddda2"
+    },
+    {
+      "path": "src/ops/wrapper/rmsnorm.cpp",
+      "sha256": "8ae217d3a52a9c12919999df05a73a0805c1cb1097d70be1c511c8579043b59a"
+    },
+    {
+      "path": "src/ops/wrapper/sigmoid_mul.cpp",
+      "sha256": "708c221dbe7b083cbfbcc78893f5c5089288eb31e792e538c950fc053a34f76a"
+    },
+    {
+      "path": "src/ops/wrapper/silu_mul.cpp",
+      "sha256": "ab8cb3eade1c0e89d2e693b1eb4918c85759eb42bc74da3699ebe566a2029849"
+    },
+    {
+      "path": "tests/ops/norm_test_common.h",
+      "sha256": "670c9b5c2155e0853f2384172c2f2dea727a89ae1137f7d58b369088cd659227"
+    },
+    {
       "path": "tests/ops/op_check.h",
       "sha256": "4374221479bc90a7bb737cfac62ad6b3ee01fd5dca57cd14c5a0fd38b5c73429"
     },
     {
       "path": "tests/ops/op_tester.h",
       "sha256": "2db18a2461ec11744225ec16c605061738b9c1da2f6bf64a9cfdd325139e06fa"
+    },
+    {
+      "path": "tests/ops/test_gated_rmsnorm.cpp",
+      "sha256": "fbe6d4d5db6d7931284e4f812e3b5c52d6c2680bef1b64c70a56d76d065b39ac"
+    },
+    {
+      "path": "tests/ops/test_l2norm.cpp",
+      "sha256": "1f3f9430e2f41111744ac350ad50469b6ea1243d61ff295aeaab9db98198eab7"
+    },
+    {
+      "path": "tests/ops/test_residual_add.cpp",
+      "sha256": "b8f2f4257280d8632b6857c7efa72cef530b85205d8b43b37f7e0093ca2c09cb"
+    },
+    {
+      "path": "tests/ops/test_rmsnorm.cpp",
+      "sha256": "6ad3623590aa12b08d19c0b73cad6e81cfed5719e0abd296842364011d88b16a"
+    },
+    {
+      "path": "tests/ops/test_sigmoid_mul.cpp",
+      "sha256": "f8a06abfda185124e0147b1004ab31a18f15ea14e737aaccb8de6f5ed019024e"
+    },
+    {
+      "path": "tests/ops/test_silu_mul.cpp",
+      "sha256": "6dc32f21bfa2dbc041762110771bbe5e98069e8735dd39cdf125c7630a45a0a6"
     }
   ]
 }

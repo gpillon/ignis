@@ -101,10 +101,30 @@ P1-06 (GitHub #42) vendors the substrate the op families are built on:
   executable's second include root, because the harness includes itself as
   `"ops/op_tester.h"`.
 
-The op families themselves (NVFP4 / BF16 / W8G32 linear, the fused
-projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
-each adding its files to this manifest and its reference op test to the leaf's
-test executable.
+P1-07 (GitHub #43) adds the norm and glue op family — the leaf's first vendored
+op family with a public API:
+
+- **norms + glue** — `rmsnorm` (plain and gated, one kernel/launcher/wrapper
+  file each), `l2norm`, `residual_add`, `silu_mul`, `sigmoid_mul`: each op's
+  kernel (`src/ops/kernel`), launcher (`src/ops/launcher`), wrapper
+  (`src/ops/wrapper`) and public header (`include/ninfer/ops`, the leaf's
+  first vendored include root — `kernel/vendor/include`). The wrapper and
+  test `.cpp` files are plain host C++ that declare a `cudaStream_t` and (in
+  the tests) call the CUDA runtime API directly, so `kernel/CMakeLists.txt`
+  now depends on `CUDAToolkit` for its include/link paths — the `.cu` files
+  never needed this because nvcc supplies them itself.
+- **their reference tests** — `tests/ops/test_rmsnorm.cpp`,
+  `test_gated_rmsnorm.cpp`, `test_l2norm.cpp`, `test_residual_add.cpp`,
+  `test_silu_mul.cpp`, `test_sigmoid_mul.cpp` and the shared
+  `tests/ops/norm_test_common.h`, each built as its own CTest executable
+  (`ignis_<op>_test`) since a reference test file brings its own `main()` and
+  cannot share a binary with another. Cases already exercise real 27B widths
+  (hidden 5120, GDN norm 128/head, MLP intermediate 17408).
+
+The remaining op families (NVFP4 / BF16 / W8G32 linear, the fused
+projections, attention, GDN, the state pools) arrive with P1-08..P1-16, each
+adding its files to this manifest and its reference op test to the leaf's
+test suite.
 
 ## Updating to a newer reference commit
 
