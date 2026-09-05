@@ -41,6 +41,9 @@ set(ignis_vendored_op_tests
   sigmoid_mul
   embedding
   argmax
+  position
+  rope
+  qk_norm_rope
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)
@@ -139,6 +142,34 @@ add_test(NAME ignis_vendor_kv_cache_test COMMAND ignis_vendor_kv_cache_test)
 add_executable(ignis_vendor_state_store_test ${IGNIS_VENDOR_DIR}/tests/test_state_store.cpp)
 target_link_libraries(ignis_vendor_state_store_test PRIVATE ignis_vendor)
 add_test(NAME ignis_vendor_state_store_test COMMAND ignis_vendor_state_store_test)
+
+# P1-15 (GitHub #51): the reference's own gqa_attention test, patched
+# (kernel/vendor/patches/tests/ops/test_gqa_attention.cpp.diff) to drop the I8
+# dtype arms and their key-split/range cases — this ticket vendors the i8/hq
+# decode/prefill launchers so the family compiles, but only the bf16 routes
+# are gated here. Exercises both registered head geometries (24q/4kv and
+# 16q/2kv, both x256) including multi-page paged-KV mappings (offset,
+# fragmented). Links only ignis_vendor: gqa_attention's public API is fully
+# vendored (ops/wrapper/gqa_attention.cpp), unlike attn_input_proj/linear_add
+# above, which needed the leaf's own qtype dispatcher.
+add_executable(ignis_kernel_gqa_attention_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/test_gqa_attention.cpp
+)
+target_include_directories(ignis_kernel_gqa_attention_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_gqa_attention_tests PRIVATE ignis_vendor)
+add_test(NAME ignis_kernel_gqa_attention_tests COMMAND ignis_kernel_gqa_attention_tests)
+
+# P1-15 (GitHub #51): the reference's own kv_cache_append_prefix test, run
+# unmodified (BF16 only in the reference itself, no patch needed). Exercises
+# both the paged and the DFlash-lane cyclic overload; the cyclic KV cache type
+# is vendored (core/cyclic_kv_cache.{h,cpp}) only so the shared header
+# compiles, not because ReplaySSM/DFlash2 (G5) is in scope here.
+add_executable(ignis_kernel_kv_cache_append_prefix_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/test_kv_cache_append_prefix.cpp
+)
+target_include_directories(ignis_kernel_kv_cache_append_prefix_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_kv_cache_append_prefix_tests PRIVATE ignis_vendor)
+add_test(NAME ignis_kernel_kv_cache_append_prefix_tests COMMAND ignis_kernel_kv_cache_append_prefix_tests)
 
 # Ours, not vendored: the leaf-level page-budget query (consumed by P1-19,
 # GitHub #55). Pure host arithmetic over the vendored planner — no GPU

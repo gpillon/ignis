@@ -28,6 +28,14 @@
       "sha256": "0ed6fc49679522326ae0209367b4f9230afea301a3e74adaa38a9aa1904e5661"
     },
     {
+      "path": "include/ninfer/ops/gqa_attention.h",
+      "sha256": "f375af5a39f81c9593febd88b3c05306582a49e1c7692f57cee1fc09d2027396"
+    },
+    {
+      "path": "include/ninfer/ops/kv_cache_append_prefix.h",
+      "sha256": "564fb3d532e94a06093a31ca21c7bf749a793229b71537b10b5e48f3e7a54851"
+    },
+    {
       "path": "include/ninfer/ops/l2norm.h",
       "sha256": "69a8062843a8d42b427f26ff918d89e66c5777de11135e4ac09a48d4bb43e6a4"
     },
@@ -40,12 +48,24 @@
       "sha256": "68e9d798bde4963f042840e866fa5567261cf96514aa6588230a88d185a04a45"
     },
     {
+      "path": "include/ninfer/ops/position.h",
+      "sha256": "23c43fd13fb48881773ac6fd52175ea7ad1660c18349822fcfae643aeffa47ba"
+    },
+    {
+      "path": "include/ninfer/ops/qk_norm_rope.h",
+      "sha256": "1892fb54862247e78d63c09aa4f6e7bc49727f1fc61e965947b87f997d47eb1f"
+    },
+    {
       "path": "include/ninfer/ops/residual_add.h",
       "sha256": "f9ffa1dca7fbaaf7c0e91d1c4cdda0eabd818a3bb15a2e7d92aa3eacd40f7be2"
     },
     {
       "path": "include/ninfer/ops/rmsnorm.h",
       "sha256": "21e7bd906df3410579de1cbc7a276170001a25d165333f9747fdb17f6e641120"
+    },
+    {
+      "path": "include/ninfer/ops/rope.h",
+      "sha256": "0cc5c89f0561908531c01367e8a28183ed94f09d462bff61627b1dfebe8b5a96"
     },
     {
       "path": "include/ninfer/ops/sigmoid_mul.h",
@@ -62,6 +82,14 @@
     {
       "path": "src/core/arena.h",
       "sha256": "8369c1f321edc900fab00c83b5d04883959763afad7fe4b73fad45e5d6b3035d"
+    },
+    {
+      "path": "src/core/cyclic_kv_cache.cpp",
+      "sha256": "6166367452f401528f0539718bc3d4d17d3622fcac82d0aac1e02dd927595fb4"
+    },
+    {
+      "path": "src/core/cyclic_kv_cache.h",
+      "sha256": "7d928bada63b12aa88b18c76aae18f5cf99deb6c9ea096b31d432129498db536"
     },
     {
       "path": "src/core/device.cu",
@@ -228,8 +256,64 @@
       "sha256": "041e27ca7dad3cd329a163ca3e9b36a1020b6487637d3833dbc53fb941087a7c"
     },
     {
+      "path": "src/ops/kernel/gqa_attention_decode.cuh",
+      "sha256": "9520fa599f6ffd566a838c3c930760d130672b53b34635cf085717b642d07e6f"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_decode_bf16.cuh",
+      "sha256": "50917d11e7e30b4afcac8b946962a78f8e29b56b31ec5a1feba01bfc7ae2db94"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_decode_hq.cuh",
+      "sha256": "dceced16e6ed40c754d6a1a8e1df10b2072b5b7f1a86047c281b7f4944e598d2"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_decode_i8.cuh",
+      "sha256": "c822ec51d9dae4db0e24af6840bd6f4dbd30981ae34b278e22881d4495852dc4"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_geometry.cuh",
+      "sha256": "5fbf8456f640f2ebc308c5212e73fa037064af8c8fc10722daab80f0bece92d0"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_kv_quant.cuh",
+      "sha256": "fd7de9dac9e44b6c87cd4dfc2f79c9cdc171e8572c8bd71c5a49dc99ad833686"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_prefill_bf16.cuh",
+      "sha256": "bd9d455e55ce1ccf56ad66ba44b8395db4eacbeb4e0fd76370d04a34508603f8"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_prefill_common.cuh",
+      "sha256": "c1c25e1734853a8a5a7c9020c223fa8a3f3edbe41d4d0bb10905a06bcb81bc3f"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_prefill_hq.cuh",
+      "sha256": "9076eb3e89a5d13fae19d16345c58231efa59f5834d05b6967187570d47c7637"
+    },
+    {
+      "path": "src/ops/kernel/gqa_attention_prefill_i8.cuh",
+      "sha256": "e4afca6f202305d7caf31c3d53183d82b93cfae6a3f51f45aab7e88d9b6d1900"
+    },
+    {
+      "path": "src/ops/kernel/hq_codec.cuh",
+      "sha256": "bf75965478c764367af55406315af3f82538db965aa1f5d8c83a7bd602760e4a"
+    },
+    {
+      "path": "src/ops/kernel/kv_cache_append_prefix.cuh",
+      "sha256": "a622f00d492fd26cb3c0c896d3d7a9d3d75c6eab16e4a15074d177e5225beb91"
+    },
+    {
       "path": "src/ops/kernel/l2norm.cuh",
       "sha256": "e22ab6c5eff579edb2f13f9667364ade066f3e4dc7cd480cd29e315fe8d2fcf6"
+    },
+    {
+      "path": "src/ops/kernel/paged_kv_address.cuh",
+      "sha256": "c62ea55649c65d65117ef4539b64ed4618c2c636124828e651f6837c0e2c4d46"
+    },
+    {
+      "path": "src/ops/kernel/position.cuh",
+      "sha256": "afb2e19f607ab85d5a8eda99aa46279f490758afa32753e0403bb97eb0bc0a6a"
     },
     {
       "path": "src/ops/kernel/residual_add.cuh",
@@ -238,6 +322,10 @@
     {
       "path": "src/ops/kernel/rmsnorm.cuh",
       "sha256": "dcb07eaebec28134e0a7afb70a782f9cec2c7264f74d2e00bb29214472aba38d"
+    },
+    {
+      "path": "src/ops/kernel/rope.cuh",
+      "sha256": "ea5a011e8caeb6faed8c35d3101ab4578f78a0cd2499230bde57bdfe5a7c0c4c"
     },
     {
       "path": "src/ops/kernel/sigmoid_gate_mul.cuh",
@@ -264,12 +352,88 @@
       "sha256": "777f68c7ff272320e7cf2a7515f844d01aeb560039908d4138ade7f3175f0b5a"
     },
     {
+      "path": "src/ops/launcher/gqa_attention.h",
+      "sha256": "525e158d79f0b3afd3021816914b0a383d3ae22cd67f9479b6c4c7000706e08f"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode.cu",
+      "sha256": "4e70d60c636682d10a8cf20530e487759ac45097698a065065dd524463014df4"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode_bf16.cu",
+      "sha256": "592044f9045678a7e4d0e9c84d396d6553a44bae0c02112c0291c44cd97a6d7b"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode_hq_27.cu",
+      "sha256": "e68b7f9390d6bca8e37608e8c423b7e0eb1ba2d36419c1f14f5e8372070f9426"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode_hq_35.cu",
+      "sha256": "7b1b5cea32dbd12b7581a05b76305c8a7306ab7970ed8a5e52fb003005a614d6"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode_hq_routes.cuh",
+      "sha256": "b96a717e0d52b7a9a27c51b19b12408a1b0db282c1b7606fc856e254adc9b0bb"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_decode_i8.cu",
+      "sha256": "121e273092756c1e16ea6561cc6d13738cc5904181f72ab8ac6a9dfafa34cf2c"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill.cu",
+      "sha256": "fe225e841d72cc53d96656d5baa92a8623d24c407ea391cccd6732249b416b96"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill_bf16.cu",
+      "sha256": "6744debbd6dcf90b4877fc9bb89e298b0f8f3a2ce72e2418c047f779ca2ca40c"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill_hq_27.cu",
+      "sha256": "8d13cc6955d25ac8a9a57f0523c5431208f91952bcf732ba25a8078838a254fc"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill_hq_35.cu",
+      "sha256": "1364b87574608988fe45d23bd2b33b0dd0743e1af03c8f2e8b016580c4ec034f"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill_hq_routes.cuh",
+      "sha256": "a9f21b33a7f2033d0cfc87fb7cc146120e0b5362a52b31f95dac6fe28e411e31"
+    },
+    {
+      "path": "src/ops/launcher/gqa_attention_prefill_i8.cu",
+      "sha256": "9402a569ef3d20fccc1bd625ca2c03207547a1b31ba051a33f34b3232b7d3a0c"
+    },
+    {
+      "path": "src/ops/launcher/kv_cache_append_prefix.cu",
+      "sha256": "fb84d473ae27f8bf51925fa1a2c204a05f73fdc9208d5dbe4851b29dc8e3f02b"
+    },
+    {
+      "path": "src/ops/launcher/kv_cache_append_prefix.h",
+      "sha256": "7c302a1d7c656a3d40a16283f9e08413f63e5faebb17b5b513c95e35a46a436d"
+    },
+    {
       "path": "src/ops/launcher/l2norm.cu",
       "sha256": "c950db6bbbba3a9ed9247f915928bb40ceeead783fc781d3b1fdad9903f13db6"
     },
     {
       "path": "src/ops/launcher/l2norm.h",
       "sha256": "a51b9fd3c2a7fe8684bb7b821c98d7356566a7f4ba9755c8effffd57d701670d"
+    },
+    {
+      "path": "src/ops/launcher/position.cu",
+      "sha256": "354e0f0de5d66d2e11ef6f8cad87274e211c8bdb9c89820b01d9caecad7f2078"
+    },
+    {
+      "path": "src/ops/launcher/position.h",
+      "sha256": "be87f1fada8d8b6dacdaf18fcef919fbb216424f9c197e9361d66e75603222f4"
+    },
+    {
+      "path": "src/ops/launcher/qk_norm_rope.cu",
+      "sha256": "f23050d46d9c5d13703db3fe9ad3ebfc26a8e793cf47292ddf2465b36979f637"
+    },
+    {
+      "path": "src/ops/launcher/qk_norm_rope.h",
+      "sha256": "b9ad8a355362dcb3a439e06acb3e4e0e65ddc8e285adbefea5ef3347fc567d5b"
     },
     {
       "path": "src/ops/launcher/residual_add.cu",
@@ -286,6 +450,14 @@
     {
       "path": "src/ops/launcher/rmsnorm.h",
       "sha256": "f6549e610e528f6ed2aa355096737a82f95ed1ffbf783c408df10b319c9f4f1d"
+    },
+    {
+      "path": "src/ops/launcher/rope.cu",
+      "sha256": "3b3cbb8a2dc8a04f2f86ebc8e0fa3d8640b3208290d2d5b65718f2c79d79a937"
+    },
+    {
+      "path": "src/ops/launcher/rope.h",
+      "sha256": "8d53c4d4db4bbbd0964bbd1f78a64bb3e5ded8464928d3076a19f25ce126fd3f"
     },
     {
       "path": "src/ops/launcher/sigmoid_gate_mul.cu",
@@ -552,8 +724,24 @@
       "sha256": "58d3638f0e25207ed917a4388260390336707de455bcbf37488e13bcabd58060"
     },
     {
+      "path": "src/ops/wrapper/gqa_attention.cpp",
+      "sha256": "e257cd1c33fba6edf06a36f10556885cbc477ab44df31119340502074b63ffed"
+    },
+    {
+      "path": "src/ops/wrapper/kv_cache_append_prefix.cpp",
+      "sha256": "5c0f50561466873be5cd5dcc34048c032679c7c51345a198df4cbc879452bbb3"
+    },
+    {
       "path": "src/ops/wrapper/l2norm.cpp",
       "sha256": "ed556f216e2b127210cdfd1952a2e147038e7c3b8f09241c7127307585d14783"
+    },
+    {
+      "path": "src/ops/wrapper/position.cpp",
+      "sha256": "e72ac404c0fa019debf18a2f7eae7e9c85f7c813ff25ecd8de1b878dae093a63"
+    },
+    {
+      "path": "src/ops/wrapper/qk_norm_rope.cpp",
+      "sha256": "eaf038253b859a2319821c93bd25d72f72b0375d67e82b9b7e5459ddd524fafb"
     },
     {
       "path": "src/ops/wrapper/residual_add.cpp",
@@ -562,6 +750,10 @@
     {
       "path": "src/ops/wrapper/rmsnorm.cpp",
       "sha256": "8ae217d3a52a9c12919999df05a73a0805c1cb1097d70be1c511c8579043b59a"
+    },
+    {
+      "path": "src/ops/wrapper/rope.cpp",
+      "sha256": "c2639a7112eb030ed1f048aec694a51734c176f294c4b073bb97ed2de58fd51c"
     },
     {
       "path": "src/ops/wrapper/sigmoid_mul.cpp",
@@ -653,8 +845,29 @@
       "sha256": "fbe6d4d5db6d7931284e4f812e3b5c52d6c2680bef1b64c70a56d76d065b39ac"
     },
     {
+      "path": "tests/ops/test_gqa_attention.cpp",
+      "sha256": "d1d1994f113526832d537c21c6f0bb18db75fb947153ed61c6d39f6c9996a683",
+      "patch": {
+        "diff": "patches/tests/ops/test_gqa_attention.cpp.diff",
+        "sha256": "31b33fc4a1cefdde9de7ac0d7a7d91006bf01ba3bd2b383169cd38b26f3dc7e3",
+        "reason": "P1-15 (GitHub #51) vendors only the bf16 gqa_attention routes for this ticket (i8/hq launchers compile but are vendored untested); drop the I8 dtype arms and their key-split/range test cases so the CTest executable exercises bf16 only"
+      }
+    },
+    {
+      "path": "tests/ops/test_kv_cache_append_prefix.cpp",
+      "sha256": "71bb3930423ca2853ec6df5e2380212501309623c39765718c4d83cc075a5c5c"
+    },
+    {
       "path": "tests/ops/test_l2norm.cpp",
       "sha256": "1f3f9430e2f41111744ac350ad50469b6ea1243d61ff295aeaab9db98198eab7"
+    },
+    {
+      "path": "tests/ops/test_position.cpp",
+      "sha256": "60b9797a0c9f8f1bc58ca9956d5d1f2aeb6a7344bed933c52a798060dd895183"
+    },
+    {
+      "path": "tests/ops/test_qk_norm_rope.cpp",
+      "sha256": "b9f3166c5f9d1dff4841620de23cfb7cedba5eee77d7ed5f6655e54a874dc5dc"
     },
     {
       "path": "tests/ops/test_residual_add.cpp",
@@ -663,6 +876,10 @@
     {
       "path": "tests/ops/test_rmsnorm.cpp",
       "sha256": "6ad3623590aa12b08d19c0b73cad6e81cfed5719e0abd296842364011d88b16a"
+    },
+    {
+      "path": "tests/ops/test_rope.cpp",
+      "sha256": "e4f0f09213ceaf8089b2abb90034f6f9d594149f7fbcb69e60a54cab049e379b"
     },
     {
       "path": "tests/ops/test_sigmoid_mul.cpp",

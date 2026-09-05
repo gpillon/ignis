@@ -254,10 +254,68 @@ P1-16 (GitHub #52) adds the sequence-state pools:
   bytes for a VRAM budget and plane geometry, routed through
   `plan_paged_kv_pool` so it can't drift from what the pool itself allocates.
 
-The remaining op families (the fused GDN projections, SwiGLU MLP, GQA
-attention, the GDN recurrence family) arrive with P1-12..P1-15, each adding
-its files to this manifest and its reference op test to the leaf's test
-suite.
+P1-15 (GitHub #51) vendors the GQA attention family: positions, RoPE, the
+fused q/k norm+RoPE, paged KV addressing, KV append/prefix-append, and the
+GQA attention kernels (bf16 decode + prefill launchers and routes gated here;
+i8/hq launchers vendored so the family compiles, untested until a later
+ticket):
+
+- **position** — `ops/kernel/position.cuh`, `ops/launcher/position.{h,cu}`,
+  `ops/wrapper/position.cpp`, `include/ninfer/ops/position.h`
+  (`fill_i32_positions`, `offset_i32_positions`).
+- **rope** — `ops/kernel/rope.cuh`, `ops/launcher/rope.{h,cu}`,
+  `ops/wrapper/rope.cpp`, `include/ninfer/ops/rope.h` (the linear/vision
+  frequency tables and the split-half NeoX rotation, Text 1-D / MRoPE /
+  Vision modes).
+- **qk_norm_rope** — `ops/launcher/qk_norm_rope.{h,cu}`,
+  `ops/wrapper/qk_norm_rope.cpp`, `include/ninfer/ops/qk_norm_rope.h`: the
+  fused per-head q/k RMSNorm + RoPE (no separate kernel header — the kernel is
+  inline in the launcher `.cu`).
+- **paged_kv_address** — `ops/kernel/paged_kv_address.cuh`: the paged
+  block-table addressing helpers shared by every GQA attention route (no
+  public API of its own, no dedicated test — exercised through
+  `gqa_attention`).
+- **gqa_attention** — `ops/kernel/gqa_attention_geometry.cuh`,
+  `gqa_attention_kv_quant.cuh`, `gqa_attention_decode.cuh` +
+  `_decode_{bf16,i8,hq}.cuh`, `gqa_attention_prefill_common.cuh` +
+  `_prefill_{bf16,i8,hq}.cuh`, `hq_codec.cuh`; the launcher dispatch
+  `ops/launcher/gqa_attention.h` (detail declarations) and
+  `gqa_attention_{decode,prefill}.cu` (route selection) plus the per-dtype
+  partial-kernel translation units `gqa_attention_decode_{bf16,i8}.cu`,
+  `gqa_attention_decode_hq_{27,35}.cu` + `_decode_hq_routes.cuh`,
+  `gqa_attention_prefill_{bf16,i8}.cu`, `gqa_attention_prefill_hq_{27,35}.cu`
+  + `_prefill_hq_routes.cuh`; the wrapper `ops/wrapper/gqa_attention.cpp` and
+  public header `include/ninfer/ops/gqa_attention.h`. Unlike
+  `attn_input_proj`/`linear_add` (P1-11), the vendored wrapper *is* the
+  complete public API — every cache dtype (BF16, I8, hq-e8-2b/U8) is
+  vendored and compiles, so no leaf-side dispatcher (`kernel/src/*.cu`) is
+  needed for this op.
+- **kv_cache_append_prefix** — `ops/kernel/kv_cache_append_prefix.cuh`,
+  `ops/launcher/kv_cache_append_prefix.{h,cu}`,
+  `ops/wrapper/kv_cache_append_prefix.cpp`,
+  `include/ninfer/ops/kv_cache_append_prefix.h`: device-selected exact K/V
+  prefix commit, both the paged overload (this model's route) and the
+  DFlash-lane cyclic overload (out of scope — MTP/DFlash2/ReplaySSM is G5 —
+  vendored only because the header declares both in one file). Needs
+  `core/cyclic_kv_cache.{h,cpp}` (new: the cyclic cache view/layout type),
+  vendored purely to keep the header self-contained, same reasoning as
+  P1-16's dangling-include-free `kv_ring_bits`/q4/q5 headers.
+- **their reference tests** — `tests/ops/test_position.cpp`,
+  `test_rope.cpp`, `test_qk_norm_rope.cpp` (unpatched, BF16-only in the
+  reference itself), each built by the `ignis_<op>_test` CTest loop
+  alongside the P1-07/P1-08 entries; `tests/ops/test_gqa_attention.cpp`
+  (**patched**: the reference file exercises both BF16 and I8 cache dtypes
+  across two head geometries; this ticket gates only the bf16 routes, so the
+  I8 dtype arms and their key-split/range test cases are removed —
+  `kernel/vendor/patches/tests/ops/test_gqa_attention.cpp.diff`, recorded via
+  `record-patch` — leaving both registered head geometries (24q/4kv and
+  16q/2kv, both ×256) at BF16, including multi-page paged-KV mappings)
+  built as `ignis_kernel_gqa_attention_tests`; `tests/ops/test_kv_cache_append_prefix.cpp`
+  (unmodified) built as `ignis_kernel_kv_cache_append_prefix_tests`.
+
+The remaining op families (the fused GDN projections, SwiGLU MLP, the GDN
+recurrence family) arrive with P1-12..P1-14, each adding its files to this
+manifest and its reference op test to the leaf's test suite.
 
 ## Updating to a newer reference commit
 
