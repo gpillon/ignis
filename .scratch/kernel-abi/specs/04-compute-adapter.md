@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-09-05)** by `.scratch/runtime/specs/01-device-resident-forward.md` (GitHub #36): the per-op host-pointer ABI and the host-resident forward this spec describes are being deleted. Kept for history only; do not implement against it.
+
 # 04 — compute-adapter: wire the kernel leaf as the production `Compute` backend
 
 GitHub: #23

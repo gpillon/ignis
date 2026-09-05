@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-09-05)** by `.scratch/runtime/specs/01-device-resident-forward.md` (GitHub #36): the per-op host-pointer ABI and the host-resident forward this spec describes are being deleted. Kept for history only; do not implement against it.
+
 # 07 — full-correct Qwen 3.8-27B forward assembly
 
 GitHub: #30 (the #25 follow-up — A3, "full-correct 27B forward assembly")
