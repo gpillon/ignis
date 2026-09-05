@@ -10,8 +10,12 @@
 # is the only command after "stop ninfer" and before "restart ninfer".
 #
 # crates/core has no FFI and no GPU access (GitHub #39 removed the flat-C-ABI
-# surface), so this stays a process-level guard -- a script wrapping the
-# commands, not a Rust harness feature -- same as ADR 0006 always described.
+# surface), so the GPU itself can only be inspected from here. The guard is
+# not merely conventional, though: the preflight records its pass in a marker
+# file and ignis_core::gpu_profile refuses the profile without a recent one,
+# so `$env:IGNIS_GPU_PROFILE = "1"; cargo test ... -- --ignored` by hand fails
+# loudly instead of running un-preflighted. This script consumes the marker
+# (deleted in the finally block below) so it authorizes exactly this run.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 #   ... -ThresholdMiB 4096       # forwarded to gpu-preflight.ps1
@@ -31,6 +35,16 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Repository = Split-Path -Parent $ScriptDir
+# The preflight's pass marker (see gpu-preflight.ps1): this run consumes it,
+# so it must not outlive the run and authorize a later un-preflighted one.
+$MarkerPath = Join-Path $env:TEMP "ignis-gpu-preflight.ok"
+
+# A GPU-gated step that failed: report it and leave with its own exit code
+# (not a flattened 1 -- the caller wants to know which code came back).
+function FailWithCode([string]$What, [int]$Code) {
+    Write-Error "GPU profile: $What failed (exit $Code)."
+    exit $Code
+}
 
 & (Join-Path $ScriptDir "gpu-preflight.ps1") -ThresholdMiB $ThresholdMiB
 if ($LASTEXITCODE -ne 0) {
@@ -45,24 +59,19 @@ try {
     if (-not $SkipKernelBuild) {
         Write-Host "GPU profile: preflight passed -- kernel/build.ps1 -Test"
         & (Join-Path $Repository "kernel/build.ps1") -Test
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "GPU profile: kernel/build.ps1 -Test failed (exit $LASTEXITCODE)."
-            exit $LASTEXITCODE
-        }
+        if ($LASTEXITCODE -ne 0) { FailWithCode "kernel/build.ps1 -Test" $LASTEXITCODE }
     }
 
     if (-not $SkipCargoTests) {
         Write-Host "GPU profile: cargo test --workspace -- --ignored"
         & cargo test --workspace -- --ignored
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "GPU profile: cargo test --workspace -- --ignored failed (exit $LASTEXITCODE)."
-            exit $LASTEXITCODE
-        }
+        if ($LASTEXITCODE -ne 0) { FailWithCode "cargo test --workspace -- --ignored" $LASTEXITCODE }
     }
 
     Write-Host "GPU profile: done. Restart ninfer (runbook step 4, docs/agents/testing.md)."
     exit 0
 } finally {
     Remove-Item Env:\IGNIS_GPU_PROFILE -ErrorAction SilentlyContinue
+    Remove-Item $MarkerPath -ErrorAction SilentlyContinue
     Pop-Location
 }

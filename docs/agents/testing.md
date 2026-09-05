@@ -58,22 +58,29 @@ and must use the helper above rather than reinventing a self-skip. Until
 then the GPU-side coverage is the kernel leaf's own op-test executable
 (`kernel/build.ps1 -Test`), which the same runbook applies to.
 
-**`crates/core` has no FFI and no GPU access** (GitHub #39 removed the flat
-C-ABI surface): the profile can't be enforced from inside `cargo test`
-itself, so the enforcement point is the process launching it — see below.
-
 ### Running the profile: `scripts/gpu-profile.ps1`
 
 ADR 0006 calls the guard "a preflight check in the `bench`/test harness",
-not a script a developer must remember to run standalone. `scripts/gpu-
-preflight.ps1` alone doesn't enforce that — nothing stops setting
-`IGNIS_GPU_PROFILE=1` and running tests without ever running it.
-`scripts/gpu-profile.ps1` is that harness entry point: it runs the
-preflight and only sets `IGNIS_GPU_PROFILE=1` and runs the GPU-gated work
-(`kernel/build.ps1 -Test`, then `cargo test --workspace -- --ignored`) if
-the preflight passes; the env var is always cleared before it exits, pass
-or fail. **This script is the normal, documented way to run the GPU
-profile** — do not set `IGNIS_GPU_PROFILE=1` by hand.
+not a script a developer must remember to run standalone. So the profile
+takes **two** things, not one: `IGNIS_GPU_PROFILE=1` *and* a preflight pass
+on record. `scripts/gpu-preflight.ps1` writes a marker file
+(`$env:TEMP\ignis-gpu-preflight.ok`) when it passes and clears it when it
+refuses; `active()` reads that marker and **panics** if the variable is set
+without a recent one. Setting the variable by hand therefore fails loudly
+instead of running un-preflighted while ninfer may hold the card.
+
+`crates/core` has no FFI and no GPU access of its own (GitHub #39 removed
+the flat C-ABI surface), so the GPU is inspected by the script and the
+verdict is carried across to Rust by that marker.
+
+`scripts/gpu-profile.ps1` is the entry point that ties it together: it runs
+the preflight, and only on a pass sets `IGNIS_GPU_PROFILE=1` and runs the
+GPU-gated work (`kernel/build.ps1 -Test`, then
+`cargo test --workspace -- --ignored`). It consumes the marker — both it and
+the env var are cleared before the script exits, pass or fail — so one
+preflight authorizes exactly one run. A pass also ages out after 30 minutes,
+which only matters if a run was killed before it could clean up.
+**This script is the normal, documented way to run the GPU profile.**
 
 Runbook:
 

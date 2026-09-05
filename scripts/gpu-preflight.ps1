@@ -7,11 +7,16 @@
 # offending process (ninfer first, since it is the expected culprit) so the
 # developer knows what to stop.
 #
-# Exit 0: the GPU is free -- safe to set IGNIS_GPU_PROFILE=1 and run the GPU
-#         tests (docs/agents/testing.md has the runbook).
+# Exit 0: the GPU is free. A marker file ($env:TEMP\ignis-gpu-preflight.ok) is
+#         written to record the pass -- ignis_core::gpu_profile refuses the
+#         profile without a recent one, so IGNIS_GPU_PROFILE=1 on its own is
+#         not enough (ADR 0006 wants the preflight in the harness, not in the
+#         developer's memory). scripts/gpu-profile.ps1 deletes the marker when
+#         the run ends; docs/agents/testing.md has the runbook.
 # Exit 1: the GPU is busy, or nvidia-smi could not be queried -- the message
 #         names the offending process (or explains why the check could not
-#         run).
+#         run). Any earlier marker is removed first, so a refused preflight
+#         never leaves an older pass standing.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-preflight.ps1
 #   ... -ThresholdMiB 4096   # override the busy threshold
@@ -21,6 +26,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# The pass this run records, read by ignis_core::gpu_profile (which resolves
+# the same path via std::env::temp_dir()). Cleared up front: until this run
+# passes, no pass is on record.
+$MarkerPath = Join-Path $env:TEMP "ignis-gpu-preflight.ok"
+Remove-Item $MarkerPath -ErrorAction SilentlyContinue
 
 function Fail([string]$Message) {
     Write-Error $Message
@@ -56,5 +67,6 @@ if ($usedMiB -gt $ThresholdMiB) {
     Fail "GPU preflight: $usedMiB MiB in use (> $ThresholdMiB MiB) -- another process is holding VRAM. Stop it before running the GPU profile (ADR 0006)."
 }
 
-Write-Host "GPU preflight: free ($usedMiB MiB used, threshold $ThresholdMiB MiB). Safe to run the GPU profile (set IGNIS_GPU_PROFILE=1)."
+[DateTimeOffset]::UtcNow.ToString("o") | Set-Content -Path $MarkerPath -Encoding ascii
+Write-Host "GPU preflight: free ($usedMiB MiB used, threshold $ThresholdMiB MiB). Pass recorded at $MarkerPath; run scripts/gpu-profile.ps1 to use it."
 exit 0
