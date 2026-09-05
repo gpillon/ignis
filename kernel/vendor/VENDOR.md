@@ -198,6 +198,48 @@ P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
   It currently switches on `BF16_CTRL` and `W8G32_F16S`; `NVFP4` (P1-09/#45)
   extends the same switch.
 
+P1-11 (GitHub #47) vendors the fused attention input projection and the fused
+linear+residual output projection, NVFP4 and BF16 arms only:
+
+- **attn_input_proj** — `src/ops/attn_input_proj/nvfp4/` (decode, small-T, the
+  large-T W4A4 route) and `src/ops/attn_input_proj/bf16/` (decode, small-T,
+  MMA) plus the public `include/ninfer/ops/attn_input_proj.h`. This is the
+  fused q/k/output-gate/v projection: a single `[14336,5120]` parent weight
+  (BF16_CTRL contiguous or NVFP4 block-scaled) split in the reference's row
+  order — query `[0,6144)`, key `[6144,7168)`, output gate `[7168,13312)`,
+  value `[13312,14336)` — into four independent output tensors, matching the
+  24-query/4-kv-head × 256 head-dim split.
+- **linear_add** — `src/ops/linear_add/nvfp4/` (decode, small-T, W4A4;
+  `nvfp4_linear_add_epilogue.cuh` was already vendored alongside P1-09's
+  shared W4A4 GEMM kernel) and `src/ops/linear_add/bf16/` (decode, small-T,
+  MMA/aggregate-MMA) plus the public `include/ninfer/ops/linear_add.h`. This
+  is the attention output projection fused with the residual add:
+  `residual[:,t] += Linear(x,w)[:,t]` at `[5120,6144]` (the model's own
+  geometry) and `[5120,17408]` (NVFP4 only, a second registered problem the
+  reference's own test exercises).
+- **their reference op tests** — `tests/ops/test_attn_input_proj.cpp`
+  (**patched**: the reference's file is one combined test exercising Q4/Q5,
+  BF16, NVFP4, FP8 and W8 arms in a single `main()`; this ticket vendors only
+  NVFP4 and BF16, so the Q4/Q5, FP8 and W8 cases and their helpers are
+  removed — `kernel/vendor/patches/tests/ops/test_attn_input_proj.cpp.diff`,
+  recorded via `record-patch`) plus `tests/ops/input_projection_test_common.h`
+  (unpatched, generic across arms); `tests/ops/linear_add/test_nvfp4.cpp` and
+  `tests/ops/linear_add/test_bf16_a16.cpp` + `linear_add_test_common.{h,cpp}`
+  (unmodified: the reference already splits `linear_add` into one test file
+  per arm, so no patch is needed there). Each is its own CTest executable
+  (`ignis_kernel_attn_input_proj_tests`, `ignis_kernel_nvfp4_linear_add_tests`,
+  `ignis_kernel_bf16_linear_add_tests`).
+- The top-level `ops::attn_input_proj` /
+  `ops::attn_input_proj_workspace_capacity_bytes` and `ops::linear_add` /
+  `ops::linear_add_workspace_capacity_bytes` dispatch is **ours**, not
+  vendored (same reasoning as `kernel/src/linear.cu`: the reference's wrapper
+  dispatches every registered qtype, including families this ticket does not
+  vendor) — `kernel/src/attn_input_proj.cu` and `kernel/src/linear_add.cu`.
+  Each switches on `BF16_CTRL` and `NVFP4` only and throws naming this ticket
+  for every other qtype; the Q4/Q5 dual-weight `attn_input_proj` overload and
+  the W8 single/companion overloads declared in the vendored header are never
+  defined, matching that nothing in the trimmed test calls them.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;
