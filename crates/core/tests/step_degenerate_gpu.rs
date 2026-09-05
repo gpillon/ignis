@@ -13,9 +13,11 @@
 //! the RTX 5090 is exclusive, ADR 0006).
 //!
 //! The f64 reference recomputes the full 248320-entry logits vector per
-//! token id from the container's raw W8G32 bytes -- independent of
-//! `ignis_artifact::normalize`'s (private) dequant path, per spec 04's
-//! "independent oracle" convention. This is deliberately slow (a full
+//! token id from the container's raw W8G32 bytes, independently of
+//! `ignis_artifact::normalize::normalize_tensor`'s dequant path (a
+//! from-scratch decode, not a call into the crate under test) -- the same
+//! "independent oracle" convention the reference's own op tests use. This
+//! is deliberately slow (a full
 //! [vocab, hidden] GEMV in scalar f64 per token id, ADR 0005/0007: G1 is a
 //! correctness floor, not a performance gate) -- expect tens of seconds per
 //! token id.
@@ -30,7 +32,7 @@ use ignis_artifact::{
 };
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b;
-use ignis_core::step::decode_degenerate_batch;
+use ignis_core::step::{decode_degenerate_batch, prefill_degenerate};
 
 /// The fork-local model cache (the artifact the running `ninfer-serve`
 /// loads) -- mirrors `crates/core/tests/model_load_gpu.rs`.
@@ -77,7 +79,7 @@ fn bf16_to_f32(bits: u16) -> f32 {
 /// Decode one W8G32 row-split row to f64 (the per-group int8 code times the
 /// group's F16 scale -- the reference's rowsplit decode atom, independently
 /// re-derived here rather than calling `ignis_artifact::normalize`'s
-/// private decoder).
+/// (public, but not reused for the oracle) decoder).
 fn w8_decode_row(payload: &[u8], geom: &RowSplitGeometry, row: u64) -> Vec<f64> {
     let groups_per_row = geom.groups_per_row as usize;
     let cols = geom.columns as usize;
@@ -241,6 +243,34 @@ fn degenerate_program_matches_f64_reference_for_four_tokens() {
     // A few token ids spanning the vocabulary (the acceptance criteria's
     // "4 token ids"): the first, the second, one mid-range, and the last.
     let token_ids: [i32; 4] = [0, 1, 12_345, (VOCAB - 1) as i32];
+
+    // Exercise `ignis_prefill` (the acceptance criteria's other required
+    // entry point, alongside `ignis_decode` below): a two-token span whose
+    // *last* token is `token_ids[0]`. With `skip_layers` there is no
+    // KV/GDN state, so the degenerate program must reach the output head
+    // from the span's last position only (kernel/src/step.cu), not the
+    // first -- `start_position` is accepted but unread while layers are
+    // skipped.
+    let mut prefill_logits = vec![0f32; VOCAB];
+    let prefill_span = [42i32, token_ids[0]];
+    let prefill_token_id = match prefill_degenerate(&model, &prefill_span, 3, Some(&mut prefill_logits))
+    {
+        Ok(id) => id,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("ignis_prefill: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let reference_for_token0 = f64_reference_logits(&reader, token_ids[0] as u32);
+    assert_matches_bf16_tolerance(&prefill_logits, &reference_for_token0, token_ids[0] as u32);
+    assert_eq!(
+        prefill_token_id as usize,
+        argmax_lowest_index(&reference_for_token0),
+        "ignis_prefill: device argmax disagrees with the f64 reference"
+    );
+
     let mut device_logits = vec![0f32; token_ids.len() * VOCAB];
     let device_token_ids = match decode_degenerate_batch(&model, &token_ids, Some(&mut device_logits))
     {
@@ -254,7 +284,9 @@ fn degenerate_program_matches_f64_reference_for_four_tokens() {
     };
 
     for (i, &token_id) in token_ids.iter().enumerate() {
-        let reference = f64_reference_logits(&reader, token_id as u32);
+        // Token 0's reference is already computed above (`ignis_prefill`'s
+        // check) -- reuse it instead of redoing the full-vocab scalar GEMV.
+        let reference = if i == 0 { reference_for_token0.clone() } else { f64_reference_logits(&reader, token_id as u32) };
         let actual = &device_logits[i * VOCAB..(i + 1) * VOCAB];
         assert_matches_bf16_tolerance(actual, &reference, token_id as u32);
 
