@@ -139,6 +139,20 @@ target_include_directories(ignis_kernel_bf16_linear_add_tests PRIVATE ${IGNIS_VE
 target_link_libraries(ignis_kernel_bf16_linear_add_tests PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_bf16_linear_add_tests COMMAND ignis_kernel_bf16_linear_add_tests)
 
+# P1-13 (GitHub #49): the reference's own linear_swiglu NVFP4 test, patched
+# (kernel/vendor/patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff) to drop
+# the A4 (large-T W4A4) case this ticket's acceptance defers to G2 — same
+# pattern as the linear/linear_add tests above, driving the leaf's own
+# `ops::linear_swiglu` (kernel/src/linear_swiglu.cu) so it exercises the real
+# NVFP4 fused gate_up + SiLU-mul epilogue at [34816,5120] for T=1 and small T.
+add_executable(ignis_kernel_nvfp4_linear_swiglu_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear_swiglu/test_nvfp4.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear_swiglu/linear_swiglu_test_common.cpp
+)
+target_include_directories(ignis_kernel_nvfp4_linear_swiglu_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_nvfp4_linear_swiglu_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_nvfp4_linear_swiglu_tests COMMAND ignis_kernel_nvfp4_linear_swiglu_tests)
+
 # --- P1-16 (GitHub #52): the sequence-state pools ---------------------------
 #
 # The reference's own test_kv_cache.cpp / test_state_store.cpp, vendored

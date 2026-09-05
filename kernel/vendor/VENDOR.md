@@ -354,9 +354,41 @@ ticket):
   built as `ignis_kernel_gqa_attention_tests`; `tests/ops/test_kv_cache_append_prefix.cpp`
   (unmodified) built as `ignis_kernel_kv_cache_append_prefix_tests`.
 
-The remaining op families (the fused GDN projections, SwiGLU MLP) arrive with
-P1-12 and P1-13, each adding its files to this manifest and its reference op
-test to the leaf's test suite.
+P1-13 (GitHub #49) vendors the fused MLP gate_up projection with its SiLU-mul
+epilogue, NVFP4 arm only:
+
+- **linear_swiglu** — `src/ops/linear_swiglu/nvfp4/` (decode, small-T, the
+  large-T W4A4 route and its own warp-specialized TMA kernel — unlike
+  `linear_add`, this op's W4A4 GEMM epilogue is entirely private to it, so no
+  shared epilogue header is vendored alongside it) plus the public
+  `include/ninfer/ops/linear_swiglu.h`. Math: `gate_up = Linear(x,
+  gate_up_weight)`; `out[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t]` where
+  `M = gate_up_rows/2`; gate rows `[0,17408)` precede their matching up rows
+  `[17408,34816)` at the model's `[34816,5120] -> [17408,T]` geometry
+  (`Nvfp4MlpGateUpGeometry`, already registered by P1-09's
+  `nvfp4_config.h`). The large-T route (`Nvfp4LinearSwiGluRoute::
+  LinearW4A4Post`, inside the vendored plan) falls back to the already-vendored
+  `ops::linear` (P1-09/P1-10) plus `ops::silu_mul` (P1-07) rather than its own
+  fused kernel, so it compiles with no further vendoring; its own reference
+  test is deferred to G2, same as P1-09's W4A4/TMA route.
+- **its reference op test** — `tests/ops/linear_swiglu/test_nvfp4.cpp`
+  (**patched**: the reference's file exercises both the A16 route this ticket
+  vendors and the A4/large-T route deferred to G2 in one combined `main()`;
+  the A4 case and its token list are trimmed —
+  `kernel/vendor/patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff`, recorded
+  via `record-patch`) plus `tests/ops/linear_swiglu/linear_swiglu_test_common.
+  {h,cpp}` (unpatched, generic across arms). Its own CTest executable
+  (`ignis_kernel_nvfp4_linear_swiglu_tests`).
+- The top-level `ops::linear_swiglu` / `ops::linear_swiglu_workspace_capacity_
+  bytes` dispatch is **ours**, not vendored (same reasoning as
+  `kernel/src/linear.cu`: the reference's wrapper dispatches every registered
+  qtype, including families this ticket does not vendor) —
+  `kernel/src/linear_swiglu.cu`. It switches on `NVFP4` only and throws naming
+  this ticket for every other qtype.
+
+The remaining op family (the fused GDN projections: gdn_input_proj,
+gdn_gating_proj) arrives with P1-12, adding its files to this manifest and
+its reference op test to the leaf's test suite.
 
 ## Updating to a newer reference commit
 
