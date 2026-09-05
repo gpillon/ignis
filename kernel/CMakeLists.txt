@@ -30,13 +30,24 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
-# --- the vendored reference substrate (ADR 0010, GitHub #42) ----------------
+# CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44; also
+# needed by the P1-10/#46 bf16/w8 dispatch below): the vendored op wrappers'
+# public headers declare host-callable functions taking a `cudaStream_t`, and
+# the op-test harness calls the CUDA runtime API (cudaMemcpyAsync, stream
+# sync) directly from plain .cpp translation units — unlike the .cu sources,
+# MSVC's cl.exe does not see the CUDA toolkit's include/lib dirs on its own
+# for those.
+find_package(CUDAToolkit REQUIRED)
+
+# --- the vendored reference substrate (ADR 0010, GitHub #42, #43, #44, #46) -
 #
-# Verbatim copies of the reference's core and ops-common headers, pinned by
-# kernel/vendor/manifest.json and maintained by scripts/vendor-ninfer.ps1.
-# Vendored files keep the reference's include paths (`core/...`,
-# `ops/common/...`), so `kernel/vendor/src` is the include root and a diff
-# against the source stays trivial.
+# Verbatim copies of the reference's core, ops-common headers and (from P1-07)
+# the norm/glue op families, pinned by kernel/vendor/manifest.json and
+# maintained by scripts/vendor-ninfer.ps1. Vendored files keep the reference's
+# include paths (`core/...`, `ops/common/...`, `ops/kernel/...`,
+# `ops/launcher/...`), so `kernel/vendor/src` is the include root and a diff
+# against the source stays trivial. Public op headers keep the reference's
+# `ninfer/ops/...` include path, rooted at `kernel/vendor/include`.
 #
 # The source list is explicit, not a glob: the manifest is the only thing that
 # decides what is vendored, and a glob would silently absorb a stray file.
@@ -47,12 +58,37 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
-  # BF16 linear (GEMV, small-T, MMA) — GitHub #46, P1-10.
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/argmax.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/embed_gather.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/l2norm.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/residual_add.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/rmsnorm.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/sigmoid_gate_mul.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/silu_and_mul.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/fp8/fp8_format.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/argmax.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/embedding.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/l2norm.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/residual_add.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/rmsnorm.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/sigmoid_mul.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/silu_mul.cpp
+  # P1-09 (GitHub #45): the NVFP4 linear op family (codec/format/config are
+  # header-only or listed via their .cpp; GEMV, small-T and the W4A4 MMA/TMA
+  # sources below). The large-T W4A4/TMA route compiles here but is only
+  # verified at G2 (its own reference test is deferred with it).
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_format.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+  # P1-10 (GitHub #46): the BF16 linear op family (GEMV, small-T, MMA).
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_dispatch.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemv.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_small_t.cu
-  # W8G32 linear (GEMV, small-T, MMA/split-K) — GitHub #46, P1-10.
+  # P1-10 (GitHub #46): the W8G32 linear op family (GEMV, small-T, MMA/split-K).
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_dispatch.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_mma.cu
@@ -64,15 +100,22 @@ set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
   OUTPUT_NAME "ignis_vendor"
 )
-# bf16/w8 dispatch (.cpp, host-compiled) include <cuda_runtime.h> for
-# cudaStream_t; nvcc sees the toolkit include path implicitly but cl.exe does
-# not, so it is added explicitly. CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES is
-# populated once CUDA is an enabled project language.
 target_include_directories(ignis_vendor PUBLIC
   ${IGNIS_VENDOR_DIR}/src
   ${IGNIS_VENDOR_DIR}/include
-  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
+target_link_libraries(ignis_vendor PUBLIC CUDA::cudart)
+
+# nvfp4_w4a4_tma.cu is the warp-specialized SM120 W4A4 GEMM: it uses the CUDA
+# driver API directly (cuTensorMapEncodeTiled, for the TMA tensor-map
+# descriptors) and setmaxnreg to hand registers from its producer warpgroup to
+# its consumer warpgroups. The reference isolates it in a separate,
+# non-relocatable-device-code static library (`ninfer_nvfp4_tma`,
+# CUDA_SEPARABLE_COMPILATION OFF) because RDC makes ptxas discard that
+# contract; ignis has no target anywhere with CUDA_SEPARABLE_COMPILATION ON
+# (the default is already OFF), so that constraint already holds here without
+# a second library — only the driver-API link dependency needs adding.
+target_link_libraries(ignis_vendor PUBLIC CUDA::cuda_driver)
 
 # --- the leaf's own C ABI surface ------------------------------------------
 #
@@ -89,10 +132,14 @@ set_target_properties(ignis_kernel PROPERTIES
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
 
-# NOTE: neither static library resolves cudart here — a static archive carries
-# unresolved cudart symbols, which the final Rust binary resolves
-# (crates/*/build.rs link the CUDA import libs and both archives). No
-# find_package needed.
+# NOTE: ignis_kernel itself still does not resolve cudart here — a static
+# archive carries unresolved cudart symbols, which the final Rust binary
+# resolves (crates/*/build.rs link the CUDA import libs and both archives).
+# ignis_vendor's PUBLIC link to CUDA::cudart (above, P1-07/#43) is only an
+# import-library reference to the same cudart.dll, needed so its own vendored
+# op wrappers and the leaf's CTest executables (plain .cpp, not built by
+# nvcc) can see `cudaStream_t` and call the runtime API directly; it does not
+# change what the Rust link has to provide.
 
 # --- the leaf's own test executable (CTest) ---------------------------------
 enable_testing()
