@@ -72,6 +72,14 @@ pub struct ModelConfig {
     /// beta `b` — `0` = no a/b projection, the step's g / beta are 0;
     /// the Qwen 3.8-27B real model is 96 = 48 a + 48 b, A3 / #30).
     pub gdn_ab_width: u64,
+    /// The GDN recurrence's value-head count (`gdn_state_rows /
+    /// gdn_head_dim`; the sequence-state pool's per-layer slot is this many
+    /// `gdn_head_dim x gdn_head_dim` fp32 matrices, GitHub #55).
+    pub gdn_value_heads: u64,
+    /// The GDN recurrence's per-head state dimension — square (the
+    /// reference's state matrix is `gdn_head_dim x gdn_head_dim` per value
+    /// head: `value_head_dim == key_head_dim`, GitHub #55).
+    pub gdn_head_dim: u64,
     /// The GQA RoPE rotary dim (of `head_dim` — the first `rotary_dim`
     /// dims of each q / k head are rotated; `rotary_dim / 2` pairs,
     /// GitHub #28).
@@ -157,6 +165,10 @@ impl ModelConfig {
             gdn_q_width: 0,
             gdn_z_width: 0,
             gdn_ab_width: 0,
+            // 2 value heads x 8-wide state == gdn_state_rows (16); square
+            // state, so key_head_dim is the same 8.
+            gdn_value_heads: 2,
+            gdn_head_dim: 8,
             rotary_dim: 8,
             rope_theta: 1e7,
             ffn_intermediate: 32,
@@ -197,6 +209,12 @@ impl ModelConfig {
             gdn_q_width: 2048,
             gdn_z_width: 6144,
             gdn_ab_width: 96,
+            // 48 value heads x 128-wide state == gdn_state_rows (6144);
+            // square state (the reference's recurrence is 128x128 per
+            // head, A3 / #30 / GitHub #55), so key_head_dim is the same
+            // 128.
+            gdn_value_heads: 48,
+            gdn_head_dim: 128,
             // The GQA RoPE geometry (GitHub #28): the split-half NeoX
             // rotary of `rotary_dim` = 64 of `head_dim` = 256 (32 pairs),
             // base θ = 1e7 (the reference's `rope_linear_frequencies`
@@ -208,6 +226,26 @@ impl ModelConfig {
             // blocks per request (the 262k context envelope, design §2).
             block_size: 64,
             num_blocks: 4096,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `gdn_value_heads * gdn_head_dim` must equal `gdn_state_rows` (the
+    /// sequence-state pool's per-layer slot is `gdn_value_heads` square
+    /// `gdn_head_dim x gdn_head_dim` matrices, GitHub #55) — pins the
+    /// relationship so the two representations cannot silently drift.
+    #[test]
+    fn gdn_value_heads_and_head_dim_agree_with_state_rows() {
+        for cfg in [ModelConfig::synthetic(), ModelConfig::qwen38_27b()] {
+            assert_eq!(
+                cfg.gdn_value_heads * cfg.gdn_head_dim,
+                cfg.gdn_state_rows,
+                "gdn_value_heads * gdn_head_dim must equal gdn_state_rows"
+            );
         }
     }
 }

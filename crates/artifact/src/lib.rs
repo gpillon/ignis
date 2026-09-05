@@ -35,6 +35,11 @@ pub mod normalize;
 #[cfg(feature = "cuda")]
 mod ffi;
 
+/// The paged KV page-budget query (feature `cuda` — host-only arithmetic,
+/// but the query itself lives in the kernel leaf, GitHub #55).
+#[cfg(feature = "cuda")]
+pub mod kv_budget;
+
 pub use binding::{Binding, Bf16View, Nvfp4View};
 pub use binder::{
     Binder, DevicePlacement, HostPlacement, MaterializationPlan, ObjectHandle,
@@ -45,6 +50,8 @@ pub use checksum::{
 pub use device::{CpuDevice, Device, DeviceBuffer};
 #[cfg(feature = "cuda")]
 pub use device::CudaDevice;
+#[cfg(feature = "cuda")]
+pub use kv_budget::{paged_kv_page_budget, PagedKvBudget, PagedKvPlane};
 pub use frontend::{
     ChatMessage, ChatTemplate, ContentPart, FRONTEND_RESOURCES, FrontendSet, MessageContent,
     Role, ToolCall, Tokenizer,

@@ -34,6 +34,8 @@ pub mod model_load;
 pub mod prefix;
 pub mod request;
 pub mod scheduler;
+#[cfg(feature = "cuda")]
+pub mod seq;
 pub mod types;
 
 pub use admission::{
