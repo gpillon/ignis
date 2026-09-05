@@ -93,6 +93,39 @@ target_include_directories(ignis_kernel_w8_linear_tests PRIVATE ${IGNIS_VENDOR_D
 target_link_libraries(ignis_kernel_w8_linear_tests PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_w8_linear_tests COMMAND ignis_kernel_w8_linear_tests)
 
+# P1-11 (GitHub #47): the reference's own attn_input_proj test, patched
+# (kernel/vendor/patches/tests/ops/test_attn_input_proj.cpp.diff) to drop the
+# Q4/Q5, FP8 and W8 arms this ticket does not vendor — same pattern as the
+# linear tests above, driving the leaf's own `ops::attn_input_proj`
+# (kernel/src/attn_input_proj.cu) so it exercises the real NVFP4/BF16 fused
+# q/k/gate/v projection at the model's 24q/4kv x 256 split
+# ([14336,5120]).
+add_executable(ignis_kernel_attn_input_proj_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/test_attn_input_proj.cpp
+)
+target_include_directories(ignis_kernel_attn_input_proj_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_attn_input_proj_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_attn_input_proj_tests COMMAND ignis_kernel_attn_input_proj_tests)
+
+# P1-11 (GitHub #47): the reference's own linear_add tests, run unmodified —
+# the NVFP4 arm ([5120,6144] and [5120,17408]) and the BF16 arm ([5120,6144],
+# the attention output projection's residual add) — driving the leaf's own
+# `ops::linear_add` (kernel/src/linear_add.cu).
+add_executable(ignis_kernel_nvfp4_linear_add_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear_add/test_nvfp4.cpp
+)
+target_include_directories(ignis_kernel_nvfp4_linear_add_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_nvfp4_linear_add_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_nvfp4_linear_add_tests COMMAND ignis_kernel_nvfp4_linear_add_tests)
+
+add_executable(ignis_kernel_bf16_linear_add_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear_add/test_bf16_a16.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear_add/linear_add_test_common.cpp
+)
+target_include_directories(ignis_kernel_bf16_linear_add_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_bf16_linear_add_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_bf16_linear_add_tests COMMAND ignis_kernel_bf16_linear_add_tests)
+
 # --- P1-16 (GitHub #52): the sequence-state pools ---------------------------
 #
 # The reference's own test_kv_cache.cpp / test_state_store.cpp, vendored

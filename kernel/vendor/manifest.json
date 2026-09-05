@@ -16,6 +16,10 @@
       "sha256": "ada7a7b8db39b487e6f650fffff6334ecdfa9f9d723e3a4e74bf09eb3d0c8b37"
     },
     {
+      "path": "include/ninfer/ops/attn_input_proj.h",
+      "sha256": "415eef9806bf5577c47f515d6cd5399c1cf5576e5834c8f6909065c67c575242"
+    },
+    {
       "path": "include/ninfer/ops/embedding.h",
       "sha256": "dc5d91ed6e179dbf20c21f8753ff7519267e1af31224b6bc948e33c508608651"
     },
@@ -30,6 +34,10 @@
     {
       "path": "include/ninfer/ops/linear.h",
       "sha256": "3858e9af80b0a8122d92d8c59ae811419efce76a774cafb9f4fdd17b828cc06e"
+    },
+    {
+      "path": "include/ninfer/ops/linear_add.h",
+      "sha256": "68e9d798bde4963f042840e866fa5567261cf96514aa6588230a88d185a04a45"
     },
     {
       "path": "include/ninfer/ops/residual_add.h",
@@ -126,6 +134,46 @@
     {
       "path": "src/core/weight.h",
       "sha256": "5db0915d59ea0b8f0397a3e586d94b15311dcba5599bcc30c6f202d9516e9b09"
+    },
+    {
+      "path": "src/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu",
+      "sha256": "48c9d072bb1a60ada080eef1b6012e315e72dac08fb468a2a46013bfbd706cf4"
+    },
+    {
+      "path": "src/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu",
+      "sha256": "6f07e9656e602af5d5c1571e4be2aa4b621608aff91617472754f4ffb283d51d"
+    },
+    {
+      "path": "src/ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp",
+      "sha256": "bb34ac6f46d708762e1abfa366863d9000e903b7ad55aa872b179eba6dad071e"
+    },
+    {
+      "path": "src/ops/attn_input_proj/bf16/bf16_attn_input_plan.h",
+      "sha256": "d89da0eac62f966a8ab3dcbc0edb8873c2ef1d84ffc9c3e001cbd43cb3a91114"
+    },
+    {
+      "path": "src/ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu",
+      "sha256": "02ea476f9824585fb91a52e8d619b06ac50046e7b4fea33cdff6a9a7c6acf504"
+    },
+    {
+      "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu",
+      "sha256": "2c2abd1da12dec895aed1c60cd94958bc791477f06f9d38f33bcab99ed39d331"
+    },
+    {
+      "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp",
+      "sha256": "b7abc97a9c56fe73874ab9f126104d2e3fea100f28c530d885791c5d725d6bbb"
+    },
+    {
+      "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h",
+      "sha256": "c0f8502fb3906fb94f5cf3c1a6cb2c870acaedd2c79de76f6bcab696077999bd"
+    },
+    {
+      "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu",
+      "sha256": "a56df320ced04f9815bd2c6bee7bba9abd10616b0ed529ceb6738b5b2482c17f"
+    },
+    {
+      "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu",
+      "sha256": "b9371cc945e853bf105d745d715cdb124406b3f62c95ba7a9b5ea719829af9a0"
     },
     {
       "path": "src/ops/common/bf16_vector.cuh",
@@ -452,8 +500,48 @@
       "sha256": "745358b3c7588f1f01fe8be5ca180e739f576f8af87d0051d8dd0e5aac614e2c"
     },
     {
+      "path": "src/ops/linear_add/bf16/bf16_linear_add_decode.cu",
+      "sha256": "ff8ace5d0cceaaad04e80cea1c99fb8a57a4ddc17bf462e8637b40056a623889"
+    },
+    {
+      "path": "src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu",
+      "sha256": "2123f6f4e7dce26769c648f4b58e4faef2b65db400eba8b0cfa11f01f30e3f7a"
+    },
+    {
+      "path": "src/ops/linear_add/bf16/bf16_linear_add_plan.cpp",
+      "sha256": "f92dcadddb6a4674ec75d34cd5a5d5b6e31a4701ac02d10ac3d7be69093a66ab"
+    },
+    {
+      "path": "src/ops/linear_add/bf16/bf16_linear_add_plan.h",
+      "sha256": "3dd0d6ec20c63f8ea03eb0d9cc4f1a7989f1cffd5c1328c8d3b1f0df26257b5e"
+    },
+    {
+      "path": "src/ops/linear_add/bf16/bf16_linear_add_small_t.cu",
+      "sha256": "c7e0681249e301f72f9fbf5883c660cc81e7e453294a844691ad78258531824e"
+    },
+    {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu",
+      "sha256": "1816af8dabdef5316eb94b93e3887e0dd8a24a19cca12b71e2fb3c2aecd08c79"
+    },
+    {
       "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh",
       "sha256": "b92181e9d3bae4db68582ed1c6fdbbbf959c90bfa7fc572c7ed2500a829ade0b"
+    },
+    {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp",
+      "sha256": "343d0ea568e49b1bc0da93a6ca14ef2540bcda1e0df3db7821e8e303d7b2e0ba"
+    },
+    {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.h",
+      "sha256": "fb814f7c19d51f81328aef6400db78488dd7dbcf9a18da92aa7dfe413ff9a557"
+    },
+    {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu",
+      "sha256": "54cd9f2f473232e444d639ff7fa67b09e85a1ec36d231053a14458b81ea8a507"
+    },
+    {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu",
+      "sha256": "5b5d7b5c409d12b692d73ff9c46c57d0d1c708c04c25f617884a7c5f3e5166ba"
     },
     {
       "path": "src/ops/wrapper/argmax.cpp",
@@ -488,6 +576,10 @@
       "sha256": "b1e5b4a4ae62bfd085367b8abae20782cdf34a608afdfd267e018792b1ef54e4"
     },
     {
+      "path": "tests/ops/input_projection_test_common.h",
+      "sha256": "2425d469f725455aa35c96f788fe9aaec993d73d1f0180666b7b1fe93908bdb0"
+    },
+    {
       "path": "tests/ops/linear/linear_test_common.cpp",
       "sha256": "336face4755fc1b931c28497fdde9ab1c65943a8eb33d435dd53e2ff11d03185"
     },
@@ -508,6 +600,22 @@
       "sha256": "7192ac0817c3aa2c39c8512c19b94d4c94cc51d898bca541d8c9e2c3e66bb18b"
     },
     {
+      "path": "tests/ops/linear_add/linear_add_test_common.cpp",
+      "sha256": "9a5c70e91cc132e1185c87e802cd7e926af95c033842bd1a268bb90f187c73e8"
+    },
+    {
+      "path": "tests/ops/linear_add/linear_add_test_common.h",
+      "sha256": "0db4f23ba13313ca64329143ce613ea6019a05688311f53e44c55d2d0181bdf6"
+    },
+    {
+      "path": "tests/ops/linear_add/test_bf16_a16.cpp",
+      "sha256": "759f0714f80113f1e8db24eac00af00e2961afd7c289ea86fff841882ecfdbd9"
+    },
+    {
+      "path": "tests/ops/linear_add/test_nvfp4.cpp",
+      "sha256": "ffe64b771126cae948b09aff69569e1bab9e32a5305f6acb1169c31297f1910c"
+    },
+    {
       "path": "tests/ops/norm_test_common.h",
       "sha256": "670c9b5c2155e0853f2384172c2f2dea727a89ae1137f7d58b369088cd659227"
     },
@@ -526,6 +634,15 @@
     {
       "path": "tests/ops/test_argmax.cpp",
       "sha256": "1f6e8daef75487637c5ed96b5e3dddf1d53c195e73dc6e38bced50f77563f272"
+    },
+    {
+      "path": "tests/ops/test_attn_input_proj.cpp",
+      "sha256": "f27be55801b0317fc998cd91570374d2c91aa49d4e62eb4d2eca4429569292e8",
+      "patch": {
+        "diff": "patches/tests/ops/test_attn_input_proj.cpp.diff",
+        "sha256": "6aff16130bf2f26f7a451733729d84659a4056c946e56cc469ef69a8c5e0aeb7",
+        "reason": "P1-11 (GitHub #47) vendors only the NVFP4 and BF16 arms of attn_input_proj; the reference's single combined test file also exercises Q4/Q5, FP8 and W8 arms this ticket does not vendor, so those cases are trimmed (main() and their helper functions removed) rather than left to throw at runtime"
+      }
     },
     {
       "path": "tests/ops/test_embedding.cpp",

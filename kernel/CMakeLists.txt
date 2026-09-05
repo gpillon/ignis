@@ -99,6 +99,25 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_simt.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
+  # P1-11 (GitHub #47): the fused attention input projection (NVFP4 + BF16
+  # arms) and the fused linear+residual output projection (NVFP4 + BF16
+  # arms).
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_small_t.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
