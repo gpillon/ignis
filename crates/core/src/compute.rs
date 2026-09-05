@@ -1286,13 +1286,28 @@ pub struct GraphGeometry {
     pub batch: i64,
 }
 
-/// A thread-safe handle to the captured CUDA graph. The raw `*mut IgnisGraph`
-/// is not `Send`, but the handle is captured once at startup and launched via
-/// the leaf's thread-safe FFI primitives (ADR 0003), so a wrapper asserts the
-/// thread-safety (the `Compute` trait's `Send + Sync` bound, `scheduler.rs`).
+/// A thread-safe handle to the captured CUDA graph (the kernel-abi 03 empty-
+/// capture warm-up, superseded by the B2 / #32 decode graph — retained for
+/// the kernel-abi 03 surface's handle type). The raw `*mut IgnisGraph` is
+/// not `Send`, but the handle is captured once at startup and launched via
+/// the leaf's thread-safe FFI primitives (ADR 0003), so a wrapper asserts
+/// the thread-safety (the `Compute` trait's `Send + Sync` bound,
+/// `scheduler.rs`).
+#[allow(dead_code)]
 struct SendGraph(*mut ffi::IgnisGraph);
 
+#[allow(dead_code)]
 unsafe impl Send for SendGraph {}
+
+/// A thread-safe handle to the decode graph (the CUDA-graph decode replay,
+/// B2 / #32, ADR 0008). The raw `*mut IgnisDecodeGraph` is not `Send`, but
+/// the handle is constructed once at startup (the leaf-owned staging buffers
+/// + capture stream are stable) and replayed / eager-referenced via the
+/// leaf's thread-safe FFI primitives (ADR 0003), so a wrapper asserts the
+/// thread-safety (the `Compute` trait's `Send + Sync` bound, `scheduler.rs`).
+struct SendDecodeGraph(*mut ffi::IgnisDecodeGraph);
+
+unsafe impl Send for SendDecodeGraph {}
 
 /// The artifact's device context (the #26 fix): holds the `CudaDevice` (the
 /// VRAM arena owner), the `MaterializedArtifact` (the materialized tensor
@@ -1348,13 +1363,17 @@ pub struct CudaCompute {
     config: ModelConfig,
     weights: Weights,
     state: Mutex<HashMap<RequestId, RequestState>>,
-    /// The captured decode graph (the kernel-leaf's eager CUDA graph,
-    /// kernel-abi 03): `Some` when the startup capture succeeded (the GPU
-    /// was available, ADR 0006), `None` on a busy/absent GPU (the eager
-    /// fallback path).
-    graph: Mutex<Option<SendGraph>>,
-    /// The captured graph's representative geometry (`None` on a busy/absent
-    /// GPU — the eager fallback path, ADR 0006).
+    /// The decode graph (the CUDA-graph decode replay, the decode hot path,
+    /// B2 / #32, ADR 0008): the leaf's `ignis_decode_graph` handle (the
+    /// captured decode DAG + the fixed-address device staging buffers).
+    /// `Some` when the construction-time capture succeeded (a free GPU, ADR
+    /// 0006), `None` on a busy/absent GPU or a VRAM shortfall (the eager
+    /// fallback path, ADR 0003 / ADR 0006).
+    graph: Mutex<Option<SendDecodeGraph>>,
+    /// The captured decode graph's representative geometry (`None` on a
+    /// busy/absent GPU or a VRAM shortfall — the eager fallback path, ADR
+    /// 0006). A decode step of a different batch runs the eager sequence
+    /// (ADR 0003).
     graph_geom: Option<GraphGeometry>,
     /// The GQA RoPE inverse-frequency table (kernel-abi 06, A3 / #30):
     /// `inv_freq[pair] = θ^(-2·pair/rotary_dim)` (θ = `rope_theta`,
@@ -1376,38 +1395,41 @@ pub struct CudaCompute {
     /// acceptance: the GPU test asserts a multi-token prefill took the
     /// multi-token path, a single-token one did not).
     batched_prefills: AtomicU64,
+    /// The decode-step jobs replayed through the CUDA-graph hot path (B2 /
+    /// #32, ADR 0008): incremented once per `decode_step` that runs the
+    /// graph replay (the single-token, representative-batch case — a
+    /// `jobs.len() == 1` step while the graph is active). The eager fallback
+    /// (a batch that does not match the captured `GraphGeometry`, or a
+    /// busy/absent GPU that left the graph `None`, ADR 0003 / ADR 0006)
+    /// never increments — the observation surface for the `decode_step`
+    /// dispatch (the spec 09 acceptance: a test asserts the hot path used
+    /// the graph — the counter > 0 after a single-token step — and the eager
+    /// fallback engaged on a batch mismatch / a no-graph host).
+    graph_launches: AtomicU64,
 }
 
 impl CudaCompute {
     /// Construct a compute backend over a synthetic (or dequantized) model.
     ///
-    /// Runs the kernel-leaf startup check (`ignis_graph_startup_check`) and
-    /// captures the representative decode graph (the kernel-abi 03 fast
-    /// path). On a busy/absent GPU the capture self-skips (ADR 0006) and the
-    /// backend falls back to the eager sequence — a non-GPU host still gets
-    /// a (correct, eager) backend, so the scheduler never faults on a busy
-    /// GPU.
+    /// B2 / #32: constructs the decode graph (the CUDA-graph decode replay,
+    /// the decode hot path, ADR 0008) — the fixed-address device staging
+    /// buffers + the captured representative decode sequence (the graph's
+    /// DAG). On a busy/absent GPU (or a VRAM shortfall) the decode graph
+    /// self-skips (ADR 0006) and the backend falls back to the eager
+    /// sequence (ADR 0003) — a no-GPU host still gets a (correct, eager)
+    /// backend, so the scheduler never faults on a busy GPU.
     pub fn new(config: ModelConfig, weights: Weights) -> Self {
-        // The kernel-leaf startup check (ticket 10): a few KB of VRAM, runs
-        // even with a model loaded (ADR 0006 nuance). A non-zero rc (no GPU
-        // / busy) leaves the graph `None` (the eager fallback).
-        let rc = unsafe { ffi::ignis_graph_startup_check(std::ptr::null_mut()) };
-        // The representative decode-step capture (the kernel-abi 03 graph
-        // primitives): a single-token batch decode (the per-step structure).
-        // A capture that does not materialize (a no-GPU host, a stream
-        // mismatch) leaves the eager fallback (ADR 0006).
-        let (graph, graph_geom) = if rc == 0 {
-            let mut out: *mut ffi::IgnisGraph = std::ptr::null_mut();
-            let begin = unsafe { ffi::ignis_graph_begin_capture(std::ptr::null_mut()) };
-            let end =
-                unsafe { ffi::ignis_graph_end_capture(std::ptr::null_mut(), &mut out) };
-            if begin == 0 && end == 0 && !out.is_null() {
-                (Some(SendGraph(out)), Some(GraphGeometry { batch: 1 }))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
+        // B2 (#32): the decode graph (the decode hot path, ADR 0008). The
+        // construction-time capture (a free GPU, a VRAM that fits the
+        // staging) leaves `graph` Some + the `GraphGeometry` set; a
+        // busy/absent GPU or a VRAM shortfall self-skips (ADR 0006) and
+        // leaves the eager fallback (ADR 0003).
+        let (graph, graph_geom) = match Self::build_decode_graph(&config, &weights) {
+            Some(handle) => (
+                Some(SendDecodeGraph(handle)),
+                Some(GraphGeometry { batch: 1 }),
+            ),
+            None => (None, None),
         };
         // The GQA RoPE inverse-frequency table (kernel-abi 06, A3 / #30):
         // computed once at construction (host-side, a deterministic table;
@@ -1424,6 +1446,7 @@ impl CudaCompute {
             rope_inv_freq,
             device_ctx: None,
             batched_prefills: AtomicU64::new(0),
+            graph_launches: AtomicU64::new(0),
         }
     }
 
@@ -1451,11 +1474,147 @@ impl CudaCompute {
             rope_inv_freq,
             device_ctx: None,
             batched_prefills: AtomicU64::new(0),
+            graph_launches: AtomicU64::new(0),
         }
     }
 
-    /// Whether the CUDA-graph fast path is active (the startup capture
-    /// succeeded; the decode step may launch the graph, ADR 0003).
+    /// B2 (#32): build the decode graph (ADR 0008) — the representative
+    /// decode geometry (the decode-batch dims, derived from the topology) +
+    /// the read-only weights (host — the leaf H2D's them once, the
+    /// synthetic / dev path; the leaf-allocated + zeroed mutable decode
+    /// state, the paged KV + GDN state, the ADR 0003 eager geometry) — then
+    /// the leaf's `ignis_decode_graph_new` (the construction-time capture
+    /// + the staging buffers). The decode graph self-skips on a busy /
+    /// absent GPU or a VRAM shortfall (ADR 0006 — the eager fallback).
+    /// Returns the leaf handle (`Some`) or `None` (the self-skip — the
+    /// eager fallback, ADR 0003).
+    fn build_decode_graph(
+        config: &ModelConfig,
+        weights: &Weights,
+    ) -> Option<*mut ffi::IgnisDecodeGraph> {
+        // The representative decode geometry (the decode-batch dims, ADR 0008).
+        let geom = ffi::IgnisDecodeGraphGeom {
+            hidden: config.hidden as i64,
+            vocab: config.vocab as i64,
+            num_q_heads: config.num_q_heads as i64,
+            num_kv_heads: config.num_kv_heads as i64,
+            head_dim: config.head_dim as i64,
+            block_size: config.block_size as i64,
+            num_blocks: config.num_blocks as i64,
+            gdn_state_rows: config.gdn_state_rows as i64,
+            gdn_state_cols: config.gdn_state_cols as i64,
+            gdn_state_dim: config.gdn_state_dim() as i64,
+            gdn_num_layers: config.gdn_num_layers as i64,
+        };
+        // The lm_head's bf16 buffer (the representative decode step's logits
+        // GEMM consumes a plain bf16 weight): the dequantized bf16 variant
+        // (the artifact's W8 endpoint) is used as-is (the host buffer — the
+        // leaf H2D's it during the call); the NVFP4 variant (the synthetic
+        // path) is dequantized to bf16 (a temporary the leaf H2D's during
+        // the call, ADR 0005).
+        let (lm_head_ptr, lm_head_tmp): (*const c_void, Option<Vec<u16>>) =
+            match &weights.lm_head {
+                HeadWeight::DequantBf16 { data, .. } => {
+                    (data.as_ptr() as *const c_void, None)
+                }
+                HeadWeight::Nvfp4(nv) => {
+                    let buf = Self::dequant_nvfp4_to_bf16(nv);
+                    (buf.as_ptr() as *const c_void, Some(buf))
+                }
+            };
+        // The weights descriptor (host — the leaf H2D's the read-only
+        // weights once; `weights_on_device` = 0 selects the host case, ADR
+        // 0008; the device-resident artifact case is the `from_artifact`
+        // path's `weights_on_device` = 1, ADR 0002).
+        let wts = ffi::IgnisDecodeGraphWeights {
+            weights_on_device: 0,
+            embedding: weights.embedding.as_ptr() as *const c_void,
+            embedding_bytes: (config.vocab * config.hidden * 2) as i64,
+            final_norm: weights.final_norm.as_ptr() as *const c_void,
+            final_norm_bytes: (config.hidden * 2) as i64,
+            lm_head: lm_head_ptr,
+            lm_head_bytes: (config.vocab * config.hidden * 2) as i64,
+        };
+        // Construct the decode graph (the self-skip — a -1 on a busy /
+        // absent GPU, or a VRAM shortfall, ADR 0006 — the eager fallback).
+        // `lm_head_tmp` (the NVFP4 dequant temporary) lives for the call
+        // (the leaf H2D's the weights synchronously inside it).
+        let mut out: *mut ffi::IgnisDecodeGraph = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_decode_graph_new(&geom, &wts, &mut out) };
+        drop(lm_head_tmp);
+        if rc == 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Dequantize an NVFP4 GEMM weight to a plain bf16 `[m][k]` row-major
+    /// buffer (the deterministic host dequant, B2 / #32 — the
+    /// representative decode step's lm_head GEMM consumes a plain bf16
+    /// weight; the NVFP4 variant (the synthetic path) is dequantized here,
+    /// the leaf H2D's the result once, a temporary). Mirrors the nvfp4
+    /// codec (the E2M1 / E4M3 dequant, kernel-abi 01).
+    fn dequant_nvfp4_to_bf16(w: &Nvfp4Weight) -> Vec<u16> {
+        let m = w.m as usize;
+        let k = w.k as usize;
+        if m == 0 || k == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u16; m * k];
+        for r in 0..m {
+            for c in 0..k {
+                // The E2M1 code (two packed per byte: the low 4 bits = the
+                // even k, the high 4 bits = the odd k).
+                let byte = w.codes[r * (k / 2) + c / 2];
+                let code = if c % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                let e2m1 = Self::nvfp4_e2m1(code);
+                // The E4M3 group scale (one per 16-element group).
+                let scale = Self::nvfp4_e4m3(w.scales[r * (k / 16) + c / 16]);
+                out[r * k + c] = f32_to_bf16(e2m1 * scale);
+            }
+        }
+        out
+    }
+
+    /// The E2M1 (FP4) decode (1 sign bit, 3 magnitude bits ->
+    /// {0, .5, 1, 1.5, 2, 3, 4, 6}), 1:1 with the nvfp4 codec (kernel-abi
+    /// 01, the `decode_nvfp4_e2m1` helper).
+    fn nvfp4_e2m1(code: u8) -> f32 {
+        let mag = match code & 0x7 {
+            0 => 0.0,
+            1 => 0.5,
+            2 => 1.0,
+            3 => 1.5,
+            4 => 2.0,
+            5 => 3.0,
+            6 => 4.0,
+            _ => 6.0,
+        };
+        if code & 0x8 != 0 {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// The E4M3 (OCP FP8, bias 7, no inf) decode (1 sign, 4 exponent, 3
+    /// mantissa; subnormals (exp == 0) use (m/8) * 2^-6), 1:1 with the
+    /// nvfp4 codec (kernel-abi 01, the `decode_nvfp4_e4m3` helper).
+    fn nvfp4_e4m3(code: u8) -> f32 {
+        let sign = if code & 0x80 != 0 { -1.0f32 } else { 1.0 };
+        let exp = ((code >> 3) & 0x0F) as i32;
+        let man = (code & 0x07) as f32;
+        let mag = if exp == 0 {
+            (man / 8.0) * 0.015625 // subnormal: (m/8) * 2^-6
+        } else {
+            (1.0 + man / 8.0) * 2.0f32.powi(exp - 7)
+        };
+        sign * mag
+    }
+
+    /// Whether the CUDA-graph fast path is active (the construction-time
+    /// capture succeeded; the decode step may launch the graph, ADR 0003).
     pub fn uses_graph(&self) -> bool {
         self.graph_geom.is_some()
     }
@@ -1487,6 +1646,88 @@ impl CudaCompute {
     /// integration) assert the dispatch through this counter.
     pub fn batched_prefill_count(&self) -> u64 {
         self.batched_prefills.load(Ordering::Relaxed)
+    }
+
+    /// The number of decode-step jobs replayed through the CUDA-graph hot
+    /// path (B2 / #32, ADR 0008 — the `decode_step` dispatch's observation
+    /// surface, spec 09): a `decode_step` increments this counter once per
+    /// single-token (representative-batch) step that runs the graph replay
+    /// (the `ignis_graph_launch`, ADR 0008). The eager fallback (a batch
+    /// that does not match the captured `GraphGeometry`, or a busy/absent
+    /// GPU that left the graph `None`, ADR 0003 / ADR 0006) never
+    /// increments — the GPU test asserts the hot path used the graph
+    /// (the counter > 0 after a single-token step) and the eager fallback
+    /// engaged on a batch mismatch (the counter unchanged after a
+    /// multi-token step).
+    pub fn graph_launch_count(&self) -> u64 {
+        self.graph_launches.load(Ordering::Relaxed)
+    }
+
+    /// B2 (#32, ADR 0008): the decode graph's replay (the per-step hot
+    /// path): H2D the token id (the per-step input), launch the graph (the
+    /// whole decode DAG runs on the fixed staging buffers), D2H the logits
+    /// (bf16 `[vocab]`). Returns the logits (the greedy sample's input —
+    /// the caller runs `ignis_greedy_sample`, the A3 / #30 convention). A
+    /// no-graph host (a busy/absent GPU, a VRAM shortfall — ADR 0006)
+    /// returns an error (the caller runs the eager fallback, ADR 0003).
+    pub fn graph_logits_replay(&self, token_id: i32) -> Result<Vec<u16>, ComputeError> {
+        // The decode graph's leaf handle (the extracted raw pointer — a no-
+        // graph host (a busy/absent GPU, a VRAM shortfall — ADR 0006)
+        // returns an error, the caller runs the eager fallback, ADR 0003).
+        let g = self
+            .graph
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.0)
+            .ok_or(ComputeError::Kernel(-1))?;
+        let mut logits = vec![0u16; self.config.vocab as usize];
+        let rc = unsafe {
+            ffi::ignis_decode_graph_replay(
+                g,
+                token_id,
+                logits.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(logits)
+    }
+
+    /// B2 (#32, the kernel-abi 03 "replay == eager" invariant, ADR 0007):
+    /// run the representative decode sequence *eagerly* (no graph) over the
+    /// same fixed staging buffers — the eager reference for the bit-exact
+    /// check (the graph replay's verification). Same inputs / buffers /
+    /// kernels as [`Self::graph_logits_replay`], so the logits must be
+    /// bit-identical. A no-graph host (a busy/absent GPU, a VRAM
+    /// shortfall — ADR 0006) returns an error (the eager fallback, ADR
+    /// 0003).
+    pub fn graph_logits_eager(&self, token_id: i32) -> Result<Vec<u16>, ComputeError> {
+        // The decode graph's leaf handle (the extracted raw pointer — a no-
+        // graph host (a busy/absent GPU, a VRAM shortfall — ADR 0006)
+        // returns an error, the caller runs the eager fallback, ADR 0003).
+        let g = self
+            .graph
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.0)
+            .ok_or(ComputeError::Kernel(-1))?;
+        let mut logits = vec![0u16; self.config.vocab as usize];
+        let rc = unsafe {
+            ffi::ignis_decode_graph_eager(
+                g,
+                token_id,
+                logits.as_mut_ptr() as *mut c_void,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            return Err(ComputeError::Kernel(rc));
+        }
+        Ok(logits)
     }
 
     /// Get-or-create a request's compute state (the paged KV cache, the GDN
@@ -3039,6 +3280,27 @@ impl Compute for CudaCompute {
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+        // B2 (#32, ADR 0008): the decode graph hot path — a single-token,
+        // representative-batch (batch == 1) decode step replays the decode
+        // graph (the whole decode DAG runs on the fixed staging buffers, the
+        // `ignis_graph_launch`, no per-step capture / node update). A decode
+        // step whose batch does not match the captured `GraphGeometry`
+        // (a `jobs.len() != 1` step) runs the eager sequence (ADR 0003); a
+        // busy/absent GPU (the decode graph `None`, ADR 0006) also runs the
+        // eager sequence (the eager fallback).
+        if jobs.len() == 1 && self.uses_graph() {
+            let job = &jobs[0];
+            let token = self.decode_graph_step(job)?;
+            // The hot path used the graph (the `decode_step` dispatch's
+            // observation surface, spec 09 — the GPU test asserts the
+            // counter > 0 after a single-token step).
+            self.graph_launches.fetch_add(1, Ordering::Relaxed);
+            return Ok(vec![token]);
+        }
+        // The eager fallback (a batch that does not match the captured
+        // `GraphGeometry`, or a busy/absent GPU that left the graph `None`,
+        // ADR 0003 / ADR 0006): the per-lane hybrid `decode()` (the full-
+        // correct model decode, the correctness floor, ADR 0005).
         let mut out = Vec::with_capacity(jobs.len());
         for job in jobs {
             out.push(self.decode(job)?);
@@ -3047,13 +3309,71 @@ impl Compute for CudaCompute {
     }
 }
 
+impl CudaCompute {
+    /// B2 (#32, ADR 0008): the decode graph's per-step decode (the hot
+    /// path): H2D the decode query (the autoregressive token — the last
+    /// generated token, A3 / #30), launch the graph (the whole decode DAG
+    /// runs on the fixed staging buffers), D2H the logits, the greedy
+    /// sample (the deterministic token, ADR 0007), and the soft-stop
+    /// bookkeeping (the `max_tokens` / EOS counter, the A3 / #30
+    /// convention). Returns the generated token (or `None` on a soft-stop).
+    /// This is the *representative* decode (the mechanism this ticket
+    /// delivers — the full per-layer stack + the host pointwise glue as
+    /// device kernels is the 99%-gate performance material, ADR 0005 /
+    /// 0007, ticket 20); the full-correct model decode remains the eager
+    /// hybrid `decode()` (the correctness floor).
+    fn decode_graph_step(&self, job: &DecodeJob) -> Result<Option<TokenId>, ComputeError> {
+        // Ensure the request's state (the scheduler always prefills before
+        // decoding; a missing state is a caller bug).
+        self.ensure_state(job.request, job.params.max_tokens);
+        // The decode query (the autoregressive one — the last generated
+        // token, A3 / #30): the prefill's last prompt token on the first
+        // decode, the previous decode's token thereafter (a fresh request
+        // without a prefill uses token 0).
+        let cur = self
+            .state
+            .lock()
+            .unwrap()
+            .get(&job.request)
+            .and_then(|s| s.last_generated)
+            .unwrap_or(0);
+        // The decode graph replay (the hot path, ADR 0008): H2D the decode
+        // query, launch the graph, D2H the logits (the representative
+        // decode's logits).
+        let logits = self.graph_logits_replay(cur as i32)?;
+        // The greedy sample (the deterministic token, ADR 0007) — the bf16
+        // logits -> the f32 logits (the `ignis_greedy_sample` contract,
+        // kernel-abi 02), the A3 / #30 convention.
+        let token = self.sample(&bf16_to_f32s(&logits))?;
+        // The soft-stop (the `max_tokens` / EOS) + the autoregressive
+        // bookkeeping (the generated token threads into the next step's
+        // query, A3 / #30).
+        let stop = {
+            let mut st = self.state.lock().unwrap();
+            let s = st.get_mut(&job.request).ok_or(ComputeError::Kernel(-1))?;
+            s.last_generated = Some(token);
+            let mt = s.max_tokens.or(job.params.max_tokens);
+            s.generated + 1 >= mt.unwrap_or(u32::MAX)
+        };
+        if !stop {
+            self.state
+                .lock()
+                .unwrap()
+                .get_mut(&job.request)
+                .map(|s| s.generated += 1);
+        }
+        Ok(if stop { None } else { Some(token) })
+    }
+}
+
 impl Drop for CudaCompute {
     fn drop(&mut self) {
-        // Destroy the captured graph (and, when the leaf created the
-        // capture stream, the stream); NULL is a no-op (the eager
-        // fallback, ADR 0006).
-        if let Some(SendGraph(g)) = *self.graph.lock().unwrap() {
-            unsafe { ffi::ignis_graph_destroy(g) };
+        // Destroy the decode graph (the captured graph + the leaf-owned
+        // capture stream + the device staging buffers + the H2D'd weight
+        // copies, the host case); NULL is a no-op (the eager fallback,
+        // ADR 0006).
+        if let Some(SendDecodeGraph(g)) = *self.graph.lock().unwrap() {
+            unsafe { ffi::ignis_decode_graph_free(g) };
         }
     }
 }
@@ -3300,13 +3620,28 @@ impl CudaCompute {
         // The final-norm weight (the artifact's `text/final_norm`, bf16
         // `[hidden]`, A3 / #30).
         weights.final_norm = Self::host_bf16_vector(&reader, "text/final_norm")?;
-        // The #26 fix: the eager path (no kernel-leaf startup check / CUDA
-        // graph capture) — the CUDA-graph fast path is #25 (the 99%-gate)
-        // material, not the scoped #26. (The observed "hang" after the H2D
-        // was the CPU-side `Weights::synthetic` OOM trap above, not a stuck
-        // GPU sync: verified 2026-09-04 that the graph check + capture
-        // completes in ms after the H2D on a clean GPU.)
+        // B2 (#32): the decode graph (the production path — the same
+        // mechanism as the synthetic path, ADR 0008: the fixed-address
+        // device staging buffers + the captured representative decode
+        // sequence). The construction-time capture self-skips on a VRAM
+        // shortfall (a 27B decode graph's staging — the paged KV + the GDN
+        // state + the H2D'd bf16 weight copies — does not fit alongside the
+        // 19 GB of weights on a VRAM-constrained GPU, the eager fallback,
+        // ADR 0006) or a busy/absent GPU; the eager hybrid `decode()` is
+        // the correctness floor (ADR 0005).
+        let decode_graph = Self::build_decode_graph(&config, &weights);
+        // The #26 fix: the eager construction (the 19 GB of weights land in
+        // VRAM, ADR 0002) — the decode graph (B2 / #32) is layered on top
+        // (the construction-time capture, self-skipping on a VRAM shortfall).
         let mut compute = Self::new_eager(config, weights);
+        // B2 (#32): the decode graph (the decode hot path, ADR 0008) — the
+        // `GraphGeometry` is set (batch 1, the representative decode
+        // geometry); a self-skip (a VRAM shortfall, ADR 0006) leaves the
+        // eager fallback (the `graph_geom` stays `None`).
+        if let Some(handle) = decode_graph {
+            *compute.graph.lock().unwrap() = Some(SendDecodeGraph(handle));
+            compute.graph_geom = Some(GraphGeometry { batch: 1 });
+        }
         // Hold the device context (the 19 GB of weights stay in VRAM for the
         // lifetime of the backend, ADR 0002).
         compute.device_ctx = Some(DeviceCtx::Cuda {

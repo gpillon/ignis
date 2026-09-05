@@ -303,6 +303,113 @@ void ignis_graph_destroy(struct ignis_graph *g);
  * failure — the graph path is broken; not a skip condition). */
 int ignis_graph_startup_check(void *stream);
 
+/* --------------------------------------------------------------------------
+ * B2 (kernel-abi 09, GitHub #32): the CUDA-graph decode replay (the decode
+ * hot path) over persistent device staging buffers (ADR 0008).
+ *
+ * The decode graph is captured at construction (one representative decode
+ * geometry, the GraphGeometry) over the leaf's fixed-address device staging
+ * buffers; each decode step H2D's the per-step input (the token id), launches
+ * the graph (the whole decode DAG runs on the fixed buffers), and D2H's the
+ * logits (ADR 0008). The graph is invariant after construction-time capture
+ * (no per-step capture, no node update — the kernel-abi 03 graph primitives
+ * are re-used: ignis_graph_begin/end_capture / ignis_graph_launch /
+ * ignis_graph_destroy). A decode step whose batch does not match the
+ * captured geometry runs the eager sequence (ADR 0003); a busy / absent GPU
+ * (a no-GPU host, a VRAM shortfall, a failed capture) leaves the graph None
+ * (the eager fallback, ADR 0006 self-skip).
+ *
+ * The representative decode sequence captured here (the mechanism this
+ * ticket delivers — the *full* per-layer stack + the host pointwise glue as
+ * device kernels is the 99%-gate performance material, ADR 0005 / 0007,
+ * ticket 20): embed -> GQA attention decode -> GDN step -> final RMSNorm ->
+ * lm_head GEMV. The sequence is launched identically for the capture and for
+ * the eager reference, so the replayed logits are bit-identical to the
+ * eager logits (the kernel-abi 03 "replay == eager" invariant, ADR 0007).
+ *
+ * Flat C-ABI conventions (ADR 0001): a flat POD geometry descriptor, an
+ * opaque handle, int return codes (0 = success, -1 = a CUDA error — the
+ * caller self-skips, ADR 0006). All buffer pointers are device memory
+ * (the staging buffers / the artifact's device-resident weights); the leaf
+ * does the per-step H2D (the token id) + D2H (the logits) around the graph
+ * launch (synchronous copies, never inside the capture window).
+ * ------------------------------------------------------------------------ */
+
+/* The representative decode geometry (the compute-adapter derives it from
+ * ModelConfig — the decode-batch dims the graph is captured for). Flat POD. */
+typedef struct ignis_decode_graph_geom {
+  int64_t hidden;          /* the residual-stream width (bf16) */
+  int64_t vocab;          /* the lm_head output width (the logits width) */
+  int64_t num_q_heads;    /* the GQA query heads */
+  int64_t num_kv_heads;   /* the GQA KV heads */
+  int64_t head_dim;       /* the per-head dim */
+  int64_t block_size;     /* the paged KV block size (keys per block) */
+  int64_t num_blocks;     /* the paged KV block count (the capacity) */
+  int64_t gdn_state_rows; /* the GDN recurrent-state rows (d_v) */
+  int64_t gdn_state_cols; /* the GDN recurrent-state cols (d_k) */
+  int64_t gdn_state_dim;  /* state_rows + state_cols + 2 (the step feature) */
+  int64_t gdn_num_layers; /* the GDN recurrent-state layer count */
+} ignis_decode_graph_geom;
+
+/* The decode graph's read-only weight / state pointers (the staging buffers
+ * + the device-resident weights). `weights_on_device` selects the pointer
+ * domain: 0 = host (the leaf H2D's the weights once into a leaf-owned
+ * device buffer, the synthetic / dev path); 1 = device-resident (the
+ * artifact's arena pointers, ADR 0002 — the leaf binds them as-is, no H2D,
+ * the leaf does NOT own them). The mutable state (the paged KV, the block
+ * table, the GDN recurrent state) is always leaf-allocated + zeroed (the
+ * representative request's fresh-state geometry, ADR 0003). */
+typedef struct ignis_decode_graph_weights {
+  int weights_on_device;  /* 0 = host (H2D'd once), 1 = device-resident */
+  const void* embedding;  /* bf16 [vocab][hidden] (the embedding table) */
+  int64_t embedding_bytes;
+  const void* final_norm; /* bf16 [hidden] (the final-norm weight) */
+  int64_t final_norm_bytes;
+  const void* lm_head;    /* bf16 [vocab][hidden] (the lm_head GEMM weight) */
+  int64_t lm_head_bytes;
+} ignis_decode_graph_weights;
+
+/* Opaque decode-graph handle (the captured graph + the leaf-owned capture
+ * stream + the device staging buffers). */
+struct ignis_decode_graph;
+
+/* Construct the decode graph: allocate the staging buffers (the fixed-
+ * address device memory, the representative decode geometry), load the
+ * read-only weights (the H2D-once host case / the device-resident artifact
+ * case), create the capture stream, capture the representative decode
+ * sequence on the fixed buffers (the graph's DAG), and instantiate the
+ * graph. Returns 0 on success, -1 on a CUDA error (no GPU / busy / OOM —
+ * the caller self-skips, ADR 0006; the VRAM shortfall is checked *before*
+ * the allocation, so a VRAM-constrained GPU self-skips without a fault). */
+int ignis_decode_graph_new(const ignis_decode_graph_geom* geom,
+                           const ignis_decode_graph_weights* wts,
+                           struct ignis_decode_graph** out);
+
+/* Replay the decode graph (the per-step hot path, ADR 0008): H2D the token
+ * id (the per-step input) into the fixed input buffer, launch the graph
+ * (the whole decode DAG runs on the fixed buffers), D2H the logits. No
+ * per-step capture, no node update (ADR 0008). `stream`: null = the graph's
+ * capture stream (the leaf-owned non-blocking stream). `out_logits_host` is
+ * a bf16 [vocab] buffer (the caller-provided host buffer). Returns 0 on
+ * success, -1 on a CUDA error (a busy GPU self-skips, ADR 0006). */
+int ignis_decode_graph_replay(struct ignis_decode_graph* g, int32_t token_id,
+                              void* out_logits_host, void* stream);
+
+/* Run the representative decode sequence *eagerly* (no graph) over the same
+ * fixed buffers — the eager reference for the "replay == eager" invariant
+ * (kernel-abi 03, ADR 0007). Same inputs / buffers / kernels as
+ * ignis_decode_graph_replay, so the logits must be bit-identical (the graph
+ * replay's verification). `stream`: null = the graph's capture stream.
+ * Returns 0 on success, -1 on a CUDA error (a busy GPU self-skips, ADR
+ * 0006). */
+int ignis_decode_graph_eager(struct ignis_decode_graph* g, int32_t token_id,
+                             void* out_logits_host, void* stream);
+
+/* Free the decode graph (the captured graph, the leaf-owned capture stream,
+ * the staging buffers, and — the host case — the H2D'd weight copies). NULL
+ * is a no-op (no CUDA calls). */
+void ignis_decode_graph_free(struct ignis_decode_graph* g);
+
 #ifdef __cplusplus
 }
 #endif
