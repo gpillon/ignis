@@ -16,7 +16,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, VendoredFile};
 use crate::sha256::sha256_hex;
 
 /// What is wrong with one vendored file.
@@ -85,28 +85,42 @@ fn hash_file(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-/// Check the vendor tree against the manifest. No reference checkout needed.
-pub fn verify_vendor_tree(vendor_root: &Path, manifest: &Manifest) -> std::io::Result<Report> {
+/// Hash every manifest file under `root` against the hash `expected` picks out
+/// of its entry. The two verifications differ only in that choice.
+fn compare_against(
+    root: &Path,
+    manifest: &Manifest,
+    expected: impl Fn(&VendoredFile) -> &str,
+) -> std::io::Result<Report> {
     let mut report = Report::default();
     for entry in &manifest.files {
         report.checked += 1;
-        let local = vendor_root.join(&entry.path);
-        match hash_file(&local)? {
+        match hash_file(&root.join(&entry.path))? {
             None => report.findings.push(Finding {
                 path: entry.path.clone(),
                 problem: Problem::Missing,
             }),
-            Some(actual) if actual != entry.expected_local_sha256() => {
-                report.findings.push(Finding {
-                    path: entry.path.clone(),
-                    problem: Problem::HashMismatch {
-                        expected: entry.expected_local_sha256().to_string(),
-                        actual,
-                    },
-                });
-            }
+            Some(actual) if actual != expected(entry) => report.findings.push(Finding {
+                path: entry.path.clone(),
+                problem: Problem::HashMismatch {
+                    expected: expected(entry).to_string(),
+                    actual,
+                },
+            }),
             Some(_) => {}
         }
+    }
+    Ok(report)
+}
+
+/// Check the vendor tree against the manifest. No reference checkout needed.
+///
+/// A patched file is expected to carry its patched hash, and the diff that
+/// justifies it must be committed — an entry claiming a patch nobody can read
+/// is the same as an unexplained edit.
+pub fn verify_vendor_tree(vendor_root: &Path, manifest: &Manifest) -> std::io::Result<Report> {
+    let mut report = compare_against(vendor_root, manifest, VendoredFile::expected_local_sha256)?;
+    for entry in &manifest.files {
         if let Some(patch) = &entry.patch {
             if !vendor_root.join(&patch.diff).exists() {
                 report.findings.push(Finding {
@@ -123,26 +137,7 @@ pub fn verify_vendor_tree(vendor_root: &Path, manifest: &Manifest) -> std::io::R
 
 /// Check the reference checkout still carries the pinned content.
 pub fn verify_reference(reference_root: &Path, manifest: &Manifest) -> std::io::Result<Report> {
-    let mut report = Report::default();
-    for entry in &manifest.files {
-        report.checked += 1;
-        let source = reference_root.join(&entry.path);
-        match hash_file(&source)? {
-            None => report.findings.push(Finding {
-                path: entry.path.clone(),
-                problem: Problem::Missing,
-            }),
-            Some(actual) if actual != entry.sha256 => report.findings.push(Finding {
-                path: entry.path.clone(),
-                problem: Problem::HashMismatch {
-                    expected: entry.sha256.clone(),
-                    actual,
-                },
-            }),
-            Some(_) => {}
-        }
-    }
-    Ok(report)
+    compare_against(reference_root, manifest, |entry| &entry.sha256)
 }
 
 /// Anything that stops a sync.
@@ -294,7 +289,7 @@ pub fn refresh_reference_hashes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{Patch, Reference, VendoredFile};
+    use crate::manifest::{Patch, Reference};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);

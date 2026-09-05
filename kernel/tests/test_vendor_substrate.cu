@@ -32,6 +32,7 @@
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/common/rowsplit_grouped_mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/common/sampling_workspace.h"
 #include "ops/common/token_slices.h"

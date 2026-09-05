@@ -88,6 +88,10 @@
       "sha256": "4af04a39c2d1607819d1270ca9b890623e33a372179b00b80a9c8fb1a7f4484c"
     },
     {
+      "path": "src/ops/common/rowsplit_grouped_mma.cuh",
+      "sha256": "83b3c9563fb10d1863859e4c6d682779b66898216e851e60b10c512f8db661f8"
+    },
+    {
       "path": "src/ops/common/rowsplit_mma.cuh",
       "sha256": "3b0c48acc65fb5ea26865d4fbc3bbd785a4b7a56d71ee1f4c6474c8a0c2fdc10"
     },
@@ -102,6 +106,14 @@
     {
       "path": "src/ops/common/warp.cuh",
       "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
+    },
+    {
+      "path": "src/ops/linear/q4/q4_rowsplit_storage.cuh",
+      "sha256": "c3443c5a913c5711c78c8039e6dd1b71d16bbd9dcbece705d761f58f4961847a"
+    },
+    {
+      "path": "src/ops/linear/q5/q5_rowsplit_storage.cuh",
+      "sha256": "f0258cfddad24f99372b474858fbc7605101d24202a865adba16614ae63ee93a"
     },
     {
       "path": "tests/ops/op_check.h",

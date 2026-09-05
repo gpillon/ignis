@@ -89,17 +89,17 @@ P1-06 (GitHub #42) vendors the substrate the op families are built on:
   descriptor, the PDL helper and the NVTX headers. Built as the static library
   `ignis_vendor` by `kernel/CMakeLists.txt`, with `kernel/vendor/src` as the
   include root.
-- **ops common** — `math`, `memory`, `mma`, `rowsplit_mma`, `warp`,
-  `bf16_vector`, `sampling_workspace`, `token_slices`.
+- **ops common** — all of the reference's `ops/common`: `math`, `memory`,
+  `mma`, `rowsplit_mma`, `rowsplit_grouped_mma`, `warp`, `bf16_vector`,
+  `sampling_workspace`, `token_slices`. `rowsplit_grouped_mma.cuh` includes
+  the q4/q5 rowsplit storage headers, so those two are vendored with it — the
+  substrate has no dangling include even though this model uses neither
+  quantization.
 - **the op-test harness** — `tests/ops/op_check.h` and `tests/ops/op_tester.h`,
   the reference's error-record convention, used by
   `kernel/tests/ignis_kernel_op_tests` (CTest). `kernel/vendor/tests` is that
   executable's second include root, because the harness includes itself as
   `"ops/op_tester.h"`.
-
-`src/ops/common/rowsplit_grouped_mma.cuh` is deliberately **not** vendored yet:
-it includes the q4/q5 rowsplit storage headers, which belong to op families
-this model does not use. It comes with whichever ticket first needs it.
 
 The op families themselves (NVFP4 / BF16 / W8G32 linear, the fused
 projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
