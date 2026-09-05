@@ -30,6 +30,13 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
+# Declarations only: several vendored headers (core/device.h and anything
+# that includes it, e.g. core/paged_kv_cache.h, core/linear_attention_state.h)
+# name CUDA runtime types even in .cpp translation units compiled by cl.exe,
+# which — unlike nvcc for .cu files — does not know the toolkit's include
+# path on its own. No linking follows from this (see the cudart note below).
+find_package(CUDAToolkit REQUIRED)
+
 # --- the vendored reference substrate (ADR 0010, GitHub #42) ----------------
 #
 # Verbatim copies of the reference's core and ops-common headers, pinned by
@@ -45,7 +52,10 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/arena.cu
   ${IGNIS_VENDOR_DIR}/src/core/device.cu
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/kv_ring_bits.cu
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/linear_attention_state.cpp
+  ${IGNIS_VENDOR_DIR}/src/core/paged_kv_cache.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
 )
 set_target_properties(ignis_vendor PROPERTIES
@@ -53,6 +63,7 @@ set_target_properties(ignis_vendor PROPERTIES
   OUTPUT_NAME "ignis_vendor"
 )
 target_include_directories(ignis_vendor PUBLIC ${IGNIS_VENDOR_DIR}/src)
+target_include_directories(ignis_vendor PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
 # --- the leaf's own C ABI surface ------------------------------------------
 #
@@ -69,10 +80,11 @@ set_target_properties(ignis_kernel PROPERTIES
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
 
-# NOTE: neither static library resolves cudart here — a static archive carries
+# NOTE: neither static library links cudart here — a static archive carries
 # unresolved cudart symbols, which the final Rust binary resolves
-# (crates/*/build.rs link the CUDA import libs and both archives). No
-# find_package needed.
+# (crates/*/build.rs link the CUDA import libs and both archives). The
+# find_package(CUDAToolkit) above is for the include path only (comment at
+# its call site); nothing here links CUDA::cudart.
 
 # --- the leaf's own test executable (CTest) ---------------------------------
 enable_testing()

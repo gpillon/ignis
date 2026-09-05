@@ -101,10 +101,28 @@ P1-06 (GitHub #42) vendors the substrate the op families are built on:
   executable's second include root, because the harness includes itself as
   `"ops/op_tester.h"`.
 
-The op families themselves (NVFP4 / BF16 / W8G32 linear, the fused
-projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
-each adding its files to this manifest and its reference op test to the leaf's
-test executable.
+P1-16 (GitHub #52) adds the sequence-state pools:
+
+- **paged KV pool** — `core/paged_kv_cache.{h,cpp}`: pages, entitlements,
+  block-table rows, selective zeroing, multi-pool reserve/resize bundles.
+- **linear-attention state pool** — `core/linear_attention_state.{h,cpp}`:
+  per-slot recurrent fp32 state + BF16/FP32 conv taps, copy/zero/pack/unpack.
+- **ring bits** — `core/kv_ring_bits.{h,cu}`: the hq-e8-2b residual-ring
+  validity-word helper, vendored with its public header even though no
+  current op enables the feature (kept dangling-include-free like q4/q5
+  above).
+- their reference tests, `tests/test_kv_cache.cpp` and
+  `tests/test_state_store.cpp`, each its own CTest executable
+  (`ignis_vendor_kv_cache_test`, `ignis_vendor_state_store_test`) since each
+  is its own `main()`.
+- the leaf's own `ignis_paged_kv_page_budget` (`kernel/include/ignis_paged_kv_budget.h`,
+  `kernel/src/paged_kv_budget.cu`) — not vendored, ours: reports page count /
+  bytes for a VRAM budget and plane geometry, routed through
+  `plan_paged_kv_pool` so it can't drift from what the pool itself allocates.
+
+The remaining op families (NVFP4 / BF16 / W8G32 linear, the fused
+projections, norms, attention, GDN) arrive with P1-07..P1-15, each adding its
+files to this manifest and its reference op test to the leaf's test suite.
 
 ## Updating to a newer reference commit
 
