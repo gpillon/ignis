@@ -235,6 +235,47 @@ linear+residual output projection, NVFP4 and BF16 arms only:
   the W8 single/companion overloads declared in the vendored header are never
   defined, matching that nothing in the trimmed test calls them.
 
+P1-14 (GitHub #50) adds the GDN family:
+
+- **causal_conv1d_silu** — `ops/kernel/causal_conv1d.cuh`,
+  `ops/launcher/causal_conv1d.{h,cu}`, `ops/wrapper/causal_conv1d_silu.cpp`,
+  `ninfer/ops/causal_conv1d_silu.h`: the depthwise causal width-4 conv fused
+  with SiLU over the conv'd channels, plus its rolling-tap and B-way snapshot
+  forms.
+- **gdn_gating** — `ops/kernel/gdn_gating.cuh`, `ops/launcher/gdn_gating.{h,cu}`,
+  `ops/wrapper/gdn_gating.cpp`, `ninfer/ops/gdn_gating.h`: the per-head decay
+  gate `g = -exp(A_log)*softplus(a+dt_bias)` and update gate
+  `beta = sigmoid(b)`.
+- **gated_delta_net** — the whole
+  `ops/linear_attention/gated_delta_net/` subtree: `common.{h,cuh}` (head
+  mapping, chunk size, state dim), `launch.h` / `recurrent.{cuh,cu}` (the
+  per-head fp32 128x128 recurrence, its distinct-state and B-way snapshot
+  forms, and the replay-record entry point), `gated_delta_net.cpp` (the public
+  wrapper: dispatches to the recurrent kernel for T=1 or a full chunk/tail
+  split above it, L2-normalizing q/k once per call rather than per chunk when
+  `normalize_qk` is set), `replay.cpp` (validation for the replay-record op),
+  and `chunked/` in full (`common.cuh`, `prepare_wy_wu.{cuh,cu}`,
+  `output.{cuh,cu}`, `state_passing.{cuh,cu}`, `launch.{h,cu}`) — the
+  chunk-parallel WY/UT prefill route, compiled and exercised by the same
+  reference test as the recurrent route (token counts that straddle the
+  64-token chunk boundary). `ninfer/ops/gated_delta_net.h` is the public
+  header for all three (recurrent, snapshot, replay-record) forms.
+- **incidental**: `recurrent.cu` and `replay.cpp` also carry the reference's
+  `gdn_replay_fold` implementation (the ReplaySSM state-pool fold), and
+  `launch.h` declares it — one translation unit each, not split by op. Vendoring
+  them whole therefore also pulls in `core/gdn_replay_records.{h,cpp}` and
+  `ninfer/ops/gdn_replay.h`. `gdn_replay_fold` compiles as part of `ignis_vendor`
+  but is not exercised by any test here; its own op family belongs to a later
+  sequence-handle ticket.
+- **their reference tests** — `tests/ops/test_causal_conv1d_silu.cpp`,
+  `test_gdn_gating.cpp`, `test_gated_delta_net.cpp` (recurrent + chunked, real
+  27B/35B-A3B geometries: 48 value heads / 16-32 qk heads x 128) and
+  `test_gated_delta_net_replay_record.cpp`, plus the shared FP64 reference
+  `tests/ops/gdn_ref.h` — each its own CTest executable via the same
+  `ignis_vendored_op_tests` loop as the norm/glue family (P1-07): none of
+  these ops dispatch across qtypes, so no leaf-side `kernel/src/*.cu`
+  dispatcher is needed, unlike `linear` / `attn_input_proj` / `linear_add`.
+
 P1-16 (GitHub #52) adds the sequence-state pools:
 
 - **paged KV pool** — `core/paged_kv_cache.{h,cpp}`: pages, entitlements,
@@ -255,9 +296,8 @@ P1-16 (GitHub #52) adds the sequence-state pools:
   `plan_paged_kv_pool` so it can't drift from what the pool itself allocates.
 
 The remaining op families (the fused GDN projections, SwiGLU MLP, GQA
-attention, the GDN recurrence family) arrive with P1-12..P1-15, each adding
-its files to this manifest and its reference op test to the leaf's test
-suite.
+attention) arrive with P1-12, P1-13, P1-15, each adding its files to this
+manifest and its reference op test to the leaf's test suite.
 
 ## Updating to a newer reference commit
 

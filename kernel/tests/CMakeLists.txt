@@ -32,6 +32,12 @@ add_test(NAME ignis_kernel_op_tests COMMAND ignis_kernel_op_tests)
 # `ninfer/ops/...` (the public headers) and `core/...` / `ops/common/...`
 # come from ignis_vendor's PUBLIC include directories; `ops/op_tester.h` and
 # `ops/norm_test_common.h` come from the vendored tests root, same as above.
+#
+# P1-14 (GitHub #50) adds the GDN family: causal_conv1d_silu, gdn_gating and
+# gated_delta_net (recurrent + chunked, exercised through the same reference
+# test by tokens counts that straddle the chunk boundary) and its
+# replay-record entry point, each still a single vendored test file with no
+# qtype dispatch, so the same loop applies.
 set(ignis_vendored_op_tests
   rmsnorm
   gated_rmsnorm
@@ -41,6 +47,10 @@ set(ignis_vendored_op_tests
   sigmoid_mul
   embedding
   argmax
+  causal_conv1d_silu
+  gdn_gating
+  gated_delta_net
+  gated_delta_net_replay_record
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)
