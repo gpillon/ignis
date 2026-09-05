@@ -35,6 +35,21 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   recording and any ignis GPU run are sequential). Owner: human.
   Blocker: a live reference stack + GPU exclusivity.
 
+- **The GPU profile's fail-never-skip rule has no caller yet (GitHub #38,
+  ADR 0006).** The rule and its harness are in place: `ignis_core::gpu_profile`
+  decides skip-vs-fail, `scripts/gpu-preflight.ps1` records a pass in a marker
+  file, `active()` refuses `IGNIS_GPU_PROFILE=1` without a recent one, and
+  `scripts/gpu-profile.ps1` preflights, runs the GPU work and consumes the
+  marker. What is *not* demonstrated is the rule doing its job for a real GPU
+  test: #39 deleted the last ten `*_gpu.rs` tests, so the helper has no callers
+  outside its own unit tests, and those drive an injected rc, not a kernel. The
+  first vendored-op / step-ABI GPU test to land (P1-07 onward) must call
+  `check_rc` / `check_compute_err` / `skip_or_fail` rather than returning early
+  on its own — that is when #38's "the rule must survive" is actually verified
+  end to end, and nothing but review enforces it until then.
+  Owner: whoever lands the first GPU test after the vendored ops.
+  Blocker: no GPU-gated test exists to carry it (P1-07+).
+
 ## Blocked (external)
 
 - **GPU availability (ADR 0006).** Every gate run and every GPU-profile test
