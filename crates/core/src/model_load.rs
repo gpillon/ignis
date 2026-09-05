@@ -24,14 +24,16 @@ use ignis_artifact::{
 
 use crate::compute::{LayerKind, ModelConfig};
 
-mod ffi {
+pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
 
     /// Opaque loaded-model handle (`kernel/include/ignis_model.h`).
     ///
     /// FFI-safe: `#[repr(C)]` + non-zero-sized so `*mut IgnisModel` is a
     /// valid C pointer across the boundary (mirrors
-    /// `ignis_artifact::ffi::IgnisDevice`).
+    /// `ignis_artifact::ffi::IgnisDevice`). `pub(crate)`: the step ABI
+    /// (`crate::step`, GitHub #54) passes the same handle to
+    /// `ignis_prefill` / `ignis_decode`.
     #[repr(C)]
     pub struct IgnisModel([u8; 1]);
 
@@ -112,6 +114,13 @@ impl Model {
         let rc = unsafe { ffi::ignis_model_stats(self.handle, &mut stats) };
         assert_eq!(rc, 0, "ignis_model_stats: null handle (unreachable — Model always holds one)");
         stats
+    }
+
+    /// The raw handle the step ABI (`crate::step`, GitHub #54) passes to
+    /// `ignis_prefill` / `ignis_decode`. `pub(crate)`: never exposed outside
+    /// this crate (mirrors the handle's own C-ABI opacity).
+    pub(crate) fn handle(&self) -> *mut ffi::IgnisModel {
+        self.handle
     }
 }
 

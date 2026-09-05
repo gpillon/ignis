@@ -18,7 +18,11 @@
 
 #include "ignis_model.h"
 
+#include "model_internal.h"
+
 #include "core/weight.h"
+
+#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <initializer_list>
@@ -50,6 +54,24 @@ ninfer::Weight to_weight(const ignis_bound_tensor &t) {
   }
   w.weight_scale_divisor = t.weight_scale_divisor;
   w.input_scale_divisor = t.input_scale_divisor;
+  // A 2-D weight's row/column counts: `ninfer::Weight` carries these
+  // separately from `shape` (ops::linear / ops::embedding read n/k
+  // directly, e.g. w8_dispatch's launch-table lookup) -- GitHub #54 is the
+  // first caller to drive a bound weight through either op, so this is the
+  // first gap that would otherwise surface as n/k == 0.
+  if (t.ndim == 2) {
+    w.n = static_cast<int32_t>(t.shape[0]);
+    w.k = static_cast<int32_t>(t.shape[1]);
+  }
+  // The W8G32_F16S group geometry + scale dtype (constant for the qtype,
+  // not carried by `ignis_bound_tensor`): required by
+  // ninfer::ops::embedding's W8 metadata validation (the two W8G32 text
+  // endpoints, token_embedding and output_head).
+  if (w.qtype == ninfer::QType::W8G32_F16S) {
+    w.group_size = 32;
+    w.group = 32;
+    w.scale_dtype = ninfer::DType::FP16;
+  }
   return w;
 }
 
@@ -142,40 +164,6 @@ class ModelBinder {
   std::unordered_map<std::string, uint64_t> index_;
 };
 
-// One decoder layer's leaf-crossing weights (the reference's per-layer
-// weight struct shape, e.g. targets/qwen3_6 FullLayerW / GdnLayerW --
-// written by us: ADR 0009, the program layer is ours, not vendored).
-struct GqaLayerWeights {
-  ninfer::Weight input_norm;
-  ninfer::Weight query_key_gate_value;
-  ninfer::Weight query_norm;
-  ninfer::Weight key_norm;
-  ninfer::Weight output;
-  ninfer::Weight post_attention_norm;
-  ninfer::Weight mlp_gate_up;
-  ninfer::Weight mlp_down;
-};
-
-struct GdnLayerWeights {
-  ninfer::Weight input_norm;
-  ninfer::Weight a_log;
-  ninfer::Weight dt_bias;
-  ninfer::Weight convolution;
-  ninfer::Weight a_b_projection;
-  ninfer::Weight query_key_value_z;
-  ninfer::Weight norm;
-  ninfer::Weight output;
-  ninfer::Weight post_attention_norm;
-  ninfer::Weight mlp_gate_up;
-  ninfer::Weight mlp_down;
-};
-
-struct LayerWeights {
-  ignis_layer_kind kind = IGNIS_LAYER_GDN;
-  GqaLayerWeights gqa{};
-  GdnLayerWeights gdn{};
-};
-
 // Every geometry the per-layer schema's expected shapes are derived from
 // (mirrors crates/core/src/compute.rs `ModelConfig`'s derivations exactly --
 // keep the two in step).
@@ -251,16 +239,6 @@ bool bind_gdn_layer(ModelBinder &binder, const std::string &prefix, const Geomet
 
 } // namespace
 
-// The opaque loaded-model handle (never dereferenced across the boundary).
-struct ignis_model {
-  ninfer::Weight token_embedding;
-  ninfer::Weight final_norm;
-  ninfer::Weight output_head;
-  std::vector<LayerWeights> layers;
-  uint64_t vram_bytes = 0;
-  uint64_t bound_tensor_count = 0;
-};
-
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                                      const struct ignis_topology *topology,
                                      struct ignis_model **out_model) {
@@ -322,6 +300,32 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   model->bound_tensor_count = count;
   model->vram_bytes = vram_bytes;
 
+  // The step ABI's geometry + program resources (ADR 0009, GitHub #54): a
+  // dedicated stream and a small scratch arena for step intermediates
+  // (embedding / norm / logits / argmax buffers). Owned by the model handle
+  // so no stream crosses the ABI.
+  model->hidden = g.hidden;
+  model->vocab = g.vocab;
+  model->rms_norm_eps = topology->rms_norm_eps;
+
+  const cudaError_t stream_err = cudaStreamCreate(&model->stream);
+  if (stream_err != cudaSuccess) {
+    set_error(std::string("ignis_model_load: cudaStreamCreate failed: ") +
+              cudaGetErrorString(stream_err));
+    return -1;
+  }
+  // embed/norm/logits/argmax scratch at 27B geometry is ~505 KiB (vocab
+  // dominates); headroom is cheap next to the 15+ GiB weight upload.
+  constexpr std::size_t kScratchBytes = 2ull * 1024 * 1024;
+  try {
+    model->scratch = std::make_unique<ninfer::DeviceArena>(kScratchBytes);
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_model_load: scratch arena allocation failed: ") + e.what());
+    cudaStreamDestroy(model->stream);
+    model->stream = nullptr;
+    return -1;
+  }
+
   *out_model = model.release();
   return 0;
 }
@@ -337,6 +341,9 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {
+  if (model != nullptr && model->stream != nullptr) {
+    cudaStreamDestroy(model->stream);
+  }
   delete model;
 }
 
