@@ -30,6 +30,15 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
+# CUDA .cu translation units get the toolkit include path from the CUDA
+# language support automatically; the vendored wrapper .cpp files (P1-08,
+# GitHub #44) are plain CXX and pull in <cuda_runtime.h> through
+# ninfer/ops/{embedding,argmax}.h for cudaStream_t, so they need it too.
+# CUDA::toolkit is include-only (no library), matching the "no find_package
+# needed for linking" note below — cudart itself still resolves at the final
+# Rust link.
+find_package(CUDAToolkit REQUIRED)
+
 # --- the vendored reference substrate (ADR 0010, GitHub #42) ----------------
 #
 # Verbatim copies of the reference's core and ops-common headers, pinned by
@@ -47,12 +56,21 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/embed_gather.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/argmax.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/embedding.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/argmax.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/fp8/fp8_format.cpp
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
   OUTPUT_NAME "ignis_vendor"
 )
-target_include_directories(ignis_vendor PUBLIC ${IGNIS_VENDOR_DIR}/src)
+target_include_directories(ignis_vendor PUBLIC
+  ${IGNIS_VENDOR_DIR}/src
+  ${IGNIS_VENDOR_DIR}/include
+)
+target_link_libraries(ignis_vendor PUBLIC CUDA::toolkit)
 
 # --- the leaf's own C ABI surface ------------------------------------------
 #

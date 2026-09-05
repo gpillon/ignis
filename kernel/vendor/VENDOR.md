@@ -101,10 +101,22 @@ P1-06 (GitHub #42) vendors the substrate the op families are built on:
   executable's second include root, because the harness includes itself as
   `"ops/op_tester.h"`.
 
-The op families themselves (NVFP4 / BF16 / W8G32 linear, the fused
-projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
-each adding its files to this manifest and its reference op test to the leaf's
-test executable.
+P1-08 (GitHub #44) adds the first op family: **embedding** (dense BF16,
+Q6G64_F16S, W8G32_F16S, FP8_E4M3FN_ROW_BF16S gather — `ops/kernel/embed_gather.cuh`,
+`ops/launcher/embed_gather.{h,cu}`, `ops/wrapper/embedding.cpp`, its
+`ninfer/ops/embedding.h` public header, and the FP8 geometry validator
+`ops/linear/fp8/fp8_format.{h,cpp}` the wrapper dispatches through) and
+**argmax** (`ops/kernel/argmax.cuh`, `ops/launcher/argmax.{h,cu}`,
+`ops/wrapper/argmax.cpp`, `ninfer/ops/argmax.h`), each with its reference op
+test (`tests/ops/test_embedding.cpp`, `tests/ops/test_argmax.cpp`) run as its
+own CTest executable (`ignis_op_test_embedding`, `ignis_op_test_argmax`) —
+matching the reference's one-test-per-executable convention, but without its
+`SKIP_RETURN_CODE 77` (ADR 0006: a missing GPU fails here, never skips).
+
+The remaining op families (NVFP4 / BF16 / W8G32 linear, the fused
+projections, norms, attention, GDN, the state pools) arrive with
+P1-07/P1-09..P1-16, each adding its files to this manifest and its reference
+op test to the leaf's test executable.
 
 ## Updating to a newer reference commit
 

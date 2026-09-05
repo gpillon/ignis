@@ -21,3 +21,19 @@ target_include_directories(ignis_kernel_op_tests PRIVATE ${IGNIS_VENDOR_DIR}/tes
 target_link_libraries(ignis_kernel_op_tests PRIVATE ignis_vendor)
 
 add_test(NAME ignis_kernel_op_tests COMMAND ignis_kernel_op_tests)
+
+# P1-08 (GitHub #44): the reference's own op tests for embedding (W8G32 gather,
+# vendored alongside dense/Q6/FP8) and argmax, vendored verbatim from
+# tests/ops/. Each reference op test is its own executable (its own main()),
+# matching the reference's one-test-per-executable convention. Unlike the
+# reference, no SKIP_RETURN_CODE is set: ADR 0006 / docs/agents/testing.md
+# make a missing GPU a failure here, never a skip.
+add_executable(ignis_op_test_embedding ${IGNIS_VENDOR_DIR}/tests/ops/test_embedding.cpp)
+target_include_directories(ignis_op_test_embedding PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_op_test_embedding PRIVATE ignis_vendor)
+add_test(NAME ignis_op_test_embedding COMMAND ignis_op_test_embedding)
+
+add_executable(ignis_op_test_argmax ${IGNIS_VENDOR_DIR}/tests/ops/test_argmax.cpp)
+target_include_directories(ignis_op_test_argmax PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_op_test_argmax PRIVATE ignis_vendor)
+add_test(NAME ignis_op_test_argmax COMMAND ignis_op_test_argmax)
