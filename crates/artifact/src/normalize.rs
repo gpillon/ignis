@@ -15,9 +15,12 @@
 //!   params `a_log` / `dt_bias`, the `*_input_scale_divisor` scalars — the
 //!   kernels consume the format directly).
 //! - **W8 / Q4 / Q5 / Q6** (`row-split-k128-v1`): the *exceptional* formats
-//!   — **dequantized to bf16** (the `text/token_embedding` +
-//!   `text/output_head` W8G32 endpoints, the mtp weights, the vision
-//!   backbone).
+//!   — **dequantized to bf16** by [`normalize_tensor`] (not yet wired to a
+//!   consumer for the mtp weights / vision backbone). The two W8G32 text
+//!   endpoints (`text/token_embedding` + `text/output_head`) are the one
+//!   case this rule no longer applies to: P1-17 (GitHub #53) exports them
+//!   as device views like every other text-scope tensor instead of a
+//!   host-side dequant — see [`crate::bind_text_scope_27b`].
 //!
 //! The dequant math is the reference's rowsplit decode atoms
 //! (`linear/{w8,q4,q5,q6}/*_rowsplit_storage.cuh`): per-group F16 scale

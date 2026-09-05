@@ -299,3 +299,73 @@ pub fn load_qwen38_27b(
     }
     Ok(Model { handle })
 }
+
+// ---------------------------------------------------------------------------
+// Tests (CPU-only: no CUDA call in this file's mapping / host-read helpers,
+// so these run without a GPU -- only `--features cuda` gates compiling them
+// at all, the same as the rest of this module).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qtype_code_matches_the_leaf_enum() {
+        // 1:1 with `enum ignis_qtype` (kernel/include/ignis_model.h).
+        assert_eq!(qtype_code(NumericFormat::Q4G64F16S), 0);
+        assert_eq!(qtype_code(NumericFormat::Q5G64F16S), 1);
+        assert_eq!(qtype_code(NumericFormat::Q6G64F16S), 2);
+        assert_eq!(qtype_code(NumericFormat::W8G32F16S), 3);
+        assert_eq!(qtype_code(NumericFormat::Bf16), 4);
+        assert_eq!(qtype_code(NumericFormat::Fp32), 5);
+        assert_eq!(qtype_code(NumericFormat::I32), 6);
+        assert_eq!(qtype_code(NumericFormat::Nvfp4), 7);
+        assert_eq!(qtype_code(NumericFormat::Fp8E4M3FnRowBf16S), 8);
+    }
+
+    #[test]
+    fn layout_code_matches_the_leaf_enum() {
+        // 1:1 with `enum ignis_quant_layout` (kernel/include/ignis_model.h).
+        assert_eq!(layout_code(StorageLayout::RowSplitK128V1), 0);
+        assert_eq!(layout_code(StorageLayout::ContiguousLeV1), 1);
+        assert_eq!(layout_code(StorageLayout::BlockScaleK16M128x4V1), 2);
+        assert_eq!(layout_code(StorageLayout::RowScaleV1), 3);
+    }
+
+    #[test]
+    fn crosses_the_abi_excludes_only_input_scale_divisor_objects() {
+        assert!(!crosses_the_abi(
+            "text/layers/3/attention/input_projection/input_scale_divisor"
+        ));
+        assert!(crosses_the_abi("text/layers/3/attention/query_key_gate_value"));
+        assert!(crosses_the_abi("text/token_embedding"));
+    }
+
+    #[test]
+    fn read_weight_divisor_decodes_the_trailing_fp32() {
+        let shape = vec![128u64, 64];
+        let geometry = ignis_artifact::block_scale_geometry(NumericFormat::Nvfp4, &shape)
+            .expect("blockscale geometry");
+        let mut payload = vec![0u8; geometry.encoded_bytes as usize];
+        let divisor: f32 = 2.5;
+        let offset = geometry.weight_divisor_offset as usize;
+        payload[offset..offset + 4].copy_from_slice(&divisor.to_le_bytes());
+
+        let objects = vec![ignis_artifact::fixture::FixtureObject::Tensor {
+            name: "w/nvfp4",
+            shape: shape.clone(),
+            format: "NVFP4",
+            layout: "blockscale-k16-m128x4-v1",
+            offset: 0,
+            bytes: geometry.encoded_bytes,
+        }];
+        let artifact =
+            ignis_artifact::fixture::write_fixture(&objects, &payload, "weight-divisor")
+                .expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+
+        let got = read_weight_divisor(&reader, "w/nvfp4", &shape).expect("read divisor");
+        assert_eq!(got, divisor);
+    }
+}

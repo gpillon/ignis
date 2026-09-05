@@ -48,10 +48,25 @@ fn real_nvfp4full_model_load_binds_every_text_scope_object() {
         }
     };
 
-    let artifact = materialize(&reader, &plan, &mut device, None)
-        .unwrap_or_else(|e| panic!("materialize the text scope on the device: {e}"));
+    // The H2D upload is where a busy/contended GPU actually surfaces (a
+    // cudaMalloc/cudaMemcpy failure) -- route it through the profile like
+    // device creation above, not a hard panic.
+    let artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(a) => a,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize the text scope on the device: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
     assert!(artifact.stats().device_capacity_bytes > 0, "VRAM used is reported");
 
+    // `ignis_model_load` does no CUDA work (kernel/src/model.cu is pure
+    // host-side name/shape matching against already-uploaded pointers), so
+    // its error is always a real descriptor-building or artifact-contract
+    // bug, never GPU contention -- a hard failure here is correct under and
+    // outside the profile alike.
     let model = load_qwen38_27b(&reader, &artifact, &handles)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
     let stats = model.stats();
