@@ -13,6 +13,10 @@
 //! - the model-load step ABI call (`model_load`, feature `cuda`, GitHub
 //!   #53 / ADR 0009): builds the bound-tensor + topology descriptors the
 //!   kernel leaf's `ignis_model_load` consumes
+//! - the degenerate step ABI call (`step`, feature `cuda`, GitHub #54 /
+//!   ADR 0009): embedding -> final norm -> output head -> argmax with every
+//!   decoder layer skipped (test-only until P1-21/P1-22 add the layer
+//!   bodies)
 //!
 //! The **public contract** (what `ignis-server` and tests code against) is
 //! [`types`] + [`scheduler`]: the [`Scheduler`] trait is driven by the
@@ -34,6 +38,8 @@ pub mod model_load;
 pub mod prefix;
 pub mod request;
 pub mod scheduler;
+#[cfg(feature = "cuda")]
+pub mod step;
 pub mod types;
 
 pub use admission::{
