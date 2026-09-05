@@ -11,10 +11,19 @@ serde_json = { workspace = true }
 # OpenAI-compatible API. http-only (the engine is a localhost endpoint, no
 # auth/TLS), so the default TLS features are dropped. `blocking` fits the
 # synchronous `Endpoint::complete` seam (one `Client` is shared across the
-# driver's worker threads; `Client` is cheap to share). Inline dependency:
-# a parallel actor owns the workspace manifest (the root `Cargo.toml` is not
-# edited by this ticket).
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+# driver's worker threads; `Client` is cheap to share). `stream`: the capture
+# proxy (`record`, spec 03) pipes the target's response back byte-for-byte
+# (`bytes_stream` — an SSE stream must not be buffered in the proxy).
+# Inline dependency: a parallel actor owns the workspace manifest (the root
+# `Cargo.toml` is not edited by this ticket).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream"] }
+# The capture proxy (`record`, spec 03): the axum app the proxy listens on +
+# the tokio runtime the CLI blocks on. The versions match the workspace's
+# `axum` / `tokio` (the same instances the tests' mock engine uses). Inline
+# dependencies: a parallel actor owns the workspace manifest (the root
+# `Cargo.toml` is not edited by this ticket).
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 # The in-process mock engine (the tests): a small axum router mimicking the

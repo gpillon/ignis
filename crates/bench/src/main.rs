@@ -17,12 +17,19 @@
 //!       99% gate, per class) + the divergence report (canary
 //!       self-consistency — the v1 verdict is their conjunction), shipped
 //!       as a single JSON file. Exits non-zero when the v1 verdict fails.
+//!   `record  --listen <proxy> --target <engine-url> --out <load>-trace.jsonl
+//!             [--class <policy>]`
+//!       The capture proxy (spec 03): accepts OpenAI chat-completions from a
+//!       live agent client, records each request as a trace line, forwards
+//!       it to the target engine, and pipes the response back. `POST
+//!       /v1/session/end` finalizes the trace and stops the proxy.
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
-//! functional on their own (they compare recorded runs and canary results).
+//! functional on their own (they compare recorded runs and canary results);
+//! `record` captures a live session (the gate-run's capture piece, spec 03).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -31,6 +38,7 @@ use ignis_bench::{
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
     gate::GateReport,
     metrics::Run,
+    record::{ClassPolicy, RecordConfig, RecordServer},
     report::PerformanceReport,
     trace::Trace,
 };
@@ -42,6 +50,7 @@ fn main() -> ExitCode {
         Some("canary") => cmd_canary(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
         Some("gate") => cmd_gate(&args[1..]),
+        Some("record") => cmd_record(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -55,7 +64,8 @@ fn print_usage() {
   ignis-bench replay --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F] [--out <run.json>] [--label L]
   ignis-bench canary --endpoint <url> [--out <canary.json>]
   ignis-bench report --ours <ours.json> --ref <ref.json>
-  ignis-bench gate --ours <ours.json> --ref <ref.json> --canary <canary.json> [--out <gate.json>]"
+  ignis-bench gate --ours <ours.json> --ref <ref.json> --canary <canary.json> [--out <gate.json>]
+  ignis-bench record --listen <proxy> --target <engine-url> --out <load>-trace.jsonl [--class <policy>]"
     );
 }
 
@@ -320,6 +330,102 @@ fn cmd_gate(args: &[String]) -> ExitCode {
         };
         eprintln!("v1 gate FAILED (ADR 0007): {detail}");
         ExitCode::FAILURE
+    }
+}
+
+fn cmd_record(args: &[String]) -> ExitCode {
+    let listen = match require(args, "listen") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let target = match require(args, "target") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = match require(args, "out") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let class = opt(args, "class").unwrap_or_else(|| "first-is-main".into());
+    let policy = match ClassPolicy::parse(&class) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    // Pre-flight: the target engine must be reachable and have a model
+    // loaded — a clean error beats a proxy that 502s on every request.
+    let probe = HttpEndpoint::new(&target);
+    match probe.list_models() {
+        Ok(models) => eprintln!("target {target}: {}", models.join(", ")),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let out_display = out.clone();
+    let server = match RecordServer::new(RecordConfig {
+        listen,
+        target,
+        out: PathBuf::from(&out),
+        class_policy: policy,
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = rt.block_on(async move {
+        let (url, listener) = server.bind().await?;
+        eprintln!(
+            "ignis-bench record: capturing on {url} (target {})",
+            server.target()
+        );
+        eprintln!("  agent client -> {url}/v1/chat/completions (OpenAI chat-completions)");
+        eprintln!("  session end  -> POST {url}/v1/session/end (or Ctrl-C — the trace is already complete: lines are flushed on arrival)");
+        eprintln!("  trace -> {out_display}");
+        let summary = server.serve(listener).await?;
+        eprintln!(
+            "recorded {} requests ({} main, {} sub) over {} ms -> {}",
+            summary.requests,
+            summary.main,
+            summary.sub,
+            summary.duration_ms,
+            summary
+                .file
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no requests)".into()),
+        );
+        Ok::<(), String>(())
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

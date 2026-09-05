@@ -11,10 +11,16 @@
 //! `reqwest` blocking client) drives the running `ignis-server`
 //! (`POST /v1/chat/completions` — streaming + non-streaming — and
 //! `GET /v1/models`) (see `.scratch/bench/specs/01-trace-replay.md`).
+//!
+//! The capture proxy (`record`) is the recording side (spec 03): a
+//! transparent OpenAI endpoint in front of a target engine that records a
+//! live agent session into a load trace the replay harness re-sends — the
+//! gate-run's capture piece.
 
 pub mod canary;
 pub mod client;
 pub mod gate;
 pub mod metrics;
+pub mod record;
 pub mod report;
 pub mod trace;
