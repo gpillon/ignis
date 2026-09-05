@@ -5,6 +5,23 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
 
 ## Open
 
+- **bench-03: gate-run — the v1 99% gate end-to-end (GitHub #24, spec 03,
+  ADR 0005/0006/0007).**
+  PARKED 2026-09-05 (operational — human prerequisites, ADR 0006/0007): the
+  gate-run (capture → replay×2 → canary → gate → dogfood) requires ADR 0006
+  GPU exclusivity (stopping the user's ninfer model runner — the coding
+  agent's own LLM backend — a destructive shared-state operation), a live
+  reference (ninfer) stack (`F:\ai\q38`), `ignis-server` + the reference
+  running *sequentially* (never both — the 5090 cannot hold two full
+  engines), a real "1 main + ~10 subagents" live agent session, and the 99%
+  performance-gate verdict (ADR 0007). Remaining **autonomous coding
+  piece**: the `ignis-bench record` capture tool (a new `crates/bench`
+  subcommand — a capture-proxy that records a live agent session into a
+  bench trace, CPU-testable against a mock target per spec 03). That piece
+  is implementable; the operational run itself is a human/external
+  prerequisite. Owner: bench actor. Blocker: human operational run (GPU
+  exclusivity + reference stack + live agent session).
+
 - **bench-02: recorded reference baseline + 99% gate (ADR 0007, GitHub #20).**
   The `ignis-bench` harness is code-complete — `HttpEndpoint` transport,
   per-class metrics, canary self-consistency, 99% gate check (bench-01,
@@ -18,6 +35,12 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   `main_plus_10.jsonl` fixture is not a reference. Procedure + file
   layout: `bench/traces/README.md`. Then `ignis-bench gate` runs the 99%
   gate. Owner: bench actor. Blocker: GPU + a recorded reference recording.
+  PARKED 2026-09-05: this v1 99% gate (ADR 0007) is the acceptance
+  milestone achieved by the bench-03 gate-run (GitHub #24) — a
+  human/operational prerequisite (GPU exclusivity, reference stack, live
+  agent session). The harness is code-complete; what remains is the
+  *recorded* side (a real reference trace + a reference run with the same
+  harness), which is the gate-run (see the bench-03 entry above).
 
 ## Blocked (external)
 
@@ -26,6 +49,30 @@ dependency. Per-ticket details live in `.scratch/<feature>/specs/`.
   GPU test run). Re-check before scheduling GPU work.
 
 ## Resolved (pruned weekly)
+
+- **#32: B2 CUDA-graph decode replay (GitHub #32, spec 09, ADR 0008).**
+  Resolved 2026-09-05: the decode graph is now the decode hot path (ADR
+  0008) — at construction (`CudaCompute::new` + `from_artifact`) the
+  representative decode sequence (embed → GQA → GDN → final RMSNorm →
+  lm_head GEMV) is captured over persistent fixed-address device staging
+  buffers, and each decode step H2Ds the token, replays via
+  `ignis_graph_launch`, and D2Hs the logits (bit-identical to the eager
+  reference, ADR 0007 self-consistency). A decode step whose batch does not
+  match the captured `GraphGeometry` (batch 1) runs the eager sequence; a
+  busy/absent GPU (or a VRAM shortfall) leaves the graph `None` (the eager
+  fallback, ADR 0003/0006). New: `kernel/src/decode_graph_surface.cu` (the
+  decode-graph leaf), the C-ABI `ignis_decode_graph_*` surface (the
+  `kernel/include/ignis_kernel.h` + `crates/core/src/ffi.rs` mirror), the
+  `CudaCompute` `build_decode_graph` + `graph_logits_{replay,eager}` +
+  `uses_graph()` / `graph_launch_count()` observation surfaces + the Drop
+  cleanup, and `crates/core/tests/decode_graph_gpu.rs` (the GPU-gated
+  acceptance tests — replay==eager bit-exact, captured-at-construction,
+  hot-path + eager-fallback; self-skip on a busy GPU, ADR 0006). Landed on
+  `main` as `7c5e893` (fast-forward integration); `cargo test --workspace`
+  green after rebuilding the kernel `.lib` to pick up the new `.cu` (the
+  stale pre-#32 `.lib` was a transient LNK2019 on `ignis_decode_graph_*`).
+  Push to `origin/main` pending (the orchestrator does not push without an
+  explicit request).
 
 - **#30: A3 full-correct Qwen 3.8-27B forward assembly (GitHub #30, spec 07,
   ADR 0005/0006/0007).**
