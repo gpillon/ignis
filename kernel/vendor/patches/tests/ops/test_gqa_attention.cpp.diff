@@ -1,0 +1,104 @@
+diff --git a/reference/tests/ops/test_gqa_attention.cpp b/vendor/tests/ops/test_gqa_attention.cpp
+index 53dacd4..41fca5b 100644
+--- a/reference/tests/ops/test_gqa_attention.cpp
++++ b/vendor/tests/ops/test_gqa_attention.cpp
+@@ -1342,22 +1342,10 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
+ 
+ int run_batch_cases() {
+     int failures = 0;
+-    failures += run_batch_case(kGeometries[0], DType::I8,
+-                               {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
+     failures += run_batch_case(kGeometries[0], DType::BF16,
+                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
+     failures += run_batch_case(kGeometries[0], DType::BF16,
+                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
+-    failures += run_batch_case(kGeometries[1], DType::I8,
+-                               {1,
+-                                {0, 31, 63, 127, 511, 1023, 2047, 4095},
+-                                {1, 1, 1, 1, 1, 1, 1, 1},
+-                                {7, 0, 5, 2, 6, 1, 4, 3},
+-                                MappingPattern::Identity,
+-                                502u});
+-    failures +=
+-        run_batch_case(kGeometries[0], DType::I8,
+-                       {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
+     failures += run_batch_case(kGeometries[1], DType::BF16,
+                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+     return failures;
+@@ -1365,21 +1353,13 @@ int run_batch_cases() {
+ 
+ int run_geometry(const Geometry& geometry) {
+     int failures = 0;
+-    for (const DType dtype : {DType::BF16, DType::I8}) {
++    for (const DType dtype : {DType::BF16}) {
+         for (const MappingPattern mapping :
+              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
+             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
+             failures += run_a1_case(geometry, dtype, {6, 61, 67, 190u}, mapping);
+             failures += run_a3_case(geometry, dtype, {1, 128, 129, 191u}, mapping);
+         }
+-        if (dtype == DType::I8) {
+-            failures += run_append_case(geometry, dtype, MappingPattern::Fragmented,
+-                                        150u + geometry.q_heads, 129, 61);
+-            if (geometry.q_heads == 24) {
+-                failures += run_a1_case(geometry, dtype, {4, 8188, 8198, 151u},
+-                                        MappingPattern::Identity);
+-            }
+-        }
+ 
+         const AttentionCase a1_cases[] = {
+             {1, 0, 1, 201u},    {6, 17, 23, 202u},   {7, 17, 512, 203u},
+@@ -1408,52 +1388,13 @@ int run_geometry(const Geometry& geometry) {
+             failures +=
+                 run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
+         }
+-
+-        if (dtype == DType::I8) {
+-            // Key-split coverage (ROADMAP WI-K1a): T=130 selects S=2 (and splits the repeated
+-            // block across segments in large_v_peaked); T=1024/base 0 selects S=3 — the
+-            // production chunk shape.
+-            failures += run_a1_case(geometry, dtype, {1024, 0, 1100, 507u},
+-                                    MappingPattern::Identity);
+-            // K1 range cases for the f16-accumulated PV partial. base 128 + block 0 puts the 64
+-            // repeated keys on one aligned key tile; with same-sign |V| ~ 2000 the unguarded
+-            // partial is ~128k > 65504 (measured non-finite before the 2^-6 guard), the guarded
+-            // one is bounded by max|v|. The second case drives post-q/k-norm Q/K magnitudes
+-            // (RMS ~1) so the softmax is concentrated rather than the default flat profile.
+-            // Both carry profile-specific criteria: at these profiles the INT8 quantization
+-            // itself exceeds the registered flat-profile criterion (measured rel_l2 3.43e-3 /
+-            // gross ratio 1.45 on the PRE-f16-PV kernel, 3.45e-3 / 1.48 with it — the f16 tile
+-            // partial adds <=0.5% of the error), so these bounds pin the range guard and the
+-            // realistic-profile margin (measured rel_l2 1.21e-3 and 3.45e-3) rather than the
+-            // flat-profile contract.
+-            const AttentionProfile large_v_peaked{
+-                "large_v_peaked", -1.0f, 1.0f, -1.0f, 1.0f, 1800.0f, 2200.0f, 0, true};
+-            const AttentionProfile realistic_qk{
+-                "realistic_qk", -1.7f, 1.7f, -1.7f, 1.7f, -1.0f, 1.0f, -1, false};
+-            const ReductionCriterion large_v_peaked_criterion{
+-                /*relative_l2*/ 4.0e-3,
+-                /*gross_absolute*/ 10.0e-3,
+-                /*gross_relative_to_max_reference*/ 6.0e-3,
+-            };
+-            const ReductionCriterion realistic_qk_criterion{
+-                /*relative_l2*/ 5.0e-3,
+-                /*gross_absolute*/ 2.5e-3,
+-                /*gross_relative_to_max_reference*/ 4.0e-3,
+-            };
+-            failures += run_a1_case(geometry, dtype, {130, 128, 260, 505u},
+-                                    MappingPattern::Identity, &large_v_peaked,
+-                                    &large_v_peaked_criterion);
+-            failures += run_a1_case(geometry, dtype, {130, 128, 260, 506u},
+-                                    MappingPattern::Identity, &realistic_qk,
+-                                    &realistic_qk_criterion);
+-        }
+     }
+     return failures;
+ }
+ 
+ int verify_workspace_capacity_contract() {
+     int failures = 0;
+-    for (const DType dtype : {DType::BF16, DType::I8}) {
++    for (const DType dtype : {DType::BF16}) {
+         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
+         const std::size_t interval =
+             ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);

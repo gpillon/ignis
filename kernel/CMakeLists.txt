@@ -55,6 +55,7 @@ find_package(CUDAToolkit REQUIRED)
 set(IGNIS_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
 add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/arena.cu
+  ${IGNIS_VENDOR_DIR}/src/core/cyclic_kv_cache.cpp
   ${IGNIS_VENDOR_DIR}/src/core/device.cu
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/kv_ring_bits.cu
@@ -140,6 +141,29 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/output.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  # P1-15 (GitHub #51): the GQA attention family — positions, RoPE, the fused
+  # q/k norm+RoPE, paged KV addressing, KV append/prefix-append, and the bf16
+  # decode + prefill attention routes (i8/hq launchers vendored, compiled here,
+  # untested until G2/G4 pick up their own reference tests).
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/position.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/rope.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/qk_norm_rope.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/kv_cache_append_prefix.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_bf16.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_i8.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_27.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_35.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_bf16.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_i8.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_hq_27.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_hq_35.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/position.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/rope.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/qk_norm_rope.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gqa_attention.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/kv_cache_append_prefix.cpp
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
