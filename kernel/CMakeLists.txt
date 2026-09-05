@@ -118,6 +118,28 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  # P1-14 (GitHub #50): the GDN family — causal_conv1d_silu, gdn_gating, and
+  # the gated_delta_net recurrence (recurrent + chunked routes, the snapshot
+  # form, and the replay-record entry point). gated_delta_net's replay.cpp and
+  # recurrent.cu also carry the reference's gdn_replay_fold implementation
+  # (core/gdn_replay_records.{h,cpp}, include/ninfer/ops/gdn_replay.h): the
+  # reference keeps it in the same translation units as
+  # gated_delta_net_replay_record, so ADR 0010's whole-file vendoring pulls it
+  # in too. It compiles as part of ignis_vendor but is not exercised by any
+  # test here — its own op family (the sequence-handle ReplaySSM fold) is out
+  # of this ticket's scope.
+  ${IGNIS_VENDOR_DIR}/src/core/gdn_replay_records.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/causal_conv1d.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gdn_gating.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/causal_conv1d_silu.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gdn_gating.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/recurrent.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/replay.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/output.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""

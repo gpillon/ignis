@@ -20,12 +20,28 @@
       "sha256": "415eef9806bf5577c47f515d6cd5399c1cf5576e5834c8f6909065c67c575242"
     },
     {
+      "path": "include/ninfer/ops/causal_conv1d_silu.h",
+      "sha256": "6815cec1e6e5a67aba25630b2ed0eafc90f7036394e94a16e132637feb741a34"
+    },
+    {
       "path": "include/ninfer/ops/embedding.h",
       "sha256": "dc5d91ed6e179dbf20c21f8753ff7519267e1af31224b6bc948e33c508608651"
     },
     {
+      "path": "include/ninfer/ops/gated_delta_net.h",
+      "sha256": "963864d960f1875fa003f4347421713adef71459cac5f0355a92057c2145de45"
+    },
+    {
       "path": "include/ninfer/ops/gated_rmsnorm.h",
       "sha256": "0ed6fc49679522326ae0209367b4f9230afea301a3e74adaa38a9aa1904e5661"
+    },
+    {
+      "path": "include/ninfer/ops/gdn_gating.h",
+      "sha256": "0349a9232663c0497b528b5bca27ad9cec3b2e126baefdf3b6ae31fc8da06656"
+    },
+    {
+      "path": "include/ninfer/ops/gdn_replay.h",
+      "sha256": "e093cbf7d02ff8b8d3c5b642b3779491bd4b6710298267005c16e6adaf38b471"
     },
     {
       "path": "include/ninfer/ops/l2norm.h",
@@ -78,6 +94,14 @@
     {
       "path": "src/core/dtype.h",
       "sha256": "13ab4e833debe24baf9294a9d8eefc3f61a182b914e8a128d1725be3d93574ed"
+    },
+    {
+      "path": "src/core/gdn_replay_records.cpp",
+      "sha256": "a85caa0ed0943a2403144491388d0d71209e1a393689d7f7b93234f885958b55"
+    },
+    {
+      "path": "src/core/gdn_replay_records.h",
+      "sha256": "5089592180de7dff3dedb500d7a67c7a384acd23955ebfdcdf9c5b2818d9c4d0"
     },
     {
       "path": "src/core/kv_ring_bits.cu",
@@ -224,8 +248,16 @@
       "sha256": "4923d9f8c61d5c0f412247fc2a8e33547149d9c7018fdaadeb4969bf1603eacc"
     },
     {
+      "path": "src/ops/kernel/causal_conv1d.cuh",
+      "sha256": "6ee83c24c7712595446a0e7fbe822fbb89550f7768578550b7834ccfc9a82fd8"
+    },
+    {
       "path": "src/ops/kernel/embed_gather.cuh",
       "sha256": "041e27ca7dad3cd329a163ca3e9b36a1020b6487637d3833dbc53fb941087a7c"
+    },
+    {
+      "path": "src/ops/kernel/gdn_gating.cuh",
+      "sha256": "997f22f6b0d0a9ba393dd9c804e964d9e52d12cd6bd88879b5ce3eb42f35e962"
     },
     {
       "path": "src/ops/kernel/l2norm.cuh",
@@ -256,12 +288,28 @@
       "sha256": "6e8786c5987878bf8edd782e4cacd9d8baa68eec61de67be3ab33e68b156d6b8"
     },
     {
+      "path": "src/ops/launcher/causal_conv1d.cu",
+      "sha256": "8bd0bb43606002853dc324ee7b54ffb2b50e72b0bbabf3946586484d4f78a654"
+    },
+    {
+      "path": "src/ops/launcher/causal_conv1d.h",
+      "sha256": "4e0d8a3a365d4e2aa7aabf8bcabf863c19d1c568d14b9768c246014a92ce1b5b"
+    },
+    {
       "path": "src/ops/launcher/embed_gather.cu",
       "sha256": "c4da1ee6de08c7f4c814930bfee52b089eb488a48f4a1c0eddc9182c9be58e1f"
     },
     {
       "path": "src/ops/launcher/embed_gather.h",
       "sha256": "777f68c7ff272320e7cf2a7515f844d01aeb560039908d4138ade7f3175f0b5a"
+    },
+    {
+      "path": "src/ops/launcher/gdn_gating.cu",
+      "sha256": "cd9fd4e07fc1960b616214a7a2dff88e155ac271d421c3013132fbf1c9d29a79"
+    },
+    {
+      "path": "src/ops/launcher/gdn_gating.h",
+      "sha256": "6038004a20ba93784d2e525a7aa6c5b4da47883499d12311ac26e473527cc22e"
     },
     {
       "path": "src/ops/launcher/l2norm.cu",
@@ -544,12 +592,84 @@
       "sha256": "5b5d7b5c409d12b692d73ff9c46c57d0d1c708c04c25f617884a7c5f3e5166ba"
     },
     {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/common.cuh",
+      "sha256": "ca50965d3e97808caaf5894891e939d420acbd965c33d69dcfa2089b705c42e9"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/launch.cu",
+      "sha256": "1910d4ed8252dd5fd5babb67cd53295f50c7a0f10defca78901e26c501a5eb77"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/launch.h",
+      "sha256": "5c730a30135ffc9a84c82d8b2040c53d9110c7b6a82ba5cc6644d0dfe15f5106"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/output.cu",
+      "sha256": "9a04d55e9a0d6dfa2914e13696131687a217abadc36587389335c4ed5cfa6ceb"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/output.cuh",
+      "sha256": "54d161362f8b14d166d6e1d9df5244361d0bbe430e58934d1695986ec55cc50d"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu",
+      "sha256": "a9ac2f60f5ba55850c11702b08346e35b2373bf87a6fdcf1807491db106463c3"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cuh",
+      "sha256": "7bacaa6be2ee6d0a6cfc6ae0fe327785f99c750b4ea269427e47cf348c0767fe"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu",
+      "sha256": "eafe9a496989c589aa959b69a351ac579f759aed9e678bdc85b5fcc136a3d227"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh",
+      "sha256": "5a417f56f23889d6846a31c834629aa153395cb50a7e375f6672178884ebf90a"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/common.cuh",
+      "sha256": "901b8c7a5ce55f12ebd7e2ac8e4374201fd8ccd91bab57fde0280f6bd74d1f36"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/common.h",
+      "sha256": "8485c9c88e4e5ce84244e3b1943070429c37791d858b5e9762bcebc7eef458b1"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp",
+      "sha256": "1b28b3db933c7962d7aa384db8d4a875415ad27041aa3cd8f6e0ab8f5aaf34cb"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/launch.h",
+      "sha256": "45fdc94d16cffd5b091f84ce390aa5e6a268d132ddc3d53176c08843aadb8d10"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/recurrent.cu",
+      "sha256": "78e568f5725e936522a32df77cf02d384dc93291bad8b33cbeda48509912eed8"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/recurrent.cuh",
+      "sha256": "edb4baee7bd6a07b4b97b28c54c2652b9fb0541aeaa1dbcf23b0b31c41f6e08a"
+    },
+    {
+      "path": "src/ops/linear_attention/gated_delta_net/replay.cpp",
+      "sha256": "5f0214cf39116e77f8ee68bbdc35a5d357fa4103167e3d2ccd2315339e0c337f"
+    },
+    {
       "path": "src/ops/wrapper/argmax.cpp",
       "sha256": "d28b3b2f52432fbe059ad097052c7343bb9bf170dd0b5ca322e2f675dbadbfa7"
     },
     {
+      "path": "src/ops/wrapper/causal_conv1d_silu.cpp",
+      "sha256": "a5e5621c8b4c2479e1b65c07c35ee6e500e2a7f747b763129c5a7bbac7f3e669"
+    },
+    {
       "path": "src/ops/wrapper/embedding.cpp",
       "sha256": "58d3638f0e25207ed917a4388260390336707de455bcbf37488e13bcabd58060"
+    },
+    {
+      "path": "src/ops/wrapper/gdn_gating.cpp",
+      "sha256": "9ba45f131c5ef473f76343ffc6098b0df7e2bb4dd2b476e7002e07198f004c8b"
     },
     {
       "path": "src/ops/wrapper/l2norm.cpp",
@@ -574,6 +694,10 @@
     {
       "path": "tests/ops/direct_bf16_weight.h",
       "sha256": "b1e5b4a4ae62bfd085367b8abae20782cdf34a608afdfd267e018792b1ef54e4"
+    },
+    {
+      "path": "tests/ops/gdn_ref.h",
+      "sha256": "8290d1b43da8753281847f4c9402048b847ce1a551dfdcf5104f5cd321354728"
     },
     {
       "path": "tests/ops/input_projection_test_common.h",
@@ -645,12 +769,28 @@
       }
     },
     {
+      "path": "tests/ops/test_causal_conv1d_silu.cpp",
+      "sha256": "94e000c93d4343e991a1da8b13e37a417bb9696ba24c34ce582c91d07ff00d93"
+    },
+    {
       "path": "tests/ops/test_embedding.cpp",
       "sha256": "a262a90b83b3ec9e5cda1ee889231eb30bf84264dc20d04ab441d04dca2dd44c"
     },
     {
+      "path": "tests/ops/test_gated_delta_net.cpp",
+      "sha256": "f6c9dafe2ae922fadeac5fb22f7f67b94f12c5f2ec860a6159cdcaf2f1a54ea1"
+    },
+    {
+      "path": "tests/ops/test_gated_delta_net_replay_record.cpp",
+      "sha256": "91730ab20fc041eeb844413e6f4bcba0e1122f7135ac805c803c3a84321cd469"
+    },
+    {
       "path": "tests/ops/test_gated_rmsnorm.cpp",
       "sha256": "fbe6d4d5db6d7931284e4f812e3b5c52d6c2680bef1b64c70a56d76d065b39ac"
+    },
+    {
+      "path": "tests/ops/test_gdn_gating.cpp",
+      "sha256": "2b248ec94bfd156a984bee67372f22970fb1a76ebcd65667db36bd272c3d2119"
     },
     {
       "path": "tests/ops/test_l2norm.cpp",
