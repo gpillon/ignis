@@ -1,8 +1,9 @@
 //! Build script: link the kernel leaf (ADR 0001).
 //!
-//! Expects `kernel/build/ignis_kernel.lib` (prebuilt by `kernel/build.ps1`,
-//! the proven cmake + ninja + nvcc flow). If the library is missing, the
-//! script is run automatically.
+//! Expects `kernel/build/ignis_kernel.lib` and `kernel/build/ignis_vendor.lib`
+//! (the vendored reference substrate, ADR 0010), both prebuilt by
+//! `kernel/build.ps1`, the proven cmake + ninja + nvcc flow. If either library
+//! is missing, the script is run automatically.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,9 +17,14 @@ fn main() {
         .unwrap()
         .join("kernel");
     let build_dir = kernel_dir.join("build");
-    let lib = build_dir.join("ignis_kernel.lib");
+    // Two archives: the leaf's own C ABI surface and the vendored reference
+    // substrate it is built on (ADR 0010, kernel/vendor/VENDOR.md).
+    let libraries = ["ignis_kernel", "ignis_vendor"];
 
-    if !lib.exists() {
+    if libraries
+        .iter()
+        .any(|name| !build_dir.join(format!("{name}.lib")).exists())
+    {
         let script = kernel_dir.join("build.ps1");
         let out = Command::new("powershell")
             .args([
@@ -42,7 +48,9 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search={}", build_dir.display());
-    println!("cargo:rustc-link-lib=static=ignis_kernel");
+    for name in libraries {
+        println!("cargo:rustc-link-lib=static={name}");
+    }
 
     // CUDA runtime (dynamic): the static library imports cudart symbols; the
     // import lib is resolved at link time, the DLL (cudart64_13.dll) at

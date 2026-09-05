@@ -13,6 +13,10 @@ $Kernel = Split-Path -Parent $MyInvocation.MyCommand.Path
 # verify new .cu files without contending on the canonical build.
 $BuildDir = if ($args -and $args[0] -and ($args[0] -notlike '-*')) { $args[0] } else { "build" }
 $BuildPath = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $Kernel $BuildDir }
+# -Test also runs the leaf's op-test executable through CTest. These are GPU
+# tests and they FAIL (never skip) when the GPU is busy or a kernel errors
+# (ADR 0006), so run them on a free GPU: stop the reference runner first.
+$RunTests = $args -contains '-Test'
 
 function Import-Vcvars {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -65,4 +69,11 @@ $cmakeArgs = @(
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & cmake --build $BuildPath --parallel
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+if ($RunTests) {
+    Write-Host "[ignis-kernel] ctest (GPU: a skip is never green, ADR 0006)"
+    & ctest --test-dir $BuildPath --output-on-failure
+    exit $LASTEXITCODE
+}
+exit 0

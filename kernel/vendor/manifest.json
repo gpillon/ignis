@@ -1,0 +1,115 @@
+{
+  "reference": {
+    "repo": "gpillon/ninfer",
+    "branch": "feat/dflash2-local",
+    "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+    "default_path": "F:/ai/q38/ninfer"
+  },
+  "vendor_root": "kernel/vendor",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "src/core/arena.cu",
+      "sha256": "53a1d7ac6ec55e8ba8806897cd3cc21fd9aac2d4c9f737c7518a2fd64c254957"
+    },
+    {
+      "path": "src/core/arena.h",
+      "sha256": "8369c1f321edc900fab00c83b5d04883959763afad7fe4b73fad45e5d6b3035d"
+    },
+    {
+      "path": "src/core/device.cu",
+      "sha256": "2bc900d8c650dd0f96f399b7d49798b15681cddf866944d00319b83746b1cd3b"
+    },
+    {
+      "path": "src/core/device.h",
+      "sha256": "e8e8aab962803f3e805f5db8084bda7221352c9ebae7ff09c2cf35199897d97f"
+    },
+    {
+      "path": "src/core/dtype.cpp",
+      "sha256": "8a3ae4906cb6ae4d9ef3e67c39dacc45e3a153f546ecb2b22843e6448cd93663"
+    },
+    {
+      "path": "src/core/dtype.h",
+      "sha256": "13ab4e833debe24baf9294a9d8eefc3f61a182b914e8a128d1725be3d93574ed"
+    },
+    {
+      "path": "src/core/layout.cpp",
+      "sha256": "ee9f6cf62eb6aa4d27b0b946e3ca3a62eeb70c3a1f7b8b696b3fd2158b7d45aa"
+    },
+    {
+      "path": "src/core/layout.h",
+      "sha256": "1e5ef267fd354444795c830f16f9e5b7a6fe59845a59c5b0a6e008fbd2c9ee47"
+    },
+    {
+      "path": "src/core/nvtx.h",
+      "sha256": "608429a6e1c297635e075ec619bceba1622bf7f71878bf95e8e9f78741d79957"
+    },
+    {
+      "path": "src/core/nvtx_range.h",
+      "sha256": "5a0d72018262be74900327c8521c8780e19ed9f1ad52ba98c1c0d8f29094961f"
+    },
+    {
+      "path": "src/core/pdl.cuh",
+      "sha256": "787b6d0fdfc5b25fe29dcb32548de56637e4d5b9b3561b9caaa2544cba4eb57f"
+    },
+    {
+      "path": "src/core/tensor.cpp",
+      "sha256": "2601e178702db595e08471b7052368d4f3297ca715a785710b7a165ce82e572a"
+    },
+    {
+      "path": "src/core/tensor.h",
+      "sha256": "938c95eb81a85c417d709930dc763936de325a261cb71083a09014768481f27a"
+    },
+    {
+      "path": "src/core/weight.h",
+      "sha256": "5db0915d59ea0b8f0397a3e586d94b15311dcba5599bcc30c6f202d9516e9b09"
+    },
+    {
+      "path": "src/ops/common/bf16_vector.cuh",
+      "sha256": "2f8cc281eae6e9809a7ac9478373236bae0400c668865be456e8caf81502e00d"
+    },
+    {
+      "path": "src/ops/common/math.cuh",
+      "sha256": "5aedc4dccaa3cf3cf75a6b03cbe24c8ef830ef183488f002864103f0c35b760e"
+    },
+    {
+      "path": "src/ops/common/math.h",
+      "sha256": "2f61fe7900d5584e700c824add008fe5c1d21e7d32a31e93ac9089b9f861f330"
+    },
+    {
+      "path": "src/ops/common/memory.cuh",
+      "sha256": "68d4ce555d86761aa4c21d49726be2e48d82fcbdc4f6dbe4fc8b7356f945e205"
+    },
+    {
+      "path": "src/ops/common/mma.cuh",
+      "sha256": "4af04a39c2d1607819d1270ca9b890623e33a372179b00b80a9c8fb1a7f4484c"
+    },
+    {
+      "path": "src/ops/common/rowsplit_mma.cuh",
+      "sha256": "3b0c48acc65fb5ea26865d4fbc3bbd785a4b7a56d71ee1f4c6474c8a0c2fdc10"
+    },
+    {
+      "path": "src/ops/common/sampling_workspace.h",
+      "sha256": "54188d65ee0dc2c9a68b1d5ede2e858af551a9449140975ec5b0d26309f6156d"
+    },
+    {
+      "path": "src/ops/common/token_slices.h",
+      "sha256": "b88b2fb74e3e5ae673ab4b0199c8f606c495d8584b5a87feb71e947d41b295a0"
+    },
+    {
+      "path": "src/ops/common/warp.cuh",
+      "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
+    },
+    {
+      "path": "tests/ops/op_check.h",
+      "sha256": "4374221479bc90a7bb737cfac62ad6b3ee01fd5dca57cd14c5a0fd38b5c73429"
+    },
+    {
+      "path": "tests/ops/op_tester.h",
+      "sha256": "2db18a2461ec11744225ec16c605061738b9c1da2f6bf64a9cfdd325139e06fa"
+    }
+  ]
+}

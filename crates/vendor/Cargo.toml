@@ -1,0 +1,13 @@
+[package]
+name = "ignis-vendor"
+description = "ignis: the kernel-leaf vendoring tool — copy, hash-verify and patch-record the reference ops (ADR 0010)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "vendor-ninfer"
+path = "src/main.rs"

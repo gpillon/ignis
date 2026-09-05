@@ -13,7 +13,25 @@ repo license headers are preserved where present. This project reuses that code
 by explicit decision (grilling session, 2026-09-02) and keeps the provenance
 recorded here so it is never silently dropped.
 
-## Per-file provenance
+## The vendored subtree (ADR 0010) — `kernel/vendor/`
+
+Since GitHub #42, provenance for reference code is a **manifest, not a header
+comment**: `kernel/vendor/manifest.json` pins the reference commit and records
+every vendored file with its content hash, and `scripts/vendor-ninfer.ps1`
+copies and verifies them. Files under `kernel/vendor/` are byte-identical
+copies of the reference at that commit, except where the manifest records a
+patch as a committed diff. See `kernel/vendor/VENDOR.md`.
+
+The subtree is Apache-2.0; the upstream `LICENSE` is vendored alongside the
+code at `kernel/vendor/LICENSE`, and this NOTICE carries the attribution.
+
+The per-file section below covers the **pre-#42** files under `kernel/src/`,
+which are adaptations rather than verbatim copies. ADR 0010 supersedes that
+practice: those kernels and their host-pointer surfaces are deleted by
+GitHub #39, and their replacements are vendored under the manifest. A port
+claim that is not a manifest entry is not a port claim.
+
+## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)
 NVFP4 decode GEMM (GEMV path). Adapted from the reference

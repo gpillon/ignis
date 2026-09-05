@@ -6,8 +6,8 @@ until the test suite is green.
 
 ## The gate
 
-- `cargo test` from the workspace root — all four crates
-  (`artifact`, `core`, `server`, `bench`).
+- `cargo test` from the workspace root — all five crates
+  (`artifact`, `core`, `server`, `bench`, `vendor`).
 - Machine-local smoke tests skip gracefully when their fixture is
   absent (e.g. `crates/artifact/tests/real_artifact.rs` needs the
   artifact in `F:\ai\q38`). A skip counts as green; a failure does not.
@@ -19,9 +19,12 @@ until the test suite is green.
   **GPU profile**, which requires the GPU free and *fails* on any kernel
   error. The default `cargo test` stays CPU-only. The profile, its preflight
   and its runbook are GitHub #38.
-- Kernel work (`kernel/`, CUDA) is not exercised by `cargo test`: build with
-  `kernel/build.ps1`, run the leaf's own op-test executable (CTest), and
-  verify end to end through the GPU profile.
+- Kernel work (`kernel/`, CUDA) is not exercised by `cargo test`: build and
+  run the leaf's own op-test executable (CTest) with `kernel/build.ps1 -Test`,
+  and verify end to end through the GPU profile. The one kernel-adjacent thing
+  `cargo test` *does* check is the vendored subtree's integrity
+  (`crates/vendor`): a vendored file edited without a recorded patch turns the
+  workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).
 
 ## Where tests live
 

@@ -3,9 +3,10 @@
 //! Pure-Rust by default: the `CpuDevice` mock is the ADR 0006 stand-in while
 //! the RTX 5090 is held by the reference runner, so the default build links
 //! nothing. When the `cuda` feature is enabled this mirrors
-//! `crates/core/build.rs`: it links the kernel leaf's static library (which
-//! now carries the flat C device surface, `kernel/src/device.cu`) and the CUDA
-//! import libs, auto-building the kernel leaf if the library is missing.
+//! `crates/core/build.rs`: it links the kernel leaf's static libraries (its
+//! own C ABI surface, which carries the flat C device surface
+//! `kernel/src/device.cu`, plus the vendored reference substrate of ADR 0010)
+//! and the CUDA import libs, auto-building the leaf if either is missing.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,9 +26,14 @@ fn main() {
         .unwrap()
         .join("kernel");
     let build_dir = kernel_dir.join("build");
-    let lib = build_dir.join("ignis_kernel.lib");
+    // Two archives: the leaf's own C ABI surface and the vendored reference
+    // substrate it is built on (ADR 0010, kernel/vendor/VENDOR.md).
+    let libraries = ["ignis_kernel", "ignis_vendor"];
 
-    if !lib.exists() {
+    if libraries
+        .iter()
+        .any(|name| !build_dir.join(format!("{name}.lib")).exists())
+    {
         let script = kernel_dir.join("build.ps1");
         let out = Command::new("powershell")
             .args([
@@ -51,7 +57,9 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search={}", build_dir.display());
-    println!("cargo:rustc-link-lib=static=ignis_kernel");
+    for name in libraries {
+        println!("cargo:rustc-link-lib=static={name}");
+    }
 
     // CUDA runtime (dynamic): the static library imports cudart symbols; the
     // import lib is resolved at link time, the DLL (cudart64_*.dll) at runtime

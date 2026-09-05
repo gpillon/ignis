@@ -647,6 +647,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignis-vendor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "indicatif"
 version = "0.17.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

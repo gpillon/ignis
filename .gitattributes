@@ -1,0 +1,5 @@
+# The vendored reference subtree is content-addressed: kernel/vendor/manifest.json
+# records each file's SHA-256, and scripts/vendor-ninfer.ps1 verifies it. Any
+# end-of-line normalization on checkout or commit would change those bytes and
+# break the byte-identical guarantee of ADR 0010, so git must leave them alone.
+kernel/vendor/** -text

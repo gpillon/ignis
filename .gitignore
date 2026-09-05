@@ -3,6 +3,7 @@ target/
 kernel/build/
 kernel/build-a/
 kernel/build-b/
+kernel/build-c/
 
 # webui (later phase)
 node_modules/
