@@ -118,6 +118,14 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  # P1-13 (GitHub #49): the fused MLP gate_up projection with the SiLU-mul
+  # epilogue, NVFP4 arm only. The large-T W4A4/TMA sources compile here but
+  # are verified only at G2, same as P1-09's own W4A4/TMA route.
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""

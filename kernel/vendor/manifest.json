@@ -40,6 +40,10 @@
       "sha256": "68e9d798bde4963f042840e866fa5567261cf96514aa6588230a88d185a04a45"
     },
     {
+      "path": "include/ninfer/ops/linear_swiglu.h",
+      "sha256": "8a6107500217604a3f5e7f945d5ff2b2ef37b81c4f373e8ddc83cd880da1a805"
+    },
+    {
       "path": "include/ninfer/ops/residual_add.h",
       "sha256": "f9ffa1dca7fbaaf7c0e91d1c4cdda0eabd818a3bb15a2e7d92aa3eacd40f7be2"
     },
@@ -544,6 +548,38 @@
       "sha256": "5b5d7b5c409d12b692d73ff9c46c57d0d1c708c04c25f617884a7c5f3e5166ba"
     },
     {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu",
+      "sha256": "b810b70ae841239fb2bda874faa492a745ecbdd12ed83a973affd5ec85de5c3f"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp",
+      "sha256": "0f3a3694334c71c0b918c2c7def395ce0bac7eabe827494f4ba33d7683d4a439"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h",
+      "sha256": "f890c2c58ee1ab9a79c86952e24e2bcf4e3e2c1d84c96f9e4f094a62dfb84a62"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu",
+      "sha256": "6e8e046babdcf80ba7db5e9e35369bf5ca1de0797890d641d83602ac90ebf12e"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu",
+      "sha256": "c9e75a41f31176cc98f7ea04d246592a1e88222777622a3dc062e601709eafce"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu",
+      "sha256": "fc3a21b20da3792f3c7aa7802d15d22385a45fd4b7549f2ca5179f68d487a893"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cuh",
+      "sha256": "a5ec67c5fa20727112e11cc850d02be4399daa03e28ddd54b8d7a02ece209156"
+    },
+    {
+      "path": "src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h",
+      "sha256": "59e39fea7eb2660033e3f546f9ad9eaecd46a22cf655bba9ddfe61f72ad6a402"
+    },
+    {
       "path": "src/ops/wrapper/argmax.cpp",
       "sha256": "d28b3b2f52432fbe059ad097052c7343bb9bf170dd0b5ca322e2f675dbadbfa7"
     },
@@ -614,6 +650,23 @@
     {
       "path": "tests/ops/linear_add/test_nvfp4.cpp",
       "sha256": "ffe64b771126cae948b09aff69569e1bab9e32a5305f6acb1169c31297f1910c"
+    },
+    {
+      "path": "tests/ops/linear_swiglu/linear_swiglu_test_common.cpp",
+      "sha256": "6e68470a96c75cd38247dbeeaf314e55382dda40374c58eaa1594c53d56ef456"
+    },
+    {
+      "path": "tests/ops/linear_swiglu/linear_swiglu_test_common.h",
+      "sha256": "52c8d8c8d49a5c1d49f09864426799cc4259b730b29220648a4af1be051e3c22"
+    },
+    {
+      "path": "tests/ops/linear_swiglu/test_nvfp4.cpp",
+      "sha256": "7ba75d771b7f0514e4e227ef90c4732789e7325f15c5381cc9a0c99a609b114e",
+      "patch": {
+        "diff": "patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff",
+        "sha256": "1f413cc11b8128063724b546bd23af712246984c2dceabb544b3ebdfe78b0c33",
+        "reason": "P1-13 (GitHub #49) vendors only the NVFP4 arm's A16/small-T route (T=1 and small T); the reference's combined test file also exercises the A4 (large-T W4A4) route, whose reference test verification is deferred to G2 per the roadmap, so that run_profile call and kA4Cases are trimmed rather than left to exercise an unverified route"
+      }
     },
     {
       "path": "tests/ops/norm_test_common.h",
