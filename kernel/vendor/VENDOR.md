@@ -101,10 +101,43 @@ P1-06 (GitHub #42) vendors the substrate the op families are built on:
   executable's second include root, because the harness includes itself as
   `"ops/op_tester.h"`.
 
-The op families themselves (NVFP4 / BF16 / W8G32 linear, the fused
-projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
-each adding its files to this manifest and its reference op test to the leaf's
-test executable.
+P1-09 (GitHub #45) vendors the NVFP4 linear op family: `nvfp4_codec.cuh`
+(E2M1/E4M3 decode), `nvfp4_config.h` (geometries, schedules, the registered
+`[N,K]` problems), `nvfp4_format.{h,cpp}` (the `blockscale-k16-m128x4-v1`
+weight-layout validator), `nvfp4_dispatch.{h,cpp}` (A16 vs. W4A4 route
+selection), `nvfp4_gemv.{cuh,cu}` / `nvfp4_small_t.{cuh,cu}` /
+`nvfp4_launch.h` / `nvfp4_output.cuh` (the decode and small-T A16 kernels and
+their launchers), and the large-T W4A4 route in full —
+`nvfp4_w4a4_plan.h`, `nvfp4_w4a4_mma.cuh` / `nvfp4_w4a4.cu` (the tensor-core
+MMA route) and `nvfp4_w4a4_tma.{cuh,cu}` / `nvfp4_w4a4_tma_launch.h` (the
+warp-specialized SM120 TMA route, which needs the CUDA driver API directly for
+`cuTensorMapEncodeTiled`; `ignis_vendor` links `CUDA::cuda_driver` for it). Two
+small epilogue/output headers from *other* op families are vendored alongside
+it because `nvfp4_w4a4_tma.cu` is the shared W4A4 GEMM kernel those families
+reuse: `ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh` and
+`ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh` — both self-contained
+structs over the already-vendored `ops/common/memory.cuh`, with no other
+dependency. The public header `include/ninfer/ops/linear.h` is vendored too,
+under a new `kernel/vendor/include` root: unlike the reference's
+`src/ops/linear/linear.cpp` (not vendored — it dispatches every weight qtype
+at once, pulling in op families this ticket does not vendor), the header
+itself has no such dependency, so it is byte-identical here and the leaf's own
+thin dispatcher (`kernel/src/linear.cu`, not vendored) implements it, routing
+`QType::NVFP4` to the vendored `detail::nvfp4_dispatch` and throwing a clear
+error naming P1-10 (#46) for every other qtype. The reference's own NVFP4 a16
+linear test — `tests/ops/linear/test_nvfp4_a16.cpp` plus its shared harness
+`linear_test_common.{h,cpp}` and the packed-weight fixture generator
+`tests/ops/quantized_weight.h` — is vendored and built as the CTest target
+`ignis_kernel_nvfp4_linear_tests` (its own executable: the reference's test
+file brings its own `main()`, so it cannot be another source in
+`ignis_kernel_op_tests`). The large-T W4A4/TMA sources compile as part of
+`ignis_vendor` but are not exercised by this test; their own reference test
+(`test_nvfp4_a4.cpp`) is out of scope until G2.
+
+The remaining op families (BF16 / W8G32 linear, the fused projections, norms,
+attention, GDN, the state pools) arrive with P1-10..P1-16, each adding its
+files to this manifest and its reference op test to the leaf's test
+executable.
 
 ## Updating to a newer reference commit
 

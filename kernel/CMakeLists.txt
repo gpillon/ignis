@@ -47,12 +47,39 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
+  # P1-09 (GitHub #45): the NVFP4 linear op family (codec/format/config are
+  # header-only or listed via their .cpp; GEMV, small-T and the W4A4 MMA/TMA
+  # sources below). The large-T W4A4/TMA route compiles here but is only
+  # verified at G2 (its own reference test is deferred with it).
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_format.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
   OUTPUT_NAME "ignis_vendor"
 )
 target_include_directories(ignis_vendor PUBLIC ${IGNIS_VENDOR_DIR}/src)
+# The reference's public op headers (`ninfer/ops/...`) keep their own include
+# root distinct from `src`, mirroring the reference's include/ vs src/ split;
+# `ninfer/ops/linear.h` is vendored here (P1-09) rather than reimplemented,
+# since it has no dependency on any op family's dispatch header.
+target_include_directories(ignis_vendor PUBLIC ${IGNIS_VENDOR_DIR}/include)
+
+# nvfp4_w4a4_tma.cu is the warp-specialized SM120 W4A4 GEMM: it uses the CUDA
+# driver API directly (cuTensorMapEncodeTiled, for the TMA tensor-map
+# descriptors) and setmaxnreg to hand registers from its producer warpgroup to
+# its consumer warpgroups. The reference isolates it in a separate,
+# non-relocatable-device-code static library (`ninfer_nvfp4_tma`,
+# CUDA_SEPARABLE_COMPILATION OFF) because RDC makes ptxas discard that
+# contract; ignis has no target anywhere with CUDA_SEPARABLE_COMPILATION ON
+# (the default is already OFF), so that constraint already holds here without
+# a second library — only the driver-API link dependency needs adding.
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(ignis_vendor PUBLIC CUDA::cuda_driver)
 
 # --- the leaf's own C ABI surface ------------------------------------------
 #

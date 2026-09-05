@@ -12,6 +12,10 @@
       "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
     {
+      "path": "include/ninfer/ops/linear.h",
+      "sha256": "3858e9af80b0a8122d92d8c59ae811419efce76a774cafb9f4fdd17b828cc06e"
+    },
+    {
       "path": "src/core/arena.cu",
       "sha256": "53a1d7ac6ec55e8ba8806897cd3cc21fd9aac2d4c9f737c7518a2fd64c254957"
     },
@@ -108,6 +112,82 @@
       "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
     },
     {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh",
+      "sha256": "13f5b8297527382a9b3688ba2a9f1b47c02c9d00da54ef7a9a9a8abf855a5ab0"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_codec.cuh",
+      "sha256": "b1eb2a90ee717c85b1c6415015fffb588dbb7ed52ae675207bfcb0a3a22b8c63"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_config.h",
+      "sha256": "78cbbffc7885290547acee338a55e40fe03fc11b715ba9e6c450fe4f2a788aee"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_dispatch.cpp",
+      "sha256": "25eb8c4cd1551be53d698aabb39888160ea27cedd2044c4da2ebf473391395cd"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_dispatch.h",
+      "sha256": "e56bdc3265a7c2f7b7ffaf076e1081326d335bf46eb325d034d9c2e4b5a3fc0a"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_format.cpp",
+      "sha256": "a19651b564584aa5dc53c26d8658f97db5d5947439bb8f05877766ae0352eebe"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_format.h",
+      "sha256": "7cc98ab592a32f300ee68852002b450921f2cd8595c0ab61590fa49cf1d0db7f"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_gemv.cu",
+      "sha256": "820294d8d1acfb6cdf50f72c96a41b8e3c7cb3012c8c0168ee273a5608938a27"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_gemv.cuh",
+      "sha256": "2829185e7658c77b1ae8728313aef8002287320a494ef802e66fd2f7f86cd8e5"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_launch.h",
+      "sha256": "aceca9f1b302905f99bb7881519bd60e75fd4b5b032acffd44f14fab44846bbb"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_output.cuh",
+      "sha256": "5faad7191f065f18ed11039126c5c42ec491d8bf299e5f7e79926bfbbe65d74c"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_small_t.cu",
+      "sha256": "51a5d682f4cab738e779567e25b24fce0bbbb6b846ad51e2c4dbcc9669d2ae03"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_small_t.cuh",
+      "sha256": "ff606738b9f0de12ad0757649d7238d49acaf5aa5b002e4bea40bd0e10cfa6ae"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4.cu",
+      "sha256": "00bb3da1a9cb0cdd600493671fb8dd0f1df171ea28e92984c26fdb893b85a4ca"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh",
+      "sha256": "20d616588b536a7b02822a4a61f4f6b8e655e673db468064e1504de9c3f5b6c7"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4_plan.h",
+      "sha256": "5a7780c70c7dabf9e1bbdb9e5fd9d6e4ab243125ff728fa224d72d2d807a70b5"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma.cu",
+      "sha256": "07be8cb501141ba31dbf8b7c6b69d269d82e66a598940278d706a05e430f7054"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma.cuh",
+      "sha256": "24e6a6be6b2f56c7a6be942d954f00326cbef9c8df58047cfe614ef1bbebca1f"
+    },
+    {
+      "path": "src/ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h",
+      "sha256": "746762e9f3d7a81d7cf0dd3181c4255fd70416c139ebe819acd112cb1dcd8681"
+    },
+    {
       "path": "src/ops/linear/q4/q4_rowsplit_storage.cuh",
       "sha256": "c3443c5a913c5711c78c8039e6dd1b71d16bbd9dcbece705d761f58f4961847a"
     },
@@ -116,12 +196,32 @@
       "sha256": "f0258cfddad24f99372b474858fbc7605101d24202a865adba16614ae63ee93a"
     },
     {
+      "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh",
+      "sha256": "b92181e9d3bae4db68582ed1c6fdbbbf959c90bfa7fc572c7ed2500a829ade0b"
+    },
+    {
+      "path": "tests/ops/linear/linear_test_common.cpp",
+      "sha256": "336face4755fc1b931c28497fdde9ab1c65943a8eb33d435dd53e2ff11d03185"
+    },
+    {
+      "path": "tests/ops/linear/linear_test_common.h",
+      "sha256": "df6d269874f7b1eea7418a26dd5809a09b67fca53a0008977c084d076509b427"
+    },
+    {
+      "path": "tests/ops/linear/test_nvfp4_a16.cpp",
+      "sha256": "9c6248d41446a4cc797a9f0078c6a43a53a54a1af0363713b1f0938939fe8041"
+    },
+    {
       "path": "tests/ops/op_check.h",
       "sha256": "4374221479bc90a7bb737cfac62ad6b3ee01fd5dca57cd14c5a0fd38b5c73429"
     },
     {
       "path": "tests/ops/op_tester.h",
       "sha256": "2db18a2461ec11744225ec16c605061738b9c1da2f6bf64a9cfdd325139e06fa"
+    },
+    {
+      "path": "tests/ops/quantized_weight.h",
+      "sha256": "29cfe9624d30cd493174217bf63d57d01ab7b2857780cf6b398ac26b6c5462c5"
     }
   ]
 }

@@ -21,3 +21,27 @@ target_include_directories(ignis_kernel_op_tests PRIVATE ${IGNIS_VENDOR_DIR}/tes
 target_link_libraries(ignis_kernel_op_tests PRIVATE ignis_vendor)
 
 add_test(NAME ignis_kernel_op_tests COMMAND ignis_kernel_op_tests)
+
+# P1-09 (GitHub #45): the reference's own NVFP4 a16/small-T linear test, run
+# unmodified. This is a *second* executable, not another source in
+# ignis_kernel_op_tests, because the reference's test file brings its own
+# main() (op_tester.h's convention is one test = one process; the reference's
+# test suite is a set of small binaries, not one big one). It links the
+# leaf's `ops::linear` dispatcher (ignis_kernel, kernel/src/linear.cu) so the
+# vendored test drives real NVFP4 GEMV/small-T kernels, exercising the
+# blockscale-k16-m128x4-v1 scale decoder and the weight divisor exactly as the
+# acceptance criteria require — this test file is never rewritten to do that
+# itself.
+add_executable(ignis_kernel_nvfp4_linear_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_nvfp4_a16.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_nvfp4_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_nvfp4_linear_tests PRIVATE ignis_kernel ignis_vendor)
+
+# ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE here either. The
+# reference's own main() returns 77 when it finds no usable CUDA device (its
+# convention for a CPU-only machine); left unconfigured, CTest treats any
+# nonzero exit — 77 included — as FAILED, never as a skip, so a busy or
+# missing GPU cannot read as green.
+add_test(NAME ignis_kernel_nvfp4_linear_tests COMMAND ignis_kernel_nvfp4_linear_tests)
