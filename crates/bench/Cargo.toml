@@ -24,6 +24,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # `Cargo.toml` is not edited by this ticket).
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+# The canary oracle (`oracle`, P1-04): tokenizes recorded text with the
+# artifact's real tokenizer (`ignis_artifact::Tokenizer`). CPU-only (the
+# `cuda` feature is off), same path-dependency pattern as `crates/server`
+# and `crates/core`.
+ignis-artifact = { path = "../artifact" }
 
 [dev-dependencies]
 # The in-process mock engine (the tests): a small axum router mimicking the

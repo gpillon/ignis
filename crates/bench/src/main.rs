@@ -38,6 +38,7 @@ use ignis_bench::{
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
     gate::GateReport,
     metrics::Run,
+    oracle::{self, Fixture},
     record::{ClassPolicy, RecordConfig, RecordServer},
     report::PerformanceReport,
     trace::Trace,
@@ -51,6 +52,7 @@ fn main() -> ExitCode {
         Some("report") => cmd_report(&args[1..]),
         Some("gate") => cmd_gate(&args[1..]),
         Some("record") => cmd_record(&args[1..]),
+        Some("oracle") => cmd_oracle(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -65,7 +67,10 @@ fn print_usage() {
   ignis-bench canary --endpoint <url> [--out <canary.json>]
   ignis-bench report --ours <ours.json> --ref <ref.json>
   ignis-bench gate --ours <ours.json> --ref <ref.json> --canary <canary.json> [--out <gate.json>]
-  ignis-bench record --listen <proxy> --target <engine-url> --out <load>-trace.jsonl [--class <policy>]"
+  ignis-bench record --listen <proxy> --target <engine-url> --out <load>-trace.jsonl [--class <policy>]
+  ignis-bench oracle record --endpoint <url> --artifact <artifact.ninfer> --out <fixture.json> [--max-tokens N]
+  ignis-bench oracle compare --fixture <fixture.json> --endpoint <url> --artifact <artifact.ninfer> [--first-n N]
+  ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]"
     );
 }
 
@@ -426,6 +431,200 @@ fn cmd_record(args: &[String]) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `oracle record` / `oracle compare` (P1-04, GitHub #40): dispatch on the
+/// oracle sub-subcommand.
+fn cmd_oracle(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("record") => cmd_oracle_record(&args[1..]),
+        Some("compare") => cmd_oracle_compare(&args[1..]),
+        _ => {
+            eprintln!("oracle: expected `record` or `compare`");
+            print_usage();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Open the artifact's frontend set (`ignis-artifact`) — its `.tokenizer()`
+/// is what the recorder/comparer tokenize canary text with. `FrontendSet`
+/// owns its parsed tokenizer (not borrowed from the `Reader`), so the
+/// reader is dropped once extraction succeeds.
+fn open_frontend(artifact_path: &str) -> Result<ignis_artifact::FrontendSet, String> {
+    let reader = ignis_artifact::Reader::open(Path::new(artifact_path))
+        .map_err(|e| format!("open artifact {artifact_path}: {e}"))?;
+    ignis_artifact::FrontendSet::from_reader(&reader)
+        .map_err(|e| format!("read the frontend set from {artifact_path}: {e}"))
+}
+
+fn cmd_oracle_record(args: &[String]) -> ExitCode {
+    let endpoint = match require(args, "endpoint") {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let artifact = match require(args, "artifact") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let out = match require(args, "out") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let max_tokens = opt(args, "max-tokens")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(32);
+
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ep = HttpEndpoint::new(&endpoint);
+    let model = match ep.list_models() {
+        Ok(models) if !models.is_empty() => {
+            eprintln!("engine {endpoint}: {}", models.join(", "));
+            models[0].clone()
+        }
+        Ok(_) => {
+            eprintln!("error: engine {endpoint} reports no loaded model");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let fixture = match oracle::record(&ep, frontend.tokenizer(), model, max_tokens) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for p in &fixture.prompts {
+        println!("recorded {:<16} {} tokens", p.id, p.token_ids.len());
+    }
+    if let Err(e) = fixture.write(Path::new(&out)) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("wrote {out}");
+    ExitCode::SUCCESS
+}
+
+fn cmd_oracle_compare(args: &[String]) -> ExitCode {
+    let fixture_path = match require(args, "fixture") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let first_n = opt(args, "first-n").and_then(|v| v.parse::<usize>().ok()).unwrap_or(32);
+
+    let oracle_fixture = match Fixture::read(Path::new(&fixture_path)) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The candidate side: either a pre-recorded fixture (`--candidate`, a
+    // token list already tokenized the same way) or a live endpoint
+    // (`--endpoint` + `--artifact`, recorded fresh through the same
+    // recorder).
+    let candidate_fixture = if let Some(candidate_path) = opt(args, "candidate") {
+        match Fixture::read(Path::new(&candidate_path)) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let endpoint = match require(args, "endpoint") {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("{e}: (or pass --candidate <fixture.json>)");
+                print_usage();
+                return ExitCode::FAILURE;
+            }
+        };
+        let artifact = match require(args, "artifact") {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                print_usage();
+                return ExitCode::FAILURE;
+            }
+        };
+        let frontend = match open_frontend(&artifact) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let ep = HttpEndpoint::new(&endpoint);
+        if let Err(e) = ep.list_models() {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        match oracle::record(&ep, frontend.tokenizer(), "candidate".into(), oracle_fixture.max_tokens) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let results = match oracle::compare_fixtures(&oracle_fixture, &candidate_fixture, first_n) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for r in &results {
+        println!(
+            "canary {:<16} agreement={:.1}% ({}/{}){}",
+            r.id,
+            r.agreement * 100.0,
+            r.agree,
+            r.compared,
+            match r.first_divergence {
+                Some(pos) => format!("  first divergence @ {pos}"),
+                None => String::new(),
+            }
+        );
+    }
+    let overall = oracle::overall_agreement(&results);
+    println!("overall agreement: {:.1}%", overall * 100.0);
+    if overall >= 0.95 {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("oracle FAILED: overall agreement {:.1}% < 95% (G1 floor)", overall * 100.0);
+        ExitCode::FAILURE
     }
 }
 

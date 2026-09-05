@@ -16,11 +16,17 @@
 //! transparent OpenAI endpoint in front of a target engine that records a
 //! live agent session into a load trace the replay harness re-sends — the
 //! gate-run's capture piece.
+//!
+//! The canary oracle (`oracle`, P1-04) is the G1 correctness tooling: a
+//! recorder captures the reference engine's greedy canary completions as a
+//! fixture (tokenized with the artifact's tokenizer), and a comparer reports
+//! per-canary token agreement + first divergence against it.
 
 pub mod canary;
 pub mod client;
 pub mod gate;
 pub mod metrics;
+pub mod oracle;
 pub mod record;
 pub mod report;
 pub mod trace;
