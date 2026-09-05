@@ -58,22 +58,41 @@ and must use the helper above rather than reinventing a self-skip. Until
 then the GPU-side coverage is the kernel leaf's own op-test executable
 (`kernel/build.ps1 -Test`), which the same runbook applies to.
 
+**`crates/core` has no FFI and no GPU access** (GitHub #39 removed the flat
+C-ABI surface): the profile can't be enforced from inside `cargo test`
+itself, so the enforcement point is the process launching it — see below.
+
+### Running the profile: `scripts/gpu-profile.ps1`
+
+ADR 0006 calls the guard "a preflight check in the `bench`/test harness",
+not a script a developer must remember to run standalone. `scripts/gpu-
+preflight.ps1` alone doesn't enforce that — nothing stops setting
+`IGNIS_GPU_PROFILE=1` and running tests without ever running it.
+`scripts/gpu-profile.ps1` is that harness entry point: it runs the
+preflight and only sets `IGNIS_GPU_PROFILE=1` and runs the GPU-gated work
+(`kernel/build.ps1 -Test`, then `cargo test --workspace -- --ignored`) if
+the preflight passes; the env var is always cleared before it exits, pass
+or fail. **This script is the normal, documented way to run the GPU
+profile** — do not set `IGNIS_GPU_PROFILE=1` by hand.
+
 Runbook:
 
 ```powershell
 # 1. Stop ninfer (frees the VRAM the GPU profile needs).
-# 2. Preflight: refuses to proceed while the GPU is held, and names the
-#    offending process.
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-preflight.ps1
-# 3. Run the GPU work under the profile: the leaf's op tests, and the
-#    #[ignore]d Rust GPU tests once they exist again (add --features cuda /
-#    IGNIS_ARTIFACT=<path> for the ones that need the real artifact).
-$env:IGNIS_GPU_PROFILE = "1"
-kernel\build.ps1 -Test
-cargo test --workspace -- --ignored
-Remove-Item Env:\IGNIS_GPU_PROFILE
-# 4. Restart ninfer.
+# 2. Preflight + profile in one step: refuses to proceed while the GPU is
+#    held (and names the offending process); on a free GPU, runs the leaf's
+#    op tests and the #[ignore]d Rust GPU tests (none exist yet -- see
+#    above) under IGNIS_GPU_PROFILE=1, then clears it.
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
+# -ThresholdMiB <n>    forwarded to gpu-preflight.ps1
+# -SkipKernelBuild     Rust GPU tests only, skip kernel/build.ps1 -Test
+# -SkipCargoTests      kernel leaf only, skip cargo test --workspace -- --ignored
+# 3. Restart ninfer.
 ```
+
+`scripts/gpu-preflight.ps1` still exists as the standalone check
+(`scripts/gpu-profile.ps1` calls it) for a quick "is the GPU free" query
+that doesn't run anything.
 
 ## Where tests live
 
@@ -96,5 +115,5 @@ Remove-Item Env:\IGNIS_GPU_PROFILE
 1. every new or changed behavior has a test that covers it
 2. `cargo test` passes workspace-wide (machine-local skips allowed)
 3. kernel changes: `kernel/build.ps1` clean + the leaf's op tests green +
-   the GPU profile green on a free 5090 (`scripts/gpu-preflight.ps1` passed,
-   `IGNIS_GPU_PROFILE=1` — never a skip)
+   the GPU profile green on a free 5090 (`scripts/gpu-profile.ps1` —
+   preflight passed, `IGNIS_GPU_PROFILE=1` for the run — never a skip)
