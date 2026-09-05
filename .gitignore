@@ -18,6 +18,8 @@ __pycache__/
 
 # local agent state
 .qwen/
+.claude/
+.codex/
 
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/
