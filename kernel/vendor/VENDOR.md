@@ -235,6 +235,47 @@ linear+residual output projection, NVFP4 and BF16 arms only:
   the W8 single/companion overloads declared in the vendored header are never
   defined, matching that nothing in the trimmed test calls them.
 
+P1-14 (GitHub #50) adds the GDN family:
+
+- **causal_conv1d_silu** — `ops/kernel/causal_conv1d.cuh`,
+  `ops/launcher/causal_conv1d.{h,cu}`, `ops/wrapper/causal_conv1d_silu.cpp`,
+  `ninfer/ops/causal_conv1d_silu.h`: the depthwise causal width-4 conv fused
+  with SiLU over the conv'd channels, plus its rolling-tap and B-way snapshot
+  forms.
+- **gdn_gating** — `ops/kernel/gdn_gating.cuh`, `ops/launcher/gdn_gating.{h,cu}`,
+  `ops/wrapper/gdn_gating.cpp`, `ninfer/ops/gdn_gating.h`: the per-head decay
+  gate `g = -exp(A_log)*softplus(a+dt_bias)` and update gate
+  `beta = sigmoid(b)`.
+- **gated_delta_net** — the whole
+  `ops/linear_attention/gated_delta_net/` subtree: `common.{h,cuh}` (head
+  mapping, chunk size, state dim), `launch.h` / `recurrent.{cuh,cu}` (the
+  per-head fp32 128x128 recurrence, its distinct-state and B-way snapshot
+  forms, and the replay-record entry point), `gated_delta_net.cpp` (the public
+  wrapper: dispatches to the recurrent kernel for T=1 or a full chunk/tail
+  split above it, L2-normalizing q/k once per call rather than per chunk when
+  `normalize_qk` is set), `replay.cpp` (validation for the replay-record op),
+  and `chunked/` in full (`common.cuh`, `prepare_wy_wu.{cuh,cu}`,
+  `output.{cuh,cu}`, `state_passing.{cuh,cu}`, `launch.{h,cu}`) — the
+  chunk-parallel WY/UT prefill route, compiled and exercised by the same
+  reference test as the recurrent route (token counts that straddle the
+  64-token chunk boundary). `ninfer/ops/gated_delta_net.h` is the public
+  header for all three (recurrent, snapshot, replay-record) forms.
+- **incidental**: `recurrent.cu` and `replay.cpp` also carry the reference's
+  `gdn_replay_fold` implementation (the ReplaySSM state-pool fold), and
+  `launch.h` declares it — one translation unit each, not split by op. Vendoring
+  them whole therefore also pulls in `core/gdn_replay_records.{h,cpp}` and
+  `ninfer/ops/gdn_replay.h`. `gdn_replay_fold` compiles as part of `ignis_vendor`
+  but is not exercised by any test here; its own op family belongs to a later
+  sequence-handle ticket.
+- **their reference tests** — `tests/ops/test_causal_conv1d_silu.cpp`,
+  `test_gdn_gating.cpp`, `test_gated_delta_net.cpp` (recurrent + chunked, real
+  27B/35B-A3B geometries: 48 value heads / 16-32 qk heads x 128) and
+  `test_gated_delta_net_replay_record.cpp`, plus the shared FP64 reference
+  `tests/ops/gdn_ref.h` — each its own CTest executable via the same
+  `ignis_vendored_op_tests` loop as the norm/glue family (P1-07): none of
+  these ops dispatch across qtypes, so no leaf-side `kernel/src/*.cu`
+  dispatcher is needed, unlike `linear` / `attn_input_proj` / `linear_add`.
+
 P1-16 (GitHub #52) adds the sequence-state pools:
 
 - **paged KV pool** — `core/paged_kv_cache.{h,cpp}`: pages, entitlements,
@@ -254,10 +295,100 @@ P1-16 (GitHub #52) adds the sequence-state pools:
   bytes for a VRAM budget and plane geometry, routed through
   `plan_paged_kv_pool` so it can't drift from what the pool itself allocates.
 
-The remaining op families (the fused GDN projections, SwiGLU MLP, GQA
-attention, the GDN recurrence family) arrive with P1-12..P1-15, each adding
-its files to this manifest and its reference op test to the leaf's test
-suite.
+P1-15 (GitHub #51) vendors the GQA attention family: positions, RoPE, the
+fused q/k norm+RoPE, paged KV addressing, KV append/prefix-append, and the
+GQA attention kernels (bf16 decode + prefill launchers and routes gated here;
+i8/hq launchers vendored so the family compiles, untested until a later
+ticket):
+
+- **position** — `ops/kernel/position.cuh`, `ops/launcher/position.{h,cu}`,
+  `ops/wrapper/position.cpp`, `include/ninfer/ops/position.h`
+  (`fill_i32_positions`, `offset_i32_positions`).
+- **rope** — `ops/kernel/rope.cuh`, `ops/launcher/rope.{h,cu}`,
+  `ops/wrapper/rope.cpp`, `include/ninfer/ops/rope.h` (the linear/vision
+  frequency tables and the split-half NeoX rotation, Text 1-D / MRoPE /
+  Vision modes).
+- **qk_norm_rope** — `ops/launcher/qk_norm_rope.{h,cu}`,
+  `ops/wrapper/qk_norm_rope.cpp`, `include/ninfer/ops/qk_norm_rope.h`: the
+  fused per-head q/k RMSNorm + RoPE (no separate kernel header — the kernel is
+  inline in the launcher `.cu`).
+- **paged_kv_address** — `ops/kernel/paged_kv_address.cuh`: the paged
+  block-table addressing helpers shared by every GQA attention route (no
+  public API of its own, no dedicated test — exercised through
+  `gqa_attention`).
+- **gqa_attention** — `ops/kernel/gqa_attention_geometry.cuh`,
+  `gqa_attention_kv_quant.cuh`, `gqa_attention_decode.cuh` +
+  `_decode_{bf16,i8,hq}.cuh`, `gqa_attention_prefill_common.cuh` +
+  `_prefill_{bf16,i8,hq}.cuh`, `hq_codec.cuh`; the launcher dispatch
+  `ops/launcher/gqa_attention.h` (detail declarations) and
+  `gqa_attention_{decode,prefill}.cu` (route selection) plus the per-dtype
+  partial-kernel translation units `gqa_attention_decode_{bf16,i8}.cu`,
+  `gqa_attention_decode_hq_{27,35}.cu` + `_decode_hq_routes.cuh`,
+  `gqa_attention_prefill_{bf16,i8}.cu`, `gqa_attention_prefill_hq_{27,35}.cu`
+  + `_prefill_hq_routes.cuh`; the wrapper `ops/wrapper/gqa_attention.cpp` and
+  public header `include/ninfer/ops/gqa_attention.h`. Unlike
+  `attn_input_proj`/`linear_add` (P1-11), the vendored wrapper *is* the
+  complete public API — every cache dtype (BF16, I8, hq-e8-2b/U8) is
+  vendored and compiles, so no leaf-side dispatcher (`kernel/src/*.cu`) is
+  needed for this op.
+- **kv_cache_append_prefix** — `ops/kernel/kv_cache_append_prefix.cuh`,
+  `ops/launcher/kv_cache_append_prefix.{h,cu}`,
+  `ops/wrapper/kv_cache_append_prefix.cpp`,
+  `include/ninfer/ops/kv_cache_append_prefix.h`: device-selected exact K/V
+  prefix commit, both the paged overload (this model's route) and the
+  DFlash-lane cyclic overload (out of scope — MTP/DFlash2/ReplaySSM is G5 —
+  vendored only because the header declares both in one file). Needs
+  `core/cyclic_kv_cache.{h,cpp}` (new: the cyclic cache view/layout type),
+  vendored purely to keep the header self-contained, same reasoning as
+  P1-16's dangling-include-free `kv_ring_bits`/q4/q5 headers.
+- **their reference tests** — `tests/ops/test_position.cpp`,
+  `test_rope.cpp`, `test_qk_norm_rope.cpp` (unpatched, BF16-only in the
+  reference itself), each built by the `ignis_<op>_test` CTest loop
+  alongside the P1-07/P1-08 entries; `tests/ops/test_gqa_attention.cpp`
+  (**patched**: the reference file exercises both BF16 and I8 cache dtypes
+  across two head geometries; this ticket gates only the bf16 routes, so the
+  I8 dtype arms and their key-split/range test cases are removed —
+  `kernel/vendor/patches/tests/ops/test_gqa_attention.cpp.diff`, recorded via
+  `record-patch` — leaving both registered head geometries (24q/4kv and
+  16q/2kv, both ×256) at BF16, including multi-page paged-KV mappings)
+  built as `ignis_kernel_gqa_attention_tests`; `tests/ops/test_kv_cache_append_prefix.cpp`
+  (unmodified) built as `ignis_kernel_kv_cache_append_prefix_tests`.
+
+P1-13 (GitHub #49) vendors the fused MLP gate_up projection with its SiLU-mul
+epilogue, NVFP4 arm only:
+
+- **linear_swiglu** — `src/ops/linear_swiglu/nvfp4/` (decode, small-T, the
+  large-T W4A4 route and its own warp-specialized TMA kernel — unlike
+  `linear_add`, this op's W4A4 GEMM epilogue is entirely private to it, so no
+  shared epilogue header is vendored alongside it) plus the public
+  `include/ninfer/ops/linear_swiglu.h`. Math: `gate_up = Linear(x,
+  gate_up_weight)`; `out[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t]` where
+  `M = gate_up_rows/2`; gate rows `[0,17408)` precede their matching up rows
+  `[17408,34816)` at the model's `[34816,5120] -> [17408,T]` geometry
+  (`Nvfp4MlpGateUpGeometry`, already registered by P1-09's
+  `nvfp4_config.h`). The large-T route (`Nvfp4LinearSwiGluRoute::
+  LinearW4A4Post`, inside the vendored plan) falls back to the already-vendored
+  `ops::linear` (P1-09/P1-10) plus `ops::silu_mul` (P1-07) rather than its own
+  fused kernel, so it compiles with no further vendoring; its own reference
+  test is deferred to G2, same as P1-09's W4A4/TMA route.
+- **its reference op test** — `tests/ops/linear_swiglu/test_nvfp4.cpp`
+  (**patched**: the reference's file exercises both the A16 route this ticket
+  vendors and the A4/large-T route deferred to G2 in one combined `main()`;
+  the A4 case and its token list are trimmed —
+  `kernel/vendor/patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff`, recorded
+  via `record-patch`) plus `tests/ops/linear_swiglu/linear_swiglu_test_common.
+  {h,cpp}` (unpatched, generic across arms). Its own CTest executable
+  (`ignis_kernel_nvfp4_linear_swiglu_tests`).
+- The top-level `ops::linear_swiglu` / `ops::linear_swiglu_workspace_capacity_
+  bytes` dispatch is **ours**, not vendored (same reasoning as
+  `kernel/src/linear.cu`: the reference's wrapper dispatches every registered
+  qtype, including families this ticket does not vendor) —
+  `kernel/src/linear_swiglu.cu`. It switches on `NVFP4` only and throws naming
+  this ticket for every other qtype.
+
+The remaining op family (the fused GDN projections: gdn_input_proj,
+gdn_gating_proj) arrives with P1-12, adding its files to this manifest and
+its reference op test to the leaf's test suite.
 
 ## Updating to a newer reference commit
 

@@ -55,6 +55,7 @@ find_package(CUDAToolkit REQUIRED)
 set(IGNIS_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor)
 add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/arena.cu
+  ${IGNIS_VENDOR_DIR}/src/core/cyclic_kv_cache.cpp
   ${IGNIS_VENDOR_DIR}/src/core/device.cu
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/kv_ring_bits.cu
@@ -134,6 +135,59 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ${IGNIS_VENDOR_DIR}/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gdn_gating_proj.cpp
+  # P1-14 (GitHub #50): the GDN family — causal_conv1d_silu, gdn_gating, and
+  # the gated_delta_net recurrence (recurrent + chunked routes, the snapshot
+  # form, and the replay-record entry point). gated_delta_net's replay.cpp and
+  # recurrent.cu also carry the reference's gdn_replay_fold implementation
+  # (core/gdn_replay_records.{h,cpp}, include/ninfer/ops/gdn_replay.h): the
+  # reference keeps it in the same translation units as
+  # gated_delta_net_replay_record, so ADR 0010's whole-file vendoring pulls it
+  # in too. It compiles as part of ignis_vendor but is not exercised by any
+  # test here — its own op family (the sequence-handle ReplaySSM fold) is out
+  # of this ticket's scope.
+  ${IGNIS_VENDOR_DIR}/src/core/gdn_replay_records.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/causal_conv1d.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gdn_gating.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/causal_conv1d_silu.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gdn_gating.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/recurrent.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/replay.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/output.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  # P1-15 (GitHub #51): the GQA attention family — positions, RoPE, the fused
+  # q/k norm+RoPE, paged KV addressing, KV append/prefix-append, and the bf16
+  # decode + prefill attention routes (i8/hq launchers vendored, compiled here,
+  # untested until G2/G4 pick up their own reference tests).
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/position.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/rope.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/qk_norm_rope.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/kv_cache_append_prefix.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_bf16.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_i8.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_27.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_hq_35.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_bf16.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_i8.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_hq_27.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_prefill_hq_35.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/position.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/rope.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/qk_norm_rope.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gqa_attention.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/kv_cache_append_prefix.cpp
+  # P1-13 (GitHub #49): the fused MLP gate_up projection with the SiLU-mul
+  # epilogue, NVFP4 arm only. The large-T W4A4/TMA sources compile here but
+  # are verified only at G2, same as P1-09's own W4A4/TMA route.
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
