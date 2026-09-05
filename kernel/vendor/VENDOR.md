@@ -106,6 +106,33 @@ projections, norms, attention, GDN, the state pools) arrive with P1-07..P1-16,
 each adding its files to this manifest and its reference op test to the leaf's
 test executable.
 
+P1-10 (GitHub #46) vendors the BF16 and W8G32 linear families:
+
+- **BF16 linear** — `src/ops/linear/bf16/` in full (GEMV, small-T, MMA) plus
+  the public `include/ninfer/ops/linear.h` (`LinearPolicy`,
+  `linear_workspace_capacity_bytes`, the two `linear()` overloads) that every
+  linear family's dispatch header depends on.
+- **W8G32 linear** — `src/ops/linear/w8/` in full (GEMV, small-T, MMA and
+  split-K variants, the rowsplit storage/output decoders): `w8_dispatch`'s
+  launch table spans geometries beyond this model's own (it is the
+  reference's one dispatcher for the whole W8 family), so the family is
+  vendored whole rather than picking out only the shapes G1 needs.
+- **their reference op tests** — `tests/ops/linear/test_bf16_a16.cpp` +
+  `tests/ops/direct_bf16_weight.h`, and `tests/ops/linear/test_w8_a16.cpp` +
+  `tests/ops/linear/linear_test_common.{h,cpp}` + `tests/ops/quantized_weight.h`,
+  each its own CTest executable (`ignis_kernel_op_test_bf16_linear`,
+  `ignis_kernel_op_test_w8_linear`) — a vendored test file owns a `main()`, so
+  it cannot be appended as another source of `ignis_kernel_op_tests`. Neither
+  sets `SKIP_RETURN_CODE 77` (the reference's own CMake does, for CPU-only
+  machines): under ADR 0006 a missing/busy GPU must fail the run, not skip it,
+  so the byte-identical vendored `main()`'s `return 77` surfaces to CTest as a
+  plain nonzero exit.
+- The top-level `ops::linear` / `ops::linear_workspace_capacity_bytes`
+  dispatch across qtypes is **ours**, not vendored (ADR 0010: it is glue that
+  composes per-family dispatchers, not an op) — `kernel/src/ops/linear.cu`.
+  It currently switches on `BF16_CTRL` and `W8G32_F16S`; `NVFP4` (P1-09/#45)
+  extends the same switch.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;

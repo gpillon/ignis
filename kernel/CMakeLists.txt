@@ -47,12 +47,32 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/core/dtype.cpp
   ${IGNIS_VENDOR_DIR}/src/core/layout.cpp
   ${IGNIS_VENDOR_DIR}/src/core/tensor.cpp
+  # BF16 linear (GEMV, small-T, MMA) — GitHub #46, P1-10.
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/bf16/bf16_small_t.cu
+  # W8G32 linear (GEMV, small-T, MMA/split-K) — GitHub #46, P1-10.
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
 )
 set_target_properties(ignis_vendor PROPERTIES
   PREFIX ""
   OUTPUT_NAME "ignis_vendor"
 )
-target_include_directories(ignis_vendor PUBLIC ${IGNIS_VENDOR_DIR}/src)
+# bf16/w8 dispatch (.cpp, host-compiled) include <cuda_runtime.h> for
+# cudaStream_t; nvcc sees the toolkit include path implicitly but cl.exe does
+# not, so it is added explicitly. CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES is
+# populated once CUDA is an enabled project language.
+target_include_directories(ignis_vendor PUBLIC
+  ${IGNIS_VENDOR_DIR}/src
+  ${IGNIS_VENDOR_DIR}/include
+  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+)
 
 # --- the leaf's own C ABI surface ------------------------------------------
 #

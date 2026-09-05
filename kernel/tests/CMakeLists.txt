@@ -21,3 +21,23 @@ target_include_directories(ignis_kernel_op_tests PRIVATE ${IGNIS_VENDOR_DIR}/tes
 target_link_libraries(ignis_kernel_op_tests PRIVATE ignis_vendor)
 
 add_test(NAME ignis_kernel_op_tests COMMAND ignis_kernel_op_tests)
+
+# BF16 and W8G32 linear reference op tests (GitHub #46, P1-10). Each vendored
+# test file owns a `main()`, so each is its own executable/CTest entry rather
+# than a source appended to ignis_kernel_op_tests. No SKIP_RETURN_CODE is set:
+# the reference's own build treats "no CUDA" (exit 77) as a skip, but ADR 0006
+# makes a missing/busy GPU a CTest FAILURE here.
+add_executable(ignis_kernel_op_test_bf16_linear
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_bf16_a16.cpp
+)
+target_include_directories(ignis_kernel_op_test_bf16_linear PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_op_test_bf16_linear PRIVATE ignis_kernel)
+add_test(NAME ignis_kernel_op_test_bf16_linear COMMAND ignis_kernel_op_test_bf16_linear)
+
+add_executable(ignis_kernel_op_test_w8_linear
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_w8_a16.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_op_test_w8_linear PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_op_test_w8_linear PRIVATE ignis_kernel)
+add_test(NAME ignis_kernel_op_test_w8_linear COMMAND ignis_kernel_op_test_w8_linear)
