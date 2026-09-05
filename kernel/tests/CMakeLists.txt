@@ -126,6 +126,33 @@ target_include_directories(ignis_kernel_bf16_linear_add_tests PRIVATE ${IGNIS_VE
 target_link_libraries(ignis_kernel_bf16_linear_add_tests PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_bf16_linear_add_tests COMMAND ignis_kernel_bf16_linear_add_tests)
 
+# P1-12 (GitHub #48): the reference's own gdn_input_proj test, patched
+# (kernel/vendor/patches/tests/ops/test_gdn_input_proj.cpp.diff) to drop the
+# Q4/Q5, W8 and FP8 arms this ticket does not vendor (every GDN layer's
+# query_key_value_z parent is NVFP4 per qwen3.8-27b-artifact.md §14.1, so no
+# BF16 arm is needed here) — driving the leaf's own `ops::gdn_input_proj`
+# (kernel/src/gdn_input_proj.cu) at the model's fused q/k/value/z split
+# ([16384,5120]).
+add_executable(ignis_kernel_gdn_input_proj_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/test_gdn_input_proj.cpp
+)
+target_include_directories(ignis_kernel_gdn_input_proj_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_gdn_input_proj_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_gdn_input_proj_tests COMMAND ignis_kernel_gdn_input_proj_tests)
+
+# P1-12 (GitHub #48): the reference's own gdn_gating_proj test, run unmodified
+# (BF16-only op, no excluded op family to trim) — both the Qwen3.8-27B
+# ([96,5120] ab_weight) and Qwen3.6-35B geometries. The wrapper itself is
+# vendored (kernel/vendor/src/ops/wrapper/gdn_gating_proj.cpp, built into
+# ignis_vendor), so this links only ignis_vendor, same as the norm/glue tests
+# above.
+add_executable(ignis_kernel_gdn_gating_proj_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/test_gdn_gating_proj.cpp
+)
+target_include_directories(ignis_kernel_gdn_gating_proj_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_gdn_gating_proj_tests PRIVATE ignis_vendor)
+add_test(NAME ignis_kernel_gdn_gating_proj_tests COMMAND ignis_kernel_gdn_gating_proj_tests)
+
 # --- P1-16 (GitHub #52): the sequence-state pools ---------------------------
 #
 # The reference's own test_kv_cache.cpp / test_state_store.cpp, vendored

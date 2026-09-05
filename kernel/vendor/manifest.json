@@ -28,6 +28,14 @@
       "sha256": "0ed6fc49679522326ae0209367b4f9230afea301a3e74adaa38a9aa1904e5661"
     },
     {
+      "path": "include/ninfer/ops/gdn_gating_proj.h",
+      "sha256": "793f3fe8321e9ed2f9ed0305a89a905d6740d9452641b61ce61edd48b502bafe"
+    },
+    {
+      "path": "include/ninfer/ops/gdn_input_proj.h",
+      "sha256": "87dd4361072cbe1f6e6876f4c650a9fde48703b305acf9aa2bf2a435f6f3d7d0"
+    },
+    {
       "path": "include/ninfer/ops/l2norm.h",
       "sha256": "69a8062843a8d42b427f26ff918d89e66c5777de11135e4ac09a48d4bb43e6a4"
     },
@@ -216,8 +224,84 @@
       "sha256": "7555cb64c0bfd8738209fc25ebe5972f4cb032fee03ea4fc769770da4ec2d839"
     },
     {
+      "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh",
+      "sha256": "99ae67839e5ff541014dad3cd649b2f5f2b630df51d41198f25da5dd9e5746b0"
+    },
+    {
+      "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu",
+      "sha256": "b14306ddd2b42adc4b2b6502279b5e92689df692a765d9c153dc90821a2347fe"
+    },
+    {
+      "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h",
+      "sha256": "d1e7282543b5df34a4784d96620dd0a51ca09d6ea242884619c6b9ad1a05c108"
+    },
+    {
+      "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp",
+      "sha256": "8043b407c8882a0dc024dba37f899d26698ed51e6e0b49ab5a9c1d21a41dc33f"
+    },
+    {
+      "path": "src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h",
+      "sha256": "3e79d2260a0dc315383793e2fe8939dd060c4ac515b0d1d3989718d3b94ea358"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/gdn_conv.cuh",
+      "sha256": "c073a576dc3e77ef5a7392e432248b262b0106e9aad8b065bb3ff35139323800"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/gdn_conv_output.cuh",
+      "sha256": "bc19e2e3ecb559e9f4047320fceaa6e9142360cef93dde47e57e2487dbc6f333"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/gdn_projected_conv.cu",
+      "sha256": "f2775b594d82e4b53067437b89578b87b457a77e5e1c252c3fcba413c9bd8f36"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/gdn_projected_conv.h",
+      "sha256": "45a05c005a90c43c86d0a47839f71d027ad804a296d332b22de0c2b17d6e547f"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu",
+      "sha256": "4879ac80acab10207eacafa97929dfb4364e03f39b532a0557276c77f6cdbc9a"
+    },
+    {
       "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh",
       "sha256": "13f5b8297527382a9b3688ba2a9f1b47c02c9d00da54ef7a9a9a8abf855a5ab0"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp",
+      "sha256": "9b487bac41f94e06e7dde90194a2c92f80d6ba6e892c8e8016b6171c169ee331"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h",
+      "sha256": "cab188908ac7425f0ebade30625ac97985a4458c962ad0e9d58619efb49efef1"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu",
+      "sha256": "6a55a2504d825a55010d98eb8211febd9740137d400613b526b76ac092cfc5db"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu",
+      "sha256": "3cd26fc71cb9d7ab06579c00a3759e08105374335a5c771960a28d82635bc441"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu",
+      "sha256": "80a405519cbf09c999ccf4d51300bc2b7fab2927040e3f00fb561ea720e1b3ba"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp",
+      "sha256": "6486ce356cac6e44dfd3231d7b509819d52575cf2637eddb094a31806ac5bdd0"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h",
+      "sha256": "938894bf9b8f5b0c733a8ff3b3f6198c95a78f82a59aa98a84dda2f5d3ea686d"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu",
+      "sha256": "ef1850b17c5a962b8f855ffc594856c69fc96debf49375a7031ced6f2bdeb0c7"
+    },
+    {
+      "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu",
+      "sha256": "f6e445f38d6941f83d9b637042a49b28f2d23156b3733cd4cffa47a0819fa9d2"
     },
     {
       "path": "src/ops/kernel/argmax.cuh",
@@ -552,6 +636,10 @@
       "sha256": "58d3638f0e25207ed917a4388260390336707de455bcbf37488e13bcabd58060"
     },
     {
+      "path": "src/ops/wrapper/gdn_gating_proj.cpp",
+      "sha256": "eac01785e14458c7776f53c0ef00a2e35ed7b090be3298602ca5cc5c7a9d728a"
+    },
+    {
       "path": "src/ops/wrapper/l2norm.cpp",
       "sha256": "ed556f216e2b127210cdfd1952a2e147038e7c3b8f09241c7127307585d14783"
     },
@@ -651,6 +739,19 @@
     {
       "path": "tests/ops/test_gated_rmsnorm.cpp",
       "sha256": "fbe6d4d5db6d7931284e4f812e3b5c52d6c2680bef1b64c70a56d76d065b39ac"
+    },
+    {
+      "path": "tests/ops/test_gdn_gating_proj.cpp",
+      "sha256": "5d6ea618f0b3338fa87792afaa031eec907b9c92e689d0fb3078ea948895375f"
+    },
+    {
+      "path": "tests/ops/test_gdn_input_proj.cpp",
+      "sha256": "b67178f6c079a88827d54cdaeff50e40ab7b8f81b330d43255910f6633b912c0",
+      "patch": {
+        "diff": "patches/tests/ops/test_gdn_input_proj.cpp.diff",
+        "sha256": "14310e0257b883a91d118cb7f14577a0ee139d04552bcd5dc2795d4fb27b7f9f",
+        "reason": "P1-12 (GitHub #48) vendors only the NVFP4 arm of gdn_input_proj (every GDN layer's query_key_value_z parent is NVFP4 per qwen3.8-27b-artifact.md #14.1; the layer-4 BF16 exception applies to gdn/output, already covered by the linear_add BF16 arm from P1-11/#47); the reference's single combined test file also exercises Q4/Q5, W8 and FP8 arms this ticket does not vendor, so those cases are trimmed (main() and their helper functions removed)"
+      }
     },
     {
       "path": "tests/ops/test_l2norm.cpp",
