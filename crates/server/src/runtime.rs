@@ -1,9 +1,12 @@
 //! Server construction over the safe step-ABI compute adapter.
 //!
-//! The binary keeps its CPU `MockCompute` fallback until P1-23 supplies the
-//! real FFI [`ignis_runtime::StepLeaf`] implementation. This module is the
-//! production construction point: a loader can hand it a model handle and EOS
-//! token without leaking either into HTTP or scheduler code.
+//! [`scheduler`] is the leaf-agnostic construction point: a loader hands it
+//! a model handle and EOS token without leaking either into HTTP or
+//! scheduler code. [`cuda_scheduler`] (GitHub #61 / P1-25, feature `cuda`)
+//! is the production path built on it: materialize an artifact's weights
+//! on the device and wrap the loaded model behind
+//! [`ignis_runtime::CudaLeaf`] — the binary falls back to CPU `MockCompute`
+//! (`main.rs`) only without this feature or without an artifact.
 
 use std::sync::Arc;
 
