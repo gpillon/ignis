@@ -7,17 +7,25 @@
 //! weights, the bound-tensor handles — plus the CUDA device context they
 //! were materialized on (kept alive: the device memory is not valid once
 //! the context is destroyed). [`StepLeaf::load_model`] sizes the
-//! sequence-state pool from the VRAM left over after the weights land
-//! (`Device::free_bytes`), so the KV pool the server serves from is not a
-//! guess.
+//! sequence-state pool deterministically from [`CudaLeafConfig`]
+//! (`slot_count` sequences of up to `max_context_tokens` each) rather than
+//! from the VRAM left over after the weights land: an earlier attempt at
+//! the latter (`Device::free_bytes` minus a fixed reserve, handed straight
+//! to `ignis_paged_kv_page_budget`) OOM'd on the real 27B artifact — the
+//! model's real post-load footprint (weights + the program's own
+//! workspace) leaves far less headroom than a naive `total - weights`
+//! guess, and a wrong guess fails as a hard `cudaMalloc` error, not a
+//! graceful degradation. Auto-sizing from real free VRAM (the target
+//! envelope README describes) needs the leaf to report its own workspace
+//! footprint first — later work, not needed for a correct G1 server.
 
 #![cfg(feature = "cuda")]
 
-use ignis_artifact::{CudaDevice, Device, MaterializedArtifact, ObjectHandle, PagedKvPlane, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step;
 use ignis_core::{ModelConfig, N_DECODE_LANES, TokenId};
+use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 
 use crate::{RuntimeStats, StepLeaf};
 
@@ -29,18 +37,19 @@ pub struct CudaLeafConfig {
     pub max_context_tokens: u32,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
-    /// VRAM held back from the KV budget on top of the weights (workspace
-    /// buffers + fragmentation headroom) — a fixed, documented guess until
-    /// real workspace accounting lands.
-    pub vram_reserve_bytes: u64,
 }
 
 impl Default for CudaLeafConfig {
     fn default() -> Self {
         Self {
-            max_context_tokens: 8192,
+            // A modest, deterministic default: `slot_count *
+            // max_context_tokens` sequence-tokens of BF16 paged KV is a
+            // few hundred MiB at this model's KV geometry (head_dim 256,
+            // 4 KV heads) — negligible next to the ~19 GB of weights, so
+            // it fits regardless of exactly how much VRAM the weights and
+            // the program's own workspace left behind.
+            max_context_tokens: 4096,
             slot_count: N_DECODE_LANES as u32,
-            vram_reserve_bytes: 2 << 30, // 2 GiB
         }
     }
 }
@@ -49,6 +58,11 @@ impl Default for CudaLeafConfig {
 /// materialized artifact, and the bound-tensor handles `ignis_model_load`
 /// reads on every (re)load.
 pub struct CudaLeaf {
+    // Never read directly (no more live free-VRAM query — see the module
+    // doc): held purely so the device context outlives `artifact` and
+    // every loaded model, since dropping it would invalidate their device
+    // memory.
+    #[allow(dead_code)]
     device: CudaDevice,
     reader: Reader,
     artifact: MaterializedArtifact,
@@ -115,20 +129,13 @@ impl StepLeaf for CudaLeaf {
         let model = model_load::load_qwen38_27b(&self.reader, &self.artifact, &self.handles)
             .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
-        let free_bytes = self.device.free_bytes().unwrap_or(0);
-        let vram_budget = free_bytes.saturating_sub(self.config.vram_reserve_bytes);
-        // One K plane + one V plane, both BF16 at the model's KV geometry
-        // (G1: no quantized KV yet, ADR per `.scratch/ROADMAP.md` G4).
-        let planes = [
-            PagedKvPlane::bf16(cfg.head_dim as i32, cfg.num_kv_heads as i32),
-            PagedKvPlane::bf16(cfg.head_dim as i32, cfg.num_kv_heads as i32),
-        ];
-        let kv_budget = ignis_artifact::paged_kv_page_budget(&planes, vram_budget)
-            .map_err(|e| leaf_error("KV page budget", e.to_string()))?;
+        // The leaf's fixed paged-KV page size (`kPagedKVPageSize`, 64
+        // tokens) — every slot reserves enough pages for its full context.
+        let pages_per_sequence = self.config.max_context_tokens.div_ceil(64);
         let pool = SeqPool::create(
             &cfg,
             &SeqPoolBudget {
-                kv_page_group_count: kv_budget.page_count,
+                kv_page_group_count: self.config.slot_count * pages_per_sequence,
                 max_context_tokens: self.config.max_context_tokens,
                 slot_count: self.config.slot_count,
             },

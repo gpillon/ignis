@@ -64,12 +64,18 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &w, ninfer::DType dtype,
 
 // Runs one GDN layer for `num_tokens` sequential tokens of one sequence
 // (GitHub #58). `slot` is the sequence's state-pool slot (conv taps + fp32
-// recurrent state); `in_residual` / `out_residual` are device BF16
-// `[hidden, num_tokens]` feature-major buffers (out_residual is written in
-// place and receives the final residual). Returns 0 on success, -1 on error
-// (message set via set_error).
+// recurrent state); `layer` is the *model's* zero-based layer index (0..63,
+// used for `model->layers[layer]`'s weights); `gdn_layer` is this GDN
+// layer's position among GDN layers only (0..47, used for the state pool,
+// which is sized/addressed by GDN layer count, GitHub #55) -- the same
+// absolute-vs-relative split `ignis_gqa_layer_step`'s `gqa_layer` already
+// makes for its own (16-count) pool addressing. `in_residual` /
+// `out_residual` are device BF16 `[hidden, num_tokens]` feature-major
+// buffers (out_residual is written in place and receives the final
+// residual). Returns 0 on success, -1 on error (message set via set_error).
 int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, uint32_t layer,
-                      void *in_residual, void *out_residual, uint64_t num_tokens) {
+                      uint32_t gdn_layer, void *in_residual, void *out_residual,
+                      uint64_t num_tokens) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto T = static_cast<std::int32_t>(num_tokens);
   const auto stream = model->stream;
@@ -117,8 +123,8 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // pool here is sized by concurrency, GitHub #55). These views alias the
     // pool's persistent storage: the ops below update them in place, and a
     // released/re-allocated sequence's fresh slot reads zero (ignis_seq.h).
-    ninfer::Tensor conv_state = pool->gdn_pool.conv_slot(layer, slot);
-    ninfer::Tensor ssm_state = pool->gdn_pool.recurrent_slot(layer, slot);
+    ninfer::Tensor conv_state = pool->gdn_pool.conv_slot(gdn_layer, slot);
+    ninfer::Tensor ssm_state = pool->gdn_pool.recurrent_slot(gdn_layer, slot);
 
     // The input residual viewed as the layer's [hidden, T] feature-major input.
     const ninfer::Tensor in(in_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
@@ -247,8 +253,16 @@ extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_
     set_error("ignis_gdn_layer_step: layer " + std::to_string(layer) + " is not a GDN layer");
     return -1;
   }
-  return run_gdn_layer(model, pool, seq->slot, layer, const_cast<void *>(in_residual), out_residual,
-                       num_tokens);
+  // This GDN layer's position among GDN layers only (0..47): the Qwen 3.8
+  // topology's GQA layers sit at index 3, 7, 11, ... (every 4th, validated
+  // by `ignis_gqa_layer_step`'s own check), so the count of GQA layers at
+  // or before `layer` is `(layer + 1) / 4` -- subtracting it out of the
+  // absolute index gives the GDN-relative one the state pool is sized and
+  // addressed by (GitHub #55), mirroring `ignis_gqa_layer_step`'s
+  // `gqa_layer = (layer - 3) / 4` for its own (16-count) pool.
+  const uint32_t gdn_layer = layer - (layer + 1) / 4;
+  return run_gdn_layer(model, pool, seq->slot, layer, gdn_layer,
+                       const_cast<void *>(in_residual), out_residual, num_tokens);
 }
 
 extern "C" const char *ignis_gdn_layer_last_error(void) {

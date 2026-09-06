@@ -164,7 +164,9 @@ evolve as the engine matures.
 
 > **Real completions on the GPU.** Built with `--features cuda` and a
 > verified `IGNIS_ARTIFACT`, the server loads the ~19 GB of weights into
-> VRAM, sizes its KV pool from what's left, and drives the real 64-layer
+> VRAM, builds a modest fixed-size KV pool (8 sequences × 4096 tokens —
+> auto-sizing it from whatever VRAM the weights leave behind is later
+> work, `ignis_runtime::CudaLeafConfig`), and drives the real 64-layer
 > program for every request: streaming and non-streaming chat completions
 > stop at the model's own EOS token (`finish_reason: "stop"`) or at
 > `max_tokens` (`finish_reason: "length"`). Without `--features cuda`, or
