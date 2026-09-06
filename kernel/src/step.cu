@@ -80,7 +80,7 @@ int32_t run_degenerate_step(ignis_model *model, int32_t token_id, int32_t *out_t
     ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
                                {hidden, 1, 1, 1});
     ninfer::Tensor norm_out = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(embed_out, norm_weight, model->rms_norm_eps, /*unit_offset=*/false,
+    ninfer::ops::rmsnorm(embed_out, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
                          norm_out, model->stream);
 
     ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
@@ -190,7 +190,7 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
                                {hidden, 1, 1, 1});
     ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(left, norm_weight, model->rms_norm_eps, /*unit_offset=*/false,
+    ninfer::ops::rmsnorm(left, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
                          normalized, model->stream);
     ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
     ninfer::ops::linear(normalized, model->output_head, logits, model->stream);

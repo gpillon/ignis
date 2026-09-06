@@ -132,7 +132,7 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // --- input RMSNorm (the layer's pre-attention norm) ---
     const ninfer::Tensor input_norm =
         weight_tensor(w.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/false, h, stream);
+    ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/true, h, stream);
 
     // --- GDN input projection (NVFP4, kernel/src/gdn_input_proj.cu) -> the
     // combined pre-conv q/k/v plane (query/key/value channel order) and z
@@ -216,7 +216,7 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // residual ---
     const ninfer::Tensor post_norm =
         weight_tensor(w.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(residual_view, post_norm, model->rms_norm_eps, /*unit_offset=*/false,
+    ninfer::ops::rmsnorm(residual_view, post_norm, model->rms_norm_eps, /*unit_offset=*/true,
                          post, stream);
     ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused, *model->scratch, stream);
     ninfer::ops::linear_add(fused, w.mlp_down, residual_view, *model->scratch, stream);

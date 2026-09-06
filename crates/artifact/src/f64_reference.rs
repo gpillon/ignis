@@ -442,7 +442,7 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 fn mlp(common: &CommonWeights<'_>, residual: &mut [f64]) -> Result<()> {
-    let normalized = norm(residual, &vector(&common.post_norm)?, false)?;
+    let normalized = norm(residual, &vector(&common.post_norm)?, true)?;
     let gates = common.gate_up.product(&normalized)?;
     let mut fused = vec![0.; 17408];
     for i in 0..17408 {
@@ -491,7 +491,7 @@ fn evaluate_gqa(
         let h = norm(
             &input.residual[token * HIDDEN..(token + 1) * HIDDEN],
             &input_norm,
-            false,
+            true,
         )?;
         let p = projection.product(&h)?;
         qs[token].copy_from_slice(&p[..6144]);
@@ -598,7 +598,7 @@ fn evaluate_gdn(
         let h = norm(
             &input.residual[token * HIDDEN..(token + 1) * HIDDEN],
             &input_norm,
-            false,
+            true,
         )?;
         let p = projection.product(&h)?;
         projected[token].copy_from_slice(&p[..10240]);

@@ -91,7 +91,7 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     const ninfer::Tensor input(in_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
     const ninfer::Tensor input_norm =
         weight_tensor(weights.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(input, input_norm, model->rms_norm_eps, /*unit_offset=*/false,
+    ninfer::ops::rmsnorm(input, input_norm, model->rms_norm_eps, /*unit_offset=*/true,
                          normalized, stream);
 
     // P1-21 is the T=1..4 A16 path; the vendored convenience overload has no
@@ -156,7 +156,7 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 
     const ninfer::Tensor post_norm =
         weight_tensor(weights.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(residual, post_norm, model->rms_norm_eps, /*unit_offset=*/false, post,
+    ninfer::ops::rmsnorm(residual, post_norm, model->rms_norm_eps, /*unit_offset=*/true, post,
                          stream);
     ninfer::ops::linear_swiglu(post, weights.mlp_gate_up, fused, *model->scratch, stream);
     ninfer::ops::linear_add(fused, weights.mlp_down, residual, *model->scratch, stream);
