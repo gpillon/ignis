@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "ignis_model.h"
+#include "ignis_seq.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +63,38 @@ int32_t ignis_decode(struct ignis_model *model, const int32_t *token_ids, uint64
  * on this thread (thread-local; overwritten by the next call; empty string
  * if none failed yet). Never NULL. */
 const char *ignis_step_last_error(void);
+
+/* Runtime counters for the real program entry points.  `kernel_count` is
+ * the number of program-layer dispatches in the latest step: the leaf's
+ * stable, graph-independent dispatch counter until G3 groups those calls in
+ * CUDA graphs. */
+struct ignis_program_stats {
+  uint64_t vram_bytes;
+  uint64_t last_step_micros;
+  uint64_t kernel_count;
+};
+
+/* Run the complete 64-layer program for every token in a prompt span.  The
+ * span starts exactly at `start_position`; it advances the sequence's KV,
+ * GDN, convolution and position state once per token.  No token is emitted:
+ * the greedy successor is retained on `seq` for ignis_program_decode. */
+int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *pool,
+                              struct ignis_seq *seq, const int32_t *token_ids,
+                              uint64_t num_tokens, uint64_t start_position,
+                              const struct ignis_sampling_params *sampling);
+
+/* Complete one greedy decode round for a batch of sequence handles.  Each
+ * output is the successor made ready by prefill/the prior round; that token
+ * is consumed before return to make the next successor ready. */
+int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *pool,
+                             struct ignis_seq *const *sequences, uint64_t batch_size,
+                             const struct ignis_sampling_params *sampling,
+                             int32_t *out_token_ids);
+
+/* Read program counters and allocated device footprint. */
+int32_t ignis_program_stats(const struct ignis_model *model,
+                            const struct ignis_seq_pool *pool,
+                            struct ignis_program_stats *out_stats);
 
 #ifdef __cplusplus
 }
