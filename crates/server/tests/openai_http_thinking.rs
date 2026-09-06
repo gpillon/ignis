@@ -104,8 +104,6 @@ impl TokenDecoder for RecordingTokenDecoder {
 struct Harness {
     app: axum::Router,
     template: Arc<RecordingTemplateProvider>,
-    #[allow(dead_code)]
-    driver: tokio::task::JoinHandle<()>,
 }
 
 fn harness_with(template: RecordingTemplateProvider) -> Harness {
@@ -142,12 +140,9 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
         Box::new(Shared(Arc::clone(&template)))
     })
     .with_request_timeout(Duration::from_secs(5));
-    let driver_engine = server.engine.clone();
-    let driver = tokio::spawn(async move { driver_engine.run().await });
     Harness {
         app: server.app(),
         template,
-        driver,
     }
 }
 
