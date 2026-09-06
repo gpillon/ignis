@@ -221,9 +221,18 @@ struct ChatCompletionsRequest {
     /// `true` → stream the completion as SSE chunks.
     #[serde(default)]
     stream: bool,
+    /// Streaming-only options. `include_usage: true` appends the trailing
+    /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
+    stream_options: Option<StreamOptions>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     seed: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 /// `POST /v1/chat/completions` — non-streaming and streaming (SSE).
@@ -257,12 +266,15 @@ async fn chat_completions(
     if req.stream {
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
+        let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
         return Sse::new(ChunkStream::new(
             stream,
             id,
             created,
             model,
             server.template.clone(),
+            prompt_tokens,
+            include_usage,
         ))
         .into_response();
     }
@@ -344,6 +356,8 @@ struct Chunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Serialize)]
@@ -375,6 +389,14 @@ struct ChunkStream {
     created: u64,
     model: String,
     template: Arc<dyn TemplateProvider>,
+    prompt_tokens: u32,
+    /// `stream_options.include_usage` — gates the trailing usage chunk
+    /// (OpenAI only sends it when the client opts in).
+    include_usage: bool,
+    /// The final usage chunk, queued between the `finish_reason` chunk and
+    /// the `[DONE]` marker (set once the request's `Done` event arrives, and
+    /// only when `include_usage` is set).
+    pending_usage: Option<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
 }
@@ -386,6 +408,8 @@ impl ChunkStream {
         created: u64,
         model: String,
         template: Arc<dyn TemplateProvider>,
+        prompt_tokens: u32,
+        include_usage: bool,
     ) -> Self {
         Self {
             stream,
@@ -393,6 +417,9 @@ impl ChunkStream {
             created,
             model,
             template,
+            prompt_tokens,
+            include_usage,
+            pending_usage: None,
             done_sent: false,
         }
     }
@@ -411,8 +438,27 @@ impl ChunkStream {
                 },
                 finish_reason,
             }],
+            usage: None,
         };
         // `serde_json` cannot fail on this (all serializable fields).
+        Event::default().data(serde_json::to_string(&chunk).expect("chunk serializes"))
+    }
+
+    /// The final summary chunk: empty `choices`, populated `usage` (OpenAI's
+    /// trailing usage chunk, sent right before `[DONE]`).
+    fn usage_chunk(&self, completion_tokens: u32) -> Event {
+        let chunk = Chunk {
+            id: self.id.clone(),
+            object: "chat.completion.chunk",
+            created: self.created,
+            model: self.model.clone(),
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens,
+                total_tokens: self.prompt_tokens.saturating_add(completion_tokens),
+            }),
+        };
         Event::default().data(serde_json::to_string(&chunk).expect("chunk serializes"))
     }
 }
@@ -430,6 +476,11 @@ impl Stream for ChunkStream {
         // `ChunkStream` is `Unpin` (all fields are `Unpin`), so we can get a
         // plain `&mut` back out of the pinned self.
         let this = self.get_mut();
+        // The queued usage chunk (set when the `Done` event was handled)
+        // goes out before anything else is polled from the stream.
+        if let Some(usage) = this.pending_usage.take() {
+            return Poll::Ready(Some(Ok(usage)));
+        }
         loop {
             match this.stream.poll_recv(cx) {
                 Poll::Ready(None) => {
@@ -452,9 +503,13 @@ impl Stream for ChunkStream {
                         return Poll::Ready(Some(Ok(this.chunk(&content, None))));
                     }
                     // The request completed: the final chunk (finish
-                    // reason), then the `[DONE]` marker on the next poll
-                    // (the stream closes).
-                    SchedEvent::Done { reason, .. } => {
+                    // reason) now, the usage summary chunk queued for the
+                    // next poll, then the `[DONE]` marker once the stream
+                    // closes.
+                    SchedEvent::Done { reason, tokens, .. } => {
+                        if this.include_usage {
+                            this.pending_usage = Some(this.usage_chunk(tokens));
+                        }
                         return Poll::Ready(Some(Ok(this.chunk("", Some(finish_reason_str(reason))))));
                     }
                     // Other events for this request (admissions,
@@ -645,6 +700,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let json = serde_json::to_value(&c).expect("chunk serializes");
         assert_eq!(json["id"], "chatcmpl-7");
@@ -671,11 +727,35 @@ mod tests {
                 },
                 finish_reason: Some("stop"),
             }],
+            usage: None,
         };
         let json = serde_json::to_value(&c).expect("chunk serializes");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         // An empty delta serializes to `{}` (the content key is omitted).
         assert_eq!(json["choices"][0]["delta"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn the_usage_chunk_has_empty_choices_and_populated_usage() {
+        // The trailing summary chunk (sent right before `[DONE]`): empty
+        // `choices`, `usage` populated with the token counts.
+        let c = Chunk {
+            id: "chatcmpl-7".into(),
+            object: "chat.completion.chunk",
+            created: 123,
+            model: "test-model".into(),
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: 58,
+                completion_tokens: 1500,
+                total_tokens: 1558,
+            }),
+        };
+        let json = serde_json::to_value(&c).expect("chunk serializes");
+        assert_eq!(json["choices"], serde_json::json!([]));
+        assert_eq!(json["usage"]["prompt_tokens"], 58);
+        assert_eq!(json["usage"]["completion_tokens"], 1500);
+        assert_eq!(json["usage"]["total_tokens"], 1558);
     }
 
     #[test]

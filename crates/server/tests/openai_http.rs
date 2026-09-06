@@ -160,7 +160,8 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
         .filter(|l| l.as_str() != "[DONE]")
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // 3 token chunks + 1 final finish-reason chunk.
+    // 3 token chunks + 1 final finish-reason chunk. No `stream_options` was
+    // sent, so no trailing usage chunk (OpenAI only sends it opt-in).
     assert_eq!(chunks.len(), 4, "3 tokens + final chunk: {body}");
     // The 3 token chunks carry the mock's exact token ids (request 0).
     let expected_tokens = mock_tokens(0, 3);
@@ -176,6 +177,43 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
         .collect::<Vec<_>>()
         .join(" ");
     assert_eq!(streamed_content, rendered(&expected_tokens));
+}
+
+#[tokio::test]
+async fn chat_completions_streaming_with_include_usage_appends_a_usage_chunk() {
+    let h = harness();
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 3,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "streaming chat should be 200: {body}");
+
+    let data_lines: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .collect();
+    assert_eq!(data_lines.last().map(|s| s.as_str()), Some("[DONE]"));
+    let chunks: Vec<serde_json::Value> = data_lines
+        .iter()
+        .filter(|l| l.as_str() != "[DONE]")
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // 3 token chunks + 1 final finish-reason chunk + 1 trailing usage chunk.
+    assert_eq!(chunks.len(), 5, "3 tokens + final chunk + usage chunk: {body}");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
+    // The trailing usage chunk: empty choices, populated usage — sent
+    // right before `[DONE]` (OpenAI's summary chunk, opt-in via
+    // `stream_options.include_usage`).
+    assert_eq!(chunks[4]["choices"], serde_json::json!([]));
+    assert_eq!(chunks[4]["usage"]["completion_tokens"], 3);
+    assert_eq!(
+        chunks[4]["usage"]["total_tokens"],
+        chunks[4]["usage"]["prompt_tokens"].as_u64().unwrap() + 3
+    );
 }
 
 // ── POST /v1/responses ────────────────────────────────────────────────────
