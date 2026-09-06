@@ -63,12 +63,15 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     kv_spec.logical_page_capacity = logical_page_capacity;
     kv_spec.table_rows            = static_cast<std::int32_t>(spec->slot_count);
     kv_spec.plane_order           = ninfer::PagedKVPlaneOrder::PageMajor;
-    kv_spec.planes                = {
-        {ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
-         static_cast<std::int32_t>(spec->num_kv_heads)},
-        {ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
-         static_cast<std::int32_t>(spec->num_kv_heads)},
-    };
+    // One K/V pair per full-attention layer. The GQA layer program selects its
+    // own pair, so a layer's K/V history never aliases another layer's pages.
+    kv_spec.planes.reserve(2 * kIgnisGqaLayerCount);
+    for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+      kv_spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
+                                static_cast<std::int32_t>(spec->num_kv_heads)});
+      kv_spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
+                                static_cast<std::int32_t>(spec->num_kv_heads)});
+    }
     const ninfer::PagedKVPoolLayout kv_layout = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
     const std::size_t kv_bytes                = kv_builder.finish(256);
     const std::uint64_t kv_page_bytes = static_cast<std::uint64_t>(kv_layout.payload_bytes()) /

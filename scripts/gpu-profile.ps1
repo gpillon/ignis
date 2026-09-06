@@ -20,7 +20,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 #   ... -ThresholdMiB 4096       # forwarded to gpu-preflight.ps1
 #   ... -SkipKernelBuild         # skip kernel/build.ps1 -Test (Rust GPU tests only)
-#   ... -SkipCargoTests          # skip cargo test --workspace -- --ignored (kernel leaf only)
+#   ... -SkipCargoTests          # skip cargo test --workspace --features cuda -- --ignored (kernel leaf only)
 #
 # Exit codes: 1 if the preflight refuses (its own message says why); otherwise
 # the exit code of the first GPU-gated step that fails, or 0 if both pass.
@@ -63,9 +63,9 @@ try {
     }
 
     if (-not $SkipCargoTests) {
-        Write-Host "GPU profile: cargo test --workspace -- --ignored"
-        & cargo test --workspace -- --ignored
-        if ($LASTEXITCODE -ne 0) { FailWithCode "cargo test --workspace -- --ignored" $LASTEXITCODE }
+        Write-Host "GPU profile: cargo test --workspace --features cuda -- --ignored"
+        & cargo test --workspace --features cuda -- --ignored
+        if ($LASTEXITCODE -ne 0) { FailWithCode "cargo test --workspace --features cuda -- --ignored" $LASTEXITCODE }
     }
 
     Write-Host "GPU profile: done. Restart ninfer (runbook step 4, docs/agents/testing.md)."

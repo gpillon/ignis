@@ -51,12 +51,11 @@ code, `check_compute_err(&e, "...")` for a `ComputeError`, and
 tests (in `crates/core/src/gpu_profile.rs`) pin the skip/fail decision on
 CPU with an injected rc — no GPU needed, so they run in the default suite.
 
-There are no GPU-gated Rust tests in the tree right now: GitHub #39 deleted
-the superseded forward pass and its `*_gpu.rs` tests. They come back with
-the vendored ops and the step ABI (`.scratch/ROADMAP.md`, P1-07 onward),
-and must use the helper above rather than reinventing a self-skip. Until
-then the GPU-side coverage is the kernel leaf's own op-test executable
-(`kernel/build.ps1 -Test`), which the same runbook applies to.
+GPU-gated Rust tests use the `cuda` feature and `#[ignore]`: P1-21's
+`gqa_layer_gpu` checks the BF16 exception and NVFP4 GQA layers against the
+f64 oracle. They must use the helper above rather than reinventing a
+self-skip. The GPU-side coverage also includes the kernel leaf's own op-test
+executable (`kernel/build.ps1 -Test`), which the same runbook applies to.
 
 ### Running the profile: `scripts/gpu-profile.ps1`
 
@@ -76,7 +75,7 @@ verdict is carried across to Rust by that marker.
 `scripts/gpu-profile.ps1` is the entry point that ties it together: it runs
 the preflight, and only on a pass sets `IGNIS_GPU_PROFILE=1` and runs the
 GPU-gated work (`kernel/build.ps1 -Test`, then
-`cargo test --workspace -- --ignored`). It consumes the marker — both it and
+`cargo test --workspace --features cuda -- --ignored`). It consumes the marker — both it and
 the env var are cleared before the script exits, pass or fail — so one
 preflight authorizes exactly one run. A pass also ages out after 30 minutes,
 which only matters if a run was killed before it could clean up.
@@ -88,12 +87,12 @@ Runbook:
 # 1. Stop ninfer (frees the VRAM the GPU profile needs).
 # 2. Preflight + profile in one step: refuses to proceed while the GPU is
 #    held (and names the offending process); on a free GPU, runs the leaf's
-#    op tests and the #[ignore]d Rust GPU tests (none exist yet -- see
-#    above) under IGNIS_GPU_PROFILE=1, then clears it.
+#    op tests and the #[ignore]d Rust GPU tests under IGNIS_GPU_PROFILE=1,
+#    then clears it.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 # -ThresholdMiB <n>    forwarded to gpu-preflight.ps1
 # -SkipKernelBuild     Rust GPU tests only, skip kernel/build.ps1 -Test
-# -SkipCargoTests      kernel leaf only, skip cargo test --workspace -- --ignored
+# -SkipCargoTests      kernel leaf only, skip cargo test --workspace --features cuda -- --ignored
 # 3. Restart ninfer.
 ```
 

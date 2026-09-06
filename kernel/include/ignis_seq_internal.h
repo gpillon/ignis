@@ -14,6 +14,7 @@
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -28,6 +29,11 @@ inline constexpr int32_t kIgnisGdnConvKernel = 4;
  * gated_delta_net/replay.cpp), NOT the kernel width above -- the conv_snapshot
  * op's slot stride is `channels * 3`, so the pool must carry 3 taps. */
 inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
+
+/* The Qwen 3.8 text backbone has one full-attention layer every four layers:
+ * 3, 7, ..., 63. Each keeps independent K/V history, so the paged pool owns
+ * one K/V-plane pair and one frontier per GQA layer. */
+inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
 struct ignis_seq_pool {
   ninfer::DeviceArena kv_arena;
@@ -46,6 +52,7 @@ struct ignis_seq_pool {
 struct ignis_seq {
   ninfer::PagedKVAllocation kv;
   std::int32_t slot = -1;
+  std::array<std::uint32_t, kIgnisGqaLayerCount> gqa_positions{};
 };
 
 #endif /* IGNIS_SEQ_INTERNAL_H */

@@ -110,10 +110,10 @@ int main() {
     return 1;
   }
 
-  // A small, fast geometry: 2 KV planes (K, V) of head_dim=8 x 2 heads,
-  // kPagedKVPageSize=64 tokens/page; a 2-layer GDN state of 2 value heads x
-  // 4x4 fp32 each. slot_count=3 lets one test drive both the "no free KV
-  // pages" and the "no free slot" exhaustion paths independently.
+  // A small, fast geometry: every GQA layer has a K,V pair of head_dim=8 x 2
+  // heads, kPagedKVPageSize=64 tokens/page; a 2-layer GDN state of 2 value
+  // heads x 4x4 fp32 each. slot_count=3 lets one test drive both the "no free
+  // KV pages" and the "no free slot" exhaustion paths independently.
   ignis_seq_pool_spec spec{};
   spec.num_kv_heads        = 2;
   spec.head_dim            = 8;
@@ -168,8 +168,9 @@ int main() {
   // Dirty A's pages and slot before releasing it, so re-allocation can prove
   // the fresh handle observes zero, not the previous occupant's bytes.
   const std::int32_t a_slot = a_stats.slot;
-  dirty_page(pool->kv_pool.plane(0), 0);
-  dirty_page(pool->kv_pool.plane(1), 0);
+  for (std::size_t plane = 0; plane < pool->kv_pool.plane_count(); ++plane) {
+    dirty_page(pool->kv_pool.plane(plane), 0);
+  }
   dirty_slot(*pool, spec.gdn_num_layers, a_slot);
   expect(!page_is_zero(pool->kv_pool.plane(0), 0), "sanity: dirtied page reads non-zero");
   expect(!slot_is_zero(*pool, spec.gdn_num_layers, a_slot), "sanity: dirtied slot reads non-zero");
@@ -190,10 +191,12 @@ int main() {
   struct ignis_seq_stats d_stats{};
   expect_rc(ignis_seq_stats(seq_d, &d_stats), 0, "seq D stats");
   for (std::int32_t page_id : seq_d->kv.page_ids()) {
-    if (!page_is_zero(pool->kv_pool.plane(0), page_id) ||
-        !page_is_zero(pool->kv_pool.plane(1), page_id)) {
-      ++failures;
-      std::fprintf(stderr, "FAIL: re-allocated sequence's KV page %d is not zero\n", page_id);
+    for (std::size_t plane = 0; plane < pool->kv_pool.plane_count(); ++plane) {
+      if (!page_is_zero(pool->kv_pool.plane(plane), page_id)) {
+        ++failures;
+        std::fprintf(stderr, "FAIL: re-allocated sequence's KV page %d plane %zu is not zero\n",
+                     page_id, plane);
+      }
     }
   }
   expect(slot_is_zero(*pool, spec.gdn_num_layers, d_stats.slot),
