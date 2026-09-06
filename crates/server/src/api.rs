@@ -19,8 +19,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -37,10 +38,43 @@ use crate::Server;
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 pub fn router(state: Arc<Server>) -> Router {
     Router::new()
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses_api))
+        .route("/v1/models", get(list_models).options(cors_preflight))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).options(cors_preflight),
+        )
+        .route(
+            "/v1/responses",
+            post(responses_api).options(cors_preflight),
+        )
+        .layer(middleware::from_fn(cors_headers))
         .with_state(state)
+}
+
+/// Answers a CORS preflight request with no body; `cors_headers` attaches
+/// the `Access-Control-Allow-*` headers below.
+async fn cors_preflight() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Adds permissive CORS headers to every response so the API is reachable
+/// from browser-based clients on other origins.
+async fn cors_headers(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        "Access-Control-Allow-Headers",
+        HeaderValue::from_static("Content-Type, Authorization"),
+    );
+    res
 }
 
 /// The request's model, the templated prompt tokens, and the prompt-token
