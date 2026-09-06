@@ -11,7 +11,9 @@
 //! requests into one call, not N calls) without a GPU.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
 use crate::types::{ComputeError, FinishReason, RequestId, TokenId};
@@ -146,5 +148,90 @@ impl MockCompute {
         h ^= request_seed.wrapping_mul(0x1656_67B1_9E37_79F9);
         h ^= (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (h % (u32::MAX as u64)) as u32
+    }
+}
+
+/// A test-only `Compute` decorator (GitHub #69) that lets a test hold one
+/// `decode_step` call open deterministically — a stand-in for the real
+/// backend's per-step GPU latency, without a single `sleep()` anywhere
+/// (ADR 0006). Wraps any `Compute` (in practice, always a [`MockCompute`]).
+pub struct GatedCompute {
+    inner: Arc<dyn Compute>,
+    armed: AtomicBool,
+    entered_tx: SyncSender<()>,
+    release_rx: Mutex<Receiver<()>>,
+}
+
+/// The test's handle onto a [`GatedCompute`]'s gate.
+pub struct GateController {
+    entered_rx: Receiver<()>,
+    release_tx: SyncSender<()>,
+}
+
+impl GateController {
+    /// Blocks the calling thread until the gated `decode_step` call has
+    /// entered the gate — proof that whatever is driving `Compute` (in
+    /// production, the model thread) is now stuck inside this call and
+    /// cannot do anything else until [`GateController::release`] is called.
+    pub fn wait_entered(&self) {
+        self.entered_rx
+            .recv()
+            .expect("the armed decode_step must enter the gate before the compute is dropped");
+    }
+
+    /// Releases the held `decode_step` call, letting it complete.
+    pub fn release(&self) {
+        self.release_tx
+            .send(())
+            .expect("the armed decode_step must still be waiting to be released");
+    }
+}
+
+impl GatedCompute {
+    /// Wrap `inner`; the gate starts disarmed (`decode_step` passes through
+    /// untouched until [`GatedCompute::arm`] is called).
+    pub fn new(inner: Arc<dyn Compute>) -> (Arc<Self>, GateController) {
+        let (entered_tx, entered_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        (
+            Arc::new(Self {
+                inner,
+                armed: AtomicBool::new(false),
+                entered_tx,
+                release_rx: Mutex::new(release_rx),
+            }),
+            GateController {
+                entered_rx,
+                release_tx,
+            },
+        )
+    }
+
+    /// Arms the gate: the next `decode_step` call blocks until
+    /// [`GateController::release`] is called. Consumed on entry (one arm =
+    /// one held call) — a test re-arms explicitly for each hold it wants.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Compute for GatedCompute {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+        self.inner.prefill_step(jobs)
+    }
+
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            // A rendezvous pair: `send` blocks until `wait_entered`'s `recv`
+            // is there to receive it, then this call blocks again until
+            // `release` sends the go-ahead.
+            let _ = self.entered_tx.send(());
+            let _ = self.release_rx.lock().unwrap().recv();
+        }
+        self.inner.decode_step(jobs)
+    }
+
+    fn release(&self, request: RequestId) {
+        self.inner.release(request);
     }
 }

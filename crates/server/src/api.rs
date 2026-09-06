@@ -256,7 +256,7 @@ async fn chat_completions(
         req.max_tokens,
         req.seed,
     );
-    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive) {
+    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -583,7 +583,7 @@ async fn responses_api(
         req.max_output_tokens,
         req.seed,
     );
-    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive) {
+    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };

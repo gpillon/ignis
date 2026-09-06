@@ -8,8 +8,9 @@
 //! - `POST /v1/responses` — the OpenAI responses API (non-streaming in v1).
 //!
 //! Architecture: the server owns the core [`Scheduler`] behind an
-//! [`Engine`] (submit / per-request event routing / a driver loop that
-//! advances the engine, `engine.rs`); the text⇄token boundary is the
+//! [`Engine`] — a dedicated model thread owning the scheduler exclusively,
+//! with the async/HTTP side talking to it only through a command channel
+//! (GitHub #69, `engine.rs`); the text⇄token boundary is the
 //! [`TemplateProvider`] seam (`template.rs`) — v1 ships a minimal built-in
 //! provider, artifact-02 (the artifact's frontend object set, GitHub #7)
 //! replaces it through the same constructor-injection seam.
@@ -93,16 +94,12 @@ impl Server {
         api::router(state)
     }
 
-    /// Bind `addr` and serve (spawns the engine's driver loop — the single
-    /// task that advances the engine and routes events into the request
-    /// streams). Runs until the listener is closed.
+    /// Bind `addr` and serve. The engine's model thread (GitHub #69) was
+    /// already spawned when it was constructed — nothing to start here.
+    /// Runs until the listener is closed.
     pub async fn serve(self, addr: String) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         let app = self.app();
-        // The driver loop: one task for the server's life (the single
-        // engine advancer; see `Engine::run`).
-        let driver = self.engine.clone();
-        tokio::spawn(async move { driver.run().await });
         axum::serve(listener, app).await
     }
 }

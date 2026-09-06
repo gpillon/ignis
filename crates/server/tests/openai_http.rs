@@ -14,26 +14,29 @@ use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use tower::ServiceExt;
 
-use ignis_core::{mock::MockCompute, ConcreteScheduler, SchedulerConfig};
+use ignis_core::mock::{GateController, GatedCompute, MockCompute};
+use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
 use ignis_server::engine::Engine;
 use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
 use ignis_server::Server;
 
+#[path = "support/mod.rs"]
+mod support;
+use support::nudge;
+
 const MODEL: &str = "test-model";
 
-/// A live harness: the real axum router over a mock-compute engine, with
-/// the engine's driver loop running (so submitted requests actually
-/// advance and route their events).
+/// A live harness: the real axum router over a mock-compute engine. The
+/// engine's model thread (GitHub #69) was already spawned when it was
+/// constructed — nothing else to start here.
 struct Harness {
     app: axum::Router,
-    /// Keeps the driver task alive (it runs for the harness's life; the
-    /// test's runtime drop cancels it cleanly).
-    #[allow(dead_code)]
-    driver: tokio::task::JoinHandle<()>,
 }
 
-fn harness() -> Harness {
-    let compute = Arc::new(MockCompute::new());
+/// Build a harness over `compute` (shared by [`harness`] and
+/// [`harness_gated`] — they differ only in which `Compute` backs the
+/// scheduler).
+fn harness_over(compute: Arc<dyn Compute>) -> Harness {
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
@@ -46,14 +49,20 @@ fn harness() -> Harness {
         Box::new(SimpleTemplateProvider),
     )
     .with_request_timeout(Duration::from_secs(5));
-    // The engine's driver loop: the single task that advances the engine
-    // and routes per-request events into the handlers' streams.
-    let driver_engine = server.engine.clone();
-    let driver = tokio::spawn(async move { driver_engine.run().await });
-    Harness {
-        app: server.app(),
-        driver,
-    }
+    Harness { app: server.app() }
+}
+
+fn harness() -> Harness {
+    harness_over(Arc::new(MockCompute::new()))
+}
+
+/// A harness whose compute is gated (GitHub #69): lets a test hold one
+/// decode step open deterministically, to prove an unrelated concurrent
+/// request is never held up by it (ADR 0006 — no sleeps).
+fn harness_gated() -> (Harness, Arc<GatedCompute>, GateController) {
+    let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+    let h = harness_over(gated.clone() as Arc<dyn Compute>);
+    (h, gated, controller)
 }
 
 /// The token the seed-0 mock emits for request `id` at decode step `i`
@@ -293,4 +302,72 @@ async fn a_streaming_responses_request_is_a_400() {
     });
     let (status, _body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
     assert_eq!(status, 400, "streaming responses are unsupported in v1: 400");
+}
+
+// ── concurrency (GitHub #69: the isolated model thread) ─────────────────
+
+/// The HTTP-level regression for GitHub #69: a concurrent streaming request
+/// must not be serialized behind another request's in-flight generation.
+/// One request is held mid-decode via the gated compute; a second,
+/// unrelated streaming request is submitted while it is held and must
+/// complete without waiting for the held request's generation to finish.
+#[tokio::test]
+async fn a_concurrent_stream_is_not_serialized_behind_a_held_generation() {
+    let (h, gated, controller) = harness_gated();
+
+    // Arm the gate before anything is submitted: the very first decode
+    // step (request A's) blocks until released.
+    gated.arm();
+
+    let app_a = h.app.clone();
+    let task_a = tokio::spawn(async move {
+        let req = serde_json::json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 3,
+            "stream": true
+        });
+        call(&app_a, "POST", "/v1/chat/completions", Some(req)).await
+    });
+    // Let A's handler run up to `engine.submit(..).await`, which the model
+    // thread will drain and then advance into the gated decode step.
+    nudge().await;
+    controller.wait_entered();
+
+    // B is submitted while A is confirmed stuck mid-decode.
+    let app_b = h.app.clone();
+    let task_b = tokio::spawn(async move {
+        let req = serde_json::json!({
+            "model": MODEL,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 2,
+            "stream": true
+        });
+        call(&app_b, "POST", "/v1/chat/completions", Some(req)).await
+    });
+    // Let B's submit command actually reach the model thread's queue.
+    nudge().await;
+
+    controller.release();
+
+    // B completes without ever needing A's generation to finish first — the
+    // old shared-mutex design could not have gotten here without releasing
+    // A all the way to completion.
+    let (status_b, body_b) = task_b.await.expect("task B must not panic");
+    assert_eq!(status_b, 200, "B should be 200: {body_b}");
+    let done_b = body_b
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim()))
+        .next_back();
+    assert_eq!(done_b, Some("[DONE]"), "B's stream must complete: {body_b}");
+
+    // A is not starved either — releasing the gate lets it run to
+    // completion normally.
+    let (status_a, body_a) = task_a.await.expect("task A must not panic");
+    assert_eq!(status_a, 200, "A should be 200: {body_a}");
+    let done_a = body_a
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim()))
+        .next_back();
+    assert_eq!(done_a, Some("[DONE]"), "A's stream must complete: {body_a}");
 }

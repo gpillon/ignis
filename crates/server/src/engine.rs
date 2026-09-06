@@ -1,34 +1,45 @@
-//! The server's engine: the core scheduler + per-request event routing.
+//! The server's engine: a dedicated model thread owning the core
+//! [`Scheduler`] exclusively, plus per-request event routing (GitHub #69).
 //!
-//! The [`Scheduler`] contract is `&mut self` (the engine is a single
-//! owner), but the HTTP handlers are concurrent — so the [`Engine`] is the
-//! shared seam: it owns the scheduler behind a `std::sync::Mutex` (short
-//! critical sections; a step holds the lock across a compute call, and the
-//! only other lock taken inside it is the compute backend's own — no lock
-//! inversion with this one) and routes the events each [`Engine::step`]
-//! emits into per-request event streams that request handlers read from.
-//!
-//! Concurrency model (v1):
-//! - **One driver** — a single async task runs [`Engine::run`]: step the
-//!   engine, route the events, sleep a tick while idle. Every in-flight
-//!   request is advanced by the same loop, so concurrent requests stream
-//!   in parallel (the scheduler's N-lane batching does its job instead of
-//!   N handlers each double-stepping the engine).
-//! - **Atomic submit** — [`Engine::submit`] enqueues the request with the
-//!   scheduler and registers its event stream under the same critical
-//!   section: no event can be lost between submit and registration (the
-//!   driver routes into whatever the map holds at the moment of the step).
+//! Concurrency model (v2, GitHub #69 — replaces the shared-mutex v1):
+//! - **The model thread** — a single, dedicated `std::thread`, spawned once
+//!   when the [`Engine`] is constructed and living for the server's whole
+//!   life, owns the [`Scheduler`] and the per-request route table
+//!   (`streams`) as plain, unshared, thread-owned state. Nothing outside
+//!   this thread ever touches either — no `Arc<Mutex<..>>` around them, so
+//!   nothing on the async/HTTP side can ever contend a lock with a GPU-bound
+//!   `Scheduler::advance()` call.
+//! - **The command channel** — [`Engine::submit`] is the one call that
+//!   crosses the thread boundary: it sends a command and awaits a one-shot
+//!   reply. The model thread drains every queued command *before* each
+//!   `advance()`, so command latency is bounded by "at most one decode
+//!   step," not by however long the current generation runs.
+//! - **`model_id`** — immutable for the server's life, captured once at
+//!   construction and read lock-free off the `Engine` handle; it never
+//!   touches the model thread.
+//! - **Telemetry** — the model thread only ever pushes lightweight facts
+//!   (a routed event, a submission notice, a per-step tick) onto an
+//!   unbounded channel; a separate async task owns the [`Telemetry`] value
+//!   and does all the sink I/O and counter math off the model thread, then
+//!   publishes the computed counters into a wait-free [`ArcSwap`] snapshot.
 
 use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use ignis_core::{
-    FinishReason, RequestClass, RequestId, RequestInput, Scheduler, SchedEvent, SubmitError,
+    FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, Scheduler, SubmitError,
     TokenId,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
-use crate::telemetry::{NullSink, SystemClock, Telemetry, TelemetryClock, TelemetrySink};
+use crate::telemetry::{
+    IntervalCounters, IntervalStatsProvider, NullSink, SystemClock, Telemetry, TelemetryClock,
+    TelemetrySink,
+};
 
 /// A per-request event stream: the `SchedEvent`s the engine routed to one
 /// request. The stream closes (the sender is dropped) when the request
@@ -39,29 +50,57 @@ pub type EventStream = UnboundedReceiver<SchedEvent>;
 /// A request's event route (the engine's side of its stream).
 pub type EventRoute = UnboundedSender<SchedEvent>;
 
-struct EngineInner {
-    /// The core scheduler the server drives (production: the kernel leaf
-    /// via FFI; tests: `MockCompute` — ADR 0006).
-    scheduler: Box<dyn Scheduler>,
-    /// Live per-request event streams (request → its route). A route is
-    /// removed when its request completes (the dropped sender closes the
-    /// receiver, signalling end-of-stream to the handler).
-    streams: HashMap<RequestId, EventRoute>,
-    /// The v1 telemetry (server-02): the interval + request JSONL lines the
-    /// engine emits from its routed events (design §5).
-    telemetry: Telemetry,
+/// A command sent from the async/HTTP side to the model thread. `submit` is
+/// the only one today (design §"the command channel") — `model_id` is
+/// static, cloneable state on the `Engine` handle, and `is_idle` never left
+/// the model thread's own loop.
+enum Command {
+    Submit {
+        input: RequestInput,
+        class: RequestClass,
+        reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
+    },
 }
 
-/// The server-side engine: owns the core [`Scheduler`] and routes its
-/// events into per-request event streams.
+/// A message on the telemetry consumer's inbox. The model thread only ever
+/// sends the first three variants — lightweight facts, never sink I/O,
+/// never counter math (mirroring the call sites [`Telemetry`] has: a
+/// submission, a routed event, a per-step tick). `SetSink`/`SetStats` are a
+/// different kind of message on the same channel: an async-side
+/// reconfiguration request the model thread never sends, used by
+/// [`Engine::with_telemetry`] / [`Engine::with_stats`] to reach the
+/// already-running consumer without ever sharing a lock with the model
+/// thread.
+enum TelemetryFact {
+    Submitted(RequestId),
+    Routed(SchedEvent),
+    Tick,
+    SetSink(Arc<dyn TelemetrySink>),
+    SetStats(Arc<dyn IntervalStatsProvider>),
+}
+
+/// The server-side engine: a cheap, cloneable handle onto the model thread
+/// (GitHub #69) that owns the core [`Scheduler`] exclusively for the
+/// server's whole life.
 pub struct Engine {
-    inner: std::sync::Arc<std::sync::Mutex<EngineInner>>,
+    /// The loaded model id — immutable for the server's life, so it is
+    /// captured once here instead of crossing the command channel.
+    model_id: String,
+    commands: std_mpsc::Sender<Command>,
+    facts: UnboundedSender<TelemetryFact>,
+    /// The latest interval counters, published wait-free by the telemetry
+    /// consumer after each tick (design §"telemetry: computed off the model
+    /// thread, published wait-free").
+    counters: Arc<ArcSwap<IntervalCounters>>,
 }
 
 impl Clone for Engine {
     fn clone(&self) -> Self {
         Self {
-            inner: std::sync::Arc::clone(&self.inner),
+            model_id: self.model_id.clone(),
+            commands: self.commands.clone(),
+            facts: self.facts.clone(),
+            counters: Arc::clone(&self.counters),
         }
     }
 }
@@ -69,149 +108,236 @@ impl Clone for Engine {
 impl Engine {
     /// Wrap a concrete scheduler in a server engine (telemetry off — a no-op
     /// sink, so no JSONL is written; use [`Engine::with_sinks`] to enable it).
+    /// Spawns the model thread immediately (server startup, for the
+    /// process's whole life).
     pub fn new(scheduler: Box<dyn Scheduler>) -> Self {
-        Self::with_sinks(
-            scheduler,
-            std::sync::Arc::new(NullSink),
-            std::sync::Arc::new(SystemClock),
-        )
+        Self::with_sinks(scheduler, Arc::new(NullSink), Arc::new(SystemClock))
     }
 
     /// Wrap a concrete scheduler in a server engine whose telemetry writes
     /// through `sink`, with `clock` supplying the request-line `ms` /
-    /// `tok_s` (a fixed clock keeps tests deterministic — ADR 0006).
+    /// `tok_s` (a fixed clock keeps tests deterministic — ADR 0006). Spawns
+    /// the model thread and the async telemetry consumer immediately.
     pub fn with_sinks(
         scheduler: Box<dyn Scheduler>,
-        sink: std::sync::Arc<dyn TelemetrySink>,
-        clock: std::sync::Arc<dyn TelemetryClock>,
+        sink: Arc<dyn TelemetrySink>,
+        clock: Arc<dyn TelemetryClock>,
     ) -> Self {
+        let model_id = scheduler.model_id().to_string();
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (facts_tx, facts_rx) = unbounded_channel();
+        let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+
+        // The model thread: a single, dedicated OS thread that owns the
+        // Scheduler + route table exclusively for the server's whole life.
+        let facts_tx_for_thread = facts_tx.clone();
+        std::thread::Builder::new()
+            .name("ignis-model".into())
+            .spawn(move || model_thread_loop(scheduler, command_rx, facts_tx_for_thread))
+            .expect("spawning the model thread must not fail");
+
+        // The telemetry consumer: an async task that owns `Telemetry` and
+        // does all sink I/O / counter math off the model thread.
+        let telemetry = Telemetry::new(sink, clock);
+        tokio::spawn(telemetry_task(telemetry, facts_rx, Arc::clone(&counters)));
+
         Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(EngineInner {
-                scheduler,
-                streams: HashMap::new(),
-                telemetry: Telemetry::new(sink, clock),
-            })),
+            model_id,
+            commands: command_tx,
+            facts: facts_tx,
+            counters,
         }
     }
 
     /// Route the engine's telemetry through `sink` (keeping the existing
-    /// clock and any live counter source).
-    pub fn with_telemetry(self, sink: std::sync::Arc<dyn TelemetrySink>) -> Self {
-        self.inner.lock().unwrap().telemetry.set_sink(sink);
+    /// clock and any live counter source). Reconfigures the already-running
+    /// telemetry consumer through the facts channel — never touches the
+    /// model thread.
+    pub fn with_telemetry(self, sink: Arc<dyn TelemetrySink>) -> Self {
+        let _ = self.facts.send(TelemetryFact::SetSink(sink));
         self
     }
 
     /// Use `provider` as the live counter source for the interval line (the
     /// §5 blocker seam: a real `Scheduler::stats` accessor, once core ships
     /// it, overrides the event-derived estimator).
-    pub fn with_stats(
-        self,
-        provider: std::sync::Arc<dyn crate::telemetry::IntervalStatsProvider>,
-    ) -> Self {
-        self.inner.lock().unwrap().telemetry.with_stats(provider);
+    pub fn with_stats(self, provider: Arc<dyn IntervalStatsProvider>) -> Self {
+        let _ = self.facts.send(TelemetryFact::SetStats(provider));
         self
     }
 
-    /// The loaded model id (for `GET /v1/models`).
+    /// The loaded model id (for `GET /v1/models`) — immutable for the
+    /// server's life, read lock-free off this handle (never touches the
+    /// model thread).
     pub fn model_id(&self) -> String {
-        self.inner.lock().unwrap().scheduler.model_id().to_string()
+        self.model_id.clone()
     }
 
-    /// Submit a request and attach its event stream (atomic: the request is
-    /// in the engine and its route is registered under the same critical
-    /// section, so no event can be lost).
+    /// The latest interval counters, published wait-free by the telemetry
+    /// consumer (a snapshot; never blocks on, or is blocked by, the model
+    /// thread or the telemetry consumer).
+    pub fn interval_counters(&self) -> IntervalCounters {
+        *self.counters.load_full()
+    }
+
+    /// Submit a request and attach its event stream. Sends a command to the
+    /// model thread and awaits its one-shot reply — the model thread drains
+    /// every queued command before its next `advance()`, so this completes
+    /// promptly (at most one decode step of latency) even while the model
+    /// thread is busy decoding other requests.
     ///
     /// Returns the request's id and its event stream. The stream delivers
     /// every [`SchedEvent`] the engine emits for that request (tokens,
     /// completions, evictions, restorations) and closes when the request
     /// completes.
-    pub fn submit(
+    pub async fn submit(
         &self,
         input: RequestInput,
         class: RequestClass,
     ) -> Result<(RequestId, EventStream), SubmitError> {
-        let (route, stream) = unbounded_channel();
-        let mut inner = self.inner.lock().unwrap();
-        let id = inner.scheduler.submit(input, class)?;
-        inner.streams.insert(id, route);
-        // Telemetry: anchor this request's `ms` timeline (server-02).
-        inner.telemetry.note_submit(id);
-        Ok((id, stream))
+        let (reply, reply_rx) = oneshot::channel();
+        self.commands
+            .send(Command::Submit { input, class, reply })
+            .expect("the model thread outlives every Engine handle");
+        reply_rx
+            .await
+            .expect("the model thread replies to every submit before it can exit")
     }
+}
 
-    /// One engine tick: advance the scheduler and route the emitted events
-    /// into the registered per-request streams. Called by the driver loop
-    /// ([`Engine::run`]); also called directly in tests (no driver, manual
-    /// stepping).
-    pub fn step(&self) -> Vec<SchedEvent> {
-        let events = self
-            .inner
-            .lock()
-            .unwrap()
-            .scheduler
-            .advance();
-        for event in &events {
-            // Every event names the request it belongs to — except
-            // `Protected` (an admission *batch* event: protection
-            // established for the protected head in this step). It isn't
-            // per-request stream content, so skip it (the protected head
-            // sees its own deal through the normal `Admitted`/`Token`
-            // flow) and keep routing the remaining events in the batch.
-            let request = match event {
-                SchedEvent::Token { request, .. }
-                | SchedEvent::Done { request, .. }
-                | SchedEvent::Admitted { request, .. }
-                | SchedEvent::Evicted { request }
-                | SchedEvent::Restored { request, .. }
-                | SchedEvent::Requeued { request }
-                | SchedEvent::PrefixReused { request, .. } => *request,
-                SchedEvent::Protected { .. } => continue,
-            };
-            let mut inner = self.inner.lock().unwrap();
+/// The model thread's loop (GitHub #69): drains every queued command
+/// (non-blocking), performs exactly one `Scheduler::advance()` when
+/// anything is in flight, and blocks on the command channel (no busy-spin)
+/// when idle. Returns — a clean shutdown — once every [`Engine`] handle has
+/// been dropped (the command channel disconnects).
+fn model_thread_loop(
+    mut scheduler: Box<dyn Scheduler>,
+    commands: std_mpsc::Receiver<Command>,
+    facts: UnboundedSender<TelemetryFact>,
+) {
+    let mut streams: HashMap<RequestId, EventRoute> = HashMap::new();
+    loop {
+        loop {
+            match commands.try_recv() {
+                Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts),
+                Err(std_mpsc::TryRecvError::Empty) => break,
+                // Every Engine handle was dropped: clean shutdown (no
+                // in-flight request is silently dropped — the process is
+                // exiting anyway; nothing left to notify).
+                Err(std_mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        if !scheduler.is_idle() {
+            let events = scheduler.advance();
+            route_events(&events, &mut streams, &facts);
+            let _ = facts.send(TelemetryFact::Tick);
+            continue;
+        }
+        // Idle: block on the next command instead of busy-spinning. An
+        // unbounded `recv()` (rather than a timed wait) is deliberate: with
+        // nothing in flight, there is no periodic work to come back for —
+        // the only thing that can end the idle period is a new command, so
+        // waking on exactly that costs strictly less than a bounded wait
+        // that would poll on a timer for no reason (an idle server costs
+        // ~no CPU either way, but this is the tighter of the two).
+        match commands.recv() {
+            Ok(command) => handle_command(command, &mut *scheduler, &mut streams, &facts),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Handle one command against the thread-owned scheduler/route table.
+fn handle_command(
+    command: Command,
+    scheduler: &mut dyn Scheduler,
+    streams: &mut HashMap<RequestId, EventRoute>,
+    facts: &UnboundedSender<TelemetryFact>,
+) {
+    match command {
+        Command::Submit { input, class, reply } => {
+            let result = scheduler.submit(input, class).map(|id| {
+                let (route, stream) = unbounded_channel();
+                streams.insert(id, route);
+                let _ = facts.send(TelemetryFact::Submitted(id));
+                (id, stream)
+            });
+            // A dropped receiver (the caller gave up) is not an error here.
+            let _ = reply.send(result);
+        }
+    }
+}
+
+/// Route one step's emitted events into their registered per-request
+/// streams, and push a copy of each onto the telemetry facts channel.
+fn route_events(
+    events: &[SchedEvent],
+    streams: &mut HashMap<RequestId, EventRoute>,
+    facts: &UnboundedSender<TelemetryFact>,
+) {
+    for event in events {
+        // Every event names the request it belongs to — except `Protected`
+        // (an admission *batch* event: protection established for the
+        // protected head in this step). It isn't per-request stream
+        // content, so it is not routed to a stream, but the rest of the
+        // batch (which may follow it) still is.
+        if let Some(request) = event_request(event) {
             // The route may be gone (the handler already reaped the
             // stream): a failed send is a no-op, not an error.
-            if let Some(route) = inner.streams.get(&request) {
+            if let Some(route) = streams.get(&request) {
                 let _ = route.send(event.clone());
             }
             if let SchedEvent::Done { .. } = event {
-                // Completion: close the stream (the dropped sender ends
-                // the receiver — the `Done` itself was just delivered).
-                inner.streams.remove(&request);
-            }
-            // Telemetry: record the lifecycle event (admitted / first token
-            // / done / evicted) so the interval + request lines reflect it
-            // (server-02, design §5).
-            match event {
-                SchedEvent::Admitted { .. } => inner.telemetry.on_admitted(request),
-                SchedEvent::Token { .. } => inner.telemetry.on_token(request),
-                SchedEvent::Evicted { .. } => inner.telemetry.on_evicted(request),
-                SchedEvent::Done { tokens, .. } => inner.telemetry.on_done(request, *tokens),
-                _ => {}
+                // Completion: close the stream (the dropped sender ends the
+                // receiver — the `Done` itself was just delivered).
+                streams.remove(&request);
             }
         }
-        // The interval line: one per scheduler step / driver tick
-        // (server-02, design §5).
-        self.inner.lock().unwrap().telemetry.emit_interval();
-        events
+        let _ = facts.send(TelemetryFact::Routed(event.clone()));
     }
+}
 
-    /// Whether the engine has nothing in flight (the driver sleeps a tick
-    /// instead of busy-spinning).
-    pub fn is_idle(&self) -> bool {
-        self.inner.lock().unwrap().scheduler.is_idle()
+/// The request an event belongs to, or `None` for `Protected` (an
+/// admission-batch marker with no single owning request).
+fn event_request(event: &SchedEvent) -> Option<RequestId> {
+    match event {
+        SchedEvent::Token { request, .. }
+        | SchedEvent::Done { request, .. }
+        | SchedEvent::Admitted { request, .. }
+        | SchedEvent::Evicted { request }
+        | SchedEvent::Restored { request, .. }
+        | SchedEvent::Requeued { request }
+        | SchedEvent::PrefixReused { request, .. } => Some(*request),
+        SchedEvent::Protected { .. } => None,
     }
+}
 
-    /// The driver loop: step the engine and route the events; sleep a
-    /// tick while idle so an empty engine costs ~no CPU. Runs for the
-    /// life of the server (`main` spawns it; tests drive the engine
-    /// directly via [`Engine::step`]).
-    pub async fn run(&self) {
-        let tick = Duration::from_millis(1);
-        loop {
-            self.step();
-            if self.is_idle() {
-                tokio::time::sleep(tick).await;
+/// The async telemetry consumer (GitHub #69): owns `Telemetry` and drains
+/// the facts channel, calling the exact same methods the old inline driver
+/// called — all sink I/O and counter math happens here, off the model
+/// thread. After each tick, publishes the computed counters into `counters`
+/// (the wait-free `ArcSwap` snapshot).
+async fn telemetry_task(
+    mut telemetry: Telemetry,
+    mut facts: UnboundedReceiver<TelemetryFact>,
+    counters: Arc<ArcSwap<IntervalCounters>>,
+) {
+    while let Some(fact) = facts.recv().await {
+        match fact {
+            TelemetryFact::Submitted(id) => telemetry.note_submit(id),
+            TelemetryFact::Routed(event) => match event {
+                SchedEvent::Admitted { request, .. } => telemetry.on_admitted(request),
+                SchedEvent::Token { request, .. } => telemetry.on_token(request),
+                SchedEvent::Evicted { request } => telemetry.on_evicted(request),
+                SchedEvent::Done { request, tokens, .. } => telemetry.on_done(request, tokens),
+                _ => {}
+            },
+            TelemetryFact::Tick => {
+                let snapshot = telemetry.emit_interval();
+                counters.store(Arc::new(snapshot));
             }
+            TelemetryFact::SetSink(sink) => telemetry.set_sink(sink),
+            TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
         }
     }
 }
@@ -257,11 +383,9 @@ pub enum CollectError {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::sync::mpsc::error::TryRecvError;
 
-    use ignis_core::{
-        mock::MockCompute, ConcreteScheduler, DecodeParams, EngineMode, SchedulerConfig,
-    };
+    use ignis_core::mock::{GatedCompute, MockCompute};
+    use ignis_core::{ConcreteScheduler, Compute, DecodeParams, EngineMode, SchedulerConfig};
 
     /// A test engine: the concrete scheduler over a deterministic mock
     /// compute (ADR 0006 — CPU-only).
@@ -288,72 +412,59 @@ mod tests {
         }
     }
 
-    /// Drive the engine (manual stepping, no driver task) until the
-    /// request's stream delivers its `Done`; returns the non-terminal
-    /// events routed along the way.
-    fn drive_to_done(engine: &Engine, rx: &mut EventStream) -> Vec<SchedEvent> {
-        let mut routed = Vec::new();
+    /// Drain a request's stream to its `Done`, returning the tokens
+    /// generated along the way plus why it stopped.
+    async fn drain_to_done(rx: &mut EventStream) -> (Vec<TokenId>, FinishReason) {
+        let mut tokens = Vec::new();
         loop {
-            engine.step();
-            match rx.try_recv() {
-                Ok(SchedEvent::Done { .. }) => break,
-                Ok(event) => routed.push(event),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => break,
+            match rx.recv().await.expect("the stream must reach a Done before closing") {
+                SchedEvent::Token { token, .. } => tokens.push(token),
+                SchedEvent::Done { reason, .. } => return (tokens, reason),
+                _ => {}
             }
         }
-        routed
     }
 
-    #[test]
-    fn tokens_route_to_the_request_stream() {
+    #[tokio::test]
+    async fn tokens_route_to_the_request_stream() {
         let (engine, compute) = test_engine();
         let (id, mut rx) = engine
             .submit(input("test-model", vec![1, 2, 3], Some(2)), RequestClass::Interactive)
+            .await
             .expect("submit");
-        let mut tokens = Vec::new();
-        for _ in 0..16 {
-            engine.step();
-            if let Ok(event) = rx.try_recv() {
-                match event {
-                    SchedEvent::Token { token, .. } => tokens.push(token),
-                    SchedEvent::Done { .. } => break,
-                    _ => {}
-                }
-            }
-        }
+        let (tokens, reason) = drain_to_done(&mut rx).await;
         // The mock's deterministic stream (seed 0): pin the exact tokens,
         // not just "some tokens" — proves the routed stream carries the
         // engine's real token ids in order.
         assert_eq!(tokens, vec![compute.token_for(id, 0), compute.token_for(id, 1)]);
+        assert_eq!(reason, FinishReason::Length);
     }
 
-    #[test]
-    fn unknown_model_is_rejected_at_submit() {
+    #[tokio::test]
+    async fn unknown_model_is_rejected_at_submit() {
         let (engine, _) = test_engine();
         let err = engine
             .submit(input("no-such-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
             .expect_err("submit must fail for an unknown model");
         assert!(matches!(err, SubmitError::UnknownModel(_)));
     }
 
-    #[test]
-    fn the_stream_closes_on_completion() {
+    #[tokio::test]
+    async fn the_stream_closes_on_completion() {
         let (engine, _) = test_engine();
-        let (id, mut rx) = engine
+        let (_id, mut rx) = engine
             .submit(input("test-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
             .expect("submit");
-        let routed = drive_to_done(&engine, &mut rx);
-        // The routed stream delivered the request's token, then its
-        // completion (the engine removed the route on Done).
-        assert!(routed
-            .iter()
-            .any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == id)));
-        assert!(rx.try_recv().is_err());
+        let (tokens, _reason) = drain_to_done(&mut rx).await;
+        assert_eq!(tokens.len(), 1);
+        // The engine removed the route on Done: the stream is fully closed.
+        assert!(rx.recv().await.is_none());
     }
 
-    #[test]
-    fn an_unbounded_request_completes_at_its_reservation_cap() {
+    #[tokio::test]
+    async fn an_unbounded_request_completes_at_its_reservation_cap() {
         // `max_tokens: None`: the request reserves `max_sequence_tokens`
         // (8192) and completes exactly there (the reservation is a hard
         // cap — pins that un-capped requests still terminate, so their
@@ -361,22 +472,11 @@ mod tests {
         let (engine, _) = test_engine();
         let (_id, mut rx) = engine
             .submit(input("test-model", vec![1], None), RequestClass::Interactive)
+            .await
             .expect("submit");
-        for _ in 0..12 {
-            engine.step();
-            // Break early if the request finished (the route was removed and
-            // the stream disconnected); otherwise keep draining.
-            if let Err(TryRecvError::Disconnected) = rx.try_recv() {
-                break; // done early
-            }
-        }
-        // 12 of ~8192 steps done: the stream is still routed (the request
-        // is mid-generation), not closed — `Empty` = open but drained,
-        // `Disconnected` = the engine removed the route (completion).
-        assert!(matches!(
-            rx.try_recv(),
-            Err(TryRecvError::Empty) | Ok(_)
-        ));
+        let (tokens, reason) = drain_to_done(&mut rx).await;
+        assert_eq!(tokens.len(), 8192);
+        assert_eq!(reason, FinishReason::Length);
     }
 
     /// A scheduler that emits a single `[Protected, Token, Done]` batch for
@@ -492,22 +592,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_prefix_reused_event_is_routed_to_the_request_stream() {
+    #[tokio::test]
+    async fn a_prefix_reused_event_is_routed_to_the_request_stream() {
         let engine = Engine::new(Box::new(PrefixReuseBatchScheduler { emitted: false }));
         let (id, mut rx) = engine
             .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
             .expect("submit");
         assert_eq!(id, ProtectedBatchScheduler::ID);
-        engine.step();
-        // Drain the routed stream: the `PrefixReused` marker must have been
-        // forwarded to this request's stream (it carries the request's id),
-        // and the `Token`/`Done` that follow it must still arrive (the
-        // reuse marker does not drop the rest of the batch).
         let mut saw_reused = false;
         let mut saw_token = false;
         let mut saw_done = false;
-        while let Ok(event) = rx.try_recv() {
+        while let Some(event) = rx.recv().await {
             match event {
                 SchedEvent::PrefixReused { request, .. } if request == id => saw_reused = true,
                 SchedEvent::Token { .. } => saw_token = true,
@@ -523,21 +619,17 @@ mod tests {
         assert!(saw_done, "the batch's Done must be routed after a PrefixReused");
     }
 
-    #[test]
-    fn a_protected_event_does_not_drop_the_same_batches_events() {
+    #[tokio::test]
+    async fn a_protected_event_does_not_drop_the_same_batches_events() {
         let engine = Engine::new(Box::new(ProtectedBatchScheduler { emitted: false }));
         let (id, mut rx) = engine
             .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
             .expect("submit");
         assert_eq!(id, ProtectedBatchScheduler::ID);
-        engine.step();
-        // Drain the routed stream: both the batch's `Token` and its `Done`
-        // must have been delivered even though a `Protected` event preceded
-        // them in the same step (regression for the router skipping
-        // `Protected` instead of early-returning and dropping the rest).
         let mut saw_token = false;
         let mut saw_done = false;
-        while let Ok(event) = rx.try_recv() {
+        while let Some(event) = rx.recv().await {
             match event {
                 SchedEvent::Token { .. } => saw_token = true,
                 SchedEvent::Done { .. } => saw_done = true,
@@ -546,5 +638,102 @@ mod tests {
         }
         assert!(saw_token, "the batch's Token must be routed after a Protected");
         assert!(saw_done, "the batch's Done must be routed after a Protected");
+    }
+
+    // ── the primary seam: the isolated model thread (GitHub #69) ──────────
+
+    #[tokio::test]
+    async fn a_submit_completes_promptly_while_another_request_is_held_mid_decode() {
+        let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                ..SchedulerConfig::default()
+            },
+            gated.clone() as Arc<dyn Compute>,
+        );
+        let engine = Engine::new(Box::new(scheduler));
+
+        // Arm the gate before anything is submitted: the very first
+        // decode_step call (for request A, below) blocks until released.
+        gated.arm();
+        let (id_a, rx_a) = engine
+            .submit(
+                input("test-model", vec![1, 2, 3], Some(8000)),
+                RequestClass::Interactive,
+            )
+            .await
+            .expect("submit A");
+
+        // Blocks until the model thread is confirmed stuck inside A's first
+        // decode_step call — it cannot service anything else right now.
+        controller.wait_entered();
+
+        // `model_id` never touches the model thread — it answers instantly
+        // even while the thread is stuck inside a compute call.
+        assert_eq!(engine.model_id(), "test-model");
+
+        // Submit B while A is held. If the old shared-mutex design were
+        // still in place, this would have to wait for A's *entire*
+        // generation; here it only has to wait for the model thread to
+        // finish draining its command queue, which happens the instant A's
+        // held step returns.
+        let engine_b = engine.clone();
+        let submit_b = tokio::spawn(async move {
+            engine_b
+                .submit(input("test-model", vec![9], Some(1)), RequestClass::Interactive)
+                .await
+        });
+        // Let the spawned task actually enqueue its command before we
+        // release the hold (deterministic: one yield, not a sleep).
+        tokio::task::yield_now().await;
+
+        controller.release();
+
+        let (id_b, mut rx_b) = submit_b
+            .await
+            .expect("the submit task must not panic")
+            .expect("submit B");
+        assert_ne!(id_a, id_b);
+
+        // Both requests still complete normally once the gate stops
+        // interfering with anything further.
+        let (_tokens_b, _reason_b) = drain_to_done(&mut rx_b).await;
+        // Drop A's stream without draining it to completion — the model
+        // thread's shutdown must not hang on an abandoned request.
+        drop(rx_a);
+    }
+
+    /// Story 22 (GitHub #69): the model thread shuts down cleanly — no
+    /// hung thread — once every `Engine` handle (and so every clone of the
+    /// command sender) is dropped. A white-box test against
+    /// `model_thread_loop` directly, since nothing on the public `Engine`
+    /// surface can observe the thread itself exiting.
+    #[test]
+    fn the_model_thread_exits_once_every_command_sender_is_dropped() {
+        let compute = Arc::new(MockCompute::new());
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                ..SchedulerConfig::default()
+            },
+            compute,
+        );
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (facts_tx, _facts_rx) = unbounded_channel();
+        let (done_tx, done_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            model_thread_loop(Box::new(scheduler), command_rx, facts_tx);
+            // Reached only once `model_thread_loop` returns.
+            let _ = done_tx.send(());
+        });
+
+        // Drop the only command sender — the model thread's next command
+        // channel check must see it disconnected and return.
+        drop(command_tx);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the model thread must exit once every command sender is dropped");
     }
 }

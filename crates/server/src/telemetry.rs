@@ -9,9 +9,11 @@
 //!   `{"kind":"request","id":7,"event":"done","ms":210,"n":512,"tok_s":41.2}`
 //!
 //! The sink is injectable (tests capture lines in memory; production targets
-//! stdout or a file) and stays cheap on the request path: a write is a
-//! single buffered line into a lock-protected buffer, so it never blocks a
-//! request and never inverts a lock with the engine's scheduler mutex.
+//! stdout or a file). Since GitHub #69, all of this module's work (sink I/O,
+//! counter math) runs on an async task off the model thread — the thread
+//! that owns the `Scheduler` never calls into `Telemetry` at all, so a slow
+//! sink can never add latency to a decode step, no matter how long a write
+//! takes or how it is implemented.
 //!
 //! **Live counters (blocker for the coordinator).** The core [`Scheduler`]
 //! trait — the public API the server drives (`Box<dyn Scheduler>`) — does not
@@ -366,8 +368,11 @@ impl Telemetry {
         }
     }
 
-    /// Emit the interval line (called once per scheduler step / driver tick).
-    pub fn emit_interval(&mut self) {
+    /// Emit the interval line (called once per scheduler step / driver
+    /// tick), returning the counters it computed (GitHub #69: the async
+    /// telemetry consumer republishes this into the wait-free `ArcSwap`
+    /// snapshot without recomputing it).
+    pub fn emit_interval(&mut self) -> IntervalCounters {
         self.tick = self.tick.saturating_add(1);
         let counters = self.counters();
         let line = IntervalLine {
@@ -380,6 +385,7 @@ impl Telemetry {
             kv_evictions: counters.kv_evictions,
         };
         self.sink.write_line(&to_line(&line));
+        counters
     }
 
     /// Emit a request line (one compact JSON object).

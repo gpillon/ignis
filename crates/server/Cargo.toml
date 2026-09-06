@@ -13,9 +13,11 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures-core = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+http-body-util = { workspace = true }
 
 [features]
 # Forwards to the artifact crate's VRAM materialization path (ADR 0002) and
