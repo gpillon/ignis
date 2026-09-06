@@ -30,6 +30,12 @@
 //!   server refuses to start (no silent fallback to the placeholder).
 //! - `IGNIS_TELEMETRY` — the telemetry JSONL sink path (server-02, design
 //!   §5): one compact line per event; unset = stdout.
+//! - `IGNIS_ENABLE_THINKING` — the server-wide default for `enable_thinking`
+//!   (GitHub #68); `true` or `false`, default `true`. An unparseable value,
+//!   or a `false` the loaded template cannot honour, refuses to start.
+//! - `IGNIS_REASONING_EFFORT` — the server-wide default `reasoning_effort`;
+//!   unset means "let the template's own default apply". An unknown value,
+//!   or one the loaded template does not support, refuses to start.
 
 use std::sync::Arc;
 
@@ -42,6 +48,7 @@ use ignis_server::{
     loader,
     template::SimpleTemplateProvider,
     telemetry::{FileSink, StdoutSink, SystemClock, TelemetrySink},
+    thinking::{self, ThinkingDefaults},
     Server,
 };
 
@@ -110,6 +117,27 @@ async fn main() {
     let bind = env("IGNIS_BIND", DEFAULT_BIND);
     let artifact = env("IGNIS_ARTIFACT", "");
 
+    // The thinking defaults (GitHub #68): parsed up front so a typo is
+    // caught before any of the slower loader/scheduler work below runs.
+    // Capability-checked against the loaded template once `server` exists,
+    // below.
+    let default_enable_thinking =
+        match thinking::parse_default_enable_thinking(&env("IGNIS_ENABLE_THINKING", "true")) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("ignis-server: {err} — refusing to start");
+                std::process::exit(1);
+            }
+        };
+    let default_reasoning_effort =
+        match thinking::parse_default_reasoning_effort(&env("IGNIS_REASONING_EFFORT", "")) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("ignis-server: {err} — refusing to start");
+                std::process::exit(1);
+            }
+        };
+
     // The telemetry sink (server-02, design §5): a JSONL file named by
     // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
     let telemetry_sink: Arc<dyn TelemetrySink> = match env("IGNIS_TELEMETRY", "") {
@@ -168,6 +196,21 @@ async fn main() {
         let engine = Engine::with_sinks(scheduler, telemetry_sink, Arc::new(SystemClock));
         Server::with_artifact_template(engine, frontend)
     };
+
+    // A default the loaded template cannot honour is a refused start (a
+    // model swap must not silently change behaviour), matching how the
+    // server already treats a missing EOS token or an unclean checksum.
+    let thinking_defaults = ThinkingDefaults {
+        enable_thinking: default_enable_thinking,
+        reasoning_effort: default_reasoning_effort,
+    };
+    if let Err(err) =
+        thinking::validate_defaults(&thinking_defaults, &server.template.thinking_capabilities())
+    {
+        eprintln!("ignis-server: {err} — refusing to start");
+        std::process::exit(1);
+    }
+    let server = server.with_thinking_defaults(default_enable_thinking, default_reasoning_effort);
 
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the

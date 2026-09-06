@@ -21,11 +21,13 @@
 
 pub mod api;
 pub mod artifact_template;
+pub mod decoder;
 pub mod engine;
 pub mod loader;
 pub mod runtime;
 pub mod telemetry;
 pub mod template;
+pub mod thinking;
 
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ use axum::Router;
 
 use crate::engine::Engine;
 use crate::template::TemplateProvider;
+use crate::thinking::ReasoningEffort;
 
 /// The server's knobs (constructor injection — the template seam is
 /// pluggable here: artifact-02 swaps in the artifact-backed provider).
@@ -48,6 +51,11 @@ pub struct Server {
     /// handler gives up with a 504 (guards a wedged engine from hanging
     /// the client forever).
     pub request_timeout: Duration,
+    /// The server-wide `enable_thinking` default (`IGNIS_ENABLE_THINKING`,
+    /// GitHub #68) a request's unset field falls back to.
+    pub default_enable_thinking: bool,
+    /// The server-wide `reasoning_effort` default (`IGNIS_REASONING_EFFORT`).
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Server {
@@ -57,6 +65,8 @@ impl Server {
             engine,
             template: std::sync::Arc::from(template),
             request_timeout: Duration::from_secs(30),
+            default_enable_thinking: true,
+            default_reasoning_effort: None,
         }
     }
 
@@ -77,6 +87,22 @@ impl Server {
     /// 30 s).
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Set the server-wide thinking defaults (`IGNIS_ENABLE_THINKING` /
+    /// `IGNIS_REASONING_EFFORT`, GitHub #68). Callers that set a non-trivial
+    /// default should validate it against `template.thinking_capabilities()`
+    /// first (`thinking::validate_defaults`) — this setter does not, so
+    /// tests can construct an out-of-band `Server` without a template to
+    /// probe.
+    pub fn with_thinking_defaults(
+        mut self,
+        enable_thinking: bool,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
+        self.default_enable_thinking = enable_thinking;
+        self.default_reasoning_effort = reasoning_effort;
         self
     }
 

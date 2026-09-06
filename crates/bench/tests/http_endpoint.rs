@@ -21,6 +21,7 @@ fn request(id: &str, prompt: &str, max_tokens: u32, stream: bool) -> Request {
         prompt: prompt.into(),
         max_tokens,
         stream,
+        enable_thinking: None,
     }
 }
 

@@ -141,6 +141,7 @@ pub fn run_canaries(ep: &dyn Endpoint) -> Vec<CanaryResult> {
                 prompt: c.prompt.to_string(),
                 max_tokens: 64,
                 stream: false,
+                enable_thinking: None,
             };
             let first = ep.complete(&req).map(|o: Outcome| o.output).unwrap_or_default();
             let second = ep.complete(&req).map(|o: Outcome| o.output).unwrap_or_default();

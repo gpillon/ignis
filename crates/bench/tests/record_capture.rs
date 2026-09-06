@@ -36,6 +36,7 @@ fn chat_request(id: &str, prompt: &str, max_tokens: u32, stream: bool) -> Reques
         prompt: prompt.into(),
         max_tokens,
         stream,
+        enable_thinking: None,
     }
 }
 
