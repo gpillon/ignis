@@ -4,20 +4,21 @@ A high-throughput inference engine for **Qwen 3.8-27B** on a single **NVIDIA
 RTX 5090** (SM120a), serving an **OpenAI-compatible HTTP API** from a Rust core
 backed by a C++/CUDA kernel leaf.
 
-**Status:** early development — **the engine does not yet produce a real
-completion.** The Rust core above the step (HTTP + OpenAI surface, artifact
-reader/binder/materializer, scheduler, admission, paged-KV accounting, host
-tier, prefix index, bench harness) works and is CPU-tested; the forward pass
-does not, and is being rebuilt device-resident behind a step-level C ABI
-(ADR 0009) on top of verbatim-vendored reference kernels (ADR 0010).
+**Status:** early development — **the engine now serves real completions on
+the GPU.** With `IGNIS_ARTIFACT` set and the binary built with `--features
+cuda`, `ignis-server` loads the model onto the device and drives the real
+64-layer program (device-resident, step-level C ABI — ADR 0009, verbatim-
+vendored reference kernels — ADR 0010) for both streaming and non-streaming
+chat completions, stopping on the model's own EOS token or `max_tokens`.
+Without an artifact, or without `--features cuda`, it falls back to the
+deterministic CPU-only mock (`MockCompute`, ADR 0006) for protocol and loop
+work.
 
-**Next milestone: gate G1** — a correct, device-resident forward pass at
-batch 1 with bf16 KV: coherent greedy completions on the canary suite, per-layer
-activations within bf16 tolerance of an f64 reference, ≥ 95% first-32-token
-agreement with the canary oracle, EOS honored, reproducible across loads.
-The 99% performance gate (ADR 0007) sits behind G4. The full phase/gate plan
-is `.scratch/ROADMAP.md`; the review that reset it is
-`.scratch/REVIEW-2026-09-05.md`.
+**Next milestone: the G1 gate run** — record the verdict (canary agreement
+≥ 95% vs. the recorded oracle fixture, the f64 layer checks, reproducibility
+across loads) and close out gate G1. The 99% performance gate (ADR 0007) sits
+behind G4. The full phase/gate plan is `.scratch/ROADMAP.md`; the review that
+reset it is `.scratch/REVIEW-2026-09-05.md`.
 
 ---
 
@@ -133,11 +134,12 @@ canonical `kernel/build/`.
 cargo build -p ignis-server --features cuda
 ```
 
-- **`--features cuda`** enables the production CUDA compute backend
-  (`CudaCompute`) — the real model path.
-- **Without `--features cuda`**, the server runs in ADR 0006 dev mode: a
-  deterministic CPU-only mock (`MockCompute`), for protocol and loop work
-  without a GPU.
+- **`--features cuda`** enables the production GPU-backed compute backend
+  (`ignis_runtime::CudaLeaf`, driven through `ignis_server::runtime::cuda_scheduler`)
+  — with `IGNIS_ARTIFACT` set, the real model path.
+- **Without `--features cuda`, or without an artifact**, the server runs in
+  ADR 0006 dev mode: a deterministic CPU-only mock (`MockCompute`), for
+  protocol and loop work without a GPU.
 
 The cargo build reuses an already-built `kernel/build/ignis_kernel.lib` when
 present (incremental), so it does not recompile the C++ leaf from scratch each
@@ -160,11 +162,17 @@ The server is an **OpenAI-compatible** HTTP server on localhost (no auth,
 localhost-only by design). The current API surface is the v1 OpenAI API and will
 evolve as the engine matures.
 
-> **The protocol works; the model does not yet.** Until gate G1, completions
-> come from the deterministic CPU mock (`MockCompute`) — the endpoints,
-> streaming, telemetry and scheduler behavior are real, the generated text is
-> not. `--features cuda` with a real artifact loads and verifies the 19 GB of
-> weights into VRAM, but the forward pass behind it is being rebuilt.
+> **Real completions on the GPU.** Built with `--features cuda` and a
+> verified `IGNIS_ARTIFACT`, the server loads the ~19 GB of weights into
+> VRAM, sizes its KV pool from what's left, and drives the real 64-layer
+> program for every request: streaming and non-streaming chat completions
+> stop at the model's own EOS token (`finish_reason: "stop"`) or at
+> `max_tokens` (`finish_reason: "length"`). Without `--features cuda`, or
+> without an artifact, completions come from the deterministic CPU mock
+> (`MockCompute`) instead — the endpoints, streaming, telemetry and
+> scheduler behavior are real, the generated text is not (and every
+> completion reports `finish_reason: "length"`, since the mock has no real
+> EOS token).
 
 ### Configuration (environment)
 
@@ -228,6 +236,17 @@ curl http://127.0.0.1:8000/v1/responses \
 - **The responses API** accepts `input` (a string or a message list), `model`,
   `max_output_tokens`, `temperature`, and `seed`; it returns the responses API
   `output` shape with the generated text in an `output_text` part.
+
+### Canary check
+
+`ignis-bench canary` runs the fixed high-signal prompt suite against a live
+server and checks each output is *sane* and *deterministic* (greedy + fixed
+seed ⇒ identical output on a repeat run — ADR 0007's self-check, not a
+reference-token comparison):
+
+```bash
+cargo run -p ignis-bench -- canary --endpoint http://127.0.0.1:8000
+```
 
 ## Telemetry
 

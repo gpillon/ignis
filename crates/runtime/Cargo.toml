@@ -6,8 +6,12 @@ edition.workspace = true
 
 [dependencies]
 ignis-core = { path = "../core" }
+ignis-artifact = { path = "../artifact" }
 
 [features]
 # The safe wrapper itself is leaf-agnostic; this forwards the production
 # build's link requirements to the existing CUDA-gated core ABI modules.
-cuda = ["ignis-core/cuda"]
+# `ignis-artifact/cuda` is needed directly (not only through `ignis-core`):
+# the production `CudaLeaf` (`src/cuda_leaf.rs`) owns the materialized
+# artifact + device context its model load reads from.
+cuda = ["ignis-core/cuda", "ignis-artifact/cuda"]

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use ignis_core::{
-    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeParams, PrefillJob, RequestClass,
-    RequestInput, Scheduler, SchedulerConfig,
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams,
+    FinishReason, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
 };
 use ignis_runtime::{Model, RuntimeCompute, RuntimeStats, StepLeaf};
 
@@ -287,9 +287,20 @@ fn adapter_enforces_max_tokens_and_eos() {
             ..DecodeParams::default()
         },
     };
-    assert_eq!(compute.decode_step(&[job.clone()]).unwrap(), vec![Some(7)]);
-    assert_eq!(compute.decode_step(&[job]).unwrap(), vec![None]);
+    assert_eq!(
+        compute.decode_step(&[job.clone()]).unwrap(),
+        vec![DecodeOutcome::Token(7)]
+    );
+    // The cap (`max_tokens: Some(1)`) was already reached by the first
+    // token: `Length`, not `Stop` (the leaf never even runs — see
+    // `decode_batch_sizes` below).
+    assert_eq!(
+        compute.decode_step(&[job]).unwrap(),
+        vec![DecodeOutcome::Finished(FinishReason::Length)]
+    );
 
+    // Request 2 has no `max_tokens`: the only way it stops is the leaf's
+    // next token (99) matching this adapter's configured EOS (99) — `Stop`.
     compute.prefill_step(&[prefill(2, None)]).unwrap();
     assert_eq!(
         compute
@@ -299,7 +310,7 @@ fn adapter_enforces_max_tokens_and_eos() {
                 params: DecodeParams::default(),
             }])
             .unwrap(),
-        vec![None]
+        vec![DecodeOutcome::Finished(FinishReason::Stop)]
     );
     assert_eq!(leaf.calls.lock().unwrap().sequences_released, 2);
 }
@@ -328,7 +339,7 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                 },
             ])
             .unwrap(),
-        vec![Some(17), Some(23)]
+        vec![DecodeOutcome::Token(17), DecodeOutcome::Token(23)]
     );
     assert_eq!(leaf.calls.lock().unwrap().decode_batch_sizes, vec![2]);
     assert_eq!(compute.live_sequences(), 2);

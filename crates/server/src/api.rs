@@ -28,7 +28,7 @@ use axum::{Json, Router};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
-use ignis_core::{DecodeParams, RequestClass, RequestInput, SchedEvent, SubmitError};
+use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
 
 use crate::engine::{collect_tokens, EventStream};
 use crate::template::{ChatMessage, TemplateProvider};
@@ -125,6 +125,16 @@ fn error_response(
         }),
     )
         .into_response()
+}
+
+/// Map the engine's [`FinishReason`] to the OpenAI `finish_reason` string
+/// (GitHub #61 / P1-25): `stop` on the model's own EOS token, `length` on
+/// `max_tokens` or the engine's reservation cap.
+fn finish_reason_str(reason: FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+    }
 }
 
 /// The Unix epoch seconds (OpenAI's `created` / `created_at` fields).
@@ -225,7 +235,7 @@ async fn chat_completions(
     // Non-streaming: collect the request's tokens to its completion (a
     // timeout guards a wedged engine from hanging the client).
     match collect_tokens(&mut stream, server.request_timeout).await {
-        Ok(tokens) => {
+        Ok((tokens, reason)) => {
             let content = server.template.render_tokens(&tokens);
             let completion_tokens = tokens.len() as u32;
             Json(ChatCompletion {
@@ -239,7 +249,7 @@ async fn chat_completions(
                         role: "assistant",
                         content,
                     },
-                    finish_reason: "stop",
+                    finish_reason: finish_reason_str(reason),
                 }],
                 usage: Usage {
                     prompt_tokens,
@@ -410,8 +420,8 @@ impl Stream for ChunkStream {
                     // The request completed: the final chunk (finish
                     // reason), then the `[DONE]` marker on the next poll
                     // (the stream closes).
-                    SchedEvent::Done { .. } => {
-                        return Poll::Ready(Some(Ok(this.chunk("", Some("stop")))));
+                    SchedEvent::Done { reason, .. } => {
+                        return Poll::Ready(Some(Ok(this.chunk("", Some(finish_reason_str(reason))))));
                     }
                     // Other events for this request (admissions,
                     // evictions, restorations, requeues) do not change the
@@ -489,7 +499,10 @@ async fn responses_api(
         Err(err) => return submit_error(&server, err),
     };
     match collect_tokens(&mut stream, server.request_timeout).await {
-        Ok(tokens) => {
+        Ok((tokens, _reason)) => {
+            // The responses API's v1 shape carries no `finish_reason`
+            // field (only `status: "completed"`); the stop reason is not
+            // surfaced here.
             // The generated text (the template seam: artifact-02's
             // tokenizer renders real text here).
             let text = server.template.render_tokens(&tokens);

@@ -12,8 +12,8 @@
 //!   without a GPU (ADR 0006).
 
 use crate::types::{
-    ComputeError, DecodeParams, LaneId, RequestClass, RequestId, RequestInput, SchedEvent,
-    SubmitError, TokenId,
+    ComputeError, DecodeParams, FinishReason, LaneId, RequestClass, RequestId, RequestInput,
+    SchedEvent, SubmitError, TokenId,
 };
 
 /// One prefill job handed to the compute backend (batched prefill groups
@@ -53,6 +53,18 @@ pub struct DecodeJob {
     pub params: DecodeParams,
 }
 
+/// One job's result from a decode step (GitHub #61 / P1-25): either the
+/// token generated this step, or the reason the request finished instead
+/// of generating one — the scheduler forwards the reason straight into the
+/// [`SchedEvent::Done`] it emits, which the server maps to `finish_reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeOutcome {
+    /// The job produced a token and the request keeps running.
+    Token(TokenId),
+    /// The request finished this step instead of producing a token.
+    Finished(FinishReason),
+}
+
 /// The compute seam the scheduler drives for actual token generation.
 ///
 /// This is the *only* GPU-coupled step in the engine. The scheduler's logic —
@@ -66,9 +78,10 @@ pub trait Compute: Send + Sync {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError>;
 
     /// Generate the next token for each running lane (one decode step).
-    /// Returns, per job in order, the token generated this step, or `None` if
-    /// that request finished this step (reached `max_tokens` / EOS).
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError>;
+    /// Returns, per job in order, [`DecodeOutcome::Token`] when a token was
+    /// generated, or [`DecodeOutcome::Finished`] with why (EOS or
+    /// `max_tokens`) when that request finished this step instead.
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError>;
 
     /// Release leaf-owned state for a request that completed or was evicted.
     /// CPU-only compute implementations need no lifecycle bookkeeping.

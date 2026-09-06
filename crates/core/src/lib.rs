@@ -61,8 +61,8 @@ pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
-pub use scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
+pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
 pub use types::{
-    BackfillClass, ComputeError, DecodeParams, EngineMode, LaneId, N_DECODE_LANES, RequestClass,
-    RequestId, RequestInput, RequestState, SchedEvent, SubmitError, TokenId,
+    BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
+    RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError, TokenId,
 };

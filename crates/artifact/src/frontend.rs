@@ -109,6 +109,15 @@ impl FrontendSet {
         &self.generation_config
     }
 
+    /// The model's end-of-sequence token id, from `generation_config.json`'s
+    /// `eos_token_id` field (GitHub #61 / P1-25: the runtime stops decoding
+    /// on this id instead of running to `max_sequence_tokens`). `None` when
+    /// the field is absent or the config does not parse as JSON — the
+    /// caller decides whether that is fatal.
+    pub fn eos_token_id(&self) -> Option<u32> {
+        parse_eos_token_id(&self.generation_config)
+    }
+
     /// Raw host bytes of `preprocessor_config.json`.
     pub fn preprocessor_config(&self) -> &[u8] {
         &self.preprocessor_config
@@ -117,6 +126,20 @@ impl FrontendSet {
     /// Raw host bytes of `video_preprocessor_config.json`.
     pub fn video_preprocessor_config(&self) -> &[u8] {
         &self.video_preprocessor_config
+    }
+}
+
+/// Parse `eos_token_id` out of a `generation_config.json` payload: a
+/// HuggingFace generation config carries either a single id or a list of
+/// stop ids (Qwen3's config lists the chat end-of-turn marker first) —
+/// either shape yields the first id. `None` on missing field or invalid
+/// JSON.
+fn parse_eos_token_id(generation_config: &[u8]) -> Option<u32> {
+    let value: JsonValue = serde_json::from_slice(generation_config).ok()?;
+    match value.get("eos_token_id")? {
+        JsonValue::Number(n) => n.as_u64().map(|n| n as u32),
+        JsonValue::Array(ids) => ids.first()?.as_u64().map(|n| n as u32),
+        _ => None,
     }
 }
 
@@ -524,6 +547,36 @@ mod tests {
             assert_eq!(set.preprocessor_config(), PREPROCESSOR_CONFIG);
             assert_eq!(set.video_preprocessor_config(), VIDEO_PREPROCESSOR_CONFIG);
         });
+    }
+
+    #[test]
+    fn eos_token_id_is_none_when_the_field_is_absent() {
+        // The shared fixture's `GENERATION_CONFIG` carries no `eos_token_id`.
+        with_frontend_set(None, |_, set| {
+            assert_eq!(set.eos_token_id(), None);
+        });
+    }
+
+    #[test]
+    fn eos_token_id_reads_a_single_number() {
+        assert_eq!(parse_eos_token_id(br#"{"eos_token_id": 151645}"#), Some(151645));
+    }
+
+    #[test]
+    fn eos_token_id_reads_the_first_entry_of_a_list() {
+        // Qwen3's generation config lists the chat end-of-turn marker
+        // first, then the base `<|endoftext|>` — the first id is the one
+        // the runtime stops decode on.
+        assert_eq!(
+            parse_eos_token_id(br#"{"eos_token_id": [151645, 151643]}"#),
+            Some(151645)
+        );
+    }
+
+    #[test]
+    fn eos_token_id_is_none_on_malformed_json() {
+        assert_eq!(parse_eos_token_id(b"not json"), None);
+        assert_eq!(parse_eos_token_id(b"{}"), None);
     }
 
     #[test]

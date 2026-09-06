@@ -18,6 +18,19 @@ pub type TokenId = u32;
 /// concurrent coding workload; overflow goes to the host KV-RAM tier).
 pub const N_DECODE_LANES: usize = 8;
 
+/// Why a request's generation stopped (GitHub #61 / P1-25) — the two
+/// reasons the OpenAI surface reports as `finish_reason`: `stop` (the
+/// model's own EOS token) or `length` (`max_tokens`, or a scheduler-side
+/// reservation cap, reached first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model generated its end-of-sequence token.
+    Stop,
+    /// `max_tokens` or the engine's KV reservation cap was reached before
+    /// EOS.
+    Length,
+}
+
 /// The engine's operating mode (what the scheduler + telemetry report).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineMode {
@@ -129,7 +142,13 @@ pub enum SchedEvent {
     /// A new token was generated for a request.
     Token { request: RequestId, token: TokenId },
     /// A request completed (`tokens` = total generated this request).
-    Done { request: RequestId, tokens: u32 },
+    Done {
+        request: RequestId,
+        tokens: u32,
+        /// Why generation stopped (GitHub #61 / P1-25) — the server maps
+        /// this straight to the OpenAI `finish_reason` field.
+        reason: FinishReason,
+    },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for
     /// a normal deal, `Persistent` / `Temporal` for a backfill admitted
