@@ -22,6 +22,13 @@
  * config, so it is not on `ignis_seq_pool_spec` either). */
 inline constexpr int32_t kIgnisGdnConvKernel = 4;
 
+/* The conv-state history width: the 4-tap causal conv keeps width-1 = 3 past
+ * taps in the state pool. The reference's LinearAttentionStatePool requires
+ * conv_width == 3 (vendor/tests/test_state_store.cpp,
+ * gated_delta_net/replay.cpp), NOT the kernel width above -- the conv_snapshot
+ * op's slot stride is `channels * 3`, so the pool must carry 3 taps. */
+inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
+
 struct ignis_seq_pool {
   ninfer::DeviceArena kv_arena;
   ninfer::PagedKVPool kv_pool;

@@ -9,8 +9,11 @@
 //! bound-tensor descriptors; the [`ModelConfig::qwen38_27b`] topology
 //! crosses once. The `*_input_scale_divisor` objects are bound and
 //! shape-checked against the artifact (ADR 0002 — a missing or mis-shaped
-//! one is still a load failure) but do not cross this ABI yet: the W4A4
-//! activation-quant path that reads them is G2
+//! one is still a load failure) and never get their own bound-tensor
+//! descriptor, but each one's value is read and carried on its paired
+//! NVFP4 weight's descriptor (GitHub #58): the reference's NVFP4 `Weight`
+//! validation requires a finite, positive divisor regardless of compute
+//! policy, even though the W4A4 path that multiplies by it is still G2
 //! (`.scratch/runtime/specs/01-device-resident-forward.md`).
 
 #![cfg(feature = "cuda")]
@@ -178,6 +181,27 @@ fn read_weight_divisor(reader: &Reader, name: &str, shape: &[u64]) -> Result<f32
     Ok(f32::from_le_bytes(bytes))
 }
 
+/// Read a `*_input_scale_divisor` object's FP32 scalar directly from the
+/// container (a standalone rank-0 object, not a trailing region of its
+/// paired weight -- [`read_weight_divisor`] reads that one).
+///
+/// Every NVFP4 projection's reference `Weight` carries a finite, positive
+/// `input_scale_divisor` regardless of which compute policy consumes it
+/// (`kernel/vendor/src/ops/linear/nvfp4/nvfp4_format.cpp`'s
+/// `validate_nvfp4_weight` requires it unconditionally); the W4A4 path that
+/// actually multiplies by it is still G2, but the value must cross the ABI
+/// now so A16-only NVFP4 ops validate.
+fn read_input_scale_divisor(reader: &Reader, name: &str) -> Result<f32, String> {
+    let span = reader.payload(name).map_err(|e| e.to_string())?;
+    let bytes: [u8; 4] = span
+        .data
+        .get(0..4)
+        .ok_or_else(|| format!("{name}: input divisor span is truncated"))?
+        .try_into()
+        .map_err(|_| format!("{name}: input divisor span is truncated"))?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
 /// Build the bound-tensor descriptors for every text-scope tensor
 /// [`ignis_artifact::bind_text_scope_27b`] placed on the device, in [`text_scope_27b`]
 /// order.
@@ -201,16 +225,31 @@ fn build_bound_tensors(
 
     let mut names = Vec::with_capacity(entries.len());
     let mut tensors = Vec::with_capacity(entries.len());
-    for (entry, &handle) in entries.iter().zip(handles.iter()) {
+    for (i, (entry, &handle)) in entries.iter().zip(handles.iter()).enumerate() {
         if !crosses_the_abi(entry.name) {
             continue;
         }
         let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
 
-        let weight_scale_divisor = if entry.format == NumericFormat::Nvfp4 {
-            read_weight_divisor(reader, entry.name, entry.shape)?
+        let (weight_scale_divisor, input_scale_divisor) = if entry.format == NumericFormat::Nvfp4 {
+            // The paired `<name>/..._projection/input_scale_divisor` object
+            // (present for every NVFP4 projection) is generated immediately
+            // after its weight in `text_scope_27b`'s per-layer templates
+            // (`crates/artifact/src/inventory.rs`); the `real_artifact`
+            // cross-check pins that adjacency against the container.
+            let divisor_name = entries
+                .get(i + 1)
+                .map(|next| next.name)
+                .filter(|name| name.ends_with("/input_scale_divisor"))
+                .ok_or_else(|| {
+                    format!("{}: expected a paired input_scale_divisor object", entry.name)
+                })?;
+            (
+                read_weight_divisor(reader, entry.name, entry.shape)?,
+                read_input_scale_divisor(reader, divisor_name)?,
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         };
 
         if view.shape.len() > 4 {
@@ -244,7 +283,7 @@ fn build_bound_tensors(
             padded_shape,
             ndim: view.shape.len() as u32,
             weight_scale_divisor,
-            input_scale_divisor: 0.0,
+            input_scale_divisor,
         });
         names.push(name);
     }

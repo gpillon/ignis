@@ -78,7 +78,10 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     ninfer::LinearAttentionStatePoolSpec gdn_spec;
     gdn_spec.layers         = spec->gdn_num_layers;
     gdn_spec.conv_channels  = static_cast<std::int32_t>(spec->gdn_conv_channels);
-    gdn_spec.conv_width     = kIgnisGdnConvKernel;
+    // The conv STATE (history) is width-1 = 3 taps, not the kernel width: the
+    // conv_snapshot op's slot stride is `channels * 3` and the reference's
+    // state pool requires conv_width == 3 (GitHub #58, GDN layer).
+    gdn_spec.conv_width     = kIgnisGdnConvStateWidth;
     gdn_spec.value_heads    = static_cast<std::int32_t>(spec->gdn_value_heads);
     gdn_spec.value_head_dim = static_cast<std::int32_t>(spec->gdn_head_dim);
     gdn_spec.key_head_dim   = static_cast<std::int32_t>(spec->gdn_head_dim);

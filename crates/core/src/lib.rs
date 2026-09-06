@@ -32,6 +32,8 @@ pub mod admission;
 pub mod compute;
 pub mod concrete;
 pub mod gdn;
+#[cfg(feature = "cuda")]
+pub mod gdn_layer;
 pub mod gpu_profile;
 pub mod host;
 pub mod kv;
