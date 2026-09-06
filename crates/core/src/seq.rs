@@ -20,7 +20,7 @@ use std::os::raw::c_void;
 
 use crate::compute::ModelConfig;
 
-mod ffi {
+pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
 
     /// Opaque sequence-state pool handle (`kernel/include/ignis_seq.h`).
@@ -181,6 +181,12 @@ impl SeqPool {
             _pool: PhantomData,
         })
     }
+
+    /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never
+    /// exposed outside this crate (mirrors the handle's C-ABI opacity).
+    pub(crate) fn handle(&self) -> *mut ffi::IgnisSeqPool {
+        self.handle
+    }
 }
 
 impl Drop for SeqPool {
@@ -232,6 +238,12 @@ impl Seq<'_> {
         } else {
             Err(rc)
         }
+    }
+
+    /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never
+    /// exposed outside this crate (mirrors the handle's C-ABI opacity).
+    pub(crate) fn handle(&self) -> *mut ffi::IgnisSeq {
+        self.handle
     }
 }
 

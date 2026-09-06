@@ -8,10 +8,14 @@
 // topology-derived per-layer schema and rejects (loudly, all-or-nothing) a
 // missing, extra, or mis-shaped one.
 //
-// The `*_input_scale_divisor` objects (the W4A4 activation-quant path, G2)
-// do not cross this ABI yet -- Rust binds and validates them against the
-// artifact (ADR 0002), but the leaf's per-layer schema below only lists the
-// fields the program layer consumes today.
+// The `*_input_scale_divisor` objects never get their own bound-tensor
+// descriptor (Rust binds and validates them against the artifact, ADR
+// 0002, but the leaf's per-layer schema below only lists the weight
+// tensors), but each one's value crosses on its paired NVFP4 weight's
+// `ignis_bound_tensor::input_scale_divisor` field (GitHub #58): the
+// reference's NVFP4 `Weight` validation requires a finite, positive
+// divisor regardless of compute policy, even though the W4A4 path that
+// multiplies by it is still G2.
 //
 // Style follows the ticket-04 leaf (device.cu): explicit pointers + sizes,
 // int32 return codes (0 = ok, -1 = error), no C++ types across the boundary.
@@ -47,6 +51,13 @@ ninfer::Weight to_weight(const ignis_bound_tensor &t) {
   w.qdata = t.qdata;
   w.qhigh = t.qhigh;
   w.scales = t.scales;
+  // The packed payload's base address: every layout's low/code plane sits at
+  // its start (NVFP4/FP8's own format validation requires `qdata == payload`
+  // and `scales == payload + scale_plane_offset`, kernel/vendor/src/ops/
+  // linear/{nvfp4,fp8}/*_format.cpp), and `bytes` is the layout's exact
+  // encoded length (ignis_model.h).
+  w.payload = t.qdata;
+  w.payload_bytes = t.bytes;
   w.ndim = t.ndim;
   for (uint32_t i = 0; i < 4; ++i) {
     w.shape[i] = t.shape[i];
@@ -71,6 +82,15 @@ ninfer::Weight to_weight(const ignis_bound_tensor &t) {
     w.group_size = 32;
     w.group = 32;
     w.scale_dtype = ninfer::DType::FP16;
+  }
+  // The NVFP4 blockscale group geometry + scale dtype (constant for the
+  // qtype, not carried by `ignis_bound_tensor`): required by
+  // ninfer::ops::detail::validate_nvfp4_weight (GitHub #58 is the first
+  // caller to drive a bound NVFP4 weight through an NVFP4 op).
+  if (w.qtype == ninfer::QType::NVFP4) {
+    w.group_size = 16;
+    w.group = 16;
+    w.scale_dtype = ninfer::DType::FP8_E4M3FN;
   }
   return w;
 }
