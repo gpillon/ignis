@@ -14,8 +14,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, PrefillJob};
-use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, SchedEvent, TokenId};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
 /// A prompt of `n` distinct tokens starting at `start` (a deterministic,
@@ -297,7 +297,7 @@ impl Compute for PrefillFailsOn {
         }
         self.inner.prefill_step(jobs)
     }
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.inner.decode_step(jobs)
     }
 }

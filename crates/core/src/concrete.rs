@@ -66,10 +66,10 @@ use crate::admission::{
 use crate::host::{HostEntry, HostTier, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
-use crate::scheduler::{Compute, DecodeJob, PrefillJob, Scheduler};
+use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
 use crate::types::{
-    BackfillClass, ComputeError, EngineMode, LaneId, N_DECODE_LANES, RequestClass, RequestId,
-    RequestInput, RequestState, SchedEvent, SubmitError,
+    BackfillClass, ComputeError, EngineMode, FinishReason, LaneId, N_DECODE_LANES, RequestClass,
+    RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
 };
 
 /// Knobs for the concrete scheduler (v1 defaults; the KV-RAM host tier
@@ -515,7 +515,9 @@ impl ConcreteScheduler {
     }
 
     /// Complete request `idx` (its lane and KV reservation are released).
-    fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+    /// `reason` is why it stopped — carried into the emitted
+    /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
+    fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>, reason: FinishReason) {
         let (release_pages, lane, request_id, tokens, prefix_entry) = {
             let r = &self.requests[idx];
             (r.resources.kv_pages, r.lane, r.id, r.tokens, r.prefix_entry)
@@ -541,6 +543,7 @@ impl ConcreteScheduler {
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
+            reason,
         });
     }
 
@@ -959,7 +962,7 @@ impl Scheduler for ConcreteScheduler {
             if self.requests[i].remaining_work == 0 {
                 // The reservation cap was reached (core-05): complete
                 // now, releasing the lane and the reservation.
-                self.mark_done(i, &mut events);
+                self.mark_done(i, &mut events, FinishReason::Length);
             }
         }
         let to_decode: Vec<usize> = running
@@ -979,7 +982,7 @@ impl Scheduler for ConcreteScheduler {
                 Ok(results) => {
                     for (&i, res) in to_decode.iter().zip(&results) {
                         match res {
-                            Some(token) => {
+                            DecodeOutcome::Token(token) => {
                                 self.requests[i].tokens += 1;
                                 // Service-work decay (core-05): one
                                 // quantum per generated token.
@@ -998,13 +1001,14 @@ impl Scheduler for ConcreteScheduler {
                                 // The reservation cap: the request
                                 // completes on its final reserved token.
                                 if self.requests[i].remaining_work == 0 {
-                                    self.mark_done(i, &mut events);
+                                    self.mark_done(i, &mut events, FinishReason::Length);
                                 }
                             }
-                            None => {
-                                // Finished (max_tokens / EOS): Done,
-                                // lane released.
-                                self.mark_done(i, &mut events);
+                            DecodeOutcome::Finished(reason) => {
+                                // Finished (EOS or the backend's own
+                                // `max_tokens` enforcement): Done, lane
+                                // released.
+                                self.mark_done(i, &mut events, *reason);
                             }
                         }
                     }

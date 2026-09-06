@@ -8,7 +8,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ignis_core::{Compute, ComputeError, DecodeJob, PrefillJob, RequestId, TokenId};
+use ignis_core::{
+    Compute, ComputeError, DecodeJob, DecodeOutcome, FinishReason, PrefillJob, RequestId, TokenId,
+};
+
+#[cfg(feature = "cuda")]
+mod cuda_leaf;
+#[cfg(feature = "cuda")]
+pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel};
 
 /// A failure returned by the step ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +227,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         Ok(())
     }
 
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         let mut sequences = self.sequences.lock().unwrap();
         let mut batch: Vec<(DecodeJob, LiveSequence<L::Sequence>)> = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -233,14 +240,19 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             batch.push((job.clone(), sequence));
         }
 
-        let mut tokens = vec![None; jobs.len()];
+        // `None` until filled below; every index is either already-finished
+        // (a prior round's `max_tokens`, `Length`), gets a fresh token, or
+        // finishes this round (EOS, `Stop`) — so every slot is set once.
+        let mut outcomes: Vec<Option<DecodeOutcome>> = vec![None; jobs.len()];
         let mut active = vec![false; jobs.len()];
         for (index, (job, sequence)) in batch.iter().enumerate() {
-            if !job
+            if job
                 .params
                 .max_tokens
                 .is_some_and(|max| sequence.generated >= max)
             {
+                outcomes[index] = Some(DecodeOutcome::Finished(FinishReason::Length));
+            } else {
                 active[index] = true;
             }
         }
@@ -278,10 +290,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             }
             let token = decoded.next().expect("decoded result length was checked");
             if token == self.eos {
+                outcomes[index] = Some(DecodeOutcome::Finished(FinishReason::Stop));
                 released.push(sequence);
             } else {
                 sequence.generated += 1;
-                tokens[index] = Some(token);
+                outcomes[index] = Some(DecodeOutcome::Token(token));
                 sequences.insert(job.request, sequence);
             }
         }
@@ -289,7 +302,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         for sequence in released {
             self.release_sequence(sequence.handle);
         }
-        Ok(tokens)
+        Ok(outcomes
+            .into_iter()
+            .map(|o| o.expect("every job index is filled by one of the branches above"))
+            .collect())
     }
 
     fn release(&self, request: RequestId) {

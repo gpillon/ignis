@@ -417,11 +417,16 @@ fn tensor_view(
         StorageLayout::ContiguousLeV1 => (None, None, None),
         StorageLayout::RowSplitK128V1 => {
             let g = row_split_geometry(tensor.format, &tensor.shape)?;
-            (
-                Some(g.high_plane_offset),
-                Some(g.scale_plane_offset),
-                None,
-            )
+            // A format with no high (exception) plane (Q4G64F16S,
+            // W8G32F16S: `quant_geometry`'s `high_bpg` is 0) still gets a
+            // `high_plane_offset` from the geometry math above — it is
+            // simply the offset the (empty) plane *would* start at. Only
+            // formats that actually store one (Q5/Q6) get a `Some` here;
+            // otherwise a vendored op that requires a null `qhigh` for its
+            // qtype (e.g. `embedding.cpp`'s W8G32_F16S check) sees a
+            // dangling non-null pointer into zero bytes and rejects it.
+            let high = (g.high_plane_bytes > 0).then_some(g.high_plane_offset);
+            (high, Some(g.scale_plane_offset), None)
         }
         StorageLayout::BlockScaleK16M128x4V1 => {
             let g = block_scale_geometry(tensor.format, &tensor.shape)?;

@@ -1,0 +1,179 @@
+//! GPU integration coverage for the real model behind the OpenAI HTTP
+//! surface (GitHub #61 / P1-25): the same axum router `openai_http.rs`
+//! drives against `MockCompute`, but here wired to the production
+//! `ignis_server::runtime::cuda_scheduler` — a real request round-trips
+//! through HTTP → the templated prompt → the GPU-resident program → the
+//! tokenizer back to text, for both non-streaming and streaming chat
+//! completions.
+
+#![cfg(feature = "cuda")]
+
+use std::path::Path;
+use std::time::Duration;
+
+use axum::body::{to_bytes, Body};
+use axum::http::Request;
+use tower::ServiceExt;
+
+use ignis_artifact::{FrontendSet, Reader};
+use ignis_core::gpu_profile;
+use ignis_server::engine::Engine;
+use ignis_server::runtime::cuda_scheduler;
+use ignis_server::Server;
+
+const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
+const MODEL: &str = "qwen3.8-27b";
+
+/// A live harness over the real GPU-backed scheduler (mirrors
+/// `openai_http.rs`'s mock harness, but with the production backend
+/// running underneath the same axum router).
+struct Harness {
+    app: axum::Router,
+    #[allow(dead_code)]
+    driver: tokio::task::JoinHandle<()>,
+}
+
+/// Build the harness, or `None` when the GPU profile says to skip
+/// (artifact absent / CUDA unavailable outside the profile — a hard
+/// failure under it, via `gpu_profile::skip_or_fail`).
+fn harness() -> Option<Harness> {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return None;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let eos = frontend
+        .eos_token_id()
+        .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
+
+    let scheduler = match cuda_scheduler(path, MODEL.into(), eos) {
+        Ok(scheduler) => scheduler,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
+                return None;
+            }
+            unreachable!();
+        }
+    };
+    let engine = Engine::new(Box::new(scheduler));
+    let server = Server::with_artifact_template(engine, frontend)
+        .with_request_timeout(Duration::from_secs(120));
+    let driver_engine = server.engine.clone();
+    let driver = tokio::spawn(async move { driver_engine.run().await });
+    Some(Harness {
+        app: server.app(),
+        driver,
+    })
+}
+
+/// Make one request against the router, returning (status, body-as-string).
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, String) {
+    let body_bytes = match body {
+        Some(v) => v.to_string().into_bytes(),
+        None => Vec::new(),
+    };
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body_bytes))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_non_streaming_completion_returns_coherent_text_with_finish_reason_and_usage() {
+    let Some(h) = harness() else { return };
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "user", "content": "In one sentence, what is 2 + 2?" }
+        ],
+        "max_tokens": 32,
+        "stream": false
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "chat should be 200: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["object"], "chat.completion");
+    assert_eq!(v["model"], MODEL);
+
+    // finish_reason is one of the two real reasons (GitHub #61): "stop"
+    // (the model's own EOS) or "length" (the 32-token cap) — never the old
+    // hardcoded "stop" regardless of why generation ended.
+    let reason = v["choices"][0]["finish_reason"].as_str().unwrap();
+    assert!(
+        reason == "stop" || reason == "length",
+        "finish_reason must be stop or length, got {reason}"
+    );
+
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(!content.trim().is_empty(), "the real model must return non-empty text");
+    assert!(!content.contains('\0'), "no NUL bytes in real text");
+
+    // Usage counts: real, non-zero, internally consistent.
+    let prompt_tokens = v["usage"]["prompt_tokens"].as_u64().unwrap();
+    let completion_tokens = v["usage"]["completion_tokens"].as_u64().unwrap();
+    let total_tokens = v["usage"]["total_tokens"].as_u64().unwrap();
+    assert!(prompt_tokens > 0, "a templated prompt always tokenizes to something");
+    assert!(completion_tokens > 0, "the model generated at least one token");
+    assert!(completion_tokens <= 32, "decode must stop at max_tokens even without EOS");
+    assert_eq!(total_tokens, prompt_tokens + completion_tokens);
+}
+
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_streaming_completion_emits_token_deltas_then_a_finish_reason_chunk() {
+    let Some(h) = harness() else { return };
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "user", "content": "In one sentence, what is 2 + 2?" }
+        ],
+        "max_tokens": 32,
+        "stream": true
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "streaming chat should be 200: {body}");
+
+    let data_lines: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .collect();
+    assert_eq!(data_lines.last().map(|s| s.as_str()), Some("[DONE]"), "{body}");
+
+    let chunks: Vec<serde_json::Value> = data_lines
+        .iter()
+        .filter(|l| l.as_str() != "[DONE]")
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(chunks.len() >= 2, "at least one token delta + the final chunk: {body}");
+
+    // Every chunk but the last carries a token delta and no finish_reason;
+    // reassembling them must produce non-empty, coherent text.
+    let mut streamed = String::new();
+    for chunk in &chunks[..chunks.len() - 1] {
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+        streamed.push_str(chunk["choices"][0]["delta"]["content"].as_str().unwrap());
+    }
+    assert!(!streamed.trim().is_empty(), "streamed text must be non-empty");
+
+    // The final chunk: empty delta, a real finish_reason (GitHub #61).
+    let last = &chunks[chunks.len() - 1];
+    assert_eq!(last["choices"][0]["delta"], serde_json::json!({}));
+    let reason = last["choices"][0]["finish_reason"].as_str().unwrap();
+    assert!(
+        reason == "stop" || reason == "length",
+        "finish_reason must be stop or length, got {reason}"
+    );
+}

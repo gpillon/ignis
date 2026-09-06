@@ -5,8 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, PrefillJob};
-use ignis_core::types::{ComputeError, RequestId, SchedEvent, TokenId};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::types::{ComputeError, RequestId, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
 /// A compute that fails its first `prefill_step` with a kernel fault, then
@@ -44,7 +44,7 @@ impl Compute for FailingCompute {
         Err(ComputeError::Kernel(-7))
     }
 
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         self.inner.decode_step(jobs)
     }
 }
@@ -108,7 +108,7 @@ impl Compute for DecodeFaultCompute {
         self.inner.prefill_step(jobs)
     }
 
-    fn decode_step(&self, _jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+    fn decode_step(&self, _jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         Err(ComputeError::Kernel(-9))
     }
 }

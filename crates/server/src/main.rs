@@ -12,10 +12,10 @@
 //! (`template.rs`): v1 ships a deterministic built-in provider,
 //! artifact-02's artifact-backed tokenizer replaces it through the same
 //! constructor injection. The compute backend is injected through the
-//! scheduler: this entrypoint drives the deterministic mock (CPU-only,
-//! ADR 0006) until the vendored `Compute` adapter lands (GitHub #39
-//! deleted the superseded flat-C-ABI forward; the replacement is tracked
-//! at `.scratch/ROADMAP.md`, P1-24 / #60).
+//! scheduler: with `IGNIS_ARTIFACT` set and the binary built with
+//! `--features cuda`, the entrypoint drives the real GPU-backed model
+//! (`ignis_server::runtime::cuda_scheduler`, GitHub #61 / P1-25); without
+//! either, it drives the deterministic `MockCompute` (CPU-only, ADR 0006).
 //!
 //! Configuration (environment):
 //! - `IGNIS_MODEL` — the loaded model id (default `qwen3.8-27b`; what
@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use ignis_core::{
     mock::MockCompute,
-    Compute, ConcreteScheduler, SchedulerConfig,
+    Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
 };
 use ignis_server::{
     engine::Engine,
@@ -56,32 +56,60 @@ fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
 
+/// The mock-backed scheduler (ADR 0006, CPU-only): used whenever no
+/// artifact is configured, or the binary was not built with
+/// `--features cuda` — the entrypoint never silently blocks startup on a
+/// missing GPU backend.
+fn mock_scheduler(model: &str) -> Box<dyn Scheduler> {
+    let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
+    Box::new(ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: model.into(),
+            ..SchedulerConfig::default()
+        },
+        compute,
+    ))
+}
+
+/// Build the real GPU-backed scheduler for `artifact_path` (GitHub #61 /
+/// P1-25). Requires `generation_config.json` to carry `eos_token_id` — a
+/// backend that can never stop on EOS would silently run every request to
+/// its `max_tokens` cap, so a missing one is a load failure like the
+/// checksum / sidecar checks above it, not a silent default.
+#[cfg(feature = "cuda")]
+fn cuda_scheduler(
+    artifact_path: &std::path::Path,
+    model: &str,
+    frontend: &ignis_artifact::FrontendSet,
+) -> Box<dyn Scheduler> {
+    let eos = match frontend.eos_token_id() {
+        Some(eos) => eos,
+        None => {
+            eprintln!(
+                "ignis-server: {}: generation_config.json has no eos_token_id — refusing to start",
+                artifact_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos) {
+        Ok(scheduler) => {
+            eprintln!("ignis-server: {} loaded on the GPU (eos={eos})", artifact_path.display());
+            Box::new(scheduler)
+        }
+        Err(err) => {
+            eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let model = env("IGNIS_MODEL", DEFAULT_MODEL);
     let bind = env("IGNIS_BIND", DEFAULT_BIND);
-
-    // The compute seam: the deterministic `MockCompute` (CPU-only, ADR 0006
-    // dev mode) — the production adapter (the vendored `Compute` backend,
-    // P1-24 / #60) is not landed yet (GitHub #39 deleted the superseded
-    // flat-C-ABI forward it replaces).
     let artifact = env("IGNIS_ARTIFACT", "");
-    let compute: Arc<dyn Compute> = Arc::new(MockCompute::new());
-    let scheduler = ConcreteScheduler::with_config(
-        SchedulerConfig {
-            model: model.clone(),
-            ..SchedulerConfig::default()
-        },
-        compute,
-    );
 
-    // The loader path (server-03, GitHub #21): the `.ninfer` container
-    // named by `IGNIS_ARTIFACT` is loaded through the verified loader —
-    // open the reader, load the sidecar (ADR 0002), verify the checksum
-    // report, and only then extract the frontend set. A missing sidecar
-    // or a report that is not clean is a load failure: serving a broken
-    // artifact would silently degrade to the placeholder, so the server
-    // refuses to start instead.
     // The telemetry sink (server-02, design §5): a JSONL file named by
     // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
     let telemetry_sink: Arc<dyn TelemetrySink> = match env("IGNIS_TELEMETRY", "") {
@@ -97,11 +125,19 @@ async fn main() {
             }
         },
     };
-    let engine = Engine::with_sinks(Box::new(scheduler), telemetry_sink, Arc::new(SystemClock));
+
     let server = if artifact.is_empty() {
-        eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text)");
+        eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute");
+        let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     } else {
+        // The loader path (server-03, GitHub #21): the `.ninfer` container
+        // named by `IGNIS_ARTIFACT` is loaded through the verified loader —
+        // open the reader, load the sidecar (ADR 0002), verify the checksum
+        // report, and only then extract the frontend set. A missing
+        // sidecar or a report that is not clean is a load failure: serving
+        // a broken artifact would silently degrade to the placeholder, so
+        // the server refuses to start instead.
         let artifact_path = std::path::Path::new(&artifact);
         let sidecar = match loader::find_sidecar(artifact_path) {
             Ok(path) => path,
@@ -110,16 +146,27 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        match loader::load_artifact(artifact_path, &sidecar) {
+        let frontend = match loader::load_artifact(artifact_path, &sidecar) {
             Ok(frontend) => {
                 eprintln!("ignis-server: {artifact} verified (checksum clean) — tokenizer + chat template loaded");
-                Server::with_artifact_template(engine, frontend)
+                frontend
             }
             Err(err) => {
                 eprintln!("ignis-server: {artifact}: {err} — refusing to start");
                 std::process::exit(1);
             }
-        }
+        };
+
+        #[cfg(feature = "cuda")]
+        let scheduler = cuda_scheduler(artifact_path, &model, &frontend);
+        #[cfg(not(feature = "cuda"))]
+        let scheduler = {
+            eprintln!("ignis-server: built without --features cuda — MockCompute despite IGNIS_ARTIFACT (the templated text is real, the completions are not)");
+            mock_scheduler(&model)
+        };
+
+        let engine = Engine::with_sinks(scheduler, telemetry_sink, Arc::new(SystemClock));
+        Server::with_artifact_template(engine, frontend)
     };
 
     // The driver loop: the single task that advances the engine and routes

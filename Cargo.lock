@@ -637,6 +637,7 @@ dependencies = [
 name = "ignis-runtime"
 version = "0.1.0"
 dependencies = [
+ "ignis-artifact",
  "ignis-core",
 ]
 

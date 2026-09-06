@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::scheduler::{Compute, DecodeJob, PrefillJob};
-use crate::types::{ComputeError, RequestId, TokenId};
+use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use crate::types::{ComputeError, FinishReason, RequestId, TokenId};
 
 /// Recording handle onto the mock's call history (shared through the
 /// `Arc<dyn Compute>` the scheduler holds, so tests can assert the batch
@@ -105,7 +105,7 @@ impl Compute for MockCompute {
         Ok(())
     }
 
-    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         g.decode_batches.push(jobs.to_vec());
         Ok(jobs
@@ -121,12 +121,15 @@ impl Compute for MockCompute {
                     .copied()
                     .or_else(|| g.limits.get(&job.request).copied().flatten());
                 match limit {
-                    Some(n) if step >= n => None, // finished: max_tokens / EOS reached
+                    // The mock has no real EOS token — its stop condition
+                    // is always a token-count cap, so it always finishes
+                    // with `Length` (never `Stop`).
+                    Some(n) if step >= n => DecodeOutcome::Finished(FinishReason::Length),
                     _ => {
                         let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
                         let token = Self::mix(self.seed, job.request, seed, step);
                         *g.generated.get_mut(&job.request).unwrap() += 1;
-                        Some(token)
+                        DecodeOutcome::Token(token)
                     }
                 }
             })

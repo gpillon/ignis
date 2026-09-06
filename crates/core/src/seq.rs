@@ -245,6 +245,28 @@ impl Seq<'_> {
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeq {
         self.handle
     }
+
+    /// Detach the compile-time borrow tying this sequence to its pool
+    /// (GitHub #61 / P1-25): the production leaf keeps a sequence alive for
+    /// a whole request, well past the stack frame that called
+    /// [`SeqPool::alloc`], so a lifetime parameter cannot express the
+    /// relationship across the `ignis-runtime` crate boundary. The pool's C
+    /// handle is a raw pointer either way — `into_static` only removes the
+    /// Rust-side borrow-checker tie, not a real one.
+    ///
+    /// # Safety
+    /// The caller must keep the originating [`SeqPool`] alive (not
+    /// dropped) for as long as the returned handle exists or is dropped.
+    pub unsafe fn into_static(self) -> Seq<'static> {
+        let handle = self.handle;
+        let pool = self.pool;
+        std::mem::forget(self);
+        Seq {
+            handle,
+            pool,
+            _pool: PhantomData,
+        }
+    }
 }
 
 impl Drop for Seq<'_> {
@@ -252,3 +274,10 @@ impl Drop for Seq<'_> {
         unsafe { ffi::ignis_seq_release(self.pool, self.handle) };
     }
 }
+
+// A `Seq` is moved into the scheduler's `Mutex`-guarded live-sequence map
+// (never accessed from more than one thread at a time — the engine drives
+// every `Compute` call under its own single-owner lock, mirroring
+// `SeqPool`'s documented single-thread-driver contract above) but never
+// shared by reference across threads, so only `Send` is asserted.
+unsafe impl Send for Seq<'_> {}

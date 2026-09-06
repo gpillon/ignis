@@ -124,7 +124,9 @@ async fn chat_completions_non_streaming_returns_the_completion() {
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "chat.completion");
     assert_eq!(v["model"], MODEL);
-    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    // The mock has no real EOS token, so hitting the request's `max_tokens`
+    // reports `length` (not `stop`) — GitHub #61 / P1-25's finish_reason.
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
     // The exact token stream the mock produced for request 0 (4 steps) —
     // pins that tokens flowed scheduler → engine → template → HTTP.
     let expected = rendered(&mock_tokens(0, 4));
@@ -165,8 +167,9 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
     for (i, chunk) in chunks.iter().take(3).enumerate() {
         assert_eq!(chunk["choices"][0]["delta"]["content"], expected_tokens[i].to_string());
     }
-    // The final chunk: finish_reason set, empty delta.
-    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+    // The final chunk: finish_reason set, empty delta. The mock has no
+    // real EOS, so hitting `max_tokens` reports `length` (GitHub #61).
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
     // The token sequence, re-rendered, matches the built-in template.
     let streamed_content: String = chunks.iter().take(3)
         .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap().to_string())

@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ignis_core::{
-    RequestClass, RequestId, RequestInput, Scheduler, SchedEvent, SubmitError, TokenId,
+    FinishReason, RequestClass, RequestId, RequestInput, Scheduler, SchedEvent, SubmitError,
+    TokenId,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -216,20 +217,21 @@ impl Engine {
 }
 
 /// Drive a submitted request's stream to completion: collect the generated
-/// tokens until the request's [`SchedEvent::Done`] (or its stream closes).
-/// Bounded by `timeout` — a wedged engine must not hang the client
-/// forever.
+/// tokens until the request's [`SchedEvent::Done`] (or its stream closes),
+/// returning them alongside why the request stopped (the OpenAI
+/// `finish_reason`, GitHub #61 / P1-25). Bounded by `timeout` — a wedged
+/// engine must not hang the client forever.
 pub async fn collect_tokens(
     rx: &mut EventStream,
     timeout: Duration,
-) -> Result<Vec<TokenId>, CollectError> {
+) -> Result<(Vec<TokenId>, FinishReason), CollectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tokens = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => match event {
                 SchedEvent::Token { token, .. } => tokens.push(token),
-                SchedEvent::Done { .. } => return Ok(tokens),
+                SchedEvent::Done { reason, .. } => return Ok((tokens, reason)),
                 // Other events for this request (admissions, evictions,
                 // restorations) do not change the generated-token list —
                 // keep draining.
@@ -420,6 +422,7 @@ mod tests {
                 SchedEvent::Done {
                     request: Self::ID,
                     tokens: 1,
+                    reason: FinishReason::Stop,
                 },
             ]
         }
@@ -474,6 +477,7 @@ mod tests {
                 SchedEvent::Done {
                     request: ProtectedBatchScheduler::ID,
                     tokens: 1,
+                    reason: FinishReason::Stop,
                 },
             ]
         }
