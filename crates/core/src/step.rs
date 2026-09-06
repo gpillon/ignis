@@ -14,16 +14,26 @@
 use std::ffi::CStr;
 
 use crate::model_load::Model;
+use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
 
 mod ffi {
     use std::os::raw::c_char;
 
     use crate::model_load::ffi::IgnisModel;
+    use crate::seq::ffi::{IgnisSeq, IgnisSeqPool};
 
     /// 1:1 with `struct ignis_sampling_params`.
     #[repr(C)]
     pub struct IgnisSamplingParams {
         pub greedy: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct IgnisProgramStats {
+        pub vram_bytes: u64,
+        pub last_step_micros: u64,
+        pub kernel_count: u64,
     }
 
     unsafe extern "C" {
@@ -49,12 +59,45 @@ mod ffi {
         ) -> i32;
 
         pub fn ignis_step_last_error() -> *const c_char;
+
+        pub fn ignis_program_prefill(
+            model: *mut IgnisModel,
+            pool: *mut IgnisSeqPool,
+            seq: *mut IgnisSeq,
+            token_ids: *const i32,
+            num_tokens: u64,
+            start_position: u64,
+            sampling: *const IgnisSamplingParams,
+        ) -> i32;
+
+        pub fn ignis_program_decode(
+            model: *mut IgnisModel,
+            pool: *mut IgnisSeqPool,
+            sequences: *const *mut IgnisSeq,
+            batch_size: u64,
+            sampling: *const IgnisSamplingParams,
+            out_token_ids: *mut i32,
+        ) -> i32;
+
+        pub fn ignis_program_stats(
+            model: *const IgnisModel,
+            pool: *const IgnisSeqPool,
+            out_stats: *mut IgnisProgramStats,
+        ) -> i32;
     }
 }
 
 /// Greedy sampling (G1) -- the only supported mode until G3 adds
 /// temperature / top-p / top-k / penalties / seed.
 const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams { greedy: 1 };
+
+/// Device footprint and most-recent-step telemetry from the real program.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramStats {
+    pub vram_bytes: u64,
+    pub last_step_micros: u64,
+    pub kernel_count: u64,
+}
 
 fn last_error() -> String {
     let message = unsafe { CStr::from_ptr(ffi::ignis_step_last_error()) };
@@ -132,4 +175,69 @@ pub fn decode_degenerate_batch(
         return Err(last_error());
     }
     Ok(out_token_ids)
+}
+
+/// Prefill one span through the complete 64-layer program. The sequence is
+/// advanced once per input token; generation starts at the following decode
+/// round.
+pub fn prefill_program(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+) -> Result<(), String> {
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &GREEDY,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// Emit one greedy token for each sequence and prepare the following round.
+pub fn decode_program_batch(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+) -> Result<Vec<i32>, String> {
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    let mut tokens = vec![-1; handles.len()];
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            &GREEDY,
+            tokens.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(tokens)
+}
+
+/// Read full-program telemetry without exposing a device pointer or stream.
+pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, String> {
+    let mut stats = ffi::IgnisProgramStats::default();
+    let rc = unsafe { ffi::ignis_program_stats(model.handle(), pool.handle(), &mut stats) };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(ProgramStats {
+        vram_bytes: stats.vram_bytes,
+        last_step_micros: stats.last_step_micros,
+        kernel_count: stats.kernel_count,
+    })
 }

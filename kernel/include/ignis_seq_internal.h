@@ -53,6 +53,14 @@ struct ignis_seq {
   ninfer::PagedKVAllocation kv;
   std::int32_t slot = -1;
   std::array<std::uint32_t, kIgnisGqaLayerCount> gqa_positions{};
+  // The token which is ready to be emitted on the next decode round.  Prefill
+  // consumes the complete prompt and computes this greedy successor; decode
+  // returns it while consuming it to prepare the following round.
+  std::int32_t pending_token = -1;
+  // One program-wide frontier, distinct from the per-GQA cache frontiers
+  // above.  It pins span prefill's start_position contract even for GDN-only
+  // prefixes.
+  std::uint64_t position = 0;
 };
 
 #endif /* IGNIS_SEQ_INTERNAL_H */

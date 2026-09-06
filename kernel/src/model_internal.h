@@ -71,4 +71,6 @@ struct ignis_model {
   float rms_norm_eps = 0.0F;
   cudaStream_t stream = nullptr;
   std::unique_ptr<ninfer::DeviceArena> scratch;
+  uint64_t last_step_micros = 0;
+  uint64_t last_step_kernel_count = 0;
 };
