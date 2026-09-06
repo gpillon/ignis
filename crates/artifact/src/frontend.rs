@@ -19,10 +19,103 @@
 //! [`FrontendSet`] through its own `TemplateProvider` seam (the dependency
 //! direction is server → artifact, never the other way).
 
+use std::collections::BTreeSet;
+
 use minijinja::{Environment, Value};
 use serde_json::{json, Value as JsonValue};
 
 use crate::{fail, Object, Reader, Result};
+
+// ---------------------------------------------------------------------------
+// Thinking controls (GitHub #68): the reasoning-effort vocabulary and the
+// per-template capability set a chat template supports.
+// ---------------------------------------------------------------------------
+
+/// The protocol's full `reasoning_effort` vocabulary (the reference's wire
+/// contract). Not every value is supported by every template — see
+/// [`ThinkingCapabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Every value in the protocol vocabulary, in wire order.
+    pub const ALL: [ReasoningEffort; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+        Self::Max,
+    ];
+
+    /// The wire name (also the string the template's `reasoning_effort`
+    /// variable is bound to).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a wire-name effort. `None` for anything outside the protocol
+    /// vocabulary (the caller reports the accepted-values list).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == name)
+    }
+}
+
+/// What a loaded chat template can actually do with the thinking controls —
+/// discovered by probing the template, not hard-coded (a maintainer swapping
+/// in a different model must not have to touch this code).
+#[derive(Debug, Clone, Default)]
+pub struct ThinkingCapabilities {
+    /// Whether the template accepts `enable_thinking: false` without
+    /// raising.
+    pub can_disable: bool,
+    /// The non-`none` efforts the template accepts without raising. `medium`
+    /// belongs here even though it adds no instruction text to the system
+    /// turn — support is decided by whether the render raises, never by
+    /// whether the output changed.
+    pub supported_efforts: BTreeSet<ReasoningEffort>,
+}
+
+impl ThinkingCapabilities {
+    /// A template that accepts every thinking control (the built-in
+    /// placeholder's stance — v1 has no jinja template to probe, so it
+    /// imposes no capability limits of its own).
+    pub fn permissive() -> Self {
+        Self {
+            can_disable: true,
+            supported_efforts: ReasoningEffort::ALL
+                .into_iter()
+                .filter(|e| *e != ReasoningEffort::None)
+                .collect(),
+        }
+    }
+
+    /// Whether `effort` is usable on this template (`None` — disable
+    /// thinking — is governed by [`Self::can_disable`], not this set).
+    pub fn supports(&self, effort: ReasoningEffort) -> bool {
+        match effort {
+            ReasoningEffort::None => self.can_disable,
+            other => self.supported_efforts.contains(&other),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The six frontend resources
@@ -46,6 +139,7 @@ pub const FRONTEND_RESOURCES: [&str; 6] = [
 pub struct FrontendSet {
     tokenizer: Tokenizer,
     chat_template: ChatTemplate,
+    thinking_capabilities: ThinkingCapabilities,
     tokenizer_config: Vec<u8>,
     generation_config: Vec<u8>,
     preprocessor_config: Vec<u8>,
@@ -79,9 +173,11 @@ impl FrontendSet {
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)?;
         let chat_template =
             ChatTemplate::from_bytes(&read_resource(reader, "chat_template.jinja")?)?;
+        let thinking_capabilities = chat_template.probe_thinking_capabilities();
         Ok(Self {
             tokenizer,
             chat_template,
+            thinking_capabilities,
             tokenizer_config: read_resource(reader, "tokenizer_config.json")?,
             generation_config: read_resource(reader, "generation_config.json")?,
             preprocessor_config: read_resource(reader, "preprocessor_config.json")?,
@@ -97,6 +193,12 @@ impl FrontendSet {
     /// The compiled container-carried chat template.
     pub fn chat_template(&self) -> &ChatTemplate {
         &self.chat_template
+    }
+
+    /// The thinking controls the container's template supports (probed once
+    /// at load time — GitHub #68).
+    pub fn thinking_capabilities(&self) -> &ThinkingCapabilities {
+        &self.thinking_capabilities
     }
 
     /// Raw host bytes of `tokenizer_config.json`.
@@ -208,6 +310,60 @@ impl Tokenizer {
             .decode(ids, false)
             .map_err(|e| fail(format!("detokenize: {e}")))
     }
+
+    /// One step of incremental decode (GitHub #68): feed the next generated
+    /// token id and get back the text it makes available, or `None` while
+    /// its bytes are still an incomplete UTF-8 sequence (a multi-byte
+    /// character split across tokens resolves once the completing token
+    /// arrives — never as a lossily-replaced fragment).
+    ///
+    /// `state` is a plain, owned value with no borrow on this tokenizer —
+    /// callers hold one per in-flight request across whatever intervals the
+    /// tokens arrive on (an SSE stream awaiting the engine).
+    pub fn decode_step(
+        &self,
+        state: &mut DecodeStreamState,
+        id: u32,
+    ) -> Result<Option<String>> {
+        tokenizers::step_decode_stream(
+            &self.inner,
+            id,
+            false,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|e| fail(format!("streaming detokenize: {e}")))
+    }
+
+    /// Flush an incremental decode's held-back tail at end of generation:
+    /// whatever text remains once no more tokens are coming (a genuinely
+    /// incomplete trailing sequence surfaces as the replacement character,
+    /// matching `String::from_utf8_lossy`'s own convention rather than
+    /// dropping bytes silently).
+    pub fn decode_step_finish(&self, state: &DecodeStreamState) -> Result<String> {
+        if state.ids.is_empty() {
+            return Ok(String::new());
+        }
+        let full = self
+            .inner
+            .decode(&state.ids, false)
+            .map_err(|e| fail(format!("streaming detokenize: {e}")))?;
+        Ok(full[state.prefix.len()..].to_string())
+    }
+}
+
+/// The owned state an incremental [`Tokenizer::decode_step`] carries across
+/// calls: the token ids not yet confirmed into a returned chunk, the
+/// previously-returned text (trimmed off the next chunk), and where it sits
+/// in the id buffer. Mirrors `tokenizers::DecodeStream`'s own bookkeeping,
+/// but as a value with no lifetime — a request's decoder outlives any single
+/// borrow of the tokenizer (GitHub #68).
+#[derive(Debug, Default, Clone)]
+pub struct DecodeStreamState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,19 +409,77 @@ impl ChatTemplate {
     ///
     /// `add_generation_prompt` is set to `true` (the standard completion
     /// behavior); the remaining template variables use the template's own
-    /// defaults.
+    /// defaults — the trivial delegation to [`Self::render_with_thinking`]
+    /// that binds nothing, so callers that do not care about thinking are
+    /// unaffected (GitHub #68).
     pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
-        let context = json!({
-            "messages": messages.iter().map(message_to_json).collect::<Vec<_>>(),
-            "add_generation_prompt": true,
-        });
+        self.render_context(messages, None)
+    }
+
+    /// Render a conversation with the thinking controls bound as template
+    /// variables (GitHub #68 — the template seam's options-carrying
+    /// variant).
+    ///
+    /// `enable_thinking` is always bound (never left undefined): the Qwen
+    /// 3.8 template branches on `enable_thinking is undefined or
+    /// enable_thinking is true`, so leaving it undefined and leaving it
+    /// `true` are the same thing, and binding it explicitly removes that
+    /// "which default won" ambiguity. `reasoning_effort` is bound only when
+    /// `effort` is `Some` — an unresolved effort means "let the template's
+    /// own default apply".
+    pub fn render_with_thinking(
+        &self,
+        messages: &[ChatMessage],
+        enable_thinking: bool,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<String> {
+        self.render_context(messages, Some((enable_thinking, effort)))
+    }
+
+    fn render_context(
+        &self,
+        messages: &[ChatMessage],
+        thinking: Option<(bool, Option<ReasoningEffort>)>,
+    ) -> Result<String> {
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "messages".to_owned(),
+            json!(messages.iter().map(message_to_json).collect::<Vec<_>>()),
+        );
+        context.insert("add_generation_prompt".to_owned(), json!(true));
+        if let Some((enable_thinking, effort)) = thinking {
+            context.insert("enable_thinking".to_owned(), json!(enable_thinking));
+            if let Some(effort) = effort {
+                context.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
+            }
+        }
         let template = self
             .env
             .get_template(self.name)
             .map_err(|e| fail(format!("render chat template: {e}")))?;
         template
-            .render(&context)
+            .render(&JsonValue::Object(context))
             .map_err(|e| fail(format!("render chat template: {e}")))
+    }
+
+    /// Probe this template's thinking capabilities (GitHub #68): render a
+    /// minimal one-message conversation once with thinking disabled and
+    /// once per protocol effort — a probe that raises marks that control
+    /// unsupported, one that renders marks it supported. Discovered from the
+    /// template itself, not hard-coded, so a different model's template
+    /// changes behavior without a code change.
+    pub fn probe_thinking_capabilities(&self) -> ThinkingCapabilities {
+        let probe = [ChatMessage::text(Role::User, "probe")];
+        let can_disable = self.render_with_thinking(&probe, false, None).is_ok();
+        let supported_efforts = ReasoningEffort::ALL
+            .into_iter()
+            .filter(|e| *e != ReasoningEffort::None)
+            .filter(|&effort| self.render_with_thinking(&probe, true, Some(effort)).is_ok())
+            .collect();
+        ThinkingCapabilities {
+            can_disable,
+            supported_efforts,
+        }
     }
 }
 
@@ -687,5 +901,108 @@ mod tests {
         let template = ChatTemplate::from_source(FIXTURE_TEMPLATE).expect("compile");
         let prompt = template.render(&[]).expect("render");
         assert_eq!(prompt, "END");
+    }
+
+    // -- thinking controls (GitHub #68) --------------------------------------
+
+    #[test]
+    fn reasoning_effort_round_trips_the_protocol_vocabulary() {
+        for effort in ReasoningEffort::ALL {
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+        }
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
+    }
+
+    /// A template that mimics the Qwen 3.8 shape closely enough to exercise
+    /// capability probing: it raises when asked to disable thinking, and it
+    /// raises on a `reasoning_effort` outside a small supported set — so a
+    /// probe must decide support by whether the render raises, not by
+    /// scanning the output text (a probe naively checking "did the output
+    /// change" would misjudge `medium`, which is deliberately silent here
+    /// too).
+    const THINKING_TEMPLATE: &str = r#"
+{%- if not enable_thinking -%}
+  {{- raise_exception("this template cannot disable thinking") -}}
+{%- endif -%}
+{%- if reasoning_effort is defined -%}
+  {%- if reasoning_effort not in ["low", "medium", "xhigh"] -%}
+    {{- raise_exception("Unexpected reasoning effort " ~ reasoning_effort) -}}
+  {%- elif reasoning_effort == "low" -%}
+    {{- "brief. " -}}
+  {%- elif reasoning_effort == "xhigh" -%}
+    {{- "careful. " -}}
+  {%- endif -%}
+{%- endif -%}
+enable_thinking={{ enable_thinking }};done"#;
+
+    #[test]
+    fn render_with_thinking_binds_enable_thinking_unconditionally() {
+        let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
+        let out = template
+            .render_with_thinking(&[], true, None)
+            .expect("render");
+        assert!(out.contains("enable_thinking=True"), "{out}");
+    }
+
+    #[test]
+    fn render_with_thinking_binds_reasoning_effort_only_when_resolved() {
+        let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
+        // No effort resolved: the template's own default instruction (none
+        // here) applies — no "brief."/"careful." prefix.
+        let out = template
+            .render_with_thinking(&[], true, None)
+            .expect("render");
+        assert!(!out.contains("brief.") && !out.contains("careful."), "{out}");
+        let out = template
+            .render_with_thinking(&[], true, Some(ReasoningEffort::Low))
+            .expect("render");
+        assert!(out.starts_with("brief."), "{out}");
+    }
+
+    #[test]
+    fn render_with_thinking_disabled_raises_on_a_template_that_cannot() {
+        let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
+        assert!(template.render_with_thinking(&[], false, None).is_err());
+    }
+
+    #[test]
+    fn probe_thinking_capabilities_decides_support_by_whether_the_render_raises() {
+        let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
+        let caps = template.probe_thinking_capabilities();
+        assert!(!caps.can_disable, "the template raises on disable");
+        assert!(caps.supports(ReasoningEffort::Low));
+        assert!(caps.supports(ReasoningEffort::Medium), "silent but supported");
+        assert!(caps.supports(ReasoningEffort::Xhigh));
+        assert!(!caps.supports(ReasoningEffort::Minimal));
+        assert!(!caps.supports(ReasoningEffort::High));
+        assert!(!caps.supports(ReasoningEffort::Max));
+        assert!(!caps.supports(ReasoningEffort::None), "can_disable governs None");
+    }
+
+    #[test]
+    fn permissive_capabilities_accept_every_effort_and_disable() {
+        let caps = ThinkingCapabilities::permissive();
+        assert!(caps.can_disable);
+        for effort in ReasoningEffort::ALL {
+            assert!(caps.supports(effort), "{effort:?}");
+        }
+    }
+
+    #[test]
+    fn decode_step_assembles_a_multi_token_word_and_finish_is_idle_when_confirmed() {
+        with_frontend_set(None, |_, set| {
+            // The fixture's word-level vocab: "the"=0, "quick"=1.
+            let mut state = DecodeStreamState::default();
+            let mut out = String::new();
+            for id in [0u32, 1] {
+                if let Some(chunk) = set.tokenizer().decode_step(&mut state, id).expect("step") {
+                    out.push_str(&chunk);
+                }
+            }
+            assert_eq!(out, "the quick");
+            // Every token was already confirmed into a chunk — nothing left
+            // to flush.
+            assert_eq!(set.tokenizer().decode_step_finish(&state).expect("finish"), "");
+        });
     }
 }

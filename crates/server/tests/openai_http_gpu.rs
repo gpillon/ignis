@@ -177,3 +177,40 @@ async fn a_streaming_completion_emits_token_deltas_then_a_finish_reason_chunk() 
         "finish_reason must be stop or length, got {reason}"
     );
 }
+
+/// GitHub #68: a thinking-disabled request against the real model and the
+/// real Qwen 3.8 template returns a real answer directly — the CPU gate
+/// covers every wire-contract case, but only the real template can prove
+/// `enable_thinking: false` actually reaches it and the model answers
+/// within a small budget instead of consuming it on a thinking trace.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_thinking_disabled_request_returns_a_real_answer_with_no_reasoning() {
+    let Some(h) = harness() else { return };
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "user", "content": "In one word, what is the capital of France?" }
+        ],
+        "max_tokens": 32,
+        "stream": false,
+        "enable_thinking": false
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "chat should be 200: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // No reasoning field at all (GitHub #68 story 18): thinking was
+    // disabled, so there is no trace to carry.
+    assert!(
+        v["choices"][0]["message"].as_object().unwrap().get("reasoning_content").is_none(),
+        "reasoning_content must be absent when thinking is disabled: {body}"
+    );
+
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(!content.trim().is_empty(), "a small budget must be enough for a direct answer");
+    assert!(!content.contains("<think>") && !content.contains("</think>"), "{content}");
+    // `content` parsed out of the JSON response body as a Rust `String`,
+    // which is only possible if it was valid UTF-8 — the response could
+    // not have reached this point otherwise.
+}

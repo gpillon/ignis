@@ -38,6 +38,12 @@ pub struct Request {
     pub max_tokens: u32,
     /// Whether the request was streaming (affects ttft).
     pub stream: bool,
+    /// `enable_thinking` to send on the request (GitHub #68), or `None` to
+    /// omit the field (the server's configured default applies). Only the
+    /// canary oracle recorder/comparer set this explicitly — see
+    /// `oracle::record`'s doc comment for why the G1 comparison needs
+    /// thinking disabled.
+    pub enable_thinking: Option<bool>,
 }
 
 /// The raw outcome of a single request completion.
@@ -174,6 +180,23 @@ impl HttpEndpoint {
     }
 }
 
+/// The `/v1/chat/completions` JSON body for `req` (GitHub #68: `enable_thinking`
+/// rides along only when the request set it — most replay traffic leaves it
+/// unset, letting the server's configured default apply).
+fn request_body(req: &Request) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "messages": [{ "role": "user", "content": req.prompt }],
+        "max_tokens": req.max_tokens,
+        "temperature": 0,
+        "seed": 0,
+        "stream": req.stream,
+    });
+    if let Some(enable_thinking) = req.enable_thinking {
+        body["enable_thinking"] = serde_json::json!(enable_thinking);
+    }
+    body
+}
+
 impl Endpoint for HttpEndpoint {
     fn complete(&self, req: &Request) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -182,13 +205,7 @@ impl Endpoint for HttpEndpoint {
         // carried inside the prompt text). `temperature: 0` + `seed: 0` pin
         // the greedy + fixed-seed contract of the v1 gate (ADR 0007 — the
         // server's defaults, sent explicitly).
-        let body = serde_json::json!({
-            "messages": [{ "role": "user", "content": req.prompt }],
-            "max_tokens": req.max_tokens,
-            "temperature": 0,
-            "seed": 0,
-            "stream": req.stream,
-        });
+        let body = request_body(req);
         let start = Instant::now();
         let resp = self
             .client
@@ -407,6 +424,32 @@ pub fn replay(ep: Arc<dyn Endpoint>, trace: &Trace, cfg: &ReplayConfig) -> Vec<R
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_body_omits_enable_thinking_when_unset() {
+        let req = Request {
+            id: "r".into(),
+            class: RequestClass::Sub,
+            prompt: "p".into(),
+            max_tokens: 4,
+            stream: false,
+            enable_thinking: None,
+        };
+        assert!(request_body(&req).get("enable_thinking").is_none());
+    }
+
+    #[test]
+    fn request_body_sends_enable_thinking_when_set() {
+        let req = Request {
+            id: "r".into(),
+            class: RequestClass::Sub,
+            prompt: "p".into(),
+            max_tokens: 4,
+            stream: false,
+            enable_thinking: Some(false),
+        };
+        assert_eq!(request_body(&req)["enable_thinking"], false);
+    }
+
     fn trace_jsonl() -> String {
         [
             r#"{"id":"main","class":"main","t_arrive_ms":0,"prompt":"P","max_tokens":512,"stream":true}"#,
@@ -496,6 +539,7 @@ mod tests {
             prompt: "p".into(),
             max_tokens: 1,
             stream: false,
+            enable_thinking: None,
         };
         let o = MockEndpoint::fallback_for(&req);
         let m = RequestMetrics {

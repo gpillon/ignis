@@ -14,6 +14,7 @@
 //! request, 503 engine full, 504 the engine did not finish the request in
 //! the timeout).
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,11 +29,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
 
+use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{collect_tokens, EventStream};
 use crate::template::{ChatMessage, TemplateProvider};
+use crate::thinking::{self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields};
 use crate::Server;
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
@@ -87,6 +91,7 @@ fn build_request(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     seed: Option<u64>,
+    thinking: &ThinkingOptions,
 ) -> (RequestInput, String, u32) {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
@@ -97,7 +102,7 @@ fn build_request(
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let tokens = server.template.apply_chat_template(messages);
+    let tokens = server.template.apply_chat_template(messages, thinking);
     let prompt_tokens = tokens.len() as u32;
     let input = RequestInput {
         model: model.clone(),
@@ -109,6 +114,53 @@ fn build_request(
         },
     };
     (input, model, prompt_tokens)
+}
+
+/// Resolve one request's thinking controls, or the OpenAI-shaped 400 to
+/// return instead. Validation errors and capability errors carry different
+/// `code`s (the client's mistake vs. the loaded model's limitation).
+fn resolve_thinking(
+    server: &Server,
+    fields: ThinkingRequestFields<'_>,
+) -> Result<ThinkingOptions, Response> {
+    let defaults = ThinkingDefaults {
+        enable_thinking: server.default_enable_thinking,
+        reasoning_effort: server.default_reasoning_effort,
+    };
+    let capabilities = server.template.thinking_capabilities();
+    thinking::resolve(fields, &defaults, &capabilities).map_err(|err| match err {
+        ThinkingError::Validation(message) => bad_request(&message),
+        ThinkingError::Capability(message) => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "reasoning_effort_unsupported",
+            message,
+        ),
+    })
+}
+
+/// Split a finished generation's tokens into `reasoning_content` /
+/// `content` (GitHub #68): feeds the whole token list through the same
+/// [`OutputDecoder`] the streaming path uses one token at a time, so the
+/// two modes agree by construction (spec story 24).
+fn split_reasoning(
+    template: &dyn TemplateProvider,
+    tokens: &[ignis_core::TokenId],
+    thinking: &ThinkingOptions,
+) -> (Option<String>, String) {
+    let starts_in_reasoning = template.decoder_starts_in_reasoning(thinking);
+    let mut decoder = OutputDecoder::new(template.token_decoder(), starts_in_reasoning);
+    let mut deltas = decoder.push(tokens);
+    deltas.extend(decoder.finish());
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    for delta in deltas {
+        match delta.channel {
+            Channel::Reasoning => reasoning.push_str(&delta.text),
+            Channel::Content => content.push_str(&delta.text),
+        }
+    }
+    (if reasoning.is_empty() { None } else { Some(reasoning) }, content)
 }
 
 /// Map a [`SubmitError`] from the engine's submit to the OpenAI-shaped
@@ -227,6 +279,14 @@ struct ChatCompletionsRequest {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     seed: Option<u64>,
+    /// The thinking controls (GitHub #68) — kept as raw JSON so the wire
+    /// contract's tri-state semantics (absent / `null` / a bad type) and
+    /// its own error messages are decided by `thinking::resolve`, not by
+    /// serde's generic type-mismatch error.
+    enable_thinking: Option<JsonValue>,
+    reasoning_effort: Option<JsonValue>,
+    preserve_thinking: Option<JsonValue>,
+    chat_template_kwargs: Option<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +308,18 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
+    let thinking = match resolve_thinking(
+        &server,
+        ThinkingRequestFields {
+            enable_thinking: req.enable_thinking.as_ref(),
+            reasoning_effort: req.reasoning_effort.as_ref(),
+            preserve_thinking: req.preserve_thinking.as_ref(),
+            chat_template_kwargs: req.chat_template_kwargs.as_ref(),
+        },
+    ) {
+        Ok(t) => t,
+        Err(response) => return response,
+    };
     let (input, model, prompt_tokens) = build_request(
         &server,
         req.model,
@@ -255,6 +327,7 @@ async fn chat_completions(
         req.temperature,
         req.max_tokens,
         req.seed,
+        &thinking,
     );
     let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive) {
         Ok(x) => x,
@@ -267,12 +340,13 @@ async fn chat_completions(
         // The SSE response: the request's event stream wrapped in the
         // `chat.completion.chunk` shape (a `[DONE]` marker terminates).
         let include_usage = req.stream_options.is_some_and(|o| o.include_usage);
+        let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
         return Sse::new(ChunkStream::new(
             stream,
             id,
             created,
             model,
-            server.template.clone(),
+            OutputDecoder::new(server.template.token_decoder(), starts_in_reasoning),
             prompt_tokens,
             include_usage,
         ))
@@ -282,7 +356,8 @@ async fn chat_completions(
     // timeout guards a wedged engine from hanging the client).
     match collect_tokens(&mut stream, server.request_timeout).await {
         Ok((tokens, reason)) => {
-            let content = server.template.render_tokens(&tokens);
+            let (reasoning_content, content) =
+                split_reasoning(server.template.as_ref(), &tokens, &thinking);
             let completion_tokens = tokens.len() as u32;
             Json(ChatCompletion {
                 id,
@@ -293,6 +368,7 @@ async fn chat_completions(
                     index: 0,
                     message: AssistantMessage {
                         role: "assistant",
+                        reasoning_content,
                         content,
                     },
                     finish_reason: finish_reason_str(reason),
@@ -335,6 +411,12 @@ struct CompletionChoice {
 #[derive(Serialize)]
 struct AssistantMessage {
     role: &'static str,
+    /// The model's thinking trace (GitHub #68) — omitted entirely (not
+    /// serialized as an empty string) when thinking produced no reasoning,
+    /// so a thinking-disabled response is structurally distinct from a
+    /// thinking-enabled one that happened to reason not at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     content: String,
 }
 
@@ -367,10 +449,12 @@ struct ChunkChoice {
     finish_reason: Option<&'static str>,
 }
 
-/// The token delta. An empty `content` serializes to `{}` (OpenAI's final
-/// chunk shape).
-#[derive(Serialize)]
+/// The token delta. An empty `content` and absent `reasoning_content`
+/// serialize to `{}` (OpenAI's final chunk shape).
+#[derive(Serialize, Default)]
 struct Delta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     content: String,
 }
@@ -388,15 +472,21 @@ struct ChunkStream {
     id: String,
     created: u64,
     model: String,
-    template: Arc<dyn TemplateProvider>,
+    /// The incremental reasoning/content decoder (GitHub #68) — owns the
+    /// byte- and marker-splitting state across this request's whole token
+    /// stream (`crate::decoder::OutputDecoder`).
+    decoder: OutputDecoder,
     prompt_tokens: u32,
     /// `stream_options.include_usage` — gates the trailing usage chunk
     /// (OpenAI only sends it when the client opts in).
     include_usage: bool,
-    /// The final usage chunk, queued between the `finish_reason` chunk and
-    /// the `[DONE]` marker (set once the request's `Done` event arrives, and
-    /// only when `include_usage` is set).
-    pending_usage: Option<Event>,
+    /// Fully-formed events queued ahead of the next stream poll: a single
+    /// generated token can yield zero, one, or two decoder deltas (a
+    /// reasoning tail plus a content head, right at the `</think>`
+    /// marker), and the `Done` event queues its flush deltas, the
+    /// `finish_reason` chunk, and (opt-in) the usage chunk together, in
+    /// that order, ahead of `[DONE]`.
+    pending: VecDeque<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
 }
@@ -407,7 +497,7 @@ impl ChunkStream {
         id: String,
         created: u64,
         model: String,
-        template: Arc<dyn TemplateProvider>,
+        decoder: OutputDecoder,
         prompt_tokens: u32,
         include_usage: bool,
     ) -> Self {
@@ -416,16 +506,16 @@ impl ChunkStream {
             id,
             created,
             model,
-            template,
+            decoder,
             prompt_tokens,
             include_usage,
-            pending_usage: None,
+            pending: VecDeque::new(),
             done_sent: false,
         }
     }
 
-    /// One chunk (a token delta or the final `finish_reason` chunk).
-    fn chunk(&self, content: &str, finish_reason: Option<&'static str>) -> Event {
+    /// One chunk (a decoded delta or the final `finish_reason` chunk).
+    fn chunk(&self, delta: Delta, finish_reason: Option<&'static str>) -> Event {
         let chunk = Chunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",
@@ -433,15 +523,29 @@ impl ChunkStream {
             model: self.model.clone(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta {
-                    content: content.to_string(),
-                },
+                delta,
                 finish_reason,
             }],
             usage: None,
         };
         // `serde_json` cannot fail on this (all serializable fields).
         Event::default().data(serde_json::to_string(&chunk).expect("chunk serializes"))
+    }
+
+    /// One decoder delta as its SSE chunk (`delta.reasoning_content` or
+    /// `delta.content`, never both — GitHub #68).
+    fn delta_chunk(&self, delta: crate::decoder::Delta) -> Event {
+        let delta = match delta.channel {
+            Channel::Reasoning => Delta {
+                reasoning_content: Some(delta.text),
+                content: String::new(),
+            },
+            Channel::Content => Delta {
+                reasoning_content: None,
+                content: delta.text,
+            },
+        };
+        self.chunk(delta, None)
     }
 
     /// The final summary chunk: empty `choices`, populated `usage` (OpenAI's
@@ -468,7 +572,10 @@ impl ChunkStream {
 /// Pulls one event per poll (the driver routes events into the stream as
 /// they are generated — tokens arrive in generation order); an `Evicted` /
 /// `Restored` event for the request is skipped (it does not change the
-/// generated-token sequence).
+/// generated-token sequence). A single scheduler event can queue more than
+/// one SSE chunk (or none at all, while the decoder is holding back a
+/// multi-byte character or a possible `</think>` prefix) — queued chunks
+/// drain before the stream is polled again.
 impl Stream for ChunkStream {
     type Item = Result<Event, Infallible>;
 
@@ -476,12 +583,10 @@ impl Stream for ChunkStream {
         // `ChunkStream` is `Unpin` (all fields are `Unpin`), so we can get a
         // plain `&mut` back out of the pinned self.
         let this = self.get_mut();
-        // The queued usage chunk (set when the `Done` event was handled)
-        // goes out before anything else is polled from the stream.
-        if let Some(usage) = this.pending_usage.take() {
-            return Poll::Ready(Some(Ok(usage)));
-        }
         loop {
+            if let Some(event) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
             match this.stream.poll_recv(cx) {
                 Poll::Ready(None) => {
                     // Stream closed (the request completed and the engine
@@ -496,21 +601,26 @@ impl Stream for ChunkStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(event)) => match event {
                     SchedEvent::Token { token, .. } => {
-                        // The template seam: token id → response text
-                        // (artifact-02's real tokenizer replaces this
-                        // built-in rendering).
-                        let content = this.template.render_tokens(std::slice::from_ref(&token));
-                        return Poll::Ready(Some(Ok(this.chunk(&content, None))));
-                    }
-                    // The request completed: the final chunk (finish
-                    // reason) now, the usage summary chunk queued for the
-                    // next poll, then the `[DONE]` marker once the stream
-                    // closes.
-                    SchedEvent::Done { reason, tokens, .. } => {
-                        if this.include_usage {
-                            this.pending_usage = Some(this.usage_chunk(tokens));
+                        // The incremental decoder: zero, one, or two deltas
+                        // for this token (GitHub #68). Zero means the
+                        // decoder is holding back — loop to poll the next
+                        // scheduler event rather than returning nothing.
+                        for delta in this.decoder.push(&[token]) {
+                            this.pending.push_back(this.delta_chunk(delta));
                         }
-                        return Poll::Ready(Some(Ok(this.chunk("", Some(finish_reason_str(reason))))));
+                    }
+                    // The request completed: flush whatever the decoder
+                    // held back, then the finish-reason chunk, then (opt-in)
+                    // the usage chunk — all queued ahead of `[DONE]`.
+                    SchedEvent::Done { reason, tokens, .. } => {
+                        for delta in this.decoder.finish() {
+                            this.pending.push_back(this.delta_chunk(delta));
+                        }
+                        this.pending
+                            .push_back(this.chunk(Delta::default(), Some(finish_reason_str(reason))));
+                        if this.include_usage {
+                            this.pending.push_back(this.usage_chunk(tokens));
+                        }
                     }
                     // Other events for this request (admissions,
                     // evictions, restorations, requeues) do not change the
@@ -538,6 +648,12 @@ struct ResponsesRequest {
     // streaming response is a later ticket).
     #[serde(default)]
     stream: bool,
+    /// The thinking controls (GitHub #68) — same wire contract as chat
+    /// completions, resolved through the same `thinking::resolve` path.
+    enable_thinking: Option<JsonValue>,
+    reasoning_effort: Option<JsonValue>,
+    preserve_thinking: Option<JsonValue>,
+    chat_template_kwargs: Option<JsonValue>,
 }
 
 /// The responses API's `input` (a string or a message list).
@@ -566,15 +682,24 @@ async fn responses_api(
     // `input` → messages: a string is a single user turn; a message list is
     // used as-is (an empty list is a 400).
     let messages = match req.input {
-        ResponsesInput::Text(text) => vec![ChatMessage {
-            role: "user".into(),
-            content: text,
-        }],
+        ResponsesInput::Text(text) => vec![ChatMessage::text("user", text)],
         ResponsesInput::Messages(m) => m,
     };
     if messages.is_empty() {
         return bad_request("input must not be empty");
     }
+    let thinking = match resolve_thinking(
+        &server,
+        ThinkingRequestFields {
+            enable_thinking: req.enable_thinking.as_ref(),
+            reasoning_effort: req.reasoning_effort.as_ref(),
+            preserve_thinking: req.preserve_thinking.as_ref(),
+            chat_template_kwargs: req.chat_template_kwargs.as_ref(),
+        },
+    ) {
+        Ok(t) => t,
+        Err(response) => return response,
+    };
     let (input, model, prompt_tokens) = build_request(
         &server,
         req.model,
@@ -582,6 +707,7 @@ async fn responses_api(
         req.temperature,
         req.max_output_tokens,
         req.seed,
+        &thinking,
     );
     let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive) {
         Ok(x) => x,
@@ -592,9 +718,11 @@ async fn responses_api(
             // The responses API's v1 shape carries no `finish_reason`
             // field (only `status: "completed"`); the stop reason is not
             // surfaced here.
-            // The generated text (the template seam: artifact-02's
-            // tokenizer renders real text here).
-            let text = server.template.render_tokens(&tokens);
+            // GitHub #68: `text` is the content channel only — the
+            // reasoning trace is discarded (this endpoint has no field to
+            // carry it, and leaking it into `text` is the bug being fixed).
+            let (_reasoning_content, text) =
+                split_reasoning(server.template.as_ref(), &tokens, &thinking);
             let output_tokens = tokens.len() as u32;
             Json(Responses {
                 id: format!("resp_{id}"),
@@ -696,6 +824,7 @@ mod tests {
             choices: vec![ChunkChoice {
                 index: 0,
                 delta: Delta {
+                    reasoning_content: None,
                     content: "hello".into(),
                 },
                 finish_reason: None,
@@ -722,9 +851,7 @@ mod tests {
             model: "test-model".into(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta {
-                    content: String::new(),
-                },
+                delta: Delta::default(),
                 finish_reason: Some("stop"),
             }],
             usage: None,

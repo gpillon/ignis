@@ -103,6 +103,11 @@ impl Fixture {
 /// with `tokenizer`. `model` and `max_tokens` are stamped into the fixture
 /// as recorded (the caller probes `model` via `Endpoint::list_models`-style
 /// preflight, matching `canary`/`replay`'s existing CLI pattern).
+///
+/// `enable_thinking: false` is sent on every request (GitHub #68): the
+/// oracle fixture was recorded from the reference with thinking off, so a
+/// candidate fixture recorded any other way compares a template difference
+/// instead of engine agreement.
 pub fn record(
     ep: &dyn Endpoint,
     tokenizer: &dyn Tokenize,
@@ -117,6 +122,7 @@ pub fn record(
             prompt: c.prompt.to_string(),
             max_tokens,
             stream: false,
+            enable_thinking: Some(false),
         };
         let outcome = ep
             .complete(&req)
@@ -445,6 +451,14 @@ mod tests {
         let received = ep.received.lock().unwrap();
         assert_eq!(received.len(), CANARIES.len());
         assert!(received.iter().all(|r| r.max_tokens == 7 && !r.stream));
+        // GitHub #68: the recorder drives thinking disabled — the recorded
+        // candidate must describe the same prompt as the thinking-off
+        // reference fixture, or the G1 comparison measures a template
+        // difference instead of engine agreement.
+        assert!(
+            received.iter().all(|r| r.enable_thinking == Some(false)),
+            "oracle record must send enable_thinking: false"
+        );
     }
 
     #[test]

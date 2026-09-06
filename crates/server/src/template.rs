@@ -20,6 +20,9 @@
 use ignis_core::TokenId;
 use serde::{Deserialize, Serialize};
 
+use crate::decoder::TokenDecoder;
+use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
+
 /// One conversation message in OpenAI wire shape (`role` + `content`).
 ///
 /// `content` is the plain-string form (v1: the structured content-parts
@@ -30,6 +33,21 @@ pub struct ChatMessage {
     pub role: String,
     /// The message text.
     pub content: String,
+    /// A prior assistant turn's thinking trace (GitHub #68). Dropped before
+    /// rendering unless the request sets `preserve_thinking: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    /// A message with plain content and no prior reasoning.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
 }
 
 /// The template / tokenizer seam (artifact-02 plugs the real implementation
@@ -42,11 +60,44 @@ pub struct ChatMessage {
 /// instance across request handlers).
 pub trait TemplateProvider: Send + Sync {
     /// Apply the chat template: the templated prompt tokens for
-    /// `messages` (the scheduler prompt — role markers, delimiters, etc.).
-    fn apply_chat_template(&self, messages: &[ChatMessage]) -> Vec<TokenId>;
+    /// `messages` (the scheduler prompt — role markers, delimiters, etc.),
+    /// with `options` (GitHub #68) the second — and only other — thing that
+    /// crosses this seam.
+    fn apply_chat_template(&self, messages: &[ChatMessage], options: &ThinkingOptions) -> Vec<TokenId>;
 
-    /// Render generated tokens to the response text (`content` / `text`).
+    /// Render generated tokens to the response text (`content` / `text`) —
+    /// a whole-list decode, unaware of the reasoning/content split.
     fn render_tokens(&self, tokens: &[TokenId]) -> String;
+
+    /// The thinking controls this provider's template supports (GitHub
+    /// #68). The built-in placeholder has no jinja template to probe, so it
+    /// imposes no capability limits of its own.
+    fn thinking_capabilities(&self) -> ThinkingCapabilities;
+
+    /// A fresh incremental token→text decoder for one request (GitHub #68):
+    /// the byte-completeness half of the streaming split — see
+    /// [`crate::decoder::OutputDecoder`] for the marker-splitting half built
+    /// on top of it.
+    fn token_decoder(&self) -> Box<dyn TokenDecoder>;
+
+    /// Whether [`crate::decoder::OutputDecoder`] should start a request in
+    /// the reasoning channel (GitHub #68).
+    ///
+    /// A real thinking-aware template opens thinking-enabled generation
+    /// directly in reasoning text — the prompt already primed the opening
+    /// `<think>` tag, so there is no marker to wait for before the model's
+    /// first generated token is genuinely reasoning. The default answers
+    /// `thinking.enable_thinking`, which is correct for such a provider.
+    ///
+    /// A provider whose output can never actually separate into two
+    /// channels (the built-in placeholder: no jinja template, no
+    /// `</think>` it could ever emit) must override this to always return
+    /// `false` — otherwise a thinking-enabled request would misclassify
+    /// its entire output as reasoning purely because no marker can ever
+    /// arrive to prove otherwise.
+    fn decoder_starts_in_reasoning(&self, thinking: &ThinkingOptions) -> bool {
+        thinking.enable_thinking
+    }
 }
 
 /// The minimal built-in provider (v1 placeholder, replaced by artifact-02):
@@ -61,7 +112,11 @@ pub trait TemplateProvider: Send + Sync {
 pub struct SimpleTemplateProvider;
 
 impl TemplateProvider for SimpleTemplateProvider {
-    fn apply_chat_template(&self, messages: &[ChatMessage]) -> Vec<TokenId> {
+    fn apply_chat_template(&self, messages: &[ChatMessage], _options: &ThinkingOptions) -> Vec<TokenId> {
+        // The placeholder has no jinja template to bind thinking variables
+        // into — it ignores `options` (a test-only `TemplateProvider` that
+        // wants to observe the resolved options records them itself; see
+        // `openai_http.rs`'s recording double).
         messages
             .iter()
             .flat_map(|m| {
@@ -78,6 +133,45 @@ impl TemplateProvider for SimpleTemplateProvider {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn thinking_capabilities(&self) -> ThinkingCapabilities {
+        ThinkingCapabilities::permissive()
+    }
+
+    fn token_decoder(&self) -> Box<dyn TokenDecoder> {
+        Box::new(SimpleTokenDecoder { first: true })
+    }
+
+    fn decoder_starts_in_reasoning(&self, _thinking: &ThinkingOptions) -> bool {
+        // The placeholder has no jinja template and can never emit a
+        // `</think>` marker — it never produces a reasoning span, so its
+        // output is always content regardless of the resolved thinking
+        // options (see the trait doc for why this must not default to
+        // `thinking.enable_thinking` here).
+        false
+    }
+}
+
+/// The placeholder's incremental decoder: the same decimal-id, space-joined
+/// rendering as [`SimpleTemplateProvider::render_tokens`], but one token at
+/// a time. Every token is plain ASCII, so there is no multi-byte concern to
+/// hold back.
+struct SimpleTokenDecoder {
+    first: bool,
+}
+
+impl TokenDecoder for SimpleTokenDecoder {
+    fn push(&mut self, token: TokenId) -> String {
+        if std::mem::replace(&mut self.first, false) {
+            token.to_string()
+        } else {
+            format!(" {token}")
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        String::new()
     }
 }
 
@@ -97,39 +191,40 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.into(),
-            content: content.into(),
-        }
+        ChatMessage::text(role, content)
+    }
+
+    fn opts() -> ThinkingOptions {
+        ThinkingOptions::default()
     }
 
     #[test]
     fn template_is_deterministic() {
         let p = SimpleTemplateProvider;
         let messages = [msg("user", "hello world"), msg("assistant", "hi")];
-        let a = p.apply_chat_template(&messages);
-        let b = p.apply_chat_template(&messages);
+        let a = p.apply_chat_template(&messages, &opts());
+        let b = p.apply_chat_template(&messages, &opts());
         assert_eq!(a, b, "the same conversation must template identically");
     }
 
     #[test]
     fn one_token_per_word_and_role_scoped() {
         let p = SimpleTemplateProvider;
-        let tokens = p.apply_chat_template(&[msg("user", "a b c")]);
+        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts());
         assert_eq!(tokens.len(), 3, "one token per whitespace word");
         // The same word under a different role is a different token (the
         // role is part of the hashed key).
-        let other = p.apply_chat_template(&[msg("assistant", "a")]);
-        let user_a = p.apply_chat_template(&[msg("user", "a")]);
+        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts());
+        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts());
         assert_ne!(other, user_a);
     }
 
     #[test]
     fn empty_conversation_has_no_tokens() {
         let p = SimpleTemplateProvider;
-        assert!(p.apply_chat_template(&[]).is_empty());
+        assert!(p.apply_chat_template(&[], &opts()).is_empty());
         assert!(p
-            .apply_chat_template(&[msg("user", "   ")])
+            .apply_chat_template(&[msg("user", "   ")], &opts())
             .is_empty());
     }
 
@@ -138,5 +233,24 @@ mod tests {
         let p = SimpleTemplateProvider;
         assert_eq!(p.render_tokens(&[7, 42, 3]), "7 42 3");
         assert_eq!(p.render_tokens(&[]), "");
+    }
+
+    #[test]
+    fn the_placeholder_accepts_every_thinking_control() {
+        let caps = SimpleTemplateProvider.thinking_capabilities();
+        assert!(caps.can_disable);
+        assert!(caps.supports(crate::thinking::ReasoningEffort::Xhigh));
+    }
+
+    #[test]
+    fn the_incremental_decoder_matches_the_whole_list_render() {
+        let p = SimpleTemplateProvider;
+        let mut decoder = p.token_decoder();
+        let mut out = String::new();
+        for &t in &[7u32, 42, 3] {
+            out.push_str(&decoder.push(t));
+        }
+        out.push_str(&decoder.finish());
+        assert_eq!(out, p.render_tokens(&[7, 42, 3]));
     }
 }

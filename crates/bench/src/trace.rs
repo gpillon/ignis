@@ -80,6 +80,7 @@ impl TraceLine {
             prompt: self.prompt.clone(),
             max_tokens: self.max_tokens,
             stream: self.stream,
+            enable_thinking: None,
         }
     }
 }

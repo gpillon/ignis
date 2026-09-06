@@ -163,19 +163,28 @@ async fn chat_completions_streaming_emits_chunks_then_done() {
     // 3 token chunks + 1 final finish-reason chunk. No `stream_options` was
     // sent, so no trailing usage chunk (OpenAI only sends it opt-in).
     assert_eq!(chunks.len(), 4, "3 tokens + final chunk: {body}");
-    // The 3 token chunks carry the mock's exact token ids (request 0).
+    // The 3 token chunks carry the mock's exact token ids (request 0). The
+    // incremental decoder (GitHub #68) reproduces the whole-list render's
+    // space-joined shape by construction: the first chunk is bare, every
+    // later one carries its leading separator space.
     let expected_tokens = mock_tokens(0, 3);
     for (i, chunk) in chunks.iter().take(3).enumerate() {
-        assert_eq!(chunk["choices"][0]["delta"]["content"], expected_tokens[i].to_string());
+        let expected = if i == 0 {
+            expected_tokens[i].to_string()
+        } else {
+            format!(" {}", expected_tokens[i])
+        };
+        assert_eq!(chunk["choices"][0]["delta"]["content"], expected);
     }
     // The final chunk: finish_reason set, empty delta. The mock has no
     // real EOS, so hitting `max_tokens` reports `length` (GitHub #61).
     assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
-    // The token sequence, re-rendered, matches the built-in template.
+    // The token sequence, re-rendered, matches the built-in template —
+    // plain concatenation now that each delta carries its own separator
+    // (story 24: streaming and non-streaming agree by construction).
     let streamed_content: String = chunks.iter().take(3)
         .map(|c| c["choices"][0]["delta"]["content"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
     assert_eq!(streamed_content, rendered(&expected_tokens));
 }
 
