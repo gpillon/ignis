@@ -32,3 +32,10 @@ See `docs/agents/domain.md`.
 
 Every code change ships with a test, and the task is not complete until
 `cargo test` passes workspace-wide. See `docs/agents/testing.md`.
+
+### Worktrees
+
+All git worktrees for this repo live under `../.inference-qwen-worktrees/`
+(sibling of the repo root), one subdirectory per issue/feature. Do not create
+worktrees anywhere else (e.g. no separate `.inference-claude-worktrees/`) —
+one shared location for every agent.
