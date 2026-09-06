@@ -131,7 +131,11 @@ canonical `kernel/build/`.
 ### 2. Rust workspace
 
 ```
-cargo build -p ignis-server --features cuda
+# GPU-backed (real model, needs the kernel leaf built and IGNIS_ARTIFACT set)
+cargo build --release -p ignis-server --features cuda
+
+# CPU-only mock (protocol/loop work, no GPU, no kernel leaf needed)
+cargo build --release -p ignis-server
 ```
 
 - **`--features cuda`** enables the production GPU-backed compute backend
@@ -140,6 +144,8 @@ cargo build -p ignis-server --features cuda
 - **Without `--features cuda`, or without an artifact**, the server runs in
   ADR 0006 dev mode: a deterministic CPU-only mock (`MockCompute`), for
   protocol and loop work without a GPU.
+- Drop `--release` for a debug build (slower, faster to compile); the binary
+  then lands under `target/x86_64-pc-windows-msvc/debug/` instead of `release/`.
 
 The cargo build reuses an already-built `kernel/build/ignis_kernel.lib` when
 present (incremental), so it does not recompile the C++ leaf from scratch each
@@ -155,6 +161,32 @@ requires the 5090 to be free and **fails** — never skips — when the GPU is b
 or a kernel errors (ADR 0006; a skip is not green for compute work). The kernel
 leaf additionally has its own CTest executable running each vendored op's
 reference test at real 27B geometry (ADR 0010).
+
+## Models (`./models`)
+
+`./models` is a symlink to `F:\ai\q38\ninfer-models` (the shared model store —
+also used by `ninfer` itself, on the same 5090). Current contents:
+
+| File | Size | Notes |
+|---|---|---|
+| `qwen3_8_27b_nvfp4full-v2.ninfer` | ~19.4 GB | **The correct artifact — use this one.** v2: same base tensors as v1 (bit-identical) plus a grafted DFlash2 speculative-decoding drafter module. Has a matching `.sha256` and `.README.md` (full provenance) alongside it. |
+| `qwen3_8_27b_nvfp4full.ninfer` | ~18.3 GB | v1 (pre-DFlash2). Legacy — kept for comparison/rollback, not the one to point `IGNIS_ARTIFACT` at. |
+| `qwen3_8_27b_nvfp4full-v2.ninfer.graft.json` | — | The DFlash2 graft manifest for v2 (which objects were appended, and how). |
+| `qwen3_8_27b_nvfp4full-v2.ninfer.sha256` | — | Checksum for v2; the server verifies it at load and refuses to start if it does not match. |
+| `qwen3_8_27b_nvfp4full.ninfer.conversion.json` | — | v1's conversion manifest. |
+| `.cache/`, `.ninfer-webui.*.tmp/`, `webui/` | — | ninfer's own scratch/webui state — not ours, ignore. |
+
+Point `IGNIS_ARTIFACT` at the v2 file (relative path works since `./models` is
+a symlink into the real store):
+
+```
+set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
+```
+
+ignis does not use DFlash2 speculative decoding itself (that is a `ninfer`
+CLI flag, `--spec dflash2`) — for ignis, v2 is used purely because it carries
+the same verified base weights as v1 with nothing removed; the drafter module
+sits unused in the container and costs no VRAM unless materialized.
 
 ## Usage (in development)
 
@@ -188,8 +220,8 @@ evolve as the engine matures.
 ### Launch
 
 ```
-set IGNIS_ARTIFACT=F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
-target\x86_64-pc-windows-msvc\debug\ignis-server.exe
+set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
+target\x86_64-pc-windows-msvc\release\ignis-server.exe
 ```
 
 At startup the server verifies the artifact, loads the real tokenizer + chat
