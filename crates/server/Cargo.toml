@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 ignis-core = { path = "../core" }
 ignis-artifact = { path = "../artifact" }
+ignis-runtime = { path = "../runtime" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }

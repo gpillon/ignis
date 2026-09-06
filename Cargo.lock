@@ -634,6 +634,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignis-runtime"
+version = "0.1.0"
+dependencies = [
+ "ignis-core",
+]
+
+[[package]]
 name = "ignis-server"
 version = "0.1.0"
 dependencies = [
@@ -641,6 +648,7 @@ dependencies = [
  "futures-core",
  "ignis-artifact",
  "ignis-core",
+ "ignis-runtime",
  "serde",
  "serde_json",
  "tokio",

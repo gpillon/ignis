@@ -29,6 +29,13 @@ pub struct PrefillJob {
     /// tail (a full-prompt match) warms nothing: the job only sets up the
     /// decode state.
     pub tokens: Vec<TokenId>,
+    /// Total sequence reservation, including the prompt and effective
+    /// generation cap. The runtime uses it when it first allocates a leaf
+    /// sequence for this request.
+    pub context_tokens: u32,
+    /// Position of `tokens[0]` in the sequence (nonzero after shared-prefix
+    /// reuse).
+    pub start_position: u32,
     /// The request's generation parameters (carried so the backend can set
     /// up the decode state; prefill only warms the KV).
     pub params: DecodeParams,
@@ -62,6 +69,10 @@ pub trait Compute: Send + Sync {
     /// Returns, per job in order, the token generated this step, or `None` if
     /// that request finished this step (reached `max_tokens` / EOS).
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError>;
+
+    /// Release leaf-owned state for a request that completed or was evicted.
+    /// CPU-only compute implementations need no lifecycle bookkeeping.
+    fn release(&self, _request: RequestId) {}
 }
 
 /// The engine's scheduling interface — what the server drives.
