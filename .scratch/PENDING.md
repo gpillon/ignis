@@ -13,9 +13,10 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
 
 - **G1 — a correct, device-resident forward pass (GitHub #36, spec
   `.scratch/runtime/specs/01-device-resident-forward.md`, ADR 0009/0010).**
-  ignis does not yet compute the model. The forward pass is being rebuilt as a
-  device-resident program in the kernel leaf behind a step-level C ABI, on
-  vendored reference ops. Until the G1 gate is recorded green on a free RTX
+  ignis computes the model and produces coherent greedy completions as of the
+  RMSNorm `unit_offset` fix (#67), but the gate is **not** green: first-32-token
+  agreement with the canary oracle is 52%, against a ≥ 95% floor (see the
+  canary-divergence item below). Until the G1 gate is recorded green on a free RTX
   5090 — coherent greedy completions on the canary suite, per-layer output
   within bf16 tolerance of the f64 layer reference, ≥ 95% first-32-token
   agreement with the canary oracle, EOS honored, reproducible across loads —
@@ -25,15 +26,23 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   do not resurrect it. Owner: the runtime work, tickets #37–#62.
   Blocker: the work itself, plus GPU exclusivity for the gate run (ADR 0006).
 
-- **Canary oracle fixture recording (GitHub #41, spec 01 — human
-  prerequisite).** The G1 agreement check needs a recorded fixture: 3 canary
-  prompts × 32 greedy tokens, recorded against the *reference* engine (ninfer)
-  with exact argmax over its HTTP API, on the same artifact, tokenized with the
-  artifact's tokenizer. The tooling (recorder + comparer + fixture format) is
-  agent work (#40); the recording itself is **operational** — it needs the
-  reference stack running and the GPU (ADR 0006: one engine at a time, so the
-  recording and any ignis GPU run are sequential). Owner: human.
-  Blocker: a live reference stack + GPU exclusivity.
+- **Two canaries diverge from the oracle at token 0 (no ticket yet; blocks
+  G1).** With the RMSNorm convention fixed (#67) and the chat template's
+  thinking disabled to match how the oracle was recorded, `rust-hello` scores
+  21/21 and `math-greedy` 32/32 — exact agreement with the reference. But
+  `rust-sort` and `explain-reverse` score 0/32 and 0/17, diverging at the very
+  first generated token, which puts the suite at 52% against the ≥ 95% G1
+  floor. Both produce correct, fluent answers (`` `v` is set to `[1, 2, 3]`. ``
+  and a correct one-sentence description of `Vec::reverse`), just different
+  wording from the oracle's — so this is not the #67 class of failure. The
+  working theory is an argmax near-tie flipped by a residual numeric
+  difference; once flipped, the trajectory diverges entirely. Confirming that
+  needs logits, which the server does not expose: the next boundary is top-k
+  IDs and values after the final head, for the same tokenized prompt, on both
+  engines. Note this cannot be measured through the HTTP surface until
+  `enable_thinking` lands (#68), because ignis cannot currently reproduce the
+  prompt the oracle was recorded with. Owner: unassigned.
+  Blocker: #68 for a repeatable harness, plus GPU exclusivity (ADR 0006).
 
 - **The GPU profile's fail-never-skip rule is called but not yet exercised
   green (GitHub #38/#53, ADR 0006).** P1-17 (#53) landed the first caller:
