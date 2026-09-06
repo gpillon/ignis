@@ -34,6 +34,9 @@ mod tests {
             Ok(())
         }
         fn release_model(&self, _model: Self::Model) {}
+        fn stats(&self, _model: &Self::Model) -> Result<ignis_runtime::RuntimeStats, i32> {
+            Ok(ignis_runtime::RuntimeStats::default())
+        }
         fn allocate_sequence(
             &self,
             _model: &Self::Model,
@@ -54,9 +57,9 @@ mod tests {
         fn decode(
             &self,
             _model: &Self::Model,
-            _sequence: &mut Self::Sequence,
-        ) -> Result<TokenId, i32> {
-            Ok(7)
+            sequences: &mut [&mut Self::Sequence],
+        ) -> Result<Vec<TokenId>, i32> {
+            Ok(vec![7; sequences.len()])
         }
     }
 

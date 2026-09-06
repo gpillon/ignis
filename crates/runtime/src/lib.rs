@@ -17,6 +17,27 @@ pub enum RuntimeError {
     Leaf(i32),
 }
 
+/// Counters and geometry reported by the step runtime.
+///
+/// The scheduler consumes the page geometry for admission accounting; the
+/// timing and dispatch counters feed the server/bench telemetry once P1-23's
+/// FFI leaf exposes them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeStats {
+    /// Bytes retained by the leaf for the loaded model and live sequences.
+    pub vram_bytes: u64,
+    /// Tokens held by one physical KV page.
+    pub kv_page_tokens: u32,
+    /// Bytes in one physical KV page.
+    pub kv_page_bytes: u64,
+    /// Duration of the most recent leaf step.
+    pub last_step_micros: u64,
+    /// Kernels dispatched by the most recent leaf step.
+    pub kernel_count: u64,
+    /// CUDA graph launches by the most recent leaf step.
+    pub graph_launches: u64,
+}
+
 impl From<RuntimeError> for ComputeError {
     fn from(value: RuntimeError) -> Self {
         match value {
@@ -40,6 +61,8 @@ pub trait StepLeaf: Send + Sync + 'static {
     fn load_model(&self) -> Result<Self::Model, i32>;
     /// Release a model handle.
     fn release_model(&self, model: Self::Model);
+    /// Read the leaf's current geometry and step counters.
+    fn stats(&self, model: &Self::Model) -> Result<RuntimeStats, i32>;
     /// Allocate one sequence with its full context reservation.
     fn allocate_sequence(
         &self,
@@ -56,8 +79,14 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
     ) -> Result<(), i32>;
-    /// Decode one token from a warmed sequence.
-    fn decode(&self, model: &Self::Model, sequence: &mut Self::Sequence) -> Result<TokenId, i32>;
+    /// Decode one round over a batch of warmed sequences. On an error, the
+    /// leaf must leave every input sequence unchanged so the scheduler can
+    /// retry the round without corrupting token order.
+    fn decode(
+        &self,
+        model: &Self::Model,
+        sequences: &mut [&mut Self::Sequence],
+    ) -> Result<Vec<TokenId>, i32>;
 }
 
 /// A loaded model whose leaf handle is released exactly once on drop.
@@ -80,6 +109,11 @@ impl<L: StepLeaf> Model<L> {
         self.handle
             .as_ref()
             .expect("a live model always owns its leaf handle")
+    }
+
+    /// Read the loaded model's leaf statistics through the safe wrapper.
+    pub fn stats(&self) -> Result<RuntimeStats, RuntimeError> {
+        self.leaf.stats(self.handle()).map_err(RuntimeError::Leaf)
     }
 }
 
@@ -134,12 +168,24 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         let mut sequences = self.sequences.lock().unwrap();
         for job in jobs {
             if !sequences.contains_key(&job.request) {
-                let handle = self
+                let handle = match self
                     .model
                     .leaf
                     .allocate_sequence(self.model.handle(), job.context_tokens)
-                    .map_err(RuntimeError::Leaf)
-                    .map_err(ComputeError::from)?;
+                {
+                    Ok(handle) => handle,
+                    Err(code) => {
+                        let released: Vec<_> = jobs
+                            .iter()
+                            .filter_map(|job| sequences.remove(&job.request))
+                            .collect();
+                        drop(sequences);
+                        for sequence in released {
+                            self.release_sequence(sequence.handle);
+                        }
+                        return Err(RuntimeError::Leaf(code).into());
+                    }
+                };
                 sequences.insert(
                     job.request,
                     LiveSequence {
@@ -157,11 +203,17 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 &job.tokens,
                 job.start_position,
             ) {
-                let failed = sequences
-                    .remove(&job.request)
-                    .expect("failed prefill still owns its sequence");
+                // Core retries a failed *batch*, not only this job. Return
+                // every batch sequence to zero state so that retry does not
+                // prefill a successful earlier span twice.
+                let released: Vec<_> = jobs
+                    .iter()
+                    .filter_map(|job| sequences.remove(&job.request))
+                    .collect();
                 drop(sequences);
-                self.release_sequence(failed.handle);
+                for sequence in released {
+                    self.release_sequence(sequence.handle);
+                }
                 return Err(RuntimeError::Leaf(code).into());
             }
         }
@@ -170,39 +222,69 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<Option<TokenId>>, ComputeError> {
         let mut sequences = self.sequences.lock().unwrap();
-        let mut finished = Vec::new();
-        let mut tokens = Vec::with_capacity(jobs.len());
+        let mut batch: Vec<(DecodeJob, LiveSequence<L::Sequence>)> = Vec::with_capacity(jobs.len());
         for job in jobs {
-            let sequence = sequences
-                .get_mut(&job.request)
-                .ok_or(ComputeError::Kernel(-1))?;
-            if job
+            let Some(sequence) = sequences.remove(&job.request) else {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(ComputeError::Kernel(-1));
+            };
+            batch.push((job.clone(), sequence));
+        }
+
+        let mut tokens = vec![None; jobs.len()];
+        let mut active = vec![false; jobs.len()];
+        for (index, (job, sequence)) in batch.iter().enumerate() {
+            if !job
                 .params
                 .max_tokens
                 .is_some_and(|max| sequence.generated >= max)
             {
-                finished.push(job.request);
-                tokens.push(None);
-                continue;
-            }
-            let token = self
-                .model
-                .leaf
-                .decode(self.model.handle(), &mut sequence.handle)
-                .map_err(RuntimeError::Leaf)
-                .map_err(ComputeError::from)?;
-            if token == self.eos {
-                finished.push(job.request);
-                tokens.push(None);
-            } else {
-                sequence.generated += 1;
-                tokens.push(Some(token));
+                active[index] = true;
             }
         }
-        let released: Vec<_> = finished
-            .into_iter()
-            .filter_map(|request| sequences.remove(&request))
-            .collect();
+        let decoded = {
+            let mut handles: Vec<&mut L::Sequence> = batch
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| active[*index])
+                .map(|(_, (_, sequence))| &mut sequence.handle)
+                .collect();
+            self.model.leaf.decode(self.model.handle(), &mut handles)
+        };
+        let decoded = match decoded {
+            Ok(tokens) if tokens.len() == active.iter().filter(|&&active| active).count() => tokens,
+            Ok(_) => {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(ComputeError::Kernel(-1));
+            }
+            Err(code) => {
+                for (job, sequence) in batch {
+                    sequences.insert(job.request, sequence);
+                }
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+
+        let mut decoded = decoded.into_iter();
+        let mut released = Vec::new();
+        for (index, (job, mut sequence)) in batch.into_iter().enumerate() {
+            if !active[index] {
+                released.push(sequence);
+                continue;
+            }
+            let token = decoded.next().expect("decoded result length was checked");
+            if token == self.eos {
+                released.push(sequence);
+            } else {
+                sequence.generated += 1;
+                tokens[index] = Some(token);
+                sequences.insert(job.request, sequence);
+            }
+        }
         drop(sequences);
         for sequence in released {
             self.release_sequence(sequence.handle);
@@ -213,6 +295,19 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn release(&self, request: RequestId) {
         let sequence = self.sequences.lock().unwrap().remove(&request);
         if let Some(sequence) = sequence {
+            self.release_sequence(sequence.handle);
+        }
+    }
+}
+
+impl<L: StepLeaf> Drop for RuntimeCompute<L> {
+    fn drop(&mut self) {
+        let sequences = std::mem::take(
+            self.sequences
+                .get_mut()
+                .expect("RuntimeCompute is not dropped while its sequence lock is held"),
+        );
+        for (_, sequence) in sequences {
             self.release_sequence(sequence.handle);
         }
     }
