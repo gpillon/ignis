@@ -22,5 +22,8 @@ __pycache__/
 .claude/
 .codex/
 
+# local server pid
+.scratch/runtime/ignis-server.pid
+
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/
