@@ -1,0 +1,13 @@
+[package]
+name = "ignis-runtime"
+description = "ignis: safe step-ABI runtime and scheduler compute adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ignis-core = { path = "../core" }
+
+[features]
+# The safe wrapper itself is leaf-agnostic; this forwards the production
+# build's link requirements to the existing CUDA-gated core ABI modules.
+cuda = ["ignis-core/cuda"]

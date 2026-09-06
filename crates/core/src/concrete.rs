@@ -521,6 +521,7 @@ impl ConcreteScheduler {
             (r.resources.kv_pages, r.lane, r.id, r.tokens, r.prefix_entry)
         };
         self.requests[idx].advance(RequestState::Done);
+        self.compute.release(request_id);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
             self.kv_used_pages = self.kv_used_pages.saturating_sub(release_pages);
@@ -705,6 +706,7 @@ impl ConcreteScheduler {
             }
             // Evict the request (Running → Evicted; the lane is released).
             self.requests[v_idx].evict();
+            self.compute.release(v_id);
             self.free_lanes.push(victim_lane);
             self.kv_used_pages = self.kv_used_pages.saturating_sub(v_pages);
             events.push(SchedEvent::Evicted { request: v_id });
@@ -873,6 +875,16 @@ impl Scheduler for ConcreteScheduler {
                 PrefillJob {
                     request: r.id,
                     tokens,
+                    context_tokens: ((r.input.tokens.len() as u64)
+                        .saturating_add(
+                            r.input
+                                .params
+                                .max_tokens
+                                .unwrap_or(self.config.max_sequence_tokens)
+                                as u64,
+                        )
+                        .min(u32::MAX as u64)) as u32,
+                    start_position: r.shared_prefix_tokens,
                     params: r.input.params,
                 }
             })
