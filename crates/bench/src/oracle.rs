@@ -4,7 +4,9 @@
 //!
 //! This is the *tooling* half of the oracle (spec `01-device-resident-forward`
 //! §"Oracle (two levels)"): the fixture format, the recorder, and the
-//! comparer's agreement math. Recording the fixture against the real
+//! agreement math for both scorings (ADR 0014) — teacher-forced next-token
+//! agreement, which is the G1 correctness floor, and the free-running
+//! comparison, which is a diagnostic. Recording the fixture against the real
 //! reference engine is P1-05 (a human/GPU step); this module is fully
 //! CPU-testable against a mock [`Endpoint`] and a mock [`Tokenize`]
 //! implementation — no artifact, no GPU (prior art: `record.rs`'s capture
@@ -173,6 +175,13 @@ impl AgreementResult {
 /// candidate position beyond the candidate's own length is a mismatch (a
 /// truncated/early-stopped candidate is a divergence, not an excused gap).
 /// Pure and CPU-only — the core of the comparer.
+///
+/// **Diagnostic only** (ADR 0014). This scores a *free-running* candidate:
+/// the engine fed its own emitted tokens back in, so the two streams stop
+/// sharing a prefix after the first divergence and every later position is
+/// decorrelated. That measures continuation similarity, not whether the
+/// forward pass is grossly broken, so it is no longer the G1 floor — see
+/// [`score_teacher_forced`].
 pub fn compare_tokens(oracle: &[u32], candidate: &[u32], first_n: usize) -> AgreementResult {
     let compared = first_n.min(oracle.len());
     let mut agree = 0usize;
@@ -219,10 +228,13 @@ pub fn compare_fixtures(
         .collect()
 }
 
-/// The overall agreement across every compared canary: total matches over
-/// total compared positions (not a per-canary average — a canary with more
-/// compared tokens weighs proportionally more, matching the G1 gate's
-/// "first-32-token agreement" figure).
+/// The overall free-running agreement across every compared canary: total
+/// matches over total compared positions (not a per-canary average — a
+/// canary with more compared tokens weighs proportionally more).
+///
+/// **Diagnostic only** (ADR 0014): this is the free-running figure, and it
+/// is no longer the G1 correctness floor. Use
+/// [`overall_teacher_forced_agreement`] for the gate.
 pub fn overall_agreement(results: &[AgreementResult]) -> f64 {
     let (agree, compared) = results
         .iter()
@@ -232,6 +244,112 @@ pub fn overall_agreement(results: &[AgreementResult]) -> f64 {
     } else {
         agree as f64 / compared as f64
     }
+}
+
+// ── the G1 gate: teacher-forced next-token agreement (ADR 0014) ───────────
+
+/// The G1 correctness floor (ADR 0014): overall teacher-forced next-token
+/// agreement across the canary suite. Deliberately a *sanity* floor — it
+/// exists to catch gross implementation errors (wrong layouts, missing ops,
+/// broken state wiring, wrong positions, corrupted activations), not to
+/// require numerical or token-level parity with the reference (ADR 0007).
+pub const G1_AGREEMENT_FLOOR: f64 = 0.95;
+
+/// One position where the engine's teacher-forced next token differed from
+/// the oracle's. Recorded for reporting only — a mismatch is a mismatch, and
+/// no class of mismatch (exact BF16 logit ties included) is waived or
+/// excluded from the score (ADR 0014).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeacherForcedMismatch {
+    /// The 0-indexed oracle position.
+    pub position: usize,
+    /// The oracle's recorded token at this position.
+    pub expected: u32,
+    /// The engine's greedy next-token argmax given the oracle's prefix, or
+    /// `None` when the engine produced no prediction for this position.
+    pub predicted: Option<u32>,
+}
+
+/// One canary's teacher-forced result: how often the engine's greedy
+/// next-token argmax matched the oracle's token, each position scored
+/// against the *oracle's own* prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeacherForcedResult {
+    /// The canary's id.
+    pub id: String,
+    /// Positions actually scored: `min(first_n, oracle.len())`.
+    pub compared: usize,
+    /// Matching positions among `compared`.
+    pub agree: usize,
+    /// `agree / compared` (`1.0` when `compared == 0`).
+    pub agreement: f64,
+    /// Every mismatching position, in order.
+    pub mismatches: Vec<TeacherForcedMismatch>,
+}
+
+/// Score one canary teacher-forced (ADR 0014, the G1 metric).
+///
+/// `predictions[i]` is the engine's greedy next-token argmax **after being
+/// fed the oracle's tokens `[0..i)`** on top of the canary prompt — so
+/// position `i` is judged on a prefix both engines share, and a divergence
+/// cannot cascade into the positions after it. This is the whole point of
+/// the metric: free-running comparison ([`compare_tokens`]) lets one flip
+/// decorrelate the rest of the stream.
+///
+/// A position the engine produced no prediction for counts as a mismatch,
+/// never an excused gap (same rule as [`compare_tokens`]). Pure and
+/// CPU-only, so the gate's arithmetic is unit-tested without a GPU; the
+/// GPU-side driver is `crates/server/tests/oracle_teacher_forced_gpu.rs`.
+pub fn score_teacher_forced(
+    id: &str,
+    oracle: &[u32],
+    predictions: &[u32],
+    first_n: usize,
+) -> TeacherForcedResult {
+    let compared = first_n.min(oracle.len());
+    let mut agree = 0usize;
+    let mut mismatches = Vec::new();
+    for i in 0..compared {
+        let predicted = predictions.get(i).copied();
+        if predicted == Some(oracle[i]) {
+            agree += 1;
+        } else {
+            mismatches.push(TeacherForcedMismatch {
+                position: i,
+                expected: oracle[i],
+                predicted,
+            });
+        }
+    }
+    let agreement = if compared == 0 { 1.0 } else { agree as f64 / compared as f64 };
+    TeacherForcedResult {
+        id: id.to_string(),
+        compared,
+        agree,
+        agreement,
+        mismatches,
+    }
+}
+
+/// The suite's overall teacher-forced agreement: total matches over total
+/// scored positions (not a per-canary average — a canary with more scored
+/// positions weighs proportionally more). This is the figure
+/// [`meets_g1_floor`] judges.
+pub fn overall_teacher_forced_agreement(results: &[TeacherForcedResult]) -> f64 {
+    let (agree, compared) = results
+        .iter()
+        .fold((0usize, 0usize), |(a, c), r| (a + r.agree, c + r.compared));
+    if compared == 0 {
+        1.0
+    } else {
+        agree as f64 / compared as f64
+    }
+}
+
+/// Whether an overall teacher-forced agreement clears the G1 floor
+/// ([`G1_AGREEMENT_FLOOR`]). No tolerance, no tie waiver (ADR 0014).
+pub fn meets_g1_floor(overall: f64) -> bool {
+    overall >= G1_AGREEMENT_FLOOR
 }
 
 #[cfg(test)]
@@ -471,5 +589,92 @@ mod tests {
         }
         let err = record(&Failing, &WordIdTokenizer, "m".into(), 8).expect_err("the engine is down");
         assert!(err.contains("engine down"));
+    }
+
+    // ── the G1 gate: teacher-forced scoring (ADR 0014) ────────────────────
+
+    #[test]
+    fn every_matching_prediction_is_full_teacher_forced_agreement() {
+        let r = score_teacher_forced("c", &[1, 2, 3, 4], &[1, 2, 3, 4], 32);
+        assert_eq!(r.compared, 4);
+        assert_eq!(r.agree, 4);
+        assert_eq!(r.agreement, 1.0);
+        assert!(r.mismatches.is_empty());
+    }
+
+    #[test]
+    fn a_teacher_forced_mismatch_does_not_cascade_into_later_positions() {
+        // The whole point of the metric (ADR 0014): position 0 is wrong, but
+        // every later position is still scored against the oracle's own
+        // prefix, so it can still agree. Free-running comparison would have
+        // decorrelated everything after the flip.
+        let r = score_teacher_forced("c", &[1, 2, 3, 4], &[9, 2, 3, 4], 32);
+        assert_eq!(r.agree, 3);
+        assert_eq!(r.compared, 4);
+        assert_eq!(r.mismatches.len(), 1);
+        assert_eq!(r.mismatches[0].position, 0);
+        assert_eq!(r.mismatches[0].expected, 1);
+        assert_eq!(r.mismatches[0].predicted, Some(9));
+    }
+
+    #[test]
+    fn a_missing_teacher_forced_prediction_counts_as_a_mismatch() {
+        let r = score_teacher_forced("c", &[1, 2, 3, 4], &[1, 2], 4);
+        assert_eq!(r.compared, 4);
+        assert_eq!(r.agree, 2);
+        assert_eq!(r.mismatches.len(), 2);
+        assert_eq!(r.mismatches[0].predicted, None);
+    }
+
+    #[test]
+    fn a_short_oracle_shrinks_the_teacher_forced_window() {
+        let r = score_teacher_forced("c", &[1, 2], &[1, 2, 3, 4], 32);
+        assert_eq!(r.compared, 2);
+        assert_eq!(r.agree, 2);
+    }
+
+    #[test]
+    fn an_empty_teacher_forced_window_is_full_agreement_by_convention() {
+        let r = score_teacher_forced("c", &[], &[1, 2], 32);
+        assert_eq!(r.compared, 0);
+        assert_eq!(r.agreement, 1.0);
+    }
+
+    #[test]
+    fn overall_teacher_forced_agreement_weighs_by_position_not_by_canary() {
+        // 1/1 on a tiny canary and 1/3 on a longer one is 2/4 = 50%, not the
+        // per-canary average of 66.7%.
+        let results = vec![
+            score_teacher_forced("small", &[1], &[1], 32),
+            score_teacher_forced("big", &[1, 2, 3], &[1, 9, 9], 32),
+        ];
+        assert_eq!(overall_teacher_forced_agreement(&results), 0.5);
+    }
+
+    #[test]
+    fn the_g1_floor_is_ninety_five_percent_with_no_tolerance() {
+        assert_eq!(G1_AGREEMENT_FLOOR, 0.95);
+        assert!(meets_g1_floor(0.95));
+        assert!(meets_g1_floor(0.971));
+        assert!(!meets_g1_floor(0.9499));
+        // The free-running figure the old gate scored (GitHub #72): 53/102.
+        assert!(!meets_g1_floor(53.0 / 102.0));
+    }
+
+    #[test]
+    fn the_recorded_g1_measurement_clears_the_floor_with_ties_counted_as_mismatches() {
+        // The 2026-09-07 measurement (ADR 0014), reproduced as arithmetic:
+        // rust-hello 21/21, rust-sort 30/32, math-greedy 32/32,
+        // explain-reverse 16/17 = 99/102. The two BF16 exact-tie positions
+        // are counted as mismatches, not waived, and it still passes.
+        let results = vec![
+            TeacherForcedResult { id: "rust-hello".into(), compared: 21, agree: 21, agreement: 1.0, mismatches: vec![] },
+            TeacherForcedResult { id: "rust-sort".into(), compared: 32, agree: 30, agreement: 30.0 / 32.0, mismatches: vec![] },
+            TeacherForcedResult { id: "math-greedy".into(), compared: 32, agree: 32, agreement: 1.0, mismatches: vec![] },
+            TeacherForcedResult { id: "explain-reverse".into(), compared: 17, agree: 16, agreement: 16.0 / 17.0, mismatches: vec![] },
+        ];
+        let overall = overall_teacher_forced_agreement(&results);
+        assert_eq!(overall, 99.0 / 102.0);
+        assert!(meets_g1_floor(overall), "99/102 = 97.1% clears the 95% floor");
     }
 }

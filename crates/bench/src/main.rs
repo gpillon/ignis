@@ -619,13 +619,22 @@ fn cmd_oracle_compare(args: &[String]) -> ExitCode {
         );
     }
     let overall = oracle::overall_agreement(&results);
-    println!("overall agreement: {:.1}%", overall * 100.0);
-    if overall >= 0.95 {
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("oracle FAILED: overall agreement {:.1}% < 95% (G1 floor)", overall * 100.0);
-        ExitCode::FAILURE
-    }
+    println!("overall free-running agreement: {:.1}%", overall * 100.0);
+    // ADR 0014: free-running comparison is a DIAGNOSTIC, not the G1 gate. A
+    // single divergence changes the candidate's own prefix and decorrelates
+    // every later position, so a low figure here means "the continuations
+    // parted ways", not "the forward pass is broken". The G1 correctness
+    // floor is teacher-forced next-token agreement
+    // (`oracle::score_teacher_forced`), driven by the GPU-profile test
+    // `crates/server/tests/oracle_teacher_forced_gpu.rs`. So this command
+    // reports and never fails the process on the agreement figure.
+    println!(
+        "note: free-running agreement is informational only (ADR 0014). The G1 \
+         correctness floor is teacher-forced next-token agreement >= {:.0}%, \
+         measured by the GPU profile.",
+        oracle::G1_AGREEMENT_FLOOR * 100.0
+    );
+    ExitCode::SUCCESS
 }
 
 fn load_run(path: &str) -> Result<Run, String> {

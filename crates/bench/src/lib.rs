@@ -19,8 +19,17 @@
 //!
 //! The canary oracle (`oracle`, P1-04) is the G1 correctness tooling: a
 //! recorder captures the reference engine's greedy canary completions as a
-//! fixture (tokenized with the artifact's tokenizer), and a comparer reports
-//! per-canary token agreement + first divergence against it.
+//! fixture (tokenized with the artifact's tokenizer), and the suite is
+//! scored against it two different ways (ADR 0014):
+//!
+//! - **Teacher-forced next-token agreement — the G1 floor.** Each position
+//!   is scored against the *oracle's own* prefix, so one divergence cannot
+//!   cascade. `oracle::score_teacher_forced` + `oracle::G1_AGREEMENT_FLOOR`;
+//!   the GPU driver is `crates/server/tests/oracle_teacher_forced_gpu.rs`.
+//! - **Free-running agreement — diagnostic only.** The candidate generates
+//!   its own continuation, so this measures continuation similarity rather
+//!   than whether the forward pass is grossly broken.
+//!   `oracle::compare_fixtures`, reported by `ignis-bench oracle compare`.
 
 pub mod canary;
 pub mod client;

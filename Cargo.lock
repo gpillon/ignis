@@ -659,6 +659,7 @@ dependencies = [
  "futures-core",
  "http-body-util",
  "ignis-artifact",
+ "ignis-bench",
  "ignis-core",
  "ignis-runtime",
  "serde",

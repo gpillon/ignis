@@ -67,7 +67,7 @@ reader builds on them.
 2. As the engine owner, I want the completion to stop at the model's EOS token (or `max_tokens`), so that responses end where the model ends them.
 3. As the engine owner, I want the same prompt with greedy decoding to produce the same tokens on every run, so that the self-consistency check of ADR 0007 is meaningful.
 4. As the engine owner, I want per-layer activations of a prefill to match the reference's activation dump within bf16 tolerance, so that "sane output" is measured, not eyeballed.
-5. As the engine owner, I want the first 32 greedy tokens on each canary prompt to agree with the reference on at least 95% of positions, so that the correctness floor has a number.
+5. As the engine owner, I want the engine's next-token argmax, given the reference's own token prefix at each position, to agree with the reference's recorded token on at least 95% of the first 32 positions per canary prompt, so that the correctness floor has a number that catches gross implementation errors without demanding parity (ADR 0014). This is scored **teacher-forced** — each position judged on a prefix both engines share — precisely so that one divergence cannot cascade. It is a sanity floor, not a claim of numerical or token-level equivalence: ignis is allowed to differ numerically and linguistically from the reference, and the reference's generated continuation is not the definition of correctness (ADR 0007).
 6. As the engine owner, I want activations, KV cache and GDN state to live in VRAM for the lifetime of a sequence, so that no per-op host round trip exists on the hot path.
 7. As the engine owner, I want the NVFP4 GEMMs to decode the artifact's `blockscale-k16-m128x4-v1` scale plane and apply the weight divisor, so that every quantized projection multiplies by the right coefficient.
 8. As the engine owner, I want the GDN recurrence to run per value head on fp32 128×128 state with the reference's gating (`a_log`, `dt_bias`, softplus, sigmoid), L2-normalized q/k and the 1/√128 readout, so that the linear-attention layers compute the model's recurrence.
@@ -187,7 +187,13 @@ artifact (the artifact crate already decodes NVFP4 / W8 on the host), against
 which the leaf's per-layer output is checked; (b) the reference engine's
 greedy completions on the canary suite (recorded once through its HTTP API
 with exact argmax, tokenized with the artifact's tokenizer, stored as a
-fixture) against which the first 32 greedy tokens are compared. The
+fixture) against which the first 32 positions are scored **teacher-forced**:
+at each position the engine is fed the oracle's own token prefix and its
+greedy next-token argmax is compared with the oracle's recorded token
+(ADR 0014). Free-running continuation comparison is retained as a diagnostic
+only — it lets a single divergence decorrelate every later position, so it
+measures continuation similarity rather than whether the forward pass is
+grossly broken. The
 reference has no activation taps and its Python reference does not cover
 this artifact on this box, so per-layer dumps are not available; the f64
 layer reference replaces them.
@@ -228,8 +234,10 @@ internal tiling or the program's dispatch order.
   reference's `tests/ops` layout and its uniform error-record convention.
 - **Program tests (GPU, explicit profile).** Through the step ABI: a
   sequence prefilled with a canary prompt has per-layer residual streams and
-  final logits within bf16 tolerance of the oracle dump; 32 greedy decode
-  steps agree with the oracle on ≥ 95% of positions; two fresh model loads
+  final logits within bf16 tolerance of the oracle dump; teacher-forced
+  next-token agreement with the oracle is ≥ 95% over the first 32 positions
+  per canary (each position fed the oracle's own prefix, ADR 0014 — the
+  free-running continuation comparison is a diagnostic, not this gate); two fresh model loads
   produce identical tokens; decode stops at EOS; a sequence released and
   re-allocated starts from zero state; a busy GPU or a kernel error fails the
   test. Prior art: the existing GPU-gated tests' structure (`IGNIS_ARTIFACT`

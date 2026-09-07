@@ -109,8 +109,20 @@ When output names a domain concept, use the term as defined here.
   divergences.
 - **Canary oracle** — the recorded fixture the canary suite is checked against:
   the reference engine's greedy (exact-argmax) completions on those prompts for
-  the same artifact, tokenized with the artifact's tokenizer. The G1 floor is
-  ≥ 95% first-32-token agreement with it.
+  the same artifact, tokenized with the artifact's tokenizer.
+- **Teacher-forced agreement** — how the canary oracle is scored, and the G1
+  correctness floor: at each of the first 32 positions the engine is fed the
+  *oracle's own* token prefix, and its greedy next-token argmax is compared
+  with the oracle's recorded token. Positions are scored independently, so one
+  divergence cannot cascade. The floor is ≥ 95% overall (ADR 0014). It is a
+  sanity floor for gross implementation errors — wrong layouts, missing ops,
+  broken state wiring, wrong positions, corrupted activations — **not** a
+  parity requirement: ignis may differ numerically and linguistically from the
+  reference (ADR 0007).
+- **Free-running agreement** — the older scoring, where the engine generates
+  its own continuation and the two token streams are diffed. **Diagnostic
+  only** (ADR 0014): after the first divergence the engines no longer share a
+  prefix, so it measures continuation similarity, not forward-pass health.
 - **f64 layer reference** — a CPU fp64 computation of one GQA layer and one
   GDN layer on the real weights, the tolerance target for the leaf's per-layer
   output at G1.

@@ -18,6 +18,13 @@ arc-swap = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util = { workspace = true }
+# The G1 canary gate (ADR 0014, GitHub #76): the teacher-forced agreement
+# scoring + the >= 95% floor live in `ignis_bench::oracle` so the arithmetic
+# is CPU-unit-tested there, while the GPU driver that produces the
+# predictions lives here (`tests/oracle_teacher_forced_gpu.rs`) -- it needs
+# the step ABI, which `ignis-bench` does not depend on. Dev-only, so no
+# production dependency edge is created.
+ignis-bench = { path = "../bench" }
 
 [features]
 # Forwards to the artifact crate's VRAM materialization path (ADR 0002) and
