@@ -215,6 +215,7 @@ impl StepLeaf for CudaLeaf {
             sequence,
             &token_ids,
             u64::from(start_position),
+            None,
         )
         .map_err(|e| leaf_error("prefill", e))
     }

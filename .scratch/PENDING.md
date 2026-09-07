@@ -28,22 +28,40 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   Owner: the runtime work, tickets #37–#62.
   Blocker: #72, plus GPU exclusivity for the gate run (ADR 0006).
 
-- **Two canaries diverge from the oracle at token 0 (GitHub #72; blocks G1).**
-  With the RMSNorm convention fixed (#67) and the chat template's thinking
-  disabled to match how the oracle was recorded, `rust-hello` scores 21/21 and
-  `math-greedy` 32/32 — exact agreement with the reference. But `rust-sort`
-  and `explain-reverse` score 0/32 and 0/17, diverging at the very first
-  generated token, which puts the suite at 52% against the ≥ 95% G1 floor.
-  Both produce correct, fluent answers (`` `v` is set to `[1, 2, 3]`. `` and a
-  correct one-sentence description of `Vec::reverse`), just different wording
-  from the oracle's — so this is not the #67 class of failure. The working
-  theory is an argmax near-tie flipped by a residual numeric difference; once
-  flipped, the trajectory diverges entirely. Confirming that needs logits,
-  which the server does not expose: the next boundary is top-k IDs and values
-  after the final head, for the same tokenized prompt, on both engines.
-  `enable_thinking` (#68) has since landed, which should unblock reproducing
-  the oracle's exact prompt through the HTTP surface — not yet re-checked.
-  Owner: unassigned. Blocker: GPU exclusivity (ADR 0006).
+- **Two canaries diverge from the oracle at token 0 (GitHub #72; blocks G1)
+  — root cause confirmed 2026-09-07: an exact BF16 logit tie, not a "near"
+  one.** `rust-hello` and `math-greedy` score 21/21 and 32/32 — exact
+  agreement with the reference. `rust-sort` and `explain-reverse` score 0/32
+  and 0/17, which puts the suite at 52% against the ≥ 95% G1 floor. The
+  server had no way to see logits, so the theory (an argmax near-tie flipped
+  by a residual numeric difference) was unconfirmed; `ignis_program_prefill`
+  now optionally returns the prefill span's last-position logits
+  (`crates/core/src/step.rs::prefill_program`, `kernel/src/step.cu`,
+  mirroring the degenerate path's existing copy-back), exercised by
+  `crates/server/tests/logit_divergence_gpu.rs`. Run against the real
+  artifact with thinking disabled (matching how the oracle was recorded):
+  `rust-sort`'s top two logits are token 63 and the oracle's expected token
+  5836, **both at 19.5** (bf16); `explain-reverse`'s top two are token 760
+  and the oracle's expected token 2064, **both at 22.875**. ignis's argmax
+  breaks ties toward the lowest token id (`ninfer::ops::argmax`'s documented
+  convention), which is why it picks 63 / 760 instead of the oracle's
+  5836 / 2064 — both continuations are correct, fluent completions
+  (`` `v` is set to `[1, 2, 3]`. `` and a correct one-sentence description of
+  `Vec::reverse`), matching the earlier "not the #67 class of failure"
+  observation. Only ignis's own logits were instrumented (the reference
+  engine is a separate codebase, out of scope here); the reference's
+  internal logit values were not extracted, but ignis's runner-up being
+  *exactly* the oracle's chosen token, at an exact tied logit, is strong
+  evidence on its own — the model is genuinely ambivalent at bf16 precision
+  between two equally-good next tokens, and the reference engine's
+  tie-break (or its higher-precision output head) landed on the other one.
+  **Open decision, not yet made: how G1's ≥ 95%
+  first-32-token-agreement floor should treat a bf16-exact-tie divergence**
+  — e.g. match the reference's tie-break convention, widen the gate to
+  tolerate ties, or accept 52% as the ceiling this metric can reach against
+  a different engine's output head rounding. Owner: unassigned (gate-policy
+  decision). Blocker: none technical; needs a call from whoever owns the G1
+  gate criteria.
 
 - **Two `openai_http_gpu.rs` tests looked noticeably slower than the other
   two in a 2026-09-07 serialized GPU profile run (post-#75) — not yet

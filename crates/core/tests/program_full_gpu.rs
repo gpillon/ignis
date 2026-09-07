@@ -34,7 +34,7 @@ fn run_once(
         },
     )?;
     let mut sequence = pool.alloc(MAX_CONTEXT)?;
-    prefill_program(&model, &pool, &mut sequence, prompt, 0)?;
+    prefill_program(&model, &pool, &mut sequence, prompt, 0, None)?;
     let mut output = Vec::with_capacity(GENERATED);
     for _ in 0..GENERATED {
         output.extend(decode_program_batch(&model, &pool, &mut [&mut sequence])?);
