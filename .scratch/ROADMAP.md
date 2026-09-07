@@ -56,16 +56,28 @@ Frontier at start: #37, #38, #39, #40, #42 (five parallel starts).
 Critical path: #42 → #45/#46 → #47/#48/#49 → #57/#58 → #59 → #61 → #62.
 Current frontier (2026-09-07): #74 (P1-18 correctness, needs GPU — highest priority, surprising failure), #70/#71 (server e2e test fixes, GPU to verify), #72 (needs GPU + logit-level debugging). #73 fixed and closed same night.
 
-## Phase 2–5 candidate decomposition (not published; refined when the gate before lands)
+## Phase 2 decomposition (G2, master #63)
 
-- **G2**: superseded by `runtime/specs/02-real-prefill.md` (tickets cut from
-  that spec). What the candidate list said, for the record: W4A4 activation
-  quant + TMA GEMM route · prefill attention bf16 route in the program · GDN
-  chunked prefill route · chunked span prefill (1024) with KV append · TTFT
-  bench cell · G2 gate. The spec corrects one detail: the W4A4 route's token
-  thresholds are the vendored dispatch's own, per projection (as low as
-  T ≥ 4, and unconditional for the GDN input projection), not a single
-  T ≥ 64 rule.
+Tracer bullets from `runtime/specs/02-real-prefill.md`. The ops this phase
+needs are already vendored and compiled (G1); what is missing is a program
+that hands them more than one token, and an instrument that measures the
+result.
+
+| # | Ticket | Blocked by | Delivers (verifiable) |
+|---|---|---|---|
+| P2-01 (#83) | Prefill budgeting prefactor: prefill chunk width as a load option, program scratch reserved for it at load (sized for the widest compute policy), layer sync moved to the ABI boundary | — | Reported VRAM grows with the configured chunk; an unaffordable or unaligned chunk fails the *load*; existing per-token tests unchanged |
+| P2-02 (#84) | Chunked span prefill: prefill options struct (ADR 0016), the leaf chunk loop, per-token route retained as the self-oracle | P2-01 (#83) | 8K prefilled in 8 traversals; chunked vs per-token ≥ 95% teacher-forced agreement; span split, chunk-width invariance, determinism |
+| P2-03 (#85) | W4A4: vendor + run the reference's A4 op tests, then adopt the `AllowA4` compute policy (prefill and decode) | P2-02 (#84) | A4 op tests green at 27B geometry; canary floor and self-oracle still green; 8K prefill throughput up |
+| P2-04 (#86) | Tensor-core prefill routes: GDN chunked recurrence + fused GQA append-and-attend | P2-02 (#84) | Same GPU test set green on the new routes; per-chunk time down |
+| P2-05 (#87) | The G2 measurement instrument: `--prefill-chunk` / context flags, `ignis-bench ttft` cold-prefix cells, live/live gate check | — | Cells measurable against either engine; every refusal and the void-sample rule CPU-tested |
+| P2-06 (#88) | G2 gate run: both engines measured live/live on the 8K and 32K cells; verdict recorded | P2-03, P2-04, P2-05 | Ratio ≤ 1.5 on both cells; GPU profile green in one run; verdict in the review and here |
+
+Frontier at start: **#83** (leaf) and **#87** (Rust only, no GPU) in parallel;
+#85 and #86 are parallel once #84 lands.
+Critical path: #83 → #84 → #85/#86 → #88.
+
+## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
+
 - **G3**: batched decode round (B ≤ 8) over per-slot views · sampling (temp/top-p/top-k/penalties, seed) · decode graph capture per width + eager fallback · PDL chain where vendored ops support it · request-log JSONL · core KV pool ↔ runtime pages under load · G3 gate (C=1, C=4).
 - **G4**: hq-e8-2b codec + attention routes + exact-key side store · device prefix reuse (page refcount, shared system+tools boundary) · KV-RAM tier snapshot/restore (all state sections) · tagged lanes · preserve-thinking / tool-call stream hardening · warmup/readiness · G4 gate (bench-03 trace).
 - **G5**: MTP round + pack + adaptive width + ReplaySSM records/fold · DFlash2 drafter load + draft kernels + RAM-tier carry · G5 gate.
