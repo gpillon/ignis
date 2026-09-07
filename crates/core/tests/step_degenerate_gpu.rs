@@ -201,6 +201,7 @@ fn assert_matches_bf16_tolerance(actual: &[f32], reference: &[f64], token_id: u3
 }
 
 #[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn degenerate_program_matches_f64_reference_for_four_tokens() {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("the real artifact is absent: {ARTIFACT}")) {

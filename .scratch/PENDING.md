@@ -15,44 +15,64 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   `.scratch/runtime/specs/01-device-resident-forward.md`, ADR 0009/0010).**
   ignis computes the model and produces coherent greedy completions as of the
   RMSNorm `unit_offset` fix (#67), but the gate is **not** green: first-32-token
-  agreement with the canary oracle is 52%, against a ≥ 95% floor (see the
-  canary-divergence item below). Until the G1 gate is recorded green on a free RTX
-  5090 — coherent greedy completions on the canary suite, per-layer output
-  within bf16 tolerance of the f64 layer reference, ≥ 95% first-32-token
-  agreement with the canary oracle, EOS honored, reproducible across loads —
-  **nothing downstream of it is meaningful**, including every performance
-  number. Everything the review deleted (the host-resident forward, the toy
-  decode graphs, the scalar kernels and their host-pointer surfaces) is gone;
-  do not resurrect it. Owner: the runtime work, tickets #37–#62.
-  Blocker: the work itself, plus GPU exclusivity for the gate run (ADR 0006).
+  agreement with the canary oracle is 52%, against a ≥ 95% floor (see #72
+  below), and the 2026-09-07 gate run (#62) found the server e2e leg of the
+  GPU profile red (#70, #71) plus a test-wiring gap (#73, fixed) that hid
+  three GPU tests from every profile run — one of which (#74) turns out to
+  be a real, previously-undetected correctness failure. Until the G1 gate is
+  recorded green on a free RTX 5090 — coherent greedy completions on the
+  canary suite, per-layer output within bf16 tolerance of the f64 layer
+  reference, ≥ 95% first-32-token agreement with the canary oracle, EOS
+  honored, reproducible across loads — **nothing downstream of it is
+  meaningful**, including every performance number. Everything the review
+  deleted (the host-resident forward, the toy decode graphs, the scalar
+  kernels and their host-pointer surfaces) is gone; do not resurrect it.
+  Owner: the runtime work, tickets #37–#62.
+  Blocker: #70, #71, #72, #74, plus GPU exclusivity for the gate run (ADR 0006).
 
-- **Two canaries diverge from the oracle at token 0 (no ticket yet; blocks
-  G1).** With the RMSNorm convention fixed (#67) and the chat template's
-  thinking disabled to match how the oracle was recorded, `rust-hello` scores
-  21/21 and `math-greedy` 32/32 — exact agreement with the reference. But
-  `rust-sort` and `explain-reverse` score 0/32 and 0/17, diverging at the very
-  first generated token, which puts the suite at 52% against the ≥ 95% G1
-  floor. Both produce correct, fluent answers (`` `v` is set to `[1, 2, 3]`. ``
-  and a correct one-sentence description of `Vec::reverse`), just different
-  wording from the oracle's — so this is not the #67 class of failure. The
-  working theory is an argmax near-tie flipped by a residual numeric
-  difference; once flipped, the trajectory diverges entirely. Confirming that
-  needs logits, which the server does not expose: the next boundary is top-k
-  IDs and values after the final head, for the same tokenized prompt, on both
-  engines. Note this cannot be measured through the HTTP surface until
-  `enable_thinking` lands (#68), because ignis cannot currently reproduce the
-  prompt the oracle was recorded with. Owner: unassigned.
-  Blocker: #68 for a repeatable harness, plus GPU exclusivity (ADR 0006).
+- **Two canaries diverge from the oracle at token 0 (GitHub #72; blocks G1).**
+  With the RMSNorm convention fixed (#67) and the chat template's thinking
+  disabled to match how the oracle was recorded, `rust-hello` scores 21/21 and
+  `math-greedy` 32/32 — exact agreement with the reference. But `rust-sort`
+  and `explain-reverse` score 0/32 and 0/17, diverging at the very first
+  generated token, which puts the suite at 52% against the ≥ 95% G1 floor.
+  Both produce correct, fluent answers (`` `v` is set to `[1, 2, 3]`. `` and a
+  correct one-sentence description of `Vec::reverse`), just different wording
+  from the oracle's — so this is not the #67 class of failure. The working
+  theory is an argmax near-tie flipped by a residual numeric difference; once
+  flipped, the trajectory diverges entirely. Confirming that needs logits,
+  which the server does not expose: the next boundary is top-k IDs and values
+  after the final head, for the same tokenized prompt, on both engines.
+  `enable_thinking` (#68) has since landed, which should unblock reproducing
+  the oracle's exact prompt through the HTTP surface — not yet re-checked.
+  Owner: unassigned. Blocker: GPU exclusivity (ADR 0006).
 
-- **The GPU profile's fail-never-skip rule is called but not yet exercised
-  green (GitHub #38/#53, ADR 0006).** P1-17 (#53) landed the first caller:
-  `crates/core/tests/model_load_gpu.rs` calls `gpu_profile::skip_or_fail`
-  (a missing artifact or CUDA device) instead of self-skipping. What is
-  *still not demonstrated* is a green run under `IGNIS_GPU_PROFILE=1` on a
-  free RTX 5090 — this session cannot touch the GPU (ADR 0006: ninfer holds
-  it), so the test is compiled (`cargo test --no-run`) but never executed.
-  Owner: whoever next has a free GPU; run `scripts/gpu-profile.ps1` and
-  confirm `real_nvfp4full_model_load_binds_every_text_scope_object` passes.
+- **The GPU profile's fail-never-skip rule now runs green for most op/layer/
+  program tests, but the server e2e leg is red and the degenerate-program
+  layer check is red (GitHub #38, ADR 0006; found running #62 on 2026-09-07,
+  #73 fixed same night).** A full `scripts/gpu-profile.ps1` run on a free
+  RTX 5090 came back: kernel build green; `gqa_layers_match_f64_reference`,
+  `full_program_prefill_and_greedy_decode_are_deterministic`, the `cuda_leaf`
+  decode test, and `seq_alloc_gpu`'s 3 tests all green. `openai_http_gpu.rs`
+  (P1-25 server e2e) failed 2 of 3 under default (concurrent) `cargo test`
+  parallelism with a GPU OOM panic; re-run serialized
+  (`--test-threads=1`) it no longer OOMs but still climbs to ~31/32 GB VRAM
+  and takes 668s instead of ~160s (#71 — the test harness never tears down a
+  prior test's scheduler/driver task), and the same 2 tests instead fail on
+  empty/malformed content because they don't disable `enable_thinking` and
+  the model spends the whole 32-token budget on the reasoning channel (#70).
+  Separately, `model_load_gpu.rs` (P1-17), `gdn_layer_gpu.rs` (P1-22), and
+  `step_degenerate_gpu.rs` (P1-18) all lacked `#[ignore]`, so
+  `cargo test --features cuda -- --ignored` — the profile script's exact
+  invocation — filtered them **out** every time; they had never actually run
+  under the profile (#73, fixed same night: commit e5c2c21). Verifying the
+  fix surfaced real data for the first time: P1-17 and P1-22 pass, but P1-18
+  (`degenerate_program_matches_f64_reference_for_four_tokens`) fails hard —
+  relative L2 error 1.08 against a 0.0039 tolerance (#74) — the GPU-computed
+  logits for the embedding→norm→output-head→argmax slice are essentially
+  uncorrelated with the independent f64 reference. Owner: whoever next has a
+  free GPU; #74 (P1-18) is the most surprising and highest-priority of the
+  remaining gaps, then #70/#71 to get server e2e green.
   Blocker: GPU exclusivity (ADR 0006).
 
 ## Blocked (external)

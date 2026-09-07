@@ -185,6 +185,7 @@ fn run_layer_and_check(
 /// released and re-allocated sequence resets them), exercising the layer-4
 /// BF16 output-projection arm.
 #[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn gdn_layer_matches_f64_reference() {
     let path = Path::new(ARTIFACT);
     if !path.exists()
