@@ -123,7 +123,8 @@ async fn a_non_streaming_completion_returns_coherent_text_with_finish_reason_and
             { "role": "user", "content": "In one sentence, what is 2 + 2?" }
         ],
         "max_tokens": 32,
-        "stream": false
+        "stream": false,
+        "enable_thinking": false
     });
     let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 200, "chat should be 200: {body}");
@@ -164,7 +165,8 @@ async fn a_streaming_completion_emits_token_deltas_then_a_finish_reason_chunk() 
             { "role": "user", "content": "In one sentence, what is 2 + 2?" }
         ],
         "max_tokens": 32,
-        "stream": true
+        "stream": true,
+        "enable_thinking": false
     });
     let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 200, "streaming chat should be 200: {body}");
