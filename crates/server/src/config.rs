@@ -52,8 +52,6 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-impl std::error::Error for ConfigError {}
-
 /// Resolve `args` (argv without the program name) and `env` (injected so
 /// tests never touch the real process environment) into a [`ConfigOutcome`].
 ///
@@ -295,6 +293,15 @@ mod tests {
     #[test]
     fn help_short_circuits_before_other_flags_are_validated() {
         let outcome = resolve(&args(&["--help", "--nonsense"]), no_env).expect("resolve");
+        assert!(matches!(outcome, ConfigOutcome::Help(_)));
+    }
+
+    #[test]
+    fn help_short_circuits_even_where_it_would_otherwise_be_consumed_as_a_value() {
+        // `--bind` normally requires a following value; `--help` still wins
+        // rather than being swallowed as that value, matching "short-circuits
+        // before further parsing" for any position in argv.
+        let outcome = resolve(&args(&["--bind", "--help"]), no_env).expect("resolve");
         assert!(matches!(outcome, ConfigOutcome::Help(_)));
     }
 

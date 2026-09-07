@@ -122,7 +122,7 @@ async fn main() {
             std::process::exit(0);
         }
         Err(err) => {
-            eprintln!("ignis-server: {err}");
+            eprintln!("ignis-server: {err} — refusing to start");
             std::process::exit(1);
         }
     };
