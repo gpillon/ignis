@@ -208,14 +208,22 @@ evolve as the engine matures.
 > completion reports `finish_reason: "length"`, since the mock has no real
 > EOS token).
 
-### Configuration (environment)
+### Configuration (environment / CLI flags)
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `IGNIS_ARTIFACT` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). **Unset → the built-in placeholder template**, whose rendered content is not natural text. A configured artifact is verified (checksum clean) or the server refuses to start. |
-| `IGNIS_MODEL` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name). |
-| `IGNIS_BIND` | `127.0.0.1:8000` | The bind address (localhost only, no auth). |
-| `IGNIS_TELEMETRY` | — (stdout) | The telemetry JSONL sink path (a file). |
+Each variable has a matching CLI flag (a flag overrides its env var, which
+overrides the default — GitHub #77); run `ignis-server --help` for the
+full, always-current table.
+
+| Variable | Flag | Alias | Default | Meaning |
+|---|---|---|---|---|
+| `IGNIS_ARTIFACT` | `--artifact <path>` | `-a` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). **Unset → the built-in placeholder template**, whose rendered content is not natural text. A configured artifact is verified (checksum clean) or the server refuses to start. |
+| `IGNIS_MODEL` | `--model <id>` | `-m` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name). |
+| `IGNIS_BIND` | `--bind <addr>` | `-b` | `127.0.0.1:8000` | The bind address (localhost only, no auth). |
+| `IGNIS_TELEMETRY` | `--telemetry <path>` | `-t` | — (stdout) | The telemetry JSONL sink path (a file). |
+| `IGNIS_ENABLE_THINKING` | `--enable-thinking <true\|false>` | — | `true` | The server-wide default for `enable_thinking`. |
+| `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |
+| — | `--help` | `-h` | — | Print the flag table and exit. |
+| — | `--version` | `-V` | — | Print the crate version and exit. |
 
 ### Launch
 

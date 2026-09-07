@@ -17,25 +17,32 @@
 //! (`ignis_server::runtime::cuda_scheduler`, GitHub #61 / P1-25); without
 //! either, it drives the deterministic `MockCompute` (CPU-only, ADR 0006).
 //!
-//! Configuration (environment):
-//! - `IGNIS_MODEL` — the loaded model id (default `qwen3.8-27b`; what
-//!   `GET /v1/models` reports and what submissions must name).
-//! - `IGNIS_BIND` — the bind address (default `127.0.0.1:8000`;
-//!   localhost-only by design — no network exposure, no auth, v1).
-//! - `IGNIS_ARTIFACT` — the `.ninfer` container path (the real tokenizer
-//!   and chat template, artifact-02); unset = the built-in placeholder
-//!   template (its rendered `content` is not natural text). A configured
-//!   artifact is loaded through the verified loader path (server-03):
-//!   its sidecar must be present and its checksum report clean, or the
-//!   server refuses to start (no silent fallback to the placeholder).
-//! - `IGNIS_TELEMETRY` — the telemetry JSONL sink path (server-02, design
-//!   §5): one compact line per event; unset = stdout.
-//! - `IGNIS_ENABLE_THINKING` — the server-wide default for `enable_thinking`
-//!   (GitHub #68); `true` or `false`, default `true`. An unparseable value,
-//!   or a `false` the loaded template cannot honour, refuses to start.
-//! - `IGNIS_REASONING_EFFORT` — the server-wide default `reasoning_effort`;
-//!   unset means "let the template's own default apply". An unknown value,
-//!   or one the loaded template does not support, refuses to start.
+//! Configuration (CLI flags mirror each env var one-to-one — GitHub #77;
+//! run `ignis-server --help` for the full flag table. A flag overrides its
+//! env var, which overrides the built-in default):
+//! - `IGNIS_MODEL` / `--model`, `-m` — the loaded model id (default
+//!   `qwen3.8-27b`; what `GET /v1/models` reports and what submissions must
+//!   name).
+//! - `IGNIS_BIND` / `--bind`, `-b` — the bind address (default
+//!   `127.0.0.1:8000`; localhost-only by design — no network exposure, no
+//!   auth, v1).
+//! - `IGNIS_ARTIFACT` / `--artifact`, `-a` — the `.ninfer` container path
+//!   (the real tokenizer and chat template, artifact-02); unset = the
+//!   built-in placeholder template (its rendered `content` is not natural
+//!   text). A configured artifact is loaded through the verified loader
+//!   path (server-03): its sidecar must be present and its checksum report
+//!   clean, or the server refuses to start (no silent fallback to the
+//!   placeholder).
+//! - `IGNIS_TELEMETRY` / `--telemetry`, `-t` — the telemetry JSONL sink path
+//!   (server-02, design §5): one compact line per event; unset = stdout.
+//! - `IGNIS_ENABLE_THINKING` / `--enable-thinking` — the server-wide default
+//!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
+//!   An unparseable value, or a `false` the loaded template cannot honour,
+//!   refuses to start.
+//! - `IGNIS_REASONING_EFFORT` / `--reasoning-effort` — the server-wide
+//!   default `reasoning_effort`; unset means "let the template's own
+//!   default apply". An unknown value, or one the loaded template does not
+//!   support, refuses to start.
 
 use std::sync::Arc;
 
@@ -44,6 +51,7 @@ use ignis_core::{
     Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
 };
 use ignis_server::{
+    config::{self, Config, ConfigOutcome},
     engine::Engine,
     loader,
     template::SimpleTemplateProvider,
@@ -51,17 +59,6 @@ use ignis_server::{
     thinking::{self, ThinkingDefaults},
     Server,
 };
-
-/// The default loaded-model id (the v1 specialization: Qwen 3.8-27B —
-/// `CONTEXT.md`).
-const DEFAULT_MODEL: &str = "qwen3.8-27b";
-
-/// The default bind address: localhost, port 8000 (OpenAI convention).
-const DEFAULT_BIND: &str = "127.0.0.1:8000";
-
-fn env(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.into())
-}
 
 /// The mock-backed scheduler (ADR 0006, CPU-only): used whenever no
 /// artifact is configured, or the binary was not built with
@@ -113,38 +110,39 @@ fn cuda_scheduler(
 
 #[tokio::main]
 async fn main() {
-    let model = env("IGNIS_MODEL", DEFAULT_MODEL);
-    let bind = env("IGNIS_BIND", DEFAULT_BIND);
-    let artifact = env("IGNIS_ARTIFACT", "");
-
-    // The thinking defaults (GitHub #68): parsed up front so a typo is
-    // caught before any of the slower loader/scheduler work below runs.
-    // Capability-checked against the loaded template once `server` exists,
-    // below.
-    let default_enable_thinking =
-        match thinking::parse_default_enable_thinking(&env("IGNIS_ENABLE_THINKING", "true")) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("ignis-server: {err} — refusing to start");
-                std::process::exit(1);
-            }
-        };
-    let default_reasoning_effort =
-        match thinking::parse_default_reasoning_effort(&env("IGNIS_REASONING_EFFORT", "")) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("ignis-server: {err} — refusing to start");
-                std::process::exit(1);
-            }
-        };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = match config::resolve(&args, |name| std::env::var(name).ok()) {
+        Ok(ConfigOutcome::Config(config)) => config,
+        Ok(ConfigOutcome::Help(text)) => {
+            println!("{text}");
+            std::process::exit(0);
+        }
+        Ok(ConfigOutcome::Version(text)) => {
+            println!("{text}");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("ignis-server: {err}");
+            std::process::exit(1);
+        }
+    };
+    let Config {
+        model,
+        bind,
+        artifact,
+        telemetry,
+        enable_thinking: default_enable_thinking,
+        reasoning_effort: default_reasoning_effort,
+    } = config;
 
     // The telemetry sink (server-02, design §5): a JSONL file named by
-    // `IGNIS_TELEMETRY`, or stdout by default. One compact line per event.
-    let telemetry_sink: Arc<dyn TelemetrySink> = match env("IGNIS_TELEMETRY", "") {
-        path if path.is_empty() => Arc::new(StdoutSink),
-        path => match FileSink::open(&path) {
+    // `--telemetry`/`IGNIS_TELEMETRY`, or stdout by default. One compact
+    // line per event.
+    let telemetry_sink: Arc<dyn TelemetrySink> = match &telemetry {
+        None => Arc::new(StdoutSink),
+        Some(path) => match FileSink::open(path) {
             Ok(file) => {
-                eprintln!("ignis-server: telemetry → {path}");
+                eprintln!("ignis-server: telemetry → {}", path.display());
                 Arc::new(file)
             }
             Err(err) => {
@@ -154,33 +152,28 @@ async fn main() {
         },
     };
 
-    let server = if artifact.is_empty() {
-        eprintln!("ignis-server: no artifact (set IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute");
-        let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
-        Server::new(engine, Box::new(SimpleTemplateProvider))
-    } else {
+    let server = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
-        // named by `IGNIS_ARTIFACT` is loaded through the verified loader —
-        // open the reader, load the sidecar (ADR 0002), verify the checksum
-        // report, and only then extract the frontend set. A missing
-        // sidecar or a report that is not clean is a load failure: serving
-        // a broken artifact would silently degrade to the placeholder, so
-        // the server refuses to start instead.
-        let artifact_path = std::path::Path::new(&artifact);
+        // named by `--artifact`/`IGNIS_ARTIFACT` is loaded through the
+        // verified loader — open the reader, load the sidecar (ADR 0002),
+        // verify the checksum report, and only then extract the frontend
+        // set. A missing sidecar or a report that is not clean is a load
+        // failure: serving a broken artifact would silently degrade to the
+        // placeholder, so the server refuses to start instead.
         let sidecar = match loader::find_sidecar(artifact_path) {
             Ok(path) => path,
             Err(err) => {
-                eprintln!("ignis-server: {artifact}: {err} — refusing to start");
+                eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
                 std::process::exit(1);
             }
         };
         let frontend = match loader::load_artifact(artifact_path, &sidecar) {
             Ok(frontend) => {
-                eprintln!("ignis-server: {artifact} verified (checksum clean) — tokenizer + chat template loaded");
+                eprintln!("ignis-server: {} verified (checksum clean) — tokenizer + chat template loaded", artifact_path.display());
                 frontend
             }
             Err(err) => {
-                eprintln!("ignis-server: {artifact}: {err} — refusing to start");
+                eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
                 std::process::exit(1);
             }
         };
@@ -189,12 +182,16 @@ async fn main() {
         let scheduler = cuda_scheduler(artifact_path, &model, &frontend);
         #[cfg(not(feature = "cuda"))]
         let scheduler = {
-            eprintln!("ignis-server: built without --features cuda — MockCompute despite IGNIS_ARTIFACT (the templated text is real, the completions are not)");
+            eprintln!("ignis-server: built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)");
             mock_scheduler(&model)
         };
 
         let engine = Engine::with_sinks(scheduler, telemetry_sink, Arc::new(SystemClock));
         Server::with_artifact_template(engine, frontend)
+    } else {
+        eprintln!("ignis-server: no artifact (set --artifact/IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute");
+        let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
+        Server::new(engine, Box::new(SimpleTemplateProvider))
     };
 
     // A default the loaded template cannot honour is a refused start (a
