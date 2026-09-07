@@ -84,8 +84,21 @@ When output names a domain concept, use the term as defined here.
 - **KV-RAM** — the host-RAM KV cache tier: snapshots GPU lanes so sibling requests
   restore instead of re-prefilling; two-tier eviction (probation → protected).
 - **Prefix reuse** — concurrent requests sharing a prefix skip the redundant prefill.
-- **Chunked prefill** — prefilling a prompt in spans (1024 tokens) through the
-  span+position prefill call, rather than one token at a time.
+- **Chunked prefill** — prefilling a prompt span through the span+position
+  prefill call in **prefill chunks** rather than one token at a time. The
+  leaf owns the chunk loop; a caller may pass a span of any length.
+- **Prefill chunk** — the number of tokens one traversal of the model
+  processes during chunked prefill: a model-load option, default 1024, a
+  multiple of 128. The unit the prefill scratch is sized for.
+- **Per-token prefill route** — the G1 prefill path that runs the program one
+  token at a time (recurrent GDN, small-T attention). Retained after G2 as a
+  test-only, per-call route: the self-oracle chunked prefill is checked
+  against. Never the default.
+- **Compute policy** — the per-call activation-precision policy handed to
+  every NVFP4 projection (`A16Only` or `AllowA4`). The engine's policy is the
+  reference's: `AllowA4` on every NVFP4 text projection, prefill and decode
+  alike, with the vendored per-projection token thresholds deciding the
+  actual route. Tests may force `A16Only`.
 - **Decode round** — one traversal of the model for *all* decode-ready
   sequences in a batch; the unit a decode CUDA graph is captured over, per
   batch width.
@@ -151,6 +164,18 @@ When output names a domain concept, use the term as defined here.
   its own continuation and the two token streams are diffed. **Diagnostic
   only** (ADR 0014): after the first divergence the engines no longer share a
   prefix, so it measures continuation similarity, not forward-pass health.
+- **TTFT cell** — one fixed prompt length (8K, 32K) at which time to first
+  token is measured through the bench, the same way against either engine:
+  streaming, greedy, thinking off, a small output budget, deterministic
+  synthetic prompts of exactly that many tokens. Every sample is a **cold
+  prefix**: each sample (the warmup included) gets its own prompt, distinct
+  from the first content token, so no prefix cache or host KV tier on
+  either engine can serve it; the engine's own computed-prefill-token count
+  must equal the prompt length or the sample is void.
+- **Live/live gate** — how G2 is judged: ignis and the reference measured on
+  the same TTFT cells in the same session on the same machine, and the
+  ratio ignis/reference must be ≤ 1.5. A committed reference record exists
+  for regression and sanity only; it never decides the gate.
 - **f64 layer reference** — a CPU fp64 computation of one GQA layer and one
   GDN layer on the real weights, the tolerance target for the leaf's per-layer
   output at G1.

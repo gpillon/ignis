@@ -4,6 +4,8 @@
 
 Accepted (2026-09-05, project review). **Revises ADR 0001** — the ABI
 granularity, not the two-language split. **Supersedes ADR 0008.**
+**Amended by ADR 0016** (2026-09-07): per-call options structs, and the
+correction to this ADR's "not an ABI change" wording below.
 
 Sources: `.scratch/REVIEW-2026-09-05.md` §2, §3, §5.3, §6 (the review that
 found the defect); `.scratch/runtime/specs/01-device-resident-forward.md`
@@ -82,6 +84,12 @@ Options considered:
   one** even though this milestone runs batch 1 and per-token prefill, so
   batched decode rounds (G3) and chunked / tail prefill (G2, G4) are leaf
   changes, not ABI changes.
+  **Amended (ADR 0016, 2026-09-07):** this held for the ABI's *shape* — G2's
+  chunked prefill needed no new span or position parameter — but not for
+  per-call modulation. G2 added an extensible options struct to the prefill
+  call (route selection, compute-policy override) as a recorded, one-time
+  extension; later phases add fields to it rather than parameters or parallel
+  entry points.
 - The program layer is **ours**, written on top of vendored ops (ADR 0010);
   the reference's own program is not vendored (it is entangled with MTP,
   vision, graphs and its engine).
