@@ -17,6 +17,14 @@
 //! live agent session into a load trace the replay harness re-sends — the
 //! gate-run's capture piece.
 //!
+//! The G2 measurement instrument (`ttft` + `g2`, P2-05) is the phase-2
+//! gate tooling (ADR 0015): `ttft` measures time to first token at an
+//! exact prompt length on **cold prefixes** against any OpenAI-compatible
+//! endpoint — so ignis and the reference are measured by the same
+//! instrument — and `g2` turns two such records into the G2 verdict,
+//! refusing one outright when the evidence does not support it (records
+//! from different sessions, a missing cell, a void sample).
+//!
 //! The canary oracle (`oracle`, P1-04) is the G1 correctness tooling: a
 //! recorder captures the reference engine's greedy canary completions as a
 //! fixture (tokenized with the artifact's tokenizer), and the suite is
@@ -33,9 +41,12 @@
 
 pub mod canary;
 pub mod client;
+pub mod g2;
 pub mod gate;
 pub mod metrics;
 pub mod oracle;
 pub mod record;
 pub mod report;
+pub mod time;
 pub mod trace;
+pub mod ttft;

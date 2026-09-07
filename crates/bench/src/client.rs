@@ -38,6 +38,12 @@ pub struct Request {
     pub max_tokens: u32,
     /// Whether the request was streaming (affects ttft).
     pub stream: bool,
+    /// `stream_options.include_usage` — ask a streaming response for the
+    /// trailing usage chunk. The TTFT instrument (`ttft.rs`) needs it: the
+    /// usage figures are how a sample proves its prefix was cold (the
+    /// engine's own computed-prefill-token count). Replay traffic leaves it
+    /// `false` — one fewer chunk to parse per request.
+    pub include_usage: bool,
     /// `enable_thinking` to send on the request (GitHub #68), or `None` to
     /// omit the field (the server's configured default applies). Only the
     /// canary oracle recorder/comparer set this explicitly — see
@@ -57,6 +63,30 @@ pub struct Outcome {
     pub n_tokens: u32,
     /// The full generated text.
     pub output: String,
+    /// `usage.prompt_tokens` as the engine reported it, when it reported
+    /// any (a streaming response reports it only with
+    /// [`Request::include_usage`]).
+    pub prompt_tokens: Option<u32>,
+    /// `usage.prompt_tokens_details.cached_tokens` — the prompt tokens the
+    /// engine served from a prefix cache instead of computing. Absent means
+    /// the engine does not report the field at all, which is not the same
+    /// as a reported zero; see [`Outcome::computed_prefill_tokens`].
+    pub cached_prompt_tokens: Option<u32>,
+}
+
+impl Outcome {
+    /// The prompt tokens the engine actually *computed* this request: the
+    /// reported prompt tokens minus whatever it served from a prefix cache.
+    ///
+    /// This is the one reading the cold-prefix rule is judged on (ADR 0015),
+    /// and both engines are read the same way — the OpenAI usage shape both
+    /// speak. `None` means the engine reported no usage at all, which the
+    /// TTFT instrument treats as an unverifiable (void) sample rather than
+    /// as a cold one: a cold-prefix claim has to be evidence.
+    pub fn computed_prefill_tokens(&self) -> Option<u32> {
+        self.prompt_tokens
+            .map(|prompt| prompt.saturating_sub(self.cached_prompt_tokens.unwrap_or(0)))
+    }
 }
 
 /// An endpoint the replay driver can send requests to. `Send + Sync` so a
@@ -110,6 +140,10 @@ impl MockEndpoint {
             total_ms: ttft + decode_ms,
             n_tokens: n,
             output: format!("[{}]", req.id),
+            // The mock has no tokenizer: it reports the prompt's whitespace
+            // word count as its prompt tokens, all of them computed.
+            prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
+            cached_prompt_tokens: None,
         }
     }
 }
@@ -194,7 +228,34 @@ fn request_body(req: &Request) -> serde_json::Value {
     if let Some(enable_thinking) = req.enable_thinking {
         body["enable_thinking"] = serde_json::json!(enable_thinking);
     }
+    // The trailing usage chunk (OpenAI's `stream_options.include_usage`):
+    // meaningless on a non-streaming response, which always carries `usage`.
+    if req.include_usage && req.stream {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
     body
+}
+
+/// The `usage` figures the TTFT instrument reads back: the prompt tokens
+/// the engine counted, and how many of them it served from a prefix cache
+/// (OpenAI's `prompt_tokens_details.cached_tokens`, which the reference
+/// reports and ignis simply omits — it has no prefix cache before G4).
+struct Usage {
+    prompt_tokens: Option<u32>,
+    cached_prompt_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Read the `usage` object out of a `chat.completion` body or a
+    /// `chat.completion.chunk`'s trailing usage chunk — both carry `usage`
+    /// at the same JSON path.
+    fn from_response(value: &serde_json::Value) -> Self {
+        let as_u32 = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_u64()).map(|v| v as u32);
+        Self {
+            prompt_tokens: as_u32(value.pointer("/usage/prompt_tokens")),
+            cached_prompt_tokens: as_u32(value.pointer("/usage/prompt_tokens_details/cached_tokens")),
+        }
+    }
 }
 
 impl Endpoint for HttpEndpoint {
@@ -236,9 +297,12 @@ impl HttpEndpoint {
             resp.json()
                 .map_err(|e| format!("POST {url}: parse: {e}"))?;
         let total_ms = ms_since(start);
+        let usage = Usage::from_response(&value);
         Ok(Outcome {
             ttft_ms: total_ms,
             total_ms,
+            prompt_tokens: usage.prompt_tokens,
+            cached_prompt_tokens: usage.cached_prompt_tokens,
             n_tokens: value
                 .pointer("/usage/completion_tokens")
                 .and_then(|v| v.as_u64())
@@ -261,6 +325,8 @@ impl HttpEndpoint {
         let mut n_tokens: u32 = 0;
         let mut output = String::new();
         let mut first_token_ms: Option<f64> = None;
+        let mut prompt_tokens: Option<u32> = None;
+        let mut cached_prompt_tokens: Option<u32> = None;
         for line in reader.lines() {
             let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
             // The SSE framing: `data: <payload>` lines (empty lines
@@ -279,6 +345,15 @@ impl HttpEndpoint {
                 .map_err(|e| format!("POST {url}: bad SSE chunk {data}: {e}"))?;
             // `choices[0].delta.content` (an empty delta = the finish
             // chunk, not a token).
+            // The trailing usage chunk (`stream_options.include_usage`):
+            // empty `choices`, populated `usage`. It arrives last, so
+            // reading it here costs nothing and keeps one parse of the
+            // stream.
+            let usage = Usage::from_response(&chunk);
+            if let Some(prompt) = usage.prompt_tokens {
+                prompt_tokens = Some(prompt);
+                cached_prompt_tokens = usage.cached_prompt_tokens;
+            }
             let delta = chunk
                 .pointer("/choices/0/delta/content")
                 .and_then(|v| v.as_str())
@@ -299,6 +374,8 @@ impl HttpEndpoint {
             total_ms,
             n_tokens,
             output,
+            prompt_tokens,
+            cached_prompt_tokens,
         })
     }
 }
@@ -432,6 +509,7 @@ mod tests {
             prompt: "p".into(),
             max_tokens: 4,
             stream: false,
+            include_usage: false,
             enable_thinking: None,
         };
         assert!(request_body(&req).get("enable_thinking").is_none());
@@ -445,9 +523,57 @@ mod tests {
             prompt: "p".into(),
             max_tokens: 4,
             stream: false,
+            include_usage: false,
             enable_thinking: Some(false),
         };
         assert_eq!(request_body(&req)["enable_thinking"], false);
+    }
+
+    #[test]
+    fn request_body_asks_for_the_usage_chunk_only_when_streaming() {
+        let base = Request {
+            id: "r".into(),
+            class: RequestClass::Sub,
+            prompt: "p".into(),
+            max_tokens: 4,
+            stream: true,
+            include_usage: true,
+            enable_thinking: None,
+        };
+        assert_eq!(
+            request_body(&base)["stream_options"]["include_usage"],
+            true,
+            "a streaming request must ask for the trailing usage chunk"
+        );
+        // A non-streaming response always carries `usage`; asking for it
+        // through `stream_options` would be a field the engine ignores.
+        let non_streaming = Request { stream: false, ..base.clone() };
+        assert!(request_body(&non_streaming).get("stream_options").is_none());
+        // Replay traffic never asks for it.
+        let plain = Request { include_usage: false, ..base };
+        assert!(request_body(&plain).get("stream_options").is_none());
+    }
+
+    #[test]
+    fn computed_prefill_subtracts_the_cached_prompt_tokens() {
+        let mut o = MockEndpoint::fallback_for(&Request {
+            id: "r".into(),
+            class: RequestClass::Sub,
+            prompt: "one two three".into(),
+            max_tokens: 1,
+            stream: false,
+            include_usage: false,
+            enable_thinking: None,
+        });
+        assert_eq!(o.computed_prefill_tokens(), Some(3));
+        o.cached_prompt_tokens = Some(2);
+        assert_eq!(o.computed_prefill_tokens(), Some(1), "a cache hit is not computed prefill");
+        o.prompt_tokens = None;
+        assert_eq!(
+            o.computed_prefill_tokens(),
+            None,
+            "an engine that reports no usage cannot prove a cold prefix"
+        );
     }
 
     fn trace_jsonl() -> String {
@@ -465,6 +591,8 @@ mod tests {
             total_ms: total,
             n_tokens: n,
             output: "x".repeat(n as usize),
+            prompt_tokens: None,
+            cached_prompt_tokens: None,
         }
     }
 
@@ -539,6 +667,7 @@ mod tests {
             prompt: "p".into(),
             max_tokens: 1,
             stream: false,
+            include_usage: false,
             enable_thinking: None,
         };
         let o = MockEndpoint::fallback_for(&req);

@@ -22,14 +22,44 @@ pub fn scheduler<L: StepLeaf>(
     ConcreteScheduler::with_config(config, Arc::new(RuntimeCompute::new(model, eos)))
 }
 
-/// The leaf's fixed paged-KV page size, in tokens
-/// (`kernel/vendor/src/core/paged_kv_cache.h`'s `kPagedKVPageSize`) — the
-/// step ABI does not report it, so the scheduler's own KV-page accounting
-/// (`SchedulerConfig::kv_page_tokens`) must be kept in sync with it by hand
-/// for the real backend (the mock backend is page-size-agnostic and keeps
-/// the smaller default).
-#[cfg(feature = "cuda")]
-const LEAF_KV_PAGE_TOKENS: u32 = 64;
+/// The engine shape the operator configured (`--prefill-chunk`,
+/// `--max-context` — GitHub #87, resolved and validated by [`crate::config`]
+/// before any loader work starts). Carried as one value so the flags
+/// travel together from `main` to the leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineShape {
+    /// The prefill chunk width, in tokens (a nonzero multiple of 128).
+    pub prefill_chunk: u32,
+    /// The maximum per-sequence context, in tokens.
+    pub max_context: u32,
+    /// The paged-KV pool budget, in sequence-tokens: derived from
+    /// `max_context` ([`ignis_runtime::kv_pool_tokens_for`]), not an
+    /// independent flag.
+    pub kv_pool_tokens: u32,
+}
+
+impl Default for EngineShape {
+    /// The configured defaults, taken from [`ignis_runtime`] rather than
+    /// restated here — one source of truth for what `ignis-server` runs
+    /// with when the operator passes no flags.
+    fn default() -> Self {
+        Self {
+            prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
+            max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
+            kv_pool_tokens: ignis_runtime::kv_pool_tokens_for(ignis_runtime::DEFAULT_MAX_CONTEXT),
+        }
+    }
+}
+
+impl From<&crate::config::Config> for EngineShape {
+    fn from(config: &crate::config::Config) -> Self {
+        Self {
+            prefill_chunk: config.prefill_chunk,
+            max_context: config.max_context,
+            kv_pool_tokens: config.kv_pool_tokens,
+        }
+    }
+}
 
 /// Build the server's real GPU-backed scheduler (GitHub #61 / P1-25):
 /// open a second [`ignis_artifact::Reader`] over `artifact_path` (the
@@ -43,9 +73,10 @@ pub fn cuda_scheduler(
     artifact_path: &std::path::Path,
     model_id: String,
     eos: TokenId,
+    shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
     use ignis_artifact::{bind_text_scope_27b, materialize, CudaDevice, Reader};
-    use ignis_runtime::{CudaLeaf, CudaLeafConfig};
+    use ignis_runtime::{kv_pool_pages, CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     let (plan, handles) =
@@ -54,28 +85,35 @@ pub fn cuda_scheduler(
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
 
-    let leaf_config = CudaLeafConfig::default();
+    let leaf_config = CudaLeafConfig {
+        max_context_tokens: shape.max_context,
+        kv_pool_tokens: shape.kv_pool_tokens,
+        prefill_chunk_tokens: shape.prefill_chunk,
+        ..CudaLeafConfig::default()
+    };
     let max_sequence_tokens = leaf_config.max_context_tokens;
-    let slot_count = leaf_config.slot_count;
+    let kv_pool_tokens = leaf_config.kv_pool_tokens;
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
     let model = Arc::new(
         Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?,
     );
 
     // Match the scheduler's KV admission accounting to the pool the leaf
-    // actually built (`slot_count` sequences, each up to
-    // `max_sequence_tokens`) so admission never promises more than the
-    // pool's own budget. `slot_count` is `CudaLeafConfig::default()`'s
-    // `N_DECODE_LANES` (8), so the scheduler's own lane count
-    // (`SchedulerConfig::default()`'s `max_in_flight`) still matches it.
-    let pages_per_sequence = max_sequence_tokens / LEAF_KV_PAGE_TOKENS;
+    // actually built. Both sides derive the page count from
+    // `kv_pool_tokens` through the same `kv_pool_pages`, so growing the
+    // configured context (or the pool) can never let admission promise
+    // capacity the GPU does not have. The slot count is
+    // `CudaLeafConfig::default()`'s `N_DECODE_LANES` (8), so the
+    // scheduler's own lane count (`SchedulerConfig::default()`'s
+    // `max_in_flight`) still matches it.
+    let capacity_pages = kv_pool_pages(kv_pool_tokens);
     Ok(scheduler(
         SchedulerConfig {
             model: model_id,
-            kv_page_tokens: LEAF_KV_PAGE_TOKENS,
+            kv_page_tokens: KV_PAGE_TOKENS,
             max_sequence_tokens,
-            kv_capacity_pages: slot_count * pages_per_sequence,
-            host_capacity_pages: slot_count * pages_per_sequence,
+            kv_capacity_pages: capacity_pages,
+            host_capacity_pages: capacity_pages,
             ..SchedulerConfig::default()
         },
         model,
@@ -87,6 +125,19 @@ pub fn cuda_scheduler(
 mod tests {
     use super::*;
     use ignis_core::{DecodeParams, RequestClass, RequestInput, Scheduler};
+
+    #[test]
+    fn the_default_engine_shape_is_what_the_config_resolves_with_no_flags() {
+        // Two ways to say "the defaults" must not drift: the one `main`
+        // uses (`config::resolve`) and the one the GPU tests use
+        // (`EngineShape::default`).
+        let crate::config::ConfigOutcome::Config(config) =
+            crate::config::resolve(&[], |_| None).expect("resolve")
+        else {
+            panic!("expected a runnable config");
+        };
+        assert_eq!(EngineShape::from(&config), EngineShape::default());
+    }
 
     struct StubLeaf;
 

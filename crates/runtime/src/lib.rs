@@ -15,7 +15,50 @@ use ignis_core::{
 #[cfg(feature = "cuda")]
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
-pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel};
+pub use cuda_leaf::{kv_pool_pages, CudaLeaf, CudaLeafConfig, CudaModel, KV_PAGE_TOKENS};
+
+/// The default prefill chunk width, in tokens (spec
+/// `.scratch/runtime/specs/02-real-prefill.md`): the reference's own
+/// default, left alone — the chunk width is a knob this phase exposes,
+/// not a number it tunes. Unconditional on the `cuda` feature: it is a
+/// plain number, and both `ignis_server::config` (always compiled) and
+/// [`CudaLeafConfig::default`] (`cuda` only) fall back to it, so it has to
+/// live somewhere both can reach without one depending on the other.
+pub const DEFAULT_PREFILL_CHUNK: u32 = 1024;
+
+/// The prefill chunk width's alignment rule, in tokens: the reference's
+/// own alignment, and a multiple of the 64-token chunk the vendored GDN
+/// chunked kernels work in.
+pub const PREFILL_CHUNK_ALIGNMENT: u32 = 128;
+
+/// The default maximum per-sequence context, in tokens: a 32,768-token
+/// prompt plus an 8,192-token generation budget. G2's largest cell is a
+/// 32K prompt, so the default must admit one without editing code (spec
+/// `02-real-prefill.md`, user story 22).
+pub const DEFAULT_MAX_CONTEXT: u32 = 32_768 + 8_192;
+
+/// The default paged-KV pool budget, in sequence-tokens: the *pool* the
+/// leaf builds, which every live sequence draws its pages from.
+///
+/// Deliberately not `slot_count * max_context`: reserving a full
+/// 40,960-token context for each of the eight decode lanes is ~20 GiB of
+/// BF16 paged KV at this model's geometry (16 GQA layers x 4 KV heads x
+/// 256 head_dim x K+V x 2 bytes = 64 KiB per sequence-token), which does
+/// not fit next to ~19 GB of weights. The pool is sized so one sequence
+/// can take the whole 32K cell and the other lanes still have a working
+/// budget; a request the free pool cannot cover is a scheduler admission
+/// decision, not a load failure.
+const DEFAULT_KV_POOL_TOKENS: u32 = 65_536;
+
+/// The paged-KV pool budget for a configured `max_context`: never smaller
+/// than it, so the pool can always serve one full sequence, floored at
+/// [`DEFAULT_KV_POOL_TOKENS`] otherwise. Not independently configurable —
+/// spec `02-real-prefill.md` names only the chunk width and the
+/// per-sequence cap as engine-shape flags — so this is a function of
+/// `max_context`, not a third default of its own.
+pub fn kv_pool_tokens_for(max_context: u32) -> u32 {
+    DEFAULT_KV_POOL_TOKENS.max(max_context)
+}
 
 /// A failure returned by the step ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]

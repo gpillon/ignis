@@ -70,6 +70,13 @@ struct Inner {
     peak_in_flight: AtomicUsize,
     /// A per-request id counter (the mock's completion ids).
     next_id: std::sync::atomic::AtomicU64,
+    /// The `prompt_tokens_details.cached_tokens` the mock reports, or -1
+    /// for "the engine does not report the field" (the TTFT instrument's
+    /// cold-prefix evidence — `ttft.rs`).
+    cached_prompt_tokens: std::sync::atomic::AtomicI64,
+    /// Every prompt the mock has been sent, in arrival order (so a test
+    /// can prove the samples were distinct on the wire).
+    prompts: Mutex<Vec<String>>,
     /// The token count of every completed request (for test assertions).
     completed: Mutex<Vec<u32>>,
 }
@@ -85,7 +92,9 @@ impl MockState {
                 in_flight: AtomicUsize::new(0),
                 peak_in_flight: AtomicUsize::new(0),
                 next_id: std::sync::atomic::AtomicU64::new(0),
+                cached_prompt_tokens: std::sync::atomic::AtomicI64::new(-1),
                 completed: Mutex::new(Vec::new()),
+                prompts: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -119,6 +128,21 @@ impl MockState {
     /// The token counts of every completed request (in completion order).
     pub fn completed_tokens(&self) -> Vec<u32> {
         self.inner.completed.lock().unwrap().clone()
+    }
+
+    /// Serve the next requests as if `cached` of their prompt tokens came
+    /// from a prefix cache (`usage.prompt_tokens_details.cached_tokens`) —
+    /// the contamination the TTFT instrument must catch. `None` restores
+    /// the default: the field is not reported at all.
+    pub fn set_cached_prompt_tokens(&self, cached: Option<u32>) {
+        self.inner
+            .cached_prompt_tokens
+            .store(cached.map(i64::from).unwrap_or(-1), Ordering::Relaxed);
+    }
+
+    /// Every prompt the mock received, in arrival order.
+    pub fn prompts(&self) -> Vec<String> {
+        self.inner.prompts.lock().unwrap().clone()
     }
 }
 
@@ -197,6 +221,18 @@ struct CompletionsRequest {
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     seed: Option<u64>,
+    /// OpenAI's `stream_options` — the TTFT instrument sets
+    /// `include_usage` to read the engine's own prompt-token figures back
+    /// off a streaming response.
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+/// `stream_options` (the trailing usage chunk opt-in).
+#[derive(Debug, Default, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 /// One conversation message (the server's `role` + `content` shape).
@@ -227,6 +263,19 @@ async fn completions(
             "the engine cannot admit the request right now (all lanes in use); retry",
         );
     }
+    // The mock's "prompt tokens": the last message's whitespace word count
+    // (the server's real figure is the templated token count).
+    let prompt_tokens = prompt_token_count(&req);
+    state
+        .inner
+        .prompts
+        .lock()
+        .unwrap()
+        .push(req.messages.last().map(|m| m.content.clone()).unwrap_or_default());
+    let cached = match state.inner.cached_prompt_tokens.load(Ordering::Relaxed) {
+        c if c < 0 => None,
+        c => Some(c as u32),
+    };
     let n = req.max_tokens.unwrap_or(MAX_TOKENS).min(MAX_TOKENS);
     let model = req
         .model
@@ -242,7 +291,12 @@ async fn completions(
         // `finish_reason` chunk, then `[DONE]`) back-to-back.
         let guard = InFlightGuard::enter(state.inner.clone());
         tokio::time::sleep(PREFILL).await;
-        let events = paced_chunks(&id, &model, created, n);
+        let usage = req
+            .stream_options
+            .as_ref()
+            .is_some_and(|o| o.include_usage)
+            .then_some((prompt_tokens, cached));
+        let events = paced_chunks(&id, &model, created, n, usage);
         Sse::new(BackToBackSse::new(state.inner.clone(), n, guard, events)).into_response()
     } else {
         // Non-streaming: hold the request in flight for the "generation"
@@ -269,6 +323,15 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// The mock's prompt-token figure: the last message's whitespace word
+/// count (the server's real figure is the templated token count).
+fn prompt_token_count(req: &CompletionsRequest) -> u32 {
+    req.messages
+        .last()
+        .map(|m| m.content.split_whitespace().count() as u32)
+        .unwrap_or(0)
+}
+
 /// The non-streaming completion response (the server's `chat.completion`
 /// shape, the `usage` figures, the `message` content).
 fn completion_json(
@@ -278,13 +341,7 @@ fn completion_json(
     req: &CompletionsRequest,
     n: u32,
 ) -> serde_json::Value {
-    // The "prompt" is the last message's content (the mock's rough prompt
-    // figure — the server's real figure is the templated token count).
-    let prompt_tokens = req
-        .messages
-        .last()
-        .map(|m| m.content.split_whitespace().count() as u32)
-        .unwrap_or(0);
+    let prompt_tokens = prompt_token_count(req);
     let content = (0..n).map(token_text).collect::<Vec<_>>().join(" ");
     serde_json::json!({
         "id": id,
@@ -338,6 +395,39 @@ fn done_event() -> Event {
     Event::default().data("[DONE]")
 }
 
+/// The trailing usage chunk (`stream_options.include_usage`): empty
+/// `choices`, populated `usage`. `cached` rides along as OpenAI's
+/// `prompt_tokens_details.cached_tokens` when the mock is set to serve a
+/// prefix cache; a real engine without one simply omits the field.
+fn usage_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    prompt_tokens: u32,
+    cached: Option<u32>,
+    n: u32,
+) -> Event {
+    let mut usage = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": n,
+        "total_tokens": prompt_tokens + n,
+    });
+    if let Some(cached) = cached {
+        usage["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
+    }
+    Event::default().data(
+        serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage,
+        }))
+        .expect("chunk serializes"),
+    )
+}
+
 /// The SSE events for a request: a content chunk per token, the finish
 /// chunk (empty delta + `finish_reason`), then the `[DONE]` marker. The
 /// stream (`BackToBackSse`) emits them back-to-back; the prefill wait
@@ -347,12 +437,18 @@ fn paced_chunks(
     model: &str,
     created: u64,
     n: u32,
+    usage: Option<(u32, Option<u32>)>,
 ) -> VecDeque<Event> {
     let mut events = VecDeque::new();
     for i in 0..n {
         events.push_back(content_chunk(id, model, created, &token_text(i)));
     }
     events.push_back(finish_chunk(id, model, created));
+    // The trailing usage chunk goes right before `[DONE]`, the way the
+    // server sends it.
+    if let Some((prompt_tokens, cached)) = usage {
+        events.push_back(usage_chunk(id, model, created, prompt_tokens, cached, n));
+    }
     events.push_back(done_event());
     events
 }

@@ -137,6 +137,60 @@ cargo run -p ignis-bench -- oracle compare `
 # 4. Stop ninfer-serve (frees the GPU) and commit the updated fixture.
 ```
 
+## The G2 measurement instrument (P2-05, GitHub #87)
+
+`ignis-bench ttft` measures time to first token at an **exact** prompt
+length against any OpenAI-compatible endpoint, and `ignis-bench g2` turns
+two such records into the G2 verdict (ADR 0015). Both engines are measured
+by this one instrument; only the runs themselves need the GPU.
+
+Every sample — the warmup included — gets its own deterministically
+generated prompt, distinct from the first content token, and reads the
+engine's own computed-prefill-token count back to prove the prefix was
+cold. A sample whose computed prefill is not the prompt's own length is
+**void** and fails its cell, and `g2` refuses a verdict over a record with
+a void sample, a missing cell, or a session that does not match its
+counterpart's.
+
+The gate run (GitHub #88) needs the GPU exclusively and the reference
+stopped and restarted around it (ADR 0006). One session, one shared
+`--session` value:
+
+```powershell
+$Session = "g2-$(Get-Date -Format yyyyMMddTHHmmssZ)"
+$Artifact = "F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer"
+
+# 1. The reference, in the owner's production profile (hq-e8-2b KV, 1024
+#    prefill chunk, CUDA graphs) -- the bar actually experienced, measured
+#    as it is actually run (ADR 0015).
+cargo run -p ignis-bench -- ttft `
+  --endpoint http://127.0.0.1:8080 --artifact $Artifact `
+  --cells 8192,32768 --label reference --profile "hq-e8-2b KV, 1024 chunk, graphs" `
+  --session $Session --out .scratch/g2-reference.json
+
+# 2. Stop the reference (it owns the GPU), start ignis-server on the same
+#    artifact, then measure it on the same cells in the same session.
+cargo run -p ignis-bench -- ttft `
+  --endpoint http://127.0.0.1:8000 --artifact $Artifact `
+  --cells 8192,32768 --label ignis --profile "BF16 KV, 1024 chunk, eager" `
+  --session $Session --out .scratch/g2-ignis.json
+
+# 3. The verdict. `--note` records what is *not* equal between the two
+#    engines, rather than correcting for it.
+cargo run -p ignis-bench -- g2 `
+  --ours .scratch/g2-ignis.json --ref .scratch/g2-reference.json `
+  --note "KV format differs: ignis BF16, reference hq-e8-2b" `
+  --out .scratch/g2-verdict.json
+
+# 4. Restart the reference.
+```
+
+`ignis-server` takes the engine shape the run needs as flags (each over its
+own env var, each validated before any loader work starts): `--prefill-chunk`
+(default 1024, a nonzero multiple of 128) and `--max-context` (default
+40960 — a 32K prompt plus an 8K generation budget). The paged-KV pool the
+leaf builds is derived from `--max-context`, not a flag of its own.
+
 ## Where tests live
 
 - Unit tests: `#[cfg(test)]` modules, in the file they test.

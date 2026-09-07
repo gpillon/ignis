@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::gpu_profile;
 use ignis_server::engine::Engine;
-use ignis_server::runtime::cuda_scheduler;
+use ignis_server::runtime::{cuda_scheduler, EngineShape};
 use ignis_server::telemetry::{NullSink, SystemClock};
 use ignis_server::Server;
 
@@ -74,7 +74,7 @@ fn harness() -> Option<Harness> {
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
 
-    let scheduler = match cuda_scheduler(path, MODEL.into(), eos) {
+    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, EngineShape::default()) {
         Ok(scheduler) => scheduler,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {

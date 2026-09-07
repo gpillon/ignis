@@ -124,6 +124,7 @@ pub fn record(
             prompt: c.prompt.to_string(),
             max_tokens,
             stream: false,
+            include_usage: false,
             enable_thinking: Some(false),
         };
         let outcome = ep
@@ -378,6 +379,8 @@ mod tests {
             total_ms: 1.0,
             n_tokens: text.split_whitespace().count() as u32,
             output: text.to_string(),
+            prompt_tokens: None,
+            cached_prompt_tokens: None,
         }
     }
 

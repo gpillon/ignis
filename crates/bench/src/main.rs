@@ -17,6 +17,17 @@
 //!       99% gate, per class) + the divergence report (canary
 //!       self-consistency — the v1 verdict is their conjunction), shipped
 //!       as a single JSON file. Exits non-zero when the v1 verdict fails.
+//!   `ttft    --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768
+//!             [--samples 5] [--max-tokens 8] [--label L] [--profile P]
+//!             [--session S] [--out <record.json>]`
+//!       The G2 measurement instrument (P2-05, ADR 0015): time to first
+//!       token at an exact prompt length, on cold prefixes, against any
+//!       OpenAI-compatible endpoint. Writes one engine's record.
+//!   `g2      --ours <ignis-record.json> --ref <reference-record.json>
+//!             [--note <text>] [--out <verdict.json>]`
+//!       The G2 verdict over two such records: the ratio of medians per
+//!       cell against 1.5. Refuses a verdict when the records are not
+//!       live/live (different sessions, a missing cell, a void sample).
 //!   `record  --listen <proxy> --target <engine-url> --out <load>-trace.jsonl
 //!             [--class <policy>]`
 //!       The capture proxy (spec 03): accepts OpenAI chat-completions from a
@@ -36,12 +47,15 @@ use std::sync::Arc;
 use ignis_bench::{
     canary::{self, CanaryResult},
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
+    g2,
     gate::GateReport,
     metrics::Run,
     oracle::{self, Fixture},
     record::{ClassPolicy, RecordConfig, RecordServer},
     report::PerformanceReport,
+    time::new_session_id,
     trace::Trace,
+    ttft::{self, CellSpec, TtftConfig},
 };
 
 fn main() -> ExitCode {
@@ -53,6 +67,8 @@ fn main() -> ExitCode {
         Some("gate") => cmd_gate(&args[1..]),
         Some("record") => cmd_record(&args[1..]),
         Some("oracle") => cmd_oracle(&args[1..]),
+        Some("ttft") => cmd_ttft(&args[1..]),
+        Some("g2") => cmd_g2(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -70,7 +86,10 @@ fn print_usage() {
   ignis-bench record --listen <proxy> --target <engine-url> --out <load>-trace.jsonl [--class <policy>]
   ignis-bench oracle record --endpoint <url> --artifact <artifact.ninfer> --out <fixture.json> [--max-tokens N]
   ignis-bench oracle compare --fixture <fixture.json> --endpoint <url> --artifact <artifact.ninfer> [--first-n N]
-  ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]"
+  ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]
+  ignis-bench ttft --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768 [--samples 5] [--max-tokens 8]
+                   [--label ignis] [--profile <text>] [--session <id>] [--out <record.json>]
+  ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
     );
 }
 
@@ -431,6 +450,183 @@ fn cmd_record(args: &[String]) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Every value following a repeated `--key` flag (e.g. `--note`), in argv
+/// order. [`opt`] takes only the first; the G2 verdict may carry several
+/// known inequalities.
+fn repeated_opt(args: &[String], key: &str) -> Vec<String> {
+    let flag = format!("--{key}");
+    args.windows(2)
+        .filter(|w| w[0] == flag)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
+/// `ttft` (P2-05, GitHub #87): measure time to first token at one or more
+/// exact prompt lengths, on cold prefixes, against one OpenAI-compatible
+/// endpoint. The record it writes is one half of a G2 verdict; `g2`
+/// compares two of them.
+fn cmd_ttft(args: &[String]) -> ExitCode {
+    let (endpoint, artifact, cells_raw) = match (
+        require(args, "endpoint"),
+        require(args, "artifact"),
+        require(args, "cells"),
+    ) {
+        (Ok(e), Ok(a), Ok(c)) => (e, a, c),
+        (e, a, c) => {
+            for err in [e.err(), a.err(), c.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let samples = opt(args, "samples")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(ttft::DEFAULT_SAMPLES);
+    let max_tokens = opt(args, "max-tokens")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(ttft::DEFAULT_MAX_TOKENS);
+    let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
+    let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
+    // Live/live (ADR 0015): the *same* session id must be passed to both
+    // engines' runs, so a generated one is announced loudly enough to be
+    // reused by the second run.
+    let session = opt(args, "session").unwrap_or_else(new_session_id);
+    let out = opt(args, "out");
+
+    let mut specs = Vec::new();
+    for raw in cells_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match raw.parse::<u32>() {
+            Ok(prompt_tokens) => specs.push(CellSpec { prompt_tokens, samples }),
+            Err(_) => {
+                eprintln!("error: --cells expects comma-separated token counts, got `{raw}`");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if specs.is_empty() {
+        eprintln!("error: --cells named no cells");
+        return ExitCode::FAILURE;
+    }
+
+    // The artifact's own tokenizer + chat template: what makes a cell's
+    // claimed prompt length the length the engine actually prefills.
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ep = HttpEndpoint::new(&endpoint);
+    let engine = match ep.list_models() {
+        Ok(models) if !models.is_empty() => {
+            eprintln!("engine {endpoint}: {}", models.join(", "));
+            models[0].clone()
+        }
+        Ok(_) => {
+            eprintln!("error: engine {endpoint} reports no loaded model");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "ttft session {session}: {} cells x {samples} samples (+1 warmup) against {label}",
+        specs.len()
+    );
+
+    let cfg = TtftConfig {
+        cells: specs,
+        max_tokens,
+        label,
+        profile,
+        artifact,
+        session,
+    };
+    let record = ttft::measure(&ep, &frontend, engine, endpoint, &cfg);
+    print!("{}", record.render());
+
+    if let Some(path) = &out {
+        if let Err(e) = record.write(Path::new(path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    // A cell whose samples were not all cold measured something other than
+    // prefill; the gate check would refuse it anyway, so say so here.
+    let contaminated: Vec<u32> = record
+        .cells
+        .iter()
+        .filter(|c| !c.all_cold())
+        .map(|c| c.prompt_tokens)
+        .collect();
+    if contaminated.is_empty() {
+        eprintln!("all samples cold; pass --session {} to the other engine's run", cfg.session);
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "error: cells {contaminated:?} did not produce a full set of cold samples — this              record cannot decide the gate"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `g2` (P2-05, GitHub #87): the G2 verdict over two TTFT records. Refuses
+/// outright — rather than reporting a failure — when the two records do not
+/// support a live/live comparison (ADR 0015).
+fn cmd_g2(args: &[String]) -> ExitCode {
+    let (ours_path, ref_path) = match (require(args, "ours"), require(args, "ref")) {
+        (Ok(o), Ok(r)) => (o, r),
+        (o, r) => {
+            for err in [o.err(), r.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let ours = match ttft::Record::read(Path::new(&ours_path)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference = match ttft::Record::read(Path::new(&ref_path)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut verdict = match g2::check(&ours, &reference) {
+        Ok(v) => v,
+        Err(refusal) => {
+            eprintln!("G2 gate check REFUSED: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    verdict.notes.extend(repeated_opt(args, "note"));
+    print!("{}", verdict.render());
+    if let Some(path) = opt(args, "out") {
+        if let Err(e) = verdict.write(Path::new(&path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    if verdict.passed {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("G2 gate FAILED (ADR 0015: ratio <= {} per cell)", verdict.threshold);
+        ExitCode::FAILURE
     }
 }
 
