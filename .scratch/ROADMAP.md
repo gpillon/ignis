@@ -11,7 +11,7 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 | Phase | Gate | Master ticket | Spec |
 |---|---|---|---|
 | 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
-| 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: TTFT @8K/32K ≤ 1.5× reference MTP0 | #63 | to write when G1 lands |
+| 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `runtime/specs/02-real-prefill.md` |
 | 3 — serving loop: batched decode rounds, per-width CUDA graphs, sampling, request log | G3: C=1 MTP0 decode ≥ 99% of reference (75–76 tok/s); C=4 aggregate ≥ 99% | #64 | to write when G2 lands |
 | 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | to write when G3 lands |
 | 5 — speculative decoding: MTP + ReplaySSM, then DFlash2 | G5: ≥ 99% of reference MTP7-adaptive / DFlash2-7 committed tok/s @24K/98K/196K | #66 | to write when G4 lands |
@@ -58,7 +58,14 @@ Current frontier (2026-09-07): #74 (P1-18 correctness, needs GPU — highest pri
 
 ## Phase 2–5 candidate decomposition (not published; refined when the gate before lands)
 
-- **G2**: W4A4 activation quant + TMA GEMM route on (T ≥ 64) · prefill attention bf16 route in the program · GDN chunked prefill route · chunked span prefill (1024) with KV append · TTFT bench cell · G2 gate.
+- **G2**: superseded by `runtime/specs/02-real-prefill.md` (tickets cut from
+  that spec). What the candidate list said, for the record: W4A4 activation
+  quant + TMA GEMM route · prefill attention bf16 route in the program · GDN
+  chunked prefill route · chunked span prefill (1024) with KV append · TTFT
+  bench cell · G2 gate. The spec corrects one detail: the W4A4 route's token
+  thresholds are the vendored dispatch's own, per projection (as low as
+  T ≥ 4, and unconditional for the GDN input projection), not a single
+  T ≥ 64 rule.
 - **G3**: batched decode round (B ≤ 8) over per-slot views · sampling (temp/top-p/top-k/penalties, seed) · decode graph capture per width + eager fallback · PDL chain where vendored ops support it · request-log JSONL · core KV pool ↔ runtime pages under load · G3 gate (C=1, C=4).
 - **G4**: hq-e8-2b codec + attention routes + exact-key side store · device prefix reuse (page refcount, shared system+tools boundary) · KV-RAM tier snapshot/restore (all state sections) · tagged lanes · preserve-thinking / tool-call stream hardening · warmup/readiness · G4 gate (bench-03 trace).
 - **G5**: MTP round + pack + adaptive width + ReplaySSM records/fold · DFlash2 drafter load + draft kernels + RAM-tier carry · G5 gate.
