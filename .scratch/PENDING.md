@@ -17,16 +17,18 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   RMSNorm `unit_offset` fix (#67), but the gate is **not** green: first-32-token
   agreement with the canary oracle is 52%, against a ≥ 95% floor (see #72
   below), and the 2026-09-07 gate run (#62) found the server e2e leg of the
-  GPU profile red plus a test-wiring gap that hid three GPU tests from every
-  profile run (#70, #71, #73). Until the G1 gate is recorded green on a free
-  RTX 5090 — coherent greedy completions on the canary suite, per-layer output
-  within bf16 tolerance of the f64 layer reference, ≥ 95% first-32-token
-  agreement with the canary oracle, EOS honored, reproducible across loads —
-  **nothing downstream of it is meaningful**, including every performance
-  number. Everything the review deleted (the host-resident forward, the toy
-  decode graphs, the scalar kernels and their host-pointer surfaces) is gone;
-  do not resurrect it. Owner: the runtime work, tickets #37–#62.
-  Blocker: #70, #71, #72, #73, plus GPU exclusivity for the gate run (ADR 0006).
+  GPU profile red (#70, #71) plus a test-wiring gap (#73, fixed) that hid
+  three GPU tests from every profile run — one of which (#74) turns out to
+  be a real, previously-undetected correctness failure. Until the G1 gate is
+  recorded green on a free RTX 5090 — coherent greedy completions on the
+  canary suite, per-layer output within bf16 tolerance of the f64 layer
+  reference, ≥ 95% first-32-token agreement with the canary oracle, EOS
+  honored, reproducible across loads — **nothing downstream of it is
+  meaningful**, including every performance number. Everything the review
+  deleted (the host-resident forward, the toy decode graphs, the scalar
+  kernels and their host-pointer surfaces) is gone; do not resurrect it.
+  Owner: the runtime work, tickets #37–#62.
+  Blocker: #70, #71, #72, #74, plus GPU exclusivity for the gate run (ADR 0006).
 
 - **Two canaries diverge from the oracle at token 0 (GitHub #72; blocks G1).**
   With the RMSNorm convention fixed (#67) and the chat template's thinking
@@ -45,11 +47,11 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   the oracle's exact prompt through the HTTP surface — not yet re-checked.
   Owner: unassigned. Blocker: GPU exclusivity (ADR 0006).
 
-- **The GPU profile's fail-never-skip rule now runs green for op/layer/program
-  tests, but the server e2e leg is red and three tests are invisible to the
-  profile entirely (GitHub #38, ADR 0006; found running #62 on 2026-09-07).**
-  A full `scripts/gpu-profile.ps1` run on a free RTX 5090 came back:
-  kernel build green; `gqa_layers_match_f64_reference`,
+- **The GPU profile's fail-never-skip rule now runs green for most op/layer/
+  program tests, but the server e2e leg is red and the degenerate-program
+  layer check is red (GitHub #38, ADR 0006; found running #62 on 2026-09-07,
+  #73 fixed same night).** A full `scripts/gpu-profile.ps1` run on a free
+  RTX 5090 came back: kernel build green; `gqa_layers_match_f64_reference`,
   `full_program_prefill_and_greedy_decode_are_deterministic`, the `cuda_leaf`
   decode test, and `seq_alloc_gpu`'s 3 tests all green. `openai_http_gpu.rs`
   (P1-25 server e2e) failed 2 of 3 under default (concurrent) `cargo test`
@@ -60,12 +62,18 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   empty/malformed content because they don't disable `enable_thinking` and
   the model spends the whole 32-token budget on the reasoning channel (#70).
   Separately, `model_load_gpu.rs` (P1-17), `gdn_layer_gpu.rs` (P1-22), and
-  `step_degenerate_gpu.rs` (P1-18) all lack `#[ignore]`, so
+  `step_degenerate_gpu.rs` (P1-18) all lacked `#[ignore]`, so
   `cargo test --features cuda -- --ignored` — the profile script's exact
-  invocation — filters them **out** every time; they have never actually run
-  under the profile (#73). Owner: whoever next has a free GPU; fix #73 first
-  (cheap), then re-run the full profile to get first real data on those three,
-  then #70/#71 to get server e2e green. Blocker: GPU exclusivity (ADR 0006).
+  invocation — filtered them **out** every time; they had never actually run
+  under the profile (#73, fixed same night: commit e5c2c21). Verifying the
+  fix surfaced real data for the first time: P1-17 and P1-22 pass, but P1-18
+  (`degenerate_program_matches_f64_reference_for_four_tokens`) fails hard —
+  relative L2 error 1.08 against a 0.0039 tolerance (#74) — the GPU-computed
+  logits for the embedding→norm→output-head→argmax slice are essentially
+  uncorrelated with the independent f64 reference. Owner: whoever next has a
+  free GPU; #74 (P1-18) is the most surprising and highest-priority of the
+  remaining gaps, then #70/#71 to get server e2e green.
+  Blocker: GPU exclusivity (ADR 0006).
 
 ## Blocked (external)
 
