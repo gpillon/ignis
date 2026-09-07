@@ -154,8 +154,16 @@ fn f64_reference_logits(reader: &Reader, token_id: u32) -> Vec<f64> {
 
     let mean_sq: f64 = embed_row.iter().map(|x| x * x).sum::<f64>() / HIDDEN as f64;
     let inv = 1.0 / (mean_sq + RMS_NORM_EPS).sqrt();
-    let normed: Vec<f64> =
-        embed_row.iter().zip(norm_weight.iter()).map(|(x, w)| x * inv * w).collect();
+    // `text/final_norm` is stored in the same unit-offset (`1 + w`) form as
+    // every other hidden-width RMSNorm gain (`crates/artifact/tests/
+    // rmsnorm_weight_convention.rs`, GitHub #67) -- the device program's
+    // `ninfer::ops::rmsnorm` call (kernel/src/step.cu) passes
+    // `unit_offset=true` for exactly this reason.
+    let normed: Vec<f64> = embed_row
+        .iter()
+        .zip(norm_weight.iter())
+        .map(|(x, w)| x * inv * (1.0 + w))
+        .collect();
 
     let head_payload = reader.payload("text/output_head").expect("output_head payload").data;
     (0..VOCAB as u64).map(|v| w8_row_dot(head_payload, &geom, v, &normed)).collect()
