@@ -58,6 +58,10 @@ unsafe extern "C" {
         total_bytes: *mut u64,
     ) -> i32;
 
+    /// Free a device allocation returned by [`ignis_device_alloc`]. NULL
+    /// device or pointer is a no-op.
+    pub fn ignis_device_free(d: *mut IgnisDevice, ptr: *mut c_void);
+
     /// Destroy the context (drains the load stream first). NULL is a no-op.
     pub fn ignis_device_destroy(d: *mut IgnisDevice);
 }

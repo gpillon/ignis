@@ -74,6 +74,15 @@ pub trait Device {
     /// Block until all pending copies complete.
     fn synchronize(&mut self) -> Result<()>;
 
+    /// Release a buffer this device produced (`buffer` must come from this
+    /// same device's own [`Device::allocate`]). Default: a no-op —
+    /// [`CpuDevice`]'s arenas are plain `Vec`s it already owns, freed when
+    /// the device itself drops; only [`CudaDevice`] needs an explicit
+    /// `cudaFree` for its raw allocation.
+    fn deallocate(&mut self, _buffer: DeviceBuffer) -> Result<()> {
+        Ok(())
+    }
+
     /// Free memory in bytes (None: the implementation cannot report it).
     fn free_bytes(&self) -> Option<u64> {
         None
@@ -267,6 +276,11 @@ impl Device for CudaDevice {
             return None;
         }
         Some(total)
+    }
+
+    fn deallocate(&mut self, buffer: DeviceBuffer) -> Result<()> {
+        unsafe { crate::ffi::ignis_device_free(self.handle, buffer.base_ptr() as *mut c_void) };
+        Ok(())
     }
 }
 

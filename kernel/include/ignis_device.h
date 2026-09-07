@@ -52,6 +52,10 @@ int32_t ignis_device_sync(struct ignis_device *d);
 int32_t ignis_device_mem_info(struct ignis_device *d, uint64_t *free_bytes,
                               uint64_t *total_bytes);
 
+/* Free a device allocation returned by ignis_device_alloc. NULL device or
+ * pointer is a no-op. */
+void ignis_device_free(struct ignis_device *d, void *ptr);
+
 /* Destroy the context: drain the load stream, then free the event and stream,
  * then release the handle. NULL is a no-op. */
 void ignis_device_destroy(struct ignis_device *d);

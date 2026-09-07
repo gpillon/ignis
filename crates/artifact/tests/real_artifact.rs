@@ -223,3 +223,40 @@ fn real_nvfp4full_cuda_device() {
     assert!(stats.device_capacity_bytes > 0);
     assert_eq!(stats.tensor_count, 1319);
 }
+
+/// Regression test (GitHub #70's discovery, `.scratch` review 2026-09-07):
+/// `ignis_device_alloc` had no `cudaFree` counterpart, so every device
+/// allocation leaked for the process's life — sequential in-process model
+/// loads (the `openai_http_gpu.rs` test harness) accumulated one ~19 GB
+/// arena per load. Pins `Device::deallocate` actually returns memory to the
+/// device instead of only checking it compiles.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_device_deallocate_returns_the_allocation() {
+    use ignis_artifact::Device;
+
+    if std::env::var("IGNIS_TEST_CUDA").is_err() {
+        eprintln!("skip: set IGNIS_TEST_CUDA=1 (GPU must be free) to run the CudaDevice path");
+        return;
+    }
+    let mut device = CudaDevice::create(0).expect("CUDA driver available");
+
+    let before = device.free_bytes().expect("CUDA reports free VRAM") as i64;
+    // Large enough that a leak is unmistakable against measurement noise
+    // (background driver bookkeeping between the two free_bytes() calls).
+    const ALLOC_BYTES: i64 = 1024 * 1024 * 1024; // 1 GiB
+    let buffer = device.allocate(ALLOC_BYTES as u64).expect("allocate 1 GiB");
+    let after_alloc = device.free_bytes().expect("CUDA reports free VRAM") as i64;
+    assert!(
+        before - after_alloc >= ALLOC_BYTES - 64 * 1024 * 1024,
+        "allocating 1 GiB must reduce free VRAM by roughly that much: before={before} after={after_alloc}"
+    );
+
+    device.deallocate(buffer).expect("deallocate");
+    let after_free = device.free_bytes().expect("CUDA reports free VRAM") as i64;
+    // A leaked allocation would leave ~1 GiB still missing here, not noise.
+    assert!(
+        after_free - after_alloc >= ALLOC_BYTES - 128 * 1024 * 1024,
+        "deallocate must return the allocation to the device: after_alloc={after_alloc} after_free={after_free}"
+    );
+}
