@@ -50,10 +50,11 @@ pinned reference commit via the manifest script (spec: kernel policy).
 | P1-23 (#59) | Full program + prefill/decode ABI: 64 layers, per-token prefill over a span, decode round (batch 1), EOS from artifact defaults, stats | P1-21, P1-22 | Canary prompt → coherent greedy text; reproducible across loads |
 | P1-24 (#60) | Rust runtime crate: safe wrapper (model/sequence handles, Drop, error mapping), Compute-trait adapter, EOS / max_tokens stop; mock stays | P1-19 (#55) | CPU tests against a stub leaf; scheduler drives the adapter |
 | P1-25 (#61) | Server e2e on the real model: streaming + non-streaming chat completions with `finish_reason: stop`; bench canary against it | P1-23, P1-24 | GPU e2e green |
-| P1-26 (#62) | G1 gate run: canary agreement ≥ 95% vs the P1-05 fixture, f64 layer checks, reproducibility; record the verdict in the review; close #36 | P1-05, P1-25 | Gate recorded |
+| P1-26 (#62) | G1 gate run: canary agreement ≥ 95% vs the P1-05 fixture, f64 layer checks, reproducibility; record the verdict in the review; close #36 | P1-05, P1-25 | Gate recorded — **not green** (2026-09-07): see PENDING.md and REVIEW §6 Phase 1 verdict. Gaps filed as #70, #71, #72, #73 rather than waived. |
 
 Frontier at start: #37, #38, #39, #40, #42 (five parallel starts).
 Critical path: #42 → #45/#46 → #47/#48/#49 → #57/#58 → #59 → #61 → #62.
+Current frontier (2026-09-07): #70 (test fix, no GPU), #71 (test fix, no GPU), #73 (one-line fix, no GPU — do first), #72 (needs the GPU + logit-level debugging).
 
 ## Phase 2–5 candidate decomposition (not published; refined when the gate before lands)
 
