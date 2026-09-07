@@ -11,27 +11,6 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
 
 ## Open
 
-- **G1 — a correct, device-resident forward pass (GitHub #36, spec
-  `.scratch/runtime/specs/01-device-resident-forward.md`, ADR 0009/0010).**
-  ignis computes the model and produces coherent greedy completions as of the
-  RMSNorm `unit_offset` fix (#67), and the full GPU profile
-  (`scripts/gpu-profile.ps1`) now runs green end to end (#73/#74/#75 fixed
-  2026-09-07). The canary-agreement criterion is now **met**: teacher-forced
-  next-token agreement is 99/102 = 97.1% against the ≥ 95% floor (#76,
-  ADR 0014). Until the G1 gate is recorded green on a free RTX 5090 —
-  coherent greedy completions on the canary suite, per-layer output within
-  bf16 tolerance of the f64 layer reference, ≥ 95% teacher-forced next-token
-  agreement with the canary oracle, EOS honored, reproducible across loads —
-  **nothing downstream of it is meaningful**, including every performance
-  number. Everything the review
-  deleted (the host-resident forward, the toy decode graphs, the scalar
-  kernels and their host-pointer surfaces) is gone; do not resurrect it.
-  Owner: the runtime work, tickets #37–#62.
-  Blocker: GPU exclusivity for the gate run (ADR 0006). #72 (diagnosed) and
-  #76 (metric decided, ADR 0014) no longer block; what remains for #62 is
-  recording the verdict — the f64 layer checks and the reproducibility run —
-  on a free GPU.
-
 - **`rust-sort` position 23: a genuine (small) logit disagreement with the
   reference — diagnostic follow-up, not a gate blocker (GitHub #76).** Under
   the teacher-forced G1 metric (ADR 0014) the canary suite scores 99/102 =
