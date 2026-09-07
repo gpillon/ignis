@@ -161,12 +161,11 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     ninfer::ops::linear_swiglu(post, weights.mlp_gate_up, fused, *model->scratch, stream);
     ninfer::ops::linear_add(fused, weights.mlp_down, residual, *model->scratch, stream);
 
-    error = cudaStreamSynchronize(stream);
-    if (error != cudaSuccess) {
-      set_error(std::string("ignis_gqa_layer_step: cudaStreamSynchronize failed: ") +
-                cudaGetErrorString(error));
-      return -1;
-    }
+    // No stream synchronization here (P2-01, GitHub #83): the layer body
+    // only enqueues work, so a later chunk loop can run every layer as one
+    // pipelined unit. `ignis_gqa_layer_step` below synchronizes once the
+    // layer body returns, keeping this function's own callers' contract
+    // (its GPU tests) unchanged.
     seq->gqa_positions[gqa_layer] += static_cast<std::uint32_t>(tokens);
     return 0;
   } catch (const std::exception &error) {
@@ -205,8 +204,22 @@ extern "C" int32_t ignis_gqa_layer_step(struct ignis_model *model, struct ignis_
     set_error("ignis_gqa_layer_step: token positions exceed the sequence KV capacity");
     return -1;
   }
-  return run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual), out_residual,
-                       gqa_layer, num_tokens);
+  const int32_t rc = run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual),
+                                   out_residual, gqa_layer, num_tokens);
+  if (rc != 0) {
+    return rc;
+  }
+  // P2-01 (GitHub #83): the sync moved here from the layer body so a direct
+  // call through this ABI entry point (this function's own GPU tests) keeps
+  // seeing a synchronous result, while a caller that dispatches the body
+  // directly (the program's per-chunk loop) can pipeline every layer.
+  const cudaError_t error = cudaStreamSynchronize(model->stream);
+  if (error != cudaSuccess) {
+    set_error(std::string("ignis_gqa_layer_step: cudaStreamSynchronize failed: ") +
+              cudaGetErrorString(error));
+    return -1;
+  }
+  return 0;
 }
 
 extern "C" const char *ignis_gqa_layer_last_error(void) {

@@ -114,13 +114,32 @@ struct ignis_model_stats {
 };
 
 /* Build the leaf's per-layer weight structures from `tensors` (`count`
- * entries) against `topology`. Returns 0 and a handle in `*out_model` on
- * success. Returns -1 (no model produced; see ignis_model_last_error) on a
- * null argument, a duplicate name, a missing or extra bound tensor, or a
- * tensor whose shape does not match the one `topology` implies -- a load
- * is all-or-nothing. */
+ * entries) against `topology`. `prefill_chunk_tokens` is the widest prefill
+ * chunk the caller will ever hand `ignis_program_prefill` (P2-01, GitHub
+ * #83): the load reserves the program's scratch arena once, sized for a
+ * chunk of that width across every decoder layer's transient allocations
+ * plus each vendored op's own workspace-capacity query over the token
+ * interval [1, prefill_chunk_tokens], under the widest compute policy each
+ * weight's own qtype admits (AllowA4 for NVFP4, A16Only for the real
+ * artifact's few BF16 exception arms) -- so enabling AllowA4 for a weight
+ * that already admits it changes no reservation. Must be a nonzero multiple
+ * of 128. `max_context_tokens` is
+ * the largest single-sequence KV reservation the caller's sequence-state
+ * pool will ever build (mirrors `ignis_seq_pool_spec::max_context_tokens`,
+ * ignis_seq.h): the reservation sizes the GQA attention workspace for the
+ * worst-case visible-key count. Must be positive and at least
+ * `prefill_chunk_tokens` (a chunk wider than the sequence pool's own
+ * context bound could never be prefilled anyway).
+ *
+ * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
+ * produced; see ignis_model_last_error) on a null argument, a duplicate
+ * name, a missing or extra bound tensor, a tensor whose shape does not
+ * match the one `topology` implies, an invalid `prefill_chunk_tokens` /
+ * `max_context_tokens`, or a chunk width whose scratch reservation does not
+ * fit the device's free memory -- a load is all-or-nothing. */
 int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
-                          const struct ignis_topology *topology, struct ignis_model **out_model);
+                          const struct ignis_topology *topology, uint32_t prefill_chunk_tokens,
+                          uint32_t max_context_tokens, struct ignis_model **out_model);
 
 /* Statistics of a loaded model. Returns 0 on success, -1 on a null
  * argument. */

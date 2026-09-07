@@ -29,14 +29,21 @@ use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 
 use crate::{RuntimeStats, StepLeaf};
 
-/// Sizing knobs for the leaf's sequence-state pool.
+/// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
 pub struct CudaLeafConfig {
     /// The largest single sequence's KV reservation, in tokens (mirrors
-    /// `ignis_core::SchedulerConfig::max_sequence_tokens`).
+    /// `ignis_core::SchedulerConfig::max_sequence_tokens`). Also the bound
+    /// `ignis_model_load` sizes the GQA attention workspace reservation
+    /// for (P2-01, GitHub #83) — must not be raised without also rebuilding
+    /// the model handle.
     pub max_context_tokens: u32,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
+    /// The widest prefill chunk `ignis_model_load` reserves program scratch
+    /// for (P2-01, GitHub #83), default 1,024 (`.scratch/runtime/specs/
+    /// 02-real-prefill.md`). Must be a nonzero multiple of 128.
+    pub prefill_chunk_tokens: u32,
 }
 
 impl Default for CudaLeafConfig {
@@ -50,6 +57,7 @@ impl Default for CudaLeafConfig {
             // the program's own workspace left behind.
             max_context_tokens: 4096,
             slot_count: N_DECODE_LANES as u32,
+            prefill_chunk_tokens: 1024,
         }
     }
 }
@@ -139,8 +147,14 @@ impl StepLeaf for CudaLeaf {
     type Sequence = Seq<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
-        let model = model_load::load_qwen38_27b(&self.reader, &self.artifact, &self.handles)
-            .map_err(|e| leaf_error("model load", e))?;
+        let model = model_load::load_qwen38_27b(
+            &self.reader,
+            &self.artifact,
+            &self.handles,
+            self.config.prefill_chunk_tokens,
+            self.config.max_context_tokens,
+        )
+        .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
         // The leaf's fixed paged-KV page size (`kPagedKVPageSize`, 64
         // tokens) — every slot reserves enough pages for its full context.
