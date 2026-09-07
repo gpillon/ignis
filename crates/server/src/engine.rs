@@ -123,6 +123,25 @@ impl Engine {
         sink: Arc<dyn TelemetrySink>,
         clock: Arc<dyn TelemetryClock>,
     ) -> Self {
+        Self::with_sinks_and_driver(scheduler, sink, clock).0
+    }
+
+    /// Same as [`Engine::with_sinks`], but also returns the model thread's
+    /// [`std::thread::JoinHandle`] (GitHub #71). Production (`main.rs`)
+    /// never needs it — the process exits with the thread still running.
+    /// A caller that needs the scheduler's GPU-resident state (weights, KV
+    /// cache) fully released before proceeding — e.g. between GPU
+    /// integration tests sharing one process — must: drop every clone of
+    /// the returned `Engine` (so the command channel disconnects and
+    /// `model_thread_loop` returns), then join the handle. Joining blocks
+    /// until the model thread has actually exited and dropped the
+    /// `Scheduler` it owned, so the next caller never races the GPU
+    /// teardown of the previous one.
+    pub fn with_sinks_and_driver(
+        scheduler: Box<dyn Scheduler>,
+        sink: Arc<dyn TelemetrySink>,
+        clock: Arc<dyn TelemetryClock>,
+    ) -> (Self, std::thread::JoinHandle<()>) {
         let model_id = scheduler.model_id().to_string();
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
@@ -131,7 +150,7 @@ impl Engine {
         // The model thread: a single, dedicated OS thread that owns the
         // Scheduler + route table exclusively for the server's whole life.
         let facts_tx_for_thread = facts_tx.clone();
-        std::thread::Builder::new()
+        let driver = std::thread::Builder::new()
             .name("ignis-model".into())
             .spawn(move || model_thread_loop(scheduler, command_rx, facts_tx_for_thread))
             .expect("spawning the model thread must not fail");
@@ -141,12 +160,15 @@ impl Engine {
         let telemetry = Telemetry::new(sink, clock);
         tokio::spawn(telemetry_task(telemetry, facts_rx, Arc::clone(&counters)));
 
-        Self {
-            model_id,
-            commands: command_tx,
-            facts: facts_tx,
-            counters,
-        }
+        (
+            Self {
+                model_id,
+                commands: command_tx,
+                facts: facts_tx,
+                counters,
+            },
+            driver,
+        )
     }
 
     /// Route the engine's telemetry through `sink` (keeping the existing

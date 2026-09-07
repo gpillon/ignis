@@ -9,6 +9,7 @@
 #![cfg(feature = "cuda")]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -20,6 +21,7 @@ use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::gpu_profile;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::cuda_scheduler;
+use ignis_server::telemetry::{NullSink, SystemClock};
 use ignis_server::Server;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -27,10 +29,35 @@ const MODEL: &str = "qwen3.8-27b";
 
 /// A live harness over the real GPU-backed scheduler (mirrors
 /// `openai_http.rs`'s mock harness, but with the production backend
-/// running underneath the same axum router). The engine's model thread
-/// (GitHub #69) was already spawned when it was constructed.
+/// running underneath the same axum router).
+///
+/// GitHub #71: the 3 tests in this file share one process, and each
+/// `harness()` call loads its own ~19 GB model onto the same GPU. The
+/// model thread (GitHub #69) owns the scheduler's GPU-resident state and
+/// only releases it when it exits, so `app` is wrapped in an `Option` and
+/// `driver` (its `JoinHandle`) is kept alongside: `Drop` below drops `app`
+/// first — disconnecting the command channel every clone of the `Engine`
+/// held for routing — then joins `driver`, blocking until the model
+/// thread has actually exited and freed the previous test's VRAM before
+/// the next test's `harness()` call allocates its own.
 struct Harness {
-    app: axum::Router,
+    app: Option<axum::Router>,
+    driver: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Harness {
+    fn app(&self) -> &axum::Router {
+        self.app.as_ref().expect("app is only taken by Drop")
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        drop(self.app.take());
+        if let Some(driver) = self.driver.take() {
+            let _ = driver.join();
+        }
+    }
 }
 
 /// Build the harness, or `None` when the GPU profile says to skip
@@ -56,10 +83,11 @@ fn harness() -> Option<Harness> {
             unreachable!();
         }
     };
-    let engine = Engine::new(Box::new(scheduler));
+    let (engine, driver) =
+        Engine::with_sinks_and_driver(Box::new(scheduler), Arc::new(NullSink), Arc::new(SystemClock));
     let server = Server::with_artifact_template(engine, frontend)
         .with_request_timeout(Duration::from_secs(120));
-    Some(Harness { app: server.app() })
+    Some(Harness { app: Some(server.app()), driver: Some(driver) })
 }
 
 /// Make one request against the router, returning (status, body-as-string).
@@ -97,7 +125,7 @@ async fn a_non_streaming_completion_returns_coherent_text_with_finish_reason_and
         "max_tokens": 32,
         "stream": false
     });
-    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 200, "chat should be 200: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["object"], "chat.completion");
@@ -138,7 +166,7 @@ async fn a_streaming_completion_emits_token_deltas_then_a_finish_reason_chunk() 
         "max_tokens": 32,
         "stream": true
     });
-    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 200, "streaming chat should be 200: {body}");
 
     let data_lines: Vec<String> = body
@@ -200,7 +228,7 @@ async fn a_streaming_completions_first_chunk_arrives_before_generation_completes
         .header("content-type", "application/json")
         .body(body)
         .unwrap();
-    let resp = h.app.clone().oneshot(request).await.unwrap();
+    let resp = h.app().clone().oneshot(request).await.unwrap();
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
@@ -243,7 +271,7 @@ async fn a_thinking_disabled_request_returns_a_real_answer_with_no_reasoning() {
         "stream": false,
         "enable_thinking": false
     });
-    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 200, "chat should be 200: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
 
