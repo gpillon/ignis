@@ -197,6 +197,19 @@ extern "C" int32_t ignis_device_mem_info(struct ignis_device *d, uint64_t *free_
   return 0;
 }
 
+extern "C" void ignis_device_free(struct ignis_device *d, void *ptr) {
+  if (d == nullptr || ptr == nullptr) {
+    return;
+  }
+  if (!ensure_device(d)) {
+    return;
+  }
+  cudaError_t err = cudaFree(ptr);
+  if (err != cudaSuccess) {
+    log_cuda_error(0, "cudaFree", err);
+  }
+}
+
 extern "C" void ignis_device_destroy(struct ignis_device *d) {
   if (d == nullptr) {
     return;

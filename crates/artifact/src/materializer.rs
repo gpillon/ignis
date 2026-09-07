@@ -168,6 +168,18 @@ impl MaterializedArtifact {
         self.arena.as_ref()
     }
 
+    /// Release the device arena through `device` (the same one
+    /// [`materialize`] built it on — the buffer is invalid on any other
+    /// device). Every [`TensorView`] into it is dangling afterward; the
+    /// caller must not read through one again. Idempotent: a second call
+    /// finds `arena` already `None` and does nothing.
+    pub fn release_arena<D: Device>(&mut self, device: &mut D) -> Result<()> {
+        if let Some(arena) = self.arena.take() {
+            device.deallocate(arena)?;
+        }
+        Ok(())
+    }
+
     /// The load statistics.
     pub fn stats(&self) -> &MaterializationStats {
         &self.stats

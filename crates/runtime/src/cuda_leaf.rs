@@ -93,6 +93,19 @@ impl CudaLeaf {
     }
 }
 
+impl Drop for CudaLeaf {
+    fn drop(&mut self) {
+        // `artifact`'s weight arena has no `Drop` of its own — releasing it
+        // needs the `Device` that produced it, so it must happen explicitly
+        // here, before field auto-drop runs `device`'s own `Drop` (which
+        // only tears down its load stream/event, never this allocation).
+        // Without this, every load leaks its ~19 GB arena for the rest of
+        // the process (the fault this fixes: multiple GPU tests in one
+        // process accumulate one arena per `harness()` call).
+        let _ = self.artifact.release_arena(&mut self.device);
+    }
+}
+
 /// The leaf's model handle: the loaded weights plus the sequence-state
 /// pool sized for them. Both travel together — the step ABI takes the
 /// pool and the model as separate parameters on every prefill/decode call.
