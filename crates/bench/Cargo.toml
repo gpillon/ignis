@@ -6,7 +6,13 @@ edition.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `float_roundtrip`: a TTFT record (`ttft.rs`) is written to disk and read
+# back by the G2 gate check, so a parsed median must be the number that was
+# measured. serde_json's default float parser is allowed to land one ULP
+# away from the written value -- close enough for a ratio, but it makes
+# `write -> read -> write` not a fixpoint, which is a poor property for an
+# audit record. The exact parser costs nothing this crate notices.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # The real HTTP transport (the `HttpEndpoint`): drives the running engine's
 # OpenAI-compatible API. http-only (the engine is a localhost endpoint, no
 # auth/TLS), so the default TLS features are dropped. `blocking` fits the

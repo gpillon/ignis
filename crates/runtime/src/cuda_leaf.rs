@@ -35,21 +35,37 @@ pub struct CudaLeafConfig {
     /// The largest single sequence's KV reservation, in tokens (mirrors
     /// `ignis_core::SchedulerConfig::max_sequence_tokens`).
     pub max_context_tokens: u32,
+    /// The paged-KV pool budget, in sequence-tokens: the pool every live
+    /// sequence draws its pages from. Sized independently of
+    /// `slot_count * max_context_tokens` — see [`CudaLeafConfig::default`].
+    pub kv_pool_tokens: u32,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
+    /// The prefill chunk width, in tokens: how wide a span the program's
+    /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
+    /// nonzero multiple of 128, validated by the server's config module
+    /// before any loader work starts; the leaf's own use of it — sizing
+    /// the scratch and running the chunk loop — lands with GitHub #83/#84,
+    /// which is why prefill still walks the span one token at a time
+    /// today.
+    pub prefill_chunk_tokens: u32,
 }
 
 impl Default for CudaLeafConfig {
     fn default() -> Self {
         Self {
-            // A modest, deterministic default: `slot_count *
-            // max_context_tokens` sequence-tokens of BF16 paged KV is a
-            // few hundred MiB at this model's KV geometry (head_dim 256,
-            // 4 KV heads) — negligible next to the ~19 GB of weights, so
-            // it fits regardless of exactly how much VRAM the weights and
-            // the program's own workspace left behind.
-            max_context_tokens: 4096,
+            // The same defaults `ignis_server::config` falls back to
+            // (`crate::{DEFAULT_MAX_CONTEXT, kv_pool_tokens_for,
+            // DEFAULT_PREFILL_CHUNK}`, defined once alongside this module
+            // rather than restated here): `cuda_scheduler` always
+            // overrides these three fields from the operator's resolved
+            // `EngineShape`, so this default only matters to a caller that
+            // builds a leaf directly (the GPU layer/program tests) rather
+            // than through the server.
+            max_context_tokens: crate::DEFAULT_MAX_CONTEXT,
+            kv_pool_tokens: crate::kv_pool_tokens_for(crate::DEFAULT_MAX_CONTEXT),
             slot_count: N_DECODE_LANES as u32,
+            prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
         }
     }
 }
@@ -106,6 +122,18 @@ impl Drop for CudaLeaf {
     }
 }
 
+/// The leaf's fixed paged-KV page size, in tokens
+/// (`kernel/vendor/src/core/paged_kv_cache.h`'s `kPagedKVPageSize`).
+pub const KV_PAGE_TOKENS: u32 = 64;
+
+/// The page count a `kv_pool_tokens` budget buys, at the leaf's fixed page
+/// size. The scheduler's admission accounting
+/// (`ignis_server::runtime::cuda_scheduler`) is derived from this same
+/// function, so the two can never drift.
+pub fn kv_pool_pages(kv_pool_tokens: u32) -> u32 {
+    kv_pool_tokens.div_ceil(KV_PAGE_TOKENS)
+}
+
 /// The leaf's model handle: the loaded weights plus the sequence-state
 /// pool sized for them. Both travel together — the step ABI takes the
 /// pool and the model as separate parameters on every prefill/decode call.
@@ -143,12 +171,16 @@ impl StepLeaf for CudaLeaf {
             .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
         // The leaf's fixed paged-KV page size (`kPagedKVPageSize`, 64
-        // tokens) — every slot reserves enough pages for its full context.
-        let pages_per_sequence = self.config.max_context_tokens.div_ceil(64);
+        // tokens). The pool holds `kv_pool_tokens` worth of pages, shared
+        // across the slots; `max_context_tokens` is the per-sequence cap
+        // drawn against it. `ignis_server::runtime::cuda_scheduler` derives
+        // the scheduler's admission accounting from the same two numbers
+        // with the same arithmetic, so admission can never promise more
+        // pages than this pool holds.
         let pool = SeqPool::create(
             &cfg,
             &SeqPoolBudget {
-                kv_page_group_count: self.config.slot_count * pages_per_sequence,
+                kv_page_group_count: kv_pool_pages(self.config.kv_pool_tokens),
                 max_context_tokens: self.config.max_context_tokens,
                 slot_count: self.config.slot_count,
             },
@@ -228,5 +260,34 @@ impl StepLeaf for CudaLeaf {
         let ids = step::decode_program_batch(&model.model, &model.pool, sequences)
             .map_err(|e| leaf_error("decode", e))?;
         Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure arithmetic, no device — compiled (and run) whenever the `cuda`
+    // feature is built, without needing the GPU profile (ADR 0006).
+
+    #[test]
+    fn kv_pool_pages_rounds_up_to_a_whole_page() {
+        assert_eq!(kv_pool_pages(0), 0);
+        assert_eq!(kv_pool_pages(1), 1, "a partial page still reserves one whole page");
+        assert_eq!(kv_pool_pages(KV_PAGE_TOKENS), 1);
+        assert_eq!(kv_pool_pages(KV_PAGE_TOKENS + 1), 2);
+        assert_eq!(kv_pool_pages(65_536), 65_536 / KV_PAGE_TOKENS);
+    }
+
+    #[test]
+    fn the_default_leaf_config_pool_can_hold_the_default_context() {
+        // `cuda_scheduler` always overrides these fields from the operator's
+        // `EngineShape` in production; this default is what a GPU test gets
+        // when it builds a leaf directly, and it must not promise a context
+        // the pool it also defaults to cannot serve.
+        let config = CudaLeafConfig::default();
+        assert!(config.kv_pool_tokens >= config.max_context_tokens);
+        assert_eq!(config.max_context_tokens, crate::DEFAULT_MAX_CONTEXT);
+        assert_eq!(config.prefill_chunk_tokens, crate::DEFAULT_PREFILL_CHUNK);
     }
 }

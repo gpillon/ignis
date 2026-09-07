@@ -176,6 +176,15 @@ When output names a domain concept, use the term as defined here.
   the same TTFT cells in the same session on the same machine, and the
   ratio ignis/reference must be ≤ 1.5. A committed reference record exists
   for regression and sanity only; it never decides the gate.
+- **Measurement session** — the identifier both engines' TTFT records carry
+  when they were measured back to back in one sitting. It is what makes
+  live/live checkable rather than asserted: `ignis-bench g2` refuses a
+  verdict when the two records do not share one, which is also what stops a
+  committed fixture from ever being the live side.
+- **TTFT record** — one engine's measured cells plus the identity a later
+  reader needs to audit them: every sample and its computed-prefill count,
+  the median, the endpoint, the engine, the artifact, the profile, the date
+  and the measurement session (`ignis-bench ttft --out`).
 - **f64 layer reference** — a CPU fp64 computation of one GQA layer and one
   GDN layer on the real weights, the tolerance target for the leaf's per-layer
   output at G1.

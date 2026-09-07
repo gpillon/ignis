@@ -39,6 +39,15 @@
 //!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
 //!   An unparseable value, or a `false` the loaded template cannot honour,
 //!   refuses to start.
+//! - `IGNIS_PREFILL_CHUNK` / `--prefill-chunk` — the prefill chunk width
+//!   in tokens (default 1024; a nonzero multiple of 128 — the reference's
+//!   own alignment rule). GitHub #87.
+//! - `IGNIS_MAX_CONTEXT` / `--max-context` — the maximum per-sequence
+//!   context in tokens (default 40960: a 32K prompt plus an 8K generation
+//!   budget, so G2's largest cell is admissible without editing code). The
+//!   paged-KV pool the leaf builds is derived from this value (never
+//!   below it, so admission can never promise more pages than the leaf
+//!   built) rather than being an independent flag.
 //! - `IGNIS_REASONING_EFFORT` / `--reasoning-effort` — the server-wide
 //!   default `reasoning_effort`; unset means "let the template's own
 //!   default apply". An unknown value, or one the loaded template does not
@@ -85,6 +94,7 @@ fn cuda_scheduler(
     artifact_path: &std::path::Path,
     model: &str,
     frontend: &ignis_artifact::FrontendSet,
+    shape: ignis_server::runtime::EngineShape,
 ) -> Box<dyn Scheduler> {
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
@@ -96,9 +106,15 @@ fn cuda_scheduler(
             std::process::exit(1);
         }
     };
-    match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos) {
+    match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
         Ok(scheduler) => {
-            eprintln!("ignis-server: {} loaded on the GPU (eos={eos})", artifact_path.display());
+            eprintln!(
+                "ignis-server: {} loaded on the GPU (eos={eos}, prefill chunk {} tokens, context {} tokens, KV pool {} tokens)",
+                artifact_path.display(),
+                shape.prefill_chunk,
+                shape.max_context,
+                shape.kv_pool_tokens,
+            );
             Box::new(scheduler)
         }
         Err(err) => {
@@ -126,6 +142,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // The engine shape (GitHub #87) — already validated by `config::resolve`
+    // above, so nothing below this point can fail on an unaligned chunk
+    // width or a pool that cannot serve the configured context.
+    #[cfg(feature = "cuda")]
+    let engine_shape = ignis_server::runtime::EngineShape::from(&config);
     let Config {
         model,
         bind,
@@ -133,6 +154,9 @@ async fn main() {
         telemetry,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
+        prefill_chunk: _,
+        max_context: _,
+        kv_pool_tokens: _,
     } = config;
 
     // The telemetry sink (server-02, design §5): a JSONL file named by
@@ -179,7 +203,7 @@ async fn main() {
         };
 
         #[cfg(feature = "cuda")]
-        let scheduler = cuda_scheduler(artifact_path, &model, &frontend);
+        let scheduler = cuda_scheduler(artifact_path, &model, &frontend, engine_shape);
         #[cfg(not(feature = "cuda"))]
         let scheduler = {
             eprintln!("ignis-server: built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)");

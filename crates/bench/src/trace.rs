@@ -80,6 +80,8 @@ impl TraceLine {
             prompt: self.prompt.clone(),
             max_tokens: self.max_tokens,
             stream: self.stream,
+            // Replay measures timing, not prefix coldness — no usage chunk.
+            include_usage: false,
             enable_thinking: None,
         }
     }
