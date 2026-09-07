@@ -77,11 +77,20 @@ struct ignis_program_stats {
 /* Run the complete 64-layer program for every token in a prompt span.  The
  * span starts exactly at `start_position`; it advances the sequence's KV,
  * GDN, convolution and position state once per token.  No token is emitted:
- * the greedy successor is retained on `seq` for ignis_program_decode. */
+ * the greedy successor is retained on `seq` for ignis_program_decode.
+ *
+ * If `out_logits` is non-null, it receives the span's *last* position's
+ * full vocab-length logits (promoted from the device's BF16 storage to host
+ * `float`, caller-owned buffer of at least `vocab` entries) -- the same
+ * position whose argmax becomes the successor `ignis_program_decode` will
+ * first emit. Debug-only (GitHub #72: confirming a near-tie argmax flip on
+ * the canary suite needs the real logits, not just the winning id); every
+ * earlier position in the span still runs argmax-only, at no extra cost. */
 int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *pool,
                               struct ignis_seq *seq, const int32_t *token_ids,
                               uint64_t num_tokens, uint64_t start_position,
-                              const struct ignis_sampling_params *sampling);
+                              const struct ignis_sampling_params *sampling,
+                              float *out_logits);
 
 /* Complete one greedy decode round for a batch of sequence handles.  Each
  * output is the successor made ready by prefill/the prior round; that token

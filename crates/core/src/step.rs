@@ -68,6 +68,7 @@ mod ffi {
             num_tokens: u64,
             start_position: u64,
             sampling: *const IgnisSamplingParams,
+            out_logits: *mut f32,
         ) -> i32;
 
         pub fn ignis_program_decode(
@@ -180,13 +181,26 @@ pub fn decode_degenerate_batch(
 /// Prefill one span through the complete 64-layer program. The sequence is
 /// advanced once per input token; generation starts at the following decode
 /// round.
+///
+/// `out_logits`, if `Some`, is filled with the span's *last* position's full
+/// vocab-length logits (promoted from the leaf's BF16 storage) -- the same
+/// position whose argmax becomes the successor the next
+/// [`decode_program_batch`] round emits. Debug-only (GitHub #72: confirming
+/// a near-tie argmax flip on the canary suite needs the real logits, not
+/// just the winning id); the caller sizes the buffer to the model's vocab
+/// (`ModelConfig::qwen38_27b().vocab`).
 pub fn prefill_program(
     model: &Model,
     pool: &SeqPool,
     sequence: &mut Seq<'_>,
     token_ids: &[i32],
     start_position: u64,
+    out_logits: Option<&mut [f32]>,
 ) -> Result<(), String> {
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -196,6 +210,7 @@ pub fn prefill_program(
             token_ids.len() as u64,
             start_position,
             &GREEDY,
+            logits_ptr,
         )
     };
     if rc != 0 {

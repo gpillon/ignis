@@ -152,9 +152,11 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
 // Runs embedding -> all decoder layers -> final norm -> output head ->
 // argmax for one token.  The two residual buffers stay in the outer scratch
 // scope while every layer takes (and releases) its own nested scope, so the
-// program never materializes an activation on the host.
+// program never materializes an activation on the host. `out_logits`, if
+// non-null, receives this token's full vocab-length logits (GitHub #72
+// debug path -- the copy-back mirrors run_degenerate_step's above).
 int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
-                          int32_t token_id, int32_t *out_token_id) {
+                          int32_t token_id, int32_t *out_token_id, float *out_logits) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
@@ -203,11 +205,31 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                 cudaGetErrorString(err));
       return -1;
     }
+
+    std::vector<std::uint16_t> host_logits_bits;
+    if (out_logits != nullptr) {
+      host_logits_bits.resize(static_cast<std::size_t>(vocab));
+      err = cudaMemcpyAsync(host_logits_bits.data(), logits.data,
+                            host_logits_bits.size() * sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToHost, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program: cudaMemcpyAsync(logits) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
+
     err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_program: cudaStreamSynchronize failed: ") +
                 cudaGetErrorString(err));
       return -1;
+    }
+
+    if (out_logits != nullptr) {
+      for (std::int32_t v = 0; v < vocab; ++v) {
+        out_logits[v] = bf16_to_f32(host_logits_bits[static_cast<std::size_t>(v)]);
+      }
     }
     model->last_step_kernel_count = dispatches;
     return 0;
@@ -284,7 +306,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                                            const int32_t *token_ids,
                                            uint64_t num_tokens,
                                            uint64_t start_position,
-                                           const struct ignis_sampling_params *sampling) {
+                                           const struct ignis_sampling_params *sampling,
+                                           float *out_logits) {
   if (!validate_program(model, pool, seq, token_ids, num_tokens, sampling)) {
     return -1;
   }
@@ -299,7 +322,11 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   const auto began = std::chrono::steady_clock::now();
   for (uint64_t i = 0; i < num_tokens; ++i) {
     int32_t successor = -1;
-    if (run_program_token(model, pool, seq, token_ids[i], &successor) != 0) {
+    // Only the span's last position is the one whose logits GitHub #72
+    // needs (it decides the successor ignis_program_decode emits first) --
+    // every earlier position stays argmax-only.
+    float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
+    if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits) != 0) {
       return -1;
     }
     seq->pending_token = successor;
@@ -336,7 +363,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     }
     const int32_t emitted = seq->pending_token;
     int32_t successor = -1;
-    if (run_program_token(model, pool, seq, emitted, &successor) != 0) {
+    if (run_program_token(model, pool, seq, emitted, &successor, nullptr) != 0) {
       return -1;
     }
     out_token_ids[i] = emitted;
