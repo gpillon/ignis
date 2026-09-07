@@ -74,6 +74,10 @@ result.
 Frontier at start: **#83** (leaf) and **#87** (Rust only, no GPU) in parallel;
 #85 and #86 are parallel once #84 lands.
 Critical path: #83 → #84 → #85/#86 → #88.
+Current frontier (2026-09-08): **#83** and **#87** — phase 2 was decomposed
+the day G1 closed and nothing has been picked up yet. #84 opens when #83
+lands; #85 and #86 open together when #84 lands. (Grabbable tickets only —
+status and blocking live on GitHub.)
 
 ## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
 
