@@ -22,6 +22,7 @@ use ignis_core::model_load::load_qwen38_27b;
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
 #[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn real_nvfp4full_model_load_binds_every_text_scope_object() {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("the real artifact is absent: {ARTIFACT}")) {
