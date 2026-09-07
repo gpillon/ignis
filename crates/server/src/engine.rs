@@ -506,6 +506,16 @@ mod tests {
     /// that a `Protected` (admission-batch) event does *not* drop the
     /// `Token`/`Done` events that follow it in the same step's batch.
     struct ProtectedBatchScheduler {
+        // Starts `false`: nothing is in flight until `submit` is called.
+        // `is_idle` must report this, not just whether the batch has
+        // already been emitted — the model thread's loop calls `is_idle`
+        // in a `try_recv`-then-`advance` race against the async side's
+        // `submit` command, and a scheduler that reports "not idle" before
+        // anything was ever submitted lets `advance` run (and emit, and
+        // discard, its one-shot batch) before the request's stream route
+        // is even registered, silently dropping the batch and hanging the
+        // test's `rx.recv()` forever.
+        submitted: bool,
         emitted: bool,
     }
 
@@ -520,6 +530,7 @@ mod tests {
             _input: RequestInput,
             _class: RequestClass,
         ) -> Result<RequestId, SubmitError> {
+            self.submitted = true;
             Ok(Self::ID)
         }
         fn advance(&mut self) -> Vec<SchedEvent> {
@@ -549,7 +560,7 @@ mod tests {
             ]
         }
         fn is_idle(&self) -> bool {
-            self.emitted
+            !self.submitted || self.emitted
         }
         fn model_id(&self) -> &str {
             Self::MODEL
@@ -565,6 +576,8 @@ mod tests {
     /// (it carries a `request` id, unlike the `Protected` batch marker) and
     /// does not drop the `Token`/`Done` events that follow it.
     struct PrefixReuseBatchScheduler {
+        // See `ProtectedBatchScheduler::submitted`.
+        submitted: bool,
         emitted: bool,
     }
 
@@ -574,6 +587,7 @@ mod tests {
             _input: RequestInput,
             _class: RequestClass,
         ) -> Result<RequestId, SubmitError> {
+            self.submitted = true;
             Ok(ProtectedBatchScheduler::ID)
         }
         fn advance(&mut self) -> Vec<SchedEvent> {
@@ -604,7 +618,7 @@ mod tests {
             ]
         }
         fn is_idle(&self) -> bool {
-            self.emitted
+            !self.submitted || self.emitted
         }
         fn model_id(&self) -> &str {
             ProtectedBatchScheduler::MODEL
@@ -616,7 +630,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_prefix_reused_event_is_routed_to_the_request_stream() {
-        let engine = Engine::new(Box::new(PrefixReuseBatchScheduler { emitted: false }));
+        let engine = Engine::new(Box::new(PrefixReuseBatchScheduler {
+            submitted: false,
+            emitted: false,
+        }));
         let (id, mut rx) = engine
             .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
             .await
@@ -643,7 +660,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_protected_event_does_not_drop_the_same_batches_events() {
-        let engine = Engine::new(Box::new(ProtectedBatchScheduler { emitted: false }));
+        let engine = Engine::new(Box::new(ProtectedBatchScheduler {
+            submitted: false,
+            emitted: false,
+        }));
         let (id, mut rx) = engine
             .submit(input("fake-model", vec![1], Some(1)), RequestClass::Interactive)
             .await
