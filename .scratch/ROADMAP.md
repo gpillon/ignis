@@ -54,7 +54,6 @@ pinned reference commit via the manifest script (spec: kernel policy).
 
 Frontier at start: #37, #38, #39, #40, #42 (five parallel starts).
 Critical path: #42 → #45/#46 → #47/#48/#49 → #57/#58 → #59 → #61 → #62.
-Current frontier (2026-09-07): #74 (P1-18 correctness, needs GPU — highest priority, surprising failure), #70/#71 (server e2e test fixes, GPU to verify), #72 (needs GPU + logit-level debugging). #73 fixed and closed same night.
 
 ## Phase 2 decomposition (G2, master #63)
 
