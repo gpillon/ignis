@@ -63,9 +63,16 @@ try {
     }
 
     if (-not $SkipCargoTests) {
-        Write-Host "GPU profile: cargo test --workspace --features cuda -- --ignored"
-        & cargo test --workspace --features cuda -- --ignored
-        if ($LASTEXITCODE -ne 0) { FailWithCode "cargo test --workspace --features cuda -- --ignored" $LASTEXITCODE }
+        # `--test-threads=1`: a GPU-gated binary with more than one test (e.g.
+        # `openai_http_gpu.rs`) would otherwise run its tests concurrently
+        # under libtest's default N-core parallelism -- each independently
+        # loading the full artifact onto the single RTX 5090 (ADR 0006),
+        # overcommitting the 32 GB card into shared/system GPU memory
+        # (GitHub #75; #71 fixed the per-test teardown leak but never wired
+        # serialization into this script).
+        Write-Host "GPU profile: cargo test --workspace --features cuda -- --ignored --test-threads=1"
+        & cargo test --workspace --features cuda -- --ignored --test-threads=1
+        if ($LASTEXITCODE -ne 0) { FailWithCode "cargo test --workspace --features cuda -- --ignored --test-threads=1" $LASTEXITCODE }
     }
 
     Write-Host "GPU profile: done. Restart ninfer (runbook step 4, docs/agents/testing.md)."
