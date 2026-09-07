@@ -572,7 +572,8 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "error: cells {contaminated:?} did not produce a full set of cold samples — this              record cannot decide the gate"
+            "error: cells {contaminated:?} did not produce a full set of cold samples — this \
+             record cannot decide the gate"
         );
         ExitCode::FAILURE
     }
