@@ -97,6 +97,34 @@ When output names a domain concept, use the term as defined here.
   adaptive verification width).
 - **Vision** — multimodal (image/video) input.
 
+## Observability
+
+- **Canonical event** — the one structured representation of a log occurrence
+  (severity, event name, body, attributes, trace context). Not a Rust struct
+  every call site builds by hand: it's `tracing::Event` + active span
+  context, observed by the JSON/pretty `Layer`s. Formatters are presentation,
+  never the source of truth (ADR 0011).
+- **Event name** — a stable, class-level identifier (`ignis.<subsystem>.<event>`,
+  e.g. `ignis.model.loaded`), never occurrence-specific data.
+- **`logging` crate** — owns `tracing_subscriber` setup, the JSON/pretty
+  `Layer`s, and log-format/log-level config resolution; every other crate
+  depends on it only for macros/init, never the reverse. Distinct from the
+  pre-existing **server telemetry** (`crates/server/src/telemetry.rs`,
+  design §5): the scheduler interval-counter/request-lifecycle JSONL stream
+  behind `IGNIS_TELEMETRY`/`--telemetry`. Interval counters are metrics-shaped
+  and stay out of the logging system's scope; the request-lifecycle line
+  (`admitted`/`ttft`/`done`) migrates onto canonical `ignis.request.*` events.
+- **`request.id`** — reused as the OTel `trace_id` for the request's span
+  tree (root span at HTTP ingress, children per admission/prefill/**decode
+  round**/MTP verify/completion); one identifier for the same causal unit
+  across fairness, logs, and spans (ADR 0012). Spans stop at decode-round
+  granularity, never per-token — a per-token span is hot-path logging by
+  another name.
+- **Hot-path logging constraint** — normal INFO operation must not emit one
+  record per token/layer/kernel/allocation on the prefill/decode path; any
+  logging or tracing change touching that path must pass the G4 performance
+  gate (ADR 0007) before merge, not just design review.
+
 ## Acceptance
 
 - **Gate** — a milestone acceptance measured **on the GPU**, never on CPU
