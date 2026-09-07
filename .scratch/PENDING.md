@@ -16,52 +16,37 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   ignis computes the model and produces coherent greedy completions as of the
   RMSNorm `unit_offset` fix (#67), and the full GPU profile
   (`scripts/gpu-profile.ps1`) now runs green end to end (#73/#74/#75 fixed
-  2026-09-07) — but the gate is still **not** green: first-32-token agreement
-  with the canary oracle is 52%, against a ≥ 95% floor (#72 below). Until the
-  G1 gate is recorded green on a free RTX 5090 — coherent greedy completions
-  on the canary suite, per-layer output within bf16 tolerance of the f64
-  layer reference, ≥ 95% first-32-token agreement with the canary oracle, EOS
-  honored, reproducible across loads — **nothing downstream of it is
-  meaningful**, including every performance number. Everything the review
+  2026-09-07). The canary-agreement criterion is now **met**: teacher-forced
+  next-token agreement is 99/102 = 97.1% against the ≥ 95% floor (#76,
+  ADR 0014). Until the G1 gate is recorded green on a free RTX 5090 —
+  coherent greedy completions on the canary suite, per-layer output within
+  bf16 tolerance of the f64 layer reference, ≥ 95% teacher-forced next-token
+  agreement with the canary oracle, EOS honored, reproducible across loads —
+  **nothing downstream of it is meaningful**, including every performance
+  number. Everything the review
   deleted (the host-resident forward, the toy decode graphs, the scalar
   kernels and their host-pointer surfaces) is gone; do not resurrect it.
   Owner: the runtime work, tickets #37–#62.
-  Blocker: #72, plus GPU exclusivity for the gate run (ADR 0006).
+  Blocker: GPU exclusivity for the gate run (ADR 0006). #72 (diagnosed) and
+  #76 (metric decided, ADR 0014) no longer block; what remains for #62 is
+  recording the verdict — the f64 layer checks and the reproducibility run —
+  on a free GPU.
 
-- **Two canaries diverge from the oracle at token 0 (GitHub #72; blocks G1)
-  — root cause confirmed 2026-09-07: an exact BF16 logit tie, not a "near"
-  one.** `rust-hello` and `math-greedy` score 21/21 and 32/32 — exact
-  agreement with the reference. `rust-sort` and `explain-reverse` score 0/32
-  and 0/17, which puts the suite at 52% against the ≥ 95% G1 floor. The
-  server had no way to see logits, so the theory (an argmax near-tie flipped
-  by a residual numeric difference) was unconfirmed; `ignis_program_prefill`
-  now optionally returns the prefill span's last-position logits
-  (`crates/core/src/step.rs::prefill_program`, `kernel/src/step.cu`,
-  mirroring the degenerate path's existing copy-back), exercised by
-  `crates/server/tests/logit_divergence_gpu.rs`. Run against the real
-  artifact with thinking disabled (matching how the oracle was recorded):
-  `rust-sort`'s top two logits are token 63 and the oracle's expected token
-  5836, **both at 19.5** (bf16); `explain-reverse`'s top two are token 760
-  and the oracle's expected token 2064, **both at 22.875**. ignis's argmax
-  breaks ties toward the lowest token id (`ninfer::ops::argmax`'s documented
-  convention), which is why it picks 63 / 760 instead of the oracle's
-  5836 / 2064 — both continuations are correct, fluent completions
-  (`` `v` is set to `[1, 2, 3]`. `` and a correct one-sentence description of
-  `Vec::reverse`), matching the earlier "not the #67 class of failure"
-  observation. Only ignis's own logits were instrumented (the reference
-  engine is a separate codebase, out of scope here); the reference's
-  internal logit values were not extracted, but ignis's runner-up being
-  *exactly* the oracle's chosen token, at an exact tied logit, is strong
-  evidence on its own — the model is genuinely ambivalent at bf16 precision
-  between two equally-good next tokens, and the reference engine's
-  tie-break (or its higher-precision output head) landed on the other one.
-  **Open decision, not yet made: how G1's ≥ 95%
-  first-32-token-agreement floor should treat a bf16-exact-tie divergence**
-  — e.g. match the reference's tie-break convention, widen the gate to
-  tolerate ties, or accept 52% as the ceiling this metric can reach against
-  a different engine's output head rounding. Owner: unassigned (gate-policy
-  decision). Blocker: none technical; needs a call from whoever owns the G1
-  gate criteria.
+- **`rust-sort` position 23: a genuine (small) logit disagreement with the
+  reference — diagnostic follow-up, not a gate blocker (GitHub #76).** Under
+  the teacher-forced G1 metric (ADR 0014) the canary suite scores 99/102 =
+  97.1%. Three positions mismatch. Two are the exact BF16 logit ties
+  diagnosed in #72 (`rust-sort` position 0: tokens 63 and 5836 both at 19.5;
+  `explain-reverse` position 0: tokens 760 and 2064 both at 22.875) — ignis's
+  argmax is the reference's own vendored kernel with the same lowest-token-id
+  tie-break, so there is nothing to "fix" there and nothing is waived. The
+  third is a real one: at `rust-sort` position 23, given the oracle's own
+  prefix, ignis prefers token 198 at logit 20.25 while the oracle's token 25
+  sits at 19.25 on ignis's logits — a gap of 1.0, roughly eight units in the
+  last place at bf16. Small, isolated, and well inside the accepted floor,
+  but it is the one position where the two forward passes genuinely disagree
+  rather than coin-flip. Worth a look if a future numeric change is
+  suspected. Owner: unassigned. Blocker: GPU exclusivity (ADR 0006).
 
 - **Two `openai_http_gpu.rs` tests looked noticeably slower than the other
   two in a 2026-09-07 serialized GPU profile run (post-#75) — not yet

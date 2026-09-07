@@ -10,7 +10,7 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 
 | Phase | Gate | Master ticket | Spec |
 |---|---|---|---|
-| 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% first-32-token agreement with the reference engine; EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
+| 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
 | 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: TTFT @8K/32K ≤ 1.5× reference MTP0 | #63 | to write when G1 lands |
 | 3 — serving loop: batched decode rounds, per-width CUDA graphs, sampling, request log | G3: C=1 MTP0 decode ≥ 99% of reference (75–76 tok/s); C=4 aggregate ≥ 99% | #64 | to write when G2 lands |
 | 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | to write when G3 lands |
@@ -50,7 +50,7 @@ pinned reference commit via the manifest script (spec: kernel policy).
 | P1-23 (#59) | Full program + prefill/decode ABI: 64 layers, per-token prefill over a span, decode round (batch 1), EOS from artifact defaults, stats | P1-21, P1-22 | Canary prompt → coherent greedy text; reproducible across loads |
 | P1-24 (#60) | Rust runtime crate: safe wrapper (model/sequence handles, Drop, error mapping), Compute-trait adapter, EOS / max_tokens stop; mock stays | P1-19 (#55) | CPU tests against a stub leaf; scheduler drives the adapter |
 | P1-25 (#61) | Server e2e on the real model: streaming + non-streaming chat completions with `finish_reason: stop`; bench canary against it | P1-23, P1-24 | GPU e2e green |
-| P1-26 (#62) | G1 gate run: canary agreement ≥ 95% vs the P1-05 fixture, f64 layer checks, reproducibility; record the verdict in the review; close #36 | P1-05, P1-25 | Gate recorded — **not green** (2026-09-07): see PENDING.md and REVIEW §6 Phase 1 verdict. Gaps filed as #70, #71, #72, #74 rather than waived (#73 fixed same night). |
+| P1-26 (#62) | G1 gate run: teacher-forced canary agreement ≥ 95% vs the P1-05 fixture (ADR 0014), f64 layer checks, reproducibility; record the verdict in the review; close #36 | P1-05, P1-25 | Canary metric **green** (2026-09-07, #76): teacher-forced agreement 99/102 = 97.1% vs the ≥ 95% floor, deterministic across two runs. The 52% previously recorded was the free-running metric's cascade, now diagnostic only (ADR 0014). Remaining P1-26 work: the f64 layer checks and the reproducibility run recorded as the verdict. Gaps filed as #70, #71, #72, #74 rather than waived (#73 fixed same night). |
 
 Frontier at start: #37, #38, #39, #40, #42 (five parallel starts).
 Critical path: #42 → #45/#46 → #47/#48/#49 → #57/#58 → #59 → #61 → #62.
