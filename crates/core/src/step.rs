@@ -28,6 +28,29 @@ mod ffi {
         pub greedy: i32,
     }
 
+    /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
+    /// #84). `size` must be `sizeof(struct ignis_prefill_options)`; the
+    /// leaf rejects a size it does not recognize.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IgnisPrefillOptions {
+        pub size: u32,
+        pub route: i32,
+        pub compute_policy: i32,
+    }
+
+    /// `enum ignis_prefill_route`.
+    pub const IGNIS_PREFILL_ROUTE_CHUNKED: i32 = 0;
+    pub const IGNIS_PREFILL_ROUTE_PER_TOKEN: i32 = 1;
+
+    /// `enum ignis_prefill_compute_policy`. `A16_ONLY` has no Rust caller
+    /// yet: the engine's own dispatch sites don't reach the override until
+    /// P2-03 (GitHub #63) turns AllowA4 on, at which point a route-
+    /// comparison test is its first caller.
+    pub const IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT: i32 = 0;
+    #[allow(dead_code)]
+    pub const IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY: i32 = 1;
+
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct IgnisProgramStats {
@@ -68,6 +91,7 @@ mod ffi {
             num_tokens: u64,
             start_position: u64,
             sampling: *const IgnisSamplingParams,
+            options: *const IgnisPrefillOptions,
             out_logits: *mut f32,
         ) -> i32;
 
@@ -178,9 +202,37 @@ pub fn decode_degenerate_batch(
     Ok(out_token_ids)
 }
 
-/// Prefill one span through the complete 64-layer program. The sequence is
-/// advanced once per input token; generation starts at the following decode
-/// round.
+/// Which internal path [`prefill_program_with_route`] takes over a span's
+/// chunks (`enum ignis_prefill_route`, ADR 0016, P2-02, GitHub #84).
+/// [`prefill_program`] always uses [`PrefillRoute::Chunked`] (`NULL`
+/// options, the production default); [`PrefillRoute::PerToken`] is
+/// test-only, the self-oracle for the chunk loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillRoute {
+    Chunked,
+    PerToken,
+}
+
+impl PrefillRoute {
+    fn to_options(self) -> ffi::IgnisPrefillOptions {
+        let route = match self {
+            PrefillRoute::Chunked => ffi::IGNIS_PREFILL_ROUTE_CHUNKED,
+            PrefillRoute::PerToken => ffi::IGNIS_PREFILL_ROUTE_PER_TOKEN,
+        };
+        ffi::IgnisPrefillOptions {
+            size: std::mem::size_of::<ffi::IgnisPrefillOptions>() as u32,
+            route,
+            compute_policy: ffi::IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT,
+        }
+    }
+}
+
+/// Prefill one span through the complete 64-layer program, via the
+/// production chunked route (`NULL` options -- ADR 0016, P2-02, GitHub
+/// #84): the leaf cuts the span into `ignis_model_load`'s
+/// `prefill_chunk_tokens`-wide chunks internally, the caller never needs to
+/// know the chunk width. The sequence's KV pages, GDN slot, conv taps and
+/// position land exactly where the per-token route would have left them.
 ///
 /// `out_logits`, if `Some`, is filled with the span's *last* position's full
 /// vocab-length logits (promoted from the leaf's BF16 storage) -- the same
@@ -201,6 +253,9 @@ pub fn prefill_program(
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
+    // NULL options: the production defaults (chunked route, engine default
+    // compute policy) -- ADR 0016 keeps this call site exactly as simple as
+    // it was before the options struct existed.
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -210,6 +265,44 @@ pub fn prefill_program(
             token_ids.len() as u64,
             start_position,
             &GREEDY,
+            std::ptr::null(),
+            logits_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// [`prefill_program`], with the route selectable (ADR 0016, P2-02, GitHub
+/// #84). Test-only entry point: [`PrefillRoute::PerToken`] exists so the
+/// chunked route has a self-oracle (the same prompt prefilled both ways
+/// must agree) that needs no reference engine.
+pub fn prefill_program_with_route(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    route: PrefillRoute,
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let options = route.to_options();
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &GREEDY,
+            &options,
             logits_ptr,
         )
     };

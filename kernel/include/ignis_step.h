@@ -17,6 +17,11 @@
  * handle, kernel/src/model_internal.h) -- no host activation pointer or
  * stream crosses this boundary.
  *
+ * `ignis_program_prefill` takes a `struct ignis_prefill_options` (ADR 0016,
+ * P2-02, GitHub #84): its default (chunked) route cuts a span into
+ * `ignis_model_load`'s prefill-chunk-wide traversals; its per-token route
+ * is the original per-token loop, retained test-only as a self-oracle.
+ *
  * Rust bindings: crates/core/src/step.rs (keep 1:1).
  */
 #ifndef IGNIS_STEP_H
@@ -35,6 +40,41 @@ extern "C" {
  * penalties / seed are G3). */
 struct ignis_sampling_params {
   int32_t greedy; /* nonzero: argmax (the only supported mode today) */
+};
+
+/* Which internal path ignis_program_prefill takes over a span's chunks
+ * (ADR 0016, P2-02, GitHub #84). Chunked is the production route: the leaf
+ * cuts the span into prefill-chunk-wide traversals and synchronizes once
+ * per chunk. Per-token is retained test-only -- it is the G1 loop
+ * unchanged (one traversal per token, one synchronization per layer) --
+ * so the same prompt prefilled both ways is a self-oracle for the chunk
+ * loop, the state carry across chunk boundaries and (from P2-03/P2-04
+ * onward) the multi-token kernel routes. */
+enum ignis_prefill_route {
+  IGNIS_PREFILL_ROUTE_CHUNKED = 0,
+  IGNIS_PREFILL_ROUTE_PER_TOKEN = 1,
+};
+
+/* The compute policy every NVFP4 projection dispatches under (ADR 0016).
+ * `ENGINE_DEFAULT` is whatever policy the program layer's dispatch sites
+ * use today; `A16_ONLY` forces the A16 route so a test can compare routes
+ * on identical inputs. Turning the engine's own default to AllowA4 is
+ * P2-03 (GitHub #63) -- until then both values dispatch identically. */
+enum ignis_prefill_compute_policy {
+  IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT = 0,
+  IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY = 1,
+};
+
+/* Extensible per-call options for ignis_program_prefill (ADR 0016, amending
+ * ADR 0009's "not an ABI change" claim). `size` must be
+ * `sizeof(struct ignis_prefill_options)`; a NULL options pointer means the
+ * production defaults (chunked route, engine default policy). A future
+ * phase (G3 sampling, G4 snapshot controls) appends fields and bumps a new
+ * recognized size -- it never adds a parameter or a `_ex` entry point. */
+struct ignis_prefill_options {
+  uint32_t size;           /* sizeof(struct ignis_prefill_options) */
+  int32_t route;           /* enum ignis_prefill_route */
+  int32_t compute_policy;  /* enum ignis_prefill_compute_policy */
 };
 
 /* Prefill a token span for one sequence starting at `start_position`
@@ -79,6 +119,19 @@ struct ignis_program_stats {
  * GDN, convolution and position state once per token.  No token is emitted:
  * the greedy successor is retained on `seq` for ignis_program_decode.
  *
+ * `options` selects the route and compute policy (ADR 0016, P2-02, GitHub
+ * #84); NULL means the production defaults (chunked route). A non-null
+ * `options->size` that this leaf does not recognize is rejected. Under the
+ * default chunked route the span is cut into `ignis_model_load`'s
+ * `prefill_chunk_tokens`-wide chunks internally -- the caller never needs
+ * to know the chunk width -- and the leaf synchronizes its stream once per
+ * chunk, not once per layer; a chunk that fails is reported with its span
+ * offset and leaves `seq` at its pre-chunk position (KV pages, GDN slot,
+ * conv taps, position and pending token all unchanged), so the caller's
+ * retry path stays correct. The per-token route (test-only) is today's
+ * unchanged per-token loop. After a chunked prefill, `seq`'s state is
+ * exactly what the per-token route would have left.
+ *
  * If `out_logits` is non-null, it receives the span's *last* position's
  * full vocab-length logits (promoted from the device's BF16 storage to host
  * `float`, caller-owned buffer of at least `vocab` entries) -- the same
@@ -90,6 +143,7 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
                               struct ignis_seq *seq, const int32_t *token_ids,
                               uint64_t num_tokens, uint64_t start_position,
                               const struct ignis_sampling_params *sampling,
+                              const struct ignis_prefill_options *options,
                               float *out_logits);
 
 /* Complete one greedy decode round for a batch of sequence handles.  Each

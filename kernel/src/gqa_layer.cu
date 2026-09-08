@@ -7,6 +7,7 @@
 #include "ignis_gqa_layer.h"
 
 #include "ignis_seq_internal.h"
+#include "layer_internal.h"
 #include "model_internal.h"
 
 #include "ninfer/ops/attn_input_proj.h"
@@ -176,39 +177,55 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 
 }  // namespace
 
+// P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
+// (kernel/src/layer_internal.h) -- every check `ignis_gqa_layer_step` did,
+// minus the synchronization and position advance a per-chunk caller defers
+// until its whole chunk's dispatches succeed.
+int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                                 uint32_t layer, const void *in_residual, void *out_residual,
+                                 uint64_t num_tokens) {
+  // Errors here are prefixed `ignis_gqa_layer` (not `..._step`): this body
+  // is now dispatched both by `ignis_gqa_layer_step` and directly by a
+  // chunk loop (kernel/src/step.cu), so a message naming the ABI wrapper
+  // would misattribute a chunked-prefill failure.
+  if (model == nullptr || pool == nullptr || seq == nullptr || in_residual == nullptr ||
+      out_residual == nullptr) {
+    set_error("ignis_gqa_layer: null argument");
+    return -1;
+  }
+  if (num_tokens == 0) {
+    set_error("ignis_gqa_layer: num_tokens must be positive");
+    return -1;
+  }
+  if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
+    set_error("ignis_gqa_layer: layer " + std::to_string(layer) + " is not a GQA layer");
+    return -1;
+  }
+  if (layer < 3 || (layer + 1) % 4 != 0) {
+    set_error("ignis_gqa_layer: GQA layer index is not in the Qwen 3.8 topology");
+    return -1;
+  }
+  const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
+  const uint64_t start_position = seq->gqa_positions[gqa_layer];
+  if (num_tokens > static_cast<uint64_t>(INT32_MAX) - start_position ||
+      start_position + num_tokens > seq->kv.mapped_token_capacity()) {
+    set_error("ignis_gqa_layer: token positions exceed the sequence KV capacity");
+    return -1;
+  }
+  return run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual), out_residual,
+                       gqa_layer, num_tokens);
+}
+
 extern "C" int32_t ignis_gqa_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,
                                          struct ignis_seq *seq, uint32_t layer,
                                          const void *in_residual, void *out_residual,
                                          uint64_t num_tokens) {
-  if (model == nullptr || pool == nullptr || seq == nullptr || in_residual == nullptr ||
-      out_residual == nullptr) {
-    set_error("ignis_gqa_layer_step: null argument");
-    return -1;
-  }
-  if (num_tokens == 0) {
-    set_error("ignis_gqa_layer_step: num_tokens must be positive");
-    return -1;
-  }
-  if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
-    set_error("ignis_gqa_layer_step: layer " + std::to_string(layer) + " is not a GQA layer");
-    return -1;
-  }
-  if (layer < 3 || (layer + 1) % 4 != 0) {
-    set_error("ignis_gqa_layer_step: GQA layer index is not in the Qwen 3.8 topology");
-    return -1;
-  }
-  const uint32_t gqa_layer = (layer - 3) / 4;
-  const uint64_t start_position = seq->gqa_positions[gqa_layer];
-  if (num_tokens > static_cast<uint64_t>(INT32_MAX) - start_position ||
-      start_position + num_tokens > seq->kv.mapped_token_capacity()) {
-    set_error("ignis_gqa_layer_step: token positions exceed the sequence KV capacity");
-    return -1;
-  }
-  const int32_t rc = run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual),
-                                   out_residual, gqa_layer, num_tokens);
+  const int32_t rc =
+      ignis_gqa_layer_run_body(model, pool, seq, layer, in_residual, out_residual, num_tokens);
   if (rc != 0) {
     return rc;
   }
+  const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
   // P2-01 (GitHub #83): the sync moved here from the layer body so a direct
   // call through this ABI entry point (this function's own GPU tests) keeps
   // seeing a synchronous result, while a caller that dispatches the body

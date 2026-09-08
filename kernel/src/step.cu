@@ -13,6 +13,7 @@
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "ignis_seq_internal.h"
+#include "layer_internal.h"
 #include "model_internal.h"
 
 #include "ninfer/ops/argmax.h"
@@ -25,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -254,6 +256,168 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
   return true;
 }
 
+// P2-02 (GitHub #84): runs one prefill chunk -- embedding for the whole
+// chunk, every decoder layer's body dispatched once over the chunk's
+// `num_tokens` tokens with no per-layer synchronization, then (only when
+// `compute_output` is set -- the chunk containing the span's last
+// position) the final norm/head/argmax enqueued for that last token's
+// column alone. Everything above is enqueued on the model's stream before
+// the one synchronization this function performs, so a chunk is exactly
+// one pipelined unit of device work. Returns 0 on success (leaving
+// `*out_token_id` and, if `compute_output`, `*out_logits` filled) or -1 on
+// a kernel error (message set via set_error, naming `chunk_offset` and
+// `seq`); the caller is responsible for not advancing `seq`'s position
+// state when this returns -1.
+int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                          const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
+                          bool compute_output, int32_t *out_token_id, float *out_logits) {
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto vocab = static_cast<std::int32_t>(model->vocab);
+  const auto T = static_cast<std::int32_t>(num_tokens);
+  ninfer::DeviceArena::Scope scope = model->scratch->scope();
+  try {
+    ninfer::Tensor ids = model->scratch->alloc(ninfer::DType::I32, {T, 1, 1, 1});
+    cudaError_t err =
+        cudaMemcpyAsync(ids.data, token_ids, static_cast<std::size_t>(T) * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(ids) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    ninfer::Tensor left = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
+    ninfer::Tensor right = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
+    ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
+
+    uint64_t dispatches = 0;
+    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
+          ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens)
+          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens);
+      if (rc != 0) {
+        const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
+            ? ignis_gqa_layer_last_error()
+            : ignis_gdn_layer_last_error();
+        set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) +
+                  " (" + std::to_string(num_tokens) + " tokens) for sequence slot " +
+                  std::to_string(seq->slot) + " failed: layer " + std::to_string(layer) + ": " +
+                  detail);
+        return -1;
+      }
+      std::swap(left, right);
+      ++dispatches;
+    }
+
+    // `left` and `right` were swapped once per layer, so after an even
+    // layer count the final residual is back in `left`.
+    ninfer::Tensor final_residual = left;
+    std::vector<std::uint16_t> host_logits_bits;
+    if (compute_output) {
+      auto *last_token_hidden = static_cast<std::uint8_t *>(final_residual.data) +
+                                static_cast<std::size_t>(T - 1) * static_cast<std::size_t>(hidden) *
+                                    sizeof(uint16_t);
+      const ninfer::Tensor last_token(static_cast<void *>(last_token_hidden), ninfer::DType::BF16,
+                                      {hidden, 1, 1, 1});
+      const ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata),
+                                       ninfer::DType::BF16, {hidden, 1, 1, 1});
+      ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
+      ninfer::ops::rmsnorm(last_token, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
+                           normalized, model->stream);
+      ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
+      ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
+      ninfer::Tensor argmax_out = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
+      ninfer::ops::argmax(logits, argmax_out, vocab, model->stream);
+      err = cudaMemcpyAsync(out_token_id, argmax_out.data, sizeof(*out_token_id),
+                            cudaMemcpyDeviceToHost, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(argmax) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      if (out_logits != nullptr) {
+        host_logits_bits.resize(static_cast<std::size_t>(vocab));
+        err = cudaMemcpyAsync(host_logits_bits.data(), logits.data,
+                              host_logits_bits.size() * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToHost, model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(logits) failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
+    }
+
+    // One synchronization for the whole chunk (P2-02, GitHub #84): every
+    // layer's body above only enqueues work, and (when present) so does the
+    // output head, so this confirms the entire chunk -- not one layer --
+    // completed before the caller advances `seq`'s position state.
+    err = cudaStreamSynchronize(model->stream);
+    if (err != cudaSuccess) {
+      set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) +
+                " (" + std::to_string(num_tokens) + ") tokens for sequence slot " +
+                std::to_string(seq->slot) +
+                " failed: cudaStreamSynchronize: " + cudaGetErrorString(err));
+      return -1;
+    }
+
+    if (compute_output && out_logits != nullptr) {
+      for (std::int32_t v = 0; v < vocab; ++v) {
+        out_logits[v] = bf16_to_f32(host_logits_bits[static_cast<std::size_t>(v)]);
+      }
+    }
+    // Only advance every GQA layer's position counter once the synchronize
+    // above confirms the whole chunk's device work actually completed
+    // (mirrors `ignis_gqa_layer_step`'s own ordering) -- GDN has no
+    // separate counter to advance, its state was already updated in place
+    // by the enqueued work.
+    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      if (model->layers[layer].kind == IGNIS_LAYER_GQA) {
+        seq->gqa_positions[ignis_gqa_relative_layer(layer)] +=
+            static_cast<std::uint32_t>(num_tokens);
+      }
+    }
+    model->last_step_kernel_count = dispatches;
+    return 0;
+  } catch (const std::exception &e) {
+    set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) +
+              " (" + std::to_string(num_tokens) + " tokens) for sequence slot " +
+              std::to_string(seq->slot) + " failed: " + e.what());
+    return -1;
+  }
+}
+
+// The default route (ADR 0016, P2-02, GitHub #84): cuts `num_tokens` into
+// `model->prefill_chunk_tokens`-wide chunks (the last one possibly
+// narrower) and runs each as one multi-token traversal of the 64 layers.
+// Only the chunk holding the span's last position computes the output
+// head, matching the per-token route's contract that only the span's last
+// position's successor/logits are observable. A chunk that fails leaves
+// `seq` at its pre-chunk position: every earlier chunk in this span already
+// committed its position advance, and this loop stops before advancing for
+// the failing one.
+int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                                    const int32_t *token_ids, uint64_t num_tokens,
+                                    float *out_logits) {
+  const uint64_t chunk_width = model->prefill_chunk_tokens;
+  uint64_t offset = 0;
+  while (offset < num_tokens) {
+    const uint64_t chunk_len = std::min<uint64_t>(chunk_width, num_tokens - offset);
+    const bool is_last_chunk = (offset + chunk_len == num_tokens);
+    int32_t successor = -1;
+    float *slot_logits = is_last_chunk ? out_logits : nullptr;
+    if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, is_last_chunk,
+                          &successor, slot_logits) != 0) {
+      return -1;
+    }
+    seq->position += chunk_len;
+    if (is_last_chunk) {
+      seq->pending_token = successor;
+    }
+    offset += chunk_len;
+  }
+  return 0;
+}
+
 } // namespace
 
 extern "C" int32_t ignis_prefill(struct ignis_model *model, const int32_t *token_ids,
@@ -307,6 +471,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                                            uint64_t num_tokens,
                                            uint64_t start_position,
                                            const struct ignis_sampling_params *sampling,
+                                           const struct ignis_prefill_options *options,
                                            float *out_logits) {
   if (!validate_program(model, pool, seq, token_ids, num_tokens, sampling)) {
     return -1;
@@ -319,18 +484,61 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     set_error("ignis_program_prefill: span exceeds the sequence KV capacity");
     return -1;
   }
-  const auto began = std::chrono::steady_clock::now();
-  for (uint64_t i = 0; i < num_tokens; ++i) {
-    int32_t successor = -1;
-    // Only the span's last position is the one whose logits GitHub #72
-    // needs (it decides the successor ignis_program_decode emits first) --
-    // every earlier position stays argmax-only.
-    float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
-    if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits) != 0) {
+  // ADR 0016 (P2-02, GitHub #84): NULL means the production defaults
+  // (chunked route, engine default compute policy); a non-null options
+  // pointer whose `size` this leaf does not recognize is rejected outright,
+  // so a caller compiled against a wider future struct fails loudly instead
+  // of silently reading past what it wrote.
+  int32_t route = IGNIS_PREFILL_ROUTE_CHUNKED;
+  if (options != nullptr) {
+    if (options->size != sizeof(struct ignis_prefill_options)) {
+      set_error("ignis_program_prefill: unrecognized ignis_prefill_options size " +
+                std::to_string(options->size));
       return -1;
     }
-    seq->pending_token = successor;
-    ++seq->position;
+    if (options->route != IGNIS_PREFILL_ROUTE_CHUNKED &&
+        options->route != IGNIS_PREFILL_ROUTE_PER_TOKEN) {
+      set_error("ignis_program_prefill: unrecognized prefill route " +
+                std::to_string(options->route));
+      return -1;
+    }
+    if (options->compute_policy != IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT &&
+        options->compute_policy != IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY) {
+      set_error("ignis_program_prefill: unrecognized compute policy " +
+                std::to_string(options->compute_policy));
+      return -1;
+    }
+    route = options->route;
+    // The compute-policy override has no dispatch site to reach yet: every
+    // NVFP4 projection this program calls still uses the plain (A16Only)
+    // op overload (P2-03/P2-04, GitHub #63, turn AllowA4 on). Both
+    // recognized values are accepted now so the ABI does not have to change
+    // again when that wiring lands.
+  }
+
+  const auto began = std::chrono::steady_clock::now();
+  int32_t rc = 0;
+  if (route == IGNIS_PREFILL_ROUTE_PER_TOKEN) {
+    // Test-only self-oracle route (ADR 0016): today's unchanged per-token
+    // loop, one traversal and one synchronization per layer per token.
+    for (uint64_t i = 0; i < num_tokens; ++i) {
+      int32_t successor = -1;
+      // Only the span's last position is the one whose logits GitHub #72
+      // needs (it decides the successor ignis_program_decode emits first) --
+      // every earlier position stays argmax-only.
+      float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
+      if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits) != 0) {
+        rc = -1;
+        break;
+      }
+      seq->pending_token = successor;
+      ++seq->position;
+    }
+  } else {
+    rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, out_logits);
+  }
+  if (rc != 0) {
+    return rc;
   }
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(

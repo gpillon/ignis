@@ -255,6 +255,73 @@ async fn a_streaming_completions_first_chunk_arrives_before_generation_completes
     );
 }
 
+/// P2-02 (GitHub #84): a multi-thousand-token prompt streamed end to end
+/// through the real chunked-prefill path (`EngineShape::default()`'s
+/// `--prefill-chunk` is 1024, so this prompt spans several chunks). Proves
+/// the chunk loop reaches a real HTTP round trip, not just the step ABI
+/// directly: a coherent streamed answer, ending in a real `finish_reason`.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_streaming_completion_with_a_multi_thousand_token_prompt_finishes_coherently() {
+    let Some(h) = harness() else { return };
+    // Filler the model can skim past, followed by a direct question so a
+    // small `max_tokens` budget is plausibly enough to reach a real EOS
+    // rather than being cut off mid-thought.
+    let filler = "The quick brown fox jumps over the lazy dog. ".repeat(1200);
+    let content = format!("{filler}\nIn one sentence, what is 2 + 2?");
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "user", "content": content }
+        ],
+        "max_tokens": 32,
+        "stream": true,
+        "enable_thinking": false
+    });
+    let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "streaming chat with a long prompt should be 200: {body}");
+
+    let data_lines: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .collect();
+    assert_eq!(data_lines.last().map(|s| s.as_str()), Some("[DONE]"), "{body}");
+
+    let chunks: Vec<serde_json::Value> = data_lines
+        .iter()
+        .filter(|l| l.as_str() != "[DONE]")
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(chunks.len() >= 2, "at least one token delta + the final chunk: {body}");
+
+    let mut streamed = String::new();
+    for chunk in &chunks[..chunks.len() - 1] {
+        assert!(chunk["choices"][0]["finish_reason"].is_null());
+        streamed.push_str(chunk["choices"][0]["delta"]["content"].as_str().unwrap());
+    }
+    assert!(!streamed.trim().is_empty(), "streamed text must be non-empty");
+
+    let last = &chunks[chunks.len() - 1];
+    let reason = last["choices"][0]["finish_reason"].as_str().unwrap();
+    assert!(
+        reason == "stop" || reason == "length",
+        "finish_reason must be stop or length, got {reason}"
+    );
+
+    let prompt_tokens = chunks
+        .iter()
+        .find_map(|c| c.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()))
+        .or_else(|| {
+            last.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64())
+        });
+    if let Some(prompt_tokens) = prompt_tokens {
+        assert!(
+            prompt_tokens > 2000,
+            "the templated prompt must actually be multi-thousand tokens, got {prompt_tokens}"
+        );
+    }
+}
+
 /// GitHub #68: a thinking-disabled request against the real model and the
 /// real Qwen 3.8 template returns a real answer directly — the CPU gate
 /// covers every wire-contract case, but only the real template can prove

@@ -20,6 +20,7 @@
 #include "ignis_gdn_layer.h"
 
 #include "ignis_seq_internal.h"
+#include "layer_internal.h"
 #include "model_internal.h"
 
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -235,21 +236,31 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
 
 } // namespace
 
-extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,
-                                         struct ignis_seq *seq, uint32_t layer,
-                                         const void *in_residual, void *out_residual,
-                                         uint64_t num_tokens) {
+// P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
+// (kernel/src/layer_internal.h) -- every check `ignis_gdn_layer_step` did,
+// minus the synchronization a per-chunk caller defers until its whole
+// chunk's dispatches succeed. Unlike the GQA layer, the GDN layer has no
+// separate position counter for the caller to advance afterwards: its
+// state lives in the sequence's pool slot and is updated in place by the
+// enqueued work itself.
+int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                                 uint32_t layer, const void *in_residual, void *out_residual,
+                                 uint64_t num_tokens) {
+  // Errors here are prefixed `ignis_gdn_layer` (not `..._step`): this body
+  // is now dispatched both by `ignis_gdn_layer_step` and directly by a
+  // chunk loop (kernel/src/step.cu), so a message naming the ABI wrapper
+  // would misattribute a chunked-prefill failure.
   if (model == nullptr || pool == nullptr || seq == nullptr || in_residual == nullptr ||
       out_residual == nullptr) {
-    set_error("ignis_gdn_layer_step: null argument");
+    set_error("ignis_gdn_layer: null argument");
     return -1;
   }
   if (num_tokens == 0) {
-    set_error("ignis_gdn_layer_step: num_tokens must be positive");
+    set_error("ignis_gdn_layer: num_tokens must be positive");
     return -1;
   }
   if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GDN) {
-    set_error("ignis_gdn_layer_step: layer " + std::to_string(layer) + " is not a GDN layer");
+    set_error("ignis_gdn_layer: layer " + std::to_string(layer) + " is not a GDN layer");
     return -1;
   }
   // This GDN layer's position among GDN layers only (0..47): the Qwen 3.8
@@ -260,8 +271,16 @@ extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_
   // addressed by (GitHub #55), mirroring `ignis_gqa_layer_step`'s
   // `gqa_layer = (layer - 3) / 4` for its own (16-count) pool.
   const uint32_t gdn_layer = layer - (layer + 1) / 4;
-  const int32_t rc = run_gdn_layer(model, pool, seq->slot, layer, gdn_layer,
-                                   const_cast<void *>(in_residual), out_residual, num_tokens);
+  return run_gdn_layer(model, pool, seq->slot, layer, gdn_layer, const_cast<void *>(in_residual),
+                       out_residual, num_tokens);
+}
+
+extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,
+                                         struct ignis_seq *seq, uint32_t layer,
+                                         const void *in_residual, void *out_residual,
+                                         uint64_t num_tokens) {
+  const int32_t rc =
+      ignis_gdn_layer_run_body(model, pool, seq, layer, in_residual, out_residual, num_tokens);
   if (rc != 0) {
     return rc;
   }

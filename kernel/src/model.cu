@@ -541,6 +541,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   model->hidden = g.hidden;
   model->vocab = g.vocab;
   model->rms_norm_eps = topology->rms_norm_eps;
+  model->prefill_chunk_tokens = prefill_chunk_tokens;
 
   const cudaError_t stream_err = cudaStreamCreate(&model->stream);
   if (stream_err != cudaSuccess) {

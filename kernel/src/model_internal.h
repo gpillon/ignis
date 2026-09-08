@@ -73,4 +73,9 @@ struct ignis_model {
   std::unique_ptr<ninfer::DeviceArena> scratch;
   uint64_t last_step_micros = 0;
   uint64_t last_step_kernel_count = 0;
+
+  // P2-02 (GitHub #84): the chunk width the scratch arena above was sized
+  // for at load (P2-01, GitHub #83). The chunked prefill route cuts a span
+  // into chunks of this width; the last chunk of a span may be narrower.
+  uint32_t prefill_chunk_tokens = 0;
 };
