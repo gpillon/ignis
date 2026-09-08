@@ -66,11 +66,16 @@ fn real_nvfp4full_model_load_binds_every_text_scope_object() {
     };
     assert!(artifact.stats().device_capacity_bytes > 0, "VRAM used is reported");
 
-    // `ignis_model_load` does no CUDA work (kernel/src/model.cu is pure
-    // host-side name/shape matching against already-uploaded pointers), so
-    // its error is always a real descriptor-building or artifact-contract
-    // bug, never GPU contention -- a hard failure here is correct under and
-    // outside the profile alike.
+    // `ignis_model_load`'s tensor binding is pure host-side name/shape
+    // matching against already-uploaded pointers, so a failure here at a
+    // small, affordable chunk width (128, well under any real device's free
+    // memory) is always a real descriptor-building or artifact-contract bug
+    // -- never device contention -- so a hard failure is correct under and
+    // outside the profile alike. (P2-01, GitHub #83, gave the load its own
+    // small scratch cudaMalloc too; that failure mode is deterministic on
+    // the chunk width, not on a busy GPU, and is exercised separately by
+    // `an_unaffordable_prefill_chunk_fails_the_load_naming_the_shortfall`
+    // below.)
     let model = load_qwen38_27b(&reader, &artifact, &handles, 128, 128)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
     let stats = model.stats();
