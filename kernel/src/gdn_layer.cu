@@ -191,16 +191,28 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->scratch, g, beta,
                                  stream);
 
-    // --- per-head fp32 recurrence on the sequence's GDN slot (q/k L2-normalized,
-    // 1/sqrt(head_dim) readout; state published to the slot after all T tokens) ---
-    // The recurrence's output (the per-token readout) is the `[128, value_heads, T]`
-    // view of the `recurrent` buffer (the op writes it in place, so it must be an
-    // lvalue, not a temporary view).
+    // --- P2-04 (GitHub #86): the distinct-state recurrence entry point.
+    // The sequence's own slot is supplied as BOTH the input and the output
+    // state: the op runs the vendored chunked tensor-core kernels
+    // (prepare_wy_wu, state_passing, output) over whole 64-token chunks and
+    // the recurrent kernel over the tail, then publishes the post-T state
+    // into exactly the pool slot it read (the spec's "the state after a
+    // chunk is unchanged" contract). With the two state arguments aliased to
+    // one storage the launches are the same kernel instantiations the
+    // in-place overload resolves to (its T>1 form delegates to this exact
+    // call; its T=1 form is this call's tail with both state pointers
+    // aliased), so decode's T=1 path is numerically unchanged. The chunked
+    // workspace comes from the load-time reservation (P2-01, GitHub #83),
+    // sized by the vendored capacity query at the configured chunk width --
+    // no allocation on the prefill path.
+    // The recurrence's output (the per-token readout) is the
+    // `[128, value_heads, T]` view of the `recurrent` buffer (the op writes
+    // it in place, so it must be an lvalue, not a temporary view).
     ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, T, 1});
     ninfer::ops::gated_delta_net(
         query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
         value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, /*normalize_qk=*/true,
-        *model->scratch, ssm_state, recurrent_out, stream);
+        *model->scratch, ssm_state, ssm_state, recurrent_out, stream);
 
     // --- gated RMSNorm with z (per-head norm * SiLU(z)) ---
     const ninfer::Tensor gdn_norm =

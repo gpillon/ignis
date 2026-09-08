@@ -123,32 +123,61 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     ninfer::ops::qk_norm_rope(query_heads, key_heads, q_norm, k_norm, model->rms_norm_eps,
                               positions, rope, rotated_query_heads, rotated_key_heads, stream);
 
+    // P2-04 (GitHub #86): the fused append-and-attend entry point (A1)
+    // replaces the two-pass A2 (gqa_kv_append) + A3 (gqa_attention_cached)
+    // composition: the chunk's keys and values are appended to the paged
+    // cache at the tokens' absolute positions and attended in one pass,
+    // with the sigmoid output gate applied inside the op exactly as A3 did.
+    // The op's own route resolver picks the kernel: the tensor-core prompt
+    // route above the small-T width (every chunked prefill width, B=1, BF16
+    // cache), the small-T route for the T=1 decode and per-token calls --
+    // the engine encodes no threshold of its own. The shared numerical
+    // contract of A1/A2/A3 (kernel/vendor/include/ninfer/ops/gqa_attention.h)
+    // keeps the layer's output unchanged in form.
     const ninfer::PagedKVLayerView cache = cache_view(pool, seq, gqa_layer);
+    // A1 takes the batched cache view. The leaf is single-sequence: the
+    // sequence's block-table row IS the complete [logical_pages, 1] table
+    // matrix, and table row 0 selects it (the kv_table_rows buffer below).
+    // The residual/scale planes stay empty, as `cache_view` leaves them for
+    // the BF16 cache.
+    ninfer::PagedKVBatchLayerView batch_cache;
+    batch_cache.k_pages      = cache.k_pages;
+    batch_cache.v_pages      = cache.v_pages;
+    batch_cache.block_tables = cache.block_table.view({cache.block_table.ne[0], 1});
+    batch_cache.head_dim     = cache.head_dim;
+    batch_cache.num_kv_heads = cache.num_kv_heads;
+    batch_cache.dtype        = cache.dtype;
+    // The B=1 table-row selector: one device I32 holding 0, bumped from the
+    // load-time reservation (an arena bump like every other per-layer
+    // buffer here, not an allocation; the arena scope resets after the
+    // layer).
+    const ninfer::Tensor kv_table_rows = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
+    cudaError_t error = cudaMemsetAsync(kv_table_rows.data, 0, sizeof(std::int32_t), stream);
+    if (error != cudaSuccess) {
+      set_error(std::string("ignis_gqa_layer_step: cudaMemsetAsync(kv table rows) failed: ") +
+                cudaGetErrorString(error));
+      return -1;
+    }
     ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, tokens, 1});
-    ninfer::ops::gqa_kv_append(rotated_key_heads, value_heads, positions, cache, stream);
     const ninfer::ops::GqaExecutionEnvelope envelope{
         .min_visible_keys = 1,
         .max_visible_keys = static_cast<std::uint32_t>(start_position + tokens),
     };
-    // The BF16 small-T attention route reserves a fixed number of partial
-    // split slots, while only the active prefix is written for a short
-    // history. Give it a fresh, zeroed workspace per layer invocation: stale
-    // inactive partials would otherwise be reduced on the next T=1 call. At
-    // a chunk-sized T the resolver's B=1 prompt route legally needs none
-    // (kernel/vendor/include/ninfer/ops/gqa_attention.h: "a legal B=1
-    // prompt route may return zero for BF16/INT8 caches") -- but neither
-    // `DeviceArena` constructor (kernel/vendor/src/core/arena.h/.cu) admits
-    // zero capacity, and `WorkspaceArena` is `DeviceArena` verbatim, so
-    // there is no zero-sized arena to hand the op. P2-02 (GitHub #84):
-    // reserve at least one byte regardless -- the op only ever touches what
-    // its own query reported (zero, here), so the extra byte is never read
-    // or written.
+    // The small-T attention route reserves a fixed number of partial split
+    // slots, while only the active prefix is written for a short history: a
+    // fresh, zeroed workspace per layer invocation keeps stale inactive
+    // partials from being reduced on the next call (P2-02, GitHub #84). At
+    // a chunk-sized width the resolver's B=1 prompt route legally needs none
+    // ("a legal B=1 prompt route may return zero for BF16/INT8 caches"),
+    // but neither `DeviceArena` constructor admits zero capacity, so at
+    // least one byte is reserved regardless -- the op only ever touches
+    // what its own query reported.
     const std::size_t attention_workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
         kQHeads, ninfer::DType::BF16, envelope, /*batch_size=*/1, tokens, tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
         model->scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
-    cudaError_t error = cudaMemsetAsync(attention_workspace_storage.data, 0,
-                                        attention_workspace_storage.bytes, stream);
+    error = cudaMemsetAsync(attention_workspace_storage.data, 0,
+                            attention_workspace_storage.bytes, stream);
     if (error != cudaSuccess) {
       set_error(std::string("ignis_gqa_layer_step: cudaMemsetAsync(attention workspace) failed: ") +
                 cudaGetErrorString(error));
@@ -156,8 +185,10 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     }
     ninfer::DeviceArena attention_workspace(attention_workspace_storage);
     ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, tokens, 1});
-    ninfer::ops::gqa_attention_cached(
-        rotated_query_heads, positions, gate.view({kHeadDim, kQHeads, tokens, 1}), attention_scale, cache, envelope,
+    ninfer::ops::gqa_attention(
+        rotated_query_heads, rotated_key_heads, value_heads, positions,
+        /*valid_columns=*/ninfer::Tensor{}, kv_table_rows,
+        gate.view({kHeadDim, kQHeads, tokens, 1}), attention_scale, batch_cache, envelope,
         attention_workspace, attention_heads, stream);
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
