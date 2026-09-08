@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -126,11 +127,20 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // The BF16 small-T attention route reserves a fixed number of partial
     // split slots, while only the active prefix is written for a short
     // history. Give it a fresh, zeroed workspace per layer invocation: stale
-    // inactive partials would otherwise be reduced on the next T=1 call.
+    // inactive partials would otherwise be reduced on the next T=1 call. At
+    // a chunk-sized T the resolver's B=1 prompt route legally needs none
+    // (kernel/vendor/include/ninfer/ops/gqa_attention.h: "a legal B=1
+    // prompt route may return zero for BF16/INT8 caches") -- but neither
+    // `DeviceArena` constructor (kernel/vendor/src/core/arena.h/.cu) admits
+    // zero capacity, and `WorkspaceArena` is `DeviceArena` verbatim, so
+    // there is no zero-sized arena to hand the op. P2-02 (GitHub #84):
+    // reserve at least one byte regardless -- the op only ever touches what
+    // its own query reported (zero, here), so the extra byte is never read
+    // or written.
     const std::size_t attention_workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
         kQHeads, ninfer::DType::BF16, envelope, /*batch_size=*/1, tokens, tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
-        model->scratch->alloc_bytes(attention_workspace_bytes);
+        model->scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
     cudaError_t error = cudaMemsetAsync(attention_workspace_storage.data, 0,
                                         attention_workspace_storage.bytes, stream);
     if (error != cudaSuccess) {
@@ -159,7 +169,16 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         weight_tensor(weights.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(residual, post_norm, model->rms_norm_eps, /*unit_offset=*/true, post,
                          stream);
-    ninfer::ops::linear_swiglu(post, weights.mlp_gate_up, fused, *model->scratch, stream);
+    // P2-02 (GitHub #84): the no-policy (A16Only) overload's NVFP4
+    // registration is only valid through T=16 -- above that width this is
+    // the only registered way to run this op at all, not a route upgrade
+    // (kernel/src/layer_internal.h's `ignis_linear_swiglu_policy_for`); the
+    // scratch it can reserve was already sized for AllowA4 at any T (P2-01,
+    // GitHub #83). Below T=17 this keeps A16Only, so decode and the
+    // per-token route see no numerics change.
+    ninfer::ops::linear_swiglu(
+        post, weights.mlp_gate_up, fused,
+        ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, tokens), *model->scratch, stream);
     ninfer::ops::linear_add(fused, weights.mlp_down, residual, *model->scratch, stream);
 
     // No stream synchronization here (P2-01, GitHub #83): the layer body

@@ -219,7 +219,16 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
         weight_tensor(w.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(residual_view, post_norm, model->rms_norm_eps, /*unit_offset=*/true,
                          post, stream);
-    ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused, *model->scratch, stream);
+    // P2-02 (GitHub #84): the no-policy (A16Only) overload's NVFP4
+    // registration is only valid through T=16 -- above that width this is
+    // the only registered way to run this op at all, not a route upgrade
+    // (kernel/src/layer_internal.h's `ignis_linear_swiglu_policy_for`); the
+    // scratch it can reserve was already sized for AllowA4 at any T (P2-01,
+    // GitHub #83). Below T=17 this keeps A16Only, so decode and the
+    // per-token route see no numerics change.
+    ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused,
+                               ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, T),
+                               *model->scratch, stream);
     ninfer::ops::linear_add(fused, w.mlp_down, residual_view, *model->scratch, stream);
 
     // No stream synchronization here (P2-01, GitHub #83): the layer body

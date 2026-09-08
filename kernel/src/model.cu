@@ -22,6 +22,7 @@
 
 #include "ignis_model.h"
 
+#include "layer_internal.h"
 #include "model_internal.h"
 
 #include "core/weight.h"
@@ -275,10 +276,11 @@ bool bind_gdn_layer(ModelBinder &binder, const std::string &prefix, const Geomet
 // kernel/src/gqa_layer.cu / gdn_layer.cu allocate) plus each dispatched
 // vendored op's own workspace-capacity query over the token interval
 // [1, prefill_chunk_tokens] -- under the widest compute policy each weight's
-// own qtype admits (`widest_policy_for` below: AllowA4 for NVFP4, A16Only
-// for everything else -- the real artifact mixes NVFP4 with a few BF16
-// exception arms, GitHub #83's own gate run), so turning AllowA4 on for a
-// weight that already admits it (G2, GitHub #85) changes no reservation.
+// own qtype admits (`ignis_widest_linear_policy_for`, kernel/src/layer_internal.h:
+// AllowA4 for NVFP4, A16Only for everything else -- the real artifact mixes
+// NVFP4 with a few BF16 exception arms, GitHub #83's own gate run), so a
+// dispatch site already using that policy (P2-02, GitHub #84's
+// `linear_swiglu` call) reserves nothing new.
 // This is a load-time host-arithmetic mirror of those files' allocation
 // sequence, not a dry run: no device call, no sequence-state pool (it does
 // not exist yet at model-load time), and no kernel dispatch.
@@ -308,18 +310,6 @@ std::size_t fp32_bytes(int64_t elements) {
 
 std::size_t i32_bytes(int64_t elements) {
   return round_up_arena_align(static_cast<std::size_t>(elements) * 4);
-}
-
-// The widest compute policy `qtype`'s own registered arm admits (the real
-// 27B artifact mixes NVFP4 with a few documented BF16 exception arms --
-// GQA layer 3's attention input and output, GDN layer 4's output,
-// docs/layer-reference-fixture.md -- and BF16_CTRL / W8G32_F16S admit only
-// LinearPolicy::A16Only; only NVFP4 admits AllowA4). Sizing every op at its
-// own weight's real qtype (not a blanket AllowA4) is what "widest policy
-// the engine may adopt" means per weight.
-ninfer::ops::LinearPolicy widest_policy_for(ninfer::QType qtype) {
-  return qtype == ninfer::QType::NVFP4 ? ninfer::ops::LinearPolicy::AllowA4
-                                        : ninfer::ops::LinearPolicy::A16Only;
 }
 
 // One GQA layer's peak scratch at `T` tokens (kernel/src/gqa_layer.cu's
@@ -354,14 +344,14 @@ std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLay
       /*max_width=*/T));
   bytes += round_up_arena_align(ninfer::ops::attn_input_proj_workspace_capacity_bytes(
       w.query_key_gate_value.qtype, w.query_key_gate_value.n, w.query_key_gate_value.k,
-      widest_policy_for(w.query_key_gate_value.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.query_key_gate_value.qtype), 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.output.qtype, w.output.n, w.output.k, widest_policy_for(w.output.qtype), 1, T));
+      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_swiglu_workspace_capacity_bytes(
       w.mlp_gate_up.qtype, w.mlp_gate_up.n, w.mlp_gate_up.k,
-      widest_policy_for(w.mlp_gate_up.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, widest_policy_for(w.mlp_down.qtype), 1, T));
+      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype), 1, T));
   return bytes;
 }
 
@@ -399,18 +389,18 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
 
   bytes += round_up_arena_align(ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
       w.query_key_value_z.qtype, w.query_key_value_z.n, w.query_key_value_z.k,
-      widest_policy_for(w.query_key_value_z.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.query_key_value_z.qtype), 1, T));
   bytes += round_up_arena_align(
       ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(value_heads, hidden, 1, T));
   bytes += round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
       qk_heads, value_heads, /*normalize_qk=*/true, 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.output.qtype, w.output.n, w.output.k, widest_policy_for(w.output.qtype), 1, T));
+      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_swiglu_workspace_capacity_bytes(
       w.mlp_gate_up.qtype, w.mlp_gate_up.n, w.mlp_gate_up.k,
-      widest_policy_for(w.mlp_gate_up.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, T));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, widest_policy_for(w.mlp_down.qtype), 1, T));
+      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype), 1, T));
   return bytes;
 }
 

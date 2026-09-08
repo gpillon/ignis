@@ -20,6 +20,8 @@
 #include "model_internal.h"
 #include "ignis_seq_internal.h"
 
+#include "ninfer/ops/linear.h"
+
 #include <cstdint>
 
 // Runs one GQA layer's body (input norm -> fused q/k/gate/v projection ->
@@ -54,4 +56,40 @@ int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
 // synchronization succeeds.
 inline uint32_t ignis_gqa_relative_layer(uint32_t layer) {
   return (layer - 3) / 4;
+}
+
+// The widest compute policy `qtype`'s own registered arm admits (only
+// NVFP4 admits AllowA4; every other registered qtype in the real 27B
+// artifact -- BF16_CTRL, W8G32_F16S -- admits only A16Only). Used only for
+// *sizing*: P2-01 (GitHub #83) reserves every layer's scratch at this
+// policy per weight (kernel/src/model.cu's own
+// `compute_program_scratch_bytes`) so the reservation is an upper bound
+// regardless of the token count a given call actually resolves to.
+inline ninfer::ops::LinearPolicy ignis_widest_linear_policy_for(ninfer::QType qtype) {
+  return qtype == ninfer::QType::NVFP4 ? ninfer::ops::LinearPolicy::AllowA4
+                                       : ninfer::ops::LinearPolicy::A16Only;
+}
+
+// The policy `linear_swiglu`'s MLP-tail call needs for `tokens` tokens of a
+// `qtype` weight (P2-02, GitHub #84). Unlike every other NVFP4 dispatch
+// this program makes (attn_input_proj, gdn_input_proj, linear_add, GQA
+// attention, the GDN recurrence -- all of which admit A16Only at every
+// positive T, unchanged here), `linear_swiglu`'s NVFP4 registration admits
+// its no-policy (A16Only) overload only through T=16
+// (kernel/vendor/include/ninfer/ops/linear_swiglu.h): a chunk wider than
+// that has no registered A16Only route to fall back to, so AllowA4 is not
+// a performance choice this ticket could defer for those calls. Below
+// T=17 this returns plain A16Only, not the sizing helper's unconditional
+// AllowA4: AllowA4's real NVFP4 activation quantization is measurably less
+// precise even at small T (GitHub #84's own gate run: T=4 against the f64
+// reference moved the relative L2 error from within tolerance to ~11%),
+// so forcing it below the width where it is actually required would
+// regress decode (always T=1) and every per-token-route call for no
+// reason -- the per-token route stays bit-for-bit what it always was.
+inline ninfer::ops::LinearPolicy ignis_linear_swiglu_policy_for(ninfer::QType qtype,
+                                                                std::int32_t tokens) {
+  if (qtype != ninfer::QType::NVFP4 || tokens <= 16) {
+    return ninfer::ops::LinearPolicy::A16Only;
+  }
+  return ninfer::ops::LinearPolicy::AllowA4;
 }
