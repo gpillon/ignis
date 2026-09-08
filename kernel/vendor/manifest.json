@@ -1036,6 +1036,10 @@
       "sha256": "9c6248d41446a4cc797a9f0078c6a43a53a54a1af0363713b1f0938939fe8041"
     },
     {
+      "path": "tests/ops/linear/test_nvfp4_a4.cpp",
+      "sha256": "b2b881066d6eecdda9db100b73aaba84ec54ff75c9a31c03bd7291d4bf08c4cc"
+    },
+    {
       "path": "tests/ops/linear/test_w8_a16.cpp",
       "sha256": "7192ac0817c3aa2c39c8512c19b94d4c94cc51d898bca541d8c9e2c3e66bb18b"
     },
@@ -1065,12 +1069,7 @@
     },
     {
       "path": "tests/ops/linear_swiglu/test_nvfp4.cpp",
-      "sha256": "7ba75d771b7f0514e4e227ef90c4732789e7325f15c5381cc9a0c99a609b114e",
-      "patch": {
-        "diff": "patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff",
-        "sha256": "1f413cc11b8128063724b546bd23af712246984c2dceabb544b3ebdfe78b0c33",
-        "reason": "P1-13 (GitHub #49) vendors only the NVFP4 arm's A16/small-T route (T=1 and small T); the reference's combined test file also exercises the A4 (large-T W4A4) route, whose reference test verification is deferred to G2 per the roadmap, so that run_profile call and kA4Cases are trimmed rather than left to exercise an unverified route"
-      }
+      "sha256": "7ba75d771b7f0514e4e227ef90c4732789e7325f15c5381cc9a0c99a609b114e"
     },
     {
       "path": "tests/ops/norm_test_common.h",

@@ -97,7 +97,6 @@ add_executable(ignis_kernel_bf16_linear_tests
 target_include_directories(ignis_kernel_bf16_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
 target_link_libraries(ignis_kernel_bf16_linear_tests PRIVATE ignis_kernel)
 add_test(NAME ignis_kernel_bf16_linear_tests COMMAND ignis_kernel_bf16_linear_tests)
-
 add_executable(ignis_kernel_w8_linear_tests
   ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_w8_a16.cpp
   ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
@@ -105,6 +104,21 @@ add_executable(ignis_kernel_w8_linear_tests
 target_include_directories(ignis_kernel_w8_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
 target_link_libraries(ignis_kernel_w8_linear_tests PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_w8_linear_tests COMMAND ignis_kernel_w8_linear_tests)
+
+# P2-03 (GitHub #85): the reference's own NVFP4 W4A4 linear test, run
+# unmodified -- the activation-quantized route (CallForm::Policy AllowA4) at
+# the model's attention-input [14336,5120], GDN-input [16384,5120], gate_up
+# [34816,5120] and residual [5120,6144]/[5120,17408] geometries, driving the
+# leaf's own `ops::linear` dispatcher (kernel/src/linear.cu) exactly like the
+# a16/w8 linear tests above. Same no-SKIP_RETURN_CODE rule (ADR 0006): a
+# missing or busy GPU fails here, it does not skip.
+add_executable(ignis_kernel_nvfp4_linear_a4_tests
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_nvfp4_a4.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_nvfp4_linear_a4_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+target_link_libraries(ignis_kernel_nvfp4_linear_a4_tests PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_nvfp4_linear_a4_tests COMMAND ignis_kernel_nvfp4_linear_a4_tests)
 
 # P1-11 (GitHub #47): the reference's own attn_input_proj test, patched
 # (kernel/vendor/patches/tests/ops/test_attn_input_proj.cpp.diff) to drop the
@@ -166,12 +180,14 @@ target_include_directories(ignis_kernel_gdn_gating_proj_tests PRIVATE ${IGNIS_VE
 target_link_libraries(ignis_kernel_gdn_gating_proj_tests PRIVATE ignis_vendor)
 add_test(NAME ignis_kernel_gdn_gating_proj_tests COMMAND ignis_kernel_gdn_gating_proj_tests)
 
-# P1-13 (GitHub #49): the reference's own linear_swiglu NVFP4 test, patched
-# (kernel/vendor/patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff) to drop
-# the A4 (large-T W4A4) case this ticket's acceptance defers to G2 — same
-# pattern as the linear/linear_add tests above, driving the leaf's own
-# `ops::linear_swiglu` (kernel/src/linear_swiglu.cu) so it exercises the real
-# NVFP4 fused gate_up + SiLU-mul epilogue at [34816,5120] for T=1 and small T.
+# P1-13 (GitHub #49), A4 case restored in P2-03 (GitHub #85): the
+# reference's own linear_swiglu NVFP4 test, now run unmodified -- the A4
+# (large-T W4A4) case that #49's patch trimmed is back, because #85 turns
+# the activation-quantized route on (the leaf's `ops::linear_swiglu`
+# dispatcher, kernel/src/linear_swiglu.cu, takes the AllowA4 policy for
+# NVFP4 at 27B geometry) -- so it exercises the real NVFP4 fused gate_up +
+# SiLU-mul epilogue at [34816,5120] for T=1, small T and the A4 cases
+# {5,48,49,128,1024}.
 add_executable(ignis_kernel_nvfp4_linear_swiglu_tests
   ${IGNIS_VENDOR_DIR}/tests/ops/linear_swiglu/test_nvfp4.cpp
   ${IGNIS_VENDOR_DIR}/tests/ops/linear_swiglu/linear_swiglu_test_common.cpp

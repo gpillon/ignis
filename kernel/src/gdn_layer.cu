@@ -76,7 +76,7 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &w, ninfer::DType dtype,
 // residual). Returns 0 on success, -1 on error (message set via set_error).
 int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, uint32_t layer,
                       uint32_t gdn_layer, void *in_residual, void *out_residual,
-                      uint64_t num_tokens) {
+                      uint64_t num_tokens, LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto T = static_cast<std::int32_t>(num_tokens);
   const auto stream = model->stream;
@@ -146,7 +146,16 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     // this step ABI uses (no mid-batch padding).
     const ninfer::Tensor conv_weight = weight_tensor(
         w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
-    ninfer::ops::gdn_input_proj(h, w.query_key_value_z, qkv, zbuf, stream);
+    // P2-03 (GitHub #85): the GDN input projection under the call's mode
+    // policy (ADR 0016): AllowA4 on the NVFP4 query_key_value_z parent
+    // (the W4A4 route is then the vendored dispatch's own decision per its
+    // token thresholds) or A16Only under the override. The transient
+    // workspace comes from the model's scratch (reserved at load for the
+    // widest policy, P2-01, GitHub #83), so a chunk's A4 route needs
+    // nothing new.
+    ninfer::ops::gdn_input_proj(h, w.query_key_value_z, qkv, zbuf,
+                                ignis_policy_for(w.query_key_value_z.qtype, mode), *model->scratch,
+                                stream);
     ninfer::ops::causal_conv1d_silu(qkv, conv_weight, conv_state, qkv_conv, stream);
 
     // The convolved query/key/value channel ranges are strided sub-views of
@@ -211,7 +220,11 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
                 cudaGetErrorString(err));
       return -1;
     }
-    ninfer::ops::linear_add(gated, w.output, residual_view, *model->scratch, stream);
+    // P2-03 (GitHub #85): the output projection's residual add under the
+    // call's mode policy (AllowA4 on the NVFP4 output parent, or A16Only
+    // under the override).
+    ninfer::ops::linear_add(gated, w.output, residual_view,
+                            ignis_policy_for(w.output.qtype, mode), *model->scratch, stream);
 
     // --- MLP tail: post-attention norm -> SwiGLU (gate_up + SiLU-mul) -> down +
     // residual ---
@@ -219,17 +232,20 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
         weight_tensor(w.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(residual_view, post_norm, model->rms_norm_eps, /*unit_offset=*/true,
                          post, stream);
-    // P2-02 (GitHub #84): the no-policy (A16Only) overload's NVFP4
-    // registration is only valid through T=16 -- above that width this is
-    // the only registered way to run this op at all, not a route upgrade
-    // (kernel/src/layer_internal.h's `ignis_linear_swiglu_policy_for`); the
-    // scratch it can reserve was already sized for AllowA4 at any T (P2-01,
-    // GitHub #83). Below T=17 this keeps A16Only, so decode and the
-    // per-token route see no numerics change.
+    // P2-03 (GitHub #85): the MLP tail under the call's mode policy too
+    // (AllowA4 on the NVFP4 gate_up/down parents under the engine default,
+    // or A16 under the override). The width-aware `linear_swiglu`
+    // counterpart of the policy helper (kernel/src/layer_internal.h):
+    // under the override the A16 route is forced where it is registered
+    // (T<=16) and the op's only runnable route above its A16 cap (the pre-
+    // #85 behavior); under the engine default AllowA4 at every width, the
+    // vendored dispatch's own decision per its token thresholds, GitHub
+    // #85's acceptance.
     ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused,
-                               ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, T),
+                               ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T),
                                *model->scratch, stream);
-    ninfer::ops::linear_add(fused, w.mlp_down, residual_view, *model->scratch, stream);
+    ninfer::ops::linear_add(fused, w.mlp_down, residual_view,
+                            ignis_policy_for(w.mlp_down.qtype, mode), *model->scratch, stream);
 
     // No stream synchronization here (P2-01, GitHub #83): the layer body
     // only enqueues work, so a later chunk loop can run every layer as one
@@ -248,13 +264,12 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
 // P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
 // (kernel/src/layer_internal.h) -- every check `ignis_gdn_layer_step` did,
 // minus the synchronization a per-chunk caller defers until its whole
-// chunk's dispatches succeed. Unlike the GQA layer, the GDN layer has no
-// separate position counter for the caller to advance afterwards: its
-// state lives in the sequence's pool slot and is updated in place by the
-// enqueued work itself.
+// chunk's dispatches succeed. `mode` is the call's compute-policy mode
+// (P2-03, GitHub #85): every NVFP4 projection in the body is dispatched
+// under the policy `ignis_policy_for` resolves for it.
 int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                  uint32_t layer, const void *in_residual, void *out_residual,
-                                 uint64_t num_tokens) {
+                                 uint64_t num_tokens, LinearPolicyMode mode) {
   // Errors here are prefixed `ignis_gdn_layer` (not `..._step`): this body
   // is now dispatched both by `ignis_gdn_layer_step` and directly by a
   // chunk loop (kernel/src/step.cu), so a message naming the ABI wrapper
@@ -281,15 +296,21 @@ int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
   // `gqa_layer = (layer - 3) / 4` for its own (16-count) pool.
   const uint32_t gdn_layer = layer - (layer + 1) / 4;
   return run_gdn_layer(model, pool, seq->slot, layer, gdn_layer, const_cast<void *>(in_residual),
-                       out_residual, num_tokens);
+                       out_residual, num_tokens, mode);
 }
 
-extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,
-                                         struct ignis_seq *seq, uint32_t layer,
-                                         const void *in_residual, void *out_residual,
-                                         uint64_t num_tokens) {
+// P2-03 (GitHub #85): `ignis_gdn_layer_step`'s synchronous contract (body +
+// one stream synchronization; no position advance -- the GDN layer's state
+// is updated in place by the enqueued work) with a non-default
+// compute-policy mode -- the program's per-token route (kernel/src/step.cu)
+// threads ADR 0016's `compute_policy` override through it. The flat C ABI
+// entry point below is this same contract with `kEngineDefault`.
+int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                                  uint32_t layer, const void *in_residual, void *out_residual,
+                                  uint64_t num_tokens, LinearPolicyMode mode) {
   const int32_t rc =
-      ignis_gdn_layer_run_body(model, pool, seq, layer, in_residual, out_residual, num_tokens);
+      ignis_gdn_layer_run_body(model, pool, seq, layer, in_residual, out_residual, num_tokens,
+                               mode);
   if (rc != 0) {
     return rc;
   }
@@ -304,6 +325,14 @@ extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_
     return -1;
   }
   return 0;
+}
+
+extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,
+                                         struct ignis_seq *seq, uint32_t layer,
+                                         const void *in_residual, void *out_residual,
+                                         uint64_t num_tokens) {
+  return ignis_gdn_layer_step_mode(model, pool, seq, layer, in_residual, out_residual, num_tokens,
+                                   LinearPolicyMode::kEngineDefault);
 }
 
 extern "C" const char *ignis_gdn_layer_last_error(void) {

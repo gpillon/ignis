@@ -190,8 +190,8 @@ fn validate_prefill_config(prefill_chunk_tokens: u32, max_context_tokens: u32) -
 }
 
 /// A bound tensor does not cross the ABI if it is a
-/// `*_input_scale_divisor` scalar (the W4A4 path that reads them is G2) --
-/// its presence and shape are already validated by
+/// `*_input_scale_divisor` scalar (the W4A4 path that reads them is
+/// P2-03, GitHub #85) -- its presence and shape are already validated by
 /// [`ignis_artifact::bind_text_scope_27b`].
 fn crosses_the_abi(name: &str) -> bool {
     !name.ends_with("/input_scale_divisor")
@@ -218,9 +218,9 @@ fn read_weight_divisor(reader: &Reader, name: &str, shape: &[u64]) -> Result<f32
 /// Every NVFP4 projection's reference `Weight` carries a finite, positive
 /// `input_scale_divisor` regardless of which compute policy consumes it
 /// (`kernel/vendor/src/ops/linear/nvfp4/nvfp4_format.cpp`'s
-/// `validate_nvfp4_weight` requires it unconditionally); the W4A4 path that
-/// actually multiplies by it is still G2, but the value must cross the ABI
-/// now so A16-only NVFP4 ops validate.
+/// `validate_nvfp4_weight` requires it unconditionally). The W4A4 path that
+/// multiplies by it is live (P2-03, GitHub #85), so a wrong or missing
+/// divisor now fails a test rather than degrading quietly (acceptance #85.4).
 fn read_input_scale_divisor(reader: &Reader, name: &str) -> Result<f32, String> {
     let span = reader.payload(name).map_err(|e| e.to_string())?;
     let bytes: [u8; 4] = span
