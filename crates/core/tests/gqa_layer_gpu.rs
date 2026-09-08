@@ -180,7 +180,7 @@ fn gqa_layers_match_f64_reference() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
     let cfg = ModelConfig::qwen38_27b();
     let pool = SeqPool::create(

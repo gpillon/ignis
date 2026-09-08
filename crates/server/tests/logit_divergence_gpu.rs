@@ -140,7 +140,7 @@ fn token_zero_top_k_logits_for_the_divergent_canaries() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
 
     for canary in load_divergent_canaries() {

@@ -29,11 +29,14 @@ use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 
 use crate::{RuntimeStats, StepLeaf};
 
-/// Sizing knobs for the leaf's sequence-state pool.
+/// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
 pub struct CudaLeafConfig {
     /// The largest single sequence's KV reservation, in tokens (mirrors
-    /// `ignis_core::SchedulerConfig::max_sequence_tokens`).
+    /// `ignis_core::SchedulerConfig::max_sequence_tokens`). Also the bound
+    /// `ignis_model_load` sizes the GQA attention workspace reservation
+    /// for (P2-01, GitHub #83) — must not be raised without also rebuilding
+    /// the model handle.
     pub max_context_tokens: u32,
     /// The paged-KV pool budget, in sequence-tokens: the pool every live
     /// sequence draws its pages from. Sized independently of
@@ -44,10 +47,10 @@ pub struct CudaLeafConfig {
     /// The prefill chunk width, in tokens: how wide a span the program's
     /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
     /// nonzero multiple of 128, validated by the server's config module
-    /// before any loader work starts; the leaf's own use of it — sizing
-    /// the scratch and running the chunk loop — lands with GitHub #83/#84,
-    /// which is why prefill still walks the span one token at a time
-    /// today.
+    /// before any loader work starts. `ignis_model_load` reserves the
+    /// program scratch for a chunk of this width at load time (P2-01,
+    /// GitHub #83); the chunk loop itself lands with GitHub #84, which is
+    /// why prefill still walks the span one token at a time today.
     pub prefill_chunk_tokens: u32,
 }
 
@@ -167,8 +170,14 @@ impl StepLeaf for CudaLeaf {
     type Sequence = Seq<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
-        let model = model_load::load_qwen38_27b(&self.reader, &self.artifact, &self.handles)
-            .map_err(|e| leaf_error("model load", e))?;
+        let model = model_load::load_qwen38_27b(
+            &self.reader,
+            &self.artifact,
+            &self.handles,
+            self.config.prefill_chunk_tokens,
+            self.config.max_context_tokens,
+        )
+        .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
         // The leaf's fixed paged-KV page size (`kPagedKVPageSize`, 64
         // tokens). The pool holds `kv_pool_tokens` worth of pages, shared

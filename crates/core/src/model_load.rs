@@ -92,6 +92,8 @@ pub(crate) mod ffi {
             tensors: *const IgnisBoundTensor,
             count: u64,
             topology: *const IgnisTopology,
+            prefill_chunk_tokens: u32,
+            max_context_tokens: u32,
             out_model: *mut *mut IgnisModel,
         ) -> i32;
 
@@ -157,6 +159,34 @@ fn layout_code(layout: StorageLayout) -> i32 {
         StorageLayout::BlockScaleK16M128x4V1 => 2,
         StorageLayout::RowScaleV1 => 3,
     }
+}
+
+/// Validates the P2-01 (GitHub #83) load options before any device or FFI
+/// work: `prefill_chunk_tokens` must be a nonzero multiple of 128 (the
+/// reference's own alignment rule, and the alignment the vendored GDN
+/// chunked kernels' 64-token chunk divides evenly), `max_context_tokens`
+/// must be positive. The leaf validates the same rule again
+/// (`kernel/src/model.cu`, defense in depth for a caller that bypasses this
+/// wrapper); checking here first fails fast without touching the reader,
+/// the artifact, or the device.
+fn validate_prefill_config(prefill_chunk_tokens: u32, max_context_tokens: u32) -> Result<(), String> {
+    if prefill_chunk_tokens == 0 || prefill_chunk_tokens % 128 != 0 {
+        return Err(format!(
+            "load_qwen38_27b: prefill_chunk_tokens ({prefill_chunk_tokens}) must be a nonzero multiple of 128"
+        ));
+    }
+    if max_context_tokens == 0 {
+        return Err("load_qwen38_27b: max_context_tokens must be positive".to_string());
+    }
+    // A chunk wider than the sequence pool's own context bound can never be
+    // prefilled anyway, and the GQA attention workspace query needs
+    // max_visible_keys >= the query width it is sized for.
+    if prefill_chunk_tokens > max_context_tokens {
+        return Err(format!(
+            "load_qwen38_27b: prefill_chunk_tokens ({prefill_chunk_tokens}) must not exceed max_context_tokens ({max_context_tokens})"
+        ));
+    }
+    Ok(())
 }
 
 /// A bound tensor does not cross the ABI if it is a
@@ -328,18 +358,36 @@ fn qwen38_27b_topology(layer_kinds_buf: &mut Vec<i32>) -> ffi::IgnisTopology {
 /// (P1-17): build the bound-tensor + topology descriptors and call
 /// `ignis_model_load`. `handles` must be the handles [`ignis_artifact::bind_text_scope_27b`]
 /// returned for the same `reader` that produced `artifact`.
+///
+/// `prefill_chunk_tokens` is the widest prefill chunk this model handle will
+/// ever be asked to run (P2-01, GitHub #83): the load reserves the program
+/// scratch once for a chunk of that width. Must be a nonzero multiple of
+/// 128. `max_context_tokens` must match (or bound) the largest
+/// `max_context_tokens` the caller's [`crate::seq::SeqPool`] will be built
+/// with — it sizes the GQA attention workspace for the worst-case visible-key
+/// count.
 pub fn load_qwen38_27b(
     reader: &Reader,
     artifact: &MaterializedArtifact,
     handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
 ) -> Result<Model, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(reader, artifact, handles)?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
-        ffi::ignis_model_load(tensors.as_ptr(), tensors.len() as u64, &topology, &mut handle)
+        ffi::ignis_model_load(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            &topology,
+            prefill_chunk_tokens,
+            max_context_tokens,
+            &mut handle,
+        )
     };
     if rc != 0 || handle.is_null() {
         let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
@@ -357,6 +405,35 @@ pub fn load_qwen38_27b(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_prefill_config_accepts_the_default_chunk() {
+        assert!(validate_prefill_config(1024, 4096).is_ok());
+    }
+
+    #[test]
+    fn validate_prefill_config_rejects_a_zero_chunk() {
+        let err = validate_prefill_config(0, 4096).unwrap_err();
+        assert!(err.contains("nonzero multiple of 128"), "{err}");
+    }
+
+    #[test]
+    fn validate_prefill_config_rejects_a_chunk_not_a_multiple_of_128() {
+        let err = validate_prefill_config(100, 4096).unwrap_err();
+        assert!(err.contains("nonzero multiple of 128"), "{err}");
+    }
+
+    #[test]
+    fn validate_prefill_config_rejects_a_zero_max_context() {
+        let err = validate_prefill_config(1024, 0).unwrap_err();
+        assert!(err.contains("max_context_tokens"), "{err}");
+    }
+
+    #[test]
+    fn validate_prefill_config_rejects_a_chunk_wider_than_the_context_bound() {
+        let err = validate_prefill_config(1024, 128).unwrap_err();
+        assert!(err.contains("must not exceed max_context_tokens"), "{err}");
+    }
 
     #[test]
     fn qtype_code_matches_the_leaf_enum() {

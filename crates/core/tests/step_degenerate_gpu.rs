@@ -246,7 +246,7 @@ fn degenerate_program_matches_f64_reference_for_four_tokens() {
     // its error is always a real descriptor-building or artifact-contract
     // bug, never GPU contention -- a hard failure here is correct under and
     // outside the profile alike (mirrors model_load_gpu.rs).
-    let model = load_qwen38_27b(&reader, &artifact, &handles)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, 128, 128)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
 
     // A few token ids spanning the vocabulary (the acceptance criteria's

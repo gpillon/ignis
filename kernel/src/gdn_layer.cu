@@ -221,12 +221,11 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
     ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused, *model->scratch, stream);
     ninfer::ops::linear_add(fused, w.mlp_down, residual_view, *model->scratch, stream);
 
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_gdn_layer_step: cudaStreamSynchronize failed: ") +
-                cudaGetErrorString(err));
-      return -1;
-    }
+    // No stream synchronization here (P2-01, GitHub #83): the layer body
+    // only enqueues work, so a later chunk loop can run every layer as one
+    // pipelined unit. `ignis_gdn_layer_step` below synchronizes once the
+    // layer body returns, keeping this function's own callers' contract
+    // (its GPU tests) unchanged.
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_gdn_layer_step: ") + e.what());
@@ -261,8 +260,22 @@ extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_
   // addressed by (GitHub #55), mirroring `ignis_gqa_layer_step`'s
   // `gqa_layer = (layer - 3) / 4` for its own (16-count) pool.
   const uint32_t gdn_layer = layer - (layer + 1) / 4;
-  return run_gdn_layer(model, pool, seq->slot, layer, gdn_layer,
-                       const_cast<void *>(in_residual), out_residual, num_tokens);
+  const int32_t rc = run_gdn_layer(model, pool, seq->slot, layer, gdn_layer,
+                                   const_cast<void *>(in_residual), out_residual, num_tokens);
+  if (rc != 0) {
+    return rc;
+  }
+  // P2-01 (GitHub #83): the sync moved here from the layer body so a direct
+  // call through this ABI entry point (this function's own GPU tests) keeps
+  // seeing a synchronous result, while a caller that dispatches the body
+  // directly (the program's per-chunk loop) can pipeline every layer.
+  const cudaError_t error = cudaStreamSynchronize(model->stream);
+  if (error != cudaSuccess) {
+    set_error(std::string("ignis_gdn_layer_step: cudaStreamSynchronize failed: ") +
+              cudaGetErrorString(error));
+    return -1;
+  }
+  return 0;
 }
 
 extern "C" const char *ignis_gdn_layer_last_error(void) {
