@@ -333,6 +333,7 @@ std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLay
   bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // rotated_query
   bytes += bf16_bytes(static_cast<int64_t>(kv_width) * T); // rotated_key
   bytes += i32_bytes(T);                                   // positions
+  bytes += i32_bytes(1);                                   // kv_table_rows (P2-04, GitHub #86)
   bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // attention
   bytes += bf16_bytes(static_cast<int64_t>(hidden) * T);   // post
   bytes += bf16_bytes(static_cast<int64_t>(ffn) * T);      // fused
