@@ -98,6 +98,18 @@ fn live_server() -> Option<LiveServer> {
             unreachable!();
         }
     };
+    // `Engine::with_sinks_and_driver` spawns its telemetry task with
+    // `tokio::spawn`, which needs a live reactor -- build the runtime
+    // first and enter it before touching the engine (`openai_http_gpu.rs`
+    // gets this for free from `#[tokio::test]`; this file's `#[test]`
+    // harness has to enter its own runtime explicitly).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("serve runtime");
+    let _guard = runtime.enter();
+
     let (engine, driver) = Engine::with_sinks_and_driver(
         Box::new(scheduler),
         Arc::new(NullSink),
@@ -107,11 +119,6 @@ fn live_server() -> Option<LiveServer> {
         .with_request_timeout(Duration::from_secs(600))
         .app();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("serve runtime");
     let url = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
