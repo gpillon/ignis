@@ -156,9 +156,13 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
 // scope while every layer takes (and releases) its own nested scope, so the
 // program never materializes an activation on the host. `out_logits`, if
 // non-null, receives this token's full vocab-length logits (GitHub #72
-// debug path -- the copy-back mirrors run_degenerate_step's above).
+// debug path -- the copy-back mirrors run_degenerate_step's above). `mode`
+// is the call's compute-policy mode (P2-03, GitHub #85): the layer steps
+// dispatch every NVFP4 projection under the policy `ignis_policy_for`
+// resolves for it.
 int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
-                          int32_t token_id, int32_t *out_token_id, float *out_logits) {
+                          int32_t token_id, int32_t *out_token_id, float *out_logits,
+                          LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
@@ -177,9 +181,13 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      // P2-03 (GitHub #85): the mode-bearing step variants (the public ABI
+      // entry points with their stream synchronization and position
+      // advance) so this per-token route honors ADR 0016's `compute_policy`
+      // override, not just the engine default.
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_step(model, pool, seq, layer, left.data, right.data, 1)
-          : ignis_gdn_layer_step(model, pool, seq, layer, left.data, right.data, 1);
+          ? ignis_gqa_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode)
+          : ignis_gdn_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -270,7 +278,8 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
 // state when this returns -1.
 int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
-                          bool compute_output, int32_t *out_token_id, float *out_logits) {
+                          bool compute_output, int32_t *out_token_id, float *out_logits,
+                          LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -292,8 +301,10 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens)
-          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens);
+          ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
+                                     mode)
+          : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
+                                     mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -397,7 +408,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // the failing one.
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
-                                    float *out_logits) {
+                                    float *out_logits, LinearPolicyMode mode) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   uint64_t offset = 0;
   while (offset < num_tokens) {
@@ -406,7 +417,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, is_last_chunk,
-                          &successor, slot_logits) != 0) {
+                          &successor, slot_logits, mode) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -488,8 +499,13 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   // (chunked route, engine default compute policy); a non-null options
   // pointer whose `size` this leaf does not recognize is rejected outright,
   // so a caller compiled against a wider future struct fails loudly instead
-  // of silently reading past what it wrote.
+  // of silently reading past what it wrote. P2-03 (GitHub #85): the
+  // `compute_policy` field now reaches a dispatch site -- every NVFP4
+  // projection in the program takes the mode's policy (AllowA4 under the
+  // engine default, the reference's text-model policy; A16Only under the
+  // override, for tests that compare the routes on identical inputs).
   int32_t route = IGNIS_PREFILL_ROUTE_CHUNKED;
+  LinearPolicyMode mode = LinearPolicyMode::kEngineDefault;
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_prefill_options)) {
       set_error("ignis_program_prefill: unrecognized ignis_prefill_options size " +
@@ -509,25 +525,24 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       return -1;
     }
     route = options->route;
-    // The compute-policy override has no dispatch site to reach yet: every
-    // NVFP4 projection this program calls still uses the plain (A16Only)
-    // op overload (P2-03/P2-04, GitHub #63, turn AllowA4 on). Both
-    // recognized values are accepted now so the ABI does not have to change
-    // again when that wiring lands.
+    mode = options->compute_policy == IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY
+               ? LinearPolicyMode::kA16Only
+               : LinearPolicyMode::kEngineDefault;
   }
 
   const auto began = std::chrono::steady_clock::now();
   int32_t rc = 0;
   if (route == IGNIS_PREFILL_ROUTE_PER_TOKEN) {
-    // Test-only self-oracle route (ADR 0016): today's unchanged per-token
-    // loop, one traversal and one synchronization per layer per token.
+    // Test-only self-oracle route (ADR 0016): the per-token loop, one
+    // traversal and one synchronization per layer per token, under the
+    // call's compute-policy mode (P2-03, GitHub #85).
     for (uint64_t i = 0; i < num_tokens; ++i) {
       int32_t successor = -1;
       // Only the span's last position is the one whose logits GitHub #72
       // needs (it decides the successor ignis_program_decode emits first) --
       // every earlier position stays argmax-only.
       float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
-      if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits) != 0) {
+      if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits, mode) != 0) {
         rc = -1;
         break;
       }
@@ -535,7 +550,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       ++seq->position;
     }
   } else {
-    rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, out_logits);
+    rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, out_logits, mode);
   }
   if (rc != 0) {
     return rc;
@@ -571,7 +586,14 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     }
     const int32_t emitted = seq->pending_token;
     int32_t successor = -1;
-    if (run_program_token(model, pool, seq, emitted, &successor, nullptr) != 0) {
+    // P2-03 (GitHub #85): decode takes the engine's own compute-policy mode
+    // (ADR 0016: the flat decode ABI has no options struct, so the
+    // `A16_ONLY` override is reachable only through the prefill entry
+    // point) -- every NVFP4 projection in the decode round runs under
+    // AllowA4, the reference's text-model policy, and the route the
+    // vendored dispatch takes per its own token thresholds.
+    if (run_program_token(model, pool, seq, emitted, &successor, nullptr,
+                          LinearPolicyMode::kEngineDefault) != 0) {
       return -1;
     }
     out_token_ids[i] = emitted;

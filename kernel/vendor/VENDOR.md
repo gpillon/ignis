@@ -390,6 +390,27 @@ The remaining op family (the fused GDN projections: gdn_input_proj,
 gdn_gating_proj) arrives with P1-12, adding its files to this manifest and
 its reference op test to the leaf's test suite.
 
+P2-03 (GitHub #85) qualifies the W4A4 activation-quantized route, turning on
+the A4 cases that the earlier tickets trimmed:
+
+- **linear A4 test** — `tests/ops/linear/test_nvfp4_a4.cpp` (new manifest
+  entry, run unmodified): the reference's own `CallForm::Policy` `AllowA4`
+  invocations at the model's attention-input `[14336,5120]`, GDN-input
+  `[16384,5120]`, gate_up `[34816,5120]` and residual `[5120,6144]` /
+  `[5120,17408]` geometries, built as `ignis_kernel_nvfp4_linear_a4_tests`
+  (its own CTest executable, linking the leaf's `ops::linear` dispatcher
+  exactly like the a16/w8 linear tests above).
+- **linear_swiglu A4 case restored** — the patch recorded in P1-13
+  (`patches/tests/ops/linear_swiglu/test_nvfp4.cpp.diff`, which trimmed the
+  A4/large-T case until the W4A4 route was qualified) is dropped: the
+  manifest entry reverts to the reference's unpatched hash, `sync` restores
+  the unmodified test, and the A4 profile (`kA4Cases {5,48,49,128,1024}`)
+  runs again in `ignis_kernel_nvfp4_linear_swiglu_tests`.
+- The attention-input and GDN-input projection tests' A4 cases
+  (`tests/ops/test_attn_input_proj.cpp` and `tests/ops/test_gdn_input_proj.cpp`)
+  were already vendored with their A4 arms in P2-02 (GitHub #84) — those
+  patches trim only the non-NVFP4 arms, so no manifest change is needed here.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;
