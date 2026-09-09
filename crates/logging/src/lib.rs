@@ -78,14 +78,14 @@ fn build_subscriber(
     let level_filter = LevelFilter::from_level(config.level.as_tracing_level());
     let layer: Box<dyn Layer<Registry> + Send + Sync> = match config.format {
         LogFormat::Json => JsonLayer::new(sink).with_filter(level_filter).boxed(),
+        // `config.color` was already decided in `config::resolve` from the
+        // same injected TTY check `format`'s `auto` branch uses — an
+        // explicit `IGNIS_LOG_FORMAT=pretty` in a non-interactive pipe still
+        // gets color off, matching "gated on stdout being an interactive
+        // terminal" rather than on the format choice itself. This function
+        // stays pure: no second, real `is_terminal()` probe here.
         LogFormat::Pretty => {
-            // `auto` already resolved against the real TTY check in
-            // `config::resolve`; an explicit `IGNIS_LOG_FORMAT=pretty` in a
-            // non-interactive pipe still gets color off, matching "gated on
-            // stdout being an interactive terminal" rather than on the
-            // format choice itself.
-            let color = std::io::stdout().is_terminal();
-            PrettyLayer::new(sink, color).with_filter(level_filter).boxed()
+            PrettyLayer::new(sink, config.color).with_filter(level_filter).boxed()
         }
     };
     Registry::default().with(layer)
@@ -150,9 +150,17 @@ mod tests {
 
     /// CPU-only sanity timing check (Testing Decisions): resolving config
     /// and constructing the subscriber must not add meaningful latency to
-    /// server startup. Not a G4 gate — nothing here touches the inference
-    /// path; this only guards against something pathological (e.g.
-    /// accidental blocking I/O) sneaking into the construction path.
+    /// server startup. This is a deliberate proxy for `init()`'s own cost
+    /// rather than timing `init()` directly: `init()` installs the
+    /// process-wide global subscriber, which can only happen once per test
+    /// binary, so it can't be called (let alone timed) more than once
+    /// without colliding with every other test here. Everything `init()`
+    /// does beyond `resolve` + `build_subscriber` is exactly one
+    /// `tracing::subscriber::set_global_default` call — a fixed, one-time,
+    /// non-looping cost this sanity check isn't trying to catch regressions
+    /// in. Not a G4 gate — nothing here touches the inference path; this
+    /// only guards against something pathological (e.g. accidental blocking
+    /// I/O) sneaking into the construction path.
     #[test]
     fn resolving_config_and_building_the_subscriber_is_fast() {
         let start = Instant::now();
@@ -164,6 +172,47 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "logging init construction took {elapsed:?}, expected well under 50ms"
         );
+    }
+
+    /// `build_subscriber` must actually route through both `Json` and
+    /// `Pretty` branches (not just have the branches exist) — the dual-layer
+    /// test above builds `JsonLayer`/`PrettyLayer` directly, which never
+    /// exercises `build_subscriber`'s own `match config.format`.
+    #[test]
+    fn build_subscriber_routes_json_format_to_the_json_layer() {
+        let sink = Arc::new(MemorySink::new());
+        let config = LogConfig { format: LogFormat::Json, level: LogLevel::Info, color: false };
+        let subscriber = build_subscriber(config, sink.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(name: "ignis.build_subscriber.json_route", "via json");
+        });
+
+        let line = sink.lines().remove(0);
+        let json: serde_json::Value = serde_json::from_str(&line).expect("json layer emits valid json");
+        assert_eq!(json["event_name"], "ignis.build_subscriber.json_route");
+    }
+
+    #[test]
+    fn build_subscriber_routes_pretty_format_to_the_pretty_layer() {
+        let sink = Arc::new(MemorySink::new());
+        let config = LogConfig { format: LogFormat::Pretty, level: LogLevel::Info, color: false };
+        let subscriber = build_subscriber(config, sink.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(name: "ignis.build_subscriber.pretty_route", "via pretty");
+        });
+
+        let line = sink.lines().remove(0);
+        // The pretty layer's output is not JSON — this is what distinguishes
+        // it from the json-route test above without duplicating
+        // `pretty_layer.rs`'s own rendering assertions.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&line).is_err(),
+            "pretty layer output should not itself be a JSON line: {line}"
+        );
+        assert!(line.contains("ignis.build_subscriber.pretty_route"), "{line}");
+        assert!(line.contains("via pretty"), "{line}");
     }
 
     #[test]

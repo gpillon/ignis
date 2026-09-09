@@ -54,11 +54,17 @@ impl LogLevel {
 }
 
 /// The resolved config `init` needs: a concrete format (never `Auto` — see
-/// [`LogFormat`]) and a minimum level.
+/// [`LogFormat`]), a minimum level, and whether the real stdout is an
+/// interactive terminal (`color`) — decided once here from the same
+/// injected `is_terminal` check `format`'s `auto` resolution uses, so
+/// [`crate::build_subscriber`] never re-probes the real TTY itself. An
+/// explicit `IGNIS_LOG_FORMAT=pretty` on a non-interactive pipe still gets
+/// `color: false` — color tracks the real terminal, not the chosen format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogConfig {
     pub format: LogFormat,
     pub level: LogLevel,
+    pub color: bool,
 }
 
 /// A future CLI flag's override slot (e.g. `--log-format`/`--log-level`,
@@ -91,13 +97,15 @@ pub fn resolve(
     is_terminal: impl Fn() -> bool,
     _override: LogConfigOverride,
 ) -> Result<LogConfig, LogConfigError> {
+    let is_tty = is_terminal();
+
     let format_setting = match env("IGNIS_LOG_FORMAT") {
         None => LogFormatSetting::Auto,
         Some(raw) => parse_format(&raw)?,
     };
     let format = match format_setting {
         LogFormatSetting::Auto => {
-            if is_terminal() {
+            if is_tty {
                 LogFormat::Pretty
             } else {
                 LogFormat::Json
@@ -112,7 +120,7 @@ pub fn resolve(
         Some(raw) => parse_level(&raw)?,
     };
 
-    Ok(LogConfig { format, level })
+    Ok(LogConfig { format, level, color: is_tty })
 }
 
 fn parse_format(raw: &str) -> Result<LogFormatSetting, LogConfigError> {
@@ -252,5 +260,27 @@ mod tests {
         let err = resolve(env, tty, LogConfigOverride::default()).expect_err("must reject");
         assert!(err.0.contains("IGNIS_LOG_LEVEL"), "{err}");
         assert!(err.0.contains("verbose"), "{err}");
+    }
+
+    #[test]
+    fn color_tracks_the_real_tty_not_the_chosen_format() {
+        // Auto + TTY: pretty and color both follow the same real terminal.
+        let config = resolve(no_env, tty, LogConfigOverride::default()).expect("resolve");
+        assert_eq!(config.format, LogFormat::Pretty);
+        assert!(config.color);
+
+        // Explicit `pretty` forced on a non-interactive pipe: format is
+        // pretty, but color stays off since the real stdout isn't a TTY.
+        let env = env_map(&[("IGNIS_LOG_FORMAT", "pretty")]);
+        let config = resolve(env, no_tty, LogConfigOverride::default()).expect("resolve");
+        assert_eq!(config.format, LogFormat::Pretty);
+        assert!(!config.color, "color must not follow a forced format, only the real TTY");
+
+        // Explicit `json` forced on an interactive TTY: format is json, but
+        // color is still recorded true since the real stdout is a TTY.
+        let env = env_map(&[("IGNIS_LOG_FORMAT", "json")]);
+        let config = resolve(env, tty, LogConfigOverride::default()).expect("resolve");
+        assert_eq!(config.format, LogFormat::Json);
+        assert!(config.color);
     }
 }

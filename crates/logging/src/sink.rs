@@ -44,3 +44,36 @@ impl LineSink for MemorySink {
         self.lines.lock().unwrap().push(line.to_string());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `StdoutSink` wraps `println!`, which stable Rust gives no portable way
+    // to capture and assert on from a unit test (no stdout-redirect seam,
+    // and this isn't worth adding one for a one-line wrapper) — so this
+    // covers what a unit test safely can: it never panics on ordinary,
+    // empty, or embedded-newline input, and it satisfies `LineSink` as a
+    // trait object exactly like every other sink here.
+    #[test]
+    fn stdout_sink_writes_without_panicking() {
+        let sink: Box<dyn LineSink> = Box::new(StdoutSink);
+        sink.write_line("a plain line");
+        sink.write_line("");
+        sink.write_line("a line with an\nembedded newline");
+    }
+
+    #[test]
+    fn stdout_sink_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StdoutSink>();
+    }
+
+    #[test]
+    fn memory_sink_records_lines_in_order() {
+        let sink = MemorySink::new();
+        sink.write_line("first");
+        sink.write_line("second");
+        assert_eq!(sink.lines(), vec!["first".to_string(), "second".to_string()]);
+    }
+}
