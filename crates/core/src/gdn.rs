@@ -20,7 +20,11 @@
 pub struct GdnState {
     /// Token positions at which the state is resumable (checkpoint /
     /// frontier boundaries). A snapshot at any other position is invalid.
-    boundaries: Vec<usize>,
+    /// A `BTreeSet` (not a linearly-scanned `Vec`): a chunked prefill can
+    /// record tens of boundaries over a long span (P3-01, ADR 0018), and
+    /// `can_resume_at` sits on the hot per-chunk path — it must not be
+    /// O(context).
+    boundaries: std::collections::BTreeSet<usize>,
     /// The current position (token index) of the state.
     position: usize,
 }
@@ -30,7 +34,7 @@ impl GdnState {
     /// sequence is always resumable).
     pub fn new() -> Self {
         Self {
-            boundaries: vec![0],
+            boundaries: std::collections::BTreeSet::from([0]),
             position: 0,
         }
     }
@@ -41,7 +45,7 @@ impl GdnState {
     /// makes it resumable); backwards checkpoints are ignored.
     pub fn checkpoint(&mut self, position: usize) {
         if position >= self.position {
-            self.boundaries.push(position);
+            self.boundaries.insert(position);
             self.position = position;
         }
     }
@@ -67,6 +71,12 @@ impl GdnState {
     /// recorded checkpoint / frontier boundary.
     pub fn can_resume_at(&self, position: usize) -> bool {
         self.boundaries.contains(&position)
+    }
+
+    /// The number of recorded checkpoint / frontier boundaries (test /
+    /// telemetry observability).
+    pub fn boundary_count(&self) -> usize {
+        self.boundaries.len()
     }
 
     /// Whether `position` is exactly at a recorded boundary and thus a
@@ -186,5 +196,25 @@ mod tests {
         // A forward advance (128) is applied.
         state.advance(128);
         assert_eq!(state.position(), 128);
+    }
+
+    #[test]
+    fn boundary_lookup_is_not_a_linear_vec_scan() {
+        // P3-01 (ADR 0018): a chunked prefill records tens of boundaries
+        // over a long span. The boundary set must dedupe repeats (a `Vec`
+        // scanned with `contains()` would instead grow one entry per
+        // checkpoint, even for a duplicate).
+        let mut state = GdnState::new();
+        for chunk in 1..=64usize {
+            state.checkpoint(chunk * 1024);
+        }
+        // 64 chunk boundaries + the initial boundary at 0.
+        assert_eq!(state.boundary_count(), 65);
+        assert!(state.can_resume_at(32 * 1024));
+        assert!(!state.can_resume_at(32 * 1024 + 1));
+        // Re-recording the current position is a no-op on the boundary set
+        // (it was already inserted at the same chunk).
+        state.checkpoint(64 * 1024);
+        assert_eq!(state.boundary_count(), 65);
     }
 }

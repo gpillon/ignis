@@ -66,6 +66,21 @@ pub struct Request {
     /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
     /// full prefill, nothing skipped).
     pub shared_prefix_tokens: u32,
+    /// Prompt tokens already sent to the compute backend during prefill
+    /// (P3-01, ADR 0018): advances by at most the scheduler's serving chunk
+    /// width per `advance()`. `Prefilling` is durable and carries this as
+    /// its progress — a request can sit here across many ticks before
+    /// [`Request::prefill_complete`] is true. Seeded to `shared_prefix_tokens`
+    /// when a sibling-prefix claim skips the shared head (core-07): those
+    /// tokens are already warm, so progress starts past them.
+    pub prefill_progress: u32,
+    /// Marked by [`crate::concrete::ConcreteScheduler::cancel`] (P3-01, ADR
+    /// 0018): cancel is abort, not suspend. A cancelled request is never
+    /// dealt another chunk or decode round — the next `advance()` releases
+    /// it via [`Request::abort`] before running its phases (whatever chunk
+    /// was already in flight has, by construction, already returned: compute
+    /// calls are synchronous, so there is nothing to interrupt).
+    pub cancelled: bool,
 }
 
 impl Request {
@@ -93,6 +108,8 @@ impl Request {
             gdn: GdnState::new(),
             prefix_entry: None,
             shared_prefix_tokens: 0,
+            prefill_progress: 0,
+            cancelled: false,
         }
     }
 
@@ -129,6 +146,30 @@ impl Request {
             return false;
         }
         self.state = next;
+        true
+    }
+
+    /// Whether this request has finished prefill: every prompt token has
+    /// been sent to the compute backend (P3-01, ADR 0018). `Prefilling` is
+    /// durable — a request may sit here across many `advance()` calls
+    /// (each sending at most one serving chunk) before this is true. Only a
+    /// complete request may be dealt a decode lane.
+    pub fn prefill_complete(&self) -> bool {
+        self.prefill_progress as usize >= self.input.tokens.len()
+    }
+
+    /// Abort the request regardless of its current lifecycle state (P3-01,
+    /// ADR 0018: cancel is abort, not suspend — there is no suspend/resume
+    /// primitive for a cancelled request). Unlike [`Request::advance`], this
+    /// is not gated by [`Request::valid_transition`]: cancellation is a
+    /// deliberate exit from the pipeline, not a pipeline step. Fails
+    /// (returns `false`) when the request is already `Done`.
+    pub fn abort(&mut self) -> bool {
+        if self.state == RequestState::Done {
+            return false;
+        }
+        self.state = RequestState::Done;
+        self.lane = None;
         true
     }
 
@@ -197,6 +238,10 @@ impl Request {
         // re-claim a live entry.
         self.prefix_entry = None;
         self.shared_prefix_tokens = 0;
+        // P3-01: the re-prefilled stream starts over at position 0 too —
+        // whatever chunk progress it had before eviction is gone with the
+        // KV it warmed.
+        self.prefill_progress = 0;
         true
     }
 

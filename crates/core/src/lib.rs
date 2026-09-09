@@ -56,7 +56,9 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use compute::{LayerKind, ModelConfig};
-pub use concrete::{ConcreteScheduler, SchedulerConfig};
+pub use concrete::{
+    ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, SchedulerConfig, resolve_serving_chunk_tokens,
+};
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
