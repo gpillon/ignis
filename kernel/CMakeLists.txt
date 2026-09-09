@@ -68,6 +68,12 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/l2norm.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/residual_add.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/rmsnorm.cu
+  # P3-03 (GitHub #99): the token sampler (temperature / top-k / top-p /
+  # presence+frequency penalties / counter-based RNG), dispatching between the
+  # single-block and multi-block (partial-topk + group-finalize) routes over
+  # the already-vendored sampling_workspace layout.
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/sampling.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/sampling.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/sigmoid_gate_mul.cu
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/silu_and_mul.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear/fp8/fp8_format.cpp

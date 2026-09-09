@@ -20,6 +20,7 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/sampling.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -52,6 +53,85 @@ float bf16_to_f32(std::uint16_t bits) {
   float value;
   std::memcpy(&value, &widened, sizeof(value));
   return value;
+}
+
+// P3-03 (GitHub #99): `sampling->size` must match what this leaf compiled
+// against (ADR 0016) -- checked wherever a caller-supplied
+// ignis_sampling_params is read.
+bool sampling_size_ok(const ignis_sampling_params &sampling) {
+  return sampling.size == sizeof(ignis_sampling_params);
+}
+
+// The ABI struct -> the vendored op's own config (P3-03, GitHub #99).
+// `greedy` nonzero forces the argmax branch regardless of `temperature`,
+// matching the doc comment on `ignis_sampling_params`. `min_p` is not one of
+// this ticket's six exposed parameters, so it stays disabled. `token_counts`
+// is the caller's per-sequence penalty-count row, or null where the call
+// site has no sequence state to penalize against (the degenerate G1 path
+// never reaches this helper at all -- it stays pure argmax).
+ninfer::ops::SamplingConfig to_sampling_config(const ignis_sampling_params &abi,
+                                               std::int32_t *token_counts) {
+  ninfer::ops::SamplingConfig cfg;
+  cfg.temperature = (abi.greedy != 0) ? 0.0f : abi.temperature;
+  cfg.top_k = abi.top_k;
+  cfg.top_p = abi.top_p;
+  cfg.min_p = 0.0f;
+  cfg.presence_penalty = abi.presence_penalty;
+  cfg.frequency_penalty = abi.frequency_penalty;
+  cfg.seed = abi.seed;
+  cfg.token_counts = token_counts;
+  return cfg;
+}
+
+// Samples one sequence's single-row logits (already computed into the
+// active scratch scope) through the vendored device-side sampler, using the
+// model's stable "single" staging buffers (model_internal.h) so this call's
+// config/position/output never alias another call's -- required by
+// `ninfer::ops::sample`'s own no-alias contract, not just tidiness. `position`
+// is the absolute logical position of the token this draw is the successor
+// of (the caller has not yet advanced `seq->position` past it). Returns 0
+// and fills `*out_token_id` on success, -1 (message set) on a kernel/copy
+// error.
+int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                      const ninfer::Tensor &logits, const ignis_sampling_params &sampling,
+                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id) {
+  const ninfer::ops::SamplingConfig cfg =
+      to_sampling_config(sampling, pool->token_counts_for(seq->slot));
+  cudaError_t err = cudaMemcpyAsync(model->sampling_single_configs->p, &cfg, sizeof(cfg),
+                                    cudaMemcpyHostToDevice, model->stream);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_program: cudaMemcpyAsync(sampling config) failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  err = cudaMemcpyAsync(model->sampling_single_positions->p, &position, sizeof(position),
+                        cudaMemcpyHostToDevice, model->stream);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_program: cudaMemcpyAsync(sampling position) failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  const ninfer::Tensor positions_tensor(model->sampling_single_positions->p, ninfer::DType::I32,
+                                        {1, 1, 1, 1});
+  ninfer::Tensor out_tensor(model->sampling_single_out->p, ninfer::DType::I32, {1, 1, 1, 1});
+  try {
+    ninfer::DeviceArena::Scope workspace_scope = model->sampling_workspace->scope();
+    ninfer::ops::sample(
+        logits, out_tensor, static_cast<std::int32_t>(model->vocab),
+        static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_single_configs->p),
+        positions_tensor, purpose, *model->sampling_workspace, model->stream);
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_program: sample() failed: ") + e.what());
+    return -1;
+  }
+  err = cudaMemcpyAsync(out_token_id, model->sampling_single_out->p, sizeof(*out_token_id),
+                        cudaMemcpyDeviceToHost, model->stream);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_program: cudaMemcpyAsync(sampled token) failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  return 0;
 }
 
 // Runs embedding -> final RMSNorm -> output head -> argmax for one token
@@ -139,6 +219,11 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
     set_error("ignis_step: null argument or empty batch");
     return false;
   }
+  if (!sampling_size_ok(*sampling)) {
+    set_error("ignis_step: unrecognized ignis_sampling_params size " +
+              std::to_string(sampling->size));
+    return false;
+  }
   if (sampling->greedy == 0) {
     set_error("ignis_step: only greedy sampling is supported (G1)");
     return false;
@@ -152,17 +237,20 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
 }
 
 // Runs embedding -> all decoder layers -> final norm -> output head ->
-// argmax for one token.  The two residual buffers stay in the outer scratch
-// scope while every layer takes (and releases) its own nested scope, so the
-// program never materializes an activation on the host. `out_logits`, if
-// non-null, receives this token's full vocab-length logits (GitHub #72
-// debug path -- the copy-back mirrors run_degenerate_step's above). `mode`
-// is the call's compute-policy mode (P2-03, GitHub #85): the layer steps
-// dispatch every NVFP4 projection under the policy `ignis_policy_for`
-// resolves for it.
+// device-side sample for one token.  The two residual buffers stay in the
+// outer scratch scope while every layer takes (and releases) its own nested
+// scope, so the program never materializes an activation on the host.
+// `out_logits`, if non-null, receives this token's full vocab-length logits
+// (GitHub #72 debug path -- the copy-back mirrors run_degenerate_step's
+// above). `mode` is the call's compute-policy mode (P2-03, GitHub #85): the
+// layer steps dispatch every NVFP4 projection under the policy
+// `ignis_policy_for` resolves for it. `sampling` (P3-03, GitHub #99) selects
+// how the successor is drawn from this token's logits; the logical position
+// fed to the sampler's RNG is `seq->position` (the caller advances it only
+// after this call returns).
 int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
-                          int32_t token_id, int32_t *out_token_id, float *out_logits,
-                          LinearPolicyMode mode) {
+                          int32_t token_id, const ignis_sampling_params &sampling,
+                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
@@ -206,13 +294,8 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                          normalized, model->stream);
     ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
     ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
-    ninfer::Tensor argmax_out = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
-    ninfer::ops::argmax(logits, argmax_out, vocab, model->stream);
-    err = cudaMemcpyAsync(out_token_id, argmax_out.data, sizeof(*out_token_id),
-                          cudaMemcpyDeviceToHost, model->stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program: cudaMemcpyAsync(argmax) failed: ") +
-                cudaGetErrorString(err));
+    if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
+                      static_cast<std::int32_t>(seq->position), out_token_id) != 0) {
       return -1;
     }
 
@@ -249,6 +332,73 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
   }
 }
 
+// P3-03 (GitHub #99): the decode-round forward half of run_program_token
+// above -- embedding -> all decoder layers -> final norm -> output head --
+// stopping short of sampling. Instead of drawing a token, it copies this
+// sequence's BF16 logits (device-to-device, before the scratch scope that
+// owns them exits) into `logits_column`, one lane's column of the decode
+// round's shared `[vocab, batch_size]` staging buffer
+// (`model->sampling_decode_logits`), so `ignis_program_decode` can sample
+// every lane in the round with one `ninfer::ops::sample` call instead of one
+// call per lane. Returns 0 on success, -1 on a kernel/copy error.
+int32_t run_program_token_forward_only(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
+                                       int32_t token_id, LinearPolicyMode mode,
+                                       void *logits_column) {
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto vocab = static_cast<std::int32_t>(model->vocab);
+  ninfer::DeviceArena::Scope scope = model->scratch->scope();
+  try {
+    ninfer::Tensor ids = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
+    cudaError_t err = cudaMemcpyAsync(ids.data, &token_id, sizeof(token_id),
+                                      cudaMemcpyHostToDevice, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(ids) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    ninfer::Tensor left = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::Tensor right = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
+
+    uint64_t dispatches = 0;
+    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
+          ? ignis_gqa_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode)
+          : ignis_gdn_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode);
+      if (rc != 0) {
+        const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
+            ? ignis_gqa_layer_last_error()
+            : ignis_gdn_layer_last_error();
+        set_error("ignis_program_decode: layer " + std::to_string(layer) + " failed: " + detail);
+        return -1;
+      }
+      std::swap(left, right);
+      ++dispatches;
+    }
+
+    ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
+                               {hidden, 1, 1, 1});
+    ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(left, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
+                         normalized, model->stream);
+    ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
+    ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
+    err = cudaMemcpyAsync(logits_column, logits.data,
+                          static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToDevice, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(logits column) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    model->last_step_kernel_count = dispatches;
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_program_decode: ") + e.what());
+    return -1;
+  }
+}
+
 bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
                       const ignis_seq *seq, const int32_t *tokens, uint64_t count,
                       const ignis_sampling_params *sampling) {
@@ -257,8 +407,9 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
     set_error("ignis_program: null argument or empty batch");
     return false;
   }
-  if (sampling->greedy == 0) {
-    set_error("ignis_program: only greedy sampling is supported (G1)");
+  if (!sampling_size_ok(*sampling)) {
+    set_error("ignis_program: unrecognized ignis_sampling_params size " +
+              std::to_string(sampling->size));
     return false;
   }
   return true;
@@ -278,8 +429,8 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
 // state when this returns -1.
 int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
-                          bool compute_output, int32_t *out_token_id, float *out_logits,
-                          LinearPolicyMode mode) {
+                          bool compute_output, const ignis_sampling_params &sampling,
+                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -336,13 +487,12 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                            normalized, model->stream);
       ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
       ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
-      ninfer::Tensor argmax_out = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
-      ninfer::ops::argmax(logits, argmax_out, vocab, model->stream);
-      err = cudaMemcpyAsync(out_token_id, argmax_out.data, sizeof(*out_token_id),
-                            cudaMemcpyDeviceToHost, model->stream);
-      if (err != cudaSuccess) {
-        set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(argmax) failed: ") +
-                  cudaGetErrorString(err));
+      // The absolute logical position of the span's last token in this
+      // chunk: `seq->position` is still the chunk's pre-advance frontier
+      // here (the caller advances it only after this function returns 0).
+      const auto last_position = static_cast<std::int32_t>(seq->position + T - 1);
+      if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
+                        last_position, out_token_id) != 0) {
         return -1;
       }
       if (out_logits != nullptr) {
@@ -408,7 +558,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 // the failing one.
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
-                                    float *out_logits, LinearPolicyMode mode) {
+                                    const ignis_sampling_params &sampling, float *out_logits,
+                                    LinearPolicyMode mode) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   uint64_t offset = 0;
   while (offset < num_tokens) {
@@ -417,7 +568,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, is_last_chunk,
-                          &successor, slot_logits, mode) != 0) {
+                          sampling, &successor, slot_logits, mode) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -542,7 +693,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       // needs (it decides the successor ignis_program_decode emits first) --
       // every earlier position stays argmax-only.
       float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
-      if (run_program_token(model, pool, seq, token_ids[i], &successor, slot_logits, mode) != 0) {
+      if (run_program_token(model, pool, seq, token_ids[i], *sampling, &successor, slot_logits,
+                            mode) != 0) {
         rc = -1;
         break;
       }
@@ -550,7 +702,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       ++seq->position;
     }
   } else {
-    rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, out_logits, mode);
+    rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
+                                     out_logits, mode);
   }
   if (rc != 0) {
     return rc;
@@ -561,46 +714,134 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   return 0;
 }
 
+// P3-03 (GitHub #99): one call over every decode-ready lane, each sampled
+// with its own `sampling[i]`. Every lane's forward pass runs first (still
+// one sequential per-sequence traversal each, `run_program_token_forward_only`
+// above -- this ticket does not fuse the layer bodies across sequences),
+// writing its logits into its own column of the round's shared
+// `[vocab, batch_size]` staging buffer; then one `ninfer::ops::sample` call
+// draws every lane's successor together. The round is atomic: no sequence's
+// `pending_token`/`position` advances unless every lane's forward pass and
+// the batched sample both succeed, so a mid-round failure never leaves one
+// lane's state ahead of another's.
 extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                                           struct ignis_seq_pool *pool,
                                           struct ignis_seq *const *sequences,
                                           uint64_t batch_size,
                                           const struct ignis_sampling_params *sampling,
                                           int32_t *out_token_ids) {
-  if (model == nullptr || pool == nullptr || sequences == nullptr || out_token_ids == nullptr ||
-      sampling == nullptr || batch_size == 0 || sampling->greedy == 0) {
-    set_error("ignis_program_decode: null argument, empty batch, or non-greedy sampling");
+  if (model == nullptr || pool == nullptr || sequences == nullptr || sampling == nullptr ||
+      out_token_ids == nullptr || batch_size == 0) {
+    set_error("ignis_program_decode: null argument or empty batch");
     return -1;
   }
-  const auto began = std::chrono::steady_clock::now();
-  uint64_t dispatches = 0;
-  for (uint64_t i = 0; i < batch_size; ++i) {
-    ignis_seq *seq = sequences[i];
-    if (seq == nullptr || seq->pending_token < 0) {
-      set_error("ignis_program_decode: sequence is null or was not prefilled");
-      return -1;
-    }
-    if (seq->position >= seq->kv.mapped_token_capacity()) {
-      set_error("ignis_program_decode: sequence reached its KV capacity");
-      return -1;
-    }
-    const int32_t emitted = seq->pending_token;
-    int32_t successor = -1;
-    // P2-03 (GitHub #85): decode takes the engine's own compute-policy mode
-    // (ADR 0016: the flat decode ABI has no options struct, so the
-    // `A16_ONLY` override is reachable only through the prefill entry
-    // point) -- every NVFP4 projection in the decode round runs under
-    // AllowA4, the reference's text-model policy, and the route the
-    // vendored dispatch takes per its own token thresholds.
-    if (run_program_token(model, pool, seq, emitted, &successor, nullptr,
-                          LinearPolicyMode::kEngineDefault) != 0) {
-      return -1;
-    }
-    out_token_ids[i] = emitted;
-    seq->pending_token = successor;
-    ++seq->position;
-    dispatches += model->last_step_kernel_count;
+  if (batch_size > IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_program_decode: batch_size " + std::to_string(batch_size) +
+              " exceeds IGNIS_DECODE_MAX_BATCH (" + std::to_string(IGNIS_DECODE_MAX_BATCH) + ")");
+    return -1;
   }
+  for (uint64_t i = 0; i < batch_size; ++i) {
+    if (!sampling_size_ok(sampling[i])) {
+      set_error("ignis_program_decode: unrecognized ignis_sampling_params size " +
+                std::to_string(sampling[i].size) + " at index " + std::to_string(i));
+      return -1;
+    }
+  }
+
+  const auto began = std::chrono::steady_clock::now();
+  const auto vocab = static_cast<std::int32_t>(model->vocab);
+  const auto batch = static_cast<std::int32_t>(batch_size);
+  uint64_t dispatches = 0;
+  std::vector<int32_t> emitted(batch_size, -1);
+  std::vector<std::int32_t> positions(batch_size, 0);
+  std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
+
+  try {
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      ignis_seq *seq = sequences[i];
+      if (seq == nullptr || seq->pending_token < 0) {
+        set_error("ignis_program_decode: sequence is null or was not prefilled");
+        return -1;
+      }
+      if (seq->position >= seq->kv.mapped_token_capacity()) {
+        set_error("ignis_program_decode: sequence reached its KV capacity");
+        return -1;
+      }
+      emitted[i] = seq->pending_token;
+      positions[i] = static_cast<std::int32_t>(seq->position);
+      configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
+      void *column = static_cast<std::uint8_t *>(model->sampling_decode_logits->p) +
+          i * static_cast<std::size_t>(vocab) * sizeof(std::uint16_t);
+      // P2-03 (GitHub #85): decode takes the engine's own compute-policy mode
+      // (ADR 0016: the flat decode ABI has no options struct, so the
+      // `A16_ONLY` override is reachable only through the prefill entry
+      // point) -- every NVFP4 projection in the decode round runs under
+      // AllowA4, the reference's text-model policy.
+      if (run_program_token_forward_only(model, pool, seq, emitted[i],
+                                         LinearPolicyMode::kEngineDefault, column) != 0) {
+        return -1;
+      }
+      dispatches += model->last_step_kernel_count;
+    }
+
+    cudaError_t err =
+        cudaMemcpyAsync(model->sampling_decode_configs->p, configs.data(),
+                        batch_size * sizeof(ninfer::ops::SamplingConfig), cudaMemcpyHostToDevice,
+                        model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(sampling configs) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    err = cudaMemcpyAsync(model->sampling_decode_positions->p, positions.data(),
+                          batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          model->stream);
+    if (err != cudaSuccess) {
+      set_error(
+          std::string("ignis_program_decode: cudaMemcpyAsync(sampling positions) failed: ") +
+          cudaGetErrorString(err));
+      return -1;
+    }
+
+    const ninfer::Tensor logits_tensor(model->sampling_decode_logits->p, ninfer::DType::BF16,
+                                       {vocab, batch, 1, 1});
+    ninfer::Tensor out_tensor(model->sampling_decode_out->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    const ninfer::Tensor positions_tensor(model->sampling_decode_positions->p, ninfer::DType::I32,
+                                          {batch, 1, 1, 1});
+    {
+      ninfer::DeviceArena::Scope workspace_scope = model->sampling_workspace->scope();
+      ninfer::ops::sample(
+          logits_tensor, out_tensor, vocab,
+          static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
+          positions_tensor, ninfer::ops::kSamplePurposeDecode, *model->sampling_workspace,
+          model->stream);
+    }
+
+    std::vector<int32_t> successors(batch_size, -1);
+    err = cudaMemcpyAsync(successors.data(), model->sampling_decode_out->p,
+                          batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(sampled tokens) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    err = cudaStreamSynchronize(model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaStreamSynchronize failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      out_token_ids[i] = emitted[i];
+      sequences[i]->pending_token = successors[i];
+      ++sequences[i]->position;
+    }
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_program_decode: ") + e.what());
+    return -1;
+  }
+
   model->last_step_kernel_count = dispatches;
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -614,8 +855,16 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model == nullptr || pool == nullptr || out_stats == nullptr) {
     return -1;
   }
-  out_stats->vram_bytes = model->vram_bytes + model->scratch->capacity() +
-                          pool->kv_arena.capacity() + pool->gdn_arena.capacity();
+  // P3-03 (GitHub #99): the sampling staging buffers and per-slot penalty
+  // counts are real device allocations too, small as they are next to the
+  // weights and KV/GDN pools -- "VRAM reported" means all of it.
+  out_stats->vram_bytes =
+      model->vram_bytes + model->scratch->capacity() + pool->kv_arena.capacity() +
+      pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
+      model->sampling_single_configs->bytes + model->sampling_single_positions->bytes +
+      model->sampling_single_out->bytes + model->sampling_decode_configs->bytes +
+      model->sampling_decode_positions->bytes + model->sampling_decode_out->bytes +
+      model->sampling_decode_logits->bytes + model->sampling_workspace->capacity();
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   return 0;

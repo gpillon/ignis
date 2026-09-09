@@ -22,10 +22,21 @@ mod ffi {
     use crate::model_load::ffi::IgnisModel;
     use crate::seq::ffi::{IgnisSeq, IgnisSeqPool};
 
-    /// 1:1 with `struct ignis_sampling_params`.
+    /// 1:1 with `struct ignis_sampling_params` (ADR 0016's size-prefixed
+    /// options struct, P3-03, GitHub #99). `size` must be
+    /// `sizeof(struct ignis_sampling_params)`; the leaf rejects a size it
+    /// does not recognize.
     #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
     pub struct IgnisSamplingParams {
+        pub size: u32,
         pub greedy: i32,
+        pub temperature: f32,
+        pub top_k: i32,
+        pub top_p: f32,
+        pub presence_penalty: f32,
+        pub frequency_penalty: f32,
+        pub seed: u64,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -112,9 +123,64 @@ mod ffi {
     }
 }
 
-/// Greedy sampling (G1) -- the only supported mode until G3 adds
-/// temperature / top-p / top-k / penalties / seed.
-const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams { greedy: 1 };
+/// Greedy sampling: bit-identical to argmax by the vendored sampler's own
+/// contract (P3-03, GitHub #99), regardless of the (unread) fields below.
+const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams {
+    size: std::mem::size_of::<ffi::IgnisSamplingParams>() as u32,
+    greedy: 1,
+    temperature: 0.0,
+    top_k: 0,
+    top_p: 1.0,
+    presence_penalty: 0.0,
+    frequency_penalty: 0.0,
+    seed: 0,
+};
+
+/// A sequence's real sampling parameters for one program-layer call (P3-03,
+/// GitHub #99) -- temperature, top-k (an ignis extension over the
+/// OpenAI-compatible surface), top-p, presence/frequency penalties and a
+/// seed. `top_k <= 0` or `>= 20` keeps the vendored sampler's own top-20
+/// cap; `top_p >= 1.0` disables it. RNG is counter-based (keyed by `seed`
+/// and the sequence's own logical position, not by which lane of a decode
+/// round it occupies), so what a sequence generates depends only on its own
+/// seed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub seed: u64,
+}
+
+impl SamplingParams {
+    /// `temperature <= 0` selects the leaf's greedy (argmax) branch, so
+    /// every other field here is unread.
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            seed: 0,
+        }
+    }
+
+    fn to_ffi(self) -> ffi::IgnisSamplingParams {
+        ffi::IgnisSamplingParams {
+            size: std::mem::size_of::<ffi::IgnisSamplingParams>() as u32,
+            greedy: 0,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            seed: self.seed,
+        }
+    }
+}
 
 /// Device footprint and most-recent-step telemetry from the real program.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -296,6 +362,43 @@ pub fn prefill_program(
     Ok(())
 }
 
+/// [`prefill_program`], with real sampling parameters (P3-03, GitHub #99)
+/// instead of the hardcoded greedy default: the span's last position's
+/// successor -- what [`decode_program_batch_sampled`] will first emit for
+/// this sequence -- is drawn under `sampling` instead of forced to argmax.
+pub fn prefill_program_sampled(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let params = sampling.to_ffi();
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            std::ptr::null(),
+            logits_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// [`prefill_program`], with the route selectable (ADR 0016, P2-02, GitHub
 /// #84). Test-only entry point: [`PrefillRoute::PerToken`] exists so the
 /// chunked route has a self-oracle (the same prompt prefilled both ways
@@ -370,6 +473,10 @@ pub fn decode_program_batch(
     sequences: &mut [&mut Seq<'_>],
 ) -> Result<Vec<i32>, String> {
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    // ignis_program_decode reads one ignis_sampling_params per sequence
+    // (P3-03, GitHub #99) -- an array parallel to `handles`, not one shared
+    // struct.
+    let params = vec![GREEDY; handles.len()];
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -377,7 +484,44 @@ pub fn decode_program_batch(
             pool.handle(),
             handles.as_mut_ptr(),
             handles.len() as u64,
-            &GREEDY,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(tokens)
+}
+
+/// [`decode_program_batch`], with one real [`SamplingParams`] per sequence
+/// (P3-03, GitHub #99): `sampling[i]` draws sequence `i`'s successor, so
+/// lanes sharing this round may carry independent temperatures, seeds and
+/// penalty histories. `sampling.len()` must equal `sequences.len()` and must
+/// not exceed the leaf's `IGNIS_DECODE_MAX_BATCH` (8, `ignis_step.h`).
+pub fn decode_program_batch_sampled(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    sampling: &[SamplingParams],
+) -> Result<Vec<i32>, String> {
+    if sampling.len() != sequences.len() {
+        return Err(format!(
+            "decode_program_batch_sampled: {} sampling params for {} sequences",
+            sampling.len(),
+            sequences.len()
+        ));
+    }
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    let params: Vec<ffi::IgnisSamplingParams> = sampling.iter().map(|p| p.to_ffi()).collect();
+    let mut tokens = vec![-1; handles.len()];
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
             tokens.as_mut_ptr(),
         )
     };

@@ -22,6 +22,27 @@
  * `ignis_model_load`'s prefill-chunk-wide traversals; its per-token route
  * is the original per-token loop, retained test-only as a self-oracle.
  *
+ * `ignis_sampling_params` grew real sampling (P3-03, GitHub #99): the
+ * size-prefixed struct (ADR 0016) now carries temperature, top-k, top-p,
+ * presence/frequency penalties and a seed alongside the original `greedy`
+ * flag. Device-side sampling (`ninfer::ops::sample`, vendored per ADR 0010)
+ * replaces `ninfer::ops::argmax` everywhere a token is chosen: greedy
+ * (`greedy` nonzero, or `temperature <= 0`) is bit-identical to argmax by
+ * that op's own contract, so this is not a behavior change for any existing
+ * caller. `ignis_program_decode` takes one `ignis_sampling_params` per
+ * sequence (an array parallel to `sequences`, capped at
+ * `IGNIS_DECODE_MAX_BATCH`) because lanes sharing a decode round carry
+ * independent temperatures, seeds and penalty histories; the other three
+ * entry points keep a single sampling pointer (one sequence, or -- for
+ * `ignis_prefill`/`ignis_decode` -- one degenerate step at a time). RNG is
+ * counter-based (keyed by `seed` and the sequence's own position, not by
+ * batch row), so a sequence's output depends only on its own seed, never on
+ * which lanes shared its round. Presence/frequency penalties read and
+ * update a per-sequence, per-vocab-entry count buffer that lives in the
+ * sequence handle's pool slot (`kernel/include/ignis_seq_internal.h`) --
+ * there is no separate persistent RNG state to carry, since the counter-based
+ * generator needs none.
+ *
  * Rust bindings: crates/core/src/step.rs (keep 1:1).
  */
 #ifndef IGNIS_STEP_H
@@ -36,11 +57,40 @@
 extern "C" {
 #endif
 
-/* Sampling parameters (greedy only, G1; temperature / top-p / top-k /
- * penalties / seed are G3). */
+/* Sampling parameters (ADR 0016's size-prefixed options struct; P3-03,
+ * GitHub #99). `size` must be `sizeof(struct ignis_sampling_params)` -- the
+ * leaf rejects a size it does not recognize, same rule as
+ * `ignis_prefill_options`.
+ *
+ * `greedy` nonzero or `temperature <= 0` both select argmax (bit-identical
+ * to G1's `ninfer::ops::argmax`, per the vendored sampler's own contract);
+ * every other field is then unread. Otherwise: `top_k` <= 0 or > 19 keeps
+ * the sampler's own top-20 cap; `top_p` disables at >= 1; `presence_penalty`
+ * / `frequency_penalty` read this sequence's per-vocab-entry occurrence
+ * count (zero when the leaf has no penalty state for the call, e.g. the
+ * degenerate G1 entry points); `seed` plus the sequence's own logical
+ * position key the counter-based RNG draw, independent of which other
+ * sequences share the round or their arrival order. `min_p` is not
+ * exposed at this ABI (disabled) -- not one of this ticket's six
+ * parameters. */
 struct ignis_sampling_params {
-  int32_t greedy; /* nonzero: argmax (the only supported mode today) */
+  uint32_t size;    /* sizeof(struct ignis_sampling_params) */
+  int32_t greedy;   /* nonzero: argmax, ignoring every field below */
+  float temperature;
+  int32_t top_k;    /* an ignis extension over the OpenAI-compatible surface */
+  float top_p;
+  float presence_penalty;
+  float frequency_penalty;
+  uint64_t seed;
 };
+
+/* The largest `batch_size` `ignis_program_decode` accepts: the decode
+ * round's sampling parameters and logical positions are staged in
+ * model-owned device buffers at stable addresses (so a future decode CUDA
+ * graph, P3-05/#102, can replay reading them), sized once at model load for
+ * this many lanes -- matching the engine's own N=8 resident decode-lane
+ * concurrency and the decode graphs' exact widths 1..8. */
+#define IGNIS_DECODE_MAX_BATCH 8
 
 /* Which internal path ignis_program_prefill takes over a span's chunks
  * (ADR 0016, P2-02, GitHub #84). Chunked is the production route: the leaf
@@ -146,9 +196,16 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
                               const struct ignis_prefill_options *options,
                               float *out_logits);
 
-/* Complete one greedy decode round for a batch of sequence handles.  Each
- * output is the successor made ready by prefill/the prior round; that token
- * is consumed before return to make the next successor ready. */
+/* Complete one decode round for a batch of sequence handles.  Each output is
+ * the successor made ready by prefill/the prior round; that token is
+ * consumed before return to make the next successor ready.
+ *
+ * `sampling` is an array of `batch_size` entries parallel to `sequences`
+ * (P3-03, GitHub #99): sequence `i` is sampled with `sampling[i]`, so lanes
+ * sharing this round may carry independent temperatures, seeds and penalty
+ * histories. `batch_size` must not exceed `IGNIS_DECODE_MAX_BATCH`. Returns
+ * -1 (see ignis_step_last_error) on a null argument, an oversized batch, or
+ * an unrecognized `sampling[i].size`. */
 int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *pool,
                              struct ignis_seq *const *sequences, uint64_t batch_size,
                              const struct ignis_sampling_params *sampling,

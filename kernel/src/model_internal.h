@@ -78,4 +78,35 @@ struct ignis_model {
   // for at load (P2-01, GitHub #83). The chunked prefill route cuts a span
   // into chunks of this width; the last chunk of a span may be narrower.
   uint32_t prefill_chunk_tokens = 0;
+
+  // P3-03 (GitHub #99): device-side sampling's staging buffers. Separate
+  // from `scratch` above (which resets every call) because a decode round's
+  // configs/positions must sit at addresses a future decode CUDA graph
+  // (P3-05/#102) can replay reading -- the host writes this round's values
+  // into these same buffers every call, it never reallocates them.
+  // `sampling_single_configs`/`sampling_single_positions` back the
+  // one-sequence-at-a-time calls (`ignis_prefill`, `ignis_decode`'s
+  // per-degenerate-step loop, `ignis_program_prefill`);
+  // `sampling_decode_configs`/`sampling_decode_positions` are sized for
+  // `IGNIS_DECODE_MAX_BATCH` lanes and back `ignis_program_decode`.
+  // `sampling_workspace` is `ninfer::ops::sample`'s own transient scratch
+  // (candidate selection, not the caller's inputs above), sized once for the
+  // widest lane count and reset via its own Scope every call -- it carries
+  // no cross-call state, so it does not need a stable address.
+  // `*_out` are the device I32 destinations `ninfer::ops::sample` writes
+  // picked ids into -- distinct buffers from `*_positions` above (the op's
+  // contract forbids `out` aliasing `logical_positions`).
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_single_configs;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_single_positions;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_single_out;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_configs;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_positions;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_out;
+  // The decode round's batched logits: BF16 [vocab, IGNIS_DECODE_MAX_BATCH]
+  // -- lane i's forward pass copies its own single-token logits into column
+  // i (device-to-device, still inside its own scratch scope) so the round's
+  // sampling is one `ninfer::ops::sample` call over every lane, not one call
+  // per lane.
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_logits;
+  std::unique_ptr<ninfer::DeviceArena> sampling_workspace;
 };

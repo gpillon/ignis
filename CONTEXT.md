@@ -75,8 +75,12 @@ When output names a domain concept, use the term as defined here.
 ## Sequence state
 
 - **Sequence handle** — the leaf-owned, opaque per-sequence object created by
-  the step ABI: its KV pages, its GDN slot, its conv taps, its position and its
-  last token. It is what a snapshot captures and a restore rebuilds.
+  the step ABI: its KV pages, its GDN slot, its conv taps, its position, its
+  last token, and (P3-03) its penalty-count row. It is what a snapshot
+  captures and a restore rebuilds. No RNG state is one of its sections: the
+  device-side sampler's RNG is counter-based (keyed by seed, position and
+  purpose), so nothing but the handle's own position needs to be carried for
+  it.
 - **KV page** — a fixed-size device page of the paged KV cache, addressed
   through a per-sequence block table. Page geometry is reported by the runtime
   and is what the scheduler's KV pool counts.
@@ -84,6 +88,11 @@ When output names a domain concept, use the term as defined here.
   value heads × 128 × 128 fp32** (all 48 GDN layers ≈ 144 MiB per sequence),
   drawn from a slot pool sized by the concurrency.
 - **Conv taps** — the per-sequence causal-conv1d history of a GDN layer.
+- **Penalty-count row** — a sequence's per-vocab-entry occurrence count
+  (one int32 per vocab entry), drawn from a slot-indexed device buffer the
+  same shape as the KV/GDN pools (one row per slot). Device-side sampling's
+  presence/frequency penalties read and atomically update it; zeroed at
+  `ignis_seq_alloc` like every other slot section.
 - **KV-RAM** — the host-RAM KV cache tier: snapshots GPU lanes so sibling requests
   restore instead of re-prefilling; two-tier eviction (probation → protected).
 - **Prefix reuse** — concurrent requests sharing a prefix skip the redundant prefill.

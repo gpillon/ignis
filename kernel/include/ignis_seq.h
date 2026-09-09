@@ -16,8 +16,10 @@
  * then draw from and return to that fixed pool -- no device allocation on
  * the request path.
  *
- * A freshly allocated sequence's KV pages and GDN slot (recurrent state +
- * conv taps) are zeroed before the handle is returned, so a released and
+ * A freshly allocated sequence's KV pages, GDN slot (recurrent state + conv
+ * taps) and penalty-count buffer (P3-03, GitHub #99: one int32 per vocab
+ * entry, read and updated by device-side sampling's presence/frequency
+ * penalties) are zeroed before the handle is returned, so a released and
  * re-allocated sequence never observes another request's state.
  *
  * Snapshot / restore entry points are declared now (the KV-RAM host tier,
@@ -73,6 +75,10 @@ struct ignis_seq_pool_spec {
   uint32_t gdn_conv_channels;
   uint32_t gdn_value_heads;
   uint32_t gdn_head_dim;
+  /* The model's vocabulary size (P3-03, GitHub #99): sizes each slot's
+   * presence/frequency penalty count buffer (one int32 per vocab entry).
+   * Must match the model the pool's sequences are stepped with. */
+  uint32_t vocab;
 };
 
 struct ignis_seq_pool_stats {
