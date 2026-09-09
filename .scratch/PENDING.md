@@ -56,6 +56,15 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   owner-triggered action, not something an autonomous agent does). Run
   `scripts/gpu-profile.ps1` against this branch before closing #80. Owner:
   repo owner. Blocker: GPU exclusivity (ADR 0006).
+  **Update 2026-09-09:** `scripts/gpu-profile.ps1` (kernel op-tests +
+  `cargo test --workspace --features cuda -- --ignored` under
+  `IGNIS_GPU_PROFILE=1`) was run against this branch on a free GPU and
+  passed clean, 0 failures — confirms no GPU-gated-test regression from
+  the logging queue/shutdown-flush changes. This is **not** the G4
+  acceptance criterion itself (the `ignis-bench gate` trace-replay
+  throughput run, see the "99% performance gate" entry below) — that
+  instrument has no runnable baseline in this repo yet and remains
+  blocked behind G1→G2→G3→G4, unchanged by this run.
 
 - **GitHub #81's G4 gate run is outstanding.** Issue #81 (structured logging
   Phase 4: internal request-tracing spans, `request.id` as `trace_id`, ADR
@@ -81,6 +90,14 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   ADR 0006 — stopping it is a manual, owner-triggered action). Run
   `scripts/gpu-profile.ps1` against this branch before closing #81. Owner:
   repo owner. Blocker: GPU exclusivity (ADR 0006).
+  **Update 2026-09-09:** `scripts/gpu-profile.ps1` was run against this
+  branch (which includes both #80's and #81's changes) on a free GPU and
+  passed clean, 0 failures, including a live TTFT run against
+  `ignis-server` — confirms no GPU-gated-test regression from the span
+  instrumentation. This is **not** the G4 acceptance criterion itself
+  (the `ignis-bench gate` trace-replay throughput run); that instrument
+  has no runnable baseline in this repo yet and remains blocked behind
+  G1→G2→G3→G4, unchanged by this run.
 
 - **The 99% performance gate (ADR 0007; GitHub #20 / #24, bench specs 02/03).**
   Parked behind **G4**, not open work — the roadmap folds #20 / #24 into the
