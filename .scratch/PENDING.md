@@ -57,6 +57,31 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   `scripts/gpu-profile.ps1` against this branch before closing #80. Owner:
   repo owner. Blocker: GPU exclusivity (ADR 0006).
 
+- **GitHub #81's G4 gate run is outstanding.** Issue #81 (structured logging
+  Phase 4: internal request-tracing spans, `request.id` as `trace_id`, ADR
+  0012) wired the `ignis.admission`/`ignis.prefill`/`ignis.decode.round`/
+  `ignis.completion` span tree into the live `crates/core` scheduler
+  (`concrete.rs`) plus `tower-http`'s `TraceLayer` as the HTTP-ingress root
+  span (`crates/server/src/api.rs`) — all non-GPU work, done and tested
+  (`cargo test --workspace` green; `crates/core/tests/tracing_spans.rs` and
+  `crates/server/tests/tracing_root_span.rs` cover trace_id propagation and
+  round-not-token span granularity). A careful manual read of every span's
+  open/close point (documented in `docs/design/tracing-spans.md`) confirms
+  each one sits in code that already runs once per request per prefill
+  chunk / decode round (an existing per-request bookkeeping loop, not the
+  batched `Compute::prefill_step`/`decode_step` call itself, and never
+  inside a per-token loop — there is no per-token loop in Rust to begin
+  with; the leaf is device-resident, ADR 0009). What is **not** done: the
+  acceptance criterion's own re-run of `ignis-bench gate` (G4, ≥99% of
+  reference performance) with this span instrumentation wired into the live
+  prefill/decode path, per the issue's explicit "GPU test" note and Phase
+  3's standing rule that any hot-path-adjacent change needs the performance
+  gate, not just a design argument. This was deliberately not run by the
+  implementing agent (GPU is a shared resource with the owner's own ninfer,
+  ADR 0006 — stopping it is a manual, owner-triggered action). Run
+  `scripts/gpu-profile.ps1` against this branch before closing #81. Owner:
+  repo owner. Blocker: GPU exclusivity (ADR 0006).
+
 - **The 99% performance gate (ADR 0007; GitHub #20 / #24, bench specs 02/03).**
   Parked behind **G4**, not open work — the roadmap folds #20 / #24 into the
   G4 master (#65); the trace-replay gate needs the hq-e8-2b profile on both

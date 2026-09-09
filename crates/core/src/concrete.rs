@@ -72,6 +72,34 @@
 //! evicting a retained lane to the host tier, and a request whose KV
 //! reservation exceeds the whole pool is rejected with
 //! [`SubmitError::Oversized`].
+//!
+//! **Request-lifecycle spans (GitHub #81, ADR 0012)** — the full hierarchy
+//! is documented once in `docs/design/tracing-spans.md`; this crate's own
+//! piece is four `tracing` spans, each tagged `request_id = <RequestId>`
+//! (the field `ignis_logging::trace_context` reads to derive `trace_id`,
+//! never a separately generated id):
+//!
+//! - `ignis.admission` — [`Self::try_admit`], the lane-deal decision.
+//! - `ignis.prefill` — the per-request accounting for one
+//!   `Compute::prefill_step` call (the chunked-prefill call boundary,
+//!   opened after the call returns, in the loop that already exists to
+//!   record each job's progress — never around the call itself, which may
+//!   batch several *different* requests' jobs together and so has no
+//!   single `request_id` of its own).
+//! - `ignis.decode.round` — the per-request accounting for one
+//!   `Compute::decode_step` call (one span per request *per round*, opened
+//!   in the existing per-lane outcome loop — same reasoning as prefill:
+//!   the call itself may be a batch across lanes). This is the unit a
+//!   decode CUDA graph is captured over; nothing finer is ever
+//!   instrumented here (never per-token, never per-verified-token once MTP
+//!   verify lands — see the design doc for that attach point).
+//! - `ignis.completion` — [`Self::mark_done`].
+//!
+//! All four are opened and dropped on the model thread (GitHub #69), never
+//! entered from — and never a tracing-parent of — the HTTP-ingress root
+//! span `ignis-server` opens per request (a different OS thread); the two
+//! sides are correlated by sharing the same `request_id`/`trace_id`, not by
+//! `tracing`'s own parent-child span graph. See the design doc for why.
 
 use std::sync::Arc;
 
@@ -401,6 +429,11 @@ impl ConcreteScheduler {
             None => return false,
         };
         let request_id = self.requests[idx].id;
+        // GitHub #81 / ADR 0012: the admission-decision span — entry/exit
+        // of the state machine's lane deal for this one request, tagged
+        // with its own `request_id` (the field `trace_id` is derived
+        // from).
+        let _span = tracing::info_span!("ignis.admission", request_id).entered();
         if !self.requests[idx].assign_lane(lane) {
             // Not in `Prefilling` (a bug: the machine only deals
             // `Prefilling` requests) — give the lane back, deal nothing.
@@ -615,6 +648,10 @@ impl ConcreteScheduler {
     /// `reason` is why it stopped — carried into the emitted
     /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
     fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>, reason: FinishReason) {
+        // GitHub #81 / ADR 0012: the completion span — the last stage in
+        // this request's lifecycle, tagged with its own `request_id`.
+        let request_id = self.requests[idx].id;
+        let _span = tracing::info_span!("ignis.completion", request_id).entered();
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -1086,6 +1123,20 @@ impl Scheduler for ConcreteScheduler {
             match self.compute.prefill_step(&jobs) {
                 Ok(()) => {
                     for (&i, job) in batch.iter().zip(&jobs) {
+                        // GitHub #81 / ADR 0012: the prefill span — one per
+                        // request per `prefill_step` call (the chunked-
+                        // prefill call boundary), opened here rather than
+                        // around the call above, since one call may batch
+                        // several different requests' jobs together and so
+                        // has no single `request_id` of its own.
+                        let request_id = self.requests[i].id;
+                        let _span = tracing::info_span!(
+                            "ignis.prefill",
+                            request_id,
+                            chunk_tokens = job.tokens.len() as u64,
+                            start_position = job.start_position,
+                        )
+                        .entered();
                         let r = &mut self.requests[i];
                         if r.state == RequestState::Admitted {
                             r.advance(RequestState::Prefilling);
@@ -1187,6 +1238,24 @@ impl Scheduler for ConcreteScheduler {
             match self.compute.decode_step(&jobs) {
                 Ok(results) => {
                     for (&i, res) in to_decode.iter().zip(&results) {
+                        // GitHub #81 / ADR 0012: the decode-round span —
+                        // one per request per `decode_step` call (the unit
+                        // a decode CUDA graph is captured over), opened
+                        // here rather than around the call above, since one
+                        // call spans every running lane and so has no
+                        // single `request_id` of its own. `round = self.tick`
+                        // is this `advance()` call's own tick counter — a
+                        // stable, monotonic round number. Never subdivided
+                        // further: a future MTP verify step attaches its
+                        // own child span here, still one per request per
+                        // round, never per verified token.
+                        let request_id = self.requests[i].id;
+                        let _span = tracing::info_span!(
+                            "ignis.decode.round",
+                            request_id,
+                            round = self.tick,
+                        )
+                        .entered();
                         match res {
                             DecodeOutcome::Token(token) => {
                                 self.requests[i].tokens += 1;

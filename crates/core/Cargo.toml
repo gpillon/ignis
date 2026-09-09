@@ -6,6 +6,14 @@ edition.workspace = true
 
 [dependencies]
 ignis-artifact = { path = "../artifact" }
+# Request-lifecycle span tree (GitHub #81, ADR 0012): admission / prefill /
+# decode-round / completion spans, all keyed by `request_id`. No call site
+# here decides how spans are rendered or where they go — that stays
+# `ignis-logging`'s job (this crate has no dependency on it).
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [features]
 # Forwards to the artifact crate's `cuda` feature (the VRAM materialization

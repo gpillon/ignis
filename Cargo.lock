@@ -640,6 +640,8 @@ name = "ignis-core"
 version = "0.1.0"
 dependencies = [
  "ignis-artifact",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -681,6 +683,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1508,6 +1511,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

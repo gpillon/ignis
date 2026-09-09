@@ -383,7 +383,16 @@ impl Telemetry {
     /// (`ignis-logging`) instead of this module's own JSONL shape. The
     /// per-tick `emit_interval` above is untouched: those counters are
     /// metrics-shaped (GitHub #77), not logs, and stay on `TelemetrySink`.
+    ///
+    /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
+    /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
+    /// or any of `ignis-core`'s model-thread spans — a genuinely separate
+    /// execution context, so it opens its own short span carrying
+    /// `request_id` rather than relying on inherited span context that
+    /// does not reach here. That gives these three events the same
+    /// `trace_id` as the rest of the request's lifecycle.
     fn emit_request(&mut self, id: RequestId, event: &'static str, ms: u64, n: u32, tok_s: f64) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         match event {
             "admitted" => tracing::info!(
                 name: "ignis.request.admitted",

@@ -81,11 +81,29 @@ pub struct LogRecord {
     pub service_name: &'static str,
     #[serde(rename = "service.version")]
     pub service_version: &'static str,
+    /// The OTel `trace_id` (GitHub #81, ADR 0012: the request's own
+    /// `RequestId`, never a fabricated identifier) — omitted from the
+    /// serialized record entirely (not `null`) when no active trace context
+    /// exists (spec §19).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// The OTel `span_id`: the innermost active span's own id. Always
+    /// present exactly when `trace_id` is (see `crate::trace_context`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
 }
 
 impl LogRecord {
-    /// Build a record from a live `tracing::Event`, timestamped `now`.
-    pub fn from_event(event: &Event<'_>, now: SystemTime) -> Self {
+    /// Build a record from a live `tracing::Event`, timestamped `now`, with
+    /// the `(trace_id, span_id)` pair the caller already resolved from the
+    /// event's active span scope (`crate::trace_context::resolve` — this
+    /// module never inspects spans itself, only the event's own fields).
+    pub fn from_event(
+        event: &Event<'_>,
+        now: SystemTime,
+        trace_id: Option<String>,
+        span_id: Option<String>,
+    ) -> Self {
         let meta = event.metadata();
         let level = *meta.level();
         let mut visitor = RecordVisitor::default();
@@ -99,6 +117,8 @@ impl LogRecord {
             attributes: visitor.attributes,
             service_name: SERVICE_NAME,
             service_version: SERVICE_VERSION,
+            trace_id,
+            span_id,
         }
     }
 }
@@ -269,10 +289,36 @@ mod tests {
             attributes: BTreeMap::new(),
             service_name: SERVICE_NAME,
             service_version: SERVICE_VERSION,
+            trace_id: None,
+            span_id: None,
         };
         let json = serde_json::to_value(&record).expect("serializes");
         assert_eq!(json["service.name"], "ignis");
         assert_eq!(json["service.version"], SERVICE_VERSION);
+    }
+
+    /// spec §19: an event outside an active trace context must have
+    /// `trace_id`/`span_id` genuinely absent from the serialized record —
+    /// not present as `null` — so a consumer's "does this field exist"
+    /// check (not "is this field non-null") is the correct test.
+    #[test]
+    fn absent_trace_context_omits_the_fields_entirely_not_as_null() {
+        let record = LogRecord {
+            timestamp: format_rfc3339(UNIX_EPOCH),
+            severity_text: "INFO",
+            severity_number: 9,
+            event_name: "ignis.test.no_trace".to_owned(),
+            body: "x".to_owned(),
+            attributes: BTreeMap::new(),
+            service_name: SERVICE_NAME,
+            service_version: SERVICE_VERSION,
+            trace_id: None,
+            span_id: None,
+        };
+        let json = serde_json::to_value(&record).expect("serializes");
+        let obj = json.as_object().expect("object");
+        assert!(!obj.contains_key("trace_id"), "{json}");
+        assert!(!obj.contains_key("span_id"), "{json}");
     }
 
     #[test]

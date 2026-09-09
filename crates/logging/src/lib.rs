@@ -34,6 +34,7 @@ pub mod pretty_layer;
 pub mod queue;
 pub mod record;
 pub mod sink;
+pub mod trace_context;
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -89,7 +90,12 @@ fn build_subscriber(
         // terminal" rather than on the format choice itself. This function
         // stays pure: no second, real `is_terminal()` probe here.
         LogFormat::Pretty => {
-            PrettyLayer::new(sink, config.color).with_filter(level_filter).boxed()
+            // GitHub #81: reuse `IGNIS_LOG_LEVEL` as the "verbose" signal
+            // spec §19 allows for a pretty debug mode showing trace/span
+            // ids, rather than adding a second config surface — `Debug`/
+            // `Trace` show them, `Info`/`Warn`/`Error` (the default) don't.
+            let show_trace = config.level <= LogLevel::Debug;
+            PrettyLayer::new(sink, config.color, show_trace).with_filter(level_filter).boxed()
         }
     };
     Registry::default().with(layer)
@@ -190,7 +196,7 @@ mod tests {
         let pretty_sink = Arc::new(MemorySink::new());
         let subscriber = Registry::default()
             .with(JsonLayer::new(json_sink.clone()))
-            .with(PrettyLayer::new(pretty_sink.clone(), false));
+            .with(PrettyLayer::new(pretty_sink.clone(), false, false));
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(name: "ignis.dual.check", attempt = 3i64, ok = false, "checked twice");
