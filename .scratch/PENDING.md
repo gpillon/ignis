@@ -11,22 +11,6 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
 
 ## Open
 
-- **`rust-sort` position 23: a genuine (small) logit disagreement with the
-  reference — diagnostic follow-up, not a gate blocker (GitHub #76).** Under
-  the teacher-forced G1 metric (ADR 0014) the canary suite scores 99/102 =
-  97.1%. Three positions mismatch. Two are the exact BF16 logit ties
-  diagnosed in #72 (`rust-sort` position 0: tokens 63 and 5836 both at 19.5;
-  `explain-reverse` position 0: tokens 760 and 2064 both at 22.875) — ignis's
-  argmax is the reference's own vendored kernel with the same lowest-token-id
-  tie-break, so there is nothing to "fix" there and nothing is waived. The
-  third is a real one: at `rust-sort` position 23, given the oracle's own
-  prefix, ignis prefers token 198 at logit 20.25 while the oracle's token 25
-  sits at 19.25 on ignis's logits — a gap of 1.0, roughly eight units in the
-  last place at bf16. Small, isolated, and well inside the accepted floor,
-  but it is the one position where the two forward passes genuinely disagree
-  rather than coin-flip. Worth a look if a future numeric change is
-  suspected. Owner: unassigned. Blocker: GPU exclusivity (ADR 0006).
-
 - **Two `openai_http_gpu.rs` tests looked noticeably slower than the other
   two in a 2026-09-07 serialized GPU profile run (post-#75) — not yet
   investigated.** With `--test-threads=1` (#75) the whole 4-test file took
@@ -39,6 +23,28 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   generation cost on those two prompts, or a per-test setup/teardown cost
   stacking on top of #71's fix. Owner: unassigned.
   Blocker: GPU exclusivity (ADR 0006).
+
+- **An intermittent wrong-output event in the GQA layer oracle (GitHub #96).**
+  `gqa_layer_gpu::gqa_layers_match_f64_reference` fails roughly two runs in
+  five: one token of a four-token decode sequence lands at a relative L2 of
+  0.32-0.37 against the f64 reference while every other token in the same run
+  is bit-identical to a clean run at ~0.004. Deterministic when it does not
+  fire, so this is a wrong-output event, not drift. `A4_LAYER_TOLERANCE = 0.32`
+  was very likely calibrated on the same event in #85, which would mean the
+  layer oracles carry ~80x more slack than the kernels need and would not
+  catch a real precision regression. This is what keeps the GPU profile from
+  being green in one run, and so what keeps #88 (and #63) open. Owner:
+  unassigned. Blocker: GPU exclusivity (ADR 0006).
+
+- **The G2 verdict's two legs were not interleaved (ADR 0015, GitHub #88).**
+  The gate passed at 0.878 (8K) and 0.851 (32K) against a 1.5 threshold, but
+  the reference leg was measured 2026-09-08 23:59 and the ignis leg
+  2026-09-09 02:24 — each with the GPU exclusively its own, same session id,
+  same harness, every sample cold, yet not in one sitting as ADR 0015 asks.
+  The margin is far outside what two hours of drift can move, so this is a
+  recorded deviation and not a re-open. Anyone re-running the cells for G3
+  should take both legs back to back and overwrite the record. Owner:
+  unassigned. Blocker: GPU exclusivity (ADR 0006) and the owner's ninfer.
 
 ## Blocked (external)
 

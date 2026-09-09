@@ -30,6 +30,10 @@ impl PromptTemplate for WordTemplate {
             .map(|w| w.bytes().fold(7u32, |a, b| a.wrapping_mul(131).wrapping_add(b as u32)))
             .collect())
     }
+    fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        // The filler path never decodes: a placeholder for the seam.
+        Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+    }
 }
 
 fn config(session: &str, label: &str, cells: &[u32], samples: usize) -> TtftConfig {
@@ -43,6 +47,7 @@ fn config(session: &str, label: &str, cells: &[u32], samples: usize) -> TtftConf
         profile: format!("{label}-test-profile"),
         artifact: "mock.ninfer".into(),
         session: session.into(),
+        corpus: None,
     }
 }
 

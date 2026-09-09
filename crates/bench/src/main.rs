@@ -19,7 +19,7 @@
 //!       as a single JSON file. Exits non-zero when the v1 verdict fails.
 //!   `ttft    --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768
 //!             [--samples 5] [--max-tokens 8] [--label L] [--profile P]
-//!             [--session S] [--out <record.json>]`
+//!             [--session S] [--corpus <bank.ids>] [--out <record.json>]`
 //!       The G2 measurement instrument (P2-05, ADR 0015): time to first
 //!       token at an exact prompt length, on cold prefixes, against any
 //!       OpenAI-compatible endpoint. Writes one engine's record.
@@ -88,7 +88,7 @@ fn print_usage() {
   ignis-bench oracle compare --fixture <fixture.json> --endpoint <url> --artifact <artifact.ninfer> [--first-n N]
   ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]
   ignis-bench ttft --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768 [--samples 5] [--max-tokens 8]
-                   [--label ignis] [--profile <text>] [--session <id>] [--out <record.json>]
+                   [--label ignis] [--profile <text>] [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
     );
 }
@@ -496,6 +496,16 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
     // reused by the second run.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let out = opt(args, "out");
+    let corpus = opt(args, "corpus").map(PathBuf::from);
+    if let Some(path) = &corpus {
+        // Fail before any request is sent: a missing corpus file would
+        // otherwise fail every cell (and the gate) with a late error.
+        if !path.is_file() {
+            eprintln!("error: --corpus file not found: {path:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("corpus mode: prompts are cut from {path:?} (detokenized windows, no filler growth)");
+    }
 
     let mut specs = Vec::new();
     for raw in cells_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -548,6 +558,7 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
         profile,
         artifact,
         session,
+        corpus,
     };
     let record = ttft::measure(&ep, &frontend, engine, endpoint, &cfg);
     print!("{}", record.render());

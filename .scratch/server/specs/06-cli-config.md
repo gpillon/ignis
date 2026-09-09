@@ -1,3 +1,7 @@
+# 06 — CLI flags for the env-var config surface (+ --help/--version)
+
+GitHub: #77
+
 ## Problem Statement
 
 `ignis-server`'s only configuration surface is environment variables (`IGNIS_MODEL`, `IGNIS_BIND`, `IGNIS_ARTIFACT`, `IGNIS_TELEMETRY`, `IGNIS_ENABLE_THINKING`, `IGNIS_REASONING_EFFORT`). For a one-off run (manual testing, a quick GPU-profile invocation, an agent launching the server as a subprocess) the owner has to `set`/export a variable, run, then remember to unset it — there's no way to pass a value inline on the command that starts the binary, and no `--help`/`--version` to discover the surface without reading `README.md`.

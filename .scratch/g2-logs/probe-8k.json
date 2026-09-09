@@ -1,0 +1,18 @@
+{
+  "session": "g2-20260909T005504Z",
+  "label": "ignis",
+  "endpoint": "http://127.0.0.1:8000",
+  "engine": "qwen3.8-27b",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "BF16 KV, 1024 chunk, eager",
+  "date": "2026-09-09T01:22:58Z",
+  "max_tokens": 8,
+  "cells": [
+    {
+      "prompt_tokens": 8192,
+      "samples": [],
+      "median_ttft_ms": null,
+      "error": "the warmup request failed: POST http://127.0.0.1:8000/v1/chat/completions: read SSE: error decoding response body"
+    }
+  ]
+}
