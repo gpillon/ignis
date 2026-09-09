@@ -1149,6 +1149,16 @@ impl Scheduler for ConcreteScheduler {
                         // is this request's last chunk.
                         let new_position = r.prefill_progress as usize;
                         r.checkpoint(new_position);
+                        // P3-06: the request log's per-phase fields (prefill
+                        // chunks consumed, prefilled tokens) are counted
+                        // from this event, not read back off `Request` —
+                        // the request struct itself carries no history, only
+                        // its current cumulative progress.
+                        events.push(SchedEvent::PrefillChunk {
+                            request: request_id,
+                            chunk_tokens: job.tokens.len() as u32,
+                            prefilled_tokens: r.prefill_progress,
+                        });
                         if !r.prefill_complete() {
                             // Not the last chunk: no registration yet
                             // (that moves to the last chunk's completion),

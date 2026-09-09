@@ -72,7 +72,7 @@ enum Command {
 /// already-running consumer without ever sharing a lock with the model
 /// thread.
 enum TelemetryFact {
-    Submitted(RequestId),
+    Submitted(RequestId, u32),
     Routed(SchedEvent),
     Tick,
     SetSink(Arc<dyn TelemetrySink>),
@@ -278,10 +278,14 @@ fn handle_command(
 ) {
     match command {
         Command::Submit { input, class, reply } => {
+            // P3-06: the request log's `prompt_tokens` field is read here,
+            // before `input` moves into `submit` — the scheduler's own
+            // `Request` is not reachable from the telemetry consumer.
+            let prompt_tokens = input.tokens.len() as u32;
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
-                let _ = facts.send(TelemetryFact::Submitted(id));
+                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens));
                 (id, stream)
             });
             // A dropped receiver (the caller gave up) is not an error here.
@@ -329,7 +333,8 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::Evicted { request }
         | SchedEvent::Restored { request, .. }
         | SchedEvent::Requeued { request }
-        | SchedEvent::PrefixReused { request, .. } => Some(*request),
+        | SchedEvent::PrefixReused { request, .. }
+        | SchedEvent::PrefillChunk { request, .. } => Some(*request),
         SchedEvent::Protected { .. } => None,
     }
 }
@@ -346,12 +351,22 @@ async fn telemetry_task(
 ) {
     while let Some(fact) = facts.recv().await {
         match fact {
-            TelemetryFact::Submitted(id) => telemetry.note_submit(id),
+            TelemetryFact::Submitted(id, prompt_tokens) => telemetry.note_submit(id, prompt_tokens),
             TelemetryFact::Routed(event) => match event {
-                SchedEvent::Admitted { request, .. } => telemetry.on_admitted(request),
+                SchedEvent::Admitted { request, lane, .. } => telemetry.on_admitted(request, lane),
                 SchedEvent::Token { request, .. } => telemetry.on_token(request),
                 SchedEvent::Evicted { request } => telemetry.on_evicted(request),
-                SchedEvent::Done { request, tokens, .. } => telemetry.on_done(request, tokens),
+                SchedEvent::Requeued { request } => telemetry.on_requeued(request),
+                SchedEvent::Done {
+                    request,
+                    tokens,
+                    reason,
+                } => telemetry.on_done(request, tokens, reason),
+                SchedEvent::PrefillChunk {
+                    request,
+                    prefilled_tokens,
+                    ..
+                } => telemetry.on_prefill_chunk(request, prefilled_tokens),
                 _ => {}
             },
             TelemetryFact::Tick => {

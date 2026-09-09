@@ -37,9 +37,11 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use ignis_core::RequestId;
+use ignis_core::{FinishReason, LaneId, RequestId};
 use serde::Serialize;
 use serde_json;
+
+use crate::api::finish_reason_str;
 
 // ── the JSONL sink ──────────────────────────────────────────────────────────
 
@@ -228,6 +230,26 @@ struct RequestTelemetry {
     admitted: bool,
     /// The first-token (`ttft`) line has been emitted.
     ttft: bool,
+    /// The submitted prompt's token count (P3-06; from `RequestInput` at
+    /// submit time, since a `Request`'s own history is not reachable from
+    /// the telemetry consumer).
+    prompt_tokens: u32,
+    /// Completed `SchedEvent::PrefillChunk`s seen for this request (P3-06).
+    prefill_chunks: u32,
+    /// The most recent `prefilled_tokens` cumulative count (P3-06); equals
+    /// `prompt_tokens` once prefill completes.
+    prefilled_tokens: u32,
+    /// The decode lane this request holds (P3-06; set at `admitted`, valid
+    /// for `ttft`/`done` — a request never reaches those before admission).
+    lane: LaneId,
+    /// The clock reading at the last generated token (P3-06; the inter-
+    /// token-latency anchor for the *next* token).
+    last_token_ms: Option<u64>,
+    /// Inter-token gaps recorded so far (P3-06): count, sum and max, enough
+    /// for a mean without keeping every sample.
+    itl_count: u64,
+    itl_sum_ms: u64,
+    itl_max_ms: u64,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -269,20 +291,26 @@ impl Telemetry {
         self.sink = sink;
     }
 
-    /// A request was submitted: anchor its `ms` timeline (a re-submit of an
-    /// in-flight id keeps the original anchor, so `ms` is not reset).
-    pub fn note_submit(&mut self, id: RequestId) {
+    /// A request was submitted: anchor its `ms` timeline and record its
+    /// prompt length (P3-06's `prompt_tokens` field). A re-submit of an
+    /// in-flight id keeps the original anchor (and prompt length), so `ms`
+    /// is not reset.
+    pub fn note_submit(&mut self, id: RequestId, prompt_tokens: u32) {
         self.requests
             .entry(id)
             .or_insert_with(|| RequestTelemetry {
                 submitted_ms: self.clock.now_ms(),
+                prompt_tokens,
                 ..Default::default()
             });
     }
 
-    /// A request was admitted (dealt a lane): emit the `admitted` line.
-    pub fn on_admitted(&mut self, id: RequestId) {
-        let submitted_ms = {
+    /// A request was admitted (dealt `lane`): emit the `admitted` line,
+    /// carrying the prefill phase's summary fields (P3-06: `prompt_tokens`,
+    /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
+    /// `PrefillChunk` events already seen for this request.
+    pub fn on_admitted(&mut self, id: RequestId, lane: LaneId) {
+        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens) = {
             let rt = self
                 .requests
                 .entry(id)
@@ -291,43 +319,107 @@ impl Telemetry {
                     ..Default::default()
                 });
             rt.admitted = true;
-            rt.submitted_ms
+            rt.lane = lane;
+            (rt.submitted_ms, rt.prompt_tokens, rt.prefill_chunks, rt.prefilled_tokens)
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
-        self.emit_request(id, "admitted", ms, 0, 0.0);
+        self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens);
     }
 
-    /// A token was generated: on the first one, emit the `ttft` line.
-    pub fn on_token(&mut self, id: RequestId) {
-        let first = {
-            let rt = self.requests.get_mut(&id);
-            match rt {
-                Some(rt) if !rt.ttft => {
-                    rt.ttft = true;
-                    Some(rt.submitted_ms)
-                }
-                _ => None,
-            }
-        };
-        if let Some(submitted_ms) = first {
-            let ms = self.clock.now_ms().saturating_sub(submitted_ms);
-            self.emit_request(id, "ttft", ms, 1, throughput(1, ms));
+    /// A chunked-prefill step landed for a request still queued or mid-
+    /// prefill (P3-06, ADR 0018): accumulate the phase fields the
+    /// `admitted` line reports once the request finishes prefill. Not
+    /// itself logged — a request may sit `Prefilling` across many chunks,
+    /// and per-chunk log lines would be per-round logging by another name.
+    pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.prefill_chunks = rt.prefill_chunks.saturating_add(1);
+            rt.prefilled_tokens = prefilled_tokens;
         }
     }
 
-    /// A request completed (`n` = its total tokens): emit the `done` line
-    /// and drop the request from the in-flight set.
-    pub fn on_done(&mut self, id: RequestId, n: u32) {
-        let submitted_ms = self.requests.get(&id).map(|rt| rt.submitted_ms);
-        self.requests.remove(&id);
-        let submitted_ms = submitted_ms.unwrap_or_else(|| self.clock.now_ms());
+    /// A token was generated: on the first one, emit the `ttft` line;
+    /// subsequent tokens accumulate the inter-token-latency stats (P3-06)
+    /// the `done` line reports.
+    pub fn on_token(&mut self, id: RequestId) {
+        let now = self.clock.now_ms();
+        let first = {
+            let rt = match self.requests.get_mut(&id) {
+                Some(rt) => rt,
+                None => return,
+            };
+            if !rt.ttft {
+                rt.ttft = true;
+                rt.last_token_ms = Some(now);
+                Some((rt.submitted_ms, rt.lane))
+            } else {
+                if let Some(last) = rt.last_token_ms {
+                    let gap = now.saturating_sub(last);
+                    rt.itl_count = rt.itl_count.saturating_add(1);
+                    rt.itl_sum_ms = rt.itl_sum_ms.saturating_add(gap);
+                    rt.itl_max_ms = rt.itl_max_ms.max(gap);
+                }
+                rt.last_token_ms = Some(now);
+                None
+            }
+        };
+        if let Some((submitted_ms, lane)) = first {
+            let ms = now.saturating_sub(submitted_ms);
+            self.emit_ttft(id, ms, lane);
+        }
+    }
+
+    /// A request completed (`n` = its total tokens, `reason` why it
+    /// stopped): emit the `done` line — carrying `n`, `reason`, and the
+    /// decode phase's per-lane inter-token-latency summary (P3-06) — and
+    /// drop the request from the in-flight set.
+    pub fn on_done(&mut self, id: RequestId, n: u32, reason: FinishReason) {
+        let rt = self.requests.remove(&id);
+        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms) = match rt {
+            Some(rt) => (
+                rt.submitted_ms,
+                rt.lane,
+                rt.itl_count,
+                rt.itl_sum_ms,
+                rt.itl_max_ms,
+            ),
+            None => (self.clock.now_ms(), 0, 0, 0, 0),
+        };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
-        self.emit_request(id, "done", ms, n, throughput(n, ms));
+        let itl_mean_ms = if itl_count == 0 {
+            0.0
+        } else {
+            itl_sum_ms as f64 / itl_count as f64
+        };
+        self.emit_done(
+            id,
+            ms,
+            n,
+            throughput(n, ms),
+            lane,
+            reason,
+            itl_mean_ms,
+            itl_max_ms,
+            itl_count,
+        );
     }
 
     /// A request was evicted to the host tier: bump the eviction counter.
     pub fn on_evicted(&mut self, _id: RequestId) {
         self.kv_evictions = self.kv_evictions.saturating_add(1);
+    }
+
+    /// A request's host-tier snapshot was discarded (core-06): it goes back
+    /// to `Admitted` and re-prefills from the start (`SchedEvent::Requeued`'s
+    /// own doc comment). The prefill phase's summary fields (P3-06) reset
+    /// with it — otherwise the eventual `admitted` line would sum chunks
+    /// and tokens across two unrelated prefill attempts, which is exactly
+    /// the misattribution this ticket's request log exists to prevent.
+    pub fn on_requeued(&mut self, id: RequestId) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.prefill_chunks = 0;
+            rt.prefilled_tokens = 0;
+        }
     }
 
     /// The interval-line counters: the live provider's when one is set,
@@ -377,49 +469,91 @@ impl Telemetry {
         counters
     }
 
-    /// Emit a request lifecycle event through the canonical structured-logging
-    /// system (`ignis.request.admitted`/`ttft`/`done`, GitHub #79) — request
-    /// lifecycle observability lives in the one canonical system
-    /// (`ignis-logging`) instead of this module's own JSONL shape. The
-    /// per-tick `emit_interval` above is untouched: those counters are
-    /// metrics-shaped (GitHub #77), not logs, and stay on `TelemetrySink`.
+    /// Emit the `admitted` line: the prefill phase's summary (P3-06) —
+    /// `prompt_tokens`, `prefill_chunks_consumed`, `prefilled_tokens` —
+    /// alongside the lane dealt and how long the request queued. See
+    /// [`Telemetry::emit_done`] for why this runs on the telemetry consumer
+    /// task rather than inline.
+    fn emit_admitted(
+        &self,
+        id: RequestId,
+        ms: u64,
+        lane: LaneId,
+        prompt_tokens: u32,
+        prefill_chunks_consumed: u32,
+        prefilled_tokens: u32,
+    ) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.admitted",
+            request_id = id,
+            duration_ms = ms,
+            lane = lane as u64,
+            prompt_tokens,
+            prefill_chunks_consumed,
+            prefilled_tokens,
+            "request admitted"
+        );
+    }
+
+    /// Emit the `ttft` line.
+    fn emit_ttft(&self, id: RequestId, ms: u64, lane: LaneId) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.ttft",
+            request_id = id,
+            duration_ms = ms,
+            lane = lane as u64,
+            tokens = 1,
+            tok_s = throughput(1, ms),
+            "first token"
+        );
+    }
+
+    /// Emit the `done` line: `tokens`/`tok_s` as before, plus the decode
+    /// phase's per-phase fields this ticket adds (P3-06) — `finish_reason`
+    /// (the same mapping `api.rs` uses for the HTTP response, so the two
+    /// never disagree) and the per-lane inter-token-latency summary
+    /// (`itl_ms_mean`/`itl_ms_max`/`itl_samples`) a failing G3 ITL cell is
+    /// attributed against, without a second run, by reading this stream
+    /// alongside the `admitted` lines of whatever else was prefilling in
+    /// the same window (ADR 0011: the request log is diagnosis, never the
+    /// gate's own oracle — that stays HTTP/SSE-side, P3-07).
     ///
     /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
     /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
     /// or any of `ignis-core`'s model-thread spans — a genuinely separate
     /// execution context, so it opens its own short span carrying
     /// `request_id` rather than relying on inherited span context that
-    /// does not reach here. That gives these three events the same
-    /// `trace_id` as the rest of the request's lifecycle.
-    fn emit_request(&mut self, id: RequestId, event: &'static str, ms: u64, n: u32, tok_s: f64) {
+    /// does not reach here. That gives these events the same `trace_id` as
+    /// the rest of the request's lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_done(
+        &self,
+        id: RequestId,
+        ms: u64,
+        n: u32,
+        tok_s: f64,
+        lane: LaneId,
+        reason: FinishReason,
+        itl_ms_mean: f64,
+        itl_ms_max: u64,
+        itl_samples: u64,
+    ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
-        match event {
-            "admitted" => tracing::info!(
-                name: "ignis.request.admitted",
-                request_id = id,
-                duration_ms = ms,
-                tokens = n,
-                tok_s = tok_s,
-                "request admitted"
-            ),
-            "ttft" => tracing::info!(
-                name: "ignis.request.ttft",
-                request_id = id,
-                duration_ms = ms,
-                tokens = n,
-                tok_s = tok_s,
-                "first token"
-            ),
-            "done" => tracing::info!(
-                name: "ignis.request.done",
-                request_id = id,
-                duration_ms = ms,
-                tokens = n,
-                tok_s = tok_s,
-                "request done"
-            ),
-            other => unreachable!("emit_request called with unknown event {other}"),
-        }
+        tracing::info!(
+            name: "ignis.request.done",
+            request_id = id,
+            duration_ms = ms,
+            lane = lane as u64,
+            tokens = n,
+            tok_s = tok_s,
+            finish_reason = finish_reason_str(reason),
+            itl_ms_mean,
+            itl_ms_max,
+            itl_samples,
+            "request done"
+        );
     }
 }
 
@@ -460,8 +594,8 @@ mod tests {
     #[test]
     fn an_interval_line_has_the_section5_shape() {
         let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1);
-        telemetry.on_admitted(1); // now an `ignis.request.admitted` tracing event, not a sink line
+        telemetry.note_submit(1, 3);
+        telemetry.on_admitted(1, 0); // now an `ignis.request.admitted` tracing event, not a sink line
         telemetry.emit_interval(); // emits the interval line
         let lines = sink.lines();
         assert_eq!(lines.len(), 1, "only the interval line goes through `TelemetrySink` now");
@@ -496,11 +630,11 @@ mod tests {
     fn request_events_carry_the_lifecycle_names_and_attributes() {
         let (mut telemetry, _sink) = telemetry();
         let events = capture_request_events(|| {
-            telemetry.note_submit(7);
-            telemetry.on_admitted(7);
+            telemetry.note_submit(7, 10);
+            telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
             telemetry.on_token(7); // subsequent tokens are not re-emitted
-            telemetry.on_done(7, 4);
+            telemetry.on_done(7, 4, FinishReason::Stop);
         });
 
         let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
@@ -510,18 +644,22 @@ mod tests {
         );
         for event in &events {
             assert_eq!(event["attributes"]["request_id"], 7);
+            assert_eq!(event["attributes"]["lane"], 2, "every lifecycle line names the held lane");
         }
+        let admitted = &events[0];
+        assert_eq!(admitted["attributes"]["prompt_tokens"], 10);
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["tokens"], 4, "the done event carries the total tokens");
+        assert_eq!(done["attributes"]["finish_reason"], "stop");
     }
 
     #[test]
     fn a_fixed_clock_keeps_request_events_deterministic() {
         let (mut telemetry, _sink) = telemetry();
         let events = capture_request_events(|| {
-            telemetry.note_submit(1);
-            telemetry.on_admitted(1);
-            telemetry.on_done(1, 3);
+            telemetry.note_submit(1, 3);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_done(1, 3, FinishReason::Stop);
         });
         let done = events.last().unwrap();
         // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
@@ -549,20 +687,21 @@ mod tests {
                 reads: std::sync::atomic::AtomicU32::new(0),
             }));
         let events = capture_request_events(|| {
-            telemetry.note_submit(1); // read #1 → 100 ms
-            telemetry.on_done(1, 5); // read #2 → 200 ms, so ms = 100
+            telemetry.note_submit(1, 5); // read #1 → 100 ms
+            telemetry.on_done(1, 5, FinishReason::Length); // read #2 → 200 ms, so ms = 100
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
         assert_eq!(done["attributes"]["tok_s"], 50.0, "5 tokens / 0.1 s");
+        assert_eq!(done["attributes"]["finish_reason"], "length");
     }
 
     #[test]
     fn event_derived_counters_split_waiting_and_running() {
         let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1); // queued (not yet admitted)
-        telemetry.note_submit(2); // queued
-        telemetry.on_admitted(2); // dealt a lane
+        telemetry.note_submit(1, 3); // queued (not yet admitted)
+        telemetry.note_submit(2, 3); // queued
+        telemetry.on_admitted(2, 0); // dealt a lane
         telemetry.emit_interval();
         let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
         assert_eq!(v["waiting"], 1, "request 1 is still queued");
@@ -572,13 +711,152 @@ mod tests {
     #[test]
     fn evictions_bump_the_counter() {
         let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1);
-        telemetry.on_admitted(1);
+        telemetry.note_submit(1, 3);
+        telemetry.on_admitted(1, 0);
         telemetry.on_evicted(1);
         telemetry.on_evicted(1);
         telemetry.emit_interval();
         let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
         assert_eq!(v["kv_evictions"], 2, "each eviction bumps the counter");
+    }
+
+    #[test]
+    fn admitted_reports_the_prefill_phase_summary() {
+        let (mut telemetry, _sink) = telemetry();
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1, 300); // a 300-token prompt
+            telemetry.on_prefill_chunk(1, 128); // chunk 1: 128/300
+            telemetry.on_prefill_chunk(1, 256); // chunk 2: 256/300
+            telemetry.on_prefill_chunk(1, 300); // chunk 3: prefill complete
+            telemetry.on_admitted(1, 4);
+        });
+        let admitted = events.last().unwrap();
+        assert_eq!(admitted["attributes"]["prompt_tokens"], 300);
+        assert_eq!(admitted["attributes"]["prefill_chunks_consumed"], 3);
+        assert_eq!(admitted["attributes"]["prefilled_tokens"], 300);
+        assert_eq!(admitted["attributes"]["lane"], 4);
+    }
+
+    #[test]
+    fn a_requeue_resets_the_prefill_phase_summary_for_the_re_prefill() {
+        // core-06: a requeued request's host-tier snapshot was discarded, so
+        // it re-prefills from the start (`SchedEvent::Requeued`'s own doc
+        // comment). Without a reset, the eventual `admitted` line would sum
+        // the discarded first attempt's chunks onto the second attempt's —
+        // exactly the misattribution P3-06's request log exists to prevent.
+        let (mut telemetry, _sink) = telemetry();
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1, 300);
+            telemetry.on_prefill_chunk(1, 128); // 1st attempt: 1 chunk, then evicted/discarded
+            telemetry.on_requeued(1); // re-queued: the summary resets
+            telemetry.on_prefill_chunk(1, 150); // 2nd attempt, chunk 1
+            telemetry.on_prefill_chunk(1, 300); // 2nd attempt, chunk 2: complete
+            telemetry.on_admitted(1, 4);
+        });
+        let admitted = events.last().unwrap();
+        assert_eq!(
+            admitted["attributes"]["prefill_chunks_consumed"], 2,
+            "only the surviving (2nd) prefill attempt's chunks are counted"
+        );
+        assert_eq!(admitted["attributes"]["prefilled_tokens"], 300);
+        // `prompt_tokens` is unaffected — it is the request's own submitted
+        // length, not something a prefill attempt accumulates.
+        assert_eq!(admitted["attributes"]["prompt_tokens"], 300);
+    }
+
+    #[test]
+    fn done_reports_the_per_lane_inter_token_latency_summary() {
+        let sink = Arc::new(MemorySink::new());
+        // A clock that advances 10 ms per read, so every generated token is
+        // exactly 10 ms apart — a deterministic, known ITL distribution.
+        struct StepClock(std::sync::atomic::AtomicU32);
+        impl TelemetryClock for StepClock {
+            fn now_ms(&self) -> u64 {
+                (self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64 + 1) * 10
+            }
+        }
+        let mut telemetry = Telemetry::new(
+            sink,
+            Arc::new(StepClock(std::sync::atomic::AtomicU32::new(0))),
+        );
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1, 3);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_token(1); // ttft — no ITL sample yet
+            telemetry.on_token(1); // 1st gap: 10ms
+            telemetry.on_token(1); // 2nd gap: 10ms
+            telemetry.on_done(1, 3, FinishReason::Stop);
+        });
+        let done = events.last().unwrap();
+        assert_eq!(done["attributes"]["itl_samples"], 2);
+        assert_eq!(done["attributes"]["itl_ms_mean"], 10.0);
+        assert_eq!(done["attributes"]["itl_ms_max"], 10);
+    }
+
+    /// P3-06's attribution acceptance criterion: a failing G3 ITL cell must
+    /// be attributable from this stream alone, without another run. Here a
+    /// long cold prefiller (request 2) lands a wide chunk while request 1's
+    /// decode lane is waiting on its next token — request 1's `done` line
+    /// shows the resulting ITL spike, and request 2's `admitted` line shows
+    /// the prefill activity that caused it, correlated by wall-clock
+    /// position in the one recorded stream (no re-run needed).
+    #[test]
+    fn a_failing_itl_cell_is_attributable_from_one_recorded_stream() {
+        let sink = Arc::new(MemorySink::new());
+        struct ScriptClock(std::sync::atomic::AtomicUsize, Vec<u64>);
+        impl TelemetryClock for ScriptClock {
+            fn now_ms(&self) -> u64 {
+                let i = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.1[i]
+            }
+        }
+        // Request 1 (decode lane): admitted at 0, tokens at 10/20/220 —
+        // a 200ms gap where request 2's prefill chunk lands at 25.
+        // Request 2 (cold prefiller): submitted at 5, one wide chunk
+        // completing at 25 (the interleaved chunk that stalls lane 0),
+        // admitted (starts decoding) at 230.
+        let clock = ScriptClock(
+            std::sync::atomic::AtomicUsize::new(0),
+            vec![0, 5, 10, 20, 25, 220, 230, 220],
+        );
+        let mut telemetry = Telemetry::new(sink, Arc::new(clock));
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1, 4); // t=0
+            telemetry.on_admitted(1, 0); // t=5, lane 0
+            telemetry.on_token(1); // t=10, ttft
+            telemetry.on_token(1); // t=20, 1st gap 10ms
+            telemetry.note_submit(2, 32_768); // t=25 (cold prefiller submitted)
+            telemetry.on_prefill_chunk(2, 32_768); // the wide chunk lands
+            telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
+            telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
+            telemetry.on_done(1, 3, FinishReason::Stop); // t=220 (clock re-read), lane 0 finishes
+        });
+
+        // Request 2's `admitted` line shows the wide cold-prefill chunk
+        // that ran while lane 0 was waiting on its next token.
+        let prefiller_admitted = events
+            .iter()
+            .find(|e| {
+                e["event_name"] == "ignis.request.admitted" && e["attributes"]["request_id"] == 2
+            })
+            .expect("request 2's admitted line is in the stream");
+        assert_eq!(prefiller_admitted["attributes"]["prompt_tokens"], 32_768);
+        assert_eq!(
+            prefiller_admitted["attributes"]["prefill_chunks_consumed"],
+            1
+        );
+
+        // Request 1's `done` line shows the ITL spike, attributable to that
+        // same window purely by reading this one stream — no re-run needed.
+        let lane0_done = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.done" && e["attributes"]["request_id"] == 1)
+            .expect("request 1's done line is in the stream");
+        assert_eq!(
+            lane0_done["attributes"]["itl_ms_max"], 200,
+            "the stall shows up as the max gap"
+        );
+        assert_eq!(lane0_done["attributes"]["itl_samples"], 2);
     }
 
     #[test]
@@ -621,8 +899,8 @@ mod tests {
         {
             let sink = Arc::new(FileSink::open(&path).unwrap());
             let mut telemetry = Telemetry::new(sink.clone(), Arc::new(FixedClock::new(0)));
-            telemetry.note_submit(1);
-            telemetry.on_admitted(1);
+            telemetry.note_submit(1, 3);
+            telemetry.on_admitted(1, 0);
             telemetry.emit_interval();
         }
         let content = std::fs::read_to_string(&path).unwrap();

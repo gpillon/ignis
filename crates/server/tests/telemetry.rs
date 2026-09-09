@@ -37,6 +37,25 @@ fn engine_with_sink(sink: Arc<MemorySink>) -> Engine {
     Engine::with_sinks(Box::new(scheduler), sink, Arc::new(FixedClock::new(0)))
 }
 
+/// Same as [`engine_with_sink`], but with the scheduler's serving prefill
+/// chunk width narrowed to `chunk` tokens — small enough that a short test
+/// prompt still needs several `SchedEvent::PrefillChunk`s (P3-06), so the
+/// engine's real `Command::Submit` → facts-channel → `telemetry_task` wiring
+/// for the new per-phase fields gets exercised end to end, not just
+/// `Telemetry`'s own methods called directly.
+fn engine_with_sink_and_chunk(sink: Arc<MemorySink>, chunk: u32) -> Engine {
+    let compute = Arc::new(MockCompute::new());
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "test-model".into(),
+            serving_chunk_tokens: chunk,
+            ..SchedulerConfig::default()
+        },
+        compute,
+    );
+    Engine::with_sinks(Box::new(scheduler), sink, Arc::new(FixedClock::new(0)))
+}
+
 fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
     RequestInput {
         model: "test-model".into(),
@@ -228,4 +247,41 @@ async fn reading_the_sink_while_the_telemetry_consumer_is_still_draining_does_no
     let lines = sink.lines();
     assert!(!request_event_names(&log_sink).is_empty());
     assert!(lines.iter().any(|l| kind(l) == "interval"));
+}
+
+/// P3-06: exercises the real engine wiring for the request log's per-phase
+/// fields — `Command::Submit` capturing `prompt_tokens` before `submit`
+/// moves the input, `SchedEvent::PrefillChunk` routed through the facts
+/// channel, and `telemetry_task`'s `on_prefill_chunk`/`on_admitted` — not
+/// just `Telemetry`'s own methods called directly (see `telemetry.rs`'s
+/// unit tests for that). A 10-token prompt at a 4-token chunk width needs 3
+/// chunks (matches `crates/core/tests/interleaving.rs`'s
+/// `a_long_prompt_is_split_into_chunk_wide_jobs`), so the `admitted` line
+/// this produces must show exactly that.
+#[tokio::test]
+async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
+    let sink = Arc::new(MemorySink::new());
+    let (log_sink, _guard) = capture_request_events();
+    let engine = engine_with_sink_and_chunk(sink, 4);
+    let (_id, mut rx) = engine
+        .submit(input((1..=10).collect(), 1), RequestClass::Interactive)
+        .await
+        .expect("submit");
+    collect_tokens(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("the request completes");
+    nudge().await;
+
+    let admitted = log_sink
+        .lines()
+        .iter()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["event_name"] == "ignis.request.admitted")
+        .expect("an admitted event");
+    assert_eq!(admitted["attributes"]["prompt_tokens"], 10);
+    assert_eq!(
+        admitted["attributes"]["prefill_chunks_consumed"], 3,
+        "a 10-token prompt at a 4-token chunk width takes 3 chunks"
+    );
+    assert_eq!(admitted["attributes"]["prefilled_tokens"], 10);
 }

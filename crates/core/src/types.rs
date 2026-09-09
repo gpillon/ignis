@@ -199,6 +199,17 @@ pub enum SchedEvent {
     /// these into the `sibling_prefix_reused_tok` counter (design §5,
     /// `server-02`).
     PrefixReused { request: RequestId, tokens: u32 },
+    /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
+    /// P3-06 request log): `chunk_tokens` is this chunk's width,
+    /// `prefilled_tokens` the cumulative prompt tokens sent to the compute
+    /// backend so far (`== prompt_tokens` once prefill completes).
+    /// Diagnosis-only, like `PrefixReused` — never a scheduling signal, and
+    /// never a substitute for the live/live gate measurement (ADR 0011).
+    PrefillChunk {
+        request: RequestId,
+        chunk_tokens: u32,
+        prefilled_tokens: u32,
+    },
 }
 
 /// Errors from submitting a request.
