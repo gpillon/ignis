@@ -156,13 +156,45 @@ const char *ignis_step_last_error(void);
 
 /* Runtime counters for the real program entry points.  `kernel_count` is
  * the number of program-layer dispatches in the latest step: the leaf's
- * stable, graph-independent dispatch counter until G3 groups those calls in
- * CUDA graphs. */
+ * stable, graph-independent dispatch counter, unaffected by whether that
+ * step replayed a graph. `graph_launches` (P3-05, GitHub #102) is the
+ * number of `cudaGraphLaunch` calls the most recent `ignis_program_decode`
+ * call made -- 1 when it replayed a captured decode graph, 0 when it ran
+ * the eager per-lane loop (including every `ignis_program_prefill` call,
+ * which never replays a graph). `decode_graph_ready_mask` has bit (w-1) set
+ * when a decode graph for exact width w (1..IGNIS_DECODE_MAX_BATCH) is
+ * captured and replayable; a clear bit means that width always falls back
+ * to eager. */
 struct ignis_program_stats {
   uint64_t vram_bytes;
   uint64_t last_step_micros;
   uint64_t kernel_count;
+  uint64_t graph_launches;
+  uint32_t decode_graph_ready_mask;
 };
+
+/* Captures one CUDA graph per exact decode batch width 1..IGNIS_DECODE_MAX_BATCH
+ * (P3-05, GitHub #102, ADR 0019). Must be called once, after `pool` is
+ * created and before any concurrent `ignis_program_decode` call -- capture
+ * is not thread-safe with replay. Every width is attempted independently: a
+ * capture failure for one width is logged (see ignis_step_last_error for the
+ * last one) and leaves that width's bit clear in `*out_ready_mask`, but does
+ * not fail this call or any other width -- a decode round at a width whose
+ * graph failed to capture always falls back to the eager per-lane loop, so
+ * a capture failure degrades performance and never refuses service.
+ * `*out_capture_micros`, if non-null, receives the wall-clock cost of this
+ * call (every width's capture, sequentially) so the startup cost is
+ * measured and reported, not assumed. Returns 0 unless `model` or `pool` is
+ * null (in which case no width is attempted and `*out_ready_mask` is left
+ * unset). */
+int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
+                                   uint64_t *out_capture_micros, uint32_t *out_ready_mask);
+
+/* The message from the most recent width whose capture failed inside the
+ * latest ignis_decode_graph_capture call on this thread (its own channel,
+ * separate from ignis_step_last_error -- each ABI surface owns its own).
+ * Never NULL; empty if every width captured, or before the first call. */
+const char *ignis_decode_graph_last_error(void);
 
 /* Run the complete 64-layer program for every token in a prompt span.  The
  * span starts exactly at `start_position`; it advances the sequence's KV,

@@ -535,6 +535,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   model->vocab = g.vocab;
   model->rms_norm_eps = topology->rms_norm_eps;
   model->prefill_chunk_tokens = prefill_chunk_tokens;
+  // P3-05 (GitHub #102, ADR 0019): kept for the decode graphs' fixed,
+  // conservative GqaExecutionEnvelope (every capture and every replay uses
+  // this cap, never a lane's actual current position).
+  model->max_context_tokens = max_context_tokens;
 
   const cudaError_t stream_err = cudaStreamCreate(&model->stream);
   if (stream_err != cudaSuccess) {
@@ -610,6 +614,31 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     return -1;
   }
 
+  // P3-05 (GitHub #102, ADR 0019): the decode graphs' own scratch (one
+  // lane's per-layer peak at T=1, mirroring `scratch`'s own sizing above at
+  // `prefill_chunk_tokens`) and staging buffers, reserved once here and
+  // never touched by prefill -- so a chunk running between two replays can
+  // never alias what a replay rereads. Capture itself
+  // (`ignis_decode_graph_capture`) happens later, once the sequence pool
+  // exists.
+  try {
+    const std::size_t decode_graph_scratch_bytes =
+        compute_program_scratch_bytes(*model, *topology, /*chunk=*/1, max_context_tokens);
+    model->decode_graph_scratch =
+        std::make_unique<ninfer::DeviceArena>(decode_graph_scratch_bytes);
+    model->decode_graph_token_ids =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->decode_graph_slots =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->decode_graph_zero = std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t));
+    model->decode_graph_zero->fill(0);
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_model_load: decode graph buffer allocation failed: ") + e.what());
+    cudaStreamDestroy(model->stream);
+    model->stream = nullptr;
+    return -1;
+  }
+
   *out_model = model.release();
   return 0;
 }
@@ -625,8 +654,18 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
 }
 
 extern "C" void ignis_model_free(struct ignis_model *model) {
-  if (model != nullptr && model->stream != nullptr) {
-    cudaStreamDestroy(model->stream);
+  if (model != nullptr) {
+    // P3-05 (GitHub #102, ADR 0019): destroy every captured decode graph
+    // before the stream/scratch it was captured against goes away.
+    for (auto &exec : model->decode_graph_exec) {
+      if (exec != nullptr) {
+        cudaGraphExecDestroy(exec);
+        exec = nullptr;
+      }
+    }
+    if (model->stream != nullptr) {
+      cudaStreamDestroy(model->stream);
+    }
   }
   delete model;
 }

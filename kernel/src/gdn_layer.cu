@@ -32,6 +32,8 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include "ignis_step.h"
+
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -271,6 +273,152 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
   }
 }
 
+// P3-05 (GitHub #102, ADR 0019): the graph-safe counterpart of
+// `run_gdn_layer` for one decode lane (T=1 always). `causal_conv1d_silu_snapshot`
+// / `gated_delta_net_snapshot` replace the direct `conv_slot`/`recurrent_slot`
+// calls: both read the pool slot to update from `model->decode_graph_slots +
+// lane` (device memory, this round's real value at replay time) instead of a
+// host `slot` int baked at capture time, and both write back to that same
+// slot in place (`snapshot_base_slots == initial_state_slots`). `ssm_states`
+// / `conv_states` span the whole pool (every slot, fixed address) rather
+// than one sequence's own view -- see layer_internal.h's declaration and ADR
+// 0019.
+int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                            uint32_t lane, void *in_residual, void *out_residual,
+                            uint32_t gdn_layer, LinearPolicyMode mode) {
+  constexpr std::int32_t T = 1;
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto stream = model->stream;
+  const GdnLayerWeights &w = model->layers[layer].gdn;
+
+  const auto &spec = pool->gdn_pool.spec;
+  const auto value_heads = static_cast<std::int32_t>(spec.value_heads);
+  const auto head_dim = static_cast<std::int32_t>(spec.key_head_dim);
+  const auto conv_channels = static_cast<std::int32_t>(spec.conv_channels);
+  const auto value_width = value_heads * head_dim;
+  const auto qk_width = (conv_channels - value_width) / 2;
+  const auto qk_heads = qk_width / head_dim;
+  const auto ffn = w.mlp_gate_up.n / 2;
+  const auto slot_count = pool->gdn_pool.slot_count();
+  const float readout_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  ninfer::DeviceArena::Scope scope = model->decode_graph_scratch->scope();
+  try {
+    ninfer::Tensor h = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
+    ninfer::Tensor qkv = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
+    ninfer::Tensor qkv_conv = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {conv_channels, T, 1, 1});
+    ninfer::Tensor query = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {qk_width, T, 1, 1});
+    ninfer::Tensor key = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {qk_width, T, 1, 1});
+    ninfer::Tensor value = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {value_width, T, 1, 1});
+    ninfer::Tensor zbuf = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {value_width, T, 1, 1});
+    ninfer::Tensor g = model->decode_graph_scratch->alloc(ninfer::DType::FP32, {value_heads, T, 1, 1});
+    ninfer::Tensor beta = model->decode_graph_scratch->alloc(ninfer::DType::FP32, {value_heads, T, 1, 1});
+    ninfer::Tensor recurrent = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {value_width, T, 1, 1});
+    ninfer::Tensor gated = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {value_width, T, 1, 1});
+    ninfer::Tensor post = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
+    ninfer::Tensor fused = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {ffn, T, 1, 1});
+
+    // The whole-pool state planes (every slot, fixed address) -- slot 0's
+    // view supplies the base pointer; the pool's own per-slot stride
+    // (identical to what `conv_slot`/`recurrent_slot` step by) gives the
+    // rest of the shape.
+    const ninfer::Tensor conv_states(pool->gdn_pool.conv_slot(gdn_layer, 0).data,
+                                     ninfer::DType::BF16,
+                                     {conv_channels, kIgnisGdnConvStateWidth, slot_count, 1});
+    ninfer::Tensor ssm_states(pool->gdn_pool.recurrent_slot(gdn_layer, 0).data, ninfer::DType::FP32,
+                              {head_dim, head_dim, value_heads, slot_count});
+    const ninfer::Tensor lane_slot(
+        static_cast<std::uint8_t *>(model->decode_graph_slots->p) +
+            static_cast<std::size_t>(lane) * sizeof(std::int32_t),
+        ninfer::DType::I32, {1, 1, 1, 1});
+
+    const ninfer::Tensor in(in_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
+
+    const ninfer::Tensor input_norm =
+        weight_tensor(w.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(in, input_norm, model->rms_norm_eps, /*unit_offset=*/true, h, stream);
+
+    const ninfer::Tensor conv_weight = weight_tensor(
+        w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
+    ninfer::ops::gdn_input_proj(h, w.query_key_value_z, qkv, zbuf,
+                                ignis_policy_for(w.query_key_value_z.qtype, mode),
+                                *model->decode_graph_scratch, stream);
+    // In-place snapshot form: this round's real physical slot (read from
+    // `lane_slot` at replay time) is both the window this reads and the
+    // window it writes back.
+    ninfer::Tensor conv_states_mut = conv_states;
+    ninfer::ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states_mut,
+                                             /*valid_columns=*/ninfer::Tensor{}, lane_slot,
+                                             lane_slot, qkv_conv, stream);
+
+    constexpr std::size_t kElemBytes = 2;
+    auto copy_channel_range = [&](std::int32_t offset, std::int32_t width,
+                                  ninfer::Tensor &dst) -> cudaError_t {
+      const auto *src = static_cast<const std::uint8_t *>(qkv_conv.data) +
+                        static_cast<std::size_t>(offset) * kElemBytes;
+      return cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(width) * kElemBytes, src,
+                               static_cast<std::size_t>(conv_channels) * kElemBytes,
+                               static_cast<std::size_t>(width) * kElemBytes,
+                               static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, stream);
+    };
+    cudaError_t err = copy_channel_range(0, qk_width, query);
+    if (err == cudaSuccess) { err = copy_channel_range(qk_width, qk_width, key); }
+    if (err == cudaSuccess) { err = copy_channel_range(2 * qk_width, value_width, value); }
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_gdn_layer_graph: cudaMemcpy2DAsync(qkv split) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    const ninfer::Tensor a_log =
+        weight_tensor(w.a_log, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    const ninfer::Tensor dt_bias =
+        weight_tensor(w.dt_bias, ninfer::DType::FP32, {value_heads, 1, 1, 1});
+    ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
+                                 g, beta, stream);
+
+    ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, T, 1});
+    ninfer::ops::gated_delta_net_snapshot(
+        query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
+        value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, /*normalize_qk=*/true,
+        ssm_states, /*valid_columns=*/ninfer::Tensor{}, lane_slot, lane_slot, recurrent_out,
+        stream);
+
+    const ninfer::Tensor gdn_norm =
+        weight_tensor(w.norm, ninfer::DType::BF16, {head_dim, 1, 1, 1});
+    ninfer::Tensor gated_out = gated.view({head_dim, value_heads, T, 1});
+    ninfer::ops::gated_rmsnorm(recurrent_out, gdn_norm, zbuf.view({head_dim, value_heads, T, 1}),
+                               model->rms_norm_eps, gated_out, stream);
+
+    ninfer::Tensor residual_view(out_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
+    err = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
+                          cudaMemcpyDeviceToDevice, stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_gdn_layer_graph: cudaMemcpyAsync(residual) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    ninfer::ops::linear_add(gated, w.output, residual_view,
+                            ignis_policy_for(w.output.qtype, mode), *model->decode_graph_scratch,
+                            stream);
+
+    const ninfer::Tensor post_norm =
+        weight_tensor(w.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(residual_view, post_norm, model->rms_norm_eps, /*unit_offset=*/true,
+                         post, stream);
+    ninfer::ops::linear_swiglu(post, w.mlp_gate_up, fused,
+                               ignis_linear_swiglu_policy_for(w.mlp_gate_up.qtype, mode, T),
+                               *model->decode_graph_scratch, stream);
+    ninfer::ops::linear_add(fused, w.mlp_down, residual_view,
+                            ignis_policy_for(w.mlp_down.qtype, mode), *model->decode_graph_scratch,
+                            stream);
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_gdn_layer_graph: ") + e.what());
+    return -1;
+  }
+}
+
 } // namespace
 
 // P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
@@ -337,6 +485,30 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
     return -1;
   }
   return 0;
+}
+
+// P3-05 (GitHub #102, ADR 0019): validates and dispatches
+// `run_gdn_layer_graph` -- called once per GDN layer per lane while a decode
+// graph is being captured (`kernel/src/decode_graph.cu`), never during
+// replay.
+int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                                       uint32_t lane, const void *in_residual, void *out_residual,
+                                       LinearPolicyMode mode) {
+  if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
+    set_error("ignis_gdn_layer_graph: null argument");
+    return -1;
+  }
+  if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GDN) {
+    set_error("ignis_gdn_layer_graph: layer " + std::to_string(layer) + " is not a GDN layer");
+    return -1;
+  }
+  if (lane >= IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_gdn_layer_graph: lane " + std::to_string(lane) + " exceeds IGNIS_DECODE_MAX_BATCH");
+    return -1;
+  }
+  const uint32_t gdn_layer = layer - (layer + 1) / 4;
+  return run_gdn_layer_graph(model, pool, layer, lane, const_cast<void *>(in_residual), out_residual,
+                             gdn_layer, mode);
 }
 
 extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

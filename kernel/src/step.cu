@@ -751,7 +751,6 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
   const auto began = std::chrono::steady_clock::now();
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto batch = static_cast<std::int32_t>(batch_size);
-  uint64_t dispatches = 0;
   std::vector<int32_t> emitted(batch_size, -1);
   std::vector<std::int32_t> positions(batch_size, 0);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
@@ -770,19 +769,17 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       emitted[i] = seq->pending_token;
       positions[i] = static_cast<std::int32_t>(seq->position);
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
-      void *column = static_cast<std::uint8_t *>(model->sampling_decode_logits->p) +
-          i * static_cast<std::size_t>(vocab) * sizeof(std::uint16_t);
-      // P2-03 (GitHub #85): decode takes the engine's own compute-policy mode
-      // (ADR 0016: the flat decode ABI has no options struct, so the
-      // `A16_ONLY` override is reachable only through the prefill entry
-      // point) -- every NVFP4 projection in the decode round runs under
-      // AllowA4, the reference's text-model policy.
-      if (run_program_token_forward_only(model, pool, seq, emitted[i],
-                                         LinearPolicyMode::kEngineDefault, column) != 0) {
-        return -1;
-      }
-      dispatches += model->last_step_kernel_count;
     }
+
+    // P3-05 (GitHub #102, ADR 0019): a decode graph is captured per exact
+    // batch width, never padded -- a round at this exact width replays it
+    // when one is ready, otherwise falls back to the eager per-lane loop
+    // below unchanged. Both paths share the same sampling staging buffers
+    // and the same round semantics (atomic: no sequence's
+    // pending_token/position advances unless the whole round succeeds).
+    const bool use_graph =
+        batch_size >= 1 && batch_size <= IGNIS_DECODE_MAX_BATCH &&
+        model->decode_graph_ready[batch_size - 1];
 
     cudaError_t err =
         cudaMemcpyAsync(model->sampling_decode_configs->p, configs.data(),
@@ -803,12 +800,60 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
 
-    const ninfer::Tensor logits_tensor(model->sampling_decode_logits->p, ninfer::DType::BF16,
-                                       {vocab, batch, 1, 1});
-    ninfer::Tensor out_tensor(model->sampling_decode_out->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    const ninfer::Tensor positions_tensor(model->sampling_decode_positions->p, ninfer::DType::I32,
-                                          {batch, 1, 1, 1});
-    {
+    uint64_t dispatches = 0;
+    if (use_graph) {
+      std::vector<std::int32_t> slots(batch_size, 0);
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        slots[i] = sequences[i]->slot;
+      }
+      err = cudaMemcpyAsync(model->decode_graph_token_ids->p, emitted.data(),
+                            batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph token ids) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      err = cudaMemcpyAsync(model->decode_graph_slots->p, slots.data(),
+                            batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph slots) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      err = cudaGraphLaunch(model->decode_graph_exec[batch_size - 1], model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaGraphLaunch failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      // A replayed graph's kernel_count is whatever it captured, which this
+      // call does not separately track -- kernel_count stays meaningful for
+      // the eager path; graph_launches (below) is how a caller tells the
+      // two apart.
+    } else {
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        ignis_seq *seq = sequences[i];
+        void *column = static_cast<std::uint8_t *>(model->sampling_decode_logits->p) +
+            i * static_cast<std::size_t>(vocab) * sizeof(std::uint16_t);
+        // P2-03 (GitHub #85): decode takes the engine's own compute-policy
+        // mode (ADR 0016: the flat decode ABI has no options struct, so the
+        // `A16_ONLY` override is reachable only through the prefill entry
+        // point) -- every NVFP4 projection in the decode round runs under
+        // AllowA4, the reference's text-model policy.
+        if (run_program_token_forward_only(model, pool, seq, emitted[i],
+                                           LinearPolicyMode::kEngineDefault, column) != 0) {
+          return -1;
+        }
+        dispatches += model->last_step_kernel_count;
+      }
+
+      const ninfer::Tensor logits_tensor(model->sampling_decode_logits->p, ninfer::DType::BF16,
+                                         {vocab, batch, 1, 1});
+      ninfer::Tensor out_tensor(model->sampling_decode_out->p, ninfer::DType::I32, {batch, 1, 1, 1});
+      const ninfer::Tensor positions_tensor(model->sampling_decode_positions->p, ninfer::DType::I32,
+                                            {batch, 1, 1, 1});
       ninfer::DeviceArena::Scope workspace_scope = model->sampling_workspace->scope();
       ninfer::ops::sample(
           logits_tensor, out_tensor, vocab,
@@ -837,12 +882,13 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       sequences[i]->pending_token = successors[i];
       ++sequences[i]->position;
     }
+    model->last_step_kernel_count = dispatches;
+    model->last_step_graph_launches = use_graph ? 1 : 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program_decode: ") + e.what());
     return -1;
   }
 
-  model->last_step_kernel_count = dispatches;
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - began).count());
@@ -857,15 +903,28 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   }
   // P3-03 (GitHub #99): the sampling staging buffers and per-slot penalty
   // counts are real device allocations too, small as they are next to the
-  // weights and KV/GDN pools -- "VRAM reported" means all of it.
+  // weights and KV/GDN pools -- "VRAM reported" means all of it. P3-05
+  // (GitHub #102, ADR 0019) adds the decode graphs' own scratch and staging
+  // reservation -- separate from `scratch` above, so it is also separate
+  // here.
   out_stats->vram_bytes =
       model->vram_bytes + model->scratch->capacity() + pool->kv_arena.capacity() +
       pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
       model->sampling_single_configs->bytes + model->sampling_single_positions->bytes +
       model->sampling_single_out->bytes + model->sampling_decode_configs->bytes +
       model->sampling_decode_positions->bytes + model->sampling_decode_out->bytes +
-      model->sampling_decode_logits->bytes + model->sampling_workspace->capacity();
+      model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
+      model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
+      model->decode_graph_slots->bytes + model->decode_graph_zero->bytes;
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
+  out_stats->graph_launches = model->last_step_graph_launches;
+  uint32_t ready_mask = 0;
+  for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+    if (model->decode_graph_ready[width - 1]) {
+      ready_mask |= (1u << (width - 1));
+    }
+  }
+  out_stats->decode_graph_ready_mask = ready_mask;
   return 0;
 }

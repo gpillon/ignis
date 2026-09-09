@@ -18,6 +18,8 @@
 #include "ninfer/ops/qk_norm_rope.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include "ignis_step.h"
+
 #include "core/arena.h"
 #include "core/tensor.h"
 
@@ -243,6 +245,166 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   }
 }
 
+// P3-05 (GitHub #102, ADR 0019): the graph-safe counterpart of
+// `run_gqa_layer` for one decode lane (T=1 always -- a decode round). Every
+// address either belongs to the model/pool for their lifetime or is a
+// stable staging column `lane` selects, so the same kernel launches are
+// correct at capture time (arbitrary staged content) and at every later
+// replay (this round's real content, refreshed by the caller before
+// `cudaGraphLaunch`) -- see the declaration in layer_internal.h and ADR
+// 0019 for the full argument.
+int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                            uint32_t lane, void *in_residual, void *out_residual,
+                            uint32_t gqa_layer, LinearPolicyMode mode) {
+  constexpr std::int32_t kHeadDim = 256;
+  constexpr std::int32_t kQHeads = 24;
+  constexpr std::int32_t kKvHeads = 4;
+  constexpr std::int32_t kRotaryDim = 64;
+  constexpr float kRopeTheta = 10'000'000.0F;
+  constexpr std::int32_t kTokens = 1;
+
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto q_width = kHeadDim * kQHeads;
+  const auto kv_width = kHeadDim * kKvHeads;
+  const auto ffn = model->layers[layer].gqa.mlp_gate_up.n / 2;
+  const float attention_scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
+  const GqaLayerWeights &weights = model->layers[layer].gqa;
+  const auto stream = model->stream;
+
+  ninfer::DeviceArena::Scope scope = model->decode_graph_scratch->scope();
+  try {
+    ninfer::Tensor normalized =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, kTokens, 1, 1});
+    ninfer::Tensor query =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, kTokens, 1, 1});
+    ninfer::Tensor key =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, kTokens, 1, 1});
+    ninfer::Tensor gate =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, kTokens, 1, 1});
+    ninfer::Tensor value =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, kTokens, 1, 1});
+    ninfer::Tensor rotated_query =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, kTokens, 1, 1});
+    ninfer::Tensor rotated_key =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, kTokens, 1, 1});
+    ninfer::Tensor positions =
+        model->decode_graph_scratch->alloc(ninfer::DType::I32, {kTokens, 1, 1, 1});
+    ninfer::Tensor attention =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, kTokens, 1, 1});
+    ninfer::Tensor post = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, kTokens, 1, 1});
+    ninfer::Tensor fused = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {ffn, kTokens, 1, 1});
+
+    const ninfer::Tensor input(in_residual, ninfer::DType::BF16, {hidden, kTokens, 1, 1});
+    const ninfer::Tensor input_norm =
+        weight_tensor(weights.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(input, input_norm, model->rms_norm_eps, /*unit_offset=*/true,
+                         normalized, stream);
+
+    ninfer::ops::attn_input_proj(normalized, weights.query_key_gate_value, query, gate, key,
+                                 value, ignis_policy_for(weights.query_key_gate_value.qtype, mode),
+                                 *model->decode_graph_scratch, stream);
+
+    // Graph-safe position (ADR 0019): `positions[0] = 0 + sampling_decode_positions[lane]`,
+    // read from device memory at replay -- `fill_i32_positions`'s host-scalar
+    // `start` would freeze this round's position into the graph forever.
+    const ninfer::Tensor zero_source(model->decode_graph_zero->p, ninfer::DType::I32,
+                                     {1, 1, 1, 1});
+    const ninfer::Tensor position_delta(
+        static_cast<std::uint8_t *>(model->sampling_decode_positions->p) +
+            static_cast<std::size_t>(lane) * sizeof(std::int32_t),
+        ninfer::DType::I32, {1, 1, 1, 1});
+    ninfer::ops::offset_i32_positions(zero_source, position_delta, positions, stream);
+
+    const ninfer::Tensor q_norm =
+        weight_tensor(weights.query_norm, ninfer::DType::BF16, {kHeadDim, 1, 1, 1});
+    const ninfer::Tensor k_norm =
+        weight_tensor(weights.key_norm, ninfer::DType::BF16, {kHeadDim, 1, 1, 1});
+    const ninfer::ops::RopeFrequencies rope =
+        ninfer::ops::rope_linear_frequencies(kRopeTheta, kRotaryDim);
+    ninfer::Tensor query_heads = query.view({kHeadDim, kQHeads, kTokens, 1});
+    ninfer::Tensor key_heads = key.view({kHeadDim, kKvHeads, kTokens, 1});
+    ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, kTokens, 1});
+    ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, kTokens, 1});
+    ninfer::ops::qk_norm_rope(query_heads, key_heads, q_norm, k_norm, model->rms_norm_eps,
+                              positions, rope, rotated_query_heads, rotated_key_heads, stream);
+
+    // ADR 0019: the pool-wide block-table matrix (every physical slot, a
+    // fixed address independent of round composition) with `kv_table_rows`
+    // read from this round's staged physical slot for `lane` -- unlike the
+    // eager path's single-sequence view + constant row 0.
+    ninfer::PagedKVBatchLayerView batch_cache;
+    batch_cache.k_pages      = pool->kv_pool.plane(2 * gqa_layer);
+    batch_cache.v_pages      = pool->kv_pool.plane(2 * gqa_layer + 1);
+    batch_cache.block_tables = pool->kv_pool.block_tables();
+    batch_cache.head_dim     = kHeadDim;
+    batch_cache.num_kv_heads = kKvHeads;
+    batch_cache.dtype        = ninfer::DType::BF16;
+    const ninfer::Tensor kv_table_rows(
+        static_cast<std::uint8_t *>(model->decode_graph_slots->p) +
+            static_cast<std::size_t>(lane) * sizeof(std::int32_t),
+        ninfer::DType::I32, {1, 1, 1, 1});
+    ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, kTokens, 1});
+    // A fixed, conservative envelope (ADR 0019): `max_visible_keys` is a
+    // host launch-resource promise for workspace sizing and kernel-route
+    // selection, not the causal mask (the mask comes from `positions`
+    // above, read per row inside the kernel) -- so the sequence pool's
+    // configured cap is always a safe over-approximation, regardless of
+    // this lane's actual current position, and lets one captured graph
+    // serve every round at this width.
+    const ninfer::ops::GqaExecutionEnvelope envelope{
+        .min_visible_keys = 1,
+        .max_visible_keys = model->max_context_tokens,
+    };
+    const std::size_t attention_workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
+        kQHeads, ninfer::DType::BF16, envelope, /*batch_size=*/1, kTokens, kTokens);
+    const ninfer::DeviceSpan attention_workspace_storage =
+        model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
+    cudaError_t error = cudaMemsetAsync(attention_workspace_storage.data, 0,
+                                        attention_workspace_storage.bytes, stream);
+    if (error != cudaSuccess) {
+      set_error(std::string("ignis_gqa_layer_graph: cudaMemsetAsync(attention workspace) failed: ") +
+                cudaGetErrorString(error));
+      return -1;
+    }
+    ninfer::DeviceArena attention_workspace(attention_workspace_storage);
+    ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, kTokens, 1});
+    ninfer::ops::gqa_attention(
+        rotated_query_heads, rotated_key_heads, value_heads, positions,
+        /*valid_columns=*/ninfer::Tensor{}, kv_table_rows,
+        gate.view({kHeadDim, kQHeads, kTokens, 1}), attention_scale, batch_cache, envelope,
+        attention_workspace, attention_heads, stream);
+
+    ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, kTokens, 1, 1});
+    error = cudaMemcpyAsync(out_residual, in_residual,
+                            static_cast<std::size_t>(hidden) * kTokens * sizeof(uint16_t),
+                            cudaMemcpyDeviceToDevice, stream);
+    if (error != cudaSuccess) {
+      set_error(std::string("ignis_gqa_layer_graph: cudaMemcpyAsync(residual) failed: ") +
+                cudaGetErrorString(error));
+      return -1;
+    }
+    ninfer::ops::linear_add(attention, weights.output, residual,
+                            ignis_policy_for(weights.output.qtype, mode), *model->decode_graph_scratch,
+                            stream);
+
+    const ninfer::Tensor post_norm =
+        weight_tensor(weights.post_attention_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
+    ninfer::ops::rmsnorm(residual, post_norm, model->rms_norm_eps, /*unit_offset=*/true, post,
+                         stream);
+    ninfer::ops::linear_swiglu(
+        post, weights.mlp_gate_up, fused,
+        ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, kTokens),
+        *model->decode_graph_scratch, stream);
+    ninfer::ops::linear_add(fused, weights.mlp_down, residual,
+                            ignis_policy_for(weights.mlp_down.qtype, mode), *model->decode_graph_scratch,
+                            stream);
+    return 0;
+  } catch (const std::exception &error) {
+    set_error(std::string("ignis_gqa_layer_graph: ") + error.what());
+    return -1;
+  }
+}
+
 }  // namespace
 
 // P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
@@ -319,6 +481,33 @@ int32_t ignis_gqa_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
   // failed synchronize.
   seq->gqa_positions[gqa_layer] += static_cast<std::uint32_t>(num_tokens);
   return 0;
+}
+
+// P3-05 (GitHub #102, ADR 0019): validates and dispatches
+// `run_gqa_layer_graph` -- called once per GQA layer per lane while a decode
+// graph is being captured (`kernel/src/decode_graph.cu`). Never called
+// during replay: replay only ever re-executes the kernel launches this call
+// enqueued at capture time, so this function does no host-visible branching
+// on device data and no stream synchronization -- exactly what
+// `run_gqa_layer_graph` above upholds.
+int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                                       uint32_t lane, const void *in_residual, void *out_residual,
+                                       LinearPolicyMode mode) {
+  if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
+    set_error("ignis_gqa_layer_graph: null argument");
+    return -1;
+  }
+  if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
+    set_error("ignis_gqa_layer_graph: layer " + std::to_string(layer) + " is not a GQA layer");
+    return -1;
+  }
+  if (lane >= IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_gqa_layer_graph: lane " + std::to_string(lane) + " exceeds IGNIS_DECODE_MAX_BATCH");
+    return -1;
+  }
+  const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
+  return run_gqa_layer_graph(model, pool, layer, lane, const_cast<void *>(in_residual), out_residual,
+                             gqa_layer, mode);
 }
 
 extern "C" int32_t ignis_gqa_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

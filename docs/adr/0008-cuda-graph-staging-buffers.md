@@ -2,7 +2,7 @@
 
 ## Status
 
-Superseded (2026-09-05) by ADR 0009 (step-level device-resident C ABI) — see `.scratch/runtime/specs/01-device-resident-forward.md`, GitHub #36. The staging-buffer graph model captured a non-model toy sequence; decode graphs will capture the batched decode round over per-slot state views (G3). Originally accepted 2026-09-04.
+Superseded (2026-09-05) by ADR 0009 (step-level device-resident C ABI) — see `.scratch/runtime/specs/01-device-resident-forward.md`, GitHub #36. The staging-buffer graph model captured a non-model toy sequence; decode graphs will capture the batched decode round over per-slot state views (G3). Originally accepted 2026-09-04. The decode graph this ADR anticipated landed as ADR 0019 (P3-05, GitHub #102): it keeps this ADR's persistent-staging-buffer principle but resolves round composition through device-resident slot indices rather than the fixed representative geometry this ADR assumed.
 
 ## Context
 
