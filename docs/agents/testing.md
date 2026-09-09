@@ -25,6 +25,16 @@ until the test suite is green.
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).
+- A `--features cuda` build rebuilds the leaf for you.
+  `crates/artifact/build.rs` watches every file under `kernel/src`,
+  `kernel/include`, `kernel/tests`, `kernel/vendor/src` and
+  `kernel/vendor/include` (plus `CMakeLists.txt` and `build.ps1`) and runs
+  `kernel/build.ps1` whenever one changes; a build with nothing to do costs
+  a few seconds. Do not trust a binary built any other way to carry your
+  kernel change: until GitHub #94 that script rebuilt only when
+  `kernel/build/*.lib` was *missing*, so an edited `.cu` was linked from
+  the previous archive with every test around it still green. That is what
+  invalidated the first G2 gate run (#93).
 
 ## The GPU test profile (ADR 0006, GitHub #38)
 

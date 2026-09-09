@@ -49,8 +49,9 @@ pub struct CudaLeafConfig {
     /// nonzero multiple of 128, validated by the server's config module
     /// before any loader work starts. `ignis_model_load` reserves the
     /// program scratch for a chunk of this width at load time (P2-01,
-    /// GitHub #83); the chunk loop itself lands with GitHub #84, which is
-    /// why prefill still walks the span one token at a time today.
+    /// GitHub #83), and the chunk loop that spends it landed with GitHub
+    /// #84: prefill traverses a span one chunk at a time, synchronizing
+    /// once per chunk, not once per token.
     pub prefill_chunk_tokens: u32,
 }
 
