@@ -271,8 +271,18 @@ curl http://127.0.0.1:8000/v1/responses \
 ```
 
 - **Chat completions** accept `messages` (role + content), `model`, `stream`,
-  `temperature` (default 0.0 = greedy), `max_tokens`, and `seed`. Non-streaming
-  returns `choices[].message.content` + `usage`; streaming emits
+  `max_tokens`, `temperature` (0..2), `top_p` (0..1), `presence_penalty` and
+  `frequency_penalty` (-2..2), and a signed 64-bit `seed`. `top_k` is an
+  **ignis extension**, not an OpenAI Chat Completions parameter: accepted
+  values are 0..20, where 0 selects ignis's 20-candidate sampler cap during
+  stochastic sampling. Values outside these ranges are rejected with
+  `invalid_sampling_parameter`; they are never silently clamped. Absent
+  sampling fields preserve the existing greedy, fixed-seed behavior
+  (`temperature: 0`, `seed: 0`). Because the leaf's greedy branch
+  intentionally does not read stochastic filters or penalties, a non-neutral
+  `top_p`, `top_k`, `presence_penalty`, or `frequency_penalty` requires
+  `temperature > 0` and is otherwise rejected instead of ignored.
+  Non-streaming returns `choices[].message.content` + `usage`; streaming emits
   `chat.completion.chunk` SSE frames (token deltas, a final `finish_reason`
   chunk, then `[DONE]`).
 - **The responses API** accepts `input` (a string or a message list), `model`,

@@ -33,11 +33,13 @@ use serde_json::Value as JsonValue;
 
 use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
 
-use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{collect_tokens, EventStream};
-use crate::template::{ChatMessage, TemplateProvider};
-use crate::thinking::{self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields};
 use crate::Server;
+use crate::decoder::{Channel, OutputDecoder};
+use crate::engine::{EventStream, collect_tokens};
+use crate::template::{ChatMessage, TemplateProvider};
+use crate::thinking::{
+    self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
+};
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 pub fn router(state: Arc<Server>) -> Router {
@@ -47,10 +49,7 @@ pub fn router(state: Arc<Server>) -> Router {
             "/v1/chat/completions",
             post(chat_completions).options(cors_preflight),
         )
-        .route(
-            "/v1/responses",
-            post(responses_api).options(cors_preflight),
-        )
+        .route("/v1/responses", post(responses_api).options(cors_preflight))
         .layer(middleware::from_fn(cors_headers))
         .with_state(state)
 }
@@ -66,10 +65,7 @@ async fn cors_preflight() -> StatusCode {
 async fn cors_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
-    headers.insert(
-        "Access-Control-Allow-Origin",
-        HeaderValue::from_static("*"),
-    );
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     headers.insert(
         "Access-Control-Allow-Methods",
         HeaderValue::from_static("GET, POST, OPTIONS"),
@@ -88,9 +84,7 @@ fn build_request(
     server: &Server,
     model: Option<String>,
     messages: &[ChatMessage],
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    seed: Option<u64>,
+    params: DecodeParams,
     thinking: &ThinkingOptions,
 ) -> (RequestInput, String, u32) {
     // `model` is the model the request names; `None` (or a blank) falls
@@ -107,13 +101,125 @@ fn build_request(
     let input = RequestInput {
         model: model.clone(),
         tokens,
-        params: DecodeParams {
-            max_tokens,
-            temperature: temperature.unwrap_or(0.0), // 0.0 = greedy (the v1 gate)
-            seed: seed.unwrap_or(0),
-        },
+        params,
     };
     (input, model, prompt_tokens)
+}
+
+/// The sampling fields accepted by chat completions. Values stay as JSON at
+/// the wire boundary so type, integer-width, and narrowing failures all use
+/// the same OpenAI-shaped sampling error instead of Axum's generic rejection.
+#[derive(Clone, Default, Deserialize)]
+struct SamplingRequestFields {
+    temperature: Option<JsonValue>,
+    top_p: Option<JsonValue>,
+    /// An ignis extension, not an OpenAI Chat Completions parameter.
+    top_k: Option<JsonValue>,
+    presence_penalty: Option<JsonValue>,
+    frequency_penalty: Option<JsonValue>,
+    seed: Option<JsonValue>,
+}
+
+impl SamplingRequestFields {
+    fn resolve(self, max_tokens: Option<u32>) -> Result<DecodeParams, String> {
+        let temperature = bounded_f32(
+            "temperature",
+            number("temperature", self.temperature, 0.0)?,
+            0.0,
+            2.0,
+        )?;
+        let top_p = bounded_f32("top_p", number("top_p", self.top_p, 1.0)?, 0.0, 1.0)?;
+        let presence_penalty = bounded_f32(
+            "presence_penalty",
+            number("presence_penalty", self.presence_penalty, 0.0)?,
+            -2.0,
+            2.0,
+        )?;
+        let frequency_penalty = bounded_f32(
+            "frequency_penalty",
+            number("frequency_penalty", self.frequency_penalty, 0.0)?,
+            -2.0,
+            2.0,
+        )?;
+        let top_k = signed_integer(
+            "top_k is an ignis extension and must be an integer",
+            self.top_k,
+            0,
+        )?;
+        if !(0..=20).contains(&top_k) {
+            return Err(format!(
+                "top_k is an ignis extension and must be between 0 and 20 inclusive; 0 selects ignis's 20-candidate sampler cap (got {top_k})"
+            ));
+        }
+
+        if temperature == 0.0
+            && (top_p != 1.0
+                || (top_k != 0 && top_k != 20)
+                || presence_penalty != 0.0
+                || frequency_penalty != 0.0)
+        {
+            return Err(
+                "temperature must be greater than 0 when top_p, the ignis top_k extension, presence_penalty, or frequency_penalty would otherwise be ignored by greedy sampling"
+                    .into(),
+            );
+        }
+
+        Ok(DecodeParams {
+            max_tokens,
+            temperature,
+            top_p,
+            top_k: top_k as i32,
+            presence_penalty,
+            frequency_penalty,
+            // The leaf keys its counter-based RNG with all 64 bits. Casting
+            // preserves the complete signed OpenAI seed domain bit-for-bit.
+            seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
+        })
+    }
+}
+
+fn number(name: &str, value: Option<JsonValue>, default: f64) -> Result<f64, String> {
+    match value {
+        None => Ok(default),
+        Some(JsonValue::Number(value)) => value
+            .as_f64()
+            .ok_or_else(|| format!("{name} must be a finite number")),
+        Some(value) => Err(format!("{name} must be a number (got {value})")),
+    }
+}
+
+fn signed_integer(message: &str, value: Option<JsonValue>, default: i64) -> Result<i64, String> {
+    match value {
+        None => Ok(default),
+        Some(JsonValue::Number(value)) => value.as_i64().ok_or_else(|| message.to_owned()),
+        Some(_) => Err(message.to_owned()),
+    }
+}
+
+fn bounded_f32(name: &str, value: f64, min: f64, max: f64) -> Result<f32, String> {
+    if value.is_finite() && (min..=max).contains(&value) {
+        let narrowed = value as f32;
+        if value != 0.0 && narrowed == 0.0 {
+            Err(format!(
+                "{name} magnitude is too small to be represented by the engine (got {value})"
+            ))
+        } else {
+            Ok(narrowed)
+        }
+    } else {
+        Err(format!(
+            "{name} must be between {min} and {max} inclusive (got {value})"
+        ))
+    }
+}
+
+fn invalid_sampling_parameter(message: impl Into<String>) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "invalid_sampling_parameter",
+        message,
+    )
 }
 
 /// Resolve one request's thinking controls, or the OpenAI-shaped 400 to
@@ -160,7 +266,14 @@ fn split_reasoning(
             Channel::Content => content.push_str(&delta.text),
         }
     }
-    (if reasoning.is_empty() { None } else { Some(reasoning) }, content)
+    (
+        if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        },
+        content,
+    )
 }
 
 /// Map a [`SubmitError`] from the engine's submit to the OpenAI-shaped
@@ -190,7 +303,12 @@ fn submit_error(server: &Server, err: SubmitError) -> Response {
 
 /// A 400 with the OpenAI error body.
 fn bad_request(message: &str) -> Response {
-    error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_request_error", message)
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "invalid_request_error",
+        message,
+    )
 }
 
 /// The OpenAI error body (`{"error": {message, type, code}}`).
@@ -276,9 +394,9 @@ struct ChatCompletionsRequest {
     /// Streaming-only options. `include_usage: true` appends the trailing
     /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
     stream_options: Option<StreamOptions>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
-    seed: Option<u64>,
+    #[serde(flatten)]
+    sampling: SamplingRequestFields,
     /// The thinking controls (GitHub #68) — kept as raw JSON so the wire
     /// contract's tri-state semantics (absent / `null` / a bad type) and
     /// its own error messages are decided by `thinking::resolve`, not by
@@ -308,6 +426,10 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
+    let params = match req.sampling.resolve(req.max_tokens) {
+        Ok(params) => params,
+        Err(message) => return invalid_sampling_parameter(message),
+    };
     let thinking = match resolve_thinking(
         &server,
         ThinkingRequestFields {
@@ -320,15 +442,8 @@ async fn chat_completions(
         Ok(t) => t,
         Err(response) => return response,
     };
-    let (input, model, prompt_tokens) = build_request(
-        &server,
-        req.model,
-        &req.messages,
-        req.temperature,
-        req.max_tokens,
-        req.seed,
-        &thinking,
-    );
+    let (input, model, prompt_tokens) =
+        build_request(&server, req.model, &req.messages, params, &thinking);
     let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
@@ -616,8 +731,9 @@ impl Stream for ChunkStream {
                         for delta in this.decoder.finish() {
                             this.pending.push_back(this.delta_chunk(delta));
                         }
-                        this.pending
-                            .push_back(this.chunk(Delta::default(), Some(finish_reason_str(reason))));
+                        this.pending.push_back(
+                            this.chunk(Delta::default(), Some(finish_reason_str(reason))),
+                        );
                         if this.include_usage {
                             this.pending.push_back(this.usage_chunk(tokens));
                         }
@@ -704,9 +820,12 @@ async fn responses_api(
         &server,
         req.model,
         &messages,
-        req.temperature,
-        req.max_output_tokens,
-        req.seed,
+        DecodeParams {
+            max_tokens: req.max_output_tokens,
+            temperature: req.temperature.unwrap_or(0.0),
+            seed: req.seed.unwrap_or(0),
+            ..DecodeParams::default()
+        },
         &thinking,
     );
     let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
@@ -912,11 +1031,10 @@ mod tests {
             _ => panic!("a string input must parse as Text"),
         }
         // `input: [...]` → a message list.
-        let req: ResponsesRequest =
-            serde_json::from_value(serde_json::json!({ "input": [
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({ "input": [
                 { "role": "user", "content": "hi" }
             ] }))
-            .expect("message input parses");
+        .expect("message input parses");
         match req.input {
             ResponsesInput::Messages(m) => {
                 assert_eq!(m.len(), 1);

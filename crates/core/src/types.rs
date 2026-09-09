@@ -56,14 +56,24 @@ pub struct RequestInput {
 
 /// Sampling / decoding parameters for a request.
 ///
-/// v1 correctness floor is **greedy + fixed seed** (ADR 0007); `temperature`
-/// is carried for the future but the acceptance gate is greedy.
-#[derive(Debug, Clone, Copy)]
+/// The default remains **greedy + fixed seed** (ADR 0007). Positive
+/// temperature enables the leaf's stochastic sampler, where the remaining
+/// fields are applied per request (P3-04, GitHub #101).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecodeParams {
     /// Cap on generated tokens (`None` = until EOS / model max).
     pub max_tokens: Option<u32>,
-    /// Sampling temperature (0 = greedy). v1 gate is greedy.
+    /// Sampling temperature (`0` = greedy).
     pub temperature: f32,
+    /// Nucleus-sampling probability mass (`1` disables top-p filtering).
+    pub top_p: f32,
+    /// Candidate cap (`0` selects the leaf's 20-candidate default). This is
+    /// an ignis extension, not part of the OpenAI Chat Completions standard.
+    pub top_k: i32,
+    /// One-time penalty for tokens already present in this sequence.
+    pub presence_penalty: f32,
+    /// Per-occurrence penalty for tokens already present in this sequence.
+    pub frequency_penalty: f32,
     /// Sampling seed (fixed for reproducibility / the self-check).
     pub seed: u64,
 }
@@ -73,6 +83,10 @@ impl Default for DecodeParams {
         Self {
             max_tokens: None,
             temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
         }
     }

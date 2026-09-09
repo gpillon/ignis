@@ -75,8 +75,8 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
-    use ignis_artifact::{bind_text_scope_27b, materialize, CudaDevice, Reader};
-    use ignis_runtime::{kv_pool_pages, CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
+    use ignis_artifact::{CudaDevice, Reader, bind_text_scope_27b, materialize};
+    use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS, kv_pool_pages};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     let (plan, handles) =
@@ -94,9 +94,7 @@ pub fn cuda_scheduler(
     let max_sequence_tokens = leaf_config.max_context_tokens;
     let kv_pool_tokens = leaf_config.kv_pool_tokens;
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
-    let model = Arc::new(
-        Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?,
-    );
+    let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
 
     // Match the scheduler's KV admission accounting to the pool the leaf
     // actually built. Both sides derive the page count from
@@ -183,6 +181,7 @@ mod tests {
             _sequence: &mut Self::Sequence,
             _tokens: &[TokenId],
             _start_position: u32,
+            _params: DecodeParams,
         ) -> Result<(), i32> {
             Ok(())
         }
@@ -190,6 +189,7 @@ mod tests {
             &self,
             _model: &Self::Model,
             sequences: &mut [&mut Self::Sequence],
+            _params: &[DecodeParams],
         ) -> Result<Vec<TokenId>, i32> {
             Ok(vec![7; sequences.len()])
         }

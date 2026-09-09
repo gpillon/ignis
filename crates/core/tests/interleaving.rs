@@ -74,7 +74,56 @@ fn a_long_prompt_is_split_into_chunk_wide_jobs() {
     assert_eq!(jobs_for_id[0].start_position, 0);
     assert_eq!(jobs_for_id[1].start_position, 4);
     assert_eq!(jobs_for_id[2].start_position, 8);
-    assert_eq!(jobs_for_id[2].tokens.len(), 2, "the last chunk carries the remainder");
+    assert_eq!(
+        jobs_for_id[2].tokens.len(),
+        2,
+        "the last chunk carries the remainder"
+    );
+}
+
+#[test]
+fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = sched_with_chunk(4, compute.clone());
+    let sampling = DecodeParams {
+        max_tokens: Some(1),
+        temperature: 0.8,
+        top_p: 0.7,
+        top_k: 7,
+        presence_penalty: 0.4,
+        frequency_penalty: -0.4,
+        seed: 9,
+    };
+    sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (1..=10).collect(),
+                params: sampling,
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+
+    while !sched.is_idle() {
+        sched.advance();
+    }
+
+    let calls = compute.prefill_calls();
+    let params: Vec<DecodeParams> = calls
+        .iter()
+        .flat_map(|batch| batch.iter().map(|job| job.params))
+        .collect();
+    assert_eq!(params.len(), 3);
+    assert_eq!(
+        params[0],
+        DecodeParams {
+            max_tokens: sampling.max_tokens,
+            ..DecodeParams::default()
+        }
+    );
+    assert_eq!(params[1], params[0]);
+    assert_eq!(params[2], sampling);
 }
 
 #[test]
@@ -115,7 +164,10 @@ fn a_decode_round_accompanies_every_chunk_while_a_lane_is_decode_ready() {
         prev_prefill = prefill_calls;
         prev_decode = decode_calls;
     }
-    assert!(saw_a_chunk, "the long prompt must have needed at least one chunk");
+    assert!(
+        saw_a_chunk,
+        "the long prompt must have needed at least one chunk"
+    );
 }
 
 #[test]
@@ -220,7 +272,11 @@ fn a_failed_chunk_retry_does_not_resend_an_already_applied_span() {
         "a failed chunk must not advance progress"
     );
     sched.advance(); // call #2 (the retry): must resend the same 4..8 span
-    assert_eq!(sched.prefill_progress(id), Some(8), "the retry applied chunk 2");
+    assert_eq!(
+        sched.prefill_progress(id),
+        Some(8),
+        "the retry applied chunk 2"
+    );
 
     let jobs_for_id: Vec<PrefillJob> = compute
         .inner
@@ -254,7 +310,10 @@ fn cancel_mid_prefill_aborts_and_releases_without_finishing() {
     assert_eq!(sched.request_state(id), Some(RequestState::Prefilling));
     assert_eq!(sched.prefill_progress(id), Some(4));
 
-    assert!(sched.cancel(id), "cancel must succeed on an in-flight request");
+    assert!(
+        sched.cancel(id),
+        "cancel must succeed on an in-flight request"
+    );
     let calls_before = compute.prefill_calls().len();
 
     sched.advance(); // the abort takes effect: no further chunk is sent
@@ -269,7 +328,11 @@ fn cancel_mid_prefill_aborts_and_releases_without_finishing() {
         "a cancelled request is never sent another chunk"
     );
     assert!(sched.is_idle());
-    assert_eq!(sched.kv_used_pages(), 0, "the cancelled request's reservation is released");
+    assert_eq!(
+        sched.kv_used_pages(),
+        0,
+        "the cancelled request's reservation is released"
+    );
 
     // Cancelling again (already Done) reports nothing to cancel.
     assert!(!sched.cancel(id));
@@ -287,7 +350,9 @@ fn gdn_position_keeps_advancing_through_decode_after_a_chunked_prefill() {
     let mut sched = sched_with_chunk(4, compute);
     let prompt: Vec<u32> = (1..=10).collect();
     let prompt_len = prompt.len();
-    let id = sched.submit(input(&prompt, 5), RequestClass::Agent).unwrap();
+    let id = sched
+        .submit(input(&prompt, 5), RequestClass::Agent)
+        .unwrap();
 
     // Drive prefill to completion (3 chunks at width 4) and the lane deal.
     // The tick that deals the lane also runs this tick's decode round in
@@ -313,8 +378,14 @@ fn gdn_position_keeps_advancing_through_decode_after_a_chunked_prefill() {
     let mut previous = after_first_decode;
     for _ in 0..3 {
         sched.advance();
-        let now = sched.gdn_position(id).expect("still known to the scheduler");
-        assert_eq!(now, previous + 1, "each decode tick must advance the position by one");
+        let now = sched
+            .gdn_position(id)
+            .expect("still known to the scheduler");
+        assert_eq!(
+            now,
+            previous + 1,
+            "each decode tick must advance the position by one"
+        );
         previous = now;
     }
 }

@@ -86,8 +86,8 @@ use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
 use crate::types::{
-    BackfillClass, ComputeError, EngineMode, FinishReason, LaneId, N_DECODE_LANES, RequestClass,
-    RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
+    BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
+    RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
 };
 
 /// Knobs for the concrete scheduler (v1 defaults; the KV-RAM host tier
@@ -335,7 +335,10 @@ impl ConcreteScheduler {
     fn available_capacity(&self) -> AdmissionResources {
         AdmissionResources {
             lanes: self.capacity.lanes,
-            kv_pages: self.capacity.kv_pages.saturating_sub(self.prefix.pinned_pages()),
+            kv_pages: self
+                .capacity
+                .kv_pages
+                .saturating_sub(self.prefix.pinned_pages()),
             backend_pages: self.capacity.backend_pages,
         }
     }
@@ -648,7 +651,10 @@ impl ConcreteScheduler {
     /// The request's lifecycle state (test / telemetry observability).
     /// `None` when `request` is unknown.
     pub fn request_state(&self, request: RequestId) -> Option<RequestState> {
-        self.requests.iter().find(|r| r.id == request).map(|r| r.state)
+        self.requests
+            .iter()
+            .find(|r| r.id == request)
+            .map(|r| r.state)
     }
 
     /// The request's prefill progress (P3-01, ADR 0018): prompt tokens
@@ -1028,7 +1034,8 @@ impl Scheduler for ConcreteScheduler {
         if active.is_none()
             && let Some(cut) = batch.iter().position(|&i| {
                 let r = &self.requests[i];
-                (r.input.tokens.len() as u32 - r.prefill_progress) > self.config.serving_chunk_tokens
+                (r.input.tokens.len() as u32 - r.prefill_progress)
+                    > self.config.serving_chunk_tokens
             })
         {
             batch.truncate(cut + 1);
@@ -1045,6 +1052,19 @@ impl Scheduler for ConcreteScheduler {
                 let remaining = r.input.tokens.len() as u32 - start;
                 let take = remaining.min(self.config.serving_chunk_tokens);
                 let tokens = r.input.tokens[start as usize..(start + take) as usize].to_vec();
+                // A stochastic prefill samples and updates the sequence's
+                // penalty-count row. Only the final chunk's successor is
+                // ever emitted; intermediate successors are discarded by
+                // the next prompt chunk and therefore must stay greedy (the
+                // greedy leaf branch has no sampling-state side effect).
+                let params = if take == remaining {
+                    r.input.params
+                } else {
+                    DecodeParams {
+                        max_tokens: r.input.params.max_tokens,
+                        ..DecodeParams::default()
+                    }
+                };
                 PrefillJob {
                     request: r.id,
                     tokens,
@@ -1058,7 +1078,7 @@ impl Scheduler for ConcreteScheduler {
                         )
                         .min(u32::MAX as u64)) as u32,
                     start_position: start,
-                    params: r.input.params,
+                    params,
                 }
             })
             .collect();
@@ -1097,18 +1117,14 @@ impl Scheduler for ConcreteScheduler {
                         // the registrant's own reservation keeps the
                         // residual, the entry holds the shared pages).
                         if self.requests[i].prefix_entry.is_none() {
-                            let registered = self.prefix
-                                .register(
-                                    &self.requests[i].input.tokens,
-                                    &self.requests[i].gdn,
-                                );
+                            let registered = self
+                                .prefix
+                                .register(&self.requests[i].input.tokens, &self.requests[i].gdn);
                             if let Some((entry, pages)) = registered {
                                 let r = &mut self.requests[i];
                                 r.prefix_entry = Some(entry);
-                                r.resources.kv_pages =
-                                    r.resources.kv_pages.saturating_sub(pages);
-                                self.kv_used_pages =
-                                    self.kv_used_pages.saturating_add(pages);
+                                r.resources.kv_pages = r.resources.kv_pages.saturating_sub(pages);
+                                self.kv_used_pages = self.kv_used_pages.saturating_add(pages);
                             }
                         }
                     }

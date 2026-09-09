@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ignis_core::{
-    Compute, ComputeError, DecodeJob, DecodeOutcome, FinishReason, PrefillJob, RequestId, TokenId,
+    Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason, N_DECODE_LANES,
+    PrefillJob, RequestId, TokenId,
 };
 
 #[cfg(feature = "cuda")]
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
-pub use cuda_leaf::{kv_pool_pages, CudaLeaf, CudaLeafConfig, CudaModel, KV_PAGE_TOKENS};
+pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel, KV_PAGE_TOKENS, kv_pool_pages};
 
 /// The default prefill chunk width, in tokens (spec
 /// `.scratch/runtime/specs/02-real-prefill.md`): the reference's own
@@ -132,14 +133,17 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequence: &mut Self::Sequence,
         tokens: &[TokenId],
         start_position: u32,
+        params: DecodeParams,
     ) -> Result<(), i32>;
-    /// Decode one round over a batch of warmed sequences. On an error, the
-    /// leaf must leave every input sequence unchanged so the scheduler can
-    /// retry the round without corrupting token order.
+    /// Decode one round over a batch of warmed sequences with one parameter
+    /// set per sequence. `params` is parallel to `sequences`. On an error,
+    /// the leaf must leave every input sequence unchanged so the scheduler
+    /// can retry the round without corrupting token order.
     fn decode(
         &self,
         model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
+        params: &[DecodeParams],
     ) -> Result<Vec<TokenId>, i32>;
 }
 
@@ -256,6 +260,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 &mut sequence.handle,
                 &job.tokens,
                 job.start_position,
+                job.params,
             ) {
                 // Core retries a failed *batch*, not only this job. Return
                 // every batch sequence to zero state so that retry does not
@@ -275,6 +280,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        if jobs.len() > N_DECODE_LANES {
+            return Err(ComputeError::Kernel(-1));
+        }
         let mut sequences = self.sequences.lock().unwrap();
         let mut batch: Vec<(DecodeJob, LiveSequence<L::Sequence>)> = Vec::with_capacity(jobs.len());
         for job in jobs {
@@ -304,13 +312,23 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             }
         }
         let decoded = {
+            let mut params = [DecodeParams::default(); N_DECODE_LANES];
+            let mut params_len = 0;
+            for (index, (job, _)) in batch.iter().enumerate() {
+                if active[index] {
+                    params[params_len] = job.params;
+                    params_len += 1;
+                }
+            }
             let mut handles: Vec<&mut L::Sequence> = batch
                 .iter_mut()
                 .enumerate()
                 .filter(|(index, _)| active[*index])
                 .map(|(_, (_, sequence))| &mut sequence.handle)
                 .collect();
-            self.model.leaf.decode(self.model.handle(), &mut handles)
+            self.model
+                .leaf
+                .decode(self.model.handle(), &mut handles, &params[..params_len])
         };
         let decoded = match decoded {
             Ok(tokens) if tokens.len() == active.iter().filter(|&&active| active).count() => tokens,

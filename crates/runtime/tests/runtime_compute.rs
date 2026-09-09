@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use ignis_core::{
-    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams,
-    FinishReason, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
+    N_DECODE_LANES, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
 };
 use ignis_runtime::{Model, RuntimeCompute, RuntimeStats, StepLeaf};
 
@@ -14,7 +14,9 @@ struct Calls {
     sequences_allocated: Vec<u32>,
     sequences_released: u32,
     prefill_positions: Vec<u32>,
+    prefill_params: Vec<DecodeParams>,
     decode_batch_sizes: Vec<usize>,
+    decode_params: Vec<Vec<DecodeParams>>,
 }
 
 struct StubLeaf {
@@ -134,10 +136,12 @@ impl StepLeaf for StubLeaf {
         _sequence: &mut Self::Sequence,
         _tokens: &[u32],
         start_position: u32,
+        params: DecodeParams,
     ) -> Result<(), i32> {
         let call = {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
+            calls.prefill_params.push(params);
             calls.prefill_positions.len()
         };
         self.prefill_error
@@ -153,21 +157,100 @@ impl StepLeaf for StubLeaf {
         &self,
         _model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
+        params: &[DecodeParams],
     ) -> Result<Vec<u32>, i32> {
         if let Some(code) = self.decode_error {
             return Err(code);
         }
-        self.calls
-            .lock()
-            .unwrap()
-            .decode_batch_sizes
-            .push(sequences.len());
+        let mut calls = self.calls.lock().unwrap();
+        calls.decode_batch_sizes.push(sequences.len());
+        calls.decode_params.push(params.to_vec());
+        drop(calls);
         let mut tokens = self.tokens.lock().unwrap();
         Ok(sequences
             .iter()
             .map(|_| tokens.pop_front().unwrap_or(7))
             .collect())
     }
+}
+
+#[test]
+fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
+    let leaf = Arc::new(StubLeaf::with_tokens([7, 8]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let left = DecodeParams {
+        max_tokens: Some(3),
+        temperature: 0.5,
+        top_p: 0.7,
+        top_k: 7,
+        presence_penalty: 0.4,
+        frequency_penalty: -0.4,
+        seed: 9,
+    };
+    let right = DecodeParams {
+        max_tokens: Some(4),
+        temperature: 1.2,
+        top_p: 0.8,
+        top_k: 12,
+        presence_penalty: -0.3,
+        frequency_penalty: 0.6,
+        seed: 11,
+    };
+    compute
+        .prefill_step(&[
+            PrefillJob {
+                request: 1,
+                tokens: vec![4, 5],
+                context_tokens: 9,
+                start_position: 0,
+                params: left,
+            },
+            PrefillJob {
+                request: 2,
+                tokens: vec![4, 5],
+                context_tokens: 9,
+                start_position: 0,
+                params: right,
+            },
+        ])
+        .unwrap();
+
+    compute
+        .decode_step(&[
+            DecodeJob {
+                request: 1,
+                lane: 0,
+                params: left,
+            },
+            DecodeJob {
+                request: 2,
+                lane: 1,
+                params: right,
+            },
+        ])
+        .unwrap();
+
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.prefill_params, vec![left, right]);
+    assert_eq!(calls.decode_params, vec![vec![left, right]]);
+}
+
+#[test]
+fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let jobs: Vec<_> = (0..=N_DECODE_LANES)
+        .map(|request| DecodeJob {
+            request: request as u64,
+            lane: request,
+            params: DecodeParams::default(),
+        })
+        .collect();
+
+    assert_eq!(compute.decode_step(&jobs), Err(ComputeError::Kernel(-1)));
+    assert_eq!(compute.live_sequences(), 0);
 }
 
 fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {

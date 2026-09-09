@@ -21,11 +21,11 @@
 
 #![cfg(feature = "cuda")]
 
+use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step;
-use ignis_core::{ModelConfig, N_DECODE_LANES, TokenId};
-use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
+use ignis_core::{DecodeParams, ModelConfig, N_DECODE_LANES, TokenId};
 
 use crate::{RuntimeStats, StepLeaf};
 
@@ -250,14 +250,16 @@ impl StepLeaf for CudaLeaf {
         sequence: &mut Self::Sequence,
         tokens: &[TokenId],
         start_position: u32,
+        params: DecodeParams,
     ) -> Result<(), i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        step::prefill_program(
+        step::prefill_program_sampled(
             &model.model,
             &model.pool,
             sequence,
             &token_ids,
             u64::from(start_position),
+            sampling_params(params),
             None,
         )
         .map_err(|e| leaf_error("prefill", e))
@@ -267,10 +269,40 @@ impl StepLeaf for CudaLeaf {
         &self,
         model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
+        params: &[DecodeParams],
     ) -> Result<Vec<TokenId>, i32> {
-        let ids = step::decode_program_batch(&model.model, &model.pool, sequences)
-            .map_err(|e| leaf_error("decode", e))?;
+        if params.len() > N_DECODE_LANES {
+            return Err(leaf_error(
+                "decode",
+                format!(
+                    "batch has {} sampling parameter sets; maximum is {N_DECODE_LANES}",
+                    params.len()
+                ),
+            ));
+        }
+        let mut sampling = [step::SamplingParams::greedy(); N_DECODE_LANES];
+        for (target, source) in sampling.iter_mut().zip(params.iter().copied()) {
+            *target = sampling_params(source);
+        }
+        let ids = step::decode_program_batch_sampled(
+            &model.model,
+            &model.pool,
+            sequences,
+            &sampling[..params.len()],
+        )
+        .map_err(|e| leaf_error("decode", e))?;
         Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+}
+
+fn sampling_params(params: DecodeParams) -> step::SamplingParams {
+    step::SamplingParams {
+        temperature: params.temperature,
+        top_k: params.top_k,
+        top_p: params.top_p,
+        presence_penalty: params.presence_penalty,
+        frequency_penalty: params.frequency_penalty,
+        seed: params.seed,
     }
 }
 
@@ -284,7 +316,11 @@ mod tests {
     #[test]
     fn kv_pool_pages_rounds_up_to_a_whole_page() {
         assert_eq!(kv_pool_pages(0), 0);
-        assert_eq!(kv_pool_pages(1), 1, "a partial page still reserves one whole page");
+        assert_eq!(
+            kv_pool_pages(1),
+            1,
+            "a partial page still reserves one whole page"
+        );
         assert_eq!(kv_pool_pages(KV_PAGE_TOKENS), 1);
         assert_eq!(kv_pool_pages(KV_PAGE_TOKENS + 1), 2);
         assert_eq!(kv_pool_pages(65_536), 65_536 / KV_PAGE_TOKENS);
@@ -300,5 +336,30 @@ mod tests {
         assert!(config.kv_pool_tokens >= config.max_context_tokens);
         assert_eq!(config.max_context_tokens, crate::DEFAULT_MAX_CONTEXT);
         assert_eq!(config.prefill_chunk_tokens, crate::DEFAULT_PREFILL_CHUNK);
+    }
+
+    #[test]
+    fn decode_params_map_every_sampling_field_without_changing_seed_bits() {
+        let mapped = sampling_params(DecodeParams {
+            max_tokens: Some(17),
+            temperature: 1.25,
+            top_p: 0.75,
+            top_k: 13,
+            presence_penalty: -0.5,
+            frequency_penalty: 0.625,
+            seed: u64::MAX,
+        });
+
+        assert_eq!(
+            mapped,
+            step::SamplingParams {
+                temperature: 1.25,
+                top_p: 0.75,
+                top_k: 13,
+                presence_penalty: -0.5,
+                frequency_penalty: 0.625,
+                seed: u64::MAX,
+            }
+        );
     }
 }
