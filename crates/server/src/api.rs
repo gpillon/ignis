@@ -365,8 +365,10 @@ fn error_response(
 
 /// Map the engine's [`FinishReason`] to the OpenAI `finish_reason` string
 /// (GitHub #61 / P1-25): `stop` on the model's own EOS token, `length` on
-/// `max_tokens` or the engine's reservation cap.
-fn finish_reason_str(reason: FinishReason) -> &'static str {
+/// `max_tokens` or the engine's reservation cap. `pub(crate)` since P3-06:
+/// `telemetry.rs`'s `ignis.request.done` event reuses this exact mapping so
+/// the request log and the HTTP response never disagree on the string.
+pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",

@@ -12,7 +12,9 @@
 use std::sync::{Arc, Mutex};
 
 use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
-use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, RequestState};
+use ignis_core::types::{
+    ComputeError, DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent,
+};
 use ignis_core::{
     ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig, resolve_serving_chunk_tokens,
 };
@@ -78,6 +80,41 @@ fn a_long_prompt_is_split_into_chunk_wide_jobs() {
         jobs_for_id[2].tokens.len(),
         2,
         "the last chunk carries the remainder"
+    );
+}
+
+#[test]
+fn advance_emits_a_prefill_chunk_event_per_chunk_with_cumulative_progress() {
+    // P3-06: the request log's per-phase fields (chunks consumed, prefilled
+    // tokens) are counted from `SchedEvent::PrefillChunk`, since `Request`
+    // itself carries no chunk history, only its current progress. A
+    // 10-token prompt at a 4-token chunk width must emit exactly 3 such
+    // events, `prefilled_tokens` climbing 4, 8, 10 — never restated as each
+    // chunk's own (non-cumulative) width.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = sched_with_chunk(4, compute);
+    let id = sched
+        .submit(input(&(1..=10).collect::<Vec<_>>(), 1), RequestClass::Agent)
+        .unwrap();
+
+    let mut chunk_events: Vec<(u32, u32)> = Vec::new();
+    while !sched.is_idle() {
+        for event in sched.advance() {
+            if let SchedEvent::PrefillChunk {
+                request,
+                chunk_tokens,
+                prefilled_tokens,
+            } = event
+                && request == id
+            {
+                chunk_events.push((chunk_tokens, prefilled_tokens));
+            }
+        }
+    }
+    assert_eq!(
+        chunk_events,
+        vec![(4, 4), (4, 8), (2, 10)],
+        "one PrefillChunk event per chunk, prefilled_tokens cumulative"
     );
 }
 
