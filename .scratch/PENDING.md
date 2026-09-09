@@ -24,18 +24,6 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   stacking on top of #71's fix. Owner: unassigned.
   Blocker: GPU exclusivity (ADR 0006).
 
-- **An intermittent wrong-output event in the GQA layer oracle (GitHub #96).**
-  `gqa_layer_gpu::gqa_layers_match_f64_reference` fails roughly two runs in
-  five: one token of a four-token decode sequence lands at a relative L2 of
-  0.32-0.37 against the f64 reference while every other token in the same run
-  is bit-identical to a clean run at ~0.004. Deterministic when it does not
-  fire, so this is a wrong-output event, not drift. `A4_LAYER_TOLERANCE = 0.32`
-  was very likely calibrated on the same event in #85, which would mean the
-  layer oracles carry ~80x more slack than the kernels need and would not
-  catch a real precision regression. This is what keeps the GPU profile from
-  being green in one run, and so what keeps #88 (and #63) open. Owner:
-  unassigned. Blocker: GPU exclusivity (ADR 0006).
-
 - **The G2 verdict's two legs were not interleaved (ADR 0015, GitHub #88).**
   The gate passed at 0.878 (8K) and 0.851 (32K) against a 1.5 threshold, but
   the reference leg was measured 2026-09-08 23:59 and the ignis leg
