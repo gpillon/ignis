@@ -15,6 +15,7 @@ pub type BlockId = u32;
 /// The paged KV pool: a fixed number of physical blocks derived from a byte
 /// budget. Allocation fails cleanly (`None`) when the pool is exhausted —
 /// the pool never over-allocates (core-01: no OOM under an N=8 load).
+#[derive(Debug)]
 pub struct KvPool {
     budget: usize,
     bytes_per_block: usize,
@@ -151,6 +152,64 @@ impl KvPool {
     }
 }
 
+/// The scheduler's expected page-count capacity disagreed with the pool the
+/// leaf actually built (GitHub #98, P3-02) — a stale formula or a config
+/// that drifted from the leaf, surfaced at load rather than trusted, so it
+/// fails loudly instead of showing up later as an opaque `ignis_seq_alloc`
+/// exhaustion the admission machine never saw coming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityMismatch {
+    /// The page count the scheduler's own configuration expects.
+    pub expected_pages: u32,
+    /// The page count the leaf's pool actually reports.
+    pub leaf_pages: u32,
+}
+
+impl std::fmt::Display for CapacityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KV capacity mismatch: the scheduler expects {} pages, the leaf's paged KV pool actually holds {}",
+            self.expected_pages, self.leaf_pages
+        )
+    }
+}
+
+impl std::error::Error for CapacityMismatch {}
+
+/// The leaf's reported paged-KV pool geometry (`ignis_seq_pool_stats`,
+/// GitHub #55): the page count and per-page bytes it actually built, always
+/// read back together — bundled here so the two can't be transposed at a
+/// call site the way two bare same-typed integers could be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeafPoolGeometry {
+    /// Physical KV pages the pool holds (`kv_page_group_count`).
+    pub page_count: u32,
+    /// Bytes of one physical KV page across every plane (`kv_page_bytes`).
+    pub page_bytes: u64,
+}
+
+/// The [`KvPool`] built from the leaf's reported page geometry
+/// (`ignis_seq_pool_stats`, GitHub #55), once verified to match the
+/// scheduler's independently-computed page-count capacity. The two sides
+/// derive their page count from the same configured engine shape by
+/// construction, but only asking the leaf what it actually built (rather
+/// than trusting the formula that requested it) turns a possible future
+/// drift into a load-time failure instead of a mid-serving surprise —
+/// `Err` on a disagreement, never a silently trusted guess.
+pub fn verified_kv_pool(
+    expected_pages: u32,
+    leaf: LeafPoolGeometry,
+) -> Result<KvPool, CapacityMismatch> {
+    if expected_pages != leaf.page_count {
+        return Err(CapacityMismatch {
+            expected_pages,
+            leaf_pages: leaf.page_count,
+        });
+    }
+    Ok(KvPool::from_page_geometry(leaf.page_count, leaf.page_bytes))
+}
+
 /// A per-request block table: logical block index → physical block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockTable {
@@ -280,5 +339,43 @@ mod tests {
         // Every block is now free (the two allocated + the two never used).
         assert_eq!(pool.used_blocks(), 0);
         assert_eq!(pool.free_blocks(), 4);
+    }
+
+    #[test]
+    fn verified_kv_pool_builds_the_real_pool_when_the_two_sides_agree() {
+        // The scheduler's own formula and the leaf's `ignis_seq_pool_stats`
+        // report the same page count: the real `KvPool` is handed back. Its
+        // bytes-per-page geometry is already pinned by
+        // `pool_sizes_from_runtime_reported_page_geometry` above — this test
+        // only needs to show the *verified* pool is the one built from the
+        // leaf's numbers (GitHub #98).
+        let leaf = LeafPoolGeometry {
+            page_count: 1024,
+            page_bytes: 65536,
+        };
+        let pool = verified_kv_pool(1024, leaf).expect("the two sides agree");
+        assert_eq!(pool.block_count(), 1024);
+        assert_eq!(pool.budget(), 1024 * 65536);
+    }
+
+    #[test]
+    fn verified_kv_pool_rejects_a_disagreement_instead_of_trusting_the_formula() {
+        // The scheduler expects 1024 pages (its own formula); the leaf's
+        // pool actually holds 900 — a drift that must fail loudly at load,
+        // not surface later as a mid-serving `ignis_seq_alloc` exhaustion.
+        let leaf = LeafPoolGeometry {
+            page_count: 900,
+            page_bytes: 65536,
+        };
+        let err = verified_kv_pool(1024, leaf).expect_err("a disagreement is an error");
+        assert_eq!(
+            err,
+            CapacityMismatch {
+                expected_pages: 1024,
+                leaf_pages: 900,
+            }
+        );
+        assert!(err.to_string().contains("1024"));
+        assert!(err.to_string().contains("900"));
     }
 }

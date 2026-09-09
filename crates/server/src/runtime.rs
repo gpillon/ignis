@@ -106,7 +106,24 @@ pub fn cuda_scheduler(
     // `CudaLeafConfig::default()`'s `N_DECODE_LANES` (8), so the
     // scheduler's own lane count (`SchedulerConfig::default()`'s
     // `max_in_flight`) still matches it.
-    let capacity_pages = kv_pool_pages(kv_pool_tokens);
+    let expected_pages = kv_pool_pages(kv_pool_tokens);
+
+    // GitHub #98 (P3-02): do not just trust that formula — ask the leaf
+    // what it actually built (`ignis_seq_pool_stats`, surfaced through
+    // `RuntimeStats::kv_page_count`/`kv_page_bytes`), refuse to start on a
+    // disagreement, and hand the admission machine the real, leaf-verified
+    // pool's own page count rather than the formula's guess.
+    let stats = model.stats().map_err(|e| format!("runtime stats: {e:?}"))?;
+    let kv_pool = ignis_core::kv::verified_kv_pool(
+        expected_pages,
+        ignis_core::kv::LeafPoolGeometry {
+            page_count: stats.kv_page_count,
+            page_bytes: stats.kv_page_bytes,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let capacity_pages = kv_pool.block_count() as u32;
+
     Ok(scheduler(
         SchedulerConfig {
             model: model_id,
