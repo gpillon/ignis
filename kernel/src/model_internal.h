@@ -7,12 +7,14 @@
 #pragma once
 
 #include "ignis_model.h"
+#include "ignis_step.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -109,4 +111,42 @@ struct ignis_model {
   // per lane.
   std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_logits;
   std::unique_ptr<ninfer::DeviceArena> sampling_workspace;
+
+  // P3-05 (GitHub #102, ADR 0019): the decode CUDA graphs' own resources,
+  // reserved once at load (scratch/staging) and captured once after the
+  // sequence pool exists (`ignis_decode_graph_capture`). `max_context_tokens`
+  // is copied from `ignis_model_load`'s argument so the graph's fixed,
+  // conservative `GqaExecutionEnvelope` (every replay, regardless of a
+  // lane's actual position) needs no second parameter threaded through
+  // capture.
+  uint32_t max_context_tokens = 0;
+  // Separate from `scratch` above: a graph replays fixed device addresses,
+  // and a prefill chunk (which only ever uses `scratch`) landing between two
+  // replays must never alias what a replay rereads. Sized once for one
+  // lane's per-layer peak at T=1 (mirrors `scratch`'s own sizing at
+  // `prefill_chunk_tokens`, kernel/src/model.cu) and reused, via its own
+  // `Scope`, sequentially across a graph's lanes -- the same reuse pattern
+  // the eager per-lane decode loop already applies to `scratch`.
+  std::unique_ptr<ninfer::DeviceArena> decode_graph_scratch;
+  // This round's token id per lane (I32 x IGNIS_DECODE_MAX_BATCH),
+  // refreshed by one H2D copy before a replay; a captured graph's embedding
+  // step reads lane i's id directly from column i, no per-lane device copy.
+  std::unique_ptr<ninfer::DeviceBuffer> decode_graph_token_ids;
+  // This round's physical pool slot per lane (I32 x IGNIS_DECODE_MAX_BATCH),
+  // refreshed the same way. The single value at column i serves both GQA's
+  // `kv_table_rows` (selecting a row of the pool-wide block-table matrix)
+  // and GDN's `initial_state_slots`/`snapshot_base_slots` (in place: same
+  // buffer for both, since a physical slot is a physical slot) -- read by
+  // the kernels at replay time, never baked at capture time (ADR 0019).
+  std::unique_ptr<ninfer::DeviceBuffer> decode_graph_slots;
+  // A constant zero I32 scalar: `offset_i32_positions`'s `source` argument
+  // for RoPE's per-lane position (`positions[0] = 0 + sampling_decode_positions[lane]`),
+  // graph-safe where `fill_i32_positions`'s host-scalar `start` is not.
+  std::unique_ptr<ninfer::DeviceBuffer> decode_graph_zero;
+  std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> decode_graph_exec{};
+  std::array<bool, IGNIS_DECODE_MAX_BATCH> decode_graph_ready{};
+  // Set by the most recent `ignis_program_decode` call: 1 if it replayed a
+  // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
+  // `graph_launches`).
+  uint64_t last_step_graph_launches = 0;
 };

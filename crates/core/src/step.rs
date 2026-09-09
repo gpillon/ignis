@@ -68,6 +68,13 @@ mod ffi {
         pub vram_bytes: u64,
         pub last_step_micros: u64,
         pub kernel_count: u64,
+        /// P3-05 (GitHub #102): `cudaGraphLaunch` calls the most recent
+        /// `ignis_program_decode` call made -- 1 if it replayed a decode
+        /// graph, 0 if it ran the eager per-lane loop.
+        pub graph_launches: u64,
+        /// P3-05 (GitHub #102): bit (w-1) set when a decode graph for exact
+        /// width w (1..IGNIS_DECODE_MAX_BATCH) is captured and replayable.
+        pub decode_graph_ready_mask: u32,
     }
 
     unsafe extern "C" {
@@ -120,6 +127,15 @@ mod ffi {
             pool: *const IgnisSeqPool,
             out_stats: *mut IgnisProgramStats,
         ) -> i32;
+
+        pub fn ignis_decode_graph_capture(
+            model: *mut IgnisModel,
+            pool: *mut IgnisSeqPool,
+            out_capture_micros: *mut u64,
+            out_ready_mask: *mut u32,
+        ) -> i32;
+
+        pub fn ignis_decode_graph_last_error() -> *const c_char;
     }
 }
 
@@ -188,11 +204,80 @@ pub struct ProgramStats {
     pub vram_bytes: u64,
     pub last_step_micros: u64,
     pub kernel_count: u64,
+    /// `cudaGraphLaunch` calls the most recent [`decode_program_batch`] /
+    /// [`decode_program_batch_sampled`] call made (P3-05, GitHub #102): 1 if
+    /// it replayed a captured decode graph, 0 if it ran the eager per-lane
+    /// loop.
+    pub graph_launches: u64,
+    /// Bit `w - 1` set when a decode graph for exact batch width `w`
+    /// (1..=8) is captured and replayable (P3-05, GitHub #102) -- see
+    /// [`capture_decode_graphs`].
+    pub decode_graph_ready_mask: u32,
+}
+
+/// The result of [`capture_decode_graphs`]: how long capture took and which
+/// exact batch widths (1..=8, bit `w - 1`) ended up with a replayable graph.
+/// A width whose bit is clear always falls back to the eager per-lane loop
+/// (P3-05, GitHub #102, ADR 0019: a capture failure degrades performance and
+/// never refuses service) -- [`last_decode_graph_error`] names the most
+/// recent one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeGraphCapture {
+    pub capture_micros: u64,
+    pub ready_mask: u32,
+}
+
+impl DecodeGraphCapture {
+    /// Whether exact batch width `width` (1..=8) has a replayable graph.
+    pub fn is_ready(&self, width: u32) -> bool {
+        (1..=8).contains(&width) && (self.ready_mask & (1 << (width - 1))) != 0
+    }
+
+    /// How many of the 8 exact widths captured successfully.
+    pub fn ready_count(&self) -> u32 {
+        self.ready_mask.count_ones()
+    }
 }
 
 fn last_error() -> String {
     let message = unsafe { CStr::from_ptr(ffi::ignis_step_last_error()) };
     message.to_string_lossy().into_owned()
+}
+
+/// The message from the most recent width whose capture failed inside the
+/// latest [`capture_decode_graphs`] call (P3-05, GitHub #102) -- its own
+/// channel, separate from the program-layer error [`last_error`] reads.
+pub fn last_decode_graph_error() -> String {
+    let message = unsafe { CStr::from_ptr(ffi::ignis_decode_graph_last_error()) };
+    message.to_string_lossy().into_owned()
+}
+
+/// Captures one CUDA graph per exact decode batch width 1..=8 (P3-05,
+/// GitHub #102, ADR 0019). Call once, after `pool` is created and before any
+/// concurrent [`decode_program_batch`] / [`decode_program_batch_sampled`]
+/// call -- capture is not thread-safe with replay. Every width is attempted
+/// independently: this call always returns `Ok` (the leaf never fails model
+/// availability over a capture failure), and [`DecodeGraphCapture::ready_mask`]
+/// reports which widths actually got a graph -- a width whose bit is clear
+/// always runs the eager per-lane loop, exactly as it did before this call.
+pub fn capture_decode_graphs(model: &Model, pool: &SeqPool) -> Result<DecodeGraphCapture, String> {
+    let mut capture_micros: u64 = 0;
+    let mut ready_mask: u32 = 0;
+    let rc = unsafe {
+        ffi::ignis_decode_graph_capture(
+            model.handle(),
+            pool.handle(),
+            &mut capture_micros,
+            &mut ready_mask,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(DecodeGraphCapture {
+        capture_micros,
+        ready_mask,
+    })
 }
 
 /// Runs the degenerate program (GitHub #54) over a token span for one
@@ -542,5 +627,7 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         vram_bytes: stats.vram_bytes,
         last_step_micros: stats.last_step_micros,
         kernel_count: stats.kernel_count,
+        graph_launches: stats.graph_launches,
+        decode_graph_ready_mask: stats.decode_graph_ready_mask,
     })
 }
