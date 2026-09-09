@@ -80,6 +80,10 @@ pub struct RuntimeStats {
     pub kv_page_tokens: u32,
     /// Bytes in one physical KV page.
     pub kv_page_bytes: u64,
+    /// Physical KV pages the pool actually holds (the leaf's own build, not
+    /// a requested budget; `ignis_core::kv::verified_kv_pool` cross-checks
+    /// this against the scheduler's capacity).
+    pub kv_page_count: u32,
     /// Duration of the most recent leaf step.
     pub last_step_micros: u64,
     /// Kernels dispatched by the most recent leaf step.

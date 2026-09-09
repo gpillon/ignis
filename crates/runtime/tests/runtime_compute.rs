@@ -101,6 +101,7 @@ impl StepLeaf for StubLeaf {
             vram_bytes: 4096,
             kv_page_tokens: 64,
             kv_page_bytes: 8192,
+            kv_page_count: 128,
             last_step_micros: 13,
             kernel_count: 7,
             graph_launches: 0,

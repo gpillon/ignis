@@ -322,6 +322,62 @@ fn oversized_requests_are_rejected_at_submit() {
     );
 }
 
+/// GitHub #98 (P3-02) — the scheduler's capacity is built from
+/// `ignis_core::kv::verified_kv_pool`'s output, i.e. the *leaf-verified*
+/// page geometry (`ignis_seq_pool_stats`), not an arbitrary constant: once
+/// the scheduler is configured from that verified pool's own page count, a
+/// request it cannot cover is refused at `submit` and never handed to the
+/// compute seam — the leaf never sees a job it would have to fail on.
+#[test]
+fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatches_a_refusal() {
+    // 64-token pages (the leaf's fixed `kPagedKVPageSize`), 8 physical
+    // pages of 64 KiB each — exactly what `ignis_seq_pool_stats` would
+    // report for a small pool. The scheduler's own formula (here, a stand-
+    // in for `kv_pool_pages(kv_pool_tokens)`) agrees with it, so the
+    // verification succeeds and hands back the real pool.
+    let leaf_geometry = ignis_core::kv::LeafPoolGeometry {
+        page_count: 8,
+        page_bytes: 64 * 1024,
+    };
+    let pool = ignis_core::kv::verified_kv_pool(8, leaf_geometry)
+        .expect("the scheduler's formula agrees with the leaf's reported pool");
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            max_in_flight: 16,
+            max_prefill_batch: 8,
+            kv_page_tokens: 64,
+            max_sequence_tokens: 1024,
+            kv_capacity_pages: pool.block_count() as u32,
+            host_capacity_pages: 0,
+        },
+        compute.clone(),
+    );
+
+    // ceil((1 + 511) / 64) = 8 pages == the whole KvPool: allowed.
+    let admitted = sched.submit(input(&[1], 511), RequestClass::Agent).unwrap();
+    // ceil((1 + 512) / 64) = 9 pages > the pool KvPool actually reports:
+    // refused at submit, before it can ever reach the compute seam.
+    let refused = sched.submit(input(&[1], 512), RequestClass::Agent);
+    assert_eq!(refused, Err(SubmitError::Oversized));
+
+    sched.advance();
+    let dispatched: Vec<u64> = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .map(|job| job.request)
+        .collect();
+    assert!(
+        dispatched.contains(&admitted),
+        "the request the pool covers is prefilled normally"
+    );
+    // The refused request was never even assigned a request id (`submit`
+    // returned `Err`), so by construction it cannot appear in a dispatched
+    // job — the assertion above is the positive half of that same guarantee.
+}
+
 /// Scenario 4 — a **persistent** backfill: a candidate that fits the head's
 /// *future* capacity (head + non-donors + this backfill ≤ pool) is admitted
 /// as `Persistent` — it never borrows the donor's reserved pages, so it is

@@ -215,6 +215,7 @@ impl StepLeaf for CudaLeaf {
             // `kPagedKVPageSize`) — the ABI does not report it per call.
             kv_page_tokens: 64,
             kv_page_bytes: pool_stats.kv_page_bytes,
+            kv_page_count: pool_stats.kv_page_group_count,
             last_step_micros: program.last_step_micros,
             kernel_count: program.kernel_count,
             // CUDA graph capture lands at G3; the program always runs
