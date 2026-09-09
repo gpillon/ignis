@@ -26,11 +26,16 @@ impl JsonLayer {
 
 impl<S: Subscriber> Layer<S> for JsonLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let level = *event.metadata().level();
         let record = LogRecord::from_event(event, SystemTime::now());
         // `LogRecord` derives `Serialize` from primitive/JSON-native
         // fields only — serialization cannot fail.
         let line = serde_json::to_string(&record).expect("LogRecord always serializes");
-        self.sink.write_line(&line);
+        // `write_line_at` (not `write_line`): the queued sink (GitHub #80)
+        // routes DEBUG/TRACE and INFO/WARN/ERROR into separate channels with
+        // different backpressure policy — the level has to travel with the
+        // line for that routing decision.
+        self.sink.write_line_at(level, &line);
     }
 }
 

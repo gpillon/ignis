@@ -10,6 +10,17 @@ use std::sync::Mutex;
 /// framing).
 pub trait LineSink: Send + Sync {
     fn write_line(&self, line: &str);
+
+    /// Same as [`write_line`](LineSink::write_line), but also given the
+    /// event's severity — the seam [`crate::queue::QueuedSink`] (GitHub #80)
+    /// needs to route DEBUG/TRACE into its drop-oldest channel and
+    /// INFO/WARN/ERROR into its bounded-blocking one. Every other sink here
+    /// (`StdoutSink`, `StderrSink`, `MemorySink`) doesn't care about
+    /// priority, so the default just forwards to `write_line` — only a
+    /// priority-aware sink needs to override this.
+    fn write_line_at(&self, _level: tracing::Level, line: &str) {
+        self.write_line(line);
+    }
 }
 
 /// The production sink: one line per event on stdout.

@@ -230,13 +230,35 @@ fn main() -> ExitCode {
     // `--help` text (GitHub #79). A bootstrap `eprintln!` fallback (matching
     // `ignis-server`'s, GitHub #78) covers the case logging itself fails to
     // initialize, since no subscriber exists yet to carry that message.
-    if let Err(err) =
-        ignis_logging::init_with_sink(|name| std::env::var(name).ok(), std::sync::Arc::new(ignis_logging::StderrSink))
-    {
-        eprintln!("vendor-ninfer: logging: {err}");
-        return ExitCode::from(2);
-    }
+    let logging_handle = match ignis_logging::init_with_sink(
+        |name| std::env::var(name).ok(),
+        std::sync::Arc::new(ignis_logging::StderrSink),
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("vendor-ninfer: logging: {err}");
+            return ExitCode::from(2);
+        }
+    };
 
+    // `run` does all the real work and returns the exit code through every
+    // early-return path; `main` funnels every one of them through a single
+    // `flush` (GitHub #80) before the process actually exits. Without this,
+    // a diagnostic emitted right before an early `return` (e.g. the usage
+    // error below) could be lost: logging is asynchronous now for every
+    // sink, including this one-shot command's `StderrSink`, so nothing
+    // guarantees the background writer thread drained it before `main`
+    // returns unless something waits for it explicitly.
+    let code = run();
+    // A short, fixed budget (spec §28's "bounded timeout") — this is a
+    // one-shot CLI process about to exit, not a long-running service, so
+    // there is no reason to wait longer than it takes a healthy stderr to
+    // drain a handful of lines.
+    logging_handle.flush(ignis_logging::SHUTDOWN_FLUSH_TIMEOUT);
+    code
+}
+
+fn run() -> ExitCode {
     let options = match parse_options() {
         Ok(options) => options,
         Err(message) => {

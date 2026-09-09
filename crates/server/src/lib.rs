@@ -123,10 +123,78 @@ impl Server {
 
     /// Bind `addr` and serve. The engine's model thread (GitHub #69) was
     /// already spawned when it was constructed — nothing to start here.
-    /// Runs until the listener is closed.
+    /// Runs until [`shutdown_signal`] resolves (Ctrl+C, or SIGTERM on
+    /// unix), then drains in-flight requests before returning (GitHub #80,
+    /// spec §28: graceful shutdown, not an abrupt kill) — `main` is
+    /// responsible for emitting `ignis.process.stopped` and flushing the
+    /// logging queue after this returns, since that is the true last event.
     pub async fn serve(self, addr: String) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         let app = self.app();
-        axum::serve(listener, app).await
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await
+    }
+}
+
+/// Emits `ignis.process.stopping` (spec §28) — split out from
+/// [`shutdown_signal`] so the event's own shape is unit-testable without
+/// having to actually deliver Ctrl+C/SIGTERM to a live process (not
+/// portably doable from a Rust test, and Windows has no SIGTERM at all —
+/// see `shutdown_tests` below).
+fn emit_stopping() {
+    tracing::info!(name: "ignis.process.stopping", "graceful shutdown signal received");
+}
+
+/// Waits for a graceful-shutdown signal (Ctrl+C, or SIGTERM on unix) and
+/// emits `ignis.process.stopping` (spec §28) right as it resolves — passed
+/// to `axum::serve(..).with_graceful_shutdown(..)` so in-flight requests get
+/// a chance to finish before the listener actually stops. This is the one
+/// INFO event on this path; it fires at most once per process lifetime, not
+/// a hot-path concern.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("installing the Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing the SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    emit_stopping();
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::Arc;
+
+    use ignis_logging::{JsonLayer, MemorySink};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::emit_stopping;
+
+    /// The integration-level path (`shutdown_signal` actually waiting on a
+    /// real Ctrl+C/SIGTERM) is exercised by hand, not by this suite — see
+    /// `emit_stopping`'s doc comment. This covers the part that is
+    /// meaningfully unit-testable: the event `shutdown_signal` emits once a
+    /// signal resolves has the exact name/severity spec §28 asks for.
+    #[test]
+    fn emit_stopping_produces_the_spec_shaped_event() {
+        let sink = Arc::new(MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer::new(sink.clone()));
+        tracing::subscriber::with_default(subscriber, emit_stopping);
+
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid json");
+        assert_eq!(record["event_name"], "ignis.process.stopping");
+        assert_eq!(record["severity_text"], "INFO");
     }
 }

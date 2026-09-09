@@ -658,6 +658,10 @@ version = "0.1.0"
 dependencies = [
  "ignis-artifact",
  "ignis-core",
+ "ignis-logging",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

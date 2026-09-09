@@ -29,8 +29,9 @@ impl PrettyLayer {
 
 impl<S: Subscriber> Layer<S> for PrettyLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let level = *event.metadata().level();
         let record = LogRecord::from_event(event, SystemTime::now());
-        self.sink.write_line(&render(&record, self.color));
+        self.sink.write_line_at(level, &render(&record, self.color));
     }
 }
 

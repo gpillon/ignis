@@ -84,6 +84,17 @@ fn mock_scheduler(model: &str) -> Box<dyn Scheduler> {
     ))
 }
 
+/// Flush pending logging before an immediate exit (GitHub #80): every
+/// "refusing to start" path calls this instead of a bare
+/// `std::process::exit`. Logging is asynchronous now for every sink
+/// (`ignis_logging::init`'s queued writer thread) — without this, the very
+/// diagnostic that explains *why* the process is exiting could still be
+/// sitting in the queue when the process terminates, and be lost.
+fn exit_after_flush(logging_handle: &ignis_logging::LoggingHandle, code: i32) -> ! {
+    logging_handle.flush(ignis_logging::SHUTDOWN_FLUSH_TIMEOUT);
+    std::process::exit(code);
+}
+
 /// Build the real GPU-backed scheduler for `artifact_path` (GitHub #61 /
 /// P1-25). Requires `generation_config.json` to carry `eos_token_id` — a
 /// backend that can never stop on EOS would silently run every request to
@@ -95,6 +106,7 @@ fn cuda_scheduler(
     model: &str,
     frontend: &ignis_artifact::FrontendSet,
     shape: ignis_server::runtime::EngineShape,
+    logging_handle: &ignis_logging::LoggingHandle,
 ) -> Box<dyn Scheduler> {
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
@@ -104,7 +116,7 @@ fn cuda_scheduler(
                 artifact = %artifact_path.display(),
                 "generation_config.json has no eos_token_id — refusing to start"
             );
-            std::process::exit(1);
+            exit_after_flush(logging_handle, 1);
         }
     };
     match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
@@ -127,7 +139,7 @@ fn cuda_scheduler(
                 error = %err,
                 "refusing to start"
             );
-            std::process::exit(1);
+            exit_after_flush(logging_handle, 1);
         }
     }
 }
@@ -140,10 +152,18 @@ async fn main() {
     // `eprintln!`. Every diagnostic site below is migrated onto it (GitHub
     // #79); only this call's own failure predates a subscriber existing, so
     // it keeps a minimal bootstrap `eprintln!`.
-    if let Err(err) = ignis_logging::init(|name| std::env::var(name).ok()) {
-        eprintln!("ignis-server: logging: {err} — refusing to start");
-        std::process::exit(1);
-    }
+    // Kept alive for the rest of `main` (GitHub #80): dropping it early would
+    // signal the background logging-writer thread to stop while the process
+    // is still emitting events. `logging_handle.flush(..)` below, right
+    // before the final `ignis.process.stopped` event, is the shutdown seam
+    // that actually matters — see spec §27/28.
+    let logging_handle = match ignis_logging::init(|name| std::env::var(name).ok()) {
+        Ok(handle) => handle,
+        Err(err) => {
+            eprintln!("ignis-server: logging: {err} — refusing to start");
+            std::process::exit(1);
+        }
+    };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = match config::resolve(&args, |name| std::env::var(name).ok()) {
@@ -158,7 +178,7 @@ async fn main() {
         }
         Err(err) => {
             tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
-            std::process::exit(1);
+            exit_after_flush(&logging_handle, 1);
         }
     };
     // The engine shape (GitHub #87) — already validated by `config::resolve`
@@ -221,7 +241,7 @@ async fn main() {
                     error = %err,
                     "refusing to start"
                 );
-                std::process::exit(1);
+                exit_after_flush(&logging_handle, 1);
             }
         };
         let frontend = match loader::load_artifact(artifact_path, &sidecar) {
@@ -240,12 +260,12 @@ async fn main() {
                     error = %err,
                     "refusing to start"
                 );
-                std::process::exit(1);
+                exit_after_flush(&logging_handle, 1);
             }
         };
 
         #[cfg(feature = "cuda")]
-        let scheduler = cuda_scheduler(artifact_path, &model, &frontend, engine_shape);
+        let scheduler = cuda_scheduler(artifact_path, &model, &frontend, engine_shape, &logging_handle);
         #[cfg(not(feature = "cuda"))]
         let scheduler = {
             tracing::warn!(
@@ -277,7 +297,7 @@ async fn main() {
         thinking::validate_defaults(&thinking_defaults, &server.template.thinking_capabilities())
     {
         tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
-        std::process::exit(1);
+        exit_after_flush(&logging_handle, 1);
     }
     let server = server.with_thinking_defaults(default_enable_thinking, default_reasoning_effort);
 
@@ -290,8 +310,22 @@ async fn main() {
         bind = %bind,
         "localhost, no auth; OpenAI API at /v1"
     );
-    if let Err(err) = server.serve(bind).await {
-        tracing::error!(name: "ignis.server.failed", error = %err, "server exited");
-        std::process::exit(1);
+    let serve_result = server.serve(bind).await;
+
+    // `ignis.process.stopped` MUST be the last event emitted (spec §28) —
+    // whichever branch below runs, nothing after it logs anything. The
+    // trailing `flush` (bounded, GitHub #80) gives the queued writer thread
+    // a chance to actually hand these last lines to the sink before the
+    // process exits; it never blocks past its own timeout even if the sink
+    // is stuck.
+    match serve_result {
+        Ok(()) => {
+            tracing::info!(name: "ignis.process.stopped", "graceful shutdown complete");
+            logging_handle.flush(ignis_logging::SHUTDOWN_FLUSH_TIMEOUT);
+        }
+        Err(err) => {
+            tracing::error!(name: "ignis.server.failed", error = %err, "server exited");
+            exit_after_flush(&logging_handle, 1);
+        }
     }
 }

@@ -42,6 +42,21 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   shared-state operation on the owner's working environment: never done
   autonomously. Re-check before scheduling GPU work.
 
+- **GitHub #80's G4 gate run is outstanding.** Issue #80 (structured logging
+  Phase 3: hot-path guarantees, bounded queues, shutdown flush) added the
+  two-channel bounded logging queue in `crates/logging`, wired shutdown flush
+  into `ignis-server`/`vendor-ninfer`, and did a manual/grep-based hot-path
+  audit + a static lint (`crates/logging/src/hotpath_lint.rs`) — all
+  non-GPU work, done and tested (`cargo test --workspace` green). What is
+  **not** done: the acceptance criterion itself, `ignis-bench gate` (G4,
+  ≥99% of reference performance) run with the Phase 1-3 logging system wired
+  into `ignis-server`, per ADR 0007/0011 and the issue's own "Gate" note.
+  This was deliberately not run by the implementing agent (GPU is a shared
+  resource with the owner's own ninfer, ADR 0006 — stopping it is a manual,
+  owner-triggered action, not something an autonomous agent does). Run
+  `scripts/gpu-profile.ps1` against this branch before closing #80. Owner:
+  repo owner. Blocker: GPU exclusivity (ADR 0006).
+
 - **The 99% performance gate (ADR 0007; GitHub #20 / #24, bench specs 02/03).**
   Parked behind **G4**, not open work — the roadmap folds #20 / #24 into the
   G4 master (#65); the trace-replay gate needs the hq-e8-2b profile on both

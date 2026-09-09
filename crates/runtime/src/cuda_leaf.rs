@@ -161,8 +161,18 @@ unsafe impl Sync for CudaLeaf {}
 /// wrappers already discarded the raw C return code in favor of a
 /// descriptive string (`ignis_*_last_error`), so there is no real code
 /// left to preserve here.
+///
+/// Goes through `tracing::error!` (GitHub #80), not a raw `eprintln!`: this
+/// fires from `prefill`/`decode` on the leaf's own error path, and a raw
+/// `eprintln!` is exactly the uncontrolled blocking console I/O spec §27
+/// forbids on that path — `ignis-logging`'s bounded priority queue decouples
+/// it from physical I/O the same as every other ERROR site. This is a
+/// failure path only (never once per token/layer/kernel in the success
+/// case, i.e. not the frequency spec §26 constrains), so it stays an ERROR
+/// rather than needing further demotion.
 fn leaf_error(context: &str, message: String) -> i32 {
-    eprintln!("ignis-runtime: {context}: {message}");
+    // hotpath-lint-allow: failure-only path (prefill/decode error return, see the doc comment above), reviewed exception (GitHub #80).
+    tracing::error!(name: "ignis.runtime.leaf_error", context, error = %message, "step leaf error");
     -1
 }
 
@@ -336,6 +346,27 @@ mod tests {
         assert!(config.kv_pool_tokens >= config.max_context_tokens);
         assert_eq!(config.max_context_tokens, crate::DEFAULT_MAX_CONTEXT);
         assert_eq!(config.prefill_chunk_tokens, crate::DEFAULT_PREFILL_CHUNK);
+    }
+
+    #[test]
+    fn leaf_error_emits_a_structured_event_and_returns_the_generic_code() {
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let sink = Arc::new(ignis_logging::MemorySink::new());
+        let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+        let code = tracing::subscriber::with_default(subscriber, || {
+            leaf_error("prefill", "device out of memory".to_owned())
+        });
+
+        assert_eq!(code, -1, "the generic leaf error code, regardless of context");
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(&lines[0]).expect("valid json");
+        assert_eq!(record["event_name"], "ignis.runtime.leaf_error");
+        assert_eq!(record["severity_text"], "ERROR");
+        assert_eq!(record["attributes"]["context"], "prefill");
+        assert_eq!(record["attributes"]["error"], "device out of memory");
     }
 
     #[test]

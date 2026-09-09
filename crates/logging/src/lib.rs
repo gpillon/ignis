@@ -28,13 +28,16 @@
 //! existing `println!`/`eprintln!` call site — that is Phase 2 (GitHub #79).
 
 pub mod config;
+pub mod hotpath_lint;
 pub mod json_layer;
 pub mod pretty_layer;
+pub mod queue;
 pub mod record;
 pub mod sink;
 
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::filter::LevelFilter;
@@ -43,6 +46,7 @@ use tracing_subscriber::Registry;
 pub use config::{LogConfig, LogConfigError, LogConfigOverride, LogFormat, LogLevel};
 pub use json_layer::JsonLayer;
 pub use pretty_layer::PrettyLayer;
+pub use queue::{QueueConfig, QueueWorkerGuard, QueuedSink};
 pub use record::LogRecord;
 pub use sink::{LineSink, MemorySink, StderrSink, StdoutSink};
 
@@ -91,33 +95,80 @@ fn build_subscriber(
     Registry::default().with(layer)
 }
 
+/// The shutdown flush budget every binary's `main` uses (GitHub #80, spec
+/// §28's "bounded timeout"): shared here, once, rather than the same
+/// `Duration::from_millis(500)` literal re-typed at every call site
+/// (`ignis-server`'s several "refusing to start" exits, its graceful-serve
+/// exit, and `vendor-ninfer`'s one exit) — a single number a reviewer can
+/// find and change in one place. Long enough for a healthy sink to drain a
+/// handful of lines, short enough that a stalled one never meaningfully
+/// delays process exit.
+pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The handle [`init`]/[`init_with_sink`] return: keeps the background
+/// logging-writer thread alive ([`QueueWorkerGuard`], GitHub #80) and gives
+/// the caller the one shutdown seam that matters — [`LoggingHandle::flush`]
+/// — without exposing the queue's internals. Drop it only once, at the very
+/// end of `main` (dropping it early lets the writer thread stop draining
+/// while the process is still logging).
+pub struct LoggingHandle {
+    sink: Arc<QueuedSink>,
+    _guard: QueueWorkerGuard,
+}
+
+impl std::fmt::Debug for LoggingHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoggingHandle").finish_non_exhaustive()
+    }
+}
+
+impl LoggingHandle {
+    /// Wait up to `timeout` for every INFO/WARN/ERROR event enqueued before
+    /// this call to have reached the sink — the shutdown pattern spec §28
+    /// describes: emit `ignis.process.stopping`, do any other pending
+    /// cleanup, emit `ignis.process.stopped` last, then call this once more
+    /// so the final event itself is confirmed flushed before the process
+    /// exits. Never blocks past `timeout`, even against a stalled sink.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        self.sink.flush(timeout)
+    }
+}
+
 /// Resolve `env` (real process env in production, injected in tests) and
 /// install the matching layer as the global default subscriber, writing
-/// through `sink`. Call once, at the very top of `main`, before any other
+/// through a queued wrapper around `sink` (GitHub #80: event creation and
+/// physical I/O are decoupled here, once, for every layer/format — neither
+/// `JsonLayer` nor `PrettyLayer` nor `build_subscriber` needs to know
+/// queueing exists). Call once, at the very top of `main`, before any other
 /// startup work — a minimal bootstrap `eprintln!` fallback before this call
 /// is fine (spec §31) and should stay as small as possible.
 ///
 /// [`init`] is the production entrypoint for a long-running service (`ignis
 /// serve` keeps its whole event stream on stdout, GitHub #79); a one-shot
 /// command that reserves stdout for its result output calls this directly
-/// with [`StderrSink`] instead.
+/// with [`StderrSink`] instead — and, because logging is now asynchronous
+/// for every sink, MUST call [`LoggingHandle::flush`] before exiting, or a
+/// diagnostic emitted just before `main` returns can be lost (see
+/// `crates/vendor/src/main.rs`'s `run`/`main` split).
 pub fn init_with_sink(
     env: impl Fn(&str) -> Option<String>,
     sink: Arc<dyn LineSink>,
-) -> Result<(), InitError> {
+) -> Result<LoggingHandle, InitError> {
     let config = config::resolve(
         env,
         || std::io::stdout().is_terminal(),
         LogConfigOverride::default(),
     )
     .map_err(InitError::Config)?;
-    let subscriber = build_subscriber(config, sink);
-    tracing::subscriber::set_global_default(subscriber).map_err(|_| InitError::AlreadyInitialized)
+    let (queued, guard) = QueuedSink::new(sink, QueueConfig::default());
+    let subscriber = build_subscriber(config, queued.clone());
+    tracing::subscriber::set_global_default(subscriber).map_err(|_| InitError::AlreadyInitialized)?;
+    Ok(LoggingHandle { sink: queued, _guard: guard })
 }
 
 /// [`init_with_sink`] with the production long-running-service sink
 /// ([`StdoutSink`]).
-pub fn init(env: impl Fn(&str) -> Option<String>) -> Result<(), InitError> {
+pub fn init(env: impl Fn(&str) -> Option<String>) -> Result<LoggingHandle, InitError> {
     init_with_sink(env, Arc::new(StdoutSink))
 }
 
