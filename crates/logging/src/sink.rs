@@ -21,6 +21,20 @@ impl LineSink for StdoutSink {
     }
 }
 
+/// A one-shot-command sink: one line per event on stderr, reserving stdout
+/// for command-result output (GitHub #79 — `vendor-ninfer` and other
+/// one-shot binaries route diagnostics here so `| jq .` on stdout is never
+/// interleaved with log lines; `ignis serve` keeps using [`StdoutSink`]
+/// since its entire event stream — not just command results — belongs on
+/// stdout).
+pub struct StderrSink;
+
+impl LineSink for StderrSink {
+    fn write_line(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
 /// An in-memory sink: captures emitted lines, in order, so tests can assert
 /// on them without a real stdout.
 #[derive(Default)]

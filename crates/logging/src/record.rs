@@ -20,6 +20,53 @@ use serde_json::Value;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level};
 
+/// The service resource attributes (OTel semantic conventions
+/// `service.name`/`service.version`, GitHub #79): every event carries these
+/// so a log is self-identifying without the reader having to know which
+/// binary emitted it from context alone. `ignis` is a single service across
+/// all its binaries (`ignis-server`, `vendor-ninfer`, …) — there is no
+/// per-crate name here, only one version shared by the whole workspace
+/// (`workspace.package.version`), so reading it from this crate's own
+/// `CARGO_PKG_VERSION` is equivalent to reading it from the caller's.
+pub const SERVICE_NAME: &str = "ignis";
+pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whole words (case-insensitive, `_`/`-`/`.`-delimited) that mark an
+/// attribute key as sensitive by construction (GitHub #79, ADR 0013:
+/// discipline + tests, not a typed attribute registry) — a call site that
+/// names a field `authorization`, `user_password`, `session_cookie`, etc.
+/// gets it redacted automatically, so a future call site that accidentally
+/// attaches a secret under an obviously-named field is caught before it
+/// ships, without requiring every call site to remember to redact by hand.
+///
+/// Whole-word, not substring: `tokens` (a completion token *count* — fine to
+/// log, e.g. `ignis.request.done`'s attribute) must not collide with
+/// `token`/`bearer_token` (a credential) just because one contains the
+/// other's letters.
+const SENSITIVE_KEY_WORDS: &[&str] =
+    &["password", "secret", "token", "authorization", "bearer", "cookie", "credential"];
+
+/// Adjacent-word pairs (after splitting on `_`/`-`/`.`, joined without the
+/// separator) that mark a key as sensitive even though neither word alone
+/// is in [`SENSITIVE_KEY_WORDS`] — `api_key`/`private_key` are credentials;
+/// `key` alone is too common a word (e.g. a cache or map key) to blanket-flag.
+const SENSITIVE_KEY_WORD_PAIRS: &[&str] = &["apikey", "privatekey"];
+
+/// The text a redacted attribute value is replaced with.
+const REDACTED: &str = "[REDACTED]";
+
+fn is_sensitive_key(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    if words.iter().any(|word| SENSITIVE_KEY_WORDS.contains(word)) {
+        return true;
+    }
+    words.windows(2).any(|pair| {
+        let joined = format!("{}{}", pair[0], pair[1]);
+        SENSITIVE_KEY_WORD_PAIRS.contains(&joined.as_str())
+    })
+}
+
 /// One canonical logging event, OTel LogRecord-shaped (spec §5-8): the same
 /// value both layers render, just rendered differently.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -30,6 +77,10 @@ pub struct LogRecord {
     pub event_name: String,
     pub body: String,
     pub attributes: BTreeMap<String, Value>,
+    #[serde(rename = "service.name")]
+    pub service_name: &'static str,
+    #[serde(rename = "service.version")]
+    pub service_version: &'static str,
 }
 
 impl LogRecord {
@@ -46,6 +97,8 @@ impl LogRecord {
             event_name: meta.name().to_owned(),
             body: visitor.body,
             attributes: visitor.attributes,
+            service_name: SERVICE_NAME,
+            service_version: SERVICE_VERSION,
         }
     }
 }
@@ -92,6 +145,9 @@ impl RecordVisitor {
                 Value::String(s) => s,
                 other => other.to_string(),
             };
+        } else if is_sensitive_key(field.name()) {
+            self.attributes
+                .insert(field.name().to_owned(), Value::String(REDACTED.to_owned()));
         } else {
             self.attributes.insert(field.name().to_owned(), value);
         }
@@ -129,12 +185,7 @@ impl Visit for RecordVisitor {
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.body = value.to_owned();
-        } else {
-            self.attributes
-                .insert(field.name().to_owned(), Value::String(value.to_owned()));
-        }
+        self.set(field, Value::String(value.to_owned()));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
@@ -143,11 +194,7 @@ impl Visit for RecordVisitor {
         // text, no surrounding quotes) — this is the same path
         // `tracing_subscriber`'s own formatters rely on.
         let text = format!("{value:?}");
-        if field.name() == "message" {
-            self.body = text;
-        } else {
-            self.attributes.insert(field.name().to_owned(), Value::String(text));
-        }
+        self.set(field, Value::String(text));
     }
 }
 
@@ -209,6 +256,33 @@ mod tests {
     fn sub_second_precision_is_preserved() {
         let t = UNIX_EPOCH + Duration::from_millis(1_609_459_200_500);
         assert_eq!(format_rfc3339(t), "2021-01-01T00:00:00.500Z");
+    }
+
+    #[test]
+    fn resource_attributes_use_otel_semconv_key_names() {
+        let record = LogRecord {
+            timestamp: format_rfc3339(UNIX_EPOCH),
+            severity_text: "INFO",
+            severity_number: 9,
+            event_name: "ignis.test.resource".to_owned(),
+            body: "x".to_owned(),
+            attributes: BTreeMap::new(),
+            service_name: SERVICE_NAME,
+            service_version: SERVICE_VERSION,
+        };
+        let json = serde_json::to_value(&record).expect("serializes");
+        assert_eq!(json["service.name"], "ignis");
+        assert_eq!(json["service.version"], SERVICE_VERSION);
+    }
+
+    #[test]
+    fn sensitive_key_names_are_flagged_case_insensitively() {
+        for key in ["Authorization", "API_KEY", "Bearer-Token", "user_password", "session_cookie"] {
+            assert!(is_sensitive_key(key), "{key} should be flagged sensitive");
+        }
+        for key in ["model", "duration_ms", "artifact_path"] {
+            assert!(!is_sensitive_key(key), "{key} should not be flagged sensitive");
+        }
     }
 
     #[test]

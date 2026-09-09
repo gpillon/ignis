@@ -111,6 +111,35 @@ mod tests {
     }
 
     #[test]
+    fn every_event_carries_the_service_resource_attributes() {
+        let line = one_line(|| tracing::info!(name: "ignis.test.resource", "x"));
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["service.name"], "ignis");
+        assert_eq!(value["service.version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Testing Decisions (GitHub #79): "a covered logging path never emits a
+    /// known-sensitive value" — a call site that (accidentally or not) names
+    /// a field like a bearer token must never see the raw value reach a
+    /// rendered record.
+    #[test]
+    fn a_bearer_token_shaped_value_is_redacted_not_logged() {
+        let line = one_line(|| {
+            tracing::info!(
+                name: "ignis.test.secret",
+                authorization = "Bearer sk-fake-not-a-real-secret-12345",
+                "auth attempt"
+            );
+        });
+        assert!(
+            !line.contains("sk-fake-not-a-real-secret-12345"),
+            "the secret value must never reach the rendered line: {line}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["attributes"]["authorization"], "[REDACTED]");
+    }
+
+    #[test]
     fn structured_attributes_retain_their_native_type() {
         let line = one_line(|| {
             tracing::info!(

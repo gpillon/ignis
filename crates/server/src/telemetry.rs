@@ -1,12 +1,17 @@
 //! v1 telemetry (server-02, GitHub #15, design §5): a **JSONL** sink — one
-//! compact JSON object per line — carrying two record kinds:
+//! compact JSON object per line — carrying the scheduler's live counters:
 //!
 //! - the **interval** line — the live scheduler counters, one per scheduler
 //!   step / driver tick:
 //!   `{"kind":"interval","t":3,"waiting":2,"prefilling":1,"running":3,"kv_used_pct":62,"kv_evictions":0}`
-//! - the **request** line — one per request lifecycle event
-//!   (`admitted` / `ttft` / `done`):
-//!   `{"kind":"request","id":7,"event":"done","ms":210,"n":512,"tok_s":41.2}`
+//!
+//! The per-request lifecycle events (`admitted` / `ttft` / `done`) used to be
+//! a second JSONL record kind (`kind:"request"`) on this same sink; GitHub
+//! #79 migrated them onto the canonical structured-logging system
+//! (`ignis-logging`) as `ignis.request.admitted`/`ttft`/`done` tracing
+//! events instead — request lifecycle observability lives in the one
+//! canonical system now. This sink only carries the interval line (metrics,
+//! not logs, GitHub #77 — untouched by that migration).
 //!
 //! The sink is injectable (tests capture lines in memory; production targets
 //! stdout or a file). Since GitHub #69, all of this module's work (sink I/O,
@@ -210,22 +215,6 @@ struct IntervalLine {
     kv_evictions: u64,
 }
 
-/// The request line (design §5): one per lifecycle event.
-#[derive(Debug, Serialize)]
-struct RequestLine {
-    /// The record kind (the JSONL discriminator; always `"request"`).
-    kind: &'static str,
-    /// The request's id (the scheduler's `RequestId`).
-    id: RequestId,
-    /// The lifecycle event (`"admitted"`, `"ttft"`, or `"done"`).
-    event: &'static str,
-    /// Milliseconds elapsed since the request was submitted.
-    ms: u64,
-    /// Tokens generated so far (0 at admitted, 1 at ttft, the total at done).
-    n: u32,
-    /// Throughput (tokens/s) at this event (0 until a done has a span).
-    tok_s: f64,
-}
 
 // ── the telemetry state ─────────────────────────────────────────────────────
 
@@ -388,17 +377,40 @@ impl Telemetry {
         counters
     }
 
-    /// Emit a request line (one compact JSON object).
+    /// Emit a request lifecycle event through the canonical structured-logging
+    /// system (`ignis.request.admitted`/`ttft`/`done`, GitHub #79) — request
+    /// lifecycle observability lives in the one canonical system
+    /// (`ignis-logging`) instead of this module's own JSONL shape. The
+    /// per-tick `emit_interval` above is untouched: those counters are
+    /// metrics-shaped (GitHub #77), not logs, and stay on `TelemetrySink`.
     fn emit_request(&mut self, id: RequestId, event: &'static str, ms: u64, n: u32, tok_s: f64) {
-        let line = RequestLine {
-            kind: "request",
-            id,
-            event,
-            ms,
-            n,
-            tok_s,
-        };
-        self.sink.write_line(&to_line(&line));
+        match event {
+            "admitted" => tracing::info!(
+                name: "ignis.request.admitted",
+                request_id = id,
+                duration_ms = ms,
+                tokens = n,
+                tok_s = tok_s,
+                "request admitted"
+            ),
+            "ttft" => tracing::info!(
+                name: "ignis.request.ttft",
+                request_id = id,
+                duration_ms = ms,
+                tokens = n,
+                tok_s = tok_s,
+                "first token"
+            ),
+            "done" => tracing::info!(
+                name: "ignis.request.done",
+                request_id = id,
+                duration_ms = ms,
+                tokens = n,
+                tok_s = tok_s,
+                "request done"
+            ),
+            other => unreachable!("emit_request called with unknown event {other}"),
+        }
     }
 }
 
@@ -440,12 +452,11 @@ mod tests {
     fn an_interval_line_has_the_section5_shape() {
         let (mut telemetry, sink) = telemetry();
         telemetry.note_submit(1);
-        telemetry.on_admitted(1); // emits an `admitted` request line
+        telemetry.on_admitted(1); // now an `ignis.request.admitted` tracing event, not a sink line
         telemetry.emit_interval(); // emits the interval line
         let lines = sink.lines();
-        assert_eq!(lines.len(), 2, "one request (admitted) + one interval line");
-        let last: serde_json::Value =
-            serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(lines.len(), 1, "only the interval line goes through `TelemetrySink` now");
+        let last: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(last["kind"], "interval");
         assert_eq!(last["t"], 1, "the first interval is tick 1");
         assert_eq!(last["running"], 1, "the admitted request is on a lane");
@@ -455,57 +466,62 @@ mod tests {
         assert_eq!(last["kv_evictions"], 0);
     }
 
-    #[test]
-    fn request_lines_carry_the_lifecycle_events() {
-        let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(7);
-        telemetry.on_admitted(7);
-        telemetry.on_token(7); // first token → ttft
-        telemetry.on_token(7); // subsequent tokens are not re-emitted
-        telemetry.on_done(7, 4);
+    /// Captures the `ignis.request.*` events a block of code emits through
+    /// `tracing`, via `ignis-logging`'s own `JsonLayer`/`MemorySink` (GitHub
+    /// #79's canonical replacement for the old `RequestLine` JSONL shape).
+    fn capture_request_events(f: impl FnOnce()) -> Vec<serde_json::Value> {
+        use tracing_subscriber::layer::SubscriberExt;
 
-        let lines = sink.lines();
-        let kinds: Vec<String> = lines
+        let log_sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+        let subscriber =
+            tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(log_sink.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        log_sink
+            .lines()
             .iter()
-            .map(|l| {
-                serde_json::from_str::<serde_json::Value>(l)
-                    .unwrap()
-                    .get("kind")
-                    .and_then(|k| k.as_str())
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        // Every line is a `request` line (no interval line was emitted).
-        assert!(kinds.iter().all(|k| *k == "request"));
-        let events: Vec<String> = lines
-            .iter()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]
-                .as_str()
-                .unwrap()
-                .to_string())
-            .collect();
-        assert_eq!(events, vec!["admitted", "ttft", "done"]);
-        let done: serde_json::Value =
-            serde_json::from_str(&lines[lines.len() - 1]).unwrap();
-        assert_eq!(done["id"], 7);
-        assert_eq!(done["n"], 4, "the done line carries the total tokens");
+            .map(|line| serde_json::from_str(line).expect("valid json"))
+            .collect()
     }
 
     #[test]
-    fn a_fixed_clock_keeps_the_request_line_deterministic() {
-        let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1);
-        telemetry.on_admitted(1);
-        telemetry.on_done(1, 3);
-        let done: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
-        // FixedClock(0): a zero elapsed span → `ms` and `tok_s` are 0.
-        assert_eq!(done["ms"], 0);
-        assert_eq!(done["tok_s"], 0.0);
+    fn request_events_carry_the_lifecycle_names_and_attributes() {
+        let (mut telemetry, _sink) = telemetry();
+        let events = capture_request_events(|| {
+            telemetry.note_submit(7);
+            telemetry.on_admitted(7);
+            telemetry.on_token(7); // first token → ttft
+            telemetry.on_token(7); // subsequent tokens are not re-emitted
+            telemetry.on_done(7, 4);
+        });
+
+        let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
+        assert_eq!(
+            event_names,
+            vec!["ignis.request.admitted", "ignis.request.ttft", "ignis.request.done"]
+        );
+        for event in &events {
+            assert_eq!(event["attributes"]["request_id"], 7);
+        }
+        let done = events.last().unwrap();
+        assert_eq!(done["attributes"]["tokens"], 4, "the done event carries the total tokens");
     }
 
     #[test]
-    fn a_step_clock_reports_the_elapsed_span() {
+    fn a_fixed_clock_keeps_request_events_deterministic() {
+        let (mut telemetry, _sink) = telemetry();
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1);
+            telemetry.on_admitted(1);
+            telemetry.on_done(1, 3);
+        });
+        let done = events.last().unwrap();
+        // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
+        assert_eq!(done["attributes"]["duration_ms"], 0);
+        assert_eq!(done["attributes"]["tok_s"], 0.0);
+    }
+
+    #[test]
+    fn a_step_clock_reports_the_elapsed_span_on_request_events() {
         let sink = Arc::new(MemorySink::new());
         // A clock that advances 100 ms per read: submit at 100, done at 200.
         // An `AtomicU32` (not a `Cell`) so the clock stays `Sync` for the
@@ -523,11 +539,13 @@ mod tests {
             Telemetry::new(sink.clone(), Arc::new(StepClock {
                 reads: std::sync::atomic::AtomicU32::new(0),
             }));
-        telemetry.note_submit(1); // read #1 → 100 ms
-        telemetry.on_done(1, 5); // read #2 → 200 ms, so ms = 100
-        let done: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
-        assert_eq!(done["ms"], 100, "200 - 100 = 100 ms elapsed");
-        assert_eq!(done["tok_s"], 50.0, "5 tokens / 0.1 s");
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1); // read #1 → 100 ms
+            telemetry.on_done(1, 5); // read #2 → 200 ms, so ms = 100
+        });
+        let done = events.last().unwrap();
+        assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
+        assert_eq!(done["attributes"]["tok_s"], 50.0, "5 tokens / 0.1 s");
     }
 
     #[test]
@@ -600,7 +618,9 @@ mod tests {
         }
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert!(lines.len() >= 2, "at least one request + one interval line");
+        // `on_admitted` now emits through `tracing`, not `TelemetrySink` — only
+        // the interval line lands in the file (GitHub #79).
+        assert_eq!(lines.len(), 1, "the interval line");
         assert!(lines.iter().all(|l| l.starts_with('{') && l.ends_with('}')));
         let _ = std::fs::remove_file(&path);
     }

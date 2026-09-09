@@ -225,6 +225,18 @@ fn run_record_patch(options: &Options, manifest: &mut Manifest) -> Result<bool, 
 }
 
 fn main() -> ExitCode {
+    // A one-shot command: the whole event stream goes to stderr, reserving
+    // stdout for `verify`/`sync`/`repin`/`record-patch` result output and
+    // `--help` text (GitHub #79). A bootstrap `eprintln!` fallback (matching
+    // `ignis-server`'s, GitHub #78) covers the case logging itself fails to
+    // initialize, since no subscriber exists yet to carry that message.
+    if let Err(err) =
+        ignis_logging::init_with_sink(|name| std::env::var(name).ok(), std::sync::Arc::new(ignis_logging::StderrSink))
+    {
+        eprintln!("vendor-ninfer: logging: {err}");
+        return ExitCode::from(2);
+    }
+
     let options = match parse_options() {
         Ok(options) => options,
         Err(message) => {
@@ -232,7 +244,8 @@ fn main() -> ExitCode {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            eprintln!("vendor-ninfer: {message}\n\n{USAGE}");
+            tracing::error!(name: "ignis.vendor.usage_error", error = %message, "invalid usage");
+            eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -240,7 +253,12 @@ fn main() -> ExitCode {
     let mut manifest = match Manifest::load(&options.manifest) {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!("vendor-ninfer: {error}");
+            tracing::error!(
+                name: "ignis.vendor.manifest_load_failed",
+                manifest = %options.manifest.display(),
+                error = %error,
+                "manifest load failed"
+            );
             return ExitCode::from(2);
         }
     };
@@ -257,7 +275,12 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(message) => {
-            eprintln!("vendor-ninfer: {message}");
+            tracing::error!(
+                name: "ignis.vendor.command_failed",
+                command = %options.command,
+                error = %message,
+                "command failed"
+            );
             ExitCode::from(2)
         }
     }

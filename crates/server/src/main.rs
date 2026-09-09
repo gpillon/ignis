@@ -99,26 +99,34 @@ fn cuda_scheduler(
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
         None => {
-            eprintln!(
-                "ignis-server: {}: generation_config.json has no eos_token_id — refusing to start",
-                artifact_path.display()
+            tracing::error!(
+                name: "ignis.model.eos_missing",
+                artifact = %artifact_path.display(),
+                "generation_config.json has no eos_token_id — refusing to start"
             );
             std::process::exit(1);
         }
     };
     match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
         Ok(scheduler) => {
-            eprintln!(
-                "ignis-server: {} loaded on the GPU (eos={eos}, prefill chunk {} tokens, context {} tokens, KV pool {} tokens)",
-                artifact_path.display(),
-                shape.prefill_chunk,
-                shape.max_context,
-                shape.kv_pool_tokens,
+            tracing::info!(
+                name: "ignis.model.loaded",
+                artifact = %artifact_path.display(),
+                eos,
+                prefill_chunk = shape.prefill_chunk,
+                max_context = shape.max_context,
+                kv_pool_tokens = shape.kv_pool_tokens,
+                "model loaded on the GPU"
             );
             Box::new(scheduler)
         }
         Err(err) => {
-            eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
+            tracing::error!(
+                name: "ignis.model.load_failed",
+                artifact = %artifact_path.display(),
+                error = %err,
+                "refusing to start"
+            );
             std::process::exit(1);
         }
     }
@@ -129,8 +137,9 @@ async fn main() {
     // The canonical structured-logging system (GitHub #78, ADR 0011) — first
     // thing `main` does, before args/config, so the earliest possible
     // startup messages already go through it rather than a bootstrap
-    // `eprintln!`. This call only installs the subscriber; migrating the
-    // `eprintln!`s below onto it is Phase 2 (GitHub #79).
+    // `eprintln!`. Every diagnostic site below is migrated onto it (GitHub
+    // #79); only this call's own failure predates a subscriber existing, so
+    // it keeps a minimal bootstrap `eprintln!`.
     if let Err(err) = ignis_logging::init(|name| std::env::var(name).ok()) {
         eprintln!("ignis-server: logging: {err} — refusing to start");
         std::process::exit(1);
@@ -148,7 +157,7 @@ async fn main() {
             std::process::exit(0);
         }
         Err(err) => {
-            eprintln!("ignis-server: {err} — refusing to start");
+            tracing::error!(name: "ignis.config.invalid", error = %err, "refusing to start");
             std::process::exit(1);
         }
     };
@@ -176,11 +185,20 @@ async fn main() {
         None => Arc::new(StdoutSink),
         Some(path) => match FileSink::open(path) {
             Ok(file) => {
-                eprintln!("ignis-server: telemetry → {}", path.display());
+                tracing::info!(
+                    name: "ignis.telemetry.sink_selected",
+                    path = %path.display(),
+                    "telemetry sink selected"
+                );
                 Arc::new(file)
             }
             Err(err) => {
-                eprintln!("ignis-server: telemetry: {err} (falling back to stdout)");
+                tracing::warn!(
+                    name: "ignis.telemetry.sink_failed",
+                    path = %path.display(),
+                    error = %err,
+                    "falling back to stdout"
+                );
                 Arc::new(StdoutSink)
             }
         },
@@ -197,17 +215,31 @@ async fn main() {
         let sidecar = match loader::find_sidecar(artifact_path) {
             Ok(path) => path,
             Err(err) => {
-                eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
+                tracing::error!(
+                    name: "ignis.artifact.sidecar_missing",
+                    artifact = %artifact_path.display(),
+                    error = %err,
+                    "refusing to start"
+                );
                 std::process::exit(1);
             }
         };
         let frontend = match loader::load_artifact(artifact_path, &sidecar) {
             Ok(frontend) => {
-                eprintln!("ignis-server: {} verified (checksum clean) — tokenizer + chat template loaded", artifact_path.display());
+                tracing::info!(
+                    name: "ignis.artifact.verified",
+                    artifact = %artifact_path.display(),
+                    "checksum clean — tokenizer + chat template loaded"
+                );
                 frontend
             }
             Err(err) => {
-                eprintln!("ignis-server: {}: {err} — refusing to start", artifact_path.display());
+                tracing::error!(
+                    name: "ignis.artifact.load_failed",
+                    artifact = %artifact_path.display(),
+                    error = %err,
+                    "refusing to start"
+                );
                 std::process::exit(1);
             }
         };
@@ -216,14 +248,20 @@ async fn main() {
         let scheduler = cuda_scheduler(artifact_path, &model, &frontend, engine_shape);
         #[cfg(not(feature = "cuda"))]
         let scheduler = {
-            eprintln!("ignis-server: built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)");
+            tracing::warn!(
+                name: "ignis.model.mock_compute",
+                "built without --features cuda — MockCompute despite --artifact/IGNIS_ARTIFACT (the templated text is real, the completions are not)"
+            );
             mock_scheduler(&model)
         };
 
         let engine = Engine::with_sinks(scheduler, telemetry_sink, Arc::new(SystemClock));
         Server::with_artifact_template(engine, frontend)
     } else {
-        eprintln!("ignis-server: no artifact (set --artifact/IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute");
+        tracing::warn!(
+            name: "ignis.model.placeholder_template",
+            "no artifact (set --artifact/IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute"
+        );
         let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     };
@@ -238,7 +276,7 @@ async fn main() {
     if let Err(err) =
         thinking::validate_defaults(&thinking_defaults, &server.template.thinking_capabilities())
     {
-        eprintln!("ignis-server: {err} — refusing to start");
+        tracing::error!(name: "ignis.config.thinking_invalid", error = %err, "refusing to start");
         std::process::exit(1);
     }
     let server = server.with_thinking_defaults(default_enable_thinking, default_reasoning_effort);
@@ -246,9 +284,14 @@ async fn main() {
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the
     // server's `serve` spawns it; see `Server::serve`).
-    eprintln!("ignis-server: model {model} on http://{bind} (localhost, no auth; OpenAI API at /v1)");
+    tracing::info!(
+        name: "ignis.process.started",
+        model = %model,
+        bind = %bind,
+        "localhost, no auth; OpenAI API at /v1"
+    );
     if let Err(err) = server.serve(bind).await {
-        eprintln!("ignis-server: {err}");
+        tracing::error!(name: "ignis.server.failed", error = %err, "server exited");
         std::process::exit(1);
     }
 }

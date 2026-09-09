@@ -7,6 +7,8 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ignis-logging = { path = "../logging" }
+tracing = { workspace = true }
 
 [[bin]]
 name = "vendor-ninfer"
