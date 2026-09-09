@@ -218,15 +218,22 @@ impl StepLeaf for CudaLeaf {
         // of capturing eight graphs is measured and reported, not assumed")
         // -- not only when a width failed, so the common all-8-ready case
         // still surfaces the number rather than computing and discarding it.
-        eprintln!(
-            "ignis-runtime: decode graph capture: {}/8 widths ready ({}us)",
-            capture.ready_count(),
-            capture.capture_micros,
+        // GitHub #80: structured, not a raw `eprintln!` -- this still fires
+        // exactly once per model load (never per-token/decode-round), same
+        // frequency class as `ignis.process.started`.
+        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80/#102).
+        tracing::info!(
+            name: "ignis.runtime.decode_graph_capture",
+            ready = capture.ready_count(),
+            capture_micros = capture.capture_micros,
+            "decode graph capture"
         );
         if capture.ready_count() < 8 {
-            eprintln!(
-                "ignis-runtime: decode graph capture: {}",
-                step::last_decode_graph_error()
+            // hotpath-lint-allow: same model-load-time call as above, one line down.
+            tracing::warn!(
+                name: "ignis.runtime.decode_graph_capture_incomplete",
+                error = %step::last_decode_graph_error(),
+                "decode graph capture: not all widths ready"
             );
         }
         Ok(CudaModel { model, pool })
