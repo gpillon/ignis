@@ -21,6 +21,7 @@
 // int32 return codes (0 = ok, -1 = error), no C++ types across the boundary.
 
 #include "ignis_model.h"
+#include "ignis_step.h"
 
 #include "layer_internal.h"
 #include "model_internal.h"
@@ -35,6 +36,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -574,6 +576,35 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     model->scratch = std::make_unique<ninfer::DeviceArena>(scratch_bytes);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: scratch arena allocation failed: ") + e.what());
+    cudaStreamDestroy(model->stream);
+    model->stream = nullptr;
+    return -1;
+  }
+
+  // P3-03 (GitHub #99): device-side sampling's stable staging buffers and its
+  // own transient candidate-selection workspace, sized once at load. See
+  // model_internal.h's field comments for why these are separate from
+  // `scratch` above.
+  try {
+    const auto vocab = static_cast<std::int32_t>(g.vocab);
+    model->sampling_single_configs =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(ninfer::ops::SamplingConfig));
+    model->sampling_single_positions = std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t));
+    model->sampling_single_out = std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t));
+    model->sampling_decode_configs = std::make_unique<ninfer::DeviceBuffer>(
+        sizeof(ninfer::ops::SamplingConfig) * IGNIS_DECODE_MAX_BATCH);
+    model->sampling_decode_positions =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->sampling_decode_out =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(
+        static_cast<std::size_t>(vocab) * IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t));
+    const std::size_t workspace_bytes = ninfer::ops::sampling_workspace_capacity_bytes(
+        vocab, 1, IGNIS_DECODE_MAX_BATCH);
+    model->sampling_workspace =
+        std::make_unique<ninfer::DeviceArena>(std::max<std::size_t>(workspace_bytes, kArenaAlign));
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_model_load: sampling buffer allocation failed: ") + e.what());
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;

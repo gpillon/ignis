@@ -411,6 +411,38 @@ the A4 cases that the earlier tickets trimmed:
   were already vendored with their A4 arms in P2-02 (GitHub #84) — those
   patches trim only the non-NVFP4 arms, so no manifest change is needed here.
 
+P3-03 (GitHub #99) vendors the token sampler:
+
+- **sampling** — `ops/kernel/sampling.cuh` (the single-block route),
+  `ops/kernel/sampling_device.cuh` (shared candidate-selection/RNG
+  primitives, also used by the reference's speculative acceptance, not
+  vendored here), `ops/launcher/sampling.{h,cu}` (the multi-block-vs-single-
+  block dispatch, reusing the already-vendored `ops/common/sampling_workspace.h`),
+  `ops/wrapper/sampling.cpp` (the public `sample()` / `sample_and_scatter_hidden()`
+  entry points — only `sample()` is called by this ticket, the hidden-state
+  scatter overload is speculative-decoding-only, G5) and the public header
+  `include/ninfer/ops/sampling.h` (`SamplingConfig`, `SamplePurpose`,
+  `sampling_workspace_capacity_bytes`). RNG is counter-based
+  (`sampling_uniform(seed, position, purpose, sub)`, a pure function of its
+  inputs — no mutable device RNG state), so a sequence's determinism rests on
+  the `(seed, logical_position)` pair the leaf passes each call, not on any
+  stored generator state. Greedy (`temperature <= 0`) is bit-identical to
+  `argmax()` by the vendored contract, so the leaf's program now calls
+  `sample()` unconditionally in place of `argmax()` for every sampled
+  position; the standalone `argmax()` op stays vendored and in use only by
+  the degenerate G1 program (`ignis_prefill`/`ignis_decode`, test-only).
+- **its reference op test** — `tests/ops/test_sampling.cpp` (unmodified: an
+  independent CPU argmax oracle for the greedy branch and an FP64
+  mathematical-distribution oracle for the stochastic branch, never the
+  device RNG reproduced or another production path used as a golden), built
+  as its own CTest executable (`ignis_kernel_sampling_tests`).
+- The leaf's own program-layer wiring (`kernel/src/step.cu`: building
+  `SamplingConfig` rows from the ABI's `ignis_sampling_params`, staging them
+  and the logical-position array in stable device buffers for decode-graph
+  replay, and the per-slot penalty-count buffer in the sequence pool) is
+  ours, not vendored — `ops::sample`'s contract only supplies the op, not the
+  ABI or the per-sequence state it reads from.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;

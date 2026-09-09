@@ -43,6 +43,10 @@ pub(crate) mod ffi {
         pub gdn_conv_channels: u32,
         pub gdn_value_heads: u32,
         pub gdn_head_dim: u32,
+        /// The model's vocabulary size (P3-03, GitHub #99): sizes each
+        /// slot's presence/frequency penalty count buffer (one int32 per
+        /// vocab entry).
+        pub vocab: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -149,6 +153,7 @@ impl SeqPool {
             gdn_conv_channels: cfg.gdn_conv_channels() as u32,
             gdn_value_heads: cfg.gdn_value_heads as u32,
             gdn_head_dim: cfg.gdn_head_dim as u32,
+            vocab: cfg.vocab as u32,
         };
         let mut handle: *mut ffi::IgnisSeqPool = std::ptr::null_mut();
         let rc = unsafe { ffi::ignis_seq_pool_create(&spec, &mut handle) };

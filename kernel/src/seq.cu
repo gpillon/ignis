@@ -18,6 +18,8 @@
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 
+#include <cuda_runtime.h>
+
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,7 +51,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
       !positive(spec->kv_page_group_count) || !positive(spec->max_context_tokens) ||
       !positive(spec->slot_count) || !positive(spec->gdn_num_layers) ||
       !positive(spec->gdn_conv_channels) || !positive(spec->gdn_value_heads) ||
-      !positive(spec->gdn_head_dim)) {
+      !positive(spec->gdn_head_dim) || !positive(spec->vocab)) {
     set_error("ignis_seq_pool_create: every geometry field must be positive");
     return -1;
   }
@@ -94,7 +96,14 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
         ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_spec);
     const std::size_t gdn_bytes = gdn_builder.finish(256);
 
-    auto pool = std::make_unique<ignis_seq_pool>(kv_bytes, kv_layout, gdn_bytes, gdn_layout);
+    // P3-03 (GitHub #99): one int32 penalty count per vocab entry, per slot.
+    const std::size_t sampling_counts_bytes = static_cast<std::size_t>(spec->slot_count) *
+                                              static_cast<std::size_t>(spec->vocab) *
+                                              sizeof(std::int32_t);
+
+    auto pool = std::make_unique<ignis_seq_pool>(kv_bytes, kv_layout, gdn_bytes, gdn_layout,
+                                                 sampling_counts_bytes,
+                                                 static_cast<std::int32_t>(spec->vocab));
     pool->kv_page_bytes = kv_page_bytes;
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
@@ -163,6 +172,15 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
     seq->kv.bind_row(slot);
     pool->kv_pool.zero_pages(seq->kv.page_ids());
     pool->gdn_pool.zero_slot(slot);
+    // P3-03 (GitHub #99): zero this slot's penalty-count row so a
+    // re-allocated slot never inherits another request's counts.
+    const cudaError_t err =
+        cudaMemset(pool->token_counts_for(slot), 0,
+                  static_cast<std::size_t>(pool->vocab) * sizeof(std::int32_t));
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemset(sampling counts) failed: ") +
+                               cudaGetErrorString(err));
+    }
     seq->slot = slot;
 
     pool->free_slots.pop_back();

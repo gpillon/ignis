@@ -54,6 +54,7 @@ set(ignis_vendored_op_tests
   position
   rope
   qk_norm_rope
+  sampling
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)

@@ -84,12 +84,23 @@ void dirty_slot(ignis_seq_pool &pool, std::uint32_t layers, std::int32_t slot) {
     CUDA_CHECK(cudaMemset(conv.data, 0xcd, conv.bytes()));
     CUDA_CHECK(cudaMemset(rec.data, 0xcd, rec.bytes()));
   }
+  // P3-03 (GitHub #99): this slot's presence/frequency penalty-count row.
+  CUDA_CHECK(cudaMemset(pool.token_counts_for(slot), 0xcd,
+                        static_cast<std::size_t>(pool.vocab) * sizeof(std::int32_t)));
 }
 
 bool slot_is_zero(ignis_seq_pool &pool, std::uint32_t layers, std::int32_t slot) {
   for (std::uint32_t layer = 0; layer < layers; ++layer) {
     if (!tensor_is_zero(pool.gdn_pool.conv_slot(layer, slot)) ||
         !tensor_is_zero(pool.gdn_pool.recurrent_slot(layer, slot))) {
+      return false;
+    }
+  }
+  std::vector<std::int32_t> counts(static_cast<std::size_t>(pool.vocab));
+  CUDA_CHECK(cudaMemcpy(counts.data(), pool.token_counts_for(slot),
+                        counts.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+  for (std::int32_t count : counts) {
+    if (count != 0) {
       return false;
     }
   }
@@ -124,6 +135,7 @@ int main() {
   spec.gdn_conv_channels   = 6;
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;
+  spec.vocab               = 32; // P3-03 (GitHub #99): small, fast penalty-count geometry
 
   ignis_seq_pool *pool = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "pool create");
@@ -248,6 +260,13 @@ int main() {
   ignis_seq_pool *bad_pool     = nullptr;
   expect_rc(ignis_seq_pool_create(&bad_spec, &bad_pool), -1, "non-positive geometry is rejected");
   expect(bad_pool == nullptr, "non-positive geometry produced no handle");
+
+  ignis_seq_pool_spec bad_vocab_spec = spec;
+  bad_vocab_spec.vocab               = 0;
+  ignis_seq_pool *bad_vocab_pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&bad_vocab_spec, &bad_vocab_pool), -1,
+           "zero vocab is rejected (P3-03, GitHub #99)");
+  expect(bad_vocab_pool == nullptr, "zero vocab produced no handle");
 
   ignis_seq_pool_free(pool);
 

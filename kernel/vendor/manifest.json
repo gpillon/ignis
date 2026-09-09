@@ -96,6 +96,10 @@
       "sha256": "0cc5c89f0561908531c01367e8a28183ed94f09d462bff61627b1dfebe8b5a96"
     },
     {
+      "path": "include/ninfer/ops/sampling.h",
+      "sha256": "ea8255a4b4e87df2fe815ae62353a4006667701663989f2ba658a2db368b8154"
+    },
+    {
       "path": "include/ninfer/ops/sigmoid_mul.h",
       "sha256": "c1f21ef9cebae0808419c49cf894b76bed890cc10fed15ec4b6c1cbd7b3c29cd"
     },
@@ -448,6 +452,14 @@
       "sha256": "ea5a011e8caeb6faed8c35d3101ab4578f78a0cd2499230bde57bdfe5a7c0c4c"
     },
     {
+      "path": "src/ops/kernel/sampling.cuh",
+      "sha256": "6bc85f9a6c1d45eea159c5925fdfb6c9fc56e6e447ffa64a830be778c4e27adc"
+    },
+    {
+      "path": "src/ops/kernel/sampling_device.cuh",
+      "sha256": "99864fcc72fa117895c82abadd30b4856227c1f87f9e57e5c6732c31535ae90d"
+    },
+    {
       "path": "src/ops/kernel/sigmoid_gate_mul.cuh",
       "sha256": "d9aad5219f7c471b00f468d2c0e1c0aa7615dda783110028311aa69056a8e217"
     },
@@ -594,6 +606,14 @@
     {
       "path": "src/ops/launcher/rope.h",
       "sha256": "8d53c4d4db4bbbd0964bbd1f78a64bb3e5ded8464928d3076a19f25ce126fd3f"
+    },
+    {
+      "path": "src/ops/launcher/sampling.cu",
+      "sha256": "31e425891dde71b4c071c404f9419856412d1d4298b744419ccf185f629927f2"
+    },
+    {
+      "path": "src/ops/launcher/sampling.h",
+      "sha256": "91a3cea2f8a09492b8649620b0959c658f428934995674edc7dcd1d638a07b5b"
     },
     {
       "path": "src/ops/launcher/sigmoid_gate_mul.cu",
@@ -1000,6 +1020,10 @@
       "sha256": "c2639a7112eb030ed1f048aec694a51734c176f294c4b073bb97ed2de58fd51c"
     },
     {
+      "path": "src/ops/wrapper/sampling.cpp",
+      "sha256": "986e0d0002b660c3c85988ab065db2420519d9fb0877ffaf53a8679837f69fdc"
+    },
+    {
       "path": "src/ops/wrapper/sigmoid_mul.cpp",
       "sha256": "708c221dbe7b083cbfbcc78893f5c5089288eb31e792e538c950fc053a34f76a"
     },
@@ -1173,6 +1197,10 @@
     {
       "path": "tests/ops/test_rope.cpp",
       "sha256": "e4f0f09213ceaf8089b2abb90034f6f9d594149f7fbcb69e60a54cab049e379b"
+    },
+    {
+      "path": "tests/ops/test_sampling.cpp",
+      "sha256": "828a073bb70195921341fc3d43e5c1dd1a4b945718323fdb7627a7fb6da5d086"
     },
     {
       "path": "tests/ops/test_sigmoid_mul.cpp",
