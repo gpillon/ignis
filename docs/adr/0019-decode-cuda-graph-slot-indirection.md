@@ -100,6 +100,15 @@ is created, before any sequence is ever allocated), using:
 dispatches to the width's graph when ready, else the untouched eager path.
 No ABI break, no new Rust call sites for the hot path.
 
+Two new flat-C entry points are added: `ignis_decode_graph_capture` and its
+own `ignis_decode_graph_last_error`. ADR 0016's "later phases add fields to
+the options struct rather than parameters or parallel entry points" governs
+*per-call* decode modulation (the sampling/prefill options a caller tunes
+every round); capture is a one-time startup action with no per-round
+counterpart to extend, so it is a new entry point in the same sense
+`ignis_model_load` and `ignis_seq_pool_create` are — lifecycle calls, not
+step-ABI options.
+
 ## Consequences
 
 - Row `i` of a captured width-W graph always means "whichever sequence

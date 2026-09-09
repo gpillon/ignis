@@ -204,11 +204,18 @@ impl StepLeaf for CudaLeaf {
         // (impossible here) would.
         let capture = step::capture_decode_graphs(&model, &pool)
             .map_err(|e| leaf_error("decode graph capture", e))?;
+        // Reported unconditionally (GitHub #102's acceptance: "startup cost
+        // of capturing eight graphs is measured and reported, not assumed")
+        // -- not only when a width failed, so the common all-8-ready case
+        // still surfaces the number rather than computing and discarding it.
+        eprintln!(
+            "ignis-runtime: decode graph capture: {}/8 widths ready ({}us)",
+            capture.ready_count(),
+            capture.capture_micros,
+        );
         if capture.ready_count() < 8 {
             eprintln!(
-                "ignis-runtime: decode graph capture: {}/8 widths ready ({}us) -- {}",
-                capture.ready_count(),
-                capture.capture_micros,
+                "ignis-runtime: decode graph capture: {}",
                 step::last_decode_graph_error()
             );
         }

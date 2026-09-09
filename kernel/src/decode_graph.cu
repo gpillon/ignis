@@ -178,6 +178,12 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     set_error("ignis_decode_graph_capture: null argument");
     return -1;
   }
+  // Cleared up front (not just overwritten per-width below): otherwise a
+  // failure from an earlier call to this function survives a later call
+  // that captures every width cleanly, breaking
+  // ignis_decode_graph_last_error's "empty if every width captured"
+  // contract (kernel/include/ignis_step.h).
+  set_error("");
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {

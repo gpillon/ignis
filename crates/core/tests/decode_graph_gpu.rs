@@ -31,6 +31,7 @@ use ignis_core::model_load::{Model, load_qwen38_27b};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
     SamplingParams, capture_decode_graphs, decode_program_batch_sampled, prefill_program_sampled,
+    program_stats,
 };
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -162,7 +163,12 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
         .unwrap_or_else(|e| panic!("model load (baseline): {e}"));
     let pool = new_pool(WIDTH as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
-    capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    assert!(
+        capture.is_ready(WIDTH as u32),
+        "interleaving baseline: width {WIDTH} did not capture a decode graph -- \
+         both runs would silently take the eager path and prove nothing"
+    );
     let mut lanes: Vec<Seq<'_>> = (0..WIDTH)
         .map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}")))
         .collect();
@@ -178,6 +184,11 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
             decode_program_batch_sampled(&model, &pool, &mut refs, &sampling)
                 .unwrap_or_else(|e| panic!("decode: {e}")),
         );
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert_eq!(
+            stats.graph_launches, 1,
+            "interleaving baseline: decode round did not replay a graph"
+        );
     }
     drop(lanes);
     drop(pool);
@@ -190,7 +201,12 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
         .unwrap_or_else(|e| panic!("model load (interleaved): {e}"));
     let pool = new_pool(WIDTH as u32 + 1).unwrap_or_else(|e| panic!("seq pool create: {e}"));
-    capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    assert!(
+        capture.is_ready(WIDTH as u32),
+        "interleaved run: width {WIDTH} did not capture a decode graph -- \
+         the interleaving property would go unexercised"
+    );
     let mut lanes: Vec<Seq<'_>> = (0..WIDTH)
         .map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}")))
         .collect();
@@ -204,6 +220,11 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         interleaved.push(
             decode_program_batch_sampled(&model, &pool, &mut refs, &sampling)
                 .unwrap_or_else(|e| panic!("decode 1: {e}")),
+        );
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert_eq!(
+            stats.graph_launches, 1,
+            "interleaved run: first decode round did not replay a graph"
         );
     }
     let mut interloper = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc interloper: {e}"));
@@ -223,6 +244,11 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         interleaved.push(
             decode_program_batch_sampled(&model, &pool, &mut refs, &sampling)
                 .unwrap_or_else(|e| panic!("decode 2: {e}")),
+        );
+        let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert_eq!(
+            stats.graph_launches, 1,
+            "interleaved run: second decode round (after the prefill chunk) did not replay a graph"
         );
     }
     drop(lanes);
