@@ -196,6 +196,22 @@ impl StepLeaf for CudaLeaf {
             },
         )
         .map_err(|e| leaf_error("seq pool create", e))?;
+        // P3-05 (GitHub #102, ADR 0019): capture the decode graphs once,
+        // right after the pool exists and before any sequence is ever
+        // allocated -- a per-width capture failure degrades that width to
+        // the eager per-lane loop, never model load. `capture_decode_graphs`
+        // itself never returns Err for that reason; only a null model/pool
+        // (impossible here) would.
+        let capture = step::capture_decode_graphs(&model, &pool)
+            .map_err(|e| leaf_error("decode graph capture", e))?;
+        if capture.ready_count() < 8 {
+            eprintln!(
+                "ignis-runtime: decode graph capture: {}/8 widths ready ({}us) -- {}",
+                capture.ready_count(),
+                capture.capture_micros,
+                step::last_decode_graph_error()
+            );
+        }
         Ok(CudaModel { model, pool })
     }
 
@@ -218,9 +234,10 @@ impl StepLeaf for CudaLeaf {
             kv_page_count: pool_stats.kv_page_group_count,
             last_step_micros: program.last_step_micros,
             kernel_count: program.kernel_count,
-            // CUDA graph capture lands at G3; the program always runs
-            // eager today.
-            graph_launches: 0,
+            // P3-05 (GitHub #102, ADR 0019): 1 when the most recent decode
+            // round replayed a captured graph, 0 for every prefill step and
+            // for a decode round whose exact width has no ready graph.
+            graph_launches: program.graph_launches,
         })
     }
 
