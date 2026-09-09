@@ -42,6 +42,63 @@ delivered one is superseded. The phase / gate plan is `.scratch/ROADMAP.md`.
   shared-state operation on the owner's working environment: never done
   autonomously. Re-check before scheduling GPU work.
 
+- **GitHub #80's G4 gate run is outstanding.** Issue #80 (structured logging
+  Phase 3: hot-path guarantees, bounded queues, shutdown flush) added the
+  two-channel bounded logging queue in `crates/logging`, wired shutdown flush
+  into `ignis-server`/`vendor-ninfer`, and did a manual/grep-based hot-path
+  audit + a static lint (`crates/logging/src/hotpath_lint.rs`) — all
+  non-GPU work, done and tested (`cargo test --workspace` green). What is
+  **not** done: the acceptance criterion itself, `ignis-bench gate` (G4,
+  ≥99% of reference performance) run with the Phase 1-3 logging system wired
+  into `ignis-server`, per ADR 0007/0011 and the issue's own "Gate" note.
+  This was deliberately not run by the implementing agent (GPU is a shared
+  resource with the owner's own ninfer, ADR 0006 — stopping it is a manual,
+  owner-triggered action, not something an autonomous agent does). Run
+  `scripts/gpu-profile.ps1` against this branch before closing #80. Owner:
+  repo owner. Blocker: GPU exclusivity (ADR 0006).
+  **Update 2026-09-09:** `scripts/gpu-profile.ps1` (kernel op-tests +
+  `cargo test --workspace --features cuda -- --ignored` under
+  `IGNIS_GPU_PROFILE=1`) was run against this branch on a free GPU and
+  passed clean, 0 failures — confirms no GPU-gated-test regression from
+  the logging queue/shutdown-flush changes. This is **not** the G4
+  acceptance criterion itself (the `ignis-bench gate` trace-replay
+  throughput run, see the "99% performance gate" entry below) — that
+  instrument has no runnable baseline in this repo yet and remains
+  blocked behind G1→G2→G3→G4, unchanged by this run.
+
+- **GitHub #81's G4 gate run is outstanding.** Issue #81 (structured logging
+  Phase 4: internal request-tracing spans, `request.id` as `trace_id`, ADR
+  0012) wired the `ignis.admission`/`ignis.prefill`/`ignis.decode.round`/
+  `ignis.completion` span tree into the live `crates/core` scheduler
+  (`concrete.rs`) plus `tower-http`'s `TraceLayer` as the HTTP-ingress root
+  span (`crates/server/src/api.rs`) — all non-GPU work, done and tested
+  (`cargo test --workspace` green; `crates/core/tests/tracing_spans.rs` and
+  `crates/server/tests/tracing_root_span.rs` cover trace_id propagation and
+  round-not-token span granularity). A careful manual read of every span's
+  open/close point (documented in `docs/design/tracing-spans.md`) confirms
+  each one sits in code that already runs once per request per prefill
+  chunk / decode round (an existing per-request bookkeeping loop, not the
+  batched `Compute::prefill_step`/`decode_step` call itself, and never
+  inside a per-token loop — there is no per-token loop in Rust to begin
+  with; the leaf is device-resident, ADR 0009). What is **not** done: the
+  acceptance criterion's own re-run of `ignis-bench gate` (G4, ≥99% of
+  reference performance) with this span instrumentation wired into the live
+  prefill/decode path, per the issue's explicit "GPU test" note and Phase
+  3's standing rule that any hot-path-adjacent change needs the performance
+  gate, not just a design argument. This was deliberately not run by the
+  implementing agent (GPU is a shared resource with the owner's own ninfer,
+  ADR 0006 — stopping it is a manual, owner-triggered action). Run
+  `scripts/gpu-profile.ps1` against this branch before closing #81. Owner:
+  repo owner. Blocker: GPU exclusivity (ADR 0006).
+  **Update 2026-09-09:** `scripts/gpu-profile.ps1` was run against this
+  branch (which includes both #80's and #81's changes) on a free GPU and
+  passed clean, 0 failures, including a live TTFT run against
+  `ignis-server` — confirms no GPU-gated-test regression from the span
+  instrumentation. This is **not** the G4 acceptance criterion itself
+  (the `ignis-bench gate` trace-replay throughput run); that instrument
+  has no runnable baseline in this repo yet and remains blocked behind
+  G1→G2→G3→G4, unchanged by this run.
+
 - **The 99% performance gate (ADR 0007; GitHub #20 / #24, bench specs 02/03).**
   Parked behind **G4**, not open work — the roadmap folds #20 / #24 into the
   G4 master (#65); the trace-replay gate needs the hq-e8-2b profile on both

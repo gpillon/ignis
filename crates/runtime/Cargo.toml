@@ -7,6 +7,15 @@ edition.workspace = true
 [dependencies]
 ignis-core = { path = "../core" }
 ignis-artifact = { path = "../artifact" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Only for `cuda_leaf.rs`'s `leaf_error` unit test (GitHub #80): asserts the
+# `tracing::error!` call's shape, same pure/no-GPU-needed style as this
+# module's other tests below it.
+ignis-logging = { path = "../logging" }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # The safe wrapper itself is leaf-agnostic; this forwards the production

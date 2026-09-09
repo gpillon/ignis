@@ -30,6 +30,7 @@ use axum::{Json, Router};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tower_http::trace::{MakeSpan, TraceLayer};
 
 use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
 
@@ -42,6 +43,15 @@ use crate::thinking::{
 };
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
+///
+/// `TraceLayer` (GitHub #81, ADR 0012) is the HTTP-ingress root span for
+/// every request: `tower-http`'s well-tested span-per-request middleware,
+/// not a hand-rolled equivalent. [`RootSpanMaker`] declares its
+/// `request_id` field `Empty` at creation — the scheduler has not assigned
+/// one yet at ingress — and the handler records it once
+/// [`ignis_core::Scheduler::submit`] returns one, so every log record
+/// emitted from inside the span (including this handler's own tail) gets
+/// the request's real `trace_id` (`ignis_logging::trace_context`).
 pub fn router(state: Arc<Server>) -> Router {
     Router::new()
         .route("/v1/models", get(list_models).options(cors_preflight))
@@ -51,7 +61,29 @@ pub fn router(state: Arc<Server>) -> Router {
         )
         .route("/v1/responses", post(responses_api).options(cors_preflight))
         .layer(middleware::from_fn(cors_headers))
+        .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))
         .with_state(state)
+}
+
+/// The HTTP-ingress root span's shape: `request_id` is declared `Empty` —
+/// unknown at ingress — and recorded once the request is admitted into the
+/// scheduler (see `chat_completions`/`responses_api`). A request that never
+/// reaches submission (a 400 before it, a CORS preflight, `GET
+/// /v1/models`) simply never records it, so its span (and anything logged
+/// under it) carries no `trace_id` — there is no request to correlate yet,
+/// and this module never fabricates one (spec §19).
+#[derive(Clone, Copy)]
+struct RootSpanMaker;
+
+impl<B> MakeSpan<B> for RootSpanMaker {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        tracing::info_span!(
+            "ignis.http.request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            request_id = tracing::field::Empty,
+        )
+    }
 }
 
 /// Answers a CORS preflight request with no body; `cors_headers` attaches
@@ -448,6 +480,11 @@ async fn chat_completions(
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
+    // GitHub #81 / ADR 0012: the HTTP root span declared `request_id`
+    // `Empty` at ingress (`RootSpanMaker`) since the scheduler had not
+    // assigned one yet; record it now so every log record for the rest of
+    // this span's life carries the request's real `trace_id`.
+    tracing::Span::current().record("request_id", id);
     let id = format!("chatcmpl-{id}");
     let created = now();
 
@@ -832,6 +869,8 @@ async fn responses_api(
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
+    // GitHub #81 / ADR 0012: see the matching comment in `chat_completions`.
+    tracing::Span::current().record("request_id", id);
     match collect_tokens(&mut stream, server.request_timeout).await {
         Ok((tokens, _reason)) => {
             // The responses API's v1 shape carries no `finish_reason`

@@ -8,29 +8,53 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use tracing::Subscriber;
+use tracing::span::{Attributes, Id, Record};
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 use crate::record::LogRecord;
 use crate::sink::LineSink;
+use crate::trace_context;
 
 pub struct PrettyLayer {
     sink: Arc<dyn LineSink>,
     /// ANSI color codes, gated at construction on the caller's TTY check
     /// (or an explicit override) — never re-probed per event.
     color: bool,
+    /// Show `trace_id`/`span_id` in the rendered line (spec §19: "pretty
+    /// output MAY omit trace IDs by default for readability; debug/verbose
+    /// modes MAY display them"). Reuses `IGNIS_LOG_LEVEL` as that verbose
+    /// signal (GitHub #81) rather than adding a second config surface —
+    /// `build_subscriber` passes `true` when the configured level is
+    /// `Debug`/`Trace`.
+    show_trace: bool,
 }
 
 impl PrettyLayer {
-    pub fn new(sink: Arc<dyn LineSink>, color: bool) -> Self {
-        Self { sink, color }
+    pub fn new(sink: Arc<dyn LineSink>, color: bool, show_trace: bool) -> Self {
+        Self { sink, color, show_trace }
     }
 }
 
-impl<S: Subscriber> Layer<S> for PrettyLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let record = LogRecord::from_event(event, SystemTime::now());
-        self.sink.write_line(&render(&record, self.color));
+impl<S> Layer<S> for PrettyLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        trace_context::on_new_span(attrs, id, ctx);
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        trace_context::on_record(id, values, ctx);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        let level = *event.metadata().level();
+        let (trace_id, span_id) = trace_context::resolve(event, &ctx);
+        let record = LogRecord::from_event(event, SystemTime::now(), trace_id, span_id);
+        self.sink
+            .write_line_at(level, &render(&record, self.color, self.show_trace));
     }
 }
 
@@ -50,8 +74,10 @@ const RESET: &str = "\x1b[0m";
 /// Render one line: `<timestamp> <SEVERITY> <event_name> - <body> {attrs}`.
 /// Attribute values render as their JSON text, except `*_ms` (shown also as
 /// seconds) and `*_bytes` (shown also as GiB) — abbreviation only, the
-/// underlying value is untouched.
-fn render(record: &LogRecord, color: bool) -> String {
+/// underlying value is untouched. `trace_id`/`span_id` (when present on the
+/// record) are appended only when `show_trace` is set (spec §19: pretty MAY
+/// omit them by default) — GitHub #81.
+fn render(record: &LogRecord, color: bool, show_trace: bool) -> String {
     let severity = if color {
         format!("{}{:>5}{RESET}", severity_color(record.severity_text), record.severity_text)
     } else {
@@ -62,6 +88,12 @@ fn render(record: &LogRecord, color: bool) -> String {
         "{} {} {} - {}",
         record.timestamp, severity, record.event_name, record.body
     );
+
+    if show_trace
+        && let (Some(trace_id), Some(span_id)) = (&record.trace_id, &record.span_id)
+    {
+        line.push_str(&format!(" trace_id={trace_id} span_id={span_id}"));
+    }
 
     if !record.attributes.is_empty() {
         let rendered: Vec<String> = record
@@ -98,8 +130,12 @@ mod tests {
     use crate::sink::MemorySink;
 
     fn one_line(color: bool, f: impl FnOnce()) -> String {
+        one_line_with_trace(color, false, f)
+    }
+
+    fn one_line_with_trace(color: bool, show_trace: bool, f: impl FnOnce()) -> String {
         let sink = Arc::new(MemorySink::new());
-        let layer = PrettyLayer::new(sink.clone(), color);
+        let layer = PrettyLayer::new(sink.clone(), color, show_trace);
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f);
         let mut lines = sink.lines();
@@ -144,5 +180,41 @@ mod tests {
         });
         assert!(line.contains(&format!("vram_bytes={gib_in_bytes}")), "{line}");
         assert!(line.contains("2.000GiB"), "{line}");
+    }
+
+    /// spec §19: "pretty output MAY omit trace IDs by default."
+    #[test]
+    fn trace_ids_are_omitted_by_default_even_inside_a_request_span() {
+        let line = one_line(false, || {
+            let span = tracing::info_span!("ignis.admission", request_id = 5u64);
+            let _guard = span.enter();
+            tracing::info!(name: "ignis.test.traced", "inside a span");
+        });
+        assert!(!line.contains("trace_id="), "{line}");
+        assert!(!line.contains("span_id="), "{line}");
+    }
+
+    /// GitHub #81: the verbose/debug pretty mode (reusing `IGNIS_LOG_LEVEL`,
+    /// no new config surface) shows trace/span ids when they exist.
+    #[test]
+    fn show_trace_displays_the_ids_when_a_trace_context_exists() {
+        let line = one_line_with_trace(false, true, || {
+            let span = tracing::info_span!("ignis.admission", request_id = 5u64);
+            let _guard = span.enter();
+            tracing::info!(name: "ignis.test.traced", "inside a span");
+        });
+        assert!(line.contains("trace_id=00000000000000000000000000000005"), "{line}");
+        assert!(line.contains("span_id="), "{line}");
+    }
+
+    /// Even with `show_trace` on, an event with no active span still shows
+    /// neither field — there is nothing genuine to display (spec §19).
+    #[test]
+    fn show_trace_displays_nothing_when_there_is_no_active_trace_context() {
+        let line = one_line_with_trace(false, true, || {
+            tracing::info!(name: "ignis.test.untraced", "no span");
+        });
+        assert!(!line.contains("trace_id="), "{line}");
+        assert!(!line.contains("span_id="), "{line}");
     }
 }
