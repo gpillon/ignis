@@ -352,6 +352,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             max_sequence_tokens: 1024,
             kv_capacity_pages: pool.block_count() as u32,
             host_capacity_pages: 0,
+            serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
         },
         compute.clone(),
     );
