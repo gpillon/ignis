@@ -10,7 +10,12 @@
 //! argument (`info!(name: "ignis.foo.bar", key = value, "human body")`) —
 //! nothing here invents or rewrites it. Sites that don't pass `name:` get
 //! `tracing`'s default (`"event <file>:<line>"`); migrating call sites to
-//! real names is Phase 2 (#79), out of scope here.
+//! real names is Phase 2 (#79), out of scope here. `<file>` is `file!()`'s
+//! compile-time value: already relative for a workspace crate, but for a
+//! dependency (e.g. `tower-http`'s own internal `debug!` events) it is the
+//! machine-local absolute path into `~/.cargo/registry` — [`shorten_event_name`]
+//! trims that down to `<crate>-<version>/...` so the rendered name is the
+//! same on every machine.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,6 +72,42 @@ fn is_sensitive_key(name: &str) -> bool {
     })
 }
 
+/// `tracing`'s default name for an unnamed event is `"event <file>:<line>"`.
+/// For a dependency's source file, `<file>` is the machine-local absolute
+/// path into `~/.cargo/registry/src/<index>/<crate>-<version>/...` — this
+/// trims that machine-specific prefix, keeping `<crate>-<version>/...`
+/// onward, so the same event renders identically across machines. A custom
+/// `name:` (anything not starting with `"event "`) or a file with no
+/// `registry/src/` anchor (a workspace crate's own, already-relative path)
+/// passes through unchanged.
+fn shorten_event_name(name: &str) -> String {
+    let Some(rest) = name.strip_prefix("event ") else {
+        return name.to_owned();
+    };
+    let Some(colon) = rest.rfind(':') else {
+        return name.to_owned();
+    };
+    let (file, line) = rest.split_at(colon);
+    match shorten_registry_path(file) {
+        Some(short_file) => format!("event {short_file}{line}"),
+        None => name.to_owned(),
+    }
+}
+
+/// Strips a `.../registry/src/<index>/` prefix, returning `<crate>-<version>/...`.
+/// `None` when `file` has no such anchor (already relative, or some other
+/// out-of-tree layout this doesn't recognize).
+fn shorten_registry_path(file: &str) -> Option<&str> {
+    for sep in ['\\', '/'] {
+        let anchor = format!("registry{sep}src{sep}");
+        let Some(anchor_at) = file.find(&anchor) else { continue };
+        let after_anchor = &file[anchor_at + anchor.len()..];
+        let Some(index_dir_end) = after_anchor.find(sep) else { continue };
+        return Some(&after_anchor[index_dir_end + 1..]);
+    }
+    None
+}
+
 /// One canonical logging event, OTel LogRecord-shaped (spec §5-8): the same
 /// value both layers render, just rendered differently.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -112,7 +153,7 @@ impl LogRecord {
             timestamp: format_rfc3339(now),
             severity_text: severity_text(level),
             severity_number: severity_number(level),
-            event_name: meta.name().to_owned(),
+            event_name: shorten_event_name(meta.name()),
             body: visitor.body,
             attributes: visitor.attributes,
             service_name: SERVICE_NAME,
@@ -329,6 +370,44 @@ mod tests {
         for key in ["model", "duration_ms", "artifact_path"] {
             assert!(!is_sensitive_key(key), "{key} should not be flagged sensitive");
         }
+    }
+
+    #[test]
+    fn shortens_a_windows_registry_path_to_crate_and_version_onward() {
+        let name = r"event C:\Users\Mille\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tower-http-0.6.11\src\trace\on_request.rs:80";
+        assert_eq!(
+            shorten_event_name(name),
+            r"event tower-http-0.6.11\src\trace\on_request.rs:80"
+        );
+    }
+
+    #[test]
+    fn shortens_a_unix_registry_path_to_crate_and_version_onward() {
+        let name = "event /home/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tower-http-0.6.11/src/trace/on_request.rs:80";
+        assert_eq!(
+            shorten_event_name(name),
+            "event tower-http-0.6.11/src/trace/on_request.rs:80"
+        );
+    }
+
+    #[test]
+    fn a_workspace_crate_path_with_no_registry_anchor_is_unchanged() {
+        let name = r"event crates\server\src\api.rs:42";
+        assert_eq!(shorten_event_name(name), name);
+    }
+
+    #[test]
+    fn a_custom_event_name_is_never_touched() {
+        assert_eq!(shorten_event_name("ignis.request.admitted"), "ignis.request.admitted");
+    }
+
+    #[test]
+    fn windows_drive_letter_colon_does_not_confuse_the_line_number_split() {
+        // The rightmost ':' must win, not the drive letter's — otherwise
+        // "C" would be misread as the file and ":\Users\...:80" as "the line".
+        let name = r"event C:\repo\src\main.rs:1";
+        let shortened = shorten_event_name(name);
+        assert!(shortened.ends_with(":1"), "{shortened}");
     }
 
     #[test]
