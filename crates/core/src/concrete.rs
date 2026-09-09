@@ -649,9 +649,11 @@ impl ConcreteScheduler {
     /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
     fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>, reason: FinishReason) {
         // GitHub #81 / ADR 0012: the completion span — the last stage in
-        // this request's lifecycle, tagged with its own `request_id`.
-        let request_id = self.requests[idx].id;
-        let _span = tracing::info_span!("ignis.completion", request_id).entered();
+        // this request's lifecycle, tagged with its own `request_id`
+        // (read up front: `release_request` below also returns it, but by
+        // then the request has already been released).
+        let _span =
+            tracing::info_span!("ignis.completion", request_id = self.requests[idx].id).entered();
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
