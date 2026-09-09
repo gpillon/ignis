@@ -1,8 +1,8 @@
 //! v1 telemetry (server-02, design §5) — integration tests at the public
 //! seam: a real `ConcreteScheduler` (the deterministic `MockCompute`, ADR
 //! 0006) driven by the engine's model thread (GitHub #69), asserting the
-//! interval + request JSONL lines are emitted and stay consistent under
-//! concurrent access.
+//! interval JSONL line and the `ignis.request.*` tracing events (GitHub #79)
+//! are emitted and stay consistent under concurrent access.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +48,9 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
     }
 }
 
-/// The record kind of a JSONL line (`"interval"` or `"request"`), owned.
+/// The record kind of an interval JSONL line (always `"interval"` — request
+/// lifecycle events moved off this sink onto `ignis-logging`, GitHub #79;
+/// see [`capture_request_events`]).
 fn kind(line: &str) -> String {
     serde_json::from_str::<serde_json::Value>(line)
         .unwrap()
@@ -58,9 +60,37 @@ fn kind(line: &str) -> String {
         .to_string()
 }
 
+/// Installs `ignis-logging`'s `JsonLayer` as the thread-local default
+/// tracing subscriber for the returned guard's lifetime, capturing every
+/// `ignis.request.admitted`/`ttft`/`done` event the engine's telemetry task
+/// emits (GitHub #79). `#[tokio::test]` defaults to a current-thread
+/// runtime, so the engine's spawned telemetry task runs on this same OS
+/// thread and observes the same thread-local dispatcher — hold the guard
+/// alive for as long as request events need to be captured.
+fn capture_request_events() -> (std::sync::Arc<ignis_logging::MemorySink>, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
+    let subscriber = tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone()));
+    (sink, tracing::subscriber::set_default(subscriber))
+}
+
+fn request_event_names(log_sink: &ignis_logging::MemorySink) -> Vec<String> {
+    log_sink
+        .lines()
+        .iter()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["event_name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn a_real_request_emits_interval_and_request_lines() {
     let sink = Arc::new(MemorySink::new());
+    let (log_sink, _guard) = capture_request_events();
     let engine = engine_with_sink(sink.clone());
     let (_id, mut rx) = engine
         .submit(input(vec![1, 2, 3], 4), RequestClass::Interactive)
@@ -72,36 +102,25 @@ async fn a_real_request_emits_interval_and_request_lines() {
     nudge().await;
 
     let lines = sink.lines();
-    // At least one interval line (one per model-thread step), plus the
-    // request's lines.
+    // At least one interval line (one per model-thread step).
     assert!(
         lines.iter().any(|l| kind(l) == "interval"),
         "at least one interval line: {lines:?}"
     );
-    // The request went through the full lifecycle: admitted → ttft → done.
-    let events: Vec<String> = lines
-        .iter()
-        .filter(|l| kind(l) == "request")
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l)
-                .unwrap()
-                .get("event")
-                .and_then(|e| e.as_str())
-                .unwrap()
-                .to_string()
-        })
-        .collect();
+    // The request went through the full lifecycle: admitted → ttft → done,
+    // now as `ignis.request.*` tracing events (GitHub #79), not sink lines.
+    let events = request_event_names(&log_sink);
     assert!(
-        events.iter().any(|e| e == "admitted"),
-        "an admitted line: {events:?}"
+        events.iter().any(|e| e == "ignis.request.admitted"),
+        "an admitted event: {events:?}"
     );
     assert!(
-        events.iter().any(|e| e == "ttft"),
-        "a ttft line (first token): {events:?}"
+        events.iter().any(|e| e == "ignis.request.ttft"),
+        "a ttft event (first token): {events:?}"
     );
     assert!(
-        events.iter().any(|e| e == "done"),
-        "a done line: {events:?}"
+        events.iter().any(|e| e == "ignis.request.done"),
+        "a done event: {events:?}"
     );
 }
 
@@ -192,6 +211,7 @@ async fn reading_the_sink_while_the_telemetry_consumer_is_still_draining_does_no
     // never block on, or be blocked by, that consumer's own writes (each
     // write only ever holds the sink's own buffer lock for a single push).
     let sink = Arc::new(MemorySink::new());
+    let (log_sink, _guard) = capture_request_events();
     let engine = engine_with_sink(sink.clone());
     let (_id, mut rx) = engine
         .submit(input(vec![1, 2, 3], 2), RequestClass::Interactive)
@@ -206,6 +226,6 @@ async fn reading_the_sink_while_the_telemetry_consumer_is_still_draining_does_no
         .expect("the request completes");
     nudge().await;
     let lines = sink.lines();
-    assert!(lines.iter().any(|l| kind(l) == "request"));
+    assert!(!request_event_names(&log_sink).is_empty());
     assert!(lines.iter().any(|l| kind(l) == "interval"));
 }

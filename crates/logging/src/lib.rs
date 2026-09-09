@@ -44,7 +44,7 @@ pub use config::{LogConfig, LogConfigError, LogConfigOverride, LogFormat, LogLev
 pub use json_layer::JsonLayer;
 pub use pretty_layer::PrettyLayer;
 pub use record::LogRecord;
-pub use sink::{LineSink, MemorySink, StdoutSink};
+pub use sink::{LineSink, MemorySink, StderrSink, StdoutSink};
 
 /// [`init`] failed: either the env/format config was invalid, or a global
 /// subscriber was already installed (each process may install exactly one —
@@ -92,19 +92,33 @@ fn build_subscriber(
 }
 
 /// Resolve `env` (real process env in production, injected in tests) and
-/// install the matching layer as the global default subscriber. Call once,
-/// at the very top of `main`, before any other startup work — a minimal
-/// bootstrap `eprintln!` fallback before this call is fine (spec §31) and
-/// should stay as small as possible.
-pub fn init(env: impl Fn(&str) -> Option<String>) -> Result<(), InitError> {
+/// install the matching layer as the global default subscriber, writing
+/// through `sink`. Call once, at the very top of `main`, before any other
+/// startup work — a minimal bootstrap `eprintln!` fallback before this call
+/// is fine (spec §31) and should stay as small as possible.
+///
+/// [`init`] is the production entrypoint for a long-running service (`ignis
+/// serve` keeps its whole event stream on stdout, GitHub #79); a one-shot
+/// command that reserves stdout for its result output calls this directly
+/// with [`StderrSink`] instead.
+pub fn init_with_sink(
+    env: impl Fn(&str) -> Option<String>,
+    sink: Arc<dyn LineSink>,
+) -> Result<(), InitError> {
     let config = config::resolve(
         env,
         || std::io::stdout().is_terminal(),
         LogConfigOverride::default(),
     )
     .map_err(InitError::Config)?;
-    let subscriber = build_subscriber(config, Arc::new(StdoutSink));
+    let subscriber = build_subscriber(config, sink);
     tracing::subscriber::set_global_default(subscriber).map_err(|_| InitError::AlreadyInitialized)
+}
+
+/// [`init_with_sink`] with the production long-running-service sink
+/// ([`StdoutSink`]).
+pub fn init(env: impl Fn(&str) -> Option<String>) -> Result<(), InitError> {
+    init_with_sink(env, Arc::new(StdoutSink))
 }
 
 #[cfg(test)]

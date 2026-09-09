@@ -15,10 +15,12 @@ axum = { workspace = true }
 tokio = { workspace = true }
 futures-core = { workspace = true }
 arc-swap = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
 http-body-util = { workspace = true }
+tracing-subscriber = { workspace = true }
 # The G1 canary gate (ADR 0014, GitHub #76): the teacher-forced agreement
 # scoring + the >= 95% floor live in `ignis_bench::oracle` so the arithmetic
 # is CPU-unit-tested there, while the GPU driver that produces the

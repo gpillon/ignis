@@ -677,14 +677,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "ignis-vendor"
 version = "0.1.0"
 dependencies = [
+ "ignis-logging",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
