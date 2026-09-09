@@ -383,70 +383,95 @@ pub fn generate_cell_prompts_from_corpus(
 /// Detokenize one corpus window starting at `offset` (wrapping) and land
 /// it on `target_tokens` post-template tokens, returning the prompt text
 /// and its post-template ids.
+///
+/// A real tokenizer's decode/encode round-trip drifts by a few tokens
+/// (a handful of ids re-encode to two at 32K), so the exact landing may
+/// sit a few ids short of the binary search's position, or be skipped
+/// entirely by a double step. Each rotation of the window start (the
+/// window content rotates through the bank) changes which ids fall in it,
+/// so a rotation that skips the target can land where another skips.
+/// After a bounded number of rotations the cell is refused, not drifted.
 fn land_corpus_window(
     template: &dyn PromptTemplate,
     corpus: &[u32],
     offset: usize,
     target_tokens: usize,
 ) -> Result<(String, Vec<u32>), String> {
+    // A few candidate lengths around the search position (the round-trip
+    // drift is a handful of tokens even at 32K), and a few window
+    // rotations to try before refusing: each rotation is a different
+    // rotation of the bank, and the drift shifts with it.
+    const SCAN_RADIUS: usize = 64;
+    const ROTATIONS: usize = 8;
     let len = corpus.len();
-    // Decode the `n`-id window at `offset` (wrapping) to prompt text.
-    let cut = |n: usize| -> Result<(Vec<u32>, String), String> {
-        let ids: Vec<u32> = (0..n).map(|k| corpus[(offset + k) % len]).collect();
-        let text = template.decode(&ids)?;
-        Ok((ids, text))
-    };
-    // The post-template token count of the `n`-id window: decode, then
-    // encode exactly what the engine will see.
-    let actual = |n: usize| -> Result<usize, String> {
-        let (_, text) = cut(n)?;
-        Ok(template.encode_user_message(&text)?.len())
-    };
-    // The re-encoded count of a window is monotone non-decreasing in the
-    // window length (each decoded id is at least one re-encoded token,
-    // usually exactly one), so search for the largest length whose count
-    // does not pass the target. The upper bound is the shorter of the
-    // target and the whole corpus: a window longer than `target_tokens`
-    // ids cannot land on `target_tokens` post-template tokens.
-    let mut hi = target_tokens.min(len);
-    let mut lo = 1usize;
-    while lo < hi {
-        let mid = lo + (hi - lo + 1) / 2;
-        if actual(mid)? <= target_tokens {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    // `lo` is the largest length whose re-encode stays at or under the
-    // target; check it and its successor, and refuse the cell if neither
-    // lands exactly (a window that does not land re-encodes to a length
-    // the engine will not compute — a fiction this instrument will not
-    // measure, and the word-growth fallback is the O(n²) this path
-    // exists to avoid).
-    for n in [lo, lo + 1] {
-        if n > len {
-            continue;
-        }
-        if actual(n)? == target_tokens {
+    let mut last: (usize, usize, usize) = (1, 0, 0); // (lo, under, over)
+    for rotation in 0..ROTATIONS {
+        let off = (offset + rotation) % len;
+        // Decode the `n`-id window at `off` (wrapping) to prompt text.
+        let cut = |n: usize| -> Result<(Vec<u32>, String), String> {
+            let ids: Vec<u32> = (0..n).map(|k| corpus[(off + k) % len]).collect();
+            let text = template.decode(&ids)?;
+            Ok((ids, text))
+        };
+        // The post-template token count of the `n`-id window: decode, then
+        // encode exactly what the engine will see.
+        let actual = |n: usize| -> Result<usize, String> {
             let (_, text) = cut(n)?;
-            let tokens = template.encode_user_message(&text)?;
-            return Ok((text, tokens));
+            Ok(template.encode_user_message(&text)?.len())
+        };
+        // The re-encoded count of a window is monotone non-decreasing in
+        // the window length (each decoded id is at least one re-encoded
+        // token, usually exactly one), so the largest length whose count
+        // does not pass the target bounds every exact landing from above.
+        // The upper bound is the shorter of the target and the whole
+        // corpus: a window longer than `target_tokens` ids cannot land on
+        // `target_tokens` post-template tokens.
+        let mut hi = target_tokens.min(len);
+        let mut lo = 1usize;
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if actual(mid)? <= target_tokens {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
+        // The exact landing (if this rotation has one) is at or under
+        // `lo`; scan a bounded neighborhood, since the drift pushes it a
+        // few ids below the search position (and a double step can skip
+        // it entirely).
+        for n in lo.saturating_sub(SCAN_RADIUS).max(1)..=lo {
+            if actual(n)? == target_tokens {
+                let (_, text) = cut(n)?;
+                let tokens = template.encode_user_message(&text)?;
+                return Ok((text, tokens));
+            }
+        }
+        last = (
+            lo,
+            actual(lo)?,
+            if lo + 1 <= len {
+                actual(lo + 1)?
+            } else {
+                0
+            },
+        );
     }
-    let under = actual(lo)?;
+    // Every bounded rotation missed: refuse the cell rather than measure
+    // a length the engine will not compute (the word-growth fallback is
+    // the O(n²) this path exists to avoid).
+    let (lo, under, over) = last;
     if lo == len {
         return Err(format!(
             "cannot land on {target_tokens} tokens: the whole corpus is {len} ids, re-encoding \
              to {under} post-template tokens — the corpus is too short for the cell"
         ));
     }
-    let over = actual(lo + 1)?;
     Err(format!(
-        "cannot land on {target_tokens} tokens from a corpus window: the {lo}-id cut re-encodes \
-         to {under} tokens and the {next}-id cut to {over} — the tokenizer's decode/encode \
-         drift is beyond what a bounded search absorbs; drop --corpus to use the filler \
-         generator instead",
+        "cannot land on {target_tokens} tokens from a corpus window: {ROTATIONS} rotations \
+         searched; the {lo}-id cut re-encodes to {under} tokens and the {next}-id cut to \
+         {over} — the tokenizer's decode/encode drift is beyond what a bounded search \
+         absorbs; drop --corpus to use the filler generator instead",
         next = lo + 1
     ))
 }
@@ -1113,6 +1138,50 @@ mod tests {
         let err = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect_err("must refuse");
         assert!(err.contains("cannot land"), "{err}");
         assert!(err.contains("--corpus"), "{err}");
+    }
+
+    /// A BPE-defect mock: one id (the defect) re-encodes to two tokens, so
+    /// a window that starts on a stretch of defects skips a post-template
+    /// count that a rotation past the stretch lands exactly.
+    struct SkipMock {
+        double_id: u32,
+    }
+
+    impl PromptTemplate for SkipMock {
+        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+            let mut ids: Vec<u32> = (0..6).map(|i| 1_000 + i as u32).collect();
+            for word in content.split_whitespace() {
+                let id = word
+                    .strip_prefix("t")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| format!("the skip mock only decodes 't<id>' atoms, got `{word}`"))?;
+                ids.push(id);
+                if id == self.double_id {
+                    ids.push(id); // the defect: one corpus id, two re-encoded tokens
+                }
+            }
+            ids.extend((0..3).map(|i| 2_000 + i as u32));
+            Ok(ids)
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+        }
+    }
+
+    #[test]
+    fn a_rotation_lands_where_the_first_window_rotation_skips() {
+        // The bank starts with five defect ids: a window that starts on
+        // them re-encodes with a double step (17 -> 19), skipping 18; a
+        // rotation one id further in has four defects and lands exactly.
+        // (overhead = 9: header 6 + footer 3)
+        let template = SkipMock { double_id: 42 };
+        let mut bank: Vec<u32> = vec![42; 5];
+        bank.extend(100..400);
+        let set = generate_cell_prompts_from_corpus(&template, &bank, 18, 2).expect("cut");
+        assert_eq!(set.prompts.len(), 2, "warmup + one sample");
+        for ids in &set.tokens {
+            assert_eq!(ids.len(), 18, "each prompt is exactly the claimed length");
+        }
     }
 
     #[test]
