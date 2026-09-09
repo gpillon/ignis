@@ -51,10 +51,16 @@ const MAX_CONTEXT_TOKENS: u32 = 128;
 /// (activation-quantized) route, so the A16-tuned "a few BF16 ulps" bound
 /// no longer applies: activation quantization moves the relative L2 against
 /// the f64 reference to ~0.194 at T=1 and ~0.262 at T=4 (measured 2026-09-08,
-/// GPU profile). This is the A4-route precision bound (the observed max with
-/// ~20% margin); it is a numerics criterion, not the functional gate -- that
-/// remains the G1 canary floor (ADR 0014), which this ticket keeps at
-/// >= 95% and never waives.
+/// GPU profile; re-measured 2026-09-09 at 0.194071 and 0.262192 -- exact, and
+/// deterministic run to run). This is the A4-route precision bound (the
+/// observed max with ~20% margin); it is a numerics criterion, not the
+/// functional gate -- that remains the G1 canary floor (ADR 0014), which this
+/// ticket keeps at >= 95% and never waives.
+///
+/// This bound belongs to the GDN layer and to nothing else. GitHub #96:
+/// `gqa_layer_gpu.rs` inherited the same constant on the strength of these
+/// numbers without measuring its own layer, which actually runs ~50x tighter;
+/// it now carries its own bound.
 const A4_LAYER_TOLERANCE: f64 = 0.32;
 
 /// bf16 storage -> f64 (bit-exact promotion: bf16 is fp32's top 16 bits,
@@ -112,6 +118,15 @@ fn assert_matches_bf16_tolerance(actual_bf16: &[u16], reference: &[f64], label: 
         max_abs_reference = max_abs_reference.max(r.abs());
     }
     let relative_l2 = squared_error.sqrt() / squared_reference.sqrt().max(1e-30);
+    // Printed on every arm, pass or fail (GitHub #96): this bound is
+    // calibrated from an observed maximum, so how much room each arm has is
+    // what decides whether a later numerics change is safe. Reporting it
+    // only on failure is how the GQA oracle's 80x of unused slack stayed
+    // invisible for two tickets.
+    println!(
+        "{label}: relative L2 {relative_l2:.6} of {A4_LAYER_TOLERANCE}          ({:.1}% of budget)",
+        100.0 * relative_l2 / A4_LAYER_TOLERANCE
+    );
     assert!(
         relative_l2 <= A4_LAYER_TOLERANCE,
         "{label}: relative L2 error {relative_l2} exceeds {A4_LAYER_TOLERANCE}"
@@ -168,6 +183,14 @@ fn run_layer_and_check(
     device
         .copy_d2h(&out_buf, 0, &mut out_bytes)
         .unwrap_or_else(|e| panic!("{label}: D2H output: {e}"));
+    // The read-back is a `cudaMemcpyAsync` on the device's load stream
+    // (`kernel/src/device.cu`), so wait for it before the host reads
+    // `out_bytes` (GitHub #96). This test already synchronizes before the
+    // layer, which is why it never showed the failure the GQA oracle did;
+    // this closes the matching hole on the way out.
+    device
+        .synchronize()
+        .unwrap_or_else(|e| panic!("{label}: synchronize after the D2H: {e}"));
     let out_bf16: Vec<u16> = out_bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
