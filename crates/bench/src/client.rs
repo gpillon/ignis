@@ -72,6 +72,13 @@ pub struct Outcome {
     /// the engine does not report the field at all, which is not the same
     /// as a reported zero; see [`Outcome::computed_prefill_tokens`].
     pub cached_prompt_tokens: Option<u32>,
+    /// The arrival time of every content token, in ms since the request was
+    /// sent (streaming only; empty for a non-streaming response). This is
+    /// what the G3 inter-token-latency cell reads: a decode lane's inter-
+    /// token intervals are the consecutive differences of this series
+    /// ([`crate::g3`]), sampled continuously rather than reduced to a
+    /// single ttft/total pair.
+    pub token_times_ms: Vec<f64>,
 }
 
 impl Outcome {
@@ -135,6 +142,13 @@ impl MockEndpoint {
         let n = req.max_tokens;
         let ttft = 100.0_f64;
         let decode_ms = if n > 1 { (n as f64 - 1.0) * 10.0 } else { 0.0 };
+        // One arrival time per token, `ttft` then 10 ms apart — matching
+        // `decode_ms` above so `token_times_ms.last() == total_ms`.
+        let token_times_ms = if n == 0 {
+            Vec::new()
+        } else {
+            (0..n).map(|i| ttft + i as f64 * 10.0).collect()
+        };
         Outcome {
             ttft_ms: ttft,
             total_ms: ttft + decode_ms,
@@ -144,6 +158,7 @@ impl MockEndpoint {
             // word count as its prompt tokens, all of them computed.
             prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
             cached_prompt_tokens: None,
+            token_times_ms,
         }
     }
 }
@@ -312,6 +327,8 @@ impl HttpEndpoint {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            // No per-token timing on a non-streaming response.
+            token_times_ms: Vec::new(),
         })
     }
 
@@ -327,6 +344,7 @@ impl HttpEndpoint {
         let mut first_token_ms: Option<f64> = None;
         let mut prompt_tokens: Option<u32> = None;
         let mut cached_prompt_tokens: Option<u32> = None;
+        let mut token_times_ms: Vec<f64> = Vec::new();
         for line in reader.lines() {
             let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
             // The SSE framing: `data: <payload>` lines (empty lines
@@ -359,9 +377,11 @@ impl HttpEndpoint {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !delta.is_empty() {
+                let now_ms = ms_since(start);
                 if first_token_ms.is_none() {
-                    first_token_ms = Some(ms_since(start));
+                    first_token_ms = Some(now_ms);
                 }
+                token_times_ms.push(now_ms);
                 output.push_str(delta);
                 n_tokens += 1;
             }
@@ -376,6 +396,7 @@ impl HttpEndpoint {
             output,
             prompt_tokens,
             cached_prompt_tokens,
+            token_times_ms,
         })
     }
 }
@@ -593,6 +614,7 @@ mod tests {
             output: "x".repeat(n as usize),
             prompt_tokens: None,
             cached_prompt_tokens: None,
+            token_times_ms: Vec::new(),
         }
     }
 

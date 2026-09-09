@@ -34,6 +34,17 @@
 //!       live agent client, records each request as a trace line, forwards
 //!       it to the target engine, and pipes the response back. `POST
 //!       /v1/session/end` finalizes the trace and stops the proxy.
+//!   `g3      --endpoint <url> --artifact <artifact.ninfer> [--label L]
+//!             [--profile P] [--session S] [--out <record.json>]`
+//!       The G3 measurement instrument (P3-07, ADR 0015): the C=1 / C=4 /
+//!       ITL cells (spec 03) over HTTP/SSE against any OpenAI-compatible
+//!       endpoint. Writes one engine's record.
+//!   `g3-gate --ours <ignis-record.json> --ref <reference-record.json>
+//!             [--note <text>] [--out <verdict.json>]`
+//!       The G3 verdict over two such records: C=1/C=4 aggregate throughput
+//!       ratio against 99%, ITL p95 ratio against the reference's own p95.
+//!       Refuses a verdict when the records are not live/live (different
+//!       sessions, a missing cell, a void/bad sample).
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
@@ -47,7 +58,7 @@ use std::sync::Arc;
 use ignis_bench::{
     canary::{self, CanaryResult},
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
-    g2,
+    g2, g3, g3_gate,
     gate::GateReport,
     metrics::Run,
     oracle::{self, Fixture},
@@ -69,6 +80,8 @@ fn main() -> ExitCode {
         Some("oracle") => cmd_oracle(&args[1..]),
         Some("ttft") => cmd_ttft(&args[1..]),
         Some("g2") => cmd_g2(&args[1..]),
+        Some("g3") => cmd_g3(&args[1..]),
+        Some("g3-gate") => cmd_g3_gate(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -89,7 +102,10 @@ fn print_usage() {
   ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]
   ignis-bench ttft --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768 [--samples 5] [--max-tokens 8]
                    [--label ignis] [--profile <text>] [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
-  ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
+  ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
+  ignis-bench g3 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
+                 [--session <id>] [--out <record.json>]
+  ignis-bench g3-gate --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
     );
 }
 
@@ -638,6 +654,137 @@ fn cmd_g2(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!("G2 gate FAILED (ADR 0015: ratio <= {} per cell)", verdict.threshold);
+        ExitCode::FAILURE
+    }
+}
+
+/// `g3` (P3-07, GitHub #100): measure the C=1 / C=4 / ITL cells (spec 03)
+/// against one OpenAI-compatible endpoint. The record it writes is one half
+/// of a G3 verdict; `g3-gate` compares two of them.
+fn cmd_g3(args: &[String]) -> ExitCode {
+    let (endpoint, artifact) = match (require(args, "endpoint"), require(args, "artifact")) {
+        (Ok(e), Ok(a)) => (e, a),
+        (e, a) => {
+            for err in [e.err(), a.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
+    let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
+    // Live/live (ADR 0015): the *same* session id must be passed to both
+    // engines' runs.
+    let session = opt(args, "session").unwrap_or_else(new_session_id);
+    let out = opt(args, "out");
+
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ep = HttpEndpoint::new(&endpoint);
+    let engine = match ep.list_models() {
+        Ok(models) if !models.is_empty() => {
+            eprintln!("engine {endpoint}: {}", models.join(", "));
+            models[0].clone()
+        }
+        Ok(_) => {
+            eprintln!("error: engine {endpoint} reports no loaded model");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("g3 session {session}: C=1 / C=4 / ITL against {label}");
+
+    let cfg = g3::G3Config {
+        label,
+        profile,
+        artifact,
+        session,
+        throughput: g3::ThroughputSpec::default(),
+        itl: g3::ItlConfig::default(),
+    };
+    let record = g3::measure(&ep, &frontend, engine, endpoint, &cfg);
+    print!("{}", record.render());
+
+    if let Some(path) = &out {
+        if let Err(e) = record.write(Path::new(path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    let contaminated = !record.c1.all_cold() || !record.c4.all_cold() || !record.itl.all_cold();
+    if contaminated {
+        eprintln!(
+            "error: at least one cell did not produce a full set of cold/complete samples — \
+             this record cannot decide the gate"
+        );
+        ExitCode::FAILURE
+    } else {
+        eprintln!("all cells cold; pass --session {} to the other engine's run", cfg.session);
+        ExitCode::SUCCESS
+    }
+}
+
+/// `g3-gate` (P3-07, GitHub #100): the G3 verdict over two records. Refuses
+/// outright — rather than reporting a failure — when the two records do not
+/// support a live/live comparison (ADR 0015).
+fn cmd_g3_gate(args: &[String]) -> ExitCode {
+    let (ours_path, ref_path) = match (require(args, "ours"), require(args, "ref")) {
+        (Ok(o), Ok(r)) => (o, r),
+        (o, r) => {
+            for err in [o.err(), r.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let ours = match g3::Record::read(Path::new(&ours_path)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference = match g3::Record::read(Path::new(&ref_path)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut verdict = match g3_gate::check(&ours, &reference) {
+        Ok(v) => v,
+        Err(refusal) => {
+            eprintln!("G3 gate check REFUSED: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    verdict.notes.extend(repeated_opt(args, "note"));
+    print!("{}", verdict.render());
+    if let Some(path) = opt(args, "out") {
+        if let Err(e) = verdict.write(Path::new(&path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    if verdict.passed {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "G3 gate FAILED (ADR 0015: tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {})",
+            verdict.throughput_threshold, verdict.itl_threshold
+        );
         ExitCode::FAILURE
     }
 }

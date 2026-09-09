@@ -822,7 +822,7 @@ fn measure_cell_with(
 /// the engine's disagree, which makes the cell's claimed length a fiction;
 /// either way the sample is not evidence, so it is void (ADR 0015: the
 /// tool enforces live/live, not the operator's discipline).
-fn coldness_failure(computed: Option<u32>, prompt_tokens: u32) -> Option<String> {
+pub(crate) fn coldness_failure(computed: Option<u32>, prompt_tokens: u32) -> Option<String> {
     match computed {
         None => Some(
             "the engine reported no usage, so its computed prefill cannot be read back".to_string(),

@@ -38,10 +38,20 @@
 //!   its own continuation, so this measures continuation similarity rather
 //!   than whether the forward pass is grossly broken.
 //!   `oracle::compare_fixtures`, reported by `ignis-bench oracle compare`.
+//!
+//! The G3 measurement instrument (`g3` + `g3_gate`, P3-07) is the phase-3
+//! gate tooling (ADR 0015, spec 03): `g3` measures the C=1 / C=4 / ITL
+//! cells (single-sequence and aggregate throughput, and inter-token
+//! latency under a concurrent prefill) over HTTP/SSE against any
+//! OpenAI-compatible endpoint, reusing `ttft`'s exact-length prompt
+//! generator and cold-prefix rule; `g3_gate` turns two such records into
+//! the G3 verdict, with the same live/live refusal discipline as `g2`.
 
 pub mod canary;
 pub mod client;
 pub mod g2;
+pub mod g3;
+pub mod g3_gate;
 pub mod gate;
 pub mod metrics;
 pub mod oracle;

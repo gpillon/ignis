@@ -381,6 +381,7 @@ mod tests {
             output: text.to_string(),
             prompt_tokens: None,
             cached_prompt_tokens: None,
+            token_times_ms: Vec::new(),
         }
     }
 
