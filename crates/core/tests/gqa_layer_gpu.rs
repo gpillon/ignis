@@ -78,6 +78,16 @@ fn assert_matches_bf16_tolerance(actual_bf16: &[u16], reference: &[f64], label: 
         max_abs_reference = max_abs_reference.max(expected.abs());
     }
     let relative_l2 = squared_error.sqrt() / squared_reference.sqrt().max(1e-30);
+    // Printed on every arm, pass or fail: this bound is calibrated from an
+    // observed maximum, so how much room each arm actually has is the thing
+    // that decides whether a later numerics change is safe. Reporting it only
+    // on failure hid that layer 27 runs much closer to the limit than the
+    // layer 3 reading the constant was set from (GitHub #96).
+    println!(
+        "{label}: relative L2 {relative_l2:.6} of {A4_LAYER_TOLERANCE} \
+         ({:.1}% of budget)",
+        100.0 * relative_l2 / A4_LAYER_TOLERANCE
+    );
     assert!(
         relative_l2 <= A4_LAYER_TOLERANCE,
         "{label}: relative L2 error {relative_l2} exceeds {A4_LAYER_TOLERANCE}"
