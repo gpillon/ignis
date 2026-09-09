@@ -45,6 +45,7 @@ fn small_pool() -> SchedulerConfig {
         // the host tier is disabled (no overflow), so a blocked head waits
         // for its donors instead of being admitted via a lane eviction.
         host_capacity_pages: 0,
+        serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
     }
 }
 

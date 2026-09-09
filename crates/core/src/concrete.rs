@@ -5,19 +5,37 @@
 //! seam (production: the kernel leaf via FFI, tests: [`crate::mock::MockCompute`])
 //! in three phases per advance:
 //!
-//! 1. **Batched prefill** — up to `max_prefill_batch` queued requests are
-//!    grouped into ONE compute call (not one call per request) to
-//!    saturate the GPU in prefill and cut burst TTFT. *An experiment to
-//!    verify* — we may be compute-bound, in which case it is useless (a
-//!    measure, not a guarantee; the 99% gate of ADR 0007 re-checks it on
-//!    the GPU). **Sibling prefix reuse** (core-07) runs here: before the
-//!    batch call, each request claims the longest cached prefix of its
-//!    prompt (skipping the redundant prefill — its job carries only the
-//!    tail); after a successful call, fresh requests register their now-
-//!    warm prompt in the prefix cache for siblings. The shared entry's
-//!    pages are charged to the pool once (the charge split), and the
-//!    admission machine runs against the pool minus the cache's pins
-//!    (consistent accounting — the cache never over-allocates).
+//! 1. **Chunked, interleaved prefill** (P3-01, ADR 0018) — at most one
+//!    `prefill_step` call per `advance()`, spanning at most
+//!    `serving_chunk_tokens` tokens per request, so a long prompt costs the
+//!    decode lanes one chunk of latency instead of the whole span (a 32K
+//!    prompt no longer inserts a multi-second gap into every other lane's
+//!    token stream). Several **queued** requests may still share that one
+//!    call — up to `max_prefill_batch` of them, `PrefillJob`s batched
+//!    together — but only while each finishes within its own single chunk;
+//!    the moment one of them would need more than one chunk, the batch stops
+//!    there. **Exactly one request may hold multi-tick (device-resident)
+//!    prefill progress at a time**: once a request's chunk leaves it
+//!    incomplete, it alone is served on every following `advance()` (`the
+//!    rest queue`, `run_admission`'s candidates are unaffected — a request
+//!    that already finished prefilling in an earlier tick is still dealt a
+//!    lane normally) until it finishes. `RequestState::Prefilling` is
+//!    therefore **durable**: [`Request::prefill_progress`] carries how far a
+//!    request has gotten, and [`Request::prefill_complete`] is what
+//!    `run_admission` gates a lane deal on — a half-prefilled request is
+//!    never dealt a lane (never decoded). Each completed chunk — the last
+//!    one included — is recorded as a GDN resumable boundary
+//!    ([`crate::gdn::GdnState::checkpoint`]); a chunk call that errors
+//!    leaves the request's progress untouched, so the retry resends the
+//!    same (not-yet-applied) span. **Sibling prefix reuse** (core-07) runs
+//!    here too: before a *fresh* request's first chunk, it claims the
+//!    longest cached prefix of its prompt (skipping the redundant prefill —
+//!    its first job carries only the tail); once a request's *last* chunk
+//!    completes, it registers its now-warm prompt in the prefix cache for
+//!    siblings. The shared entry's pages are charged to the pool once (the
+//!    charge split), and the admission machine runs against the pool minus
+//!    the cache's pins (consistent accounting — the cache never
+//!    over-allocates).
 //! 2. **The admission state machine** (core-05) — lane assignment is
 //!    driven by the full fairness machinery (`admission.rs`, ported from
 //!    the reference stack per ADR 0004): *protection* (a blocked head
@@ -102,6 +120,39 @@ pub struct SchedulerConfig {
     /// auto-sizes this from host RAM, tests pass small values to drive
     /// contention).
     pub host_capacity_pages: u32,
+    /// The serving prefill chunk width, in tokens (P3-01, ADR 0018): the
+    /// scheduler sends at most this many tokens of a request's remaining
+    /// prompt per `advance()`, so a long prefill costs the decode lanes one
+    /// chunk of latency instead of the whole span. Must be `<=` the width
+    /// the program scratch was reserved for at model load (P2-01 / #83) —
+    /// resolve against that bound with [`resolve_serving_chunk_tokens`]
+    /// before constructing this config; a real load should default this to
+    /// the load width. No adaptive policy: fixed for the scheduler's
+    /// lifetime.
+    pub serving_chunk_tokens: u32,
+}
+
+/// The serving prefill chunk width's default, in tokens (ADR 0018): the
+/// measured 1,024-token chunk from the G2 gate run (`.scratch/ROADMAP.md`).
+/// P3-01 is CPU-only (driven through the `Compute` seam with `MockCompute`),
+/// so this is the value CPU tests and this config's [`Default`] use; wiring
+/// a real `--features cuda` load's actual reserved width through
+/// [`resolve_serving_chunk_tokens`] is `crates/runtime`'s job, not this
+/// crate's.
+pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
+
+/// Resolve a serving-time chunk width against the width the program scratch
+/// was reserved for at model load (P2-01 / #83, ADR 0018): narrowing at
+/// serving time is free (the scratch was reserved for at least this many
+/// tokens), widening is refused — the scratch was never reserved to serve a
+/// wider chunk, and silently widening would run past it.
+pub fn resolve_serving_chunk_tokens(requested: u32, load_width: u32) -> Result<u32, String> {
+    if requested > load_width {
+        return Err(format!(
+            "serving chunk width {requested} exceeds the {load_width}-token width reserved at model load"
+        ));
+    }
+    Ok(requested)
 }
 
 impl Default for SchedulerConfig {
@@ -119,6 +170,7 @@ impl Default for SchedulerConfig {
             // Eight full sequences fit in host RAM by default: the
             // host-tier overflow budget matches the KV pool (core-06).
             host_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
+            serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
         }
     }
 }
@@ -191,6 +243,10 @@ impl ConcreteScheduler {
         assert!(
             config.kv_capacity_pages > 0,
             "the KV pool must hold at least one page"
+        );
+        assert!(
+            config.serving_chunk_tokens > 0,
+            "the serving prefill chunk width must be non-zero"
         );
         Self {
             capacity: AdmissionResources {
@@ -386,17 +442,21 @@ impl ConcreteScheduler {
     }
 
     /// Phase 2 (core-05): the admission state machine drives the lane
-    /// deal. The queue is the `Prefilling` set in (class priority, FIFO
-    /// by id) order; the head is dealt when it fits, and — when the head
-    /// is blocked by the active set — the machine opens / maintains the
-    /// protection and classifies backfills (persistent / temporal) on
-    /// the lanes the donors will free.
+    /// deal. The queue is the **completed** `Prefilling` set (P3-01, ADR
+    /// 0018: `Prefilling` is durable and may carry only partial progress —
+    /// a request that has not sent its whole prompt yet is not a
+    /// candidate; a sequence that has not finished prefilling can never be
+    /// decoded) in (class priority, FIFO by id) order; the head is dealt
+    /// when it fits, and — when the head is blocked by the active set —
+    /// the machine opens / maintains the protection and classifies
+    /// backfills (persistent / temporal) on the lanes the donors will
+    /// free.
     fn run_admission(&mut self, events: &mut Vec<SchedEvent>) {
         let mut queue: Vec<usize> = self
             .requests
             .iter()
             .enumerate()
-            .filter(|&(_, r)| r.state == RequestState::Prefilling)
+            .filter(|&(_, r)| r.state == RequestState::Prefilling && r.prefill_complete())
             .map(|(i, _)| i)
             .collect();
         queue.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
@@ -514,15 +574,20 @@ impl ConcreteScheduler {
         }
     }
 
-    /// Complete request `idx` (its lane and KV reservation are released).
-    /// `reason` is why it stopped — carried into the emitted
-    /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
-    fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>, reason: FinishReason) {
+    /// Release request `idx`'s resources regardless of its lifecycle state
+    /// (its lane, if any, its KV reservation, and its shared-prefix claim)
+    /// and abort it ([`Request::abort`]). Returns its id and its generated
+    /// token count (for the caller's own event, if it emits one). Shared by
+    /// [`Self::mark_done`] (a normal completion) and [`Self::cancel`]'s
+    /// sweep (P3-01, ADR 0018: cancel is abort, not suspend — no
+    /// suspend/resume primitive exists, so cancelling releases exactly what
+    /// completing would).
+    fn release_request(&mut self, idx: usize) -> (RequestId, u32) {
         let (release_pages, lane, request_id, tokens, prefix_entry) = {
             let r = &self.requests[idx];
             (r.resources.kv_pages, r.lane, r.id, r.tokens, r.prefix_entry)
         };
-        self.requests[idx].advance(RequestState::Done);
+        self.requests[idx].abort();
         self.compute.release(request_id);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
@@ -534,17 +599,79 @@ impl ConcreteScheduler {
         // claimant releases).
         self.release_prefix_claim(prefix_entry);
         // A protection exists to let its head in: if the protected head
-        // itself completes (rather than being dealt), its protection is
-        // stale — the next blocked head opens a fresh epoch.
+        // itself completes or is cancelled (rather than being dealt), its
+        // protection is stale — the next blocked head opens a fresh epoch.
         let protected_head = self.protection.as_ref().map(|p| p.head_request_id);
         if protected_head == Some(request_id) {
             self.protection = None;
         }
+        (request_id, tokens)
+    }
+
+    /// Complete request `idx` (its lane and KV reservation are released).
+    /// `reason` is why it stopped — carried into the emitted
+    /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
+    fn mark_done(&mut self, idx: usize, events: &mut Vec<SchedEvent>, reason: FinishReason) {
+        let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
             reason,
         });
+    }
+
+    /// Cancel `request` (P3-01, ADR 0018): abort, not suspend. Marks the
+    /// request; the *next* `advance()` releases it — before running any of
+    /// this tick's phases — releasing its lane, KV pages, GDN slot and
+    /// shared-prefix claim, and it is never dealt
+    /// another chunk or decode round. Because every compute call is
+    /// synchronous, whatever chunk was already in flight when this is
+    /// called has, by construction, already returned: there is nothing to
+    /// interrupt, so "finishes the in-flight chunk, then aborts" holds
+    /// without any extra bookkeeping. No `SchedEvent` is emitted (a
+    /// cancelled request has no listener left to tell). Returns `false`
+    /// when `request` is unknown or already `Done`.
+    pub fn cancel(&mut self, request: RequestId) -> bool {
+        match self
+            .requests
+            .iter()
+            .position(|r| r.id == request && r.state != RequestState::Done)
+        {
+            Some(idx) => {
+                self.requests[idx].cancelled = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The request's lifecycle state (test / telemetry observability).
+    /// `None` when `request` is unknown.
+    pub fn request_state(&self, request: RequestId) -> Option<RequestState> {
+        self.requests.iter().find(|r| r.id == request).map(|r| r.state)
+    }
+
+    /// The request's prefill progress (P3-01, ADR 0018): prompt tokens
+    /// already sent to the compute backend. Durable — this can hold a
+    /// partial value across many `advance()` calls while the request sits
+    /// in `Prefilling`. `None` when `request` is unknown.
+    pub fn prefill_progress(&self, request: RequestId) -> Option<u32> {
+        self.requests
+            .iter()
+            .find(|r| r.id == request)
+            .map(|r| r.prefill_progress)
+    }
+
+    /// The request's GDN recurrent-state position (core-02, P3-01): a
+    /// single absolute counter over the whole sequence (prompt tokens then
+    /// generated tokens) — chunk boundaries during prefill and per-token
+    /// boundaries during decode both checkpoint into the same counter, so
+    /// it never runs backwards. `None` when `request` is unknown.
+    pub fn gdn_position(&self, request: RequestId) -> Option<usize> {
+        self.requests
+            .iter()
+            .find(|r| r.id == request)
+            .map(|r| r.gdn.position())
     }
 
     // ── core-06: the KV-RAM host tier ───────────────────────────────────
@@ -805,32 +932,64 @@ impl Scheduler for ConcreteScheduler {
         // retained-lane victim selection).
         self.tick += 1;
 
-        // Phase 1 — batched prefill: the queued requests go to the
-        // compute backend in ONE batched call, not one call per
-        // request. The Admitted → Prefilling transition happens only
-        // AFTER the call succeeds: a failed prefill leaves the batch in
-        // `Admitted` (retryable on the next advance), so a request is
-        // never dealt a lane with an unwarmed KV (the `request.rs`
-        // invariant: "a request must finish prefill before it holds a
-        // lane").
-        let mut batch: Vec<usize> = self
+        // P3-01 / ADR 0018 — cancel is abort, not suspend: release every
+        // request marked by `cancel()` since the last `advance()`, before
+        // this tick's phases run. Every compute call is synchronous, so
+        // whatever chunk was in flight when `cancel()` was called has
+        // already returned by now — there is nothing to interrupt, and no
+        // suspend/resume primitive is needed.
+        let to_cancel: Vec<usize> = self
             .requests
             .iter()
             .enumerate()
-            .filter(|&(_, r)| r.state == RequestState::Admitted)
+            .filter(|&(_, r)| r.cancelled && r.state != RequestState::Done)
             .map(|(i, _)| i)
             .collect();
-        batch.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
-        batch.truncate(self.config.max_prefill_batch);
-        // core-07 — sibling prefix claim: each batch request without a
-        // shared head claims the longest cached prefix of its prompt
-        // (skipping the redundant prefill — its job carries only the
-        // tail, and its own reservation shrinks to the tail + max: the
-        // shared entry's pages are charged to the pool once, for every
-        // claimant). The claim is established before the prefill call
-        // (the shared prefix is already warm in the pool); a failed
-        // prefill is retried next advance with the same claim.
+        for idx in to_cancel {
+            self.release_request(idx);
+        }
+
+        // Phase 1 — chunked, interleaved prefill (P3-01, ADR 0018): at
+        // most one `prefill_step` call this tick. Exactly one request may
+        // hold multi-tick (device-resident) prefill progress at a time —
+        // find it first; if one exists, it alone is served this tick (the
+        // rest queue). Otherwise the batch is built fresh from the
+        // `Admitted` queue, same as before chunking existed.
+        let active = self
+            .requests
+            .iter()
+            .position(|r| r.state == RequestState::Prefilling && !r.prefill_complete());
+        let mut batch: Vec<usize> = match active {
+            Some(idx) => vec![idx],
+            None => {
+                let mut b: Vec<usize> = self
+                    .requests
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, r)| r.state == RequestState::Admitted)
+                    .map(|(i, _)| i)
+                    .collect();
+                b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
+                b.truncate(self.config.max_prefill_batch);
+                b
+            }
+        };
+        // core-07 — sibling prefix claim: a *fresh* candidate (not yet
+        // sent a single chunk) claims the longest cached prefix of its
+        // prompt (skipping the redundant prefill — its first job carries
+        // only the tail, and its own reservation shrinks to the tail +
+        // max: the shared entry's pages are charged to the pool once, for
+        // every claimant). The claim is established before the prefill
+        // call (the shared prefix is already warm in the pool); a failed
+        // prefill is retried next advance with the same claim. A
+        // continuing (already `Prefilling`) candidate never re-claims —
+        // it started from position 0 without one, and a claim mid-way
+        // through its own chunks cannot retroactively skip what it has
+        // already sent.
         for &i in &batch {
+            if self.requests[i].state != RequestState::Admitted {
+                continue;
+            }
             // A request that already holds a claim (from a prior advance,
             // whose prefill failed and is retried) keeps it: re-claiming
             // would double-count the entry's refcount and the
@@ -844,6 +1003,7 @@ impl Scheduler for ConcreteScheduler {
                 let r = &mut self.requests[i];
                 r.prefix_entry = Some(claim.id);
                 r.shared_prefix_tokens = claim.tokens;
+                r.prefill_progress = claim.tokens; // the shared head is already warm
                 r.gdn = claim.gdn; // core-02: resume at the shared boundary
                 // Shrink the claimant's own reservation by the shared
                 // prefix's pages (the entry now owns them — charged once,
@@ -858,23 +1018,33 @@ impl Scheduler for ConcreteScheduler {
                 });
             }
         }
-        // A claimant carries only its tail (the shared head is already
-        // warm in the pool — the kernel leaf binds the shared prefix's
-        // blocks read-only); a fresh request carries its full prompt.
+        // A fresh batch (no active carry-over) may still pack several
+        // requests into this one call, but only while each finishes
+        // within its own single chunk (P3-01: nothing beyond this call may
+        // leave more than one request `Prefilling` and incomplete). The
+        // moment one candidate's remaining span exceeds the chunk width,
+        // it is included (it becomes this tick's chunk) and the batch
+        // stops there — whatever queued behind it waits for its turn.
+        if active.is_none()
+            && let Some(cut) = batch.iter().position(|&i| {
+                let r = &self.requests[i];
+                (r.input.tokens.len() as u32 - r.prefill_progress) > self.config.serving_chunk_tokens
+            })
+        {
+            batch.truncate(cut + 1);
+        }
+        // Each job carries at most `serving_chunk_tokens` tokens starting
+        // at the request's own prefill progress (0 for a fresh request
+        // with no shared prefix, `shared_prefix_tokens` for a claimant,
+        // or wherever an earlier chunk left off for a continuing request).
         let jobs: Vec<PrefillJob> = batch
             .iter()
             .map(|&i| {
                 let r = &self.requests[i];
-                let tokens = if r.shared_prefix_tokens > 0 {
-                    r.input
-                        .tokens
-                        .iter()
-                        .skip(r.shared_prefix_tokens as usize)
-                        .copied()
-                        .collect()
-                } else {
-                    r.input.tokens.clone()
-                };
+                let start = r.prefill_progress;
+                let remaining = r.input.tokens.len() as u32 - start;
+                let take = remaining.min(self.config.serving_chunk_tokens);
+                let tokens = r.input.tokens[start as usize..(start + take) as usize].to_vec();
                 PrefillJob {
                     request: r.id,
                     tokens,
@@ -887,7 +1057,7 @@ impl Scheduler for ConcreteScheduler {
                                 as u64,
                         )
                         .min(u32::MAX as u64)) as u32,
-                    start_position: r.shared_prefix_tokens,
+                    start_position: start,
                     params: r.input.params,
                 }
             })
@@ -895,13 +1065,30 @@ impl Scheduler for ConcreteScheduler {
         if !jobs.is_empty() {
             match self.compute.prefill_step(&jobs) {
                 Ok(()) => {
-                    for &i in &batch {
-                        self.requests[i].advance(RequestState::Prefilling);
+                    for (&i, job) in batch.iter().zip(&jobs) {
+                        let r = &mut self.requests[i];
+                        if r.state == RequestState::Admitted {
+                            r.advance(RequestState::Prefilling);
+                        }
+                        r.prefill_progress += job.tokens.len() as u32;
+                        // P3-01 / ADR 0018: every completed chunk boundary
+                        // is a GDN resumable boundary, whether or not it
+                        // is this request's last chunk.
+                        let new_position = r.prefill_progress as usize;
+                        r.checkpoint(new_position);
+                        if !r.prefill_complete() {
+                            // Not the last chunk: no registration yet
+                            // (that moves to the last chunk's completion),
+                            // and the request stays `Prefilling` —
+                            // incomplete, ineligible for a lane deal.
+                            continue;
+                        }
                         // core-07 — registration: only a fresh request
                         // (no shared head — it claimed nothing) caches
-                        // its now-warm prompt for siblings. A claimant's
-                        // head is already the cached entry (registering
-                        // its full prompt would double-charge the shared
+                        // its now-warm prompt for siblings, and only once
+                        // its *last* chunk has landed. A claimant's head
+                        // is already the cached entry (registering its
+                        // full prompt would double-charge the shared
                         // pages), and a same-batch duplicate's prompt is
                         // already cached by the batch's first registrant
                         // (register returns `None` — it keeps its own
@@ -927,9 +1114,12 @@ impl Scheduler for ConcreteScheduler {
                     }
                 }
                 Err(e) => {
-                    // Failed prefill: the batch stays `Admitted` and is
-                    // retried on the next advance; the fault is
-                    // surfaced through `last_error`.
+                    // A failed chunk leaves progress untouched: the batch
+                    // stays in its pre-call state (`Admitted`, or
+                    // `Prefilling` with its prior progress) and is retried
+                    // on the next advance with the *same* span — not a
+                    // span already applied; the fault is surfaced through
+                    // `last_error`.
                     self.last_error = Some(e);
                     return events;
                 }
@@ -995,8 +1185,18 @@ impl Scheduler for ConcreteScheduler {
                                 // core-06: record a GDN checkpoint at the
                                 // new position (the host tier may snapshot
                                 // the request at this boundary — the GDN
-                                // state is resumable there).
-                                let new_pos = self.requests[i].tokens as usize;
+                                // state is resumable there). The position is
+                                // absolute over the whole sequence (prompt +
+                                // generated), not just the decode-token
+                                // count: P3-01's chunked prefill now
+                                // checkpoints at real prompt positions too
+                                // (`GdnState::checkpoint` only accepts a
+                                // position `>=` the current one), so a
+                                // decode checkpoint that restarted counting
+                                // from 0 would be silently dropped the
+                                // instant it fell behind the prompt length.
+                                let new_pos = self.requests[i].input.tokens.len()
+                                    + self.requests[i].tokens as usize;
                                 self.requests[i].checkpoint(new_pos);
                                 // The reservation cap: the request
                                 // completes on its final reserved token.
