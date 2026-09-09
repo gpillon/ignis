@@ -38,7 +38,7 @@
 //! trivial mock, so the generator, the median, the void rule and every
 //! refusal are CPU-testable with no artifact and no GPU (ADR 0006).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +71,12 @@ pub trait PromptTemplate: Send + Sync {
     /// `content`. A human-readable error on failure (a template that
     /// raises is a failed cell, not a panic).
     fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String>;
+
+    /// The text a run of pre-tokenized ids decodes to — the inverse of
+    /// [`encode_user_message`]'s inner tokenization. The corpus path
+    /// detokenizes a window of ids into the prompt text the engine then
+    /// receives (and re-tokenizes with the same tokenizer).
+    fn decode(&self, ids: &[u32]) -> Result<String, String>;
 }
 
 impl PromptTemplate for ignis_artifact::FrontendSet {
@@ -88,6 +94,12 @@ impl PromptTemplate for ignis_artifact::FrontendSet {
         self.tokenizer()
             .encode(&prompt)
             .map_err(|e| format!("tokenize the rendered prompt: {e}"))
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        self.tokenizer()
+            .decode(ids)
+            .map_err(|e| format!("detokenize the corpus window: {e}"))
     }
 }
 
@@ -240,9 +252,29 @@ pub fn generate_cell_prompts(
     // The template's own overhead, as an upper bound on how much two
     // samples may legitimately share.
     let overhead = template.encode_user_message("")?.len();
+    prove_divergence(&tokens, overhead)?;
+    Ok(PromptSet { prompts, tokens })
+}
+
+/// The number of leading elements `a` and `b` have in common.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// The distinctness proof over a cell's prompts (shared by every prompt
+/// generator, so the corpus path and the filler path prove the same
+/// thing before any prompt is sent):
+///
+/// * every pair diverges, and
+/// * every pair diverges at the *same* index, and
+/// * that shared prefix is no longer than `overhead` — the template's own
+///   tokens — so it cannot contain a content token (a shared header is
+///   unavoidable; a shared content token is the partial prefix hit this
+///   instrument exists to rule out).
+fn prove_divergence(tokens: &[Vec<u32>], overhead: usize) -> Result<(), String> {
     let mut divergence: Option<usize> = None;
-    for i in 0..count {
-        for j in (i + 1)..count {
+    for i in 0..tokens.len() {
+        for j in (i + 1)..tokens.len() {
             let d = common_prefix_len(&tokens[i], &tokens[j]);
             if d == tokens[i].len() {
                 return Err(format!("prompts {i} and {j} are identical"));
@@ -267,12 +299,156 @@ pub fn generate_cell_prompts(
             ));
         }
     }
+    Ok(())
+}
+
+// ── corpus-cut prompts of an exact length (the `--corpus` path) ──────────
+
+/// Load a corpus of pre-tokenized ids: whitespace-separated `u32`s, one
+/// window per line or a single long stream (the ninfer `bench_corpus.ids`
+/// shape: a tiled rotation of a curated bank, so any rotated window of it
+/// is a different, meaningful prompt).
+pub fn load_corpus(path: &Path) -> Result<Vec<u32>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read the corpus {}: {e}", path.display()))?;
+    text.split_whitespace()
+        .map(|id| {
+            id.parse::<u32>().map_err(|_| {
+                format!(
+                    "the corpus {} has an id that is not a u32: `{id}`",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+/// Cut `count` prompts of exactly `target_tokens` **post-template** tokens
+/// out of a pre-tokenized corpus: each prompt's content is a rotated
+/// window of the bank, detokenized by the template, then landed exactly on
+/// the target.
+///
+/// Where the filler generator grows a prompt word by word (one full
+/// re-encode per word — O(n²) at 32K), this path decodes a whole window
+/// and searches its *length*: the re-encoded count is monotone in the
+/// window length, so a bounded binary search over lengths lands exactly in
+/// a handful of full encodes. If no window length lands — the tokenizer's
+/// decode/encode round-trip drifts too far — the cell fails with a clear
+/// message instead of falling back to the word-growth path or, worse,
+/// measuring a length it does not claim.
+pub fn generate_cell_prompts_from_corpus(
+    template: &dyn PromptTemplate,
+    corpus: &[u32],
+    target_tokens: usize,
+    count: usize,
+) -> Result<PromptSet, String> {
+    if count == 0 {
+        return Err("a cell needs at least one prompt".to_string());
+    }
+    if corpus.is_empty() {
+        return Err("the corpus is empty: no window to cut".to_string());
+    }
+    // One window per prompt, rotated through the bank: consecutive
+    // prompts start `bank/count` ids apart, so their first content tokens
+    // differ (a bank periodicity that aligns two windows is caught by the
+    // divergence proof below, and the cell then fails — never measures a
+    // warm prefix).
+    let stride = corpus.len() / count;
+    if stride == 0 {
+        return Err(format!(
+            "the corpus has only {} ids, fewer than the {count} prompts a cell needs: the \
+             windows would be identical",
+            corpus.len()
+        ));
+    }
+    let overhead = template.encode_user_message("")?.len();
+    if target_tokens <= overhead {
+        return Err(format!(
+            "the chat template's own overhead is {overhead} tokens: a {target_tokens}-token \
+             cell is not reachable"
+        ));
+    }
+    let mut prompts = Vec::with_capacity(count);
+    let mut tokens = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = ((index as u64) * (stride as u64)) % corpus.len() as u64;
+        let (prompt, ids) = land_corpus_window(template, corpus, offset as usize, target_tokens)?;
+        prompts.push(prompt);
+        tokens.push(ids);
+    }
+    prove_divergence(&tokens, overhead)?;
     Ok(PromptSet { prompts, tokens })
 }
 
-/// The number of leading elements `a` and `b` have in common.
-fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+/// Detokenize one corpus window starting at `offset` (wrapping) and land
+/// it on `target_tokens` post-template tokens, returning the prompt text
+/// and its post-template ids.
+fn land_corpus_window(
+    template: &dyn PromptTemplate,
+    corpus: &[u32],
+    offset: usize,
+    target_tokens: usize,
+) -> Result<(String, Vec<u32>), String> {
+    let len = corpus.len();
+    // Decode the `n`-id window at `offset` (wrapping) to prompt text.
+    let cut = |n: usize| -> Result<(Vec<u32>, String), String> {
+        let ids: Vec<u32> = (0..n).map(|k| corpus[(offset + k) % len]).collect();
+        let text = template.decode(&ids)?;
+        Ok((ids, text))
+    };
+    // The post-template token count of the `n`-id window: decode, then
+    // encode exactly what the engine will see.
+    let actual = |n: usize| -> Result<usize, String> {
+        let (_, text) = cut(n)?;
+        Ok(template.encode_user_message(&text)?.len())
+    };
+    // The re-encoded count of a window is monotone non-decreasing in the
+    // window length (each decoded id is at least one re-encoded token,
+    // usually exactly one), so search for the largest length whose count
+    // does not pass the target. The upper bound is the shorter of the
+    // target and the whole corpus: a window longer than `target_tokens`
+    // ids cannot land on `target_tokens` post-template tokens.
+    let mut hi = target_tokens.min(len);
+    let mut lo = 1usize;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if actual(mid)? <= target_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // `lo` is the largest length whose re-encode stays at or under the
+    // target; check it and its successor, and refuse the cell if neither
+    // lands exactly (a window that does not land re-encodes to a length
+    // the engine will not compute — a fiction this instrument will not
+    // measure, and the word-growth fallback is the O(n²) this path
+    // exists to avoid).
+    for n in [lo, lo + 1] {
+        if n > len {
+            continue;
+        }
+        if actual(n)? == target_tokens {
+            let (_, text) = cut(n)?;
+            let tokens = template.encode_user_message(&text)?;
+            return Ok((text, tokens));
+        }
+    }
+    let under = actual(lo)?;
+    if lo == len {
+        return Err(format!(
+            "cannot land on {target_tokens} tokens: the whole corpus is {len} ids, re-encoding \
+             to {under} post-template tokens — the corpus is too short for the cell"
+        ));
+    }
+    let over = actual(lo + 1)?;
+    Err(format!(
+        "cannot land on {target_tokens} tokens from a corpus window: the {lo}-id cut re-encodes \
+         to {under} tokens and the {next}-id cut to {over} — the tokenizer's decode/encode \
+         drift is beyond what a bounded search absorbs; drop --corpus to use the filler \
+         generator instead",
+        next = lo + 1
+    ))
 }
 
 // ── the record ───────────────────────────────────────────────────────────
@@ -480,6 +656,11 @@ pub struct TtftConfig {
     pub artifact: String,
     /// The measurement session both engines' records must share.
     pub session: String,
+    /// A pre-tokenized prompt bank (whitespace-separated ids) to cut the
+    /// prompts from, when set (the `--corpus` flag): detokenized rotated
+    /// windows instead of the filler generator's word growth. Absent, the
+    /// filler generator is used, byte for byte the old behavior.
+    pub corpus: Option<PathBuf>,
 }
 
 /// The request one sample sends: streaming (TTFT is the first content
@@ -499,13 +680,47 @@ fn sample_request(id: String, prompt: String, max_tokens: u32) -> Request {
     }
 }
 
-/// Measure one cell: generate its prompts, send the warmup, then take the
-/// samples and reduce them to a median.
+/// Measure one cell: generate its prompts (the filler path), send the
+/// warmup, then take the samples and reduce them to a median.
 pub fn measure_cell(
     ep: &dyn Endpoint,
     template: &dyn PromptTemplate,
     spec: &CellSpec,
     max_tokens: u32,
+) -> Cell {
+    measure_cell_with(ep, spec, max_tokens, || {
+        generate_cell_prompts(template, spec.prompt_tokens as usize, spec.samples + 1)
+    })
+}
+
+/// Measure one cell cut from a pre-tokenized corpus (the `--corpus`
+/// path): its prompts are detokenized rotated windows of the corpus —
+/// bounded generation instead of the filler path's O(n²) growth — then
+/// the same warmup, samples and median as [`measure_cell`].
+pub fn measure_cell_from_corpus(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    spec: &CellSpec,
+    max_tokens: u32,
+    corpus: &[u32],
+) -> Cell {
+    measure_cell_with(ep, spec, max_tokens, || {
+        generate_cell_prompts_from_corpus(
+            template,
+            corpus,
+            spec.prompt_tokens as usize,
+            spec.samples + 1,
+        )
+    })
+}
+
+/// The shared measurement: one prompt set (generated however the caller
+/// says), the warmup request, then the samples and their median.
+fn measure_cell_with(
+    ep: &dyn Endpoint,
+    spec: &CellSpec,
+    max_tokens: u32,
+    prompts: impl FnOnce() -> Result<PromptSet, String>,
 ) -> Cell {
     let failed = |error: String| Cell {
         prompt_tokens: spec.prompt_tokens,
@@ -519,7 +734,7 @@ pub fn measure_cell(
     }
     // One prompt per sample plus the warmup's — all distinct from the first
     // content token, proven before anything is sent.
-    let set = match generate_cell_prompts(template, spec.prompt_tokens as usize, spec.samples + 1) {
+    let set = match prompts() {
         Ok(set) => set,
         Err(err) => return failed(err),
     };
@@ -607,10 +822,26 @@ pub fn measure(
     endpoint: String,
     cfg: &TtftConfig,
 ) -> Record {
+    // A configured corpus is loaded once up front and every cell's prompts
+    // are cut from it (the `--corpus` path); without one, the filler
+    // generator grows them (the old behavior, byte for byte). A corpus
+    // file that cannot be read fails every cell with that error rather
+    // than silently measuring with different prompts.
+    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
     let cells = cfg
         .cells
         .iter()
-        .map(|spec| measure_cell(ep, template, spec, cfg.max_tokens))
+        .map(|spec| match &corpus {
+            Some(Ok(ids)) => measure_cell_from_corpus(ep, template, spec, cfg.max_tokens, ids),
+            Some(Err(error)) => Cell {
+                prompt_tokens: spec.prompt_tokens,
+                warmup_ttft_ms: None,
+                samples: Vec::new(),
+                median_ttft_ms: None,
+                error: Some(error.clone()),
+            },
+            None => measure_cell(ep, template, spec, cfg.max_tokens),
+        })
         .collect();
     Record {
         session: cfg.session.clone(),
@@ -652,6 +883,11 @@ mod tests {
             }
             ids.extend((0..self.footer).map(|i| 2_000 + i as u32));
             Ok(ids)
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            // The filler path never decodes: a placeholder for the seam —
+            // the corpus tests use the exact `CorpusMock` instead.
+            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
         }
     }
 
@@ -724,6 +960,11 @@ mod tests {
                 }
                 Ok(ids)
             }
+            fn decode(&self, ids: &[u32]) -> Result<String, String> {
+                // A placeholder for the seam (this template is only used
+                // to exercise the filler path's refusal).
+                Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+            }
         }
         let err = generate_cell_prompts(&SharedHeadTemplate, 40, 6).expect_err("must refuse");
         assert!(err.contains("share content"), "{err}");
@@ -758,5 +999,155 @@ mod tests {
     #[test]
     fn an_exactly_computed_prefill_is_cold() {
         assert_eq!(coldness_failure(Some(8_192), 8_192), None);
+    }
+
+    // ── the corpus path ────────────────────────────────────────────────────
+
+    /// A template whose decode is the exact inverse of its encode (each id
+    /// decodes to a `t<id>` atom that encodes back to the same id), so the
+    /// corpus path's round-trip is controlled by the mock: `factor` scales
+    /// the id-to-tokens ratio (1: exact, 2: a stable drift), `pad` adds a
+    /// constant offset.
+    struct CorpusMock {
+        header: usize,
+        footer: usize,
+        factor: usize,
+        pad: usize,
+    }
+
+    impl CorpusMock {
+        fn exact() -> Self {
+            Self {
+                header: 6,
+                footer: 3,
+                factor: 1,
+                pad: 0,
+            }
+        }
+    }
+
+    impl PromptTemplate for CorpusMock {
+        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+            let mut ids: Vec<u32> = (0..self.header).map(|i| 1_000 + i as u32).collect();
+            for word in content.split_whitespace() {
+                let id = word
+                    .strip_prefix("t")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| format!("the corpus mock only decodes 't<id>' atoms, got `{word}`"))?;
+                for _ in 0..self.factor {
+                    ids.push(id);
+                }
+            }
+            ids.extend((0..self.footer).map(|i| 2_000 + i as u32));
+            for _ in 0..self.pad {
+                ids.push(9_999);
+            }
+            Ok(ids)
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
+        }
+    }
+
+    /// The bank the corpus tests cut from: 256 distinct-ish ids, no two
+    /// window starts (stride `256/count`) colliding on their first token.
+    fn corpus_bank() -> Vec<u32> {
+        (0..256).map(|i| ((i * 37) % 128) as u32 + 100).collect()
+    }
+
+    #[test]
+    fn a_corpus_cell_lands_exactly_on_the_target_and_diverges_at_the_first_content_token() {
+        let template = CorpusMock::exact();
+        let bank = corpus_bank();
+        let set = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut");
+        assert_eq!(set.prompts.len(), 6, "one warmup + five samples");
+        for ids in &set.tokens {
+            assert_eq!(ids.len(), 64, "each prompt is exactly the claimed length");
+        }
+        // Every pair diverges, and at the header boundary — the same proof
+        // the filler path runs, so a warm prefix is ruled out identically.
+        for i in 0..set.tokens.len() {
+            for j in (i + 1)..set.tokens.len() {
+                assert_eq!(
+                    common_prefix_len(&set.tokens[i], &set.tokens[j]),
+                    template.header,
+                    "prompts {i} and {j} must share the header and nothing more"
+                );
+            }
+        }
+        // The prompts really are the detokenized windows: re-encoding the
+        // text yields exactly the claimed ids.
+        for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
+            assert_eq!(template.encode_user_message(prompt).unwrap(), *ids);
+        }
+    }
+
+    #[test]
+    fn a_constant_round_trip_offset_is_absorbed_by_the_landing_search() {
+        let template = CorpusMock {
+            header: 6,
+            footer: 3,
+            factor: 1,
+            pad: 4,
+        };
+        let bank = corpus_bank();
+        let set = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect("cut");
+        for ids in &set.tokens {
+            assert_eq!(ids.len(), 64, "the constant offset is absorbed exactly");
+        }
+    }
+
+    #[test]
+    fn a_round_trip_that_never_lands_is_refused_instead_of_drifting() {
+        // One corpus id re-encodes to two tokens: the count is 9 + 2n,
+        // which is odd-off against any even target — no window length
+        // lands, and the cell must fail with a clear message rather than
+        // fall back to the O(n²) filler path.
+        let template = CorpusMock {
+            header: 6,
+            footer: 3,
+            factor: 2,
+            pad: 0,
+        };
+        let bank = corpus_bank();
+        let err = generate_cell_prompts_from_corpus(&template, &bank, 64, 6).expect_err("must refuse");
+        assert!(err.contains("cannot land"), "{err}");
+        assert!(err.contains("--corpus"), "{err}");
+    }
+
+    #[test]
+    fn a_corpus_shorter_than_the_prompt_count_is_refused() {
+        let template = CorpusMock::exact();
+        let bank: Vec<u32> = vec![1, 2, 3];
+        let err = generate_cell_prompts_from_corpus(&template, &bank, 16, 6).expect_err("must refuse");
+        assert!(err.contains("fewer than"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_corpus_is_refused() {
+        let template = CorpusMock::exact();
+        let err = generate_cell_prompts_from_corpus(&template, &[], 64, 6).expect_err("must refuse");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn a_corpus_target_at_or_below_the_template_overhead_is_refused() {
+        let template = CorpusMock::exact(); // overhead is 9
+        let bank = corpus_bank();
+        let err = generate_cell_prompts_from_corpus(&template, &bank, 9, 6).expect_err("must refuse");
+        assert!(err.contains("overhead"), "{err}");
+    }
+
+    #[test]
+    fn a_corpus_file_round_trips_and_rejects_bad_ids() {
+        let dir = std::env::temp_dir().join(format!("ignis-bench-corpus-{}", std::process::id()));
+        let path = dir.join("corpus.ids");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(&path, "10 20 30\n40  50\n").expect("write");
+        assert_eq!(load_corpus(&path).unwrap(), vec![10u32, 20, 30, 40, 50]);
+        std::fs::write(&path, "10 notanid\n").expect("write");
+        assert!(load_corpus(&path).unwrap_err().contains("not a u32"));
+        assert!(load_corpus(&dir.join("missing.ids")).unwrap_err().contains("read the corpus"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
