@@ -50,6 +50,7 @@ fn config(session: &str, label: &str) -> G3Config {
             decode_max_tokens: 6,
             decode_lanes: 2,
         },
+        corpus: None,
     }
 }
 
@@ -142,14 +143,16 @@ fn a_record_round_trips_through_json() {
 #[test]
 fn the_decode_lanes_run_concurrently_with_the_sequential_prefillers() {
     // The mock's in-flight peak (`common::MockState::peak_in_flight`) proves
-    // the decode lanes and the (sequential) prefillers were not serialized
-    // by the instrument itself: at least the decode lanes must overlap each
-    // other, and at least one prefiller must overlap them.
+    // a prefiller actually overlapped the decode lanes rather than the
+    // instrument serializing everything: `config()` uses 2 decode lanes, so
+    // 2 alone would just prove the lanes overlap *each other* — the peak
+    // must reach 3 (both lanes + at least one prefiller) to prove the
+    // property this cell exists to exercise.
     let engine = MockEngine::start();
     let _record = measure(&engine, &config("S-concurrency", "ignis"));
     assert!(
-        engine.state.peak_in_flight() >= 2,
-        "expected the decode lanes to overlap: peak {}",
+        engine.state.peak_in_flight() >= 3,
+        "expected a prefiller to overlap the two decode lanes: peak {}",
         engine.state.peak_in_flight()
     );
 }

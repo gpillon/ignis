@@ -35,7 +35,7 @@
 //!       it to the target engine, and pipes the response back. `POST
 //!       /v1/session/end` finalizes the trace and stops the proxy.
 //!   `g3      --endpoint <url> --artifact <artifact.ninfer> [--label L]
-//!             [--profile P] [--session S] [--out <record.json>]`
+//!             [--profile P] [--session S] [--corpus <bank.ids>] [--out <record.json>]`
 //!       The G3 measurement instrument (P3-07, ADR 0015): the C=1 / C=4 /
 //!       ITL cells (spec 03) over HTTP/SSE against any OpenAI-compatible
 //!       endpoint. Writes one engine's record.
@@ -104,7 +104,7 @@ fn print_usage() {
                    [--label ignis] [--profile <text>] [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
   ignis-bench g3 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
-                 [--session <id>] [--out <record.json>]
+                 [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g3-gate --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
     );
 }
@@ -678,6 +678,19 @@ fn cmd_g3(args: &[String]) -> ExitCode {
     // engines' runs.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let out = opt(args, "out");
+    let corpus = opt(args, "corpus").map(PathBuf::from);
+    if let Some(path) = &corpus {
+        // Fail before any request is sent: a missing corpus file would
+        // otherwise fail every cell (and the gate) with a late error.
+        if !path.is_file() {
+            eprintln!("error: --corpus file not found: {path:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "corpus mode: prompts are cut from {path:?} (detokenized windows, no filler growth — \
+             needed at the ITL cell's 32,768-token prefiller scale)"
+        );
+    }
 
     let frontend = match open_frontend(&artifact) {
         Ok(f) => f,
@@ -710,6 +723,7 @@ fn cmd_g3(args: &[String]) -> ExitCode {
         session,
         throughput: g3::ThroughputSpec::default(),
         itl: g3::ItlConfig::default(),
+        corpus,
     };
     let record = g3::measure(&ep, &frontend, engine, endpoint, &cfg);
     print!("{}", record.render());
@@ -779,11 +793,15 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
         eprintln!("wrote {path}");
     }
     if verdict.passed {
+        if let Some(warning) = &verdict.itl.warning {
+            eprintln!("G3 gate PASSED, but flagged: {warning}");
+        }
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G3 gate FAILED (ADR 0015: tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {})",
-            verdict.throughput_threshold, verdict.itl_threshold
+            "G3 gate FAILED (ADR 0015: tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
+             <= {} tolerated-with-warning)",
+            verdict.throughput_threshold, verdict.itl_pass_threshold, verdict.itl_fail_threshold
         );
         ExitCode::FAILURE
     }

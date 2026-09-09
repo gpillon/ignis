@@ -14,13 +14,19 @@
 //!   [`THROUGHPUT_RATIO_THRESHOLD`] (spec 03: "at least 99% of the live
 //!   reference's tok/s", "aggregate at least 99% of the live reference's
 //!   aggregate").
-//! - **ITL**: `ours.p95_ms / reference.p95_ms <=` [`ITL_RATIO_THRESHOLD`]
-//!   — spec 03 states the ITL verdict as "p95 within the live reference's
-//!   envelope"; this instrument reads that as "no worse than the
-//!   reference's own p95" (ratio <= 1.0), the same live/live comparison
-//!   method as the throughput cells, applied to a latency rather than a
-//!   speed. p50/p95/p99/max are all carried on the verdict regardless, so a
-//!   later reader sees the shape and not only the number that decided it.
+//! - **ITL**: `ours.p95_ms / reference.p95_ms`, judged in three bands —
+//!   spec 03 states the verdict as "p95 within the live reference's
+//!   envelope" with no numeric tolerance, so the bands are the owner's
+//!   explicit reading of that envelope (grilling session, 2026-09-09):
+//!   - at or under [`ITL_RATIO_PASS_THRESHOLD`] (1.0): a clean pass — ours
+//!     is no worse than the reference's own p95;
+//!   - above that but at or under [`ITL_RATIO_FAIL_THRESHOLD`] (1.1): still
+//!     a pass, but [`ItlVerdict::warning`] is set — tolerated, flagged for
+//!     review rather than silently accepted;
+//!   - above [`ITL_RATIO_FAIL_THRESHOLD`]: fails the gate outright.
+//!
+//!   p50/p95/p99/max are all carried on the verdict regardless, so a later
+//!   reader sees the shape and not only the number that decided it.
 
 use std::path::Path;
 
@@ -32,10 +38,14 @@ use crate::g3::Record;
 /// per cell. G3 tightens G2's 1.5x floor to 99% (spec 03).
 pub const THROUGHPUT_RATIO_THRESHOLD: f64 = 0.99;
 
-/// The ITL threshold: ignis's p95 ms over the reference's p95 ms. "Within
-/// the envelope" is read as no worse than the reference's own measured p95
-/// (see the module docs).
-pub const ITL_RATIO_THRESHOLD: f64 = 1.0;
+/// The ITL clean-pass ceiling: at or under this ratio, ours is no worse
+/// than the reference's own p95 — no warning.
+pub const ITL_RATIO_PASS_THRESHOLD: f64 = 1.0;
+
+/// The ITL hard-fail ceiling: above this ratio the gate fails outright.
+/// Between [`ITL_RATIO_PASS_THRESHOLD`] and this one, the gate still
+/// passes but [`ItlVerdict::warning`] is set (see the module docs).
+pub const ITL_RATIO_FAIL_THRESHOLD: f64 = 1.1;
 
 /// Why the gate check will not produce a verdict at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +81,13 @@ pub struct ItlVerdict {
     pub reference_max_ms: f64,
     /// `ours_p95 / reference_p95`.
     pub ratio: f64,
-    /// `ratio <= threshold`.
+    /// `ratio <= `[`ITL_RATIO_FAIL_THRESHOLD`].
     pub passed: bool,
+    /// Set when `ratio` is in the tolerated-but-flagged band
+    /// (`ITL_RATIO_PASS_THRESHOLD`, `ITL_RATIO_FAIL_THRESHOLD`]: the gate
+    /// still passes, but this is not silently a clean result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// The G3 verdict: C=1, C=4 and ITL, and their conjunction.
@@ -89,7 +104,8 @@ pub struct Verdict {
     pub ours_date: String,
     pub reference_date: String,
     pub throughput_threshold: f64,
-    pub itl_threshold: f64,
+    pub itl_pass_threshold: f64,
+    pub itl_fail_threshold: f64,
     pub c1: ThroughputVerdict,
     pub c4: ThroughputVerdict,
     pub itl: ItlVerdict,
@@ -150,14 +166,19 @@ impl Verdict {
             self.itl.ratio,
             if self.itl.passed { "PASS" } else { "FAIL" },
         ));
+        if let Some(warning) = &self.itl.warning {
+            out.push_str(&format!("  ITL WARNING: {warning}\n"));
+        }
         for note in &self.notes {
             out.push_str(&format!("\n  note: {note}\n"));
         }
         out.push_str(&format!(
-            "\nG3 verdict: {} (tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {})\n",
+            "\nG3 verdict: {} (tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / <= {} \
+             tolerated-with-warning)\n",
             if self.passed { "PASS" } else { "FAIL" },
             self.throughput_threshold,
-            self.itl_threshold,
+            self.itl_pass_threshold,
+            self.itl_fail_threshold,
         ));
         out
     }
@@ -241,7 +262,8 @@ pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
         ours_date: ours.date.clone(),
         reference_date: reference.date.clone(),
         throughput_threshold: THROUGHPUT_RATIO_THRESHOLD,
-        itl_threshold: ITL_RATIO_THRESHOLD,
+        itl_pass_threshold: ITL_RATIO_PASS_THRESHOLD,
+        itl_fail_threshold: ITL_RATIO_FAIL_THRESHOLD,
         c1,
         c4,
         itl,
@@ -280,6 +302,12 @@ fn itl_verdict(ours: &crate::g3::ItlCell, reference: &crate::g3::ItlCell) -> Res
         )));
     }
     let ratio = ours_p95 / ref_p95;
+    let warning = (ratio > ITL_RATIO_PASS_THRESHOLD && ratio <= ITL_RATIO_FAIL_THRESHOLD).then(|| {
+        format!(
+            "ITL p95 ratio {ratio:.3} exceeds the reference's own p95 (tolerated up to \
+             {ITL_RATIO_FAIL_THRESHOLD}, but not a clean pass — flagged for review)"
+        )
+    });
     Ok(ItlVerdict {
         ours_p50_ms: ours.p50_ms.unwrap_or(0.0),
         ours_p95_ms: ours_p95,
@@ -290,7 +318,8 @@ fn itl_verdict(ours: &crate::g3::ItlCell, reference: &crate::g3::ItlCell) -> Res
         reference_p99_ms: reference.p99_ms.unwrap_or(0.0),
         reference_max_ms: reference.max_ms.unwrap_or(0.0),
         ratio,
-        passed: ratio <= ITL_RATIO_THRESHOLD,
+        passed: ratio <= ITL_RATIO_FAIL_THRESHOLD,
+        warning,
     })
 }
 
@@ -403,11 +432,40 @@ mod tests {
     }
 
     #[test]
-    fn an_itl_p95_at_or_under_the_reference_passes() {
+    fn an_itl_p95_at_or_under_the_reference_passes_cleanly() {
         let ours = record("ignis", "S1", 100.0, 380.0, 7.5);
         let reference = record("reference", "S1", 100.0, 380.0, 8.0);
         let verdict = check(&ours, &reference).expect("a verdict");
         assert!(verdict.itl.passed);
+        assert!(verdict.itl.warning.is_none(), "a ratio <= 1.0 is a clean pass, no warning");
+    }
+
+    #[test]
+    fn an_itl_p95_between_the_pass_and_fail_thresholds_passes_with_a_warning() {
+        // 8.4 / 8.0 = 1.05: over the clean-pass ceiling (1.0) but under the
+        // hard-fail ceiling (1.1) — tolerated, but flagged (owner
+        // direction, grilling session 2026-09-09).
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.4);
+        let reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        let verdict = check(&ours, &reference).expect("a verdict");
+        assert!(verdict.itl.passed, "1.05 is tolerated");
+        assert!(verdict.passed);
+        let warning = verdict.itl.warning.as_deref().expect("a warning must be set");
+        assert!(warning.contains("1.1"), "{warning}");
+        assert!(verdict.render().contains("WARNING"), "the render must surface the warning");
+    }
+
+    #[test]
+    fn an_itl_p95_over_the_fail_threshold_fails_even_though_it_would_be_a_warning_below_it() {
+        // 9.0 / 8.0 = 1.125: over the hard-fail ceiling (1.1).
+        let ours = record("ignis", "S1", 100.0, 380.0, 9.0);
+        let reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        let verdict = check(&ours, &reference).expect("a verdict");
+        assert!(!verdict.itl.passed);
+        assert!(!verdict.passed);
+        // A hard fail is not also flagged as a "tolerated" warning — it's
+        // just a failure.
+        assert!(verdict.itl.warning.is_none());
     }
 
     #[test]
