@@ -1,0 +1,13 @@
+# Working scratch from the gate sessions: session-id stamps, issue-body
+# drafts, raw SSE captures, one-off probe scripts. The records that back the
+# verdict are listed in README.md and tracked explicitly.
+*
+!.gitignore
+!README.md
+!g2-reference.json
+!g2-ignis-release-20260909.json
+!g2-verdict-release-20260909.json
+!probe-1k.json
+!probe-8k.json
+!probe-1k-8k-release-build-20260909.json
+!probe-1k-debug-build-20260909.json

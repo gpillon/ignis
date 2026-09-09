@@ -1,0 +1,86 @@
+{
+  "session": "g2-20260908T214208Z",
+  "label": "reference",
+  "endpoint": "http://127.0.0.1:8080",
+  "engine": "qwen3.8-27b-nvfp4full-v2",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "hq-e8-2b KV, 1024 chunk, graphs",
+  "date": "2026-09-08T23:59:27Z",
+  "max_tokens": 8,
+  "cells": [
+    {
+      "prompt_tokens": 8192,
+      "warmup_ttft_ms": 907.59,
+      "samples": [
+        {
+          "index": 0,
+          "ttft_ms": 837.3456,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 1,
+          "ttft_ms": 817.3267,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 2,
+          "ttft_ms": 853.6418,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 3,
+          "ttft_ms": 866.0664999999999,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 4,
+          "ttft_ms": 868.6467,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        }
+      ],
+      "median_ttft_ms": 853.6418
+    },
+    {
+      "prompt_tokens": 32768,
+      "warmup_ttft_ms": 4448.395299999999,
+      "samples": [
+        {
+          "index": 0,
+          "ttft_ms": 4421.0885,
+          "computed_prefill_tokens": 32768,
+          "void": false
+        },
+        {
+          "index": 1,
+          "ttft_ms": 4484.045,
+          "computed_prefill_tokens": 32768,
+          "void": false
+        },
+        {
+          "index": 2,
+          "ttft_ms": 4684.8172,
+          "computed_prefill_tokens": 32768,
+          "void": false
+        },
+        {
+          "index": 3,
+          "ttft_ms": 4647.4454,
+          "computed_prefill_tokens": 32768,
+          "void": false
+        },
+        {
+          "index": 4,
+          "ttft_ms": 4490.3438,
+          "computed_prefill_tokens": 32768,
+          "void": false
+        }
+      ],
+      "median_ttft_ms": 4490.3438
+    }
+  ]
+}

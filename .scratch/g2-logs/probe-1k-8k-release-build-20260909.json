@@ -1,0 +1,62 @@
+{
+  "session": "20260909T022242Z",
+  "label": "ignis-release",
+  "endpoint": "http://127.0.0.1:8000",
+  "engine": "qwen3.8-27b",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "BF16 KV, 1024 chunk, eager, RELEASE build",
+  "date": "2026-09-09T02:22:55Z",
+  "max_tokens": 8,
+  "cells": [
+    {
+      "prompt_tokens": 1024,
+      "warmup_ttft_ms": 135.1215,
+      "samples": [
+        {
+          "index": 0,
+          "ttft_ms": 125.50800000000001,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 1,
+          "ttft_ms": 108.2046,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 2,
+          "ttft_ms": 109.1238,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        }
+      ],
+      "median_ttft_ms": 109.1238
+    },
+    {
+      "prompt_tokens": 8192,
+      "warmup_ttft_ms": 773.0869,
+      "samples": [
+        {
+          "index": 0,
+          "ttft_ms": 757.1639,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 1,
+          "ttft_ms": 753.3267,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        },
+        {
+          "index": 2,
+          "ttft_ms": 758.2401,
+          "computed_prefill_tokens": 8192,
+          "void": false
+        }
+      ],
+      "median_ttft_ms": 757.1639
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "session": "g2-20260908T214208Z",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b",
+  "reference_engine": "qwen3.8-27b-nvfp4full-v2",
+  "ours_profile": "BF16 KV, 1024 chunk, eager, release build",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs",
+  "ours_date": "2026-09-09T02:24:21Z",
+  "reference_date": "2026-09-08T23:59:27Z",
+  "threshold": 1.5,
+  "cells": [
+    {
+      "prompt_tokens": 8192,
+      "ours_median_ms": 749.599,
+      "reference_median_ms": 853.6418,
+      "ratio": 0.8781189018625846,
+      "passed": true
+    },
+    {
+      "prompt_tokens": 32768,
+      "ours_median_ms": 3819.6551,
+      "reference_median_ms": 4490.3438,
+      "ratio": 0.850637561426811,
+      "passed": true
+    }
+  ],
+  "notes": [
+    "release build; reference record from the 2026-09-08 23:59 leg of the same session id, ignis leg re-run 2026-09-09 02:24"
+  ],
+  "passed": true
+}

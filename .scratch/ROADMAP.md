@@ -74,10 +74,34 @@ result.
 Frontier at start: **#83** (leaf) and **#87** (Rust only, no GPU) in parallel;
 #85 and #86 are parallel once #84 lands.
 Critical path: #83 → #84 → #85/#86 → #88.
-Current frontier (2026-09-08): **#83** and **#87** — phase 2 was decomposed
-the day G1 closed and nothing has been picked up yet. #84 opens when #83
-lands; #85 and #86 open together when #84 lands. (Grabbable tickets only —
-status and blocking live on GitHub.)
+
+**G2 ratio measured 2026-09-09 — PASS. Phase 2 not yet closed.** Median
+TTFT, both engines live on the free 5090, same artifact and harness, all
+samples cold:
+
+| cell | ignis | reference | ratio |
+|---|---|---|---|
+| 8K | 749.6 ms | 853.6 ms | 0.878 |
+| 32K | 3819.7 ms | 4490.3 ms | 0.851 |
+
+ignis on `4d03d40` (BF16 KV, 1024 chunk, eager, 40,960 context) against
+`ninfer-serve` in the owner's production profile (hq-e8-2b KV, 1024 chunk,
+CUDA graphs, speculative MTP). The KV-format difference is a recorded
+inequality, uncorrected, and it runs against ignis. Full verdict, the three
+deviations recorded with it, and the records:
+`.scratch/REVIEW-2026-09-05.md` §6 Phase 2.
+
+What still holds #88 (and so #63) open is the other criterion: the GPU
+profile is not green in one run. `gqa_layer_gpu` fails about two runs in five
+on an intermittent wrong-output event, and the tolerance that normally hides
+it looks calibrated on the same event — **#96**, filed with the data.
+
+Current frontier (2026-09-09): **#96** (the layer-oracle event — the last
+thing between here and a closed G2). Behind it, **#64** (G3 — batched decode
+rounds, per-width CUDA graphs, sampling, request log). Open alongside, both
+out of the gate path: **#92** (per-chunk prefill synchronization
+investigation) and **#95** (expose the server's `request_timeout`).
+(Grabbable tickets only — status and blocking live on GitHub.)
 
 ## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
 
