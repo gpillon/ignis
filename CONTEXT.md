@@ -20,8 +20,11 @@ When output names a domain concept, use the term as defined here.
   tracked by a manifest (pinned commit, content hashes, recorded patches).
   Anything hand-written is not one, and carries no port claim (ADR 0010).
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
-- **Prefill lane** — the single global prefill that serializes all prefill work
-  across requests; decoding on other lanes continues meanwhile.
+- **Prefill lane** — the single global prefill slot: exactly one request at a
+  time holds device-resident **prefill progress** and consumes chunks, and
+  every other prefill queues behind it. It is a slot, not a promise about
+  decode: whether decoding continues while it runs is decided by
+  **prefill/decode interleaving**, not by this term (ADR 0018).
 - **Admission state machine** — the fairness machinery (protection, backfill class,
   temporal credit, frontier distance) deciding which request gets which lane.
 - **Hot reload** — in-place model reload without restarting the server; the model
@@ -86,7 +89,9 @@ When output names a domain concept, use the term as defined here.
 - **Prefix reuse** — concurrent requests sharing a prefix skip the redundant prefill.
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
-  leaf owns the chunk loop; a caller may pass a span of any length.
+  leaf knows how to loop over a span of any length; it is no longer the only
+  one that does — under interleaving the scheduler hands it one chunk per
+  call and keeps the loop itself.
 - **Prefill chunk** — the number of tokens one traversal of the model
   processes during chunked prefill: a model-load option, default 1024, a
   multiple of 128. The unit the prefill scratch is sized for.
@@ -102,6 +107,55 @@ When output names a domain concept, use the term as defined here.
 - **Decode round** — one traversal of the model for *all* decode-ready
   sequences in a batch; the unit a decode CUDA graph is captured over, per
   batch width.
+- **Prefill batch** — the group of queued requests handed to the backend in
+  one prefill call. A call shape, not a traversal: the runtime walks the group
+  and runs one model traversal per request. Naming a group does not make it
+  one forward pass.
+- **Packed prefill** — several requests' prefill tokens in *one* traversal of
+  the model (varlen attention, per-sequence GDN state side by side). The thing
+  **prefill batch** is often mistaken for. Not built; its phase is decided
+  after the per-chunk synchronization investigation reports.
+- **Prefill/decode interleaving** — running a decode round between two prefill
+  chunks of the same sequence of work, on the one model stream. Nothing is
+  concurrent on the GPU: the two take turns, so a long prefill costs the
+  decode lanes one chunk of latency instead of the whole span. The scheduler
+  drives it by passing one chunk per prefill call.
+- **True prefill/decode overlap** — prefill and decode resident on the GPU at
+  the same time, on separate streams, contending for SMs. Distinct from
+  **prefill/decode interleaving** and deliberately not built: the north-star
+  item (roadmap phase 6), excluded from G3 by ADR 0018.
+- **Chunk boundary** — the position between two prefill chunks: the sequence's
+  KV pages, GDN recurrent slot, conv taps and position have all advanced past
+  the same token, and the chunk's synchronization has returned. A property of
+  the serving loop, and what **prefill progress** resumes from — resuming is
+  nothing more than scheduling the next chunk.
+- **Snapshot point** — a position from which the *whole* sequence state may be
+  captured to the host tier and later restored. A permission, not a
+  consistency claim, and granted to a tier that does not exist before G4.
+  Every **chunk boundary** is one for the state that exists today; the two
+  terms coincide without being the same property, and a new state section
+  (G4's exact-key side store) must earn the permission again.
+- **Prefill progress** — how far into its prompt a request has been prefilled.
+  It makes `Prefilling` a state a request *lives in* for tens of rounds rather
+  than a moment between two, so the admission machinery can see a
+  half-prefilled request. Resuming needs no mechanism: it is just the next
+  chunk being scheduled. **Cancel is abort, not suspend** — the in-flight
+  chunk finishes, then the sequence is released with its KV pages, GDN slot
+  and conv taps. Until the KV-RAM tier exists, a half-prefilled request can be
+  paused but not evicted without losing the work — a limit of the tier, not of
+  what a **chunk boundary** can capture (ADR 0018).
+- **Decode graph** — the CUDA graph replayed for a decode round, captured per
+  **exact** batch width 1..8. Widths are never padded up to a captured one:
+  the GDN slot traffic is per sequence (144 MiB each), so padding a width-1
+  round to width 8 moves 1.15 GB instead of 144 MB and spends several times
+  the C=1 gate's whole margin. Its staging buffers are a reservation separate
+  from the prefill scratch, shared across the widths and sized for the widest.
+- **Per-lane sampling** — sampling parameters and RNG state carried per
+  sequence, not per decode round: lanes in one round hold different
+  temperatures, seeds and penalty histories. Sampling happens device-side in
+  the leaf, which returns token ids and never ships logits to the host. What
+  a request generates therefore depends on its own seed alone, never on which
+  lanes happened to share its round.
 - **N-lane concurrency** — 8 resident decode lanes (N=8), with overflow to the
   host KV-RAM tier; sized for a ~10-subagent concurrent coding workload.
 - **DFlash2** — the 5-layer sliding-window (2048) speculative-decoding drafter

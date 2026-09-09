@@ -12,7 +12,7 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 |---|---|---|---|
 | 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
 | 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `runtime/specs/02-real-prefill.md` |
-| 3 — serving loop: batched decode rounds, per-width CUDA graphs, sampling, request log | G3: C=1 MTP0 decode ≥ 99% of reference (75–76 tok/s); C=4 aggregate ≥ 99% | #64 | to write when G2 lands |
+| 3 — serving loop: chunk-level prefill/decode interleaving, batched decode rounds, per-width CUDA graphs, sampling, request log | G3: three cells live/live (ADR 0015) — C=1 ≥ 99% of the live reference, C=4 aggregate ≥ 99%, p95 inter-token latency under a cold 32K prefill within the live envelope; plus the K-agnostic anti-serialization property | #64 | `runtime/specs/03-serving-loop.md` |
 | 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | to write when G3 lands |
 | 5 — speculative decoding: MTP + ReplaySSM, then DFlash2 | G5: ≥ 99% of reference MTP7-adaptive / DFlash2-7 committed tok/s @24K/98K/196K | #66 | to write when G4 lands |
 | 6 — beyond the reference (north star) | per-item gates | — | concurrent prefill / prefill-decode overlap, PDL + fusion, lazy graphs, hot reload, own artifact recipe |
@@ -96,14 +96,37 @@ ordering hole in the GQA layer oracle's own harness, plus the discovery that
 that oracle had been carrying the GDN oracle's tolerance and so ~80x of
 unused slack.
 
-Current frontier (2026-09-09): **#64** (G3 — batched decode rounds, per-width
-CUDA graphs, sampling, request log). Open alongside it, both out of the gate
-path: **#92** (per-chunk prefill synchronization investigation) and **#95**
+## Phase 3 decomposition (G3, master #64)
+
+Tracer bullets from `runtime/specs/03-serving-loop.md`, cut in the grilling
+session of 2026-09-09. That session also introduced **ADR 0018**
+(scheduler-driven chunk-level prefill/decode interleaving on the single model
+stream; true GPU overlap explicitly excluded) and recorded ten deferred
+decisions in `.scratch/DEFERRED-DECISIONS.md`.
+
+| # | Ticket | Blocked by | Delivers (verifiable) |
+|---|---|---|---|
+| P3-01 (#97) | Interleaving: scheduler-driven chunk loop, K=1, serving chunk width, durable `Prefilling(progress)`, cancel as abort, `checkpoint()` at chunk boundaries | — | One `advance()` = at most one chunk + one decode round; the anti-serialization property is a CPU test |
+| P3-02 (#98) | Capacity: `KvPool` pages are device pages, admission accounts real bytes and the reserved entitlement | — | Admission refuses on capacity that exists; its view and the leaf's pool are cross-checked |
+| P3-03 (#99) | Sampling in the leaf: per-sequence params, RNG and penalty state, size-prefixed ABI extension (ADR 0016) | — | Device-side sampling at real geometry; the same seed gives the same tokens whatever the batch |
+| P3-04 (#101) | Sampling surface over HTTP; `top_k` as an ignis extension | #99 | Every parameter honoured or refused, never silently dropped |
+| P3-05 (#102) | Decode CUDA graphs: exact widths 1..8, no padding, staging buffers separate from the prefill scratch | #99 | Replay matches eager at every width; an interleaved chunk between replays changes nothing |
+| P3-06 (#103) | Request log: canonical `ignis.request.*` as JSONL with per-phase fields, no third stream | #97 | A failing cell is attributable without another run |
+| P3-07 (#100) | G3 measurement instrument: the three cells over HTTP/SSE, live/live session rule | — | Cells measurable against either engine; refusals CPU-tested |
+| P3-08 (#104) | G3 gate run and verdict | all | **G3 GREEN** or a filed gap, never a waiver |
+
+Frontier at start: **#97**, **#98**, **#99**, **#100** in parallel (#100 is
+Rust only, no GPU). Critical path: #99 → #102 → #104 — the sampler is inside
+the round the graph captures, so a graph captured before it would have to be
+captured again.
+
+Current frontier (2026-09-09): the four G3 starts above. Open alongside them,
+both out of the gate path: **#92** (per-chunk prefill synchronization
+investigation, which now also decides packed prefill's phase) and **#95**
 (expose the server's `request_timeout`). (Grabbable tickets only — status and
 blocking live on GitHub.)
 
 ## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
 
-- **G3**: batched decode round (B ≤ 8) over per-slot views · sampling (temp/top-p/top-k/penalties, seed) · decode graph capture per width + eager fallback · PDL chain where vendored ops support it · request-log JSONL · core KV pool ↔ runtime pages under load · G3 gate (C=1, C=4).
 - **G4**: hq-e8-2b codec + attention routes + exact-key side store · device prefix reuse (page refcount, shared system+tools boundary) · KV-RAM tier snapshot/restore (all state sections) · tagged lanes · preserve-thinking / tool-call stream hardening · warmup/readiness · G4 gate (bench-03 trace).
 - **G5**: MTP round + pack + adaptive width + ReplaySSM records/fold · DFlash2 drafter load + draft kernels + RAM-tier carry · G5 gate.
