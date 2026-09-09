@@ -16,6 +16,8 @@ axum = { version = "0.8", features = ["json"] }
 futures-core = "0.3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # Target-specific, inherited by members via `workspace = true` under their own
 # `[target.'cfg(...)'.dependencies]` sections.
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }

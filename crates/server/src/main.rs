@@ -126,6 +126,16 @@ fn cuda_scheduler(
 
 #[tokio::main]
 async fn main() {
+    // The canonical structured-logging system (GitHub #78, ADR 0011) — first
+    // thing `main` does, before args/config, so the earliest possible
+    // startup messages already go through it rather than a bootstrap
+    // `eprintln!`. This call only installs the subscriber; migrating the
+    // `eprintln!`s below onto it is Phase 2 (GitHub #79).
+    if let Err(err) = ignis_logging::init(|name| std::env::var(name).ok()) {
+        eprintln!("ignis-server: logging: {err} — refusing to start");
+        std::process::exit(1);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = match config::resolve(&args, |name| std::env::var(name).ok()) {
         Ok(ConfigOutcome::Config(config)) => config,
