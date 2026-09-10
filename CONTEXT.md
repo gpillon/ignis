@@ -197,6 +197,23 @@ When output names a domain concept, use the term as defined here.
   behind `IGNIS_TELEMETRY`/`--telemetry`. Interval counters are metrics-shaped
   and stay out of the logging system's scope; the request-lifecycle line
   (`admitted`/`ttft`/`done`) migrates onto canonical `ignis.request.*` events.
+- **Logging queue** — the handoff decoupling event *creation* (a `tracing`
+  call site, potentially on the prefill/decode path) from physical I/O
+  (potentially slow: a full disk, a stalled pipe). Two channels, two
+  deliberately different backpressure policies: the priority channel
+  (INFO/WARN/ERROR) is bounded and blocks briefly rather than drop — an
+  ERROR must never silently vanish; the debug/trace channel (DEBUG/TRACE) is
+  a bounded ring buffer that drops its oldest entry on overflow rather than
+  ever blocking. A background thread is the only thing that ever performs
+  the real write. Flushing at shutdown waits, up to a fixed budget, only on
+  the priority channel — a pending DEBUG/TRACE line is exactly what that
+  channel already permits losing.
+- **Sensitive attribute redaction** — an attribute whose key contains a
+  sensitive whole word (`password`, `secret`, `token`, `authorization`,
+  `bearer`, `cookie`, `credential`) or word pair (`api_key`, `private_key`)
+  is redacted by construction, not by call-site discretion — a call site
+  naming a field carelessly is caught before it ships rather than relying on
+  every call site remembering to redact by hand.
 - **`request.id`** — reused as the OTel `trace_id` for the request's span
   tree (root span at HTTP ingress, children per admission/prefill/**decode
   round**/MTP verify/completion); one identifier for the same causal unit
@@ -207,6 +224,12 @@ When output names a domain concept, use the term as defined here.
   record per token/layer/kernel/allocation on the prefill/decode path; any
   logging or tracing change touching that path must pass the G4 performance
   gate (ADR 0007) before merge, not just design review.
+- **Hotpath lint** — the grep-based, hand-maintained scan over a fixed list
+  of prefill/decode/CUDA-graph-adjacent files that fails `cargo test` on any
+  INFO-or-above `tracing` call or raw `println!`/`eprintln!`/`print!` found
+  there. What makes the **hot-path logging constraint** checkable in review,
+  not only provable later at the G4 gate. A `hotpath-lint-allow:` comment
+  marks a reviewed, intentional exception, never a silent one.
 
 ## Acceptance
 
