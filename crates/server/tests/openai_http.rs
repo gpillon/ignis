@@ -15,7 +15,10 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 use ignis_core::mock::{GateController, GatedCompute, MockCompute};
-use ignis_core::{Compute, ConcreteScheduler, SchedulerConfig};
+use ignis_core::{
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, RequestId,
+    SchedulerConfig,
+};
 use ignis_server::engine::Engine;
 use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
 use ignis_server::Server;
@@ -63,6 +66,29 @@ fn harness_gated() -> (Harness, Arc<GatedCompute>, GateController) {
     let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
     let h = harness_over(gated.clone() as Arc<dyn Compute>);
     (h, gated, controller)
+}
+
+/// A compute decorator that exposes the public lifecycle release callback so
+/// an HTTP test can wait deterministically for cancellation to free the first
+/// request before submitting the next one.
+struct ReleaseObservedCompute {
+    inner: MockCompute,
+    released: std::sync::mpsc::SyncSender<RequestId>,
+}
+
+impl Compute for ReleaseObservedCompute {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+        self.inner.prefill_step(jobs)
+    }
+
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+
+    fn release(&self, request: RequestId) {
+        self.inner.release(request);
+        let _ = self.released.send(request);
+    }
 }
 
 /// The token the seed-0 mock emits for request `id` at decode step `i`
@@ -232,6 +258,81 @@ async fn chat_completions_streaming_with_include_usage_appends_a_usage_chunk() {
         chunks[4]["usage"]["total_tokens"],
         chunks[4]["usage"]["prompt_tokens"].as_u64().unwrap() + 3
     );
+}
+
+#[tokio::test]
+async fn dropping_a_streaming_response_cancels_the_request_and_releases_its_slot() {
+    let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+    let observed = Arc::new(ReleaseObservedCompute {
+        inner: MockCompute::new(),
+        released: released_tx,
+    });
+    let (gated, controller) = GatedCompute::new(observed as Arc<dyn Compute>);
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            max_in_flight: 1,
+            ..SchedulerConfig::default()
+        },
+        gated.clone() as Arc<dyn Compute>,
+    );
+    let server = Server::new(
+        Engine::new(Box::new(scheduler)),
+        Box::new(SimpleTemplateProvider),
+    );
+    let app = server.app();
+
+    gated.arm();
+    let first = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{ "role": "user", "content": "keep decoding" }],
+                "max_tokens": 8192,
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let first_response = app.clone().oneshot(first).await.unwrap();
+    assert_eq!(first_response.status(), 200);
+    let first_body = first_response.into_body();
+    controller.wait_entered();
+    // If disconnect does not cancel the request, its next decode step will
+    // enter this second gate and it cannot reach lifecycle release.
+    gated.arm();
+
+    // Dropping the live HTTP body is the transport-level cancellation signal.
+    drop(first_body);
+    controller.release();
+    released_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("disconnecting the SSE client must release its scheduler request");
+
+    // With max_in_flight=1, a successful second submission proves the first
+    // request no longer occupies the only in-flight slot.
+    let second = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{ "role": "user", "content": "replacement" }],
+                "max_tokens": 1,
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let second_response = app.clone().oneshot(second).await.unwrap();
+    assert_eq!(second_response.status(), 200);
+    drop(second_response.into_body());
+    controller.wait_entered();
+    controller.release();
 }
 
 // ── POST /v1/responses ────────────────────────────────────────────────────

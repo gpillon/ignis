@@ -970,6 +970,10 @@ impl Scheduler for ConcreteScheduler {
         Ok(id)
     }
 
+    fn cancel(&mut self, request: RequestId) -> bool {
+        ConcreteScheduler::cancel(self, request)
+    }
+
     fn advance(&mut self) -> Vec<SchedEvent> {
         let mut events: Vec<SchedEvent> = Vec::new();
         self.last_error = None;

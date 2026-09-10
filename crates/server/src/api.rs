@@ -32,11 +32,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tower_http::trace::{MakeSpan, TraceLayer};
 
-use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
+use ignis_core::{
+    DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError,
+};
 
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{EventStream, collect_tokens};
+use crate::engine::{Engine, EventStream, collect_tokens};
 use crate::template::{ChatMessage, TemplateProvider};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
@@ -478,7 +480,8 @@ async fn chat_completions(
     };
     let (input, model, prompt_tokens) =
         build_request(&server, req.model, &req.messages, params, &thinking);
-    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
+    let (request_id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await
+    {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -486,8 +489,8 @@ async fn chat_completions(
     // `Empty` at ingress (`RootSpanMaker`) since the scheduler had not
     // assigned one yet; record it now so every log record for the rest of
     // this span's life carries the request's real `trace_id`.
-    tracing::Span::current().record("request_id", id);
-    let id = format!("chatcmpl-{id}");
+    tracing::Span::current().record("request_id", request_id);
+    let id = format!("chatcmpl-{request_id}");
     let created = now();
 
     if req.stream {
@@ -497,6 +500,7 @@ async fn chat_completions(
         let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
         return Sse::new(ChunkStream::new(
             stream,
+            CancelOnDrop::new(server.engine.clone(), request_id),
             id,
             created,
             model,
@@ -623,6 +627,8 @@ struct Delta {
 struct ChunkStream {
     /// The request's event stream (closes on the request's completion).
     stream: EventStream,
+    /// Aborts the request if this body is dropped before it completed.
+    cancel: CancelOnDrop,
     id: String,
     created: u64,
     model: String,
@@ -645,9 +651,43 @@ struct ChunkStream {
     done_sent: bool,
 }
 
+/// Cancels its request when dropped before the request has completed. An SSE
+/// client that hangs up mid-generation would otherwise leave its lane and KV
+/// reservation generating to `max_tokens` for nobody.
+struct CancelOnDrop {
+    engine: Engine,
+    request: RequestId,
+    completed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(engine: Engine, request: RequestId) -> Self {
+        Self { engine, request, completed: false }
+    }
+
+    /// The request reached its own terminal event: dropping is now a
+    /// clean end of stream, not a disconnect.
+    fn completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.engine.cancel(self.request);
+        }
+    }
+}
+
 impl ChunkStream {
+    // The chunk envelope's fields are all per-request and all needed to
+    // shape a `chat.completion.chunk`; grouping them would only rename the
+    // argument list.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: EventStream,
+        cancel: CancelOnDrop,
         id: String,
         created: u64,
         model: String,
@@ -657,6 +697,7 @@ impl ChunkStream {
     ) -> Self {
         Self {
             stream,
+            cancel,
             id,
             created,
             model,
@@ -767,6 +808,7 @@ impl Stream for ChunkStream {
                     // held back, then the finish-reason chunk, then (opt-in)
                     // the usage chunk — all queued ahead of `[DONE]`.
                     SchedEvent::Done { reason, tokens, .. } => {
+                        this.cancel.completed();
                         for delta in this.decoder.finish() {
                             this.pending.push_back(this.delta_chunk(delta));
                         }
