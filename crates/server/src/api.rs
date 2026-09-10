@@ -208,6 +208,7 @@ impl SamplingRequestFields {
             // The leaf keys its counter-based RNG with all 64 bits. Casting
             // preserves the complete signed OpenAI seed domain bit-for-bit.
             seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
+            ignore_eos: false,
         })
     }
 }
@@ -431,6 +432,9 @@ struct ChatCompletionsRequest {
     /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
     stream_options: Option<StreamOptions>,
     max_tokens: Option<u32>,
+    /// Non-standard bounded-stream control used by the ITL measurement.
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(flatten)]
     sampling: SamplingRequestFields,
     /// The thinking controls (GitHub #68) — kept as raw JSON so the wire
@@ -462,10 +466,11 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
-    let params = match req.sampling.resolve(req.max_tokens) {
+    let mut params = match req.sampling.resolve(req.max_tokens) {
         Ok(params) => params,
         Err(message) => return invalid_sampling_parameter(message),
     };
+    params.ignore_eos = req.ignore_eos;
     let thinking = match resolve_thinking(
         &server,
         ThinkingRequestFields {

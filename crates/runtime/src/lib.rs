@@ -354,7 +354,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 continue;
             }
             let token = decoded.next().expect("decoded result length was checked");
-            if token == self.eos {
+            if token == self.eos && !job.params.ignore_eos {
                 outcomes[index] = Some(DecodeOutcome::Finished(FinishReason::Stop));
                 released.push(sequence);
             } else {
