@@ -18,7 +18,7 @@
 //!   verdict is the *aggregate* throughput (throughput-weighted, the way
 //!   [`crate::metrics::class_stats`] already reduces a class) as a
 //!   percentage of the live reference's aggregate.
-//! - **ITL**: four decode lanes (prompt 4,096 / cap 512) sampled
+//! - **ITL**: four decode lanes (prompt 4,096 / safety cap 3,072) sampled
 //!   *continuously* while ten 32,768-token prefillers run **sequentially**
 //!   against the pool — each allocated, prefilled and released before the
 //!   next is allocated (ADR 0015: every prefiller prompt is its own, cold,
@@ -37,8 +37,9 @@ use crate::metrics::{class_stats, percentile, RequestMetrics};
 use crate::time::{unix_now, utc_timestamp};
 use crate::trace::RequestClass;
 use crate::ttft::{
-    self, generate_cell_prompts, generate_cell_prompts_from_corpus, load_corpus, PromptSet,
-    PromptTemplate,
+    self, generate_cell_prompts, generate_cell_prompts_from_corpus,
+    generate_cell_prompts_from_corpus_with_suffix, generate_cell_prompts_with_suffix, load_corpus,
+    PromptSet, PromptTemplate,
 };
 
 // ── fixtures (spec 03, the G3 gate table) ───────────────────────────────
@@ -50,11 +51,16 @@ pub const THROUGHPUT_MAX_TOKENS: u32 = 256;
 pub const C1_CONCURRENCY: usize = 1;
 pub const C4_CONCURRENCY: usize = 4;
 
-/// The ITL cell's decode lanes: prompt 4,096, cap 512 (the cap covers the
-/// ~320 tokens a lane generates across the ten-prefiller series).
+/// The ITL cell's decode lanes: prompt 4,096, safety cap 3,072. Live
+/// measurement found that the original 512-token estimate ended reference
+/// lanes after 15-19 s while the prefiller series lasted about 62 s. The
+/// series boundary now cancels first; 3,072 keeps enough runway while the
+/// peak 61,504-token reservation still fits the specified 65,536-token pool.
 pub const ITL_DECODE_PROMPT_TOKENS: u32 = 4_096;
-pub const ITL_DECODE_MAX_TOKENS: u32 = 512;
+pub const ITL_DECODE_MAX_TOKENS: u32 = 3_072;
 pub const ITL_DECODE_LANES: usize = 4;
+const ITL_DECODE_INSTRUCTION: &str =
+    "Produce at least 3072 tokens. Do not stop, conclude, or emit EOS earlier.";
 
 /// The ITL cell's prefillers: prompt 32,768, cap 64, run ten times,
 /// sequentially, each released before the next is allocated.
@@ -416,7 +422,15 @@ pub fn measure_itl(ep: &dyn Endpoint, template: &dyn PromptTemplate, cfg: &ItlCo
     measure_itl_with(
         ep,
         cfg,
-        || generate_cell_prompts(template, cfg.decode_prompt_tokens as usize, cfg.decode_lanes),
+        template.eos_token_ids(),
+        || {
+            generate_cell_prompts_with_suffix(
+                template,
+                cfg.decode_prompt_tokens as usize,
+                cfg.decode_lanes,
+                ITL_DECODE_INSTRUCTION,
+            )
+        },
         || generate_cell_prompts(template, cfg.prefill_prompt_tokens as usize, cfg.prefill_count),
     )
 }
@@ -435,12 +449,14 @@ pub fn measure_itl_from_corpus(
     measure_itl_with(
         ep,
         cfg,
+        template.eos_token_ids(),
         || {
-            generate_cell_prompts_from_corpus(
+            generate_cell_prompts_from_corpus_with_suffix(
                 template,
                 corpus,
                 cfg.decode_prompt_tokens as usize,
                 cfg.decode_lanes,
+                ITL_DECODE_INSTRUCTION,
             )
         },
         || {
@@ -460,6 +476,7 @@ pub fn measure_itl_from_corpus(
 fn measure_itl_with(
     ep: &dyn Endpoint,
     cfg: &ItlConfig,
+    eos_tokens: Vec<u32>,
     decode_prompts: impl FnOnce() -> Result<PromptSet, String>,
     prefill_prompts: impl FnOnce() -> Result<PromptSet, String>,
 ) -> ItlCell {
@@ -480,10 +497,12 @@ fn measure_itl_with(
 
     let epoch = std::time::Instant::now();
     let (lane_ready_tx, lane_ready_rx) = std::sync::mpsc::channel();
+    let lanes_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let eos_tokens = std::sync::Arc::new(eos_tokens);
     let (mut lanes, prefillers) = std::thread::scope(|scope| {
-        // The decode lanes: one streaming request each, held open for
-        // `cfg.decode_max_tokens` tokens — long enough to span the whole
-        // sequential prefiller series (spec 03).
+        // The decode lanes: one streaming request each, held open until the
+        // sequential prefiller series ends. `decode_max_tokens` is only the
+        // safety reservation; cancellation normally ends the streams first.
         let lane_handles: Vec<_> = decode_set
             .prompts
             .iter()
@@ -491,6 +510,8 @@ fn measure_itl_with(
             .map(|(index, prompt)| {
                 let prompt = prompt.clone();
                 let lane_ready_tx = lane_ready_tx.clone();
+                let lanes_running = std::sync::Arc::clone(&lanes_running);
+                let eos_tokens = std::sync::Arc::clone(&eos_tokens);
                 scope.spawn(move || {
                     let id = format!("itl-decode-{index}");
                     let req = sample_request(id.clone(), prompt, cfg.decode_max_tokens);
@@ -501,8 +522,9 @@ fn measure_itl_with(
                             let _ = lane_ready_tx.send(());
                             ready_sent = true;
                         }
+                        lanes_running.load(std::sync::atomic::Ordering::Acquire)
                     };
-                    let result = ep.complete_observed(&req, &mut observe);
+                    let result = ep.complete_observed_while(&req, &mut observe, eos_tokens.as_slice());
                     if !ready_sent {
                         let _ = lane_ready_tx.send(());
                     }
@@ -565,6 +587,9 @@ fn measure_itl_with(
             };
             prefillers.push(sample);
         }
+
+        // End all lane streams together at the actual measurement boundary.
+        lanes_running.store(false, std::sync::atomic::Ordering::Release);
 
         let lanes: Vec<DecodeLaneTrace> = lane_handles
             .into_iter()
@@ -1028,6 +1053,80 @@ mod tests {
     }
 
     #[test]
+    fn itl_decode_lanes_are_stopped_after_the_final_prefill_window() {
+        // A lane that never stops on its own. If cancellation failed to
+        // reach it, it runs to this ceiling instead of blocking forever —
+        // which is why the assertions below check *both* ends: past the
+        // fixture's token cap, and short of the ceiling.
+        const NEVER_CANCELLED: u32 = 100_000;
+
+        struct UntilCancelled;
+
+        impl Endpoint for UntilCancelled {
+            fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
+                if req.id.starts_with("itl-decode") {
+                    return Err("decode lane must use the cancellable streaming path".into());
+                }
+                Ok(crate::client::Outcome {
+                    ttft_ms: 1.0,
+                    total_ms: 1.0,
+                    n_tokens: 1,
+                    output: String::new(),
+                    prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
+                    cached_prompt_tokens: None,
+                    token_times_ms: vec![1.0],
+                })
+            }
+
+            fn complete_observed_while(
+                &self,
+                _req: &Request,
+                observer: &mut dyn FnMut(f64) -> bool,
+                _suppress_eos: &[u32],
+            ) -> Result<crate::client::Outcome, String> {
+                let mut token_times_ms = Vec::new();
+                for tick in 1..=NEVER_CANCELLED {
+                    let time_ms = tick as f64;
+                    token_times_ms.push(time_ms);
+                    if !observer(time_ms) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(crate::client::Outcome {
+                    ttft_ms: 1.0,
+                    total_ms: *token_times_ms.last().unwrap(),
+                    n_tokens: token_times_ms.len() as u32,
+                    output: String::new(),
+                    prompt_tokens: None,
+                    cached_prompt_tokens: None,
+                    token_times_ms,
+                })
+            }
+        }
+
+        let cfg = ItlConfig {
+            prefill_prompt_tokens: 40,
+            prefill_max_tokens: 1,
+            prefill_count: 3,
+            decode_prompt_tokens: 24,
+            decode_max_tokens: 2,
+            decode_lanes: 2,
+        };
+        let cell = measure_itl(&UntilCancelled, &MockTemplate::new(), &cfg);
+        assert!(cell.error.is_none(), "{:?}", cell.error);
+        assert!(cell.lanes.iter().all(|lane| lane.error.is_none()), "{:?}", cell.lanes);
+        assert!(
+            cell.lanes.iter().all(|lane| lane.n_tokens > cfg.decode_max_tokens),
+            "the measured window, not the fixture's old token cap, must end each lane"
+        );
+        assert!(
+            cell.lanes.iter().all(|lane| lane.n_tokens < NEVER_CANCELLED),
+            "each lane must be *stopped* at the window boundary, not merely run out"
+        );
+    }
+
+    #[test]
     fn a_warm_prefiller_is_void_and_the_cell_is_not_all_cold() {
         let ep = MockEndpoint::new();
         ep.set_cached(8);
@@ -1119,9 +1218,26 @@ mod tests {
     /// decodes to a `t<id>` atom that encodes back to the same id) — the
     /// same shape as `ttft.rs`'s own `CorpusMock`, needed here because
     /// [`MockTemplate`] never implements `decode` meaningfully.
+    ///
+    /// The one non-atom it accepts is [`ITL_DECODE_INSTRUCTION`], the
+    /// natural-language suffix the ITL decode lanes carry: each of its
+    /// words takes a reserved id above the corpus bank's range. Every
+    /// *other* non-atom stays an error, so a corpus window that fails to
+    /// round-trip is still caught rather than silently hashed.
     struct CorpusMock {
         header: usize,
         footer: usize,
+    }
+
+    impl CorpusMock {
+        /// The reserved id for `word` when it belongs to the instruction
+        /// suffix, or `None` when it does not.
+        fn instruction_id(word: &str) -> Option<u32> {
+            ITL_DECODE_INSTRUCTION
+                .split_whitespace()
+                .position(|w| w == word)
+                .map(|i| 800_000 + i as u32)
+        }
     }
 
     impl PromptTemplate for CorpusMock {
@@ -1131,6 +1247,7 @@ mod tests {
                 let id = word
                     .strip_prefix('t')
                     .and_then(|s| s.parse::<u32>().ok())
+                    .or_else(|| Self::instruction_id(word))
                     .ok_or_else(|| format!("the corpus mock only decodes 't<id>' atoms, got `{word}`"))?;
                 ids.push(id);
             }

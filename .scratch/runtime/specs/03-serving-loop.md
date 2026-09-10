@@ -222,15 +222,23 @@ entitlement at allocation.
 |---|---|---|---|---|
 | C=1 | prompt 8,192, cap 256 | 8,448 | headroom 57,088 | at least 99% of the live reference's tok/s (historically ~75–76) |
 | C=4 | 4 × (prompt 8,192, cap 256) | 33,792 | headroom 31,744 | aggregate at least 99% of the live reference's aggregate |
-| ITL | 4 × (prompt 4,096, cap 512) with a prefiller at prompt 32,768, cap 64 | 51,264 peak | headroom 14,272 | p95 within the live reference's envelope |
+| ITL | 4 × (prompt 4,096, safety cap 3,072) with a prefiller at prompt 32,768, cap 64 | 61,504 peak | headroom 4,032 | p95 within the live reference's envelope |
 
 The ITL cell runs **ten sequential cold prefillers**: each 32,768-token
 prefiller is allocated, prefilled, and released before the next is
 allocated, every prompt cold and distinct under ADR 0015's rule, while the
 four decode lanes stay alive across the whole series. The lanes' inter-token
-intervals are sampled for the entire series (~1,240 samples at K=1); p50,
-p95, p99 and max are all recorded and p95 decides. The 512-token cap covers
-the ~320 tokens a lane generates across the series.
+intervals are sampled for the entire series; p50, p95, p99 and max are all
+recorded and p95 decides. The original 512-token estimate was falsified by
+the live reference: lanes exhausted it after 15-19 seconds while the ten
+prefillers lasted about 62 seconds. A 3,072-token safety reservation fits the
+65,536-token pool, and the instrument cancels every lane immediately after
+the final prefill window so unused generation capacity is released. To keep
+the measurement lanes alive until that boundary, their prompt ends with an
+explicit request for at least 3,072 output tokens (the corpus window is
+shortened so the post-template prompt remains exactly 4,096 tokens), and the
+measurement request suppresses the artifact's EOS ids. Normal serving keeps
+its existing EOS behavior.
 
 Alongside the three cells, two non-negotiables: the functional
 anti-serialization property above, proven by a CPU test rather than inferred

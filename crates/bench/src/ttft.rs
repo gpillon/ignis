@@ -77,6 +77,12 @@ pub trait PromptTemplate: Send + Sync {
     /// detokenizes a window of ids into the prompt text the engine then
     /// receives (and re-tokenizes with the same tokenizer).
     fn decode(&self, ids: &[u32]) -> Result<String, String>;
+
+    /// The model's terminal token, when the artifact exposes it. Long-lived
+    /// measurement lanes suppress this token until their window closes.
+    fn eos_token_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 impl PromptTemplate for ignis_artifact::FrontendSet {
@@ -100,6 +106,25 @@ impl PromptTemplate for ignis_artifact::FrontendSet {
         self.tokenizer()
             .decode(ids)
             .map_err(|e| format!("detokenize the corpus window: {e}"))
+    }
+
+    fn eos_token_ids(&self) -> Vec<u32> {
+        let Ok(config) = serde_json::from_slice::<serde_json::Value>(self.generation_config())
+        else {
+            return Vec::new();
+        };
+        match config.get("eos_token_id") {
+            Some(serde_json::Value::Number(id)) => id
+                .as_u64()
+                .and_then(|id| u32::try_from(id).ok())
+                .into_iter()
+                .collect(),
+            Some(serde_json::Value::Array(ids)) => ids
+                .iter()
+                .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -156,9 +181,27 @@ pub fn generate_prompt(
     nonce: &str,
     seed: u64,
 ) -> Result<String, String> {
+    generate_prompt_with_suffix(template, target_tokens, nonce, seed, "")
+}
+
+fn generate_prompt_with_suffix(
+    template: &dyn PromptTemplate,
+    target_tokens: usize,
+    nonce: &str,
+    seed: u64,
+    suffix: &str,
+) -> Result<String, String> {
     let mut rng = Lcg(seed);
     let mut words: Vec<String> = vec![nonce.to_string()];
-    let mut count = template.encode_user_message(&words.join(" "))?.len();
+    let content = |words: &[String]| {
+        let body = words.join(" ");
+        if suffix.is_empty() {
+            body
+        } else {
+            format!("{body} {suffix}")
+        }
+    };
+    let mut count = template.encode_user_message(&content(&words))?.len();
     if count > target_tokens {
         return Err(format!(
             "the chat template's own overhead is {count} tokens: a {target_tokens}-token cell is \
@@ -168,17 +211,17 @@ pub fn generate_prompt(
     // Grow. Each word is at least one token, so this terminates.
     while count < target_tokens {
         words.push(VOCAB[(rng.next() as usize) % VOCAB.len()].to_string());
-        count = template.encode_user_message(&words.join(" "))?.len();
+        count = template.encode_user_message(&content(&words))?.len();
     }
     // Drop back under (the last word may have overshot by several tokens).
     while count > target_tokens && words.len() > 1 {
         words.pop();
-        count = template.encode_user_message(&words.join(" "))?.len();
+        count = template.encode_user_message(&content(&words))?.len();
     }
     // Land exactly, one filler token at a time.
     while count < target_tokens {
         words.push(FILLER.to_string());
-        let grown = template.encode_user_message(&words.join(" "))?.len();
+        let grown = template.encode_user_message(&content(&words))?.len();
         if grown > target_tokens {
             return Err(format!(
                 "cannot land on {target_tokens} tokens: appending `{FILLER}` moved the count from \
@@ -193,7 +236,7 @@ pub fn generate_prompt(
         }
         count = grown;
     }
-    Ok(words.join(" "))
+    Ok(content(&words))
 }
 
 /// A cell's prompts: one per sample, plus the warmup's, each exactly
@@ -251,6 +294,44 @@ pub fn generate_cell_prompts(
     }
     // The template's own overhead, as an upper bound on how much two
     // samples may legitimately share.
+    let overhead = template.encode_user_message("")?.len();
+    prove_divergence(&tokens, overhead)?;
+    Ok(PromptSet { prompts, tokens })
+}
+
+/// [`generate_cell_prompts`] with a fixed instruction appended to every
+/// prompt. The suffix is part of the measured token budget: each prompt
+/// still lands on `target_tokens` exactly, so a cell keeps its claimed
+/// length.
+pub fn generate_cell_prompts_with_suffix(
+    template: &dyn PromptTemplate,
+    target_tokens: usize,
+    count: usize,
+    suffix: &str,
+) -> Result<PromptSet, String> {
+    if count == 0 {
+        return Err("a cell needs at least one prompt".to_string());
+    }
+    let mut prompts = Vec::with_capacity(count);
+    let mut tokens = Vec::with_capacity(count);
+    for index in 0..count {
+        let prompt = generate_prompt_with_suffix(
+            template,
+            target_tokens,
+            &nonce(index),
+            0x9E3779B97F4A7C15 ^ (index as u64).wrapping_mul(0x100000001B3),
+            suffix,
+        )?;
+        let ids = template.encode_user_message(&prompt)?;
+        if ids.len() != target_tokens {
+            return Err(format!(
+                "prompt {index} came out {} tokens, not the {target_tokens} the cell claims",
+                ids.len()
+            ));
+        }
+        prompts.push(prompt);
+        tokens.push(ids);
+    }
     let overhead = template.encode_user_message("")?.len();
     prove_divergence(&tokens, overhead)?;
     Ok(PromptSet { prompts, tokens })
@@ -342,6 +423,19 @@ pub fn generate_cell_prompts_from_corpus(
     target_tokens: usize,
     count: usize,
 ) -> Result<PromptSet, String> {
+    generate_cell_prompts_from_corpus_with_suffix(template, corpus, target_tokens, count, "")
+}
+
+/// [`generate_cell_prompts_from_corpus`] with a fixed instruction appended
+/// to every prompt. The corpus window shortens to absorb the suffix, so the
+/// post-template count still lands on `target_tokens` exactly.
+pub fn generate_cell_prompts_from_corpus_with_suffix(
+    template: &dyn PromptTemplate,
+    corpus: &[u32],
+    target_tokens: usize,
+    count: usize,
+    suffix: &str,
+) -> Result<PromptSet, String> {
     if count == 0 {
         return Err("a cell needs at least one prompt".to_string());
     }
@@ -372,7 +466,8 @@ pub fn generate_cell_prompts_from_corpus(
     let mut tokens = Vec::with_capacity(count);
     for index in 0..count {
         let offset = ((index as u64) * (stride as u64)) % corpus.len() as u64;
-        let (prompt, ids) = land_corpus_window(template, corpus, offset as usize, target_tokens)?;
+        let (prompt, ids) =
+            land_corpus_window(template, corpus, offset as usize, target_tokens, suffix)?;
         prompts.push(prompt);
         tokens.push(ids);
     }
@@ -396,6 +491,7 @@ fn land_corpus_window(
     corpus: &[u32],
     offset: usize,
     target_tokens: usize,
+    suffix: &str,
 ) -> Result<(String, Vec<u32>), String> {
     // A few candidate lengths around the search position (the round-trip
     // drift is a handful of tokens even at 32K), and a few window
@@ -410,7 +506,12 @@ fn land_corpus_window(
         // Decode the `n`-id window at `off` (wrapping) to prompt text.
         let cut = |n: usize| -> Result<(Vec<u32>, String), String> {
             let ids: Vec<u32> = (0..n).map(|k| corpus[(off + k) % len]).collect();
-            let text = template.decode(&ids)?;
+            let body = template.decode(&ids)?;
+            let text = if suffix.is_empty() {
+                body
+            } else {
+                format!("{body} {suffix}")
+            };
             Ok((ids, text))
         };
         // The post-template token count of the `n`-id window: decode, then
@@ -1104,6 +1205,28 @@ mod tests {
         // text yields exactly the claimed ids.
         for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
             assert_eq!(template.encode_user_message(prompt).unwrap(), *ids);
+        }
+    }
+
+    #[test]
+    fn a_corpus_cell_can_land_a_shared_suffix_without_changing_its_claimed_length() {
+        let template = CorpusMock::exact();
+        let bank = corpus_bank();
+        // CorpusMock accepts only its reversible `t<id>` atoms; these stand
+        // in for the natural-language instruction used by the live G3 cell.
+        let suffix = "t900 t901 t902 t903 t904 t905 t906 t907";
+        let set = generate_cell_prompts_from_corpus_with_suffix(&template, &bank, 64, 6, suffix)
+            .expect("cut with suffix");
+
+        for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
+            assert!(prompt.ends_with(suffix), "the instruction must stay at the end");
+            assert_eq!(ids.len(), 64, "the suffix must not change the fixture length");
+            assert_eq!(template.encode_user_message(prompt).unwrap(), *ids);
+        }
+        for i in 0..set.tokens.len() {
+            for j in (i + 1)..set.tokens.len() {
+                assert_eq!(common_prefix_len(&set.tokens[i], &set.tokens[j]), template.header);
+            }
         }
     }
 

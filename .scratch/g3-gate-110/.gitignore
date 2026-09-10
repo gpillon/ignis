@@ -1,0 +1,11 @@
+# Working scratch from the gate session: server stdout/stderr captures. The
+# records that back the verdict are listed in README.md and tracked
+# explicitly.
+*
+!.gitignore
+!README.md
+!ignis-final.json
+!reference-final.json
+!verdict-final.json
+!reference.json
+!reference-2.json
