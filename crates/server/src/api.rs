@@ -32,11 +32,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tower_http::trace::{MakeSpan, TraceLayer};
 
-use ignis_core::{DecodeParams, FinishReason, RequestClass, RequestInput, SchedEvent, SubmitError};
+use ignis_core::{
+    DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError,
+};
 
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
-use crate::engine::{EventStream, collect_tokens};
+use crate::engine::{Engine, EventStream, collect_tokens};
 use crate::template::{ChatMessage, TemplateProvider};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
@@ -153,7 +155,12 @@ struct SamplingRequestFields {
 }
 
 impl SamplingRequestFields {
-    fn resolve(self, max_tokens: Option<u32>) -> Result<DecodeParams, String> {
+    /// `ignore_eos` is an ignis extension for bounded measurement streams.
+    /// It is refused without a `max_tokens`, because the two together are
+    /// what keeps such a request bounded: with neither an EOS nor a cap,
+    /// a non-streaming request has nothing left to stop it, and only the
+    /// streaming path cancels on client disconnect.
+    fn resolve(self, max_tokens: Option<u32>, ignore_eos: bool) -> Result<DecodeParams, String> {
         let temperature = bounded_f32(
             "temperature",
             number("temperature", self.temperature, 0.0)?,
@@ -184,6 +191,13 @@ impl SamplingRequestFields {
             ));
         }
 
+        if ignore_eos && max_tokens.is_none() {
+            return Err(
+                "ignore_eos is an ignis extension for bounded measurement streams and requires max_tokens"
+                    .into(),
+            );
+        }
+
         if temperature == 0.0
             && (top_p != 1.0
                 || (top_k != 0 && top_k != 20)
@@ -206,6 +220,7 @@ impl SamplingRequestFields {
             // The leaf keys its counter-based RNG with all 64 bits. Casting
             // preserves the complete signed OpenAI seed domain bit-for-bit.
             seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
+            ignore_eos,
         })
     }
 }
@@ -429,6 +444,11 @@ struct ChatCompletionsRequest {
     /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
     stream_options: Option<StreamOptions>,
     max_tokens: Option<u32>,
+    /// An ignis extension: keep decoding past the model's EOS token. Used
+    /// by the G3 inter-token-latency lanes, which are ended by the
+    /// measurement window rather than by the model. Requires `max_tokens`.
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(flatten)]
     sampling: SamplingRequestFields,
     /// The thinking controls (GitHub #68) — kept as raw JSON so the wire
@@ -460,7 +480,7 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
-    let params = match req.sampling.resolve(req.max_tokens) {
+    let params = match req.sampling.resolve(req.max_tokens, req.ignore_eos) {
         Ok(params) => params,
         Err(message) => return invalid_sampling_parameter(message),
     };
@@ -478,7 +498,8 @@ async fn chat_completions(
     };
     let (input, model, prompt_tokens) =
         build_request(&server, req.model, &req.messages, params, &thinking);
-    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
+    let (request_id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await
+    {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -486,8 +507,8 @@ async fn chat_completions(
     // `Empty` at ingress (`RootSpanMaker`) since the scheduler had not
     // assigned one yet; record it now so every log record for the rest of
     // this span's life carries the request's real `trace_id`.
-    tracing::Span::current().record("request_id", id);
-    let id = format!("chatcmpl-{id}");
+    tracing::Span::current().record("request_id", request_id);
+    let id = format!("chatcmpl-{request_id}");
     let created = now();
 
     if req.stream {
@@ -497,6 +518,7 @@ async fn chat_completions(
         let starts_in_reasoning = server.template.decoder_starts_in_reasoning(&thinking);
         return Sse::new(ChunkStream::new(
             stream,
+            CancelOnDrop::new(server.engine.clone(), request_id),
             id,
             created,
             model,
@@ -623,6 +645,8 @@ struct Delta {
 struct ChunkStream {
     /// The request's event stream (closes on the request's completion).
     stream: EventStream,
+    /// Aborts the request if this body is dropped before it completed.
+    cancel: CancelOnDrop,
     id: String,
     created: u64,
     model: String,
@@ -645,9 +669,43 @@ struct ChunkStream {
     done_sent: bool,
 }
 
+/// Cancels its request when dropped before the request has completed. An SSE
+/// client that hangs up mid-generation would otherwise leave its lane and KV
+/// reservation generating to `max_tokens` for nobody.
+struct CancelOnDrop {
+    engine: Engine,
+    request: RequestId,
+    completed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(engine: Engine, request: RequestId) -> Self {
+        Self { engine, request, completed: false }
+    }
+
+    /// The request reached its own terminal event: dropping is now a
+    /// clean end of stream, not a disconnect.
+    fn completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.engine.cancel(self.request);
+        }
+    }
+}
+
 impl ChunkStream {
+    // The chunk envelope's fields are all per-request and all needed to
+    // shape a `chat.completion.chunk`; grouping them would only rename the
+    // argument list.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         stream: EventStream,
+        cancel: CancelOnDrop,
         id: String,
         created: u64,
         model: String,
@@ -657,6 +715,7 @@ impl ChunkStream {
     ) -> Self {
         Self {
             stream,
+            cancel,
             id,
             created,
             model,
@@ -767,6 +826,7 @@ impl Stream for ChunkStream {
                     // held back, then the finish-reason chunk, then (opt-in)
                     // the usage chunk — all queued ahead of `[DONE]`.
                     SchedEvent::Done { reason, tokens, .. } => {
+                        this.cancel.completed();
                         for delta in this.decoder.finish() {
                             this.pending.push_back(this.delta_chunk(delta));
                         }

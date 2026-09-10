@@ -107,6 +107,11 @@ pub trait Scheduler: Send {
         class: RequestClass,
     ) -> Result<RequestId, SubmitError>;
 
+    /// Abort an in-flight request. The scheduler must stop dealing it work
+    /// and release its resources no later than the next [`Scheduler::advance`].
+    /// Returns `false` when the request is unknown or already complete.
+    fn cancel(&mut self, request: RequestId) -> bool;
+
     /// Advance the engine by one scheduling step:
     /// - run **batched prefill** for queued requests (grouped into one GPU
     ///   batch to saturate the GPU and cut burst TTFT),

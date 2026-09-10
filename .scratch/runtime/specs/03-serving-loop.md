@@ -222,15 +222,44 @@ entitlement at allocation.
 |---|---|---|---|---|
 | C=1 | prompt 8,192, cap 256 | 8,448 | headroom 57,088 | at least 99% of the live reference's tok/s (historically ~75–76) |
 | C=4 | 4 × (prompt 8,192, cap 256) | 33,792 | headroom 31,744 | aggregate at least 99% of the live reference's aggregate |
-| ITL | 4 × (prompt 4,096, cap 512) with a prefiller at prompt 32,768, cap 64 | 51,264 peak | headroom 14,272 | p95 within the live reference's envelope |
+| ITL | 4 × (prompt 4,096, safety cap 3,072) with a prefiller at prompt 32,768, cap 64 | 61,504 peak | headroom 4,032 | p95 within the live reference's envelope |
 
 The ITL cell runs **ten sequential cold prefillers**: each 32,768-token
 prefiller is allocated, prefilled, and released before the next is
 allocated, every prompt cold and distinct under ADR 0015's rule, while the
 four decode lanes stay alive across the whole series. The lanes' inter-token
-intervals are sampled for the entire series (~1,240 samples at K=1); p50,
-p95, p99 and max are all recorded and p95 decides. The 512-token cap covers
-the ~320 tokens a lane generates across the series.
+intervals are sampled for the entire series; p50, p95, p99 and max are all
+recorded and p95 decides. The original 512-token estimate was falsified by
+the live reference: lanes exhausted it after 15-19 seconds while the ten
+prefillers lasted about 62 seconds. A 3,072-token safety reservation fits the
+65,536-token pool, and the instrument cancels every lane once the final
+prefill window closes. To keep the measurement lanes alive until that
+boundary, their prompt ends with an explicit request for at least 3,072
+output tokens (the corpus window is shortened so the post-template prompt
+remains exactly 4,096 tokens), and the measurement request suppresses the
+artifact's EOS ids. Normal serving keeps its existing EOS behavior.
+
+Cancellation is the intended terminator but not a guaranteed one: an
+endpoint that honors neither ignis `ignore_eos` nor `logit_bias` still stops
+at its own EOS, and a fast enough engine reaches the 3,072-token cap first.
+The measurement does not depend on which of the three ends a lane. What it
+depends on is the guard that refuses any lane ending before the final
+prefill window closed, so every pooled interval comes from a series that had
+all four lanes alive throughout. A run in which a leg's lanes end on the cap
+is a run whose cap is load-bearing rather than spare, and the next fixture
+revision should raise it.
+
+**ITL p95 is deferred to phase 4 (GitHub #110, #112).** The live/live re-run
+on a valid fixture measured 1.106 against a 1.10 ceiling. During a prefill
+window the ITL floor is one chunk plus one decode round, so the p95 is
+effectively a second measurement of prefill throughput: ignis's intervals
+blocked behind a chunk average 180.8 ms against the reference's 155.4 ms,
+which is a 1.163 ratio on the quantity the p95 is actually reading. There is
+no phase-3 dial for that. The leading explanation is the KV precision the
+two engines run (BF16 against hq-e8-2b), which ADR 0015 records as a known
+inequality rather than correcting for, and which the v1 design schedules for
+phase 4. C=1 and C=4 pass; the ITL cell is recorded as a warning carried into
+phase 4, not waived. The separate p50 gap is ours and is tracked as #113.
 
 Alongside the three cells, two non-negotiables: the functional
 anti-serialization property above, proven by a CPU test rather than inferred

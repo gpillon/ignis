@@ -187,6 +187,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         presence_penalty: 0.4,
         frequency_penalty: -0.4,
         seed: 9,
+        ignore_eos: false,
     };
     let right = DecodeParams {
         max_tokens: Some(4),
@@ -196,6 +197,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         presence_penalty: -0.3,
         frequency_penalty: 0.6,
         seed: 11,
+        ignore_eos: false,
     };
     compute
         .prefill_step(&[
@@ -397,6 +399,29 @@ fn adapter_enforces_max_tokens_and_eos() {
         vec![DecodeOutcome::Finished(FinishReason::Stop)]
     );
     assert_eq!(leaf.calls.lock().unwrap().sequences_released, 2);
+}
+
+#[test]
+fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
+    let leaf = Arc::new(StubLeaf::with_tokens([99, 7]));
+    let model = Arc::new(Model::load(leaf).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+    let job = DecodeJob {
+        request: 1,
+        lane: 0,
+        params: DecodeParams {
+            ignore_eos: true,
+            ..DecodeParams::default()
+        },
+    };
+
+    assert_eq!(
+        compute.decode_step(std::slice::from_ref(&job)).unwrap(),
+        vec![DecodeOutcome::Token(99)]
+    );
+    assert_eq!(compute.decode_step(&[job]).unwrap(), vec![DecodeOutcome::Token(7)]);
+    assert_eq!(compute.live_sequences(), 1);
 }
 
 #[test]

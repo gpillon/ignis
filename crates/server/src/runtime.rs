@@ -61,6 +61,24 @@ impl From<&crate::config::Config> for EngineShape {
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn scheduler_config_for_shape(
+    model: String,
+    shape: EngineShape,
+    kv_page_tokens: u32,
+    capacity_pages: u32,
+) -> SchedulerConfig {
+    SchedulerConfig {
+        model,
+        kv_page_tokens,
+        max_sequence_tokens: shape.max_context,
+        kv_capacity_pages: capacity_pages,
+        host_capacity_pages: capacity_pages,
+        serving_chunk_tokens: shape.prefill_chunk,
+        ..SchedulerConfig::default()
+    }
+}
+
 /// Build the server's real GPU-backed scheduler (GitHub #61 / P1-25):
 /// open a second [`ignis_artifact::Reader`] over `artifact_path` (the
 /// caller already verified the container through the loader path — this
@@ -91,7 +109,6 @@ pub fn cuda_scheduler(
         prefill_chunk_tokens: shape.prefill_chunk,
         ..CudaLeafConfig::default()
     };
-    let max_sequence_tokens = leaf_config.max_context_tokens;
     let kv_pool_tokens = leaf_config.kv_pool_tokens;
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
@@ -123,14 +140,7 @@ pub fn cuda_scheduler(
     let capacity_pages = kv_pool.block_count() as u32;
 
     Ok(scheduler(
-        SchedulerConfig {
-            model: model_id,
-            kv_page_tokens: KV_PAGE_TOKENS,
-            max_sequence_tokens,
-            kv_capacity_pages: capacity_pages,
-            host_capacity_pages: capacity_pages,
-            ..SchedulerConfig::default()
-        },
+        scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
         model,
         eos,
     ))
@@ -152,6 +162,19 @@ mod tests {
             panic!("expected a runnable config");
         };
         assert_eq!(EngineShape::from(&config), EngineShape::default());
+    }
+
+    #[test]
+    fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
+        let shape = EngineShape {
+            prefill_chunk: 512,
+            max_context: 65_536,
+            kv_pool_tokens: 524_288,
+        };
+
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
+
+        assert_eq!(config.serving_chunk_tokens, 512);
     }
 
     struct StubLeaf;

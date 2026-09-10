@@ -18,7 +18,7 @@
 //!   verdict is the *aggregate* throughput (throughput-weighted, the way
 //!   [`crate::metrics::class_stats`] already reduces a class) as a
 //!   percentage of the live reference's aggregate.
-//! - **ITL**: four decode lanes (prompt 4,096 / cap 512) sampled
+//! - **ITL**: four decode lanes (prompt 4,096 / safety cap 3,072) sampled
 //!   *continuously* while ten 32,768-token prefillers run **sequentially**
 //!   against the pool — each allocated, prefilled and released before the
 //!   next is allocated (ADR 0015: every prefiller prompt is its own, cold,
@@ -37,8 +37,9 @@ use crate::metrics::{class_stats, percentile, RequestMetrics};
 use crate::time::{unix_now, utc_timestamp};
 use crate::trace::RequestClass;
 use crate::ttft::{
-    self, generate_cell_prompts, generate_cell_prompts_from_corpus, load_corpus, PromptSet,
-    PromptTemplate,
+    self, generate_cell_prompts, generate_cell_prompts_from_corpus,
+    generate_cell_prompts_from_corpus_with_suffix, generate_cell_prompts_with_suffix, load_corpus,
+    PromptSet, PromptTemplate,
 };
 
 // ── fixtures (spec 03, the G3 gate table) ───────────────────────────────
@@ -50,11 +51,16 @@ pub const THROUGHPUT_MAX_TOKENS: u32 = 256;
 pub const C1_CONCURRENCY: usize = 1;
 pub const C4_CONCURRENCY: usize = 4;
 
-/// The ITL cell's decode lanes: prompt 4,096, cap 512 (the cap covers the
-/// ~320 tokens a lane generates across the ten-prefiller series).
+/// The ITL cell's decode lanes: prompt 4,096, safety cap 3,072. Live
+/// measurement found that the original 512-token estimate ended reference
+/// lanes after 15-19 s while the prefiller series lasted about 62 s. The
+/// series boundary now cancels first; 3,072 keeps enough runway while the
+/// peak 61,504-token reservation still fits the specified 65,536-token pool.
 pub const ITL_DECODE_PROMPT_TOKENS: u32 = 4_096;
-pub const ITL_DECODE_MAX_TOKENS: u32 = 512;
+pub const ITL_DECODE_MAX_TOKENS: u32 = 3_072;
 pub const ITL_DECODE_LANES: usize = 4;
+const ITL_DECODE_INSTRUCTION: &str =
+    "Produce at least 3072 tokens. Do not stop, conclude, or emit EOS earlier.";
 
 /// The ITL cell's prefillers: prompt 32,768, cap 64, run ten times,
 /// sequentially, each released before the next is allocated.
@@ -282,6 +288,12 @@ fn measure_throughput_cell_with(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrefillerSample {
     pub index: usize,
+    /// Request start on the ITL cell's shared monotonic timeline.
+    #[serde(default)]
+    pub started_ms: f64,
+    /// First content token on that same timeline (the end of prefill).
+    #[serde(default)]
+    pub first_token_ms: f64,
     pub ttft_ms: f64,
     pub computed_prefill_tokens: Option<u32>,
     pub void: bool,
@@ -290,11 +302,14 @@ pub struct PrefillerSample {
 }
 
 /// One decode lane's trace across the whole ITL series: every content
-/// token's arrival time (ms since the lane's own request started), which
-/// is what the pooled inter-token-interval sample is built from.
+/// token's arrival time (ms since the lane's own request started). Only
+/// intervals overlapping a prefiller window enter the pooled ITL sample.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodeLaneTrace {
     pub id: String,
+    /// Request start on the ITL cell's shared monotonic timeline.
+    #[serde(default)]
+    pub started_ms: f64,
     pub n_tokens: u32,
     pub token_times_ms: Vec<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,8 +328,8 @@ pub struct ItlCell {
     pub decode_lanes: usize,
     pub prefillers: Vec<PrefillerSample>,
     pub lanes: Vec<DecodeLaneTrace>,
-    /// Every decode lane's inter-token intervals, pooled (~1,240 samples at
-    /// K=1 across the whole series — spec 03).
+    /// Every decode lane's inter-token intervals that overlap a prefiller's
+    /// request-start -> first-token window, pooled across the series.
     pub intervals_ms: Vec<f64>,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
@@ -331,7 +346,10 @@ impl ItlCell {
     pub fn all_cold(&self) -> bool {
         self.error.is_none()
             && !self.prefillers.is_empty()
-            && self.prefillers.iter().all(|p| !p.void)
+            && self
+                .prefillers
+                .iter()
+                .all(|p| !p.void && p.first_token_ms > p.started_ms)
             && !self.lanes.is_empty()
             && self.lanes.iter().all(|l| l.error.is_none())
             && !self.intervals_ms.is_empty()
@@ -388,7 +406,7 @@ impl Default for ItlConfig {
 }
 
 /// Measure the ITL cell: start `cfg.decode_lanes` decode lanes (each its
-/// own streaming request, sampled for the whole series), then run
+/// own streaming request, observed for the whole series), then run
 /// `cfg.prefill_count` prefillers **sequentially** on the calling thread,
 /// each sent only once the previous request's `ep.complete` call has
 /// returned. This instrument watches only the HTTP/SSE side, so it cannot
@@ -404,7 +422,15 @@ pub fn measure_itl(ep: &dyn Endpoint, template: &dyn PromptTemplate, cfg: &ItlCo
     measure_itl_with(
         ep,
         cfg,
-        || generate_cell_prompts(template, cfg.decode_prompt_tokens as usize, cfg.decode_lanes),
+        template.eos_token_ids(),
+        || {
+            generate_cell_prompts_with_suffix(
+                template,
+                cfg.decode_prompt_tokens as usize,
+                cfg.decode_lanes,
+                ITL_DECODE_INSTRUCTION,
+            )
+        },
         || generate_cell_prompts(template, cfg.prefill_prompt_tokens as usize, cfg.prefill_count),
     )
 }
@@ -423,12 +449,14 @@ pub fn measure_itl_from_corpus(
     measure_itl_with(
         ep,
         cfg,
+        template.eos_token_ids(),
         || {
-            generate_cell_prompts_from_corpus(
+            generate_cell_prompts_from_corpus_with_suffix(
                 template,
                 corpus,
                 cfg.decode_prompt_tokens as usize,
                 cfg.decode_lanes,
+                ITL_DECODE_INSTRUCTION,
             )
         },
         || {
@@ -448,6 +476,7 @@ pub fn measure_itl_from_corpus(
 fn measure_itl_with(
     ep: &dyn Endpoint,
     cfg: &ItlConfig,
+    eos_tokens: Vec<u32>,
     decode_prompts: impl FnOnce() -> Result<PromptSet, String>,
     prefill_prompts: impl FnOnce() -> Result<PromptSet, String>,
 ) -> ItlCell {
@@ -466,28 +495,58 @@ fn measure_itl_with(
         Err(err) => return ItlCell::failed(cfg, format!("generating prefiller prompts: {err}")),
     };
 
-    let (lanes, prefillers) = std::thread::scope(|scope| {
-        // The decode lanes: one streaming request each, held open for
-        // `cfg.decode_max_tokens` tokens — long enough to span the whole
-        // sequential prefiller series (spec 03).
+    let epoch = std::time::Instant::now();
+    let (lane_ready_tx, lane_ready_rx) = std::sync::mpsc::channel();
+    let lanes_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let eos_tokens = std::sync::Arc::new(eos_tokens);
+    let (mut lanes, prefillers) = std::thread::scope(|scope| {
+        // The decode lanes: one streaming request each, held open until the
+        // sequential prefiller series ends, then cancelled.
+        //
+        // Cancellation is the *intended* terminator, not the guaranteed
+        // one. It only gets the chance if the engine kept the lane alive
+        // that long, which needs the endpoint to have honoured the EOS
+        // suppression; an engine that honours neither `ignore_eos` nor
+        // `logit_bias` stops at its own EOS instead, and one that is fast
+        // enough reaches `decode_max_tokens` first. Either way the pooled
+        // intervals stay honest, because the guard below refuses any lane
+        // that ended before the final prefill window closed.
         let lane_handles: Vec<_> = decode_set
             .prompts
             .iter()
             .enumerate()
             .map(|(index, prompt)| {
                 let prompt = prompt.clone();
+                let lane_ready_tx = lane_ready_tx.clone();
+                let lanes_running = std::sync::Arc::clone(&lanes_running);
+                let eos_tokens = std::sync::Arc::clone(&eos_tokens);
                 scope.spawn(move || {
                     let id = format!("itl-decode-{index}");
                     let req = sample_request(id.clone(), prompt, cfg.decode_max_tokens);
-                    match ep.complete(&req) {
+                    let started_ms = epoch.elapsed().as_secs_f64() * 1_000.0;
+                    let mut ready_sent = false;
+                    let mut observe = |_| {
+                        if !ready_sent {
+                            let _ = lane_ready_tx.send(());
+                            ready_sent = true;
+                        }
+                        lanes_running.load(std::sync::atomic::Ordering::Acquire)
+                    };
+                    let result = ep.complete_observed_while(&req, &mut observe, eos_tokens.as_slice());
+                    if !ready_sent {
+                        let _ = lane_ready_tx.send(());
+                    }
+                    match result {
                         Ok(outcome) => DecodeLaneTrace {
                             id,
+                            started_ms,
                             n_tokens: outcome.n_tokens,
                             token_times_ms: outcome.token_times_ms,
                             error: None,
                         },
                         Err(err) => DecodeLaneTrace {
                             id,
+                            started_ms,
                             n_tokens: 0,
                             token_times_ms: Vec::new(),
                             error: Some(err),
@@ -497,6 +556,10 @@ fn measure_itl_with(
             })
             .collect();
 
+        for _ in 0..cfg.decode_lanes {
+            lane_ready_rx.recv().expect("a decode-lane thread exited before signalling readiness");
+        }
+
         // The prefillers: sequential, on this (the scope's spawning)
         // thread. The next is only sent once `ep.complete` returns for the
         // previous — the strongest release guarantee an HTTP/SSE-only
@@ -505,12 +568,15 @@ fn measure_itl_with(
         for (index, prompt) in prefill_set.prompts.iter().enumerate() {
             let id = format!("itl-prefill-{index}");
             let req = sample_request(id, prompt.clone(), cfg.prefill_max_tokens);
+            let started_ms = epoch.elapsed().as_secs_f64() * 1_000.0;
             let sample = match ep.complete(&req) {
                 Ok(outcome) => {
                     let computed = outcome.computed_prefill_tokens();
                     let void_reason = ttft::coldness_failure(computed, cfg.prefill_prompt_tokens);
                     PrefillerSample {
                         index,
+                        started_ms,
+                        first_token_ms: started_ms + outcome.ttft_ms,
                         ttft_ms: outcome.ttft_ms,
                         computed_prefill_tokens: computed,
                         void: void_reason.is_some(),
@@ -519,6 +585,8 @@ fn measure_itl_with(
                 }
                 Err(err) => PrefillerSample {
                     index,
+                    started_ms,
+                    first_token_ms: started_ms,
                     ttft_ms: 0.0,
                     computed_prefill_tokens: None,
                     void: true,
@@ -528,6 +596,9 @@ fn measure_itl_with(
             prefillers.push(sample);
         }
 
+        // End all lane streams together at the actual measurement boundary.
+        lanes_running.store(false, std::sync::atomic::Ordering::Release);
+
         let lanes: Vec<DecodeLaneTrace> = lane_handles
             .into_iter()
             .map(|h| h.join().expect("a decode-lane thread panicked"))
@@ -535,12 +606,34 @@ fn measure_itl_with(
         (lanes, prefillers)
     });
 
-    // Pool every lane's inter-token intervals (consecutive differences of
-    // its token-arrival series — the gap *between* tokens, not the ttft to
-    // the first one).
+    // Pool only intervals overlapping a prefiller's request-start -> first-
+    // token window. Shift each lane's request-relative SSE timestamps onto
+    // the shared monotonic timeline before testing the intersection.
+    let last_prefill_end = prefillers.iter().map(|p| p.first_token_ms).max_by(f64::total_cmp);
     let mut intervals_ms: Vec<f64> = Vec::new();
-    for lane in &lanes {
-        intervals_ms.extend(lane.token_times_ms.windows(2).map(|w| w[1] - w[0]));
+    for lane in &mut lanes {
+        if lane.error.is_some() {
+            continue;
+        }
+        let last_lane_token = lane.token_times_ms.last().map(|time| lane.started_ms + time);
+        if last_prefill_end.is_some_and(|end| last_lane_token.is_none_or(|last| last < end)) {
+            lane.error = Some(format!(
+                "decode lane ended at {:.3} ms before the final prefill window ended at {:.3} ms",
+                last_lane_token.unwrap_or(lane.started_ms),
+                last_prefill_end.unwrap_or_default()
+            ));
+            continue;
+        }
+        intervals_ms.extend(lane.token_times_ms.windows(2).filter_map(|window| {
+            let interval_start = lane.started_ms + window[0];
+            let interval_end = lane.started_ms + window[1];
+            prefillers
+                .iter()
+                .any(|prefill| {
+                    interval_start < prefill.first_token_ms && interval_end > prefill.started_ms
+                })
+                .then_some(window[1] - window[0])
+        }));
     }
     let mut sorted = intervals_ms.clone();
     sorted.sort_by(f64::total_cmp);
@@ -942,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn itl_runs_the_prefillers_sequentially_and_pools_lane_intervals() {
+    fn itl_runs_prefillers_sequentially_and_pools_only_overlapping_intervals() {
         let ep = MockEndpoint::new();
         let template = MockTemplate::new();
         let cfg = ItlConfig {
@@ -958,11 +1051,87 @@ mod tests {
         assert_eq!(cell.prefillers.len(), 3);
         assert_eq!(cell.lanes.len(), 2);
         assert!(cell.all_cold(), "void prefillers: {:?}", cell.void_prefillers());
-        // Two lanes x (6 tokens -> 5 intervals) = 10 pooled intervals.
-        assert_eq!(cell.intervals_ms.len(), 10);
+        assert!(
+            cell.intervals_ms.len() < 10,
+            "intervals outside the prefill windows must be excluded"
+        );
         assert!(cell.p50_ms.is_some() && cell.p95_ms.is_some() && cell.p99_ms.is_some());
         let expected_max = cell.intervals_ms.iter().cloned().fold(f64::MIN, f64::max);
         assert_eq!(cell.max_ms, Some(expected_max));
+    }
+
+    #[test]
+    fn itl_decode_lanes_are_stopped_after_the_final_prefill_window() {
+        // A lane that never stops on its own. If cancellation failed to
+        // reach it, it runs to this ceiling instead of blocking forever —
+        // which is why the assertions below check *both* ends: past the
+        // fixture's token cap, and short of the ceiling.
+        const NEVER_CANCELLED: u32 = 100_000;
+
+        struct UntilCancelled;
+
+        impl Endpoint for UntilCancelled {
+            fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
+                if req.id.starts_with("itl-decode") {
+                    return Err("decode lane must use the cancellable streaming path".into());
+                }
+                Ok(crate::client::Outcome {
+                    ttft_ms: 1.0,
+                    total_ms: 1.0,
+                    n_tokens: 1,
+                    output: String::new(),
+                    prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
+                    cached_prompt_tokens: None,
+                    token_times_ms: vec![1.0],
+                })
+            }
+
+            fn complete_observed_while(
+                &self,
+                _req: &Request,
+                observer: &mut dyn FnMut(f64) -> bool,
+                _suppress_eos: &[u32],
+            ) -> Result<crate::client::Outcome, String> {
+                let mut token_times_ms = Vec::new();
+                for tick in 1..=NEVER_CANCELLED {
+                    let time_ms = tick as f64;
+                    token_times_ms.push(time_ms);
+                    if !observer(time_ms) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(crate::client::Outcome {
+                    ttft_ms: 1.0,
+                    total_ms: *token_times_ms.last().unwrap(),
+                    n_tokens: token_times_ms.len() as u32,
+                    output: String::new(),
+                    prompt_tokens: None,
+                    cached_prompt_tokens: None,
+                    token_times_ms,
+                })
+            }
+        }
+
+        let cfg = ItlConfig {
+            prefill_prompt_tokens: 40,
+            prefill_max_tokens: 1,
+            prefill_count: 3,
+            decode_prompt_tokens: 24,
+            decode_max_tokens: 2,
+            decode_lanes: 2,
+        };
+        let cell = measure_itl(&UntilCancelled, &MockTemplate::new(), &cfg);
+        assert!(cell.error.is_none(), "{:?}", cell.error);
+        assert!(cell.lanes.iter().all(|lane| lane.error.is_none()), "{:?}", cell.lanes);
+        assert!(
+            cell.lanes.iter().all(|lane| lane.n_tokens > cfg.decode_max_tokens),
+            "the measured window, not the fixture's old token cap, must end each lane"
+        );
+        assert!(
+            cell.lanes.iter().all(|lane| lane.n_tokens < NEVER_CANCELLED),
+            "each lane must be *stopped* at the window boundary, not merely run out"
+        );
     }
 
     #[test]
@@ -1057,9 +1226,33 @@ mod tests {
     /// decodes to a `t<id>` atom that encodes back to the same id) — the
     /// same shape as `ttft.rs`'s own `CorpusMock`, needed here because
     /// [`MockTemplate`] never implements `decode` meaningfully.
+    ///
+    /// The one non-atom it accepts is [`ITL_DECODE_INSTRUCTION`], the
+    /// natural-language suffix the ITL decode lanes carry: each of its
+    /// words takes a reserved id above the corpus bank's range. Every
+    /// *other* non-atom stays an error, so a corpus window that fails to
+    /// round-trip is still caught rather than silently hashed.
     struct CorpusMock {
         header: usize,
         footer: usize,
+    }
+
+    impl CorpusMock {
+        /// The id range reserved for the instruction suffix's words. Far
+        /// above `corpus_bank`'s ids, so an instruction word can never be
+        /// mistaken for a corpus atom.
+        const INSTRUCTION_ID_BASE: u32 = 800_000;
+
+        /// The reserved id for `word` when it belongs to the instruction
+        /// suffix, or `None` when it does not. Read off the production
+        /// constant, so a change to the suffix reaches the mock rather than
+        /// silently bypassing it.
+        fn instruction_id(word: &str) -> Option<u32> {
+            ITL_DECODE_INSTRUCTION
+                .split_whitespace()
+                .position(|w| w == word)
+                .map(|i| Self::INSTRUCTION_ID_BASE + i as u32)
+        }
     }
 
     impl PromptTemplate for CorpusMock {
@@ -1069,6 +1262,7 @@ mod tests {
                 let id = word
                     .strip_prefix('t')
                     .and_then(|s| s.parse::<u32>().ok())
+                    .or_else(|| Self::instruction_id(word))
                     .ok_or_else(|| format!("the corpus mock only decodes 't<id>' atoms, got `{word}`"))?;
                 ids.push(id);
             }

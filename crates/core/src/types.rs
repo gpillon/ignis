@@ -76,6 +76,9 @@ pub struct DecodeParams {
     pub frequency_penalty: f32,
     /// Sampling seed (fixed for reproducibility / the self-check).
     pub seed: u64,
+    /// Keep decoding when the model emits its EOS token. This is reserved
+    /// for bounded measurement streams that are cancelled by their window.
+    pub ignore_eos: bool,
 }
 
 impl Default for DecodeParams {
@@ -88,6 +91,7 @@ impl Default for DecodeParams {
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             seed: 0,
+            ignore_eos: false,
         }
     }
 }

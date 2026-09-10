@@ -130,6 +130,7 @@ fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
         presence_penalty: 0.4,
         frequency_penalty: -0.4,
         seed: 9,
+        ignore_eos: false,
     };
     sched
         .submit(

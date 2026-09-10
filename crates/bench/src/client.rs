@@ -102,6 +102,55 @@ pub trait Endpoint: Send + Sync {
     /// Send one request and return its outcome. Returns a human-readable error
     /// string on failure (the driver records a failed request, not a panic).
     fn complete(&self, req: &Request) -> Result<Outcome, String>;
+
+    /// Complete a request while reporting each content-token arrival, with
+    /// no way to stop early. A convenience wrapper over
+    /// [`Endpoint::complete_observed_while`] — override *that* method, not
+    /// this one, so a streaming transport's observers run as chunks arrive
+    /// rather than after completion.
+    fn complete_observed(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64),
+    ) -> Result<Outcome, String> {
+        self.complete_observed_while(
+            req,
+            &mut |time_ms| {
+                observer(time_ms);
+                true
+            },
+            &[],
+        )
+    }
+
+    /// Stream a request while `observer` wants more tokens. Returning
+    /// `false` stops reading the response immediately; HTTP transports
+    /// thereby cancel the server-side generation by dropping the body.
+    ///
+    /// `suppress_eos` names the token ids a measurement lane must not stop
+    /// on (see [`request_body_suppressing_eos`]). It is a *request* the
+    /// endpoint may be unable to grant: this default ignores it, and even
+    /// the HTTP endpoint can only pass it on — an engine that honours
+    /// neither `ignore_eos` nor `logit_bias` still stops at its own EOS.
+    /// A caller that depends on a lane outliving EOS must check the lane's
+    /// token count rather than assume the request was honoured.
+    fn complete_observed_while(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64) -> bool,
+        suppress_eos: &[u32],
+    ) -> Result<Outcome, String> {
+        // No streaming transport here, so there is no request body to carry
+        // the suppression onto the wire.
+        let _ = suppress_eos;
+        let outcome = self.complete(req)?;
+        for &time_ms in &outcome.token_times_ms {
+            if !observer(time_ms) {
+                break;
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 /// A mock endpoint for tests: returns canned outcomes in order and records the
@@ -251,6 +300,19 @@ fn request_body(req: &Request) -> serde_json::Value {
     body
 }
 
+fn request_body_suppressing_eos(req: &Request, eos: &[u32]) -> serde_json::Value {
+    let mut body = request_body(req);
+    if !eos.is_empty() {
+        body["ignore_eos"] = serde_json::json!(true);
+        body["logit_bias"] = serde_json::Value::Object(
+            eos.iter()
+                .map(|id| (id.to_string(), serde_json::json!(-100.0)))
+                .collect(),
+        );
+    }
+    body
+}
+
 /// The `usage` figures the TTFT instrument reads back: the prompt tokens
 /// the engine counted, and how many of them it served from a prefix cache
 /// (OpenAI's `prompt_tokens_details.cached_tokens`, which the reference
@@ -275,13 +337,22 @@ impl Usage {
 
 impl Endpoint for HttpEndpoint {
     fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        self.complete_observed(req, &mut |_| {})
+    }
+
+    fn complete_observed_while(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64) -> bool,
+        suppress_eos: &[u32],
+    ) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         // The trace line's prompt becomes a single user message (the trace
         // format is prompt-based; the shared "system + tools" prefix is
         // carried inside the prompt text). `temperature: 0` + `seed: 0` pin
         // the greedy + fixed-seed contract of the v1 gate (ADR 0007 — the
         // server's defaults, sent explicitly).
-        let body = request_body(req);
+        let body = request_body_suppressing_eos(req, suppress_eos);
         let start = Instant::now();
         let resp = self
             .client
@@ -295,7 +366,7 @@ impl Endpoint for HttpEndpoint {
             return Err(format!("POST {url} -> {status}: {detail}"));
         }
         if req.stream {
-            self.read_sse(resp, start)
+            self.read_sse(resp, start, observer)
         } else {
             self.read_json(resp, start)
         }
@@ -336,7 +407,12 @@ impl HttpEndpoint {
     /// content chunk per token (a token's delta), a finish chunk (an empty
     /// delta + `finish_reason`), a terminal `[DONE]` marker. ttft is the
     /// first content chunk; the token count is the non-empty deltas.
-    fn read_sse(&self, resp: Response, start: Instant) -> Result<Outcome, String> {
+    fn read_sse(
+        &self,
+        resp: Response,
+        start: Instant,
+        observer: &mut dyn FnMut(f64) -> bool,
+    ) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let reader = std::io::BufReader::new(resp);
         let mut n_tokens: u32 = 0;
@@ -384,6 +460,9 @@ impl HttpEndpoint {
                 token_times_ms.push(now_ms);
                 output.push_str(delta);
                 n_tokens += 1;
+                if !observer(now_ms) {
+                    break;
+                }
             }
         }
         let total_ms = ms_since(start);
@@ -548,6 +627,23 @@ mod tests {
             enable_thinking: Some(false),
         };
         assert_eq!(request_body(&req)["enable_thinking"], false);
+    }
+
+    #[test]
+    fn a_measurement_lane_suppresses_the_artifacts_eos_on_both_engines() {
+        let req = Request {
+            id: "itl-decode-0".into(),
+            class: RequestClass::Main,
+            prompt: "p".into(),
+            max_tokens: 3_072,
+            stream: true,
+            include_usage: true,
+            enable_thinking: Some(false),
+        };
+        let body = request_body_suppressing_eos(&req, &[151_645, 151_643]);
+        assert_eq!(body["ignore_eos"], true, "Ignis control");
+        assert_eq!(body["logit_bias"]["151645"], -100.0, "reference control");
+        assert_eq!(body["logit_bias"]["151643"], -100.0, "every reference EOS");
     }
 
     #[test]

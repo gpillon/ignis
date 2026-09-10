@@ -1,0 +1,42 @@
+{
+  "session": "g3-110-window-cancel-v3",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b",
+  "reference_engine": "qwen3.8-27b-nvfp4full-v2",
+  "ours_profile": "BF16 KV, 1024 chunk, CUDA graphs, K=1",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, CUDA graphs, prefix reuse",
+  "ours_date": "2026-09-10T11:51:40Z",
+  "reference_date": "2026-09-10T11:45:44Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 68.29178441815387,
+    "reference_tok_s": 62.00682429391943,
+    "ratio": 1.101359168056132,
+    "passed": true
+  },
+  "c4": {
+    "ours_tok_s": 19.74859128470126,
+    "reference_tok_s": 13.048194899669387,
+    "ratio": 1.513511365867293,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 184.31530000000203,
+    "ours_p95_ms": 222.45944499999496,
+    "ours_p99_ms": 241.4084370000029,
+    "ours_max_ms": 293.0503000000026,
+    "reference_p50_ms": 133.98510000000533,
+    "reference_p95_ms": 201.1100199999928,
+    "reference_p99_ms": 217.68689600000098,
+    "reference_max_ms": 225.86160000000018,
+    "ratio": 1.1061579378292683,
+    "passed": false
+  },
+  "notes": [
+    "Issue #110 live/live exact fixture with cancellable ITL lanes and 4096-token guarded prompts"
+  ],
+  "passed": false
+}

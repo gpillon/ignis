@@ -50,15 +50,21 @@ pub type EventStream = UnboundedReceiver<SchedEvent>;
 /// A request's event route (the engine's side of its stream).
 pub type EventRoute = UnboundedSender<SchedEvent>;
 
-/// A command sent from the async/HTTP side to the model thread. `submit` is
-/// the only one today (design §"the command channel") — `model_id` is
-/// static, cloneable state on the `Engine` handle, and `is_idle` never left
-/// the model thread's own loop.
+/// A command sent from the async/HTTP side to the model thread: `submit`
+/// (design §"the command channel") and `cancel`, the two operations that
+/// must reach the scheduler the model thread owns. `model_id` is static,
+/// cloneable state on the `Engine` handle, and `is_idle` never left the
+/// model thread's own loop.
 enum Command {
     Submit {
         input: RequestInput,
         class: RequestClass,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
+    },
+    /// Abort an in-flight request (its HTTP client disconnected). No
+    /// reply channel: the caller is a `Drop` impl with nothing to await.
+    Cancel {
+        request: RequestId,
     },
 }
 
@@ -225,6 +231,12 @@ impl Engine {
             .await
             .expect("the model thread replies to every submit before it can exit")
     }
+
+    /// Ask the model thread to abort an in-flight request. This is
+    /// fire-and-forget so an HTTP response body's `Drop` can call it.
+    pub fn cancel(&self, request: RequestId) {
+        let _ = self.commands.send(Command::Cancel { request });
+    }
 }
 
 /// The model thread's loop (GitHub #69): drains every queued command
@@ -290,6 +302,11 @@ fn handle_command(
             });
             // A dropped receiver (the caller gave up) is not an error here.
             let _ = reply.send(result);
+        }
+        Command::Cancel { request } => {
+            if scheduler.cancel(request) {
+                streams.remove(&request);
+            }
         }
     }
 }
@@ -548,6 +565,9 @@ mod tests {
             self.submitted = true;
             Ok(Self::ID)
         }
+        fn cancel(&mut self, _request: RequestId) -> bool {
+            false
+        }
         fn advance(&mut self) -> Vec<SchedEvent> {
             if self.emitted {
                 return Vec::new();
@@ -604,6 +624,9 @@ mod tests {
         ) -> Result<RequestId, SubmitError> {
             self.submitted = true;
             Ok(ProtectedBatchScheduler::ID)
+        }
+        fn cancel(&mut self, _request: RequestId) -> bool {
+            false
         }
         fn advance(&mut self) -> Vec<SchedEvent> {
             if self.emitted {
