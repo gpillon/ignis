@@ -11,8 +11,9 @@ use ignis_core::{
     mock::MockCompute, ConcreteScheduler, DecodeParams, RequestClass, RequestInput,
     SchedulerConfig,
 };
+use ignis_logging::MemorySink;
 use ignis_server::engine::{collect_tokens, Engine};
-use ignis_server::telemetry::{FixedClock, MemorySink};
+use ignis_server::telemetry::FixedClock;
 
 // The telemetry consumer runs as a separate async task off the model thread
 // (GitHub #69) — `nudge()` gives it a few scheduling turns to drain

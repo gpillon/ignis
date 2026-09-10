@@ -62,12 +62,13 @@ use ignis_core::{
     mock::MockCompute,
     Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
 };
+use ignis_logging::{FileSink, LineSink, StdoutSink};
 use ignis_server::{
     config::{self, Config, ConfigOutcome},
     engine::Engine,
     loader,
     template::SimpleTemplateProvider,
-    telemetry::{FileSink, StdoutSink, SystemClock, TelemetrySink},
+    telemetry::SystemClock,
     thinking::{self, ThinkingDefaults},
     Server,
 };
@@ -205,7 +206,7 @@ async fn main() {
     // The telemetry sink (server-02, design §5): a JSONL file named by
     // `--telemetry`/`IGNIS_TELEMETRY`, or stdout by default. One compact
     // line per event.
-    let telemetry_sink: Arc<dyn TelemetrySink> = match &telemetry {
+    let telemetry_sink: Arc<dyn LineSink> = match &telemetry {
         None => Arc::new(StdoutSink),
         Some(path) => match FileSink::open(path) {
             Ok(file) => {
