@@ -157,14 +157,18 @@ const char *ignis_step_last_error(void);
 /* Runtime counters for the real program entry points.  `kernel_count` is
  * the number of program-layer dispatches in the latest step: the leaf's
  * stable, graph-independent dispatch counter, unaffected by whether that
- * step replayed a graph. `graph_launches` (P3-05, GitHub #102) is the
- * number of `cudaGraphLaunch` calls the most recent `ignis_program_decode`
- * call made -- 1 when it replayed a captured decode graph, 0 when it ran
- * the eager per-lane loop (including every `ignis_program_prefill` call,
- * which never replays a graph). `decode_graph_ready_mask` has bit (w-1) set
- * when a decode graph for exact width w (1..IGNIS_DECODE_MAX_BATCH) is
- * captured and replayable; a clear bit means that width always falls back
- * to eager. */
+ * step replayed a graph. For a decode round that is the model's layer
+ * count, at every batch width and on either path (P3-06, GitHub #111: the
+ * round is one batch-wide traversal, so its dispatch count no longer scales
+ * with the width -- it did before, one complete traversal per lane).
+ * `graph_launches` (P3-05, GitHub #102) is the number of `cudaGraphLaunch`
+ * calls the most recent `ignis_program_decode` call made -- 1 when it
+ * replayed a captured decode graph, 0 when it enqueued the same traversal
+ * directly (including every `ignis_program_prefill` call, which never
+ * replays a graph). `decode_graph_ready_mask` has bit (w-1) set when a
+ * decode graph for exact width w (1..IGNIS_DECODE_MAX_BATCH) is captured
+ * and replayable; a clear bit means that width always falls back to
+ * eager. */
 struct ignis_program_stats {
   uint64_t vram_bytes;
   uint64_t last_step_micros;

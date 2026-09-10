@@ -273,20 +273,26 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
   }
 }
 
-// P3-05 (GitHub #102, ADR 0019): the graph-safe counterpart of
-// `run_gdn_layer` for one decode lane (T=1 always). `causal_conv1d_silu_snapshot`
-// / `gated_delta_net_snapshot` replace the direct `conv_slot`/`recurrent_slot`
-// calls: both read the pool slot to update from `model->decode_graph_slots +
-// lane` (device memory, this round's real value at replay time) instead of a
-// host `slot` int baked at capture time, and both write back to that same
-// slot in place (`snapshot_base_slots == initial_state_slots`). `ssm_states`
-// / `conv_states` span the whole pool (every slot, fixed address) rather
-// than one sequence's own view -- see layer_internal.h's declaration and ADR
-// 0019.
+// P3-06 (GitHub #111): the graph-safe counterpart of `run_gdn_layer` for a
+// whole decode round -- `width` lanes at one token each, traversed once as a
+// [.., width] batch rather than `width` times at batch 1.
+// `causal_conv1d_silu_snapshot` / `gated_delta_net_snapshot` replace the
+// direct `conv_slot`/`recurrent_slot` calls: both read the pool slot to
+// update for row b from `model->decode_graph_slots[b]` (device memory, this
+// round's real value at replay time) instead of a host `slot` int baked at
+// capture time, and both write back to that same slot in place
+// (`snapshot_base_slots == initial_state_slots`), which is what keeps the
+// lanes' conv taps and recurrent states isolated inside one call.
+// `ssm_states` / `conv_states` span the whole pool (every slot, fixed
+// address) rather than one sequence's own view -- see layer_internal.h's
+// declaration and ADR 0019.
 int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                            uint32_t lane, void *in_residual, void *out_residual,
+                            uint32_t width, void *in_residual, void *out_residual,
                             uint32_t gdn_layer, LinearPolicyMode mode) {
-  constexpr std::int32_t T = 1;
+  // A decode round is exactly one token per lane: the batch's rows are the
+  // lanes, so the activation buffers below carry `T` == `width` columns and
+  // every snapshot op sees W=1 per row.
+  const auto T = static_cast<std::int32_t>(width);
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto stream = model->stream;
   const GdnLayerWeights &w = model->layers[layer].gdn;
@@ -327,10 +333,12 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                      {conv_channels, kIgnisGdnConvStateWidth, slot_count, 1});
     ninfer::Tensor ssm_states(pool->gdn_pool.recurrent_slot(gdn_layer, 0).data, ninfer::DType::FP32,
                               {head_dim, head_dim, value_heads, slot_count});
-    const ninfer::Tensor lane_slot(
-        static_cast<std::uint8_t *>(model->decode_graph_slots->p) +
-            static_cast<std::size_t>(lane) * sizeof(std::int32_t),
-        ninfer::DType::I32, {1, 1, 1, 1});
+    // This round's physical pool slot per lane, contiguous I32 [width]: both
+    // snapshot ops' `initial_state_slots` and `snapshot_base_slots`. The
+    // slots are distinct physical slots, so the ops' requirement that the
+    // rows' [base, base+W) reservations be disjoint holds by construction.
+    const ninfer::Tensor lane_slots(model->decode_graph_slots->p, ninfer::DType::I32,
+                                    {T, 1, 1, 1});
 
     const ninfer::Tensor in(in_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
 
@@ -343,13 +351,16 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     ninfer::ops::gdn_input_proj(h, w.query_key_value_z, qkv, zbuf,
                                 ignis_policy_for(w.query_key_value_z.qtype, mode),
                                 *model->decode_graph_scratch, stream);
-    // In-place snapshot form: this round's real physical slot (read from
-    // `lane_slot` at replay time) is both the window this reads and the
-    // window it writes back.
+    // In-place snapshot form: each row's real physical slot (read from
+    // `lane_slots` at replay time) is both the window that row reads and the
+    // window it writes back. `x`/`out` are [C,W,B] with W=1, which is the
+    // [conv_channels, width] buffer above viewed one column per lane.
     ninfer::Tensor conv_states_mut = conv_states;
-    ninfer::ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states_mut,
-                                             /*valid_columns=*/ninfer::Tensor{}, lane_slot,
-                                             lane_slot, qkv_conv, stream);
+    ninfer::Tensor qkv_rows = qkv.view({conv_channels, 1, T, 1});
+    ninfer::Tensor qkv_conv_rows = qkv_conv.view({conv_channels, 1, T, 1});
+    ninfer::ops::causal_conv1d_silu_snapshot(qkv_rows, conv_weight, conv_states_mut,
+                                             /*valid_columns=*/ninfer::Tensor{}, lane_slots,
+                                             lane_slots, qkv_conv_rows, stream);
 
     constexpr std::size_t kElemBytes = 2;
     auto copy_channel_range = [&](std::int32_t offset, std::int32_t width,
@@ -377,17 +388,20 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     ninfer::ops::gdn_gating_proj(h, w.a_b_projection, a_log, dt_bias, *model->decode_graph_scratch,
                                  g, beta, stream);
 
-    ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, T, 1});
+    // The snapshot form's [.., W, B] layout with W=1: one token per lane,
+    // `width` lanes -- the same contiguous buffers the projections above
+    // wrote, re-viewed with the batch on the last axis.
+    ninfer::Tensor recurrent_out = recurrent.view({head_dim, value_heads, 1, T});
     ninfer::ops::gated_delta_net_snapshot(
-        query.view({head_dim, qk_heads, T, 1}), key.view({head_dim, qk_heads, T, 1}),
-        value.view({head_dim, value_heads, T, 1}), g, beta, readout_scale, /*normalize_qk=*/true,
-        ssm_states, /*valid_columns=*/ninfer::Tensor{}, lane_slot, lane_slot, recurrent_out,
-        stream);
+        query.view({head_dim, qk_heads, 1, T}), key.view({head_dim, qk_heads, 1, T}),
+        value.view({head_dim, value_heads, 1, T}), g.view({value_heads, 1, T, 1}),
+        beta.view({value_heads, 1, T, 1}), readout_scale, /*normalize_qk=*/true, ssm_states,
+        /*valid_columns=*/ninfer::Tensor{}, lane_slots, lane_slots, recurrent_out, stream);
 
     const ninfer::Tensor gdn_norm =
         weight_tensor(w.norm, ninfer::DType::BF16, {head_dim, 1, 1, 1});
-    ninfer::Tensor gated_out = gated.view({head_dim, value_heads, T, 1});
-    ninfer::ops::gated_rmsnorm(recurrent_out, gdn_norm, zbuf.view({head_dim, value_heads, T, 1}),
+    ninfer::Tensor gated_out = gated.view({head_dim, value_heads, 1, T});
+    ninfer::ops::gated_rmsnorm(recurrent_out, gdn_norm, zbuf.view({head_dim, value_heads, 1, T}),
                                model->rms_norm_eps, gated_out, stream);
 
     ninfer::Tensor residual_view(out_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
@@ -487,12 +501,12 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
   return 0;
 }
 
-// P3-05 (GitHub #102, ADR 0019): validates and dispatches
-// `run_gdn_layer_graph` -- called once per GDN layer per lane while a decode
-// graph is being captured (`kernel/src/decode_graph.cu`), never during
-// replay.
+// P3-06 (GitHub #111): validates and dispatches `run_gdn_layer_graph` --
+// called once per GDN layer per decode round (not per lane) by
+// `kernel/src/decode_graph.cu`, either while a graph is being captured or
+// when the round runs eagerly at a width whose capture failed.
 int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                       uint32_t lane, const void *in_residual, void *out_residual,
+                                       uint32_t width, const void *in_residual, void *out_residual,
                                        LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
     set_error("ignis_gdn_layer_graph: null argument");
@@ -502,12 +516,13 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
     set_error("ignis_gdn_layer_graph: layer " + std::to_string(layer) + " is not a GDN layer");
     return -1;
   }
-  if (lane >= IGNIS_DECODE_MAX_BATCH) {
-    set_error("ignis_gdn_layer_graph: lane " + std::to_string(lane) + " exceeds IGNIS_DECODE_MAX_BATCH");
+  if (width == 0 || width > IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_gdn_layer_graph: width " + std::to_string(width) +
+              " is not in 1..IGNIS_DECODE_MAX_BATCH");
     return -1;
   }
   const uint32_t gdn_layer = layer - (layer + 1) / 4;
-  return run_gdn_layer_graph(model, pool, layer, lane, const_cast<void *>(in_residual), out_residual,
+  return run_gdn_layer_graph(model, pool, layer, width, const_cast<void *>(in_residual), out_residual,
                              gdn_layer, mode);
 }
 

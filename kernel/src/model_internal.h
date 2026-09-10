@@ -139,10 +139,6 @@ struct ignis_model {
   // buffer for both, since a physical slot is a physical slot) -- read by
   // the kernels at replay time, never baked at capture time (ADR 0019).
   std::unique_ptr<ninfer::DeviceBuffer> decode_graph_slots;
-  // A constant zero I32 scalar: `offset_i32_positions`'s `source` argument
-  // for RoPE's per-lane position (`positions[0] = 0 + sampling_decode_positions[lane]`),
-  // graph-safe where `fill_i32_positions`'s host-scalar `start` is not.
-  std::unique_ptr<ninfer::DeviceBuffer> decode_graph_zero;
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> decode_graph_exec{};
   std::array<bool, IGNIS_DECODE_MAX_BATCH> decode_graph_ready{};
   // Set by the most recent `ignis_program_decode` call: 1 if it replayed a

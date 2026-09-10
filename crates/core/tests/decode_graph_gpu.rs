@@ -1,8 +1,10 @@
 //! GPU integration coverage for P3-05's decode CUDA graphs (GitHub #102,
-//! ADR 0019): a decode graph replayed at exact batch width 1..=8 must emit
-//! the identical token stream the eager per-lane loop would have, and a
-//! prefill chunk run between two replays must not disturb a later replay's
-//! output.
+//! ADR 0019) and P3-06's batch-wide decode round (GitHub #111): a decode
+//! graph replayed at exact batch width 1..=8 must emit the identical token
+//! stream the same traversal run eagerly would have, a prefill chunk run
+//! between two replays must not disturb a later replay's output, the round
+//! must traverse the model once whatever its width, and which row of the
+//! round a sequence occupies must not change what it generates.
 //!
 //! Graph capture is triggered explicitly (`step::capture_decode_graphs`),
 //! not automatically on model load, so an "eager" run is simply a pool that
@@ -37,6 +39,11 @@ use ignis_core::step::{
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 128;
 const ROUNDS: usize = 3;
+/// The Qwen 3.8 27B topology's decoder layer count -- what one traversal of
+/// the model dispatches, and therefore what a decode round of *any* width
+/// must report (GitHub #111). Before that ticket a width-B round reported
+/// `64 * B`, because it ran B complete per-lane forwards.
+const LAYERS: u64 = 64;
 
 fn new_pool(slot_count: u32) -> Result<SeqPool, String> {
     SeqPool::create(
@@ -83,8 +90,81 @@ fn run_width(model: &Model, width: usize) -> Vec<Vec<i32>> {
         let mut refs: Vec<&mut Seq<'_>> = sequences.iter_mut().collect();
         let round = decode_program_batch_sampled(model, &pool, &mut refs, &sampling)
             .unwrap_or_else(|e| panic!("decode: {e}"));
+        // GitHub #111's leaf instrumentation: the round's dispatch count is
+        // the layer count, not the layer count times the width -- one
+        // B-wide traversal of the model, not B batch-1 forwards. Checked on
+        // both paths, since `run_width` serves the eager and the graph run.
+        let stats = program_stats(model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+        assert_eq!(
+            stats.kernel_count, LAYERS,
+            "width {width}: a decode round traversed the model more than once"
+        );
         for (lane, tok) in round.into_iter().enumerate() {
             tokens[lane].push(tok);
+        }
+    }
+    tokens
+}
+
+/// Runs `width` sequences through prefill and `ROUNDS` shared decode rounds
+/// with the lanes presented to the round in `order`, and returns each lane's
+/// token stream keyed by its *prompt* (not by its row), so two runs that
+/// differ only in row order are directly comparable.
+///
+/// `order[row]` is the prompt index the round's row `row` carries. The
+/// sequences are still allocated in prompt order, so a permuted `order` also
+/// permutes which physical pool slot each row addresses -- which is the
+/// point: the round reads every per-sequence input (token id, position, pool
+/// slot) from device staging indexed by row, and a row/slot mix-up would
+/// show up here as a changed token stream rather than as a silent
+/// cross-contamination.
+///
+/// The pool is the caller's, and it must be the one the graphs were captured
+/// against: a captured graph holds the pool's KV planes, block-table matrix
+/// and GDN state planes at their capture-time addresses (ADR 0019), so
+/// replaying it against a pool allocated later reads freed memory. The
+/// sequences are released when this returns, so two calls can share one pool.
+fn run_width_in_order(
+    model: &Model,
+    pool: &SeqPool,
+    width: usize,
+    order: &[usize],
+) -> Vec<Vec<i32>> {
+    assert_eq!(order.len(), width, "order must name every row");
+    let mut sequences: Vec<Seq<'_>> = (0..width)
+        .map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}")))
+        .collect();
+    for (prompt, seq) in sequences.iter_mut().enumerate() {
+        prefill_program_sampled(
+            model,
+            pool,
+            seq,
+            &prompt_for(prompt),
+            0,
+            SamplingParams::greedy(),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("prefill prompt {prompt}: {e}"));
+    }
+    let sampling = vec![SamplingParams::greedy(); width];
+    let mut tokens = vec![Vec::with_capacity(ROUNDS); width];
+    for _ in 0..ROUNDS {
+        // `order` maps rows to sequences; the borrow checker needs the
+        // disjointness spelled out, so the refs are taken by index.
+        let mut remaining: Vec<Option<&mut Seq<'_>>> =
+            sequences.iter_mut().map(Some).collect();
+        let mut refs: Vec<&mut Seq<'_>> = Vec::with_capacity(width);
+        for &prompt in order {
+            refs.push(
+                remaining[prompt]
+                    .take()
+                    .expect("order must be a permutation: every prompt appears once"),
+            );
+        }
+        let round = decode_program_batch_sampled(model, pool, &mut refs, &sampling)
+            .unwrap_or_else(|e| panic!("decode: {e}"));
+        for (row, tok) in round.into_iter().enumerate() {
+            tokens[order[row]].push(tok);
         }
     }
     tokens
@@ -150,9 +230,37 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
 
         assert_eq!(
             eager, graph,
-            "width {width}: graph replay diverged from the eager per-lane loop"
+            "width {width}: graph replay diverged from the same traversal run eagerly"
         );
     }
+
+    // --- a lane's row in the round must not change what it generates -----
+    // GitHub #111 made the round one B-wide traversal, so every
+    // per-sequence input -- token id, absolute position, physical pool slot
+    // -- is read from device staging indexed by the row. Presenting the same
+    // four sequences in reverse row order must leave each one's token stream
+    // untouched: a row-to-slot mix-up, or one row reading another row's
+    // activations, changes it. This is the isolation property the per-lane
+    // loop used to get for free by construction.
+    const PERMUTED_WIDTH: usize = 4;
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+        .unwrap_or_else(|e| panic!("model load (row order): {e}"));
+    let row_order_pool =
+        new_pool(PERMUTED_WIDTH as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
+    let capture = capture_decode_graphs(&model, &row_order_pool)
+        .unwrap_or_else(|e| panic!("decode graph capture: {e}"));
+    assert!(
+        capture.is_ready(PERMUTED_WIDTH as u32),
+        "row-order run: width {PERMUTED_WIDTH} did not capture a decode graph"
+    );
+    let in_row_order = run_width_in_order(&model, &row_order_pool, PERMUTED_WIDTH, &[0, 1, 2, 3]);
+    let reversed_rows = run_width_in_order(&model, &row_order_pool, PERMUTED_WIDTH, &[3, 2, 1, 0]);
+    drop(row_order_pool);
+    drop(model);
+    assert_eq!(
+        in_row_order, reversed_rows,
+        "which row of the decode round a sequence occupies changed what it generated"
+    );
 
     // --- interleaving: a prefill chunk between two replays must not
     // disturb the second replay's output (ADR 0019) ------------------------

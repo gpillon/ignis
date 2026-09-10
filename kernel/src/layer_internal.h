@@ -127,37 +127,50 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
                                   uint32_t layer, const void *in_residual, void *out_residual,
                                   uint64_t num_tokens, LinearPolicyMode mode);
 
-// P3-05 (GitHub #102, ADR 0019): one GQA layer's body for a single decode
-// lane inside a captured (or capturing) decode graph. Unlike
-// `ignis_gqa_layer_run_body`, this takes no `ignis_seq*` -- every address it
-// touches is either fixed for the model's lifetime (weights,
-// `pool->kv_pool.block_tables()`, the pool-wide block-table matrix) or a
-// stable staging address `model` owns (`decode_graph_token_ids`,
-// `decode_graph_slots`, `sampling_decode_positions`), so the exact same
-// kernel launches are correct whether this call happens during capture (any
-// staged content) or during replay (this round's real content, refreshed by
-// the caller's H2D copy before `cudaGraphLaunch`). `lane` selects which
-// column of those staging buffers this call reads -- a capture-time-fixed
-// index, not a sequence identity. Scratch comes from
-// `model->decode_graph_scratch`, never `model->scratch` (ADR 0019: a
-// prefill chunk between two replays must not alias what a replay rereads).
-// The envelope is fixed at `model->max_context_tokens` (a safe
-// over-approximation every round, per the op's own "host launch-resource
-// promise" contract) rather than derived from any lane's actual position.
-// Returns 0 on success, -1 on a kernel/copy error (see
-// ignis_gqa_layer_last_error).
+// P3-06 (GitHub #111), superseding P3-05's per-lane form: one GQA layer's
+// body for a whole decode round of `width` lanes, one token each, as a
+// single [.., width] batch. Unlike `ignis_gqa_layer_run_body`, this takes no
+// `ignis_seq*` -- every address it touches is either fixed for the model's
+// lifetime (weights, `pool->kv_pool.block_tables()`, the pool-wide
+// block-table matrix) or a stable staging buffer `model` owns
+// (`decode_graph_token_ids`, `decode_graph_slots`,
+// `sampling_decode_positions`), each a contiguous [width] row-indexed
+// vector, so the exact same kernel launches are correct whether this call
+// happens during capture (any staged content), during replay, or when the
+// round runs eagerly (this round's real content, refreshed by the caller's
+// H2D copy either way). Scratch comes from `model->decode_graph_scratch`,
+// never `model->scratch` (ADR 0019: a prefill chunk between two replays
+// must not alias what a replay rereads). The envelope is fixed at
+// `model->max_context_tokens` (a safe over-approximation every round, per
+// the op's own "host launch-resource promise" contract) rather than derived
+// from any lane's actual position. Returns 0 on success, -1 on a
+// kernel/copy error (see ignis_gqa_layer_last_error).
 int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                       uint32_t lane, const void *in_residual, void *out_residual,
+                                       uint32_t width, const void *in_residual, void *out_residual,
                                        LinearPolicyMode mode);
 
 // The GDN counterpart of `ignis_gqa_layer_run_body_graph`: uses
 // `causal_conv1d_silu_snapshot` / `gated_delta_net_snapshot` with
-// `initial_state_slots == snapshot_base_slots == decode_graph_slots + lane`
-// (in-place update of the pool slot named by this round's staged value) in
+// `initial_state_slots == snapshot_base_slots == decode_graph_slots`
+// (in-place update of the pool slot each row's staged value names) in
 // place of `ignis_gdn_layer_run_body`'s direct `seq->slot`-addressed calls.
 int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                                       uint32_t lane, const void *in_residual, void *out_residual,
+                                       uint32_t width, const void *in_residual, void *out_residual,
                                        LinearPolicyMode mode);
+
+// P3-06 (GitHub #111): one decode round's whole forward pass -- embedding,
+// every decoder layer's graph-safe body once at `width`-wide batch, final
+// norm, output head -- enqueued on the model's stream, leaving the round's
+// `[vocab, width]` logits in `model->sampling_decode_logits` for the
+// caller's batched `ninfer::ops::sample`. Implemented in
+// kernel/src/decode_graph.cu; called both by graph capture there and by
+// `ignis_program_decode` (kernel/src/step.cu) for a round at a width whose
+// graph is not ready. Reads this round's per-lane token ids, positions and
+// pool slots from the staging buffers named above, which the caller
+// refreshes before the call. Returns 0 on success, -1 on a leaf/kernel
+// error (see `ignis_decode_graph_last_error`).
+int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
+                                     LinearPolicyMode mode);
 
 // The Qwen 3.8 topology's GQA layers sit at index 3, 7, 11, ... (every 4th);
 // this is the same relative-index formula `ignis_gqa_layer_step` and

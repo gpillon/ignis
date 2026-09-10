@@ -153,6 +153,13 @@ When output names a domain concept, use the term as defined here.
   and conv taps. Until the KV-RAM tier exists, a half-prefilled request can be
   paused but not evicted without losing the work — a limit of the tier, not of
   what a **chunk boundary** can capture (ADR 0018).
+- **Decode round** — one step for every decode-ready lane, run as a single
+  batch-wide traversal of the model: the lanes are the batch's rows at one
+  token each, so eight lanes stream the weights once rather than eight times.
+  Every per-sequence input — token id, absolute position, physical pool slot
+  — is read from device staging indexed by row, and that row indirection is
+  what keeps the lanes' KV pages, GDN slots and conv taps isolated inside the
+  one call (ADR 0020, which amends ADR 0019's per-lane round).
 - **Decode graph** — the CUDA graph replayed for a decode round, captured per
   **exact** batch width 1..8. Widths are never padded up to a captured one:
   the GDN slot traffic is per sequence (144 MiB each), so padding a width-1

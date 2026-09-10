@@ -332,73 +332,6 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
   }
 }
 
-// P3-03 (GitHub #99): the decode-round forward half of run_program_token
-// above -- embedding -> all decoder layers -> final norm -> output head --
-// stopping short of sampling. Instead of drawing a token, it copies this
-// sequence's BF16 logits (device-to-device, before the scratch scope that
-// owns them exits) into `logits_column`, one lane's column of the decode
-// round's shared `[vocab, batch_size]` staging buffer
-// (`model->sampling_decode_logits`), so `ignis_program_decode` can sample
-// every lane in the round with one `ninfer::ops::sample` call instead of one
-// call per lane. Returns 0 on success, -1 on a kernel/copy error.
-int32_t run_program_token_forward_only(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
-                                       int32_t token_id, LinearPolicyMode mode,
-                                       void *logits_column) {
-  const auto hidden = static_cast<std::int32_t>(model->hidden);
-  const auto vocab = static_cast<std::int32_t>(model->vocab);
-  ninfer::DeviceArena::Scope scope = model->scratch->scope();
-  try {
-    ninfer::Tensor ids = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
-    cudaError_t err = cudaMemcpyAsync(ids.data, &token_id, sizeof(token_id),
-                                      cudaMemcpyHostToDevice, model->stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(ids) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
-    }
-    ninfer::Tensor left = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::Tensor right = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
-
-    uint64_t dispatches = 0;
-    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
-      const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode)
-          : ignis_gdn_layer_step_mode(model, pool, seq, layer, left.data, right.data, 1, mode);
-      if (rc != 0) {
-        const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
-            ? ignis_gqa_layer_last_error()
-            : ignis_gdn_layer_last_error();
-        set_error("ignis_program_decode: layer " + std::to_string(layer) + " failed: " + detail);
-        return -1;
-      }
-      std::swap(left, right);
-      ++dispatches;
-    }
-
-    ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
-                               {hidden, 1, 1, 1});
-    ninfer::Tensor normalized = model->scratch->alloc(ninfer::DType::BF16, {hidden, 1, 1, 1});
-    ninfer::ops::rmsnorm(left, norm_weight, model->rms_norm_eps, /*unit_offset=*/true,
-                         normalized, model->stream);
-    ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
-    ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
-    err = cudaMemcpyAsync(logits_column, logits.data,
-                          static_cast<std::size_t>(vocab) * sizeof(std::uint16_t),
-                          cudaMemcpyDeviceToDevice, model->stream);
-    if (err != cudaSuccess) {
-      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(logits column) failed: ") +
-                cudaGetErrorString(err));
-      return -1;
-    }
-    model->last_step_kernel_count = dispatches;
-    return 0;
-  } catch (const std::exception &e) {
-    set_error(std::string("ignis_program_decode: ") + e.what());
-    return -1;
-  }
-}
-
 bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
                       const ignis_seq *seq, const int32_t *tokens, uint64_t count,
                       const ignis_sampling_params *sampling) {
@@ -714,16 +647,18 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   return 0;
 }
 
-// P3-03 (GitHub #99): one call over every decode-ready lane, each sampled
-// with its own `sampling[i]`. Every lane's forward pass runs first (still
-// one sequential per-sequence traversal each, `run_program_token_forward_only`
-// above -- this ticket does not fuse the layer bodies across sequences),
-// writing its logits into its own column of the round's shared
-// `[vocab, batch_size]` staging buffer; then one `ninfer::ops::sample` call
-// draws every lane's successor together. The round is atomic: no sequence's
-// `pending_token`/`position` advances unless every lane's forward pass and
-// the batched sample both succeed, so a mid-round failure never leaves one
-// lane's state ahead of another's.
+// P3-03 (GitHub #99) / P3-06 (GitHub #111): one call over every decode-ready
+// lane, each sampled with its own `sampling[i]`. The round is one `B`-wide
+// traversal of the model (`ignis_decode_graph_run_batch`,
+// kernel/src/decode_graph.cu) leaving `[vocab, batch_size]` logits in the
+// shared staging buffer, then one `ninfer::ops::sample` call drawing every
+// lane's successor together -- so eight lanes stream the weights once, not
+// eight times (requirement 17). #99's per-lane forward loop, which shared
+// only the sampling, is gone: it made the round's cost scale with the batch
+// (#111 measured B=4 at 4.81x its own B=1 round, against the reference's
+// 1.07x). The round is atomic: no sequence's `pending_token`/`position`
+// advances unless the traversal and the batched sample both succeed, so a
+// mid-round failure never leaves one lane's state ahead of another's.
 extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                                           struct ignis_seq_pool *pool,
                                           struct ignis_seq *const *sequences,
@@ -800,55 +735,50 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
 
-    uint64_t dispatches = 0;
+    // P3-06 (GitHub #111): the round's per-lane token ids and physical pool
+    // slots are staged for *both* paths -- the B-wide traversal reads them
+    // from device memory whether it is being replayed from a captured graph
+    // or enqueued directly, so there is no host-indexed variant left.
+    std::vector<std::int32_t> slots(batch_size, 0);
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      slots[i] = sequences[i]->slot;
+    }
+    err = cudaMemcpyAsync(model->decode_graph_token_ids->p, emitted.data(),
+                          batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph token ids) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    err = cudaMemcpyAsync(model->decode_graph_slots->p, slots.data(),
+                          batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph slots) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
     if (use_graph) {
-      std::vector<std::int32_t> slots(batch_size, 0);
-      for (uint64_t i = 0; i < batch_size; ++i) {
-        slots[i] = sequences[i]->slot;
-      }
-      err = cudaMemcpyAsync(model->decode_graph_token_ids->p, emitted.data(),
-                            batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                            model->stream);
-      if (err != cudaSuccess) {
-        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph token ids) failed: ") +
-                  cudaGetErrorString(err));
-        return -1;
-      }
-      err = cudaMemcpyAsync(model->decode_graph_slots->p, slots.data(),
-                            batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
-                            model->stream);
-      if (err != cudaSuccess) {
-        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(graph slots) failed: ") +
-                  cudaGetErrorString(err));
-        return -1;
-      }
       err = cudaGraphLaunch(model->decode_graph_exec[batch_size - 1], model->stream);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_program_decode: cudaGraphLaunch failed: ") +
                   cudaGetErrorString(err));
         return -1;
       }
-      // A replayed graph's kernel_count is whatever it captured, which this
-      // call does not separately track -- kernel_count stays meaningful for
-      // the eager path; graph_launches (below) is how a caller tells the
-      // two apart.
     } else {
-      for (uint64_t i = 0; i < batch_size; ++i) {
-        ignis_seq *seq = sequences[i];
-        void *column = static_cast<std::uint8_t *>(model->sampling_decode_logits->p) +
-            i * static_cast<std::size_t>(vocab) * sizeof(std::uint16_t);
-        // P2-03 (GitHub #85): decode takes the engine's own compute-policy
-        // mode (ADR 0016: the flat decode ABI has no options struct, so the
-        // `A16_ONLY` override is reachable only through the prefill entry
-        // point) -- every NVFP4 projection in the decode round runs under
-        // AllowA4, the reference's text-model policy.
-        if (run_program_token_forward_only(model, pool, seq, emitted[i],
-                                           LinearPolicyMode::kEngineDefault, column) != 0) {
-          return -1;
-        }
-        dispatches += model->last_step_kernel_count;
+      // The same op sequence the graph captured, enqueued directly. P2-03
+      // (GitHub #85): decode takes the engine's own compute-policy mode
+      // (ADR 0016: the flat decode ABI has no options struct, so the
+      // `A16_ONLY` override is reachable only through the prefill entry
+      // point) -- every NVFP4 projection in the decode round runs under
+      // AllowA4, the reference's text-model policy.
+      if (ignis_decode_graph_run_batch(model, pool, static_cast<uint32_t>(batch_size),
+                                       LinearPolicyMode::kEngineDefault) != 0) {
+        set_error(std::string("ignis_program_decode: ") + ignis_decode_graph_last_error());
+        return -1;
       }
-
       const ninfer::Tensor logits_tensor(model->sampling_decode_logits->p, ninfer::DType::BF16,
                                          {vocab, batch, 1, 1});
       ninfer::Tensor out_tensor(model->sampling_decode_out->p, ninfer::DType::I32, {batch, 1, 1, 1});
@@ -881,8 +811,27 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       out_token_ids[i] = emitted[i];
       sequences[i]->pending_token = successors[i];
       ++sequences[i]->position;
+      // Only once the synchronize above confirms the round's device work
+      // completed (mirrors `ignis_gqa_layer_step`'s own ordering, and the
+      // chunked prefill's). P3-06 (GitHub #111): both decode paths now read
+      // their RoPE/attention positions from `sampling_decode_positions`
+      // (staged from `seq->position`) rather than from this counter, but the
+      // counter still feeds the per-token prefill route and the layer
+      // bodies' KV-capacity check, so a decode round must keep it truthful.
+      // Before #111 the graph path left it behind by one per round, so a
+      // round that fell back to eager after a replay read a stale position.
+      for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+        if (model->layers[layer].kind == IGNIS_LAYER_GQA) {
+          ++sequences[i]->gqa_positions[ignis_gqa_relative_layer(layer)];
+        }
+      }
     }
-    model->last_step_kernel_count = dispatches;
+    // P3-06 (GitHub #111): one traversal of the model per round, whatever
+    // the batch width and whichever path ran it -- the dispatch count is the
+    // layer count, not the layer count times the width. This is the leaf
+    // instrumentation the issue's acceptance asks for: at B>1 it stays equal
+    // to the B=1 round's, where before it was B times it.
+    model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program_decode: ") + e.what());
@@ -915,7 +864,7 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_decode_positions->bytes + model->sampling_decode_out->bytes +
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
       model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
-      model->decode_graph_slots->bytes + model->decode_graph_zero->bytes;
+      model->decode_graph_slots->bytes;
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;

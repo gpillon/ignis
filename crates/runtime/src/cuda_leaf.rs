@@ -410,6 +410,10 @@ mod tests {
             presence_penalty: -0.5,
             frequency_penalty: 0.625,
             seed: u64::MAX,
+            // Not a sampling field the leaf sees: `ignore_eos` is the
+            // scheduler's own stop-condition switch, so `sampling_params`
+            // below must not carry it into `step::SamplingParams`.
+            ignore_eos: false,
         });
 
         assert_eq!(

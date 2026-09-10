@@ -314,56 +314,68 @@ std::size_t i32_bytes(int64_t elements) {
   return round_up_arena_align(static_cast<std::size_t>(elements) * 4);
 }
 
-// One GQA layer's peak scratch at `T` tokens (kernel/src/gqa_layer.cu's
-// `run_gqa_layer`): every plain activation buffer it allocates, plus the
-// attention / attn_input_proj / linear_add / linear_swiglu workspace
-// queries over [1, T].
+// One GQA layer's peak scratch at `T` tokens per row and `batch` rows
+// (kernel/src/gqa_layer.cu's `run_gqa_layer` at batch 1, its
+// `run_gqa_layer_graph` at T=1 and a decode round's width): every plain
+// activation buffer it allocates -- all of them `T * batch` columns wide --
+// plus the attention / attn_input_proj / linear_add / linear_swiglu
+// workspace queries. The attention query is per-row (`batch_size`, widths
+// over [1, T]); the projections see one matrix of `T * batch` columns and
+// are queried that way.
 std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLayerWeights &w,
-                                     std::int32_t T, uint32_t max_context_tokens) {
+                                     std::int32_t T, uint32_t max_context_tokens,
+                                     std::int32_t batch) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto q_width = static_cast<std::int32_t>(topology.num_q_heads * topology.head_dim);
   const auto kv_width = static_cast<std::int32_t>(topology.num_kv_heads * topology.head_dim);
   const auto ffn = static_cast<std::int32_t>(topology.ffn_intermediate);
   const auto q_heads = static_cast<std::int32_t>(topology.num_q_heads);
+  const std::int32_t columns = T * batch;
 
   std::size_t bytes = 0;
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * T);   // normalized
-  bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // query
-  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * T); // key
-  bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // gate
-  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * T); // value
-  bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // rotated_query
-  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * T); // rotated_key
-  bytes += i32_bytes(T);                                   // positions
-  bytes += i32_bytes(1);                                   // kv_table_rows (P2-04, GitHub #86)
-  bytes += bf16_bytes(static_cast<int64_t>(q_width) * T);  // attention
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * T);   // post
-  bytes += bf16_bytes(static_cast<int64_t>(ffn) * T);      // fused
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);   // normalized
+  bytes += bf16_bytes(static_cast<int64_t>(q_width) * columns);  // query
+  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * columns); // key
+  bytes += bf16_bytes(static_cast<int64_t>(q_width) * columns);  // gate
+  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * columns); // value
+  bytes += bf16_bytes(static_cast<int64_t>(q_width) * columns);  // rotated_query
+  bytes += bf16_bytes(static_cast<int64_t>(kv_width) * columns); // rotated_key
+  bytes += i32_bytes(columns);                                   // positions
+  bytes += i32_bytes(batch);                                     // kv_table_rows (P2-04, GitHub #86)
+  bytes += bf16_bytes(static_cast<int64_t>(q_width) * columns);  // attention
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);   // post
+  bytes += bf16_bytes(static_cast<int64_t>(ffn) * columns);      // fused
 
   const ninfer::ops::GqaExecutionEnvelope envelope{
       /*min_visible_keys=*/1, /*max_visible_keys=*/max_context_tokens};
   bytes += round_up_arena_align(ninfer::ops::gqa_attention_workspace_capacity_bytes(
-      q_heads, ninfer::DType::BF16, envelope, /*batch_size=*/1, /*min_width=*/1,
+      q_heads, ninfer::DType::BF16, envelope, /*batch_size=*/batch, /*min_width=*/1,
       /*max_width=*/T));
   bytes += round_up_arena_align(ninfer::ops::attn_input_proj_workspace_capacity_bytes(
       w.query_key_gate_value.qtype, w.query_key_gate_value.n, w.query_key_gate_value.k,
-      ignis_widest_linear_policy_for(w.query_key_gate_value.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.query_key_gate_value.qtype), 1, columns));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1, T));
+      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1,
+      columns));
   bytes += round_up_arena_align(ninfer::ops::linear_swiglu_workspace_capacity_bytes(
       w.mlp_gate_up.qtype, w.mlp_gate_up.n, w.mlp_gate_up.k,
-      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, columns));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype), 1, T));
+      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype),
+      1, columns));
   return bytes;
 }
 
-// One GDN layer's peak scratch at `T` tokens (kernel/src/gdn_layer.cu's
-// `run_gdn_layer`): every plain activation buffer it allocates, plus the
-// gdn_input_proj / gdn_gating_proj / gated_delta_net / linear_add /
-// linear_swiglu workspace queries over [1, T].
+// One GDN layer's peak scratch at `T` tokens per row and `batch` rows
+// (kernel/src/gdn_layer.cu's `run_gdn_layer` at batch 1, its
+// `run_gdn_layer_graph` at T=1 and a decode round's width): every plain
+// activation buffer it allocates -- all of them `T * batch` columns wide --
+// plus the gdn_input_proj / gdn_gating_proj / gated_delta_net / linear_add /
+// linear_swiglu workspace queries over that column count. The snapshot form
+// of the recurrence uses no arena at all, so its query is the conservative
+// one either way.
 std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLayerWeights &w,
-                                     std::int32_t T) {
+                                     std::int32_t T, std::int32_t batch) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto ffn = static_cast<std::int32_t>(topology.ffn_intermediate);
   const auto state_rows = static_cast<std::int32_t>(topology.gdn_state_rows);
@@ -374,56 +386,63 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
   const auto qk_width = (q_width + state_cols) / 2;
   const auto value_heads = value_width / static_cast<std::int32_t>(kGdnHeadDim);
   const auto qk_heads = qk_width / static_cast<std::int32_t>(kGdnHeadDim);
+  const std::int32_t columns = T * batch;
 
   std::size_t bytes = 0;
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * T);        // h
-  bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * T); // qkv
-  bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * T); // qkv_conv
-  bytes += bf16_bytes(static_cast<int64_t>(qk_width) * T);      // query
-  bytes += bf16_bytes(static_cast<int64_t>(qk_width) * T);      // key
-  bytes += bf16_bytes(static_cast<int64_t>(value_width) * T);   // value
-  bytes += bf16_bytes(static_cast<int64_t>(value_width) * T);   // zbuf
-  bytes += fp32_bytes(static_cast<int64_t>(value_heads) * T);   // g
-  bytes += fp32_bytes(static_cast<int64_t>(value_heads) * T);   // beta
-  bytes += bf16_bytes(static_cast<int64_t>(value_width) * T);   // recurrent
-  bytes += bf16_bytes(static_cast<int64_t>(value_width) * T);   // gated
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * T);        // post
-  bytes += bf16_bytes(static_cast<int64_t>(ffn) * T);           // fused
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);        // h
+  bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * columns); // qkv
+  bytes += bf16_bytes(static_cast<int64_t>(conv_channels) * columns); // qkv_conv
+  bytes += bf16_bytes(static_cast<int64_t>(qk_width) * columns);      // query
+  bytes += bf16_bytes(static_cast<int64_t>(qk_width) * columns);      // key
+  bytes += bf16_bytes(static_cast<int64_t>(value_width) * columns);   // value
+  bytes += bf16_bytes(static_cast<int64_t>(value_width) * columns);   // zbuf
+  bytes += fp32_bytes(static_cast<int64_t>(value_heads) * columns);   // g
+  bytes += fp32_bytes(static_cast<int64_t>(value_heads) * columns);   // beta
+  bytes += bf16_bytes(static_cast<int64_t>(value_width) * columns);   // recurrent
+  bytes += bf16_bytes(static_cast<int64_t>(value_width) * columns);   // gated
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);        // post
+  bytes += bf16_bytes(static_cast<int64_t>(ffn) * columns);           // fused
 
   bytes += round_up_arena_align(ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
       w.query_key_value_z.qtype, w.query_key_value_z.n, w.query_key_value_z.k,
-      ignis_widest_linear_policy_for(w.query_key_value_z.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.query_key_value_z.qtype), 1, columns));
   bytes += round_up_arena_align(
-      ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(value_heads, hidden, 1, T));
+      ninfer::ops::gdn_gating_proj_workspace_capacity_bytes(value_heads, hidden, 1, columns));
   bytes += round_up_arena_align(ninfer::ops::gated_delta_net_workspace_capacity_bytes(
-      qk_heads, value_heads, /*normalize_qk=*/true, 1, T));
+      qk_heads, value_heads, /*normalize_qk=*/true, 1, columns));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1, T));
+      w.output.qtype, w.output.n, w.output.k, ignis_widest_linear_policy_for(w.output.qtype), 1,
+      columns));
   bytes += round_up_arena_align(ninfer::ops::linear_swiglu_workspace_capacity_bytes(
       w.mlp_gate_up.qtype, w.mlp_gate_up.n, w.mlp_gate_up.k,
-      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, T));
+      ignis_widest_linear_policy_for(w.mlp_gate_up.qtype), 1, columns));
   bytes += round_up_arena_align(ninfer::ops::linear_add_workspace_capacity_bytes(
-      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype), 1, T));
+      w.mlp_down.qtype, w.mlp_down.n, w.mlp_down.k, ignis_widest_linear_policy_for(w.mlp_down.qtype),
+      1, columns));
   return bytes;
 }
 
-// The outer program scope's own allocations at `chunk` tokens
-// (kernel/src/step.cu's `run_program_token`): the per-chunk token-id
-// staging and residual pair (widened here so P2-02's chunk loop needs no
-// new allocation), plus the single-position final-norm / output-head /
-// argmax stage (only the span's last position feeds the output head,
-// GitHub #72 -- independent of the chunk width).
-std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int32_t chunk) {
+// The outer program scope's own allocations at `chunk` tokens per row and
+// `batch` rows (kernel/src/step.cu's `run_program_token` at batch 1;
+// kernel/src/decode_graph.cu's `ignis_decode_graph_run_batch` at chunk 1 and
+// a decode round's width): the token-id staging and residual pair (widened
+// here so P2-02's chunk loop needs no new allocation), plus the final-norm /
+// output-head / argmax stage. Prefill feeds only the span's last position to
+// the output head (GitHub #72), a decode round feeds one column per lane, so
+// that stage is sized by `batch` rather than by the whole column count.
+std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int32_t chunk,
+                                        std::int32_t batch) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto vocab = static_cast<std::int32_t>(topology.vocab);
+  const std::int32_t columns = chunk * batch;
 
   std::size_t bytes = 0;
-  bytes += i32_bytes(chunk);
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * chunk); // left
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * chunk); // right
-  bytes += bf16_bytes(hidden);                               // normalized
-  bytes += bf16_bytes(vocab);                                 // logits
-  bytes += i32_bytes(1);                                      // argmax_out
+  bytes += i32_bytes(columns);
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns); // left
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns); // right
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * batch);   // normalized
+  bytes += bf16_bytes(static_cast<int64_t>(vocab) * batch);    // logits
+  bytes += i32_bytes(1);                                       // argmax_out
   return bytes;
 }
 
@@ -432,15 +451,16 @@ std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int
 // sequentially, one nested scope at a time, so only one layer's scratch is
 // ever live alongside the outer scope's).
 std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_topology &topology,
-                                          std::int32_t chunk, uint32_t max_context_tokens) {
+                                          std::int32_t chunk, uint32_t max_context_tokens,
+                                          std::int32_t batch) {
   std::size_t layer_peak = 0;
   for (const auto &layer : model.layers) {
     const std::size_t layer_bytes = layer.kind == IGNIS_LAYER_GQA
-        ? gqa_layer_scratch_bytes(topology, layer.gqa, chunk, max_context_tokens)
-        : gdn_layer_scratch_bytes(topology, layer.gdn, chunk);
+        ? gqa_layer_scratch_bytes(topology, layer.gqa, chunk, max_context_tokens, batch)
+        : gdn_layer_scratch_bytes(topology, layer.gdn, chunk, batch);
     layer_peak = std::max(layer_peak, layer_bytes);
   }
-  return program_outer_scratch_bytes(topology, chunk) + layer_peak;
+  return program_outer_scratch_bytes(topology, chunk, batch) + layer_peak;
 }
 
 } // namespace
@@ -555,7 +575,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   std::size_t scratch_bytes = 0;
   try {
     scratch_bytes = compute_program_scratch_bytes(
-        *model, *topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens);
+        *model, *topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
+        /*batch=*/1);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: prefill scratch sizing failed: ") + e.what());
     cudaStreamDestroy(model->stream);
@@ -614,24 +635,24 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     return -1;
   }
 
-  // P3-05 (GitHub #102, ADR 0019): the decode graphs' own scratch (one
-  // lane's per-layer peak at T=1, mirroring `scratch`'s own sizing above at
-  // `prefill_chunk_tokens`) and staging buffers, reserved once here and
-  // never touched by prefill -- so a chunk running between two replays can
-  // never alias what a replay rereads. Capture itself
-  // (`ignis_decode_graph_capture`) happens later, once the sequence pool
-  // exists.
+  // P3-05 (GitHub #102, ADR 0019) / P3-06 (GitHub #111): the decode rounds'
+  // own scratch and staging buffers, reserved once here and never touched by
+  // prefill -- so a chunk running between two replays can never alias what a
+  // replay rereads. Sized for the widest round the leaf admits: one token
+  // per lane (`chunk=1`) across `IGNIS_DECODE_MAX_BATCH` lanes, since #111
+  // made a round one batch-wide traversal instead of a per-lane loop, and
+  // every width 1..IGNIS_DECODE_MAX_BATCH shares this one reservation.
+  // Capture itself (`ignis_decode_graph_capture`) happens later, once the
+  // sequence pool exists.
   try {
-    const std::size_t decode_graph_scratch_bytes =
-        compute_program_scratch_bytes(*model, *topology, /*chunk=*/1, max_context_tokens);
+    const std::size_t decode_graph_scratch_bytes = compute_program_scratch_bytes(
+        *model, *topology, /*chunk=*/1, max_context_tokens, /*batch=*/IGNIS_DECODE_MAX_BATCH);
     model->decode_graph_scratch =
         std::make_unique<ninfer::DeviceArena>(decode_graph_scratch_bytes);
     model->decode_graph_token_ids =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
     model->decode_graph_slots =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
-    model->decode_graph_zero = std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t));
-    model->decode_graph_zero->fill(0);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: decode graph buffer allocation failed: ") + e.what());
     cudaStreamDestroy(model->stream);

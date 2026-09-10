@@ -266,6 +266,16 @@ is not implemented: the width-W path replays W sequential per-lane model
 traversals and batches only the sampling (#111). Bringing the round to the
 reference's order puts the blocked interval near 136 ms against 158 ms.
 
+**Requirement 17 landed on 2026-09-10 (#111, ADR 0020).** A decode round is
+now one batch-wide traversal of the model at every exact width 1..8: the
+lanes are the batch's rows at one token each, every per-sequence input is
+read from device staging indexed by row, and the same traversal serves the
+captured graph and the eager fallback. The leaf reports it — a round's
+dispatch count is the layer count at every width, where it was the layer
+count times the width. #110's ITL p95 is to be remeasured live/live against
+this tree; the numbers in the table above are the pre-#111 baseline it must
+beat.
+
 This is not a KV-precision gap. The `BF16` / `hq-e8-2b` inequality ADR 0015
 records would act on prefill, and ignis wins prefill while carrying it. An
 earlier reading of these records deferred the p95 to phase 4 on that basis;
