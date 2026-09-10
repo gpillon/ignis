@@ -1,0 +1,40 @@
+{
+  "session": "g3-110-113-20260910",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b-nvfp4full-v2",
+  "reference_engine": "qwen3.8-27b-nvfp4full-v2",
+  "ours_profile": "BF16 KV, 1024 chunk, graphs, post-#111 B-wide decode",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-capacity 65536 explicit (comparable to ignis)",
+  "ours_date": "2026-09-10T21:52:39Z",
+  "reference_date": "2026-09-10T21:49:18Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 65.2977111671802,
+    "reference_tok_s": 64.85701190774739,
+    "ratio": 1.00679493622154,
+    "passed": true
+  },
+  "c4": {
+    "ours_tok_s": 43.67156100925584,
+    "reference_tok_s": 9.958213179884348,
+    "ratio": 4.385481634142224,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 151.16910000000053,
+    "ours_p95_ms": 194.40300000000207,
+    "ours_p99_ms": 200.0403400000072,
+    "ours_max_ms": 208.15560000000005,
+    "reference_p50_ms": 140.99104999999872,
+    "reference_p95_ms": 212.91349000000008,
+    "reference_p99_ms": 235.60722500000034,
+    "reference_max_ms": 261.49209999999584,
+    "ratio": 0.9130609807767558,
+    "passed": true
+  },
+  "notes": [],
+  "passed": true
+}

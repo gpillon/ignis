@@ -319,9 +319,30 @@ lanes are the batch's rows at one token each, every per-sequence input is
 read from device staging indexed by row, and the same traversal serves the
 captured graph and the eager fallback. The leaf reports it — a round's
 dispatch count is the layer count at every width, where it was the layer
-count times the width. #110's ITL p95 is to be remeasured live/live against
-this tree; the numbers in the table above are the pre-#111 baseline it must
-beat.
+count times the width. The numbers in the table above are the pre-#111
+baseline; the re-measurement below is what replaced them.
+
+**Re-measured live/live, ADR 0021 launch-pooled, same day: ITL p95 passes
+(GitHub #110, closed).** `.scratch/g3-gate-110-113-rerun/README.md`, session
+`g3-110-113-20260910`, two independent launches per engine. Pooled mean ITL
+p95 ratio **0.960** (per-launch-pairing range 0.913-1.012, all under the
+1.10 ceiling). The decode round in isolation (the free-standing interval
+between prefill windows) moved from **70.2 ms / 4.06x the reference** to
+**18.6 ms / 1.067x the reference** — the B=4 traversal cost that used to
+dominate the cell is now within launch-to-launch noise (this same session
+measured up to 18.8% launch spread on the reference's own C=4). C=1's
+pooled ratio (0.992) sits right at its 0.99 floor and splits pass/fail by
+which reference launch it is paired against; it is not this requirement's
+cell and is left as an open observation, not a regression claim.
+
+**#113 (lockstep `advance`, one decode round per prefill chunk) closed as
+not needed for now, same re-measurement.** C=4 aggregate is now ignis 43.35
+tok/s pooled mean against the reference's 11.05 — 3.9x, not the 99%-of-
+reference bar the issue asked for. The reasoning that deferred it ("a round
+costs 70 ms against the reference's 17 ms; better asked once a round is
+cheap") no longer holds now that a round costs 18.6 ms: the policy is not
+visibly leaving throughput on the table at this shape. Reopen if a future
+gate shape shows a live gap C=4 does not already cover.
 
 This is not a KV-precision gap. The `BF16` / `hq-e8-2b` inequality ADR 0015
 records would act on prefill, and ignis wins prefill while carrying it. An

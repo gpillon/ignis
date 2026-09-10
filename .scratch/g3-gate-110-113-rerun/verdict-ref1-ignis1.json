@@ -1,0 +1,41 @@
+{
+  "session": "g3-110-113-20260910",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b-nvfp4full-v2",
+  "reference_engine": "qwen3.8-27b-nvfp4full-v2",
+  "ours_profile": "BF16 KV, 1024 chunk, graphs, post-#111 B-wide decode",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-capacity 65536 explicit (comparable to ignis)",
+  "ours_date": "2026-09-10T21:52:39Z",
+  "reference_date": "2026-09-10T21:38:46Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 65.2977111671802,
+    "reference_tok_s": 62.98475768863933,
+    "ratio": 1.036722431956868,
+    "passed": true
+  },
+  "c4": {
+    "ours_tok_s": 43.67156100925584,
+    "reference_tok_s": 12.084044773077649,
+    "ratio": 3.613985369083771,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 151.16910000000053,
+    "ours_p95_ms": 194.40300000000207,
+    "ours_p99_ms": 200.0403400000072,
+    "ours_max_ms": 208.15560000000005,
+    "reference_p50_ms": 130.02305000000024,
+    "reference_p95_ms": 193.68829000001787,
+    "reference_p99_ms": 210.5632440000023,
+    "reference_max_ms": 227.7392000000109,
+    "ratio": 1.003690001083618,
+    "passed": true,
+    "warning": "ITL p95 ratio 1.004 exceeds the reference's own p95 (tolerated up to 1.1, but not a clean pass — flagged for review)"
+  },
+  "notes": [],
+  "passed": true
+}
