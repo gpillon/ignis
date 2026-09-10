@@ -197,6 +197,11 @@ When output names a domain concept, use the term as defined here.
   behind `IGNIS_TELEMETRY`/`--telemetry`. Interval counters are metrics-shaped
   and stay out of the logging system's scope; the request-lifecycle line
   (`admitted`/`ttft`/`done`) migrates onto canonical `ignis.request.*` events.
+  The two event models never merge — but since GitHub #108, telemetry's
+  sink *implementation* (line-writing only: `StdoutSink`/`FileSink`/
+  `MemorySink`/`NullSink`) is `ignis_logging::sink`'s, not a duplicate of
+  its own; the interval line's facts, counters, and JSONL shape stay
+  telemetry's alone.
 - **Logging queue** — the handoff decoupling event *creation* (a `tracing`
   call site, potentially on the prefill/decode path) from physical I/O
   (potentially slow: a full disk, a stalled pipe). Two channels, two

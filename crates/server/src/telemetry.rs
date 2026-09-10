@@ -14,11 +14,17 @@
 //! not logs, GitHub #77 — untouched by that migration).
 //!
 //! The sink is injectable (tests capture lines in memory; production targets
-//! stdout or a file). Since GitHub #69, all of this module's work (sink I/O,
-//! counter math) runs on an async task off the model thread — the thread
-//! that owns the `Scheduler` never calls into `Telemetry` at all, so a slow
-//! sink can never add latency to a decode step, no matter how long a write
-//! takes or how it is implemented.
+//! stdout or a file) — since GitHub #108, through `ignis_logging::LineSink`
+//! and its `StdoutSink`/`FileSink`/`MemorySink`/`NullSink` impls, rather
+//! than a duplicate trait of this module's own (the two had carried
+//! identical `fn write_line(&str)` shapes since #78; only the sink
+//! plumbing is shared — the interval line's facts/counters/shape, and the
+//! logging crate's own event model, stay independent, per ADR 0011/0017).
+//! Since GitHub #69, all of this module's work (sink I/O, counter math)
+//! runs on an async task off the model thread — the thread that owns the
+//! `Scheduler` never calls into `Telemetry` at all, so a slow sink can
+//! never add latency to a decode step, no matter how long a write takes or
+//! how it is implemented.
 //!
 //! **Live counters (blocker for the coordinator).** The core [`Scheduler`]
 //! trait — the public API the server drives (`Box<dyn Scheduler>`) — does not
@@ -34,99 +40,14 @@
 //! seam this module is built to close.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 
 use ignis_core::{FinishReason, LaneId, RequestId};
+use ignis_logging::LineSink;
 use serde::Serialize;
 use serde_json;
 
 use crate::api::finish_reason_str;
-
-// ── the JSONL sink ──────────────────────────────────────────────────────────
-
-/// A telemetry sink: receives one compact JSON line per event.
-///
-/// Implementations must be cheap and non-blocking on the request path — a
-/// lock-protected buffer (or a single buffered write) is acceptable; no long
-/// holds and no I/O that can stall a request.
-pub trait TelemetrySink: Send + Sync {
-    /// Record one JSONL line (no trailing newline; the sink owns framing).
-    fn write_line(&self, line: &str);
-}
-
-/// A no-op sink (the default when telemetry is not configured: the engine
-/// still tracks request state, nothing is written).
-pub struct NullSink;
-
-impl TelemetrySink for NullSink {
-    fn write_line(&self, _line: &str) {}
-}
-
-/// An in-memory sink: captures emitted lines so tests can assert on them.
-#[derive(Default)]
-pub struct MemorySink {
-    lines: std::sync::Mutex<Vec<String>>,
-}
-
-impl MemorySink {
-    /// An empty in-memory sink.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A snapshot of the lines emitted so far, in order.
-    pub fn lines(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
-    }
-}
-
-impl TelemetrySink for MemorySink {
-    fn write_line(&self, line: &str) {
-        self.lines.lock().unwrap().push(line.to_string());
-    }
-}
-
-/// A stdout sink (the §5 default target: one JSONL line per event).
-///
-/// `stdout` is line-buffered and a single write per event never meaningfully
-/// blocks the request path.
-pub struct StdoutSink;
-
-impl TelemetrySink for StdoutSink {
-    fn write_line(&self, line: &str) {
-        let _ = writeln!(std::io::stdout(), "{line}");
-    }
-}
-
-/// A file sink: appends one JSONL line per event to an opened (buffered)
-/// file. The file is held in a `Mutex` so concurrent emits are serialized
-/// into a single, short, non-inverting lock.
-pub struct FileSink {
-    file: std::sync::Mutex<std::fs::File>,
-}
-
-impl FileSink {
-    /// Open (creating or truncating is the caller's choice) a sink at `path`.
-    /// An existing file is appended to, matching a long-running server's
-    /// telemetry log.
-    pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self {
-            file: std::sync::Mutex::new(file),
-        })
-    }
-}
-
-impl TelemetrySink for FileSink {
-    fn write_line(&self, line: &str) {
-        let mut file = self.file.lock().unwrap();
-        let _ = writeln!(file, "{line}");
-    }
-}
 
 // ── the clock (the determinism seam) ────────────────────────────────────────
 
@@ -255,7 +176,7 @@ struct RequestTelemetry {
 /// The server's telemetry: tracks per-request state and emits the interval +
 /// request JSONL lines through the injected sink.
 pub struct Telemetry {
-    sink: Arc<dyn TelemetrySink>,
+    sink: Arc<dyn LineSink>,
     clock: Arc<dyn TelemetryClock>,
     /// A live counter source (the §5 blocker seam); `None` → event-derived.
     stats: Option<Arc<dyn IntervalStatsProvider>>,
@@ -270,7 +191,7 @@ pub struct Telemetry {
 impl Telemetry {
     /// Telemetry over `sink` (lines go here) and `clock` (`ms` / `tok_s`).
     /// No live counter source is set, so the interval line is event-derived.
-    pub fn new(sink: Arc<dyn TelemetrySink>, clock: Arc<dyn TelemetryClock>) -> Self {
+    pub fn new(sink: Arc<dyn LineSink>, clock: Arc<dyn TelemetryClock>) -> Self {
         Self {
             sink,
             clock,
@@ -287,7 +208,7 @@ impl Telemetry {
     }
 
     /// Point the sink at `sink` (the clock and any stats source are kept).
-    pub fn set_sink(&mut self, sink: Arc<dyn TelemetrySink>) {
+    pub fn set_sink(&mut self, sink: Arc<dyn LineSink>) {
         self.sink = sink;
     }
 
@@ -577,6 +498,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use ignis_logging::{FileSink, MemorySink};
+
     /// A provider that reports a fixed, known set of counters.
     struct FixedStats(IntervalCounters);
     impl IntervalStatsProvider for FixedStats {
@@ -598,7 +521,7 @@ mod tests {
         telemetry.on_admitted(1, 0); // now an `ignis.request.admitted` tracing event, not a sink line
         telemetry.emit_interval(); // emits the interval line
         let lines = sink.lines();
-        assert_eq!(lines.len(), 1, "only the interval line goes through `TelemetrySink` now");
+        assert_eq!(lines.len(), 1, "only the interval line goes through `LineSink` now");
         let last: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(last["kind"], "interval");
         assert_eq!(last["t"], 1, "the first interval is tick 1");
@@ -905,7 +828,7 @@ mod tests {
         }
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        // `on_admitted` now emits through `tracing`, not `TelemetrySink` — only
+        // `on_admitted` now emits through `tracing`, not `LineSink` — only
         // the interval line lands in the file (GitHub #79).
         assert_eq!(lines.len(), 1, "the interval line");
         assert!(lines.iter().all(|l| l.starts_with('{') && l.ends_with('}')));

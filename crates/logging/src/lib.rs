@@ -18,8 +18,11 @@
 //!
 //! Named `logging`, not `telemetry`: `ignis_server::telemetry` already owns
 //! that name for an unrelated, pre-existing concern (the scheduler
-//! interval-counter / request-lifecycle JSONL stream behind
-//! `IGNIS_TELEMETRY`/`--telemetry`, GitHub #77). The two do not merge here.
+//! interval-counter JSONL stream behind `IGNIS_TELEMETRY`/`--telemetry`,
+//! GitHub #77). The two event models do not merge here — GitHub #108 only
+//! moved telemetry's line-writing sink onto [`sink::LineSink`]/
+//! [`sink::FileSink`]/[`sink::NullSink`] (see `sink.rs`'s module doc);
+//! telemetry's facts, counters, and JSONL shape stay its own.
 //!
 //! [`init`] is the one production entrypoint: resolves [`config::LogConfig`]
 //! from `IGNIS_LOG_FORMAT`/`IGNIS_LOG_LEVEL` (`auto` format picks pretty on
@@ -49,7 +52,7 @@ pub use json_layer::JsonLayer;
 pub use pretty_layer::PrettyLayer;
 pub use queue::{QueueConfig, QueueWorkerGuard, QueuedSink};
 pub use record::LogRecord;
-pub use sink::{LineSink, MemorySink, StderrSink, StdoutSink};
+pub use sink::{FileSink, LineSink, MemorySink, NullSink, StderrSink, StdoutSink};
 
 /// [`init`] failed: either the env/format config was invalid, or a global
 /// subscriber was already installed (each process may install exactly one —

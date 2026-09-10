@@ -30,9 +30,10 @@ use ignis_artifact::{FrontendSet, Reader};
 use ignis_bench::client::HttpEndpoint;
 use ignis_bench::ttft::{self, CellSpec, TtftConfig};
 use ignis_core::gpu_profile;
+use ignis_logging::NullSink;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{cuda_scheduler, EngineShape};
-use ignis_server::telemetry::{NullSink, SystemClock};
+use ignis_server::telemetry::SystemClock;
 use ignis_server::Server;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";

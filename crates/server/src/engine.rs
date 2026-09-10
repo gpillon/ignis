@@ -33,12 +33,12 @@ use ignis_core::{
     FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, Scheduler, SubmitError,
     TokenId,
 };
+use ignis_logging::{LineSink, NullSink};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::telemetry::{
-    IntervalCounters, IntervalStatsProvider, NullSink, SystemClock, Telemetry, TelemetryClock,
-    TelemetrySink,
+    IntervalCounters, IntervalStatsProvider, SystemClock, Telemetry, TelemetryClock,
 };
 
 /// A per-request event stream: the `SchedEvent`s the engine routed to one
@@ -81,7 +81,7 @@ enum TelemetryFact {
     Submitted(RequestId, u32),
     Routed(SchedEvent),
     Tick,
-    SetSink(Arc<dyn TelemetrySink>),
+    SetSink(Arc<dyn LineSink>),
     SetStats(Arc<dyn IntervalStatsProvider>),
 }
 
@@ -126,7 +126,7 @@ impl Engine {
     /// the model thread and the async telemetry consumer immediately.
     pub fn with_sinks(
         scheduler: Box<dyn Scheduler>,
-        sink: Arc<dyn TelemetrySink>,
+        sink: Arc<dyn LineSink>,
         clock: Arc<dyn TelemetryClock>,
     ) -> Self {
         Self::with_sinks_and_driver(scheduler, sink, clock).0
@@ -145,7 +145,7 @@ impl Engine {
     /// teardown of the previous one.
     pub fn with_sinks_and_driver(
         scheduler: Box<dyn Scheduler>,
-        sink: Arc<dyn TelemetrySink>,
+        sink: Arc<dyn LineSink>,
         clock: Arc<dyn TelemetryClock>,
     ) -> (Self, std::thread::JoinHandle<()>) {
         let model_id = scheduler.model_id().to_string();
@@ -181,7 +181,7 @@ impl Engine {
     /// clock and any live counter source). Reconfigures the already-running
     /// telemetry consumer through the facts channel — never touches the
     /// model thread.
-    pub fn with_telemetry(self, sink: Arc<dyn TelemetrySink>) -> Self {
+    pub fn with_telemetry(self, sink: Arc<dyn LineSink>) -> Self {
         let _ = self.facts.send(TelemetryFact::SetSink(sink));
         self
     }
