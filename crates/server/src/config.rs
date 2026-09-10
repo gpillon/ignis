@@ -18,6 +18,17 @@ pub const DEFAULT_MODEL: &str = "qwen3.8-27b";
 /// The default bind address: localhost, port 8000 (OpenAI convention).
 pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 
+/// The default non-streaming completion timeout, in seconds (GitHub #95) —
+/// unchanged from the value `Server::new` hardcoded before this flag
+/// existed.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u32 = 30;
+
+/// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
+/// ceiling against a fat-fingered value, not a real operating point — a
+/// healthy request legitimately runs for minutes at a large `max_tokens`,
+/// never hours.
+pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
+
 // The prefill-chunk and per-sequence-context defaults live in
 // `ignis_runtime` (re-exported below), the same numbers `CudaLeafConfig`
 // falls back to — one source of truth for what `ignis-server` runs with
@@ -48,6 +59,9 @@ pub struct Config {
     /// which is never smaller than it — a pool the cap cannot fit inside
     /// would admit a request the leaf can never allocate.
     pub kv_pool_tokens: u32,
+    /// How long a non-streaming request waits for its completion before the
+    /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
+    pub request_timeout_secs: u32,
 }
 
 /// What [`resolve`] produced: a runnable config, or a request to print
@@ -97,6 +111,7 @@ pub fn resolve(
     let mut reasoning_effort = None;
     let mut prefill_chunk = None;
     let mut max_context = None;
+    let mut request_timeout = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -110,6 +125,7 @@ pub fn resolve(
             "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
+            "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
         i += 1;
@@ -143,6 +159,7 @@ pub fn resolve(
     let prefill_chunk = resolve_prefill_chunk(prefill_chunk, &env)?;
     let max_context = resolve_max_context(max_context, &env)?;
     let kv_pool_tokens = ignis_runtime::kv_pool_tokens_for(max_context);
+    let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
 
     Ok(ConfigOutcome::Config(Config {
         model,
@@ -154,15 +171,21 @@ pub fn resolve(
         prefill_chunk,
         max_context,
         kv_pool_tokens,
+        request_timeout_secs,
     }))
 }
 
-/// Parse a token-count value (`--prefill-chunk`, `--max-context`), naming
-/// the flag and the offending text on failure.
-fn parse_tokens(flag: &str, raw: &str) -> Result<u32, ConfigError> {
+/// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
+/// offending text on failure.
+fn parse_count(flag: &str, unit: &str, raw: &str) -> Result<u32, ConfigError> {
     raw.trim()
         .parse::<u32>()
-        .map_err(|_| ConfigError(format!("`{flag}` expects a token count, got `{raw}`")))
+        .map_err(|_| ConfigError(format!("`{flag}` expects a {unit}, got `{raw}`")))
+}
+
+/// A token-count value (`--prefill-chunk`, `--max-context`).
+fn parse_tokens(flag: &str, raw: &str) -> Result<u32, ConfigError> {
+    parse_count(flag, "token count", raw)
 }
 
 /// `--prefill-chunk` / `IGNIS_PREFILL_CHUNK` / [`DEFAULT_PREFILL_CHUNK`].
@@ -199,6 +222,28 @@ fn resolve_max_context(
     Ok(context)
 }
 
+/// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+fn resolve_request_timeout_secs(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_REQUEST_TIMEOUT"))) else {
+        return Ok(DEFAULT_REQUEST_TIMEOUT_SECS);
+    };
+    let secs = parse_count("--request-timeout", "second count", &raw)?;
+    if secs == 0 {
+        return Err(ConfigError(
+            "`--request-timeout` must be a nonzero second count".to_owned(),
+        ));
+    }
+    if secs > MAX_REQUEST_TIMEOUT_SECS {
+        return Err(ConfigError(format!(
+            "`--request-timeout` must be at most {MAX_REQUEST_TIMEOUT_SECS} seconds, got {secs}"
+        )));
+    }
+    Ok(secs)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
@@ -229,6 +274,7 @@ fn help_text() -> String {
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
+         \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
          \n\
@@ -276,6 +322,7 @@ mod tests {
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
         assert_eq!(config.kv_pool_tokens, ignis_runtime::kv_pool_tokens_for(DEFAULT_MAX_CONTEXT));
+        assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
     #[test]
@@ -496,5 +543,58 @@ mod tests {
         for flag in ["--prefill-chunk", "--max-context"] {
             assert!(text.contains(flag), "help must document {flag}:\n{text}");
         }
+    }
+
+    // ── the request timeout (GitHub #95) ─────────────────────────────────
+
+    #[test]
+    fn the_request_timeout_env_var_wins_over_the_default() {
+        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "90")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.request_timeout_secs, 90);
+    }
+
+    #[test]
+    fn the_request_timeout_flag_wins_over_its_env_var() {
+        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "90")]);
+        let a = args(&["--request-timeout", "45"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.request_timeout_secs, 45, "flag must win over env");
+    }
+
+    #[test]
+    fn a_zero_request_timeout_is_a_usage_error() {
+        let err = resolve(&args(&["--request-timeout", "0"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("nonzero"), "{err}");
+    }
+
+    #[test]
+    fn a_non_numeric_request_timeout_is_a_usage_error() {
+        let err =
+            resolve(&args(&["--request-timeout", "soon"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("--request-timeout"), "{err}");
+    }
+
+    #[test]
+    fn a_request_timeout_above_the_ceiling_is_a_usage_error() {
+        let err = resolve(&args(&["--request-timeout", "3601"]), no_env).expect_err("must reject");
+        assert!(err.0.contains("3600"), "the message must name the ceiling: {err}");
+        assert!(err.0.contains("3601"), "the message must name the value: {err}");
+    }
+
+    #[test]
+    fn an_invalid_request_timeout_env_var_is_a_usage_error_too() {
+        let env = env_map(&[("IGNIS_REQUEST_TIMEOUT", "0")]);
+        let err = resolve(&[], env).expect_err("must reject");
+        assert!(err.0.contains("nonzero"), "{err}");
+    }
+
+    #[test]
+    fn help_lists_the_request_timeout_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--request-timeout"), "help must document --request-timeout:\n{text}");
     }
 }

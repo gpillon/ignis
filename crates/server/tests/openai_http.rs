@@ -36,10 +36,11 @@ struct Harness {
     app: axum::Router,
 }
 
-/// Build a harness over `compute` (shared by [`harness`] and
-/// [`harness_gated`] — they differ only in which `Compute` backs the
-/// scheduler).
-fn harness_over(compute: Arc<dyn Compute>) -> Harness {
+/// Build a harness over `compute` with a given completion timeout (shared
+/// by [`harness_over`] and [`harness_gated_with_timeout`] — every harness
+/// bottoms out here so a timeout-specific test never has to hand-assemble
+/// the scheduler/engine/server chain itself).
+fn harness_over_with_timeout(compute: Arc<dyn Compute>, timeout: Duration) -> Harness {
     let scheduler = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
@@ -51,8 +52,12 @@ fn harness_over(compute: Arc<dyn Compute>) -> Harness {
         Engine::new(Box::new(scheduler)),
         Box::new(SimpleTemplateProvider),
     )
-    .with_request_timeout(Duration::from_secs(5));
+    .with_request_timeout(timeout);
     Harness { app: server.app() }
+}
+
+fn harness_over(compute: Arc<dyn Compute>) -> Harness {
+    harness_over_with_timeout(compute, Duration::from_secs(5))
 }
 
 fn harness() -> Harness {
@@ -65,6 +70,14 @@ fn harness() -> Harness {
 fn harness_gated() -> (Harness, Arc<GatedCompute>, GateController) {
     let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
     let h = harness_over(gated.clone() as Arc<dyn Compute>);
+    (h, gated, controller)
+}
+
+/// [`harness_gated`] with a shorter completion timeout — for a test that
+/// needs the timeout to actually fire, without waiting out the default 5 s.
+fn harness_gated_with_timeout(timeout: Duration) -> (Harness, Arc<GatedCompute>, GateController) {
+    let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+    let h = harness_over_with_timeout(gated.clone() as Arc<dyn Compute>, timeout);
     (h, gated, controller)
 }
 
@@ -389,6 +402,31 @@ async fn an_unknown_model_is_a_404() {
     assert_eq!(status, 404, "unknown model should be 404: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["error"]["code"], "model_not_found");
+}
+
+#[tokio::test]
+async fn a_request_that_outlives_the_configured_timeout_is_a_504_naming_it() {
+    // GitHub #95: the timeout that fires is an operator knob
+    // (`with_request_timeout`, wired to `--request-timeout` in `main`), and
+    // the 504 must say what it was set to — not a bare "the engine may be
+    // wedged" that leaves an operator guessing what to raise.
+    let (h, gated, _controller) = harness_gated_with_timeout(Duration::from_secs(1));
+
+    // Armed and never released: the decode step blocks forever, standing in
+    // for a wedged engine — the exact case this timeout guards against.
+    gated.arm();
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hang forever" }],
+        "max_tokens": 8,
+        "stream": false
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 504, "an outlived request must be a 504: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["code"], "request_timeout");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("1s"), "the 504 must name the configured timeout: {message}");
 }
 
 #[tokio::test]

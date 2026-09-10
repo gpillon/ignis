@@ -50,7 +50,9 @@ pub struct Server {
     pub template: std::sync::Arc<dyn TemplateProvider>,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a 504 (guards a wedged engine from hanging
-    /// the client forever).
+    /// the client forever). An operator knob (`--request-timeout` /
+    /// `IGNIS_REQUEST_TIMEOUT`, GitHub #95) — `main` sets it via
+    /// [`Server::with_request_timeout`] after `config::resolve` validates it.
     pub request_timeout: Duration,
     /// The server-wide `enable_thinking` default (`IGNIS_ENABLE_THINKING`,
     /// GitHub #68) a request's unset field falls back to.
@@ -65,7 +67,7 @@ impl Server {
         Self {
             engine,
             template: std::sync::Arc::from(template),
-            request_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
             default_enable_thinking: true,
             default_reasoning_effort: None,
         }
@@ -84,8 +86,9 @@ impl Server {
         )
     }
 
-    /// Set the non-streaming completion timeout (test knob; the default is
-    /// 30 s).
+    /// Set the non-streaming completion timeout (`main` wires this to
+    /// `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, GitHub #95; the default
+    /// is 30 s).
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self

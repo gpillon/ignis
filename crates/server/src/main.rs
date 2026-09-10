@@ -52,6 +52,9 @@
 //!   default `reasoning_effort`; unset means "let the template's own
 //!   default apply". An unknown value, or one the loaded template does not
 //!   support, refuses to start.
+//! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
+//!   non-streaming completion waits before the handler gives up with a
+//!   `504` (default 30 seconds, max 3600 — GitHub #95).
 
 use std::sync::Arc;
 
@@ -196,6 +199,7 @@ async fn main() {
         prefill_chunk: _,
         max_context: _,
         kv_pool_tokens: _,
+        request_timeout_secs,
     } = config;
 
     // The telemetry sink (server-02, design §5): a JSONL file named by
@@ -284,7 +288,8 @@ async fn main() {
         );
         let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
-    };
+    }
+    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64));
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the

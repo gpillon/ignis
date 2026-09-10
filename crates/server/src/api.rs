@@ -378,6 +378,17 @@ fn error_response(
         .into_response()
 }
 
+/// The `504` body for a request `collect_tokens` gave up on: names the
+/// timeout that fired (GitHub #95) so an operator reading the error knows
+/// what to raise with `--request-timeout`/`IGNIS_REQUEST_TIMEOUT`, rather
+/// than suspecting a wedged engine when a healthy one just needed longer.
+fn request_timeout_message(timeout: std::time::Duration) -> String {
+    format!(
+        "the request did not complete within the server's {}s timeout (the engine may be wedged) — raise it with --request-timeout/IGNIS_REQUEST_TIMEOUT",
+        timeout.as_secs()
+    )
+}
+
 /// Map the engine's [`FinishReason`] to the OpenAI `finish_reason` string
 /// (GitHub #61 / P1-25): `stop` on the model's own EOS token, `length` on
 /// `max_tokens` or the engine's reservation cap. `pub(crate)` since P3-06:
@@ -561,7 +572,7 @@ async fn chat_completions(
             StatusCode::GATEWAY_TIMEOUT,
             "request_timeout",
             "request_timeout",
-            "the request did not complete within the server's timeout (the engine may be wedged)",
+            request_timeout_message(server.request_timeout),
         ),
     }
 }
@@ -973,7 +984,7 @@ async fn responses_api(
             StatusCode::GATEWAY_TIMEOUT,
             "request_timeout",
             "request_timeout",
-            "the request did not complete within the server's timeout (the engine may be wedged)",
+            request_timeout_message(server.request_timeout),
         ),
     }
 }
