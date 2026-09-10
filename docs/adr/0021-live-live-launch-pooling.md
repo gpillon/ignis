@@ -76,9 +76,11 @@ pair.
   taken across all launches* (not the best one, not one arbitrarily chosen
   launch) to meet the threshold. Two launches per engine is the floor — it
   catches "one side got an unlucky launch," which is the failure mode #116
-  demonstrated. A cell whose two launches disagree by more than the
-  within-launch spread (documented per cell, since #116 measured it: under
-  1.5% here) is itself a finding worth recording, not silently averaged away.
+  demonstrated. Within-launch spread is not a fixed number to check against —
+  #116 measured one launch at 1.4% and another, on the same tree, at 6.4% —
+  so a cell whose across-launch spread looks larger than its own launches'
+  internal spread is itself a finding worth recording, not silently averaged
+  away.
 - This is a session-cost, not a code, requirement: no `ignis-bench` interface
   changes are forced by this ADR. Running the existing `g3` /  `ttft`
   subcommands twice per engine and passing both pairs through the existing
