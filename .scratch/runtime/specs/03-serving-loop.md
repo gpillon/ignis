@@ -249,17 +249,32 @@ all four lanes alive throughout. A run in which a leg's lanes end on the cap
 is a run whose cap is load-bearing rather than spare, and the next fixture
 revision should raise it.
 
-**ITL p95 is deferred to phase 4 (GitHub #110, #112).** The live/live re-run
-on a valid fixture measured 1.106 against a 1.10 ceiling. During a prefill
-window the ITL floor is one chunk plus one decode round, so the p95 is
-effectively a second measurement of prefill throughput: ignis's intervals
-blocked behind a chunk average 180.8 ms against the reference's 155.4 ms,
-which is a 1.163 ratio on the quantity the p95 is actually reading. There is
-no phase-3 dial for that. The leading explanation is the KV precision the
-two engines run (BF16 against hq-e8-2b), which ADR 0015 records as a known
-inequality rather than correcting for, and which the v1 design schedules for
-phase 4. C=1 and C=4 pass; the ITL cell is recorded as a warning carried into
-phase 4, not waived. The separate p50 gap is ours and is tracked as #113.
+**ITL p95 fails at 1.106, and the cause is this phase's own decode round
+(GitHub #110, blocked by #111).** The live/live re-run on a valid fixture
+measured 1.106 against a 1.10 ceiling. Splitting a lane's intervals by
+whether a prefill chunk was in flight decomposes that number exactly:
+
+| term | ignis | reference | ratio |
+|---|---:|---:|---|
+| prefill chunk, 1,024 tokens at 32K context | 116.3 ms | 141.2 ms | 0.82 |
+| decode round, B=4 | 70.2 ms | 17.3 ms | 4.06 |
+| blocked ITL interval, the sum | 186.5 ms | 158.5 ms | 1.18 |
+
+ignis's prefill is **faster**. The whole gap is the decode round, which at
+four lanes costs 4.8x its own single-lane round because requirement 17 above
+is not implemented: the width-W path replays W sequential per-lane model
+traversals and batches only the sampling (#111). Bringing the round to the
+reference's order puts the blocked interval near 136 ms against 158 ms.
+
+This is not a KV-precision gap. The `BF16` / `hq-e8-2b` inequality ADR 0015
+records would act on prefill, and ignis wins prefill while carrying it. An
+earlier reading of these records deferred the p95 to phase 4 on that basis;
+it assumed the decode round was small on both sides, which is true of the
+reference and false of ignis.
+
+C=1 and C=4 pass. The separate lockstep gap, `advance()` running 1.056
+decode rounds per prefill chunk against the reference's 1.44, is #113 and is
+secondary to #111.
 
 Alongside the three cells, two non-negotiables: the functional
 anti-serialization property above, proven by a CPU test rather than inferred

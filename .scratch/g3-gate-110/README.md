@@ -54,40 +54,65 @@ against these.
 
 ## What the numbers say
 
-Splitting the pooled intervals into those blocked behind a prefill chunk
-(>= 40 ms) and those that are a decode round alone (< 40 ms):
+A decode lane's interval falls in one of two states: blocked behind a prefill
+chunk, or a decode round on its own between windows. The second kind is what
+separates the two engines, and it is measurable straight off these records by
+taking the intervals that intersect *no* prefiller window.
 
-| | ignis | reference |
-|---|---:|---:|
-| blocked intervals, mean | 180.8 ms | 155.4 ms |
-| intervals under 40 ms | 0 of 1,352 | 530 of 1,845 |
-| decode rounds per lane per window | 33.80 | 46.12 |
-| prefill throughput per prefiller | 5,375 tok/s | 6,164 tok/s |
-| time per 1,024-token chunk | 190.5 ms | 166.1 ms |
+| | ignis | reference | ratio |
+|---|---:|---:|---|
+| decode round, 4 lanes (median, outside every window) | 70.2 ms | 17.3 ms | 4.06 |
+| decode round, 1 lane (from the C=1 cell) | 14.6 ms | 16.1 ms | 0.91 |
 
-During a prefill window the ITL floor is one chunk plus one decode round,
-so p95 is effectively a second measurement of prefill throughput. The
-blocked-interval ratio is 1.163; restricting the reference to its blocked
-intervals alone moves its p95 only from 201.1 ms to 204.0 ms, so its cheap
-decode rounds are not what wins it the p95.
+**At one lane ignis is ahead. At four it costs 4.06x the reference, and 4.8x
+its own single-lane round.** That is GitHub #111: the width-W decode graph
+replays W sequential per-lane model traversals instead of one B-wide one, and
+`kernel/src/decode_graph.cu:105` and `kernel/src/step.cu:717` both say so in
+their own comments. Only the sampling is batched.
 
-The leading hypothesis for that prefill gap is the KV precision difference
-the profiles record (`BF16 KV` against `hq-e8-2b KV`). At 32,768 tokens
-every chunk's attention rereads the whole prior KV, so ignis moves roughly
-twice the bytes on a bandwidth-bound operation, which is the right order of
-magnitude for what was measured.
+With the decode round known, the prefill chunk follows from the window
+arithmetic (`32 chunks + rounds x round_cost = window`):
 
-**This is a hypothesis, not a measurement.** Nothing in these records
-isolates the KV format from everything else that differs between the two
-engines, and ADR 0015 forecloses the control that would test it directly:
-"Measuring the reference in a handicapped configuration ('same KV format')
-would compare a hypothetical against a hypothetical". It becomes testable
-only once ignis has hq-e8-2b of its own, which the v1 design schedules for
-phase 4.
+| term | ignis | reference | ratio |
+|---|---:|---:|---|
+| prefill chunk, 1,024 tokens at 32K context | 116.3 ms | 141.2 ms | 0.82 |
+| decode round, B=4 | 70.2 ms | 17.3 ms | 4.06 |
+| blocked ITL interval, the sum | 186.5 ms | 158.5 ms | 1.18 |
 
-The p50 gap is separate and is ours: `ConcreteScheduler::advance` runs
-exactly one prefill chunk and then exactly one batched decode round, so a
-lane can never emit two tokens between chunk boundaries.
+The reconstructed sum matches the measured blocked-interval means of 180.8 ms
+and 155.4 ms, so the split is sound.
+
+**ignis's prefill is 21% faster, not 15% slower, and the whole ITL p95 gap is
+the decode round.** An earlier reading of these same records attributed the
+blocked interval to prefill throughput; that assumed the decode round was
+small on both sides, which is true of the reference and false of ignis.
+
+The KV precision difference the profiles record (`BF16 KV` against
+`hq-e8-2b KV`) would act on prefill, and ignis already wins prefill while
+carrying it. So these records do **not** support KV precision as the
+explanation for the p95 gap. Bringing the decode round to the reference's
+order would put the blocked interval near 136 ms against 158 ms, a ratio of
+about 0.86.
+
+The lockstep of `ConcreteScheduler::advance` (#113) is real but secondary:
+ignis runs 1.056 decode rounds per prefill chunk against the reference's
+1.44. Note that ignis's "no interval under 40 ms" is *not* evidence of it —
+that is just a 70 ms decode round never fitting under the threshold.
+
+## How to reproduce the comparison
+
+Each live record used `ignis-bench g3` with `--session g3-110-window-cancel-v3`
+against its own endpoint: `:8000` for ignis, `:8080` for the reference. Max
+context 40,960; the reference's KV capacity resolved to 327,680 tokens at max
+concurrency 8; greedy, thinking disabled on both. Never compare records
+carrying different session ids — the gate check refuses to.
+
+```powershell
+.\target\x86_64-pc-windows-msvc\release\ignis-bench.exe g3-gate `
+  --ours .scratch\g3-gate-110\ignis-final.json `
+  --ref .scratch\g3-gate-110\reference-final.json `
+  --out .scratch\g3-gate-110\verdict-final.json
+```
 
 ## Profile caveat
 
