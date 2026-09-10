@@ -44,13 +44,13 @@ four 4,096-token decode lanes. Prompts cut from
 | `baseline-r4.json` | `0e1a275` | 63.8 | 18.4 | 194.78 | 237.90 |
 | `baseline-r5.json` | `0e1a275` | 63.5 | 17.9 | 195.91 | 236.75 |
 
-`baseline-r1` is an outlier on C=1 and C=4 and is kept in the record rather
-than dropped; the medians below are medians over every sample, so it does
-not carry the comparison either way. It was the first run against a
-freshly started server. The post-#111 leg's own first run shows no such
-spike, so what produced it is unexplained. #110's recorded ignis leg (68.3
-tok/s C=1) sits between that outlier and the stable cluster, which is the
-likeliest reason the cross-session read looked like a regression.
+`baseline-r1` reads as an outlier on C=1 and C=4 and is kept in the record
+rather than dropped; the medians below are medians over every sample, so it
+does not carry the comparison either way. It is not really an outlier: the
+section after the medians shows it is the fast band of a two-band spread
+that has nothing to do with the tree. #110's recorded ignis leg (68.3 tok/s
+C=1) sits between the two bands, which is why the cross-session read looked
+like a regression.
 
 ## Medians
 
@@ -61,17 +61,55 @@ likeliest reason the cross-session read looked like a regression.
 | ITL p50 | 195.92 ms | 150.09 ms | -23% |
 | ITL p95 | 237.90 ms | 194.35 ms | **-18%** |
 
-Within-session repeatability, post-#111: C=1 spread 0.9%, C=4 0.2%, ITL p95
-1.4% across three runs. The instrument is tight enough that a 6% shift is a
-signal, not noise — which is why the cross-session read had to be chased
-rather than waved off.
+## The instrument varies between server processes, not between runs
+
+Measured after the fact, while checking #114's raised cap. Three further
+samples were taken against a third server (`cap-check*.json`, same tree as
+the post-#111 leg plus the 4,032-token cap):
+
+| run | C=1 tok/s | C=4 tok/s | ITL p50 ms | ITL p95 ms |
+|---|---:|---:|---:|---:|
+| `cap-check.json` | 74.6 | 49.2 | 130.58 | 167.58 |
+| `cap-check-r2.json` | 74.7 | — | 130.23 | 167.83 |
+| `cap-check-r3.json` | 74.6 | — | 129.80 | 167.16 |
+
+Line those up against the three post-#111 samples above, which are the same
+kernel: 63.9, 64.5, 64.2 tok/s on C=1 against 74.6, 74.7, 74.6. Within one
+server process the spread is under 1%; between processes it reaches 17% on
+identical code. The pre-#111 server shows the same thing from the other
+side — its first sample, 73.9, sits in the fast band and its next four in
+the slow one.
+
+What decides the band is not known. It is not the tree, since both trees
+produced both bands, and it is not run order, since the fast server stayed
+fast across three runs while the pre-#111 server changed band after one.
+What is known is that it is stable within a process, which is why the
+earlier claim here that "the instrument is tight" was only true of
+back-to-back runs against one server.
+
+**This matters for the gate.** A live/live run measures the two engines in
+two server processes by construction, because one has to be stopped for the
+other to start. If a process can be 17% off on identical code, a ratio
+taken across two of them carries that. Filed separately.
+
+Both conclusions below survive it, because they do not rest on comparing
+one sample to one sample:
+
+- **ITL p95**: the worst post-#111 sample (194.40 ms) beats the best
+  pre-#111 one (234.59 ms). The bands do not overlap.
+- **C=4**: post-#111 spans 43.1 to 49.2 tok/s, pre-#111 spans 17.9 to 20.9.
+  The bands do not overlap.
+- **C=1**: post-#111 spans 63.9 to 74.7, pre-#111 spans 63.4 to 73.9. The
+  bands overlap almost exactly, which is the same answer as before — the
+  cell is unchanged — reached without relying on either band.
 
 ## What it says
 
-- **No C=1 regression.** The cell is marginally faster, and well inside the
-  spread. The remaining acceptance criterion on #111 is about this, and the
-  answer here is not the gate's answer, but it is not a red flag either.
-- **C=4 aggregate more than doubles.** 18.4 to 43.1 tok/s.
+- **No C=1 regression.** The two trees' C=1 ranges overlap almost exactly.
+  The remaining acceptance criterion on #111 is about this, and the answer
+  here is not the gate's answer, but it is not a red flag either.
+- **C=4 aggregate more than doubles.** 18.4 to 43.1 tok/s at the medians,
+  and the two trees' ranges do not overlap.
 - **The ITL tail moves by the predicted amount.** #110 decomposed a blocked
   inter-token interval as a prefill chunk plus a decode round and predicted
   that fixing the round would bring the interval from 186.5 ms to near

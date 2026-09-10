@@ -222,7 +222,7 @@ entitlement at allocation.
 |---|---|---|---|---|
 | C=1 | prompt 8,192, cap 256 | 8,448 | headroom 57,088 | at least 99% of the live reference's tok/s (historically ~75–76) |
 | C=4 | 4 × (prompt 8,192, cap 256) | 33,792 | headroom 31,744 | aggregate at least 99% of the live reference's aggregate |
-| ITL | 4 × (prompt 4,096, safety cap 3,072) with a prefiller at prompt 32,768, cap 64 | 61,504 peak | headroom 4,032 | p95 within the live reference's envelope |
+| ITL | 4 × (prompt 4,096, safety cap 4,032) with a prefiller at prompt 32,768, cap 64 | 65,344 peak | headroom 192 | p95 within the live reference's envelope |
 
 The ITL cell runs **ten sequential cold prefillers**: each 32,768-token
 prefiller is allocated, prefilled, and released before the next is
@@ -231,23 +231,57 @@ four decode lanes stay alive across the whole series. The lanes' inter-token
 intervals are sampled for the entire series; p50, p95, p99 and max are all
 recorded and p95 decides. The original 512-token estimate was falsified by
 the live reference: lanes exhausted it after 15-19 seconds while the ten
-prefillers lasted about 62 seconds. A 3,072-token safety reservation fits the
-65,536-token pool, and the instrument cancels every lane once the final
-prefill window closes. To keep the measurement lanes alive until that
-boundary, their prompt ends with an explicit request for at least 3,072
+prefillers lasted about 62 seconds. The instrument cancels every lane once
+the final prefill window closes. To keep the measurement lanes alive until
+that boundary, their prompt ends with an explicit request for at least 4,032
 output tokens (the corpus window is shortened so the post-template prompt
 remains exactly 4,096 tokens), and the measurement request suppresses the
 artifact's EOS ids. Normal serving keeps its existing EOS behavior.
 
 Cancellation is the intended terminator but not a guaranteed one: an
 endpoint that honors neither ignis `ignore_eos` nor `logit_bias` still stops
-at its own EOS, and a fast enough engine reaches the 3,072-token cap first.
-The measurement does not depend on which of the three ends a lane. What it
+at its own EOS, and a fast enough engine reaches the safety cap first. The
+measurement does not depend on which of the three ends a lane. What it
 depends on is the guard that refuses any lane ending before the final
 prefill window closed, so every pooled interval comes from a series that had
 all four lanes alive throughout. A run in which a leg's lanes end on the cap
-is a run whose cap is load-bearing rather than spare, and the next fixture
-revision should raise it.
+is a run whose cap is load-bearing rather than spare.
+
+**The safety cap is 4,032, the largest the pool admits (#114).** #104's
+first estimate of 512 was falsified above; 3,072 replaced it and was itself
+load-bearing on #110's reference leg, whose lanes cleared the final prefill
+window by only 3.4 to 7.0 seconds out of a 101-second run. A reference some
+7% faster would have exhausted the cap before the window closed and had its
+lane refused, failing the cell for a fixture reason rather than an engine
+one. The arithmetic, redone: admission reserves the full
+`ceil((prompt + token budget) / 64)` pages up front and never over-allocates
+mid-generation (`ignis_core::admission::AdmissionResources`), and the pool
+is 65,536 tokens, so 1,024 pages, at the server's default 40,960-token
+`--max-context` (`ignis_runtime::kv_pool_tokens_for`). Peak concurrent
+demand is the four lanes plus the single in-flight prefiller:
+
+| holder | reservation | pages |
+|---|---|---:|
+| decode lane | `ceil((4,096 + 4,032) / 64)` | 127 |
+| four of them | | 508 |
+| prefiller | `ceil((32,768 + 64) / 64)` | 513 |
+| peak | | **1,021 of 1,024** |
+
+One more page per lane — a cap of 4,096 — needs 1,025 and would have a lane
+refused. The three spare pages are not what protects the sequential
+prefiller invariant, and never were: two overlapping prefillers need 1,026
+pages at any cap, so that invariant rests on the harness sending the next
+prefiller only after the previous request returned. Raising the cap further
+means raising the pool, which is a change to the engine's shape rather than
+to the fixture, and the fixture must not be the reason the engine's shape
+moves.
+
+**Each lane's finish reason is recorded (#114).** The record carries, per
+lane, whether the measurement boundary closed it, the engine stopped on its
+own EOS, the safety cap ended it, or the stream ended for a reason the
+instrument does not model. A leg whose lanes end on the cap is warned about
+by name in the rendered record, because before this a reader could only
+notice it by seeing a token count that happened to equal the cap.
 
 **ITL p95 fails at 1.106, and the cause is this phase's own decode round
 (GitHub #110, blocked by #111).** The live/live re-run on a valid fixture

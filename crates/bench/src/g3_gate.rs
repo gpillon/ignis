@@ -384,6 +384,7 @@ mod tests {
                 started_ms: 0.0,
                 n_tokens: 300,
                 token_times_ms: vec![0.0, 10.0, 20.0],
+                finish: crate::g3::LaneFinish::Window,
                 error: None,
             }],
             intervals_ms: vec![10.0, 10.0],

@@ -382,6 +382,7 @@ mod tests {
             prompt_tokens: None,
             cached_prompt_tokens: None,
             token_times_ms: Vec::new(),
+            finish_reason: None,
         }
     }
 

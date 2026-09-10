@@ -52,6 +52,26 @@ pub struct Request {
     pub enable_thinking: Option<bool>,
 }
 
+/// Why a request's token stream ended.
+///
+/// The G3 ITL cell's decode lanes are meant to end when the harness closes
+/// them at the measurement boundary. Anything else means the fixture, not
+/// the measurement, decided how long a lane lived, and #110's own run had
+/// one leg end that way without the record showing it (GitHub #114).
+/// Reading this costs one field of a chunk this client already parses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The engine named a reason in the response's `finish_reason`
+    /// (`"stop"`, `"length"`, ...), carried verbatim rather than mapped
+    /// here: what a reason *means* to a measurement is the measurement's
+    /// business, not the transport's.
+    Engine(String),
+    /// The observer returned `false`, so this client stopped reading and
+    /// dropped the body, cancelling the generation server-side. The
+    /// engine's own reason, if it would have had one, was never sent.
+    Cancelled,
+}
+
 /// The raw outcome of a single request completion.
 #[derive(Debug, Clone)]
 pub struct Outcome {
@@ -79,6 +99,10 @@ pub struct Outcome {
     /// ([`crate::g3`]), sampled continuously rather than reduced to a
     /// single ttft/total pair.
     pub token_times_ms: Vec<f64>,
+    /// Why the stream ended, when this transport could tell (GitHub #114).
+    /// `None` for a response that named no reason and was not cancelled,
+    /// and for transports that report none.
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl Outcome {
@@ -143,9 +167,13 @@ pub trait Endpoint: Send + Sync {
         // No streaming transport here, so there is no request body to carry
         // the suppression onto the wire.
         let _ = suppress_eos;
-        let outcome = self.complete(req)?;
+        let mut outcome = self.complete(req)?;
         for &time_ms in &outcome.token_times_ms {
             if !observer(time_ms) {
+                // The caller stopped this stream, so whatever reason the
+                // canned outcome carried is not why it ended here (GitHub
+                // #114).
+                outcome.finish_reason = Some(FinishReason::Cancelled);
                 break;
             }
         }
@@ -208,6 +236,9 @@ impl MockEndpoint {
             prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
             cached_prompt_tokens: None,
             token_times_ms,
+            // The mock emits exactly `max_tokens` tokens, so the honest
+            // reason is the one a real engine would give for that.
+            finish_reason: Some(FinishReason::Engine("length".to_string())),
         }
     }
 }
@@ -384,6 +415,10 @@ impl HttpEndpoint {
                 .map_err(|e| format!("POST {url}: parse: {e}"))?;
         let total_ms = ms_since(start);
         let usage = Usage::from_response(&value);
+        let finish_reason = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .map(|reason| FinishReason::Engine(reason.to_string()));
         Ok(Outcome {
             ttft_ms: total_ms,
             total_ms,
@@ -400,6 +435,7 @@ impl HttpEndpoint {
                 .to_string(),
             // No per-token timing on a non-streaming response.
             token_times_ms: Vec::new(),
+            finish_reason,
         })
     }
 
@@ -421,6 +457,14 @@ impl HttpEndpoint {
         let mut prompt_tokens: Option<u32> = None;
         let mut cached_prompt_tokens: Option<u32> = None;
         let mut token_times_ms: Vec<f64> = Vec::new();
+        // GitHub #114. `engine_finish` is read from every chunk rather than
+        // only the terminal one: the OpenAI shape puts it on a trailing
+        // chunk with an empty delta, but an engine that hangs it off the
+        // last content chunk is equally readable this way, last write
+        // winning. `cancelled` records that *this* client ended the stream,
+        // in which case the engine never got to name a reason at all.
+        let mut engine_finish: Option<String> = None;
+        let mut cancelled = false;
         for line in reader.lines() {
             let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
             // The SSE framing: `data: <payload>` lines (empty lines
@@ -448,6 +492,12 @@ impl HttpEndpoint {
                 prompt_tokens = Some(prompt);
                 cached_prompt_tokens = usage.cached_prompt_tokens;
             }
+            if let Some(reason) = chunk
+                .pointer("/choices/0/finish_reason")
+                .and_then(|v| v.as_str())
+            {
+                engine_finish = Some(reason.to_string());
+            }
             let delta = chunk
                 .pointer("/choices/0/delta/content")
                 .and_then(|v| v.as_str())
@@ -461,6 +511,7 @@ impl HttpEndpoint {
                 output.push_str(delta);
                 n_tokens += 1;
                 if !observer(now_ms) {
+                    cancelled = true;
                     break;
                 }
             }
@@ -476,6 +527,13 @@ impl HttpEndpoint {
             prompt_tokens,
             cached_prompt_tokens,
             token_times_ms,
+            // Cancellation wins: it is why the stream ended here, and any
+            // reason the engine had was never sent.
+            finish_reason: if cancelled {
+                Some(FinishReason::Cancelled)
+            } else {
+                engine_finish.map(FinishReason::Engine)
+            },
         })
     }
 }
@@ -711,6 +769,7 @@ mod tests {
             prompt_tokens: None,
             cached_prompt_tokens: None,
             token_times_ms: Vec::new(),
+            finish_reason: None,
         }
     }
 

@@ -18,7 +18,7 @@
 //!   verdict is the *aggregate* throughput (throughput-weighted, the way
 //!   [`crate::metrics::class_stats`] already reduces a class) as a
 //!   percentage of the live reference's aggregate.
-//! - **ITL**: four decode lanes (prompt 4,096 / safety cap 3,072) sampled
+//! - **ITL**: four decode lanes (prompt 4,096 / safety cap 4,032) sampled
 //!   *continuously* while ten 32,768-token prefillers run **sequentially**
 //!   against the pool — each allocated, prefilled and released before the
 //!   next is allocated (ADR 0015: every prefiller prompt is its own, cold,
@@ -51,16 +51,40 @@ pub const THROUGHPUT_MAX_TOKENS: u32 = 256;
 pub const C1_CONCURRENCY: usize = 1;
 pub const C4_CONCURRENCY: usize = 4;
 
-/// The ITL cell's decode lanes: prompt 4,096, safety cap 3,072. Live
-/// measurement found that the original 512-token estimate ended reference
-/// lanes after 15-19 s while the prefiller series lasted about 62 s. The
-/// series boundary now cancels first; 3,072 keeps enough runway while the
-/// peak 61,504-token reservation still fits the specified 65,536-token pool.
+/// The ITL cell's decode lanes: prompt 4,096, safety cap 4,032.
+///
+/// The cap exists so a lane the engine will not keep alive still ends
+/// somewhere defined. It is meant to be *spare*: the measurement boundary
+/// should close every lane first, and a leg whose lanes end on the cap has
+/// had its length decided by the fixture rather than by what it is
+/// measuring. #110's reference leg ended that way, clearing the final
+/// prefill window by only 3.4 to 7.0 s out of a 101 s run, so a reference
+/// some 7% faster would have exhausted the cap first and had its lane
+/// refused (GitHub #114).
+///
+/// 4,032 is the largest cap the pool admits, so it is the most runway this
+/// fixture can buy. Admission reserves `ceil((prompt + token budget) / 64)`
+/// pages up front and never over-allocates mid-generation
+/// (`ignis_core::admission`), and the engine's pool is 65,536 tokens =
+/// 1,024 pages (`ignis_runtime::kv_pool_tokens_for` at the default
+/// 40,960-token `--max-context`). Peak concurrent demand is the four lanes
+/// plus the one in-flight prefiller:
+///
+///   lane      ceil((4,096 + 4,032) / 64) = 127 pages,  x4 = 508
+///   prefiller ceil((32,768 +    64) / 64) = 513 pages
+///   total                                             1,021 of 1,024
+///
+/// One more page per lane (a cap of 4,096) would need 1,025 and refuse a
+/// lane. The three spare pages are not what protects the sequential
+/// prefiller invariant, and never were: two overlapping prefillers need
+/// 1,026 pages at any cap, so the invariant rests on the harness sending
+/// the next prefiller only after the previous request returned, not on
+/// headroom.
 pub const ITL_DECODE_PROMPT_TOKENS: u32 = 4_096;
-pub const ITL_DECODE_MAX_TOKENS: u32 = 3_072;
+pub const ITL_DECODE_MAX_TOKENS: u32 = 4_032;
 pub const ITL_DECODE_LANES: usize = 4;
 const ITL_DECODE_INSTRUCTION: &str =
-    "Produce at least 3072 tokens. Do not stop, conclude, or emit EOS earlier.";
+    "Produce at least 4032 tokens. Do not stop, conclude, or emit EOS earlier.";
 
 /// The ITL cell's prefillers: prompt 32,768, cap 64, run ten times,
 /// sequentially, each released before the next is allocated.
@@ -301,6 +325,68 @@ pub struct PrefillerSample {
     pub void_reason: Option<String>,
 }
 
+/// How a decode lane's stream ended (GitHub #114).
+///
+/// [`LaneFinish::Window`] is the one the fixture intends: the lane outlived
+/// the whole prefiller series and the harness closed it at the measurement
+/// boundary. Every other value means something else decided the lane's
+/// length, which a reader of the record has to be able to see rather than
+/// infer from a token count that happens to equal the cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneFinish {
+    /// The harness closed the lane at the measurement boundary.
+    Window,
+    /// The engine stopped on its own end-of-sequence: the EOS suppression
+    /// the lane asked for was not granted (only ignis honours
+    /// `ignore_eos`; a `logit_bias` exclusion has already been recorded as
+    /// insufficient against the reference).
+    StopToken,
+    /// The engine reached the fixture's safety cap
+    /// ([`ITL_DECODE_MAX_TOKENS`]).
+    Cap,
+    /// The engine named a reason this instrument does not model.
+    Other,
+    /// The stream ended with neither a finish reason nor a cancellation —
+    /// including every record written before this field existed, which is
+    /// why it is the default.
+    #[default]
+    Unknown,
+}
+
+impl LaneFinish {
+    /// What the transport saw, in the record's own vocabulary. `"length"`
+    /// and `"stop"` are the OpenAI finish reasons both engines speak.
+    fn from_transport(reason: Option<&crate::client::FinishReason>) -> Self {
+        match reason {
+            Some(crate::client::FinishReason::Cancelled) => Self::Window,
+            Some(crate::client::FinishReason::Engine(reason)) => match reason.as_str() {
+                "length" => Self::Cap,
+                "stop" => Self::StopToken,
+                _ => Self::Other,
+            },
+            None => Self::Unknown,
+        }
+    }
+
+    /// Whether this is the fixture deciding the lane's length rather than
+    /// the measurement boundary — what the cell warns about.
+    pub fn is_cap(self) -> bool {
+        matches!(self, Self::Cap)
+    }
+
+    /// A short phrase for the rendered record.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Window => "the measurement boundary",
+            Self::StopToken => "its own EOS",
+            Self::Cap => "the safety cap",
+            Self::Other => "a reason this instrument does not model",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// One decode lane's trace across the whole ITL series: every content
 /// token's arrival time (ms since the lane's own request started). Only
 /// intervals overlapping a prefiller window enter the pooled ITL sample.
@@ -312,6 +398,9 @@ pub struct DecodeLaneTrace {
     pub started_ms: f64,
     pub n_tokens: u32,
     pub token_times_ms: Vec<f64>,
+    /// Why this lane's stream ended (GitHub #114).
+    #[serde(default)]
+    pub finish: LaneFinish,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -358,6 +447,34 @@ impl ItlCell {
     /// The prefillers that are not provably cold, with their reasons.
     pub fn void_prefillers(&self) -> Vec<&PrefillerSample> {
         self.prefillers.iter().filter(|p| p.void).collect()
+    }
+
+    /// The lanes the fixture's safety cap ended rather than the measurement
+    /// boundary (GitHub #114). Not an error: such a run can still be valid,
+    /// because the pooling guard only requires every lane to outlive the
+    /// final prefill window. It does mean the cap is load-bearing rather
+    /// than spare, so a slightly faster engine would fail this cell for a
+    /// fixture reason -- which is worth saying out loud rather than leaving
+    /// to a reader who notices a token count equal to the cap.
+    pub fn lanes_on_cap(&self) -> Vec<&DecodeLaneTrace> {
+        self.lanes.iter().filter(|lane| lane.finish.is_cap()).collect()
+    }
+
+    /// A one-line warning when the cap decided any lane's length, or `None`
+    /// when the measurement boundary closed them all.
+    pub fn cap_warning(&self) -> Option<String> {
+        let on_cap = self.lanes_on_cap();
+        if on_cap.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = on_cap.iter().map(|lane| lane.id.as_str()).collect();
+        Some(format!(
+            "{} of {} decode lane(s) ended on the {}-token safety cap rather than at the              measurement boundary ({}) -- the cap is load-bearing for this leg, so an engine              fast enough to exhaust it before the final prefill window closes would fail this              cell for a fixture reason",
+            on_cap.len(),
+            self.lanes.len(),
+            self.decode_max_tokens,
+            names.join(", "),
+        ))
     }
 
     fn failed(cfg: &ItlConfig, error: String) -> Self {
@@ -541,6 +658,7 @@ fn measure_itl_with(
                             id,
                             started_ms,
                             n_tokens: outcome.n_tokens,
+                            finish: LaneFinish::from_transport(outcome.finish_reason.as_ref()),
                             token_times_ms: outcome.token_times_ms,
                             error: None,
                         },
@@ -549,6 +667,7 @@ fn measure_itl_with(
                             started_ms,
                             n_tokens: 0,
                             token_times_ms: Vec::new(),
+                            finish: LaneFinish::Unknown,
                             error: Some(err),
                         },
                     }
@@ -760,6 +879,21 @@ impl Record {
                     self.itl.prefillers.len(),
                     if void == 0 { String::new() } else { format!(", {void} VOID") },
                 ));
+                // GitHub #114: how each lane ended, always -- a reader
+                // should never have to infer it from a token count.
+                for lane in &self.itl.lanes {
+                    out.push_str(&format!(
+                        "       lane {:<16} {:>6} tokens  ended: {}
+",
+                        lane.id,
+                        lane.n_tokens,
+                        lane.finish.describe(),
+                    ));
+                }
+                if let Some(warning) = self.itl.cap_warning() {
+                    out.push_str(&format!("  ITL  WARNING: {warning}
+"));
+                }
             }
         }
         out
@@ -970,6 +1104,7 @@ mod tests {
                 prompt_tokens: Some(prompt_tokens),
                 cached_prompt_tokens: if cached > 0 { Some(cached) } else { None },
                 token_times_ms,
+                finish_reason: Some(crate::client::FinishReason::Engine("length".into())),
             })
         }
     }
@@ -1083,6 +1218,7 @@ mod tests {
                     prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
                     cached_prompt_tokens: None,
                     token_times_ms: vec![1.0],
+                    finish_reason: Some(crate::client::FinishReason::Engine("length".into())),
                 })
             }
 
@@ -1093,10 +1229,12 @@ mod tests {
                 _suppress_eos: &[u32],
             ) -> Result<crate::client::Outcome, String> {
                 let mut token_times_ms = Vec::new();
+                let mut cancelled = false;
                 for tick in 1..=NEVER_CANCELLED {
                     let time_ms = tick as f64;
                     token_times_ms.push(time_ms);
                     if !observer(time_ms) {
+                        cancelled = true;
                         break;
                     }
                     std::thread::yield_now();
@@ -1109,6 +1247,9 @@ mod tests {
                     prompt_tokens: None,
                     cached_prompt_tokens: None,
                     token_times_ms,
+                    // This lane ran until the harness closed it, which is
+                    // what the fixture intends (GitHub #114).
+                    finish_reason: cancelled.then_some(crate::client::FinishReason::Cancelled),
                 })
             }
         }
@@ -1131,6 +1272,93 @@ mod tests {
         assert!(
             cell.lanes.iter().all(|lane| lane.n_tokens < NEVER_CANCELLED),
             "each lane must be *stopped* at the window boundary, not merely run out"
+        );
+        // GitHub #114: the record has to *say* that, rather than leave a
+        // reader to infer it from the token counts above.
+        assert!(
+            cell.lanes.iter().all(|lane| lane.finish == LaneFinish::Window),
+            "the boundary closed every lane, so every lane must record it: {:?}",
+            cell.lanes.iter().map(|l| l.finish).collect::<Vec<_>>()
+        );
+        assert!(cell.lanes_on_cap().is_empty());
+        assert_eq!(cell.cap_warning(), None, "no lane ended on the cap, so there is nothing to warn about");
+    }
+
+    /// GitHub #114. The mock generates exactly `max_tokens` and reports
+    /// `"length"` for it, which is precisely the shape the cap warning
+    /// exists to catch: the lanes end because the fixture said so, not
+    /// because the measurement did.
+    #[test]
+    fn lanes_that_end_on_the_cap_are_named_in_a_warning() {
+        let ep = MockEndpoint::new();
+        let cfg = ItlConfig {
+            prefill_prompt_tokens: 40,
+            prefill_max_tokens: 4,
+            prefill_count: 2,
+            decode_prompt_tokens: 24,
+            decode_max_tokens: 4,
+            decode_lanes: 2,
+        };
+        let cell = measure_itl(&ep, &MockTemplate::new(), &cfg);
+        assert_eq!(cell.lanes_on_cap().len(), 2, "{:?}", cell.lanes);
+        let warning = cell.cap_warning().expect("a leg whose lanes end on the cap must warn");
+        assert!(warning.contains("itl-decode-0"), "the warning names the lanes: {warning}");
+        assert!(warning.contains("itl-decode-1"), "the warning names the lanes: {warning}");
+        assert!(warning.contains('4'), "the warning states the cap: {warning}");
+    }
+
+    /// GitHub #114: every transport outcome the instrument can see maps to
+    /// exactly one recorded reason, so a record never has to be read by
+    /// guessing.
+    #[test]
+    fn every_transport_outcome_maps_to_one_recorded_reason() {
+        use crate::client::FinishReason;
+        let cases = [
+            (Some(FinishReason::Cancelled), LaneFinish::Window),
+            (Some(FinishReason::Engine("length".into())), LaneFinish::Cap),
+            (Some(FinishReason::Engine("stop".into())), LaneFinish::StopToken),
+            (Some(FinishReason::Engine("content_filter".into())), LaneFinish::Other),
+            (None, LaneFinish::Unknown),
+        ];
+        for (transport, expected) in cases {
+            assert_eq!(
+                LaneFinish::from_transport(transport.as_ref()),
+                expected,
+                "{transport:?}"
+            );
+        }
+        assert!(LaneFinish::Cap.is_cap());
+        assert!(!LaneFinish::Window.is_cap());
+    }
+
+    /// GitHub #114: the cap is the largest the engine's KV pool admits, and
+    /// the arithmetic that says so is checked rather than asserted in a
+    /// comment. Admission reserves the full `ceil((prompt + budget) /
+    /// page)` up front (`ignis_core::admission::AdmissionResources`), and
+    /// the pool is `ignis_runtime::kv_pool_tokens_for`'s 65,536 tokens at
+    /// the server's default `--max-context`. Those two numbers are mirrored
+    /// here rather than imported: this crate measures any OpenAI-compatible
+    /// engine and does not depend on ignis's own runtime.
+    #[test]
+    fn the_decode_cap_is_the_largest_the_kv_pool_admits() {
+        const PAGE_TOKENS: u32 = 64;
+        const POOL_PAGES: u32 = 65_536 / PAGE_TOKENS;
+        let pages = |tokens: u32| tokens.div_ceil(PAGE_TOKENS);
+        let peak = |cap: u32| {
+            ITL_DECODE_LANES as u32 * pages(ITL_DECODE_PROMPT_TOKENS + cap)
+                + pages(ITL_PREFILL_PROMPT_TOKENS + ITL_PREFILL_MAX_TOKENS)
+        };
+        assert!(
+            peak(ITL_DECODE_MAX_TOKENS) <= POOL_PAGES,
+            "the fixture's peak reservation ({} pages) must fit the pool ({POOL_PAGES})",
+            peak(ITL_DECODE_MAX_TOKENS)
+        );
+        // And it is the *largest* such cap: one more page per lane does not
+        // fit, so nothing is being left on the table.
+        assert!(
+            peak(ITL_DECODE_MAX_TOKENS + PAGE_TOKENS) > POOL_PAGES,
+            "a cap {} tokens higher would still fit -- raise it",
+            PAGE_TOKENS
         );
     }
 
