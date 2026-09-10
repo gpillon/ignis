@@ -501,8 +501,16 @@ fn measure_itl_with(
     let eos_tokens = std::sync::Arc::new(eos_tokens);
     let (mut lanes, prefillers) = std::thread::scope(|scope| {
         // The decode lanes: one streaming request each, held open until the
-        // sequential prefiller series ends. `decode_max_tokens` is only the
-        // safety reservation; cancellation normally ends the streams first.
+        // sequential prefiller series ends, then cancelled.
+        //
+        // Cancellation is the *intended* terminator, not the guaranteed
+        // one. It only gets the chance if the engine kept the lane alive
+        // that long, which needs the endpoint to have honoured the EOS
+        // suppression; an engine that honours neither `ignore_eos` nor
+        // `logit_bias` stops at its own EOS instead, and one that is fast
+        // enough reaches `decode_max_tokens` first. Either way the pooled
+        // intervals stay honest, because the guard below refuses any lane
+        // that ended before the final prefill window closed.
         let lane_handles: Vec<_> = decode_set
             .prompts
             .iter()
@@ -1230,13 +1238,20 @@ mod tests {
     }
 
     impl CorpusMock {
+        /// The id range reserved for the instruction suffix's words. Far
+        /// above `corpus_bank`'s ids, so an instruction word can never be
+        /// mistaken for a corpus atom.
+        const INSTRUCTION_ID_BASE: u32 = 800_000;
+
         /// The reserved id for `word` when it belongs to the instruction
-        /// suffix, or `None` when it does not.
+        /// suffix, or `None` when it does not. Read off the production
+        /// constant, so a change to the suffix reaches the mock rather than
+        /// silently bypassing it.
         fn instruction_id(word: &str) -> Option<u32> {
             ITL_DECODE_INSTRUCTION
                 .split_whitespace()
                 .position(|w| w == word)
-                .map(|i| 800_000 + i as u32)
+                .map(|i| Self::INSTRUCTION_ID_BASE + i as u32)
         }
     }
 

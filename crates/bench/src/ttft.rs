@@ -109,22 +109,33 @@ impl PromptTemplate for ignis_artifact::FrontendSet {
     }
 
     fn eos_token_ids(&self) -> Vec<u32> {
-        let Ok(config) = serde_json::from_slice::<serde_json::Value>(self.generation_config())
-        else {
-            return Vec::new();
-        };
-        match config.get("eos_token_id") {
-            Some(serde_json::Value::Number(id)) => id
-                .as_u64()
-                .and_then(|id| u32::try_from(id).ok())
-                .into_iter()
-                .collect(),
-            Some(serde_json::Value::Array(ids)) => ids
-                .iter()
-                .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
-                .collect(),
-            _ => Vec::new(),
-        }
+        eos_token_ids_from_generation_config(self.generation_config())
+    }
+}
+
+/// The `eos_token_id` entry of a HuggingFace `generation_config.json`, which
+/// is a single id in some artifacts and a list in others.
+///
+/// Returns empty for anything else — a missing entry, unparseable JSON, an
+/// id that is not a `u32`. Empty is not an error here: it means this
+/// artifact tells us no terminal token, so a measurement lane cannot ask an
+/// endpoint to suppress one. A caller that needs the lane to outlive EOS
+/// must check the lane's token count rather than trust the request.
+fn eos_token_ids_from_generation_config(bytes: &[u8]) -> Vec<u32> {
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return Vec::new();
+    };
+    match config.get("eos_token_id") {
+        Some(serde_json::Value::Number(id)) => id
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .into_iter()
+            .collect(),
+        Some(serde_json::Value::Array(ids)) => ids
+            .iter()
+            .filter_map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -270,39 +281,13 @@ pub fn generate_cell_prompts(
     target_tokens: usize,
     count: usize,
 ) -> Result<PromptSet, String> {
-    if count == 0 {
-        return Err("a cell needs at least one prompt".to_string());
-    }
-    let mut prompts = Vec::with_capacity(count);
-    let mut tokens = Vec::with_capacity(count);
-    for index in 0..count {
-        let prompt = generate_prompt(
-            template,
-            target_tokens,
-            &nonce(index),
-            0x9E3779B97F4A7C15 ^ (index as u64).wrapping_mul(0x100000001B3),
-        )?;
-        let ids = template.encode_user_message(&prompt)?;
-        if ids.len() != target_tokens {
-            return Err(format!(
-                "prompt {index} came out {} tokens, not the {target_tokens} the cell claims",
-                ids.len()
-            ));
-        }
-        prompts.push(prompt);
-        tokens.push(ids);
-    }
-    // The template's own overhead, as an upper bound on how much two
-    // samples may legitimately share.
-    let overhead = template.encode_user_message("")?.len();
-    prove_divergence(&tokens, overhead)?;
-    Ok(PromptSet { prompts, tokens })
+    generate_cell_prompts_with_suffix(template, target_tokens, count, "")
 }
 
 /// [`generate_cell_prompts`] with a fixed instruction appended to every
 /// prompt. The suffix is part of the measured token budget: each prompt
 /// still lands on `target_tokens` exactly, so a cell keeps its claimed
-/// length.
+/// length. An empty suffix is exactly [`generate_cell_prompts`].
 pub fn generate_cell_prompts_with_suffix(
     template: &dyn PromptTemplate,
     target_tokens: usize,
@@ -332,6 +317,8 @@ pub fn generate_cell_prompts_with_suffix(
         prompts.push(prompt);
         tokens.push(ids);
     }
+    // The template's own overhead, as an upper bound on how much two
+    // samples may legitimately share.
     let overhead = template.encode_user_message("")?.len();
     prove_divergence(&tokens, overhead)?;
     Ok(PromptSet { prompts, tokens })
@@ -1206,6 +1193,53 @@ mod tests {
         for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
             assert_eq!(template.encode_user_message(prompt).unwrap(), *ids);
         }
+    }
+
+    #[test]
+    fn an_artifacts_eos_entry_is_read_as_either_one_id_or_a_list() {
+        let one = eos_token_ids_from_generation_config(br#"{"eos_token_id": 151645}"#);
+        assert_eq!(one, vec![151_645]);
+        let many = eos_token_ids_from_generation_config(br#"{"eos_token_id": [151645, 151643]}"#);
+        assert_eq!(many, vec![151_645, 151_643]);
+    }
+
+    #[test]
+    fn an_unreadable_eos_entry_suppresses_nothing_rather_than_guessing() {
+        // Each of these means "this artifact names no terminal token": a
+        // measurement lane then has nothing to ask the endpoint to
+        // suppress, and must fall back to checking its own token count.
+        for bytes in [
+            &b"not json at all"[..],
+            br#"{}"#,
+            br#"{"eos_token_id": "151645"}"#,
+            br#"{"eos_token_id": null}"#,
+            br#"{"eos_token_id": -1}"#,
+            br#"{"eos_token_id": 4294967296}"#,
+        ] {
+            assert!(
+                eos_token_ids_from_generation_config(bytes).is_empty(),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_generated_cell_can_land_a_shared_suffix_without_changing_its_claimed_length() {
+        let template = MockTemplate::new();
+        let suffix = "do not stop early";
+        let set = generate_cell_prompts_with_suffix(&template, 64, 5, suffix)
+            .expect("generate with suffix");
+
+        for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
+            assert!(prompt.ends_with(suffix), "the instruction must stay at the end");
+            assert_eq!(ids.len(), 64, "the suffix must not change the fixture length");
+        }
+        // The empty suffix is the plain generator, exactly.
+        assert_eq!(
+            generate_cell_prompts_with_suffix(&template, 64, 5, "").expect("empty suffix").prompts,
+            generate_cell_prompts(&template, 64, 5).expect("plain").prompts,
+        );
     }
 
     #[test]

@@ -103,9 +103,11 @@ pub trait Endpoint: Send + Sync {
     /// string on failure (the driver records a failed request, not a panic).
     fn complete(&self, req: &Request) -> Result<Outcome, String>;
 
-    /// Complete a request while reporting each content-token arrival. The
-    /// default preserves simple test endpoints; streaming transports should
-    /// override it so observers run as chunks arrive, not after completion.
+    /// Complete a request while reporting each content-token arrival, with
+    /// no way to stop early. A convenience wrapper over
+    /// [`Endpoint::complete_observed_while`] — override *that* method, not
+    /// this one, so a streaming transport's observers run as chunks arrive
+    /// rather than after completion.
     fn complete_observed(
         &self,
         req: &Request,
@@ -124,12 +126,22 @@ pub trait Endpoint: Send + Sync {
     /// Stream a request while `observer` wants more tokens. Returning
     /// `false` stops reading the response immediately; HTTP transports
     /// thereby cancel the server-side generation by dropping the body.
+    ///
+    /// `suppress_eos` names the token ids a measurement lane must not stop
+    /// on (see [`request_body_suppressing_eos`]). It is a *request* the
+    /// endpoint may be unable to grant: this default ignores it, and even
+    /// the HTTP endpoint can only pass it on — an engine that honours
+    /// neither `ignore_eos` nor `logit_bias` still stops at its own EOS.
+    /// A caller that depends on a lane outliving EOS must check the lane's
+    /// token count rather than assume the request was honoured.
     fn complete_observed_while(
         &self,
         req: &Request,
         observer: &mut dyn FnMut(f64) -> bool,
         suppress_eos: &[u32],
     ) -> Result<Outcome, String> {
+        // No streaming transport here, so there is no request body to carry
+        // the suppression onto the wire.
         let _ = suppress_eos;
         let outcome = self.complete(req)?;
         for &time_ms in &outcome.token_times_ms {
@@ -326,21 +338,6 @@ impl Usage {
 impl Endpoint for HttpEndpoint {
     fn complete(&self, req: &Request) -> Result<Outcome, String> {
         self.complete_observed(req, &mut |_| {})
-    }
-
-    fn complete_observed(
-        &self,
-        req: &Request,
-        observer: &mut dyn FnMut(f64),
-    ) -> Result<Outcome, String> {
-        self.complete_observed_while(
-            req,
-            &mut |time_ms| {
-                observer(time_ms);
-                true
-            },
-            &[],
-        )
     }
 
     fn complete_observed_while(

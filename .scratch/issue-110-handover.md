@@ -28,7 +28,9 @@ reference lanes at 350, 545, 1,035, and 1,195 generated tokens with
   prefiller reserve at most 61,504 tokens, below the specified 65,536-token
   pool.
 - Decode streams run only until the final prefiller window ends, then the bench
-  cancels them instead of requiring them to exhaust the safety cap.
+  cancels them instead of requiring them to exhaust the safety cap. On the
+  reference leg that intent was not achieved: see "How each lane actually
+  ended" in `.scratch/g3-gate-110/README.md`.
 - Dropping an Ignis HTTP stream propagates cancellation into the engine and
   scheduler, releasing its slot and KV reservation.
 - Measurement lanes set Ignis `ignore_eos`; the normal serving default remains
@@ -85,6 +87,12 @@ decode lanes on both sides. The formal verdict is still FAIL because 1.106 is
 above ADR 0015's tolerated-with-warning ceiling of 1.10. Do not round this down
 or claim #110 is resolved.
 
+1.106 is **not** an improvement on the previously recorded 1.130. The two
+numbers measure different things -- different cap, EOS suppression,
+window-restricted pooling, cancellation -- and the harness itself refuses to
+compare records across that change. 1.130 is void; 1.106 is the first valid
+measurement, and it happens to fail too.
+
 Artifacts:
 
 - `.scratch/g3-gate-110/reference-final.json`.
@@ -139,14 +147,18 @@ ratio is 1.163 and the p95 ratio is 1.106. Restricting the reference to its
 blocked intervals alone moves its p95 from 201.1 ms to 204.0 ms, so its cheap
 decode rounds are not what makes it win the p95.
 
-**The p95 gap is prefill throughput, and the two engines are not running the
-same KV precision.** The records state it: Ignis is `BF16 KV`, the reference
-is `hq-e8-2b KV`. Every chunk's attention rereads the whole prior KV at
-32,768 tokens, so Ignis moves about twice the bytes on a bandwidth-bound
-operation. ADR 0015 chose this deliberately -- the reference is measured in
-the owner's production profile and the KV-format difference is "recorded next
-to the verdict as a known inequality, not corrected for". The v1 design doc
-schedules hq-e8-2b for phase 4 (G4), not phase 3.
+**The p95 gap is prefill throughput.** That much the records show. The
+leading explanation is that the two engines are not running the same KV
+precision -- Ignis is `BF16 KV`, the reference `hq-e8-2b KV` -- since every
+chunk's attention rereads the whole prior KV at 32,768 tokens, so Ignis moves
+roughly twice the bytes on a bandwidth-bound operation. ADR 0015 chose this
+inequality deliberately and records it next to the verdict rather than
+correcting for it, and the v1 design schedules hq-e8-2b for phase 4 (G4).
+
+Treat the KV explanation as a hypothesis. Nothing here isolates the KV format
+from the rest of what differs between the two engines, and ADR 0015 forecloses
+the matched-KV control that would test it. It becomes testable when Ignis has
+hq-e8-2b of its own.
 
 **The p50 gap is a different, real defect.** `ConcreteScheduler::advance`
 (`crates/core/src/concrete.rs:977`) runs exactly one prefill chunk and then
@@ -166,6 +178,15 @@ wrong. `crates/core/src/step.rs:555` batches every lane into one
 2. Add the evidence-backed result to GitHub issue #110 without closing it.
 3. If another run is requested, reproduce both live/live legs under one fresh
    session; do not reuse one side of `g3-110-window-cancel-v3` with a new run.
-4. Resolve #110 as deferred, with the two halves split by metric: the p95 to
-   G4's hq-e8-2b KV, the p50 and decode throughput to the phase-6 overlap
-   work. Both need their own issue.
+4. Propose resolving #110 as deferred, with the two halves split by metric:
+   the p95 to G4's hq-e8-2b KV, the p50 and decode throughput to the phase-6
+   overlap work. Both need their own issue.
+
+   Note this is a **substitution** of #110's own acceptance criterion, which
+   offers only "deferred to the phase-6 overlap work" as the escape hatch.
+   The evidence points the p95 half at phase 4 instead. That reassignment is
+   the repo owner's call, not the agent's, and #110 stays open until made.
+
+5. Raise the ITL decode cap for the next run, or record each lane's finish
+   reason in the record so a cap-terminated leg is visible in the data rather
+   than only by inspecting token counts.

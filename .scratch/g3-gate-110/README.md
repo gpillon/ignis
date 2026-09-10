@@ -20,6 +20,28 @@ back with no other process touching the GPU between legs (ADR 0015).
 | `reference.json` | First 3,072-cap attempt, one EOS id suppressed. No ITL verdict: the reference lanes still stopped early. |
 | `reference-2.json` | All artifact EOS ids sent as `logit_bias`. Still no ITL verdict — `finish=stop_token` persisted, which is what motivated ending the lanes by cancellation rather than by exhausting a cap. |
 
+## How each lane actually ended
+
+The two legs were **not** terminated by the same mechanism, which is worth
+knowing before trusting a re-run:
+
+| leg | lane | tokens | ended by |
+|---|---|---:|---|
+| ignis | all four | 897-909 | cancellation, all four at 102,325 ms |
+| reference | itl-decode-0 | 2,856 | its own EOS |
+| reference | itl-decode-1..3 | 3,072 | the safety cap |
+
+Only ignis honors `ignore_eos`; the reference was sent every artifact EOS id
+as a `logit_bias: -100` exclusion, which `reference-2.json` already recorded
+as insufficient (`finish=stop_token` persisted). So on the reference leg the
+3,072-token cap is load-bearing rather than spare: the lanes outlived the
+final window by 3.4 to 7.0 s, and a reference roughly 7% faster would have
+exhausted the cap before the window closed and had its lane refused.
+
+This does not invalidate these records. Every lane on both legs outlived the
+final prefill window, which is the property the pooling guard checks and the
+only one the metric depends on. It does mean a re-run should raise the cap.
+
 ## What the fixture now guarantees
 
 Both legs record a shared monotonic timeline, wait for a first token on
@@ -48,12 +70,19 @@ blocked-interval ratio is 1.163; restricting the reference to its blocked
 intervals alone moves its p95 only from 201.1 ms to 204.0 ms, so its cheap
 decode rounds are not what wins it the p95.
 
-The two engines are not running the same KV precision — the profiles say so
-(`BF16 KV` against `hq-e8-2b KV`). ADR 0015 chose that deliberately and
-records the difference next to the verdict rather than correcting for it;
-the v1 design doc schedules hq-e8-2b for phase 4. At 32,768 tokens every
-chunk's attention rereads the whole prior KV, so ignis moves about twice
-the bytes on a bandwidth-bound operation.
+The leading hypothesis for that prefill gap is the KV precision difference
+the profiles record (`BF16 KV` against `hq-e8-2b KV`). At 32,768 tokens
+every chunk's attention rereads the whole prior KV, so ignis moves roughly
+twice the bytes on a bandwidth-bound operation, which is the right order of
+magnitude for what was measured.
+
+**This is a hypothesis, not a measurement.** Nothing in these records
+isolates the KV format from everything else that differs between the two
+engines, and ADR 0015 forecloses the control that would test it directly:
+"Measuring the reference in a handicapped configuration ('same KV format')
+would compare a hypothetical against a hypothetical". It becomes testable
+only once ignis has hq-e8-2b of its own, which the v1 design schedules for
+phase 4.
 
 The p50 gap is separate and is ours: `ConcreteScheduler::advance` runs
 exactly one prefill chunk and then exactly one batched decode round, so a

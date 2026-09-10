@@ -155,7 +155,12 @@ struct SamplingRequestFields {
 }
 
 impl SamplingRequestFields {
-    fn resolve(self, max_tokens: Option<u32>) -> Result<DecodeParams, String> {
+    /// `ignore_eos` is an ignis extension for bounded measurement streams.
+    /// It is refused without a `max_tokens`, because the two together are
+    /// what keeps such a request bounded: with neither an EOS nor a cap,
+    /// a non-streaming request has nothing left to stop it, and only the
+    /// streaming path cancels on client disconnect.
+    fn resolve(self, max_tokens: Option<u32>, ignore_eos: bool) -> Result<DecodeParams, String> {
         let temperature = bounded_f32(
             "temperature",
             number("temperature", self.temperature, 0.0)?,
@@ -186,6 +191,13 @@ impl SamplingRequestFields {
             ));
         }
 
+        if ignore_eos && max_tokens.is_none() {
+            return Err(
+                "ignore_eos is an ignis extension for bounded measurement streams and requires max_tokens"
+                    .into(),
+            );
+        }
+
         if temperature == 0.0
             && (top_p != 1.0
                 || (top_k != 0 && top_k != 20)
@@ -208,7 +220,7 @@ impl SamplingRequestFields {
             // The leaf keys its counter-based RNG with all 64 bits. Casting
             // preserves the complete signed OpenAI seed domain bit-for-bit.
             seed: signed_integer("seed must be a signed 64-bit integer", self.seed, 0)? as u64,
-            ignore_eos: false,
+            ignore_eos,
         })
     }
 }
@@ -432,7 +444,9 @@ struct ChatCompletionsRequest {
     /// usage chunk (empty `choices`, populated `usage`) before `[DONE]`.
     stream_options: Option<StreamOptions>,
     max_tokens: Option<u32>,
-    /// Non-standard bounded-stream control used by the ITL measurement.
+    /// An ignis extension: keep decoding past the model's EOS token. Used
+    /// by the G3 inter-token-latency lanes, which are ended by the
+    /// measurement window rather than by the model. Requires `max_tokens`.
     #[serde(default)]
     ignore_eos: bool,
     #[serde(flatten)]
@@ -466,11 +480,10 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
-    let mut params = match req.sampling.resolve(req.max_tokens) {
+    let params = match req.sampling.resolve(req.max_tokens, req.ignore_eos) {
         Ok(params) => params,
         Err(message) => return invalid_sampling_parameter(message),
     };
-    params.ignore_eos = req.ignore_eos;
     let thinking = match resolve_thinking(
         &server,
         ThinkingRequestFields {

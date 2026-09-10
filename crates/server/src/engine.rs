@@ -50,16 +50,19 @@ pub type EventStream = UnboundedReceiver<SchedEvent>;
 /// A request's event route (the engine's side of its stream).
 pub type EventRoute = UnboundedSender<SchedEvent>;
 
-/// A command sent from the async/HTTP side to the model thread. `submit` is
-/// the only one today (design §"the command channel") — `model_id` is
-/// static, cloneable state on the `Engine` handle, and `is_idle` never left
-/// the model thread's own loop.
+/// A command sent from the async/HTTP side to the model thread: `submit`
+/// (design §"the command channel") and `cancel`, the two operations that
+/// must reach the scheduler the model thread owns. `model_id` is static,
+/// cloneable state on the `Engine` handle, and `is_idle` never left the
+/// model thread's own loop.
 enum Command {
     Submit {
         input: RequestInput,
         class: RequestClass,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
     },
+    /// Abort an in-flight request (its HTTP client disconnected). No
+    /// reply channel: the caller is a `Drop` impl with nothing to await.
     Cancel {
         request: RequestId,
     },

@@ -392,6 +392,60 @@ async fn an_unknown_model_is_a_404() {
 }
 
 #[tokio::test]
+async fn ignore_eos_reaches_the_decode_params_the_scheduler_deals() {
+    let mock = Arc::new(MockCompute::new());
+    let h = harness_over(mock.clone() as Arc<dyn Compute>);
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 2,
+        "ignore_eos": true
+    });
+    let (status, _body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200);
+    let jobs: Vec<_> = mock.decode_calls().into_iter().flatten().collect();
+    assert!(!jobs.is_empty(), "the request must have reached a decode step");
+    assert!(
+        jobs.iter().all(|job| job.params.ignore_eos),
+        "the wire field must reach DecodeParams, not stop at the handler"
+    );
+}
+
+#[tokio::test]
+async fn ignore_eos_without_a_token_cap_is_a_400() {
+    let h = harness();
+    // Nothing else would bound such a request: no EOS, no cap, and the
+    // non-streaming path has no client-disconnect cancellation.
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "ignore_eos": true
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 400, "unbounded ignore_eos should be 400: {body}");
+    assert!(body.contains("max_tokens"), "the error must name what is missing: {body}");
+}
+
+#[tokio::test]
+async fn a_request_that_says_nothing_about_eos_keeps_the_serving_default() {
+    let mock = Arc::new(MockCompute::new());
+    let h = harness_over(mock.clone() as Arc<dyn Compute>);
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 2
+    });
+    let (status, _body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200);
+    let jobs: Vec<_> = mock.decode_calls().into_iter().flatten().collect();
+    assert!(!jobs.is_empty(), "the request must have reached a decode step");
+    assert!(
+        jobs.iter().all(|job| !job.params.ignore_eos),
+        "normal serving must keep stopping at EOS"
+    );
+}
+
+#[tokio::test]
 async fn empty_messages_is_a_400() {
     let h = harness();
     let req = serde_json::json!({

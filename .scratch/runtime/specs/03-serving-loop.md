@@ -232,13 +232,22 @@ intervals are sampled for the entire series; p50, p95, p99 and max are all
 recorded and p95 decides. The original 512-token estimate was falsified by
 the live reference: lanes exhausted it after 15-19 seconds while the ten
 prefillers lasted about 62 seconds. A 3,072-token safety reservation fits the
-65,536-token pool, and the instrument cancels every lane immediately after
-the final prefill window so unused generation capacity is released. To keep
-the measurement lanes alive until that boundary, their prompt ends with an
-explicit request for at least 3,072 output tokens (the corpus window is
-shortened so the post-template prompt remains exactly 4,096 tokens), and the
-measurement request suppresses the artifact's EOS ids. Normal serving keeps
-its existing EOS behavior.
+65,536-token pool, and the instrument cancels every lane once the final
+prefill window closes. To keep the measurement lanes alive until that
+boundary, their prompt ends with an explicit request for at least 3,072
+output tokens (the corpus window is shortened so the post-template prompt
+remains exactly 4,096 tokens), and the measurement request suppresses the
+artifact's EOS ids. Normal serving keeps its existing EOS behavior.
+
+Cancellation is the intended terminator but not a guaranteed one: an
+endpoint that honors neither ignis `ignore_eos` nor `logit_bias` still stops
+at its own EOS, and a fast enough engine reaches the 3,072-token cap first.
+The measurement does not depend on which of the three ends a lane. What it
+depends on is the guard that refuses any lane ending before the final
+prefill window closed, so every pooled interval comes from a series that had
+all four lanes alive throughout. A run in which a leg's lanes end on the cap
+is a run whose cap is load-bearing rather than spare, and the next fixture
+revision should raise it.
 
 Alongside the three cells, two non-negotiables: the functional
 anti-serialization property above, proven by a CPU test rather than inferred
