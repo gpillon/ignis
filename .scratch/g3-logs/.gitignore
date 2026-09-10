@@ -1,0 +1,11 @@
+# Working scratch from the gate session: server stdout captures. The
+# records that back the verdict are listed in README.md and tracked
+# explicitly.
+*
+!.gitignore
+!README.md
+!g3-reference-20260910.json
+!g3-ignis-chunk1024-20260910.json
+!g3-verdict-chunk1024-20260910.json
+!g3-ignis-chunk512-20260910.json
+!g3-verdict-chunk512-20260910.json

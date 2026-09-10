@@ -120,11 +120,29 @@ Rust only, no GPU). Critical path: #99 → #102 → #104 — the sampler is insi
 the round the graph captures, so a graph captured before it would have to be
 captured again.
 
-Current frontier (2026-09-09): the four G3 starts above. Open alongside them,
-both out of the gate path: **#92** (per-chunk prefill synchronization
-investigation, which now also decides packed prefill's phase) and **#95**
-(expose the server's `request_timeout`). (Grabbable tickets only — status and
-blocking live on GitHub.)
+Open alongside the G3 starts, both out of the gate path: **#92** (per-chunk
+prefill synchronization overhead investigation, which now also decides
+packed prefill's phase) and **#95** (expose the server's `request_timeout`).
+(Grabbable tickets only — status and blocking live on GitHub.)
+
+**Phase 3 closed 2026-09-10 — G3 PARTIAL PASS, one gap filed.** Live/live,
+one session, free 5090, `ignis-bench g3` over HTTP/SSE:
+
+| cell | ignis | reference | ratio |
+|---|---|---|---|
+| C=1 | 71.7 tok/s | 65.5 tok/s | 1.095 PASS |
+| C=4 aggregate | 20.5 tok/s | 9.8 tok/s | 2.089 PASS |
+| ITL p95 | 201.14 ms | 177.93 ms | 1.130 FAIL |
+
+Serving prefill chunk width used: **1024** (reference's own width, and the
+width reserved at model load). A chunk=512 comparison made ITL p95 worse
+(ratio 1.181), so the search stopped rather than becoming an ad hoc sweep.
+The anti-serialization property, G2 correctness, and the GPU profile are all
+green on this tree. The ITL gap is **#110**, not waived — and it may share a
+root cause with the still-open **#92** (per-chunk synchronization overhead):
+both point at fixed per-chunk-boundary cost rather than chunk-proportional
+cost. Full verdict and records: `.scratch/REVIEW-2026-09-05.md` §6 Phase 3,
+`.scratch/g3-logs/`. #64 is closed on this verdict per its own text.
 
 ## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
 

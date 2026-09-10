@@ -1,0 +1,42 @@
+{
+  "session": "g3-20260910T001050Z",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b-nvfp4full-v2",
+  "reference_engine": "qwen3.8-27b-nvfp4full-v2",
+  "ours_profile": "BF16 KV, 512 chunk, CUDA graphs, K=1",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs, prefix reuse",
+  "ours_date": "2026-09-10T00:23:17Z",
+  "reference_date": "2026-09-10T00:13:32Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 71.27496000502813,
+    "reference_tok_s": 65.49987477047753,
+    "ratio": 1.088169408793337,
+    "passed": true
+  },
+  "c4": {
+    "ours_tok_s": 23.899144836293228,
+    "reference_tok_s": 9.809166587702876,
+    "ratio": 2.4364093139425376,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 44.62285000000156,
+    "ours_p95_ms": 210.04896999999946,
+    "ours_p99_ms": 228.37573300000201,
+    "ours_max_ms": 256.9738000000016,
+    "reference_p50_ms": 17.216949999998178,
+    "reference_p95_ms": 177.93128500000094,
+    "reference_p99_ms": 193.8349759999999,
+    "reference_max_ms": 214.47890000000007,
+    "ratio": 1.1805061150432221,
+    "passed": false
+  },
+  "notes": [
+    "chunk=512 comparison run"
+  ],
+  "passed": false
+}
