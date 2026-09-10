@@ -218,6 +218,19 @@ Fixtures are stated as reserved `context_tokens`, because `ignis_seq_alloc`
 reserves, materializes and zeroes pages for the full prompt-plus-cap
 entitlement at allocation.
 
+**Each engine's server process is launched at least twice within the session
+(ADR 0021, GitHub #116).** One process launch's C=1/C=4/ITL numbers can sit
+5-17% away from a second launch of the exact same binary on the exact same
+GPU, moments apart -- confirmed live, and not explained by code, by slow
+drift over a launch's life, by heat or clock carryover from whichever
+process ran just before, or by the GPU's own sustained clock (identical
+between a fast and a slow launch during genuine compute activity). A gate
+computed from one launch per engine can therefore be deciding which process
+each engine happened to draw that session, not which engine is faster. The
+verdict is taken from the cell statistic pooled across every launch, not
+from one launch arbitrarily picked, and a run that reports only one launch
+per engine is not a valid G3 reading.
+
 | cell | fixture | reserved `context_tokens` | pool 65,536 | verdict |
 |---|---|---|---|---|
 | C=1 | prompt 8,192, cap 256 | 8,448 | headroom 57,088 | at least 99% of the live reference's tok/s (historically ~75–76) |

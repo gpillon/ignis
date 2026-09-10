@@ -6,6 +6,14 @@ Accepted (2026-09-07, grilling session for GitHub #63). **Clarifies ADR 0007**
 (performance gates, not parity) and sets the measurement method the later
 performance gates (G3, G4, G5) are expected to follow.
 
+**Amended (2026-09-10) by ADR 0021** (GitHub #116): a live/live comparison
+must pool at least two independent process launches per engine within the
+session, not rely on within-launch repetition alone — #116 found that one
+process launch's throughput can sit consistently 5-17% away from another
+launch of the exact same binary, on the exact same GPU, moments apart. Every
+decision below still holds; ADR 0021 adds the launch-pooling requirement on
+top of it.
+
 Sources: `.scratch/runtime/specs/02-real-prefill.md` (GitHub #63, the spec
 this ADR serves), `.scratch/REVIEW-2026-09-05.md` §6 (Phase 2), the
 reference's published context-length tables.

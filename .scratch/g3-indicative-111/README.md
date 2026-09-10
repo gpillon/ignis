@@ -80,17 +80,28 @@ identical code. The pre-#111 server shows the same thing from the other
 side — its first sample, 73.9, sits in the fast band and its next four in
 the slow one.
 
-What decides the band is not known. It is not the tree, since both trees
-produced both bands, and it is not run order, since the fast server stayed
-fast across three runs while the pre-#111 server changed band after one.
-What is known is that it is stable within a process, which is why the
-earlier claim here that "the instrument is tight" was only true of
-back-to-back runs against one server.
+What decides the band is not the tree (both trees produced both bands here)
+and not simple run order (see below). **Follow-up in `variance/`
+(2026-09-10) narrowed it further**: it is not slow drift over a launch's
+life (one launch held its band across 21 minutes including an idle gap),
+not heat or clock state carried from whichever process ran just before (a
+second launch landed in its own band on its very first sample, immediately
+after the first was stopped), and not the GPU's own sustained clock (busy-
+time SM clock was identical between a fast-band and a slow-band launch,
+2,823 vs 2,824 MHz). The leading hypothesis is host-side per-token
+overhead (kernel dispatch, sync wait behavior, OS thread scheduling) —
+plausible given a decode token is only ~13-15 ms wide, but not provable
+without a host/device-correlated profiler this repo does not have. What is
+known is that it is stable within one process launch, which is why the
+earlier claim here that "the instrument is tight" was only ever true of
+back-to-back runs against one launch.
 
 **This matters for the gate.** A live/live run measures the two engines in
 two server processes by construction, because one has to be stopped for the
 other to start. If a process can be 17% off on identical code, a ratio
-taken across two of them carries that. Filed separately.
+taken across two of them carries that. Filed as #116; closed by ADR 0021,
+which has the gate pool at least two launches per engine rather than trust
+one.
 
 Both conclusions below survive it, because they do not rest on comparing
 one sample to one sample:
