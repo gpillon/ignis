@@ -1,5 +1,5 @@
 //! GPU integration coverage for P3-05's decode CUDA graphs (GitHub #102,
-//! ADR 0019) and P3-06's batch-wide decode round (GitHub #111): a decode
+//! ADR 0019) and the batch-wide decode round (GitHub #111): a decode
 //! graph replayed at exact batch width 1..=8 must emit the identical token
 //! stream the same traversal run eagerly would have, a prefill chunk run
 //! between two replays must not disturb a later replay's output, the round

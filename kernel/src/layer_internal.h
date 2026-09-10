@@ -127,7 +127,7 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
                                   uint32_t layer, const void *in_residual, void *out_residual,
                                   uint64_t num_tokens, LinearPolicyMode mode);
 
-// P3-06 (GitHub #111), superseding P3-05's per-lane form: one GQA layer's
+// GitHub #111, superseding P3-05's per-lane form: one GQA layer's
 // body for a whole decode round of `width` lanes, one token each, as a
 // single [.., width] batch. Unlike `ignis_gqa_layer_run_body`, this takes no
 // `ignis_seq*` -- every address it touches is either fixed for the model's
@@ -158,7 +158,7 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
                                        uint32_t width, const void *in_residual, void *out_residual,
                                        LinearPolicyMode mode);
 
-// P3-06 (GitHub #111): one decode round's whole forward pass -- embedding,
+// GitHub #111: one decode round's whole forward pass -- embedding,
 // every decoder layer's graph-safe body once at `width`-wide batch, final
 // norm, output head -- enqueued on the model's stream, leaving the round's
 // `[vocab, width]` logits in `model->sampling_decode_logits` for the

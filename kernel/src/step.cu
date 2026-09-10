@@ -647,7 +647,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   return 0;
 }
 
-// P3-03 (GitHub #99) / P3-06 (GitHub #111): one call over every decode-ready
+// P3-03 (GitHub #99) / GitHub #111: one call over every decode-ready
 // lane, each sampled with its own `sampling[i]`. The round is one `B`-wide
 // traversal of the model (`ignis_decode_graph_run_batch`,
 // kernel/src/decode_graph.cu) leaving `[vocab, batch_size]` logits in the
@@ -735,7 +735,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
 
-    // P3-06 (GitHub #111): the round's per-lane token ids and physical pool
+    // GitHub #111: the round's per-lane token ids and physical pool
     // slots are staged for *both* paths -- the B-wide traversal reads them
     // from device memory whether it is being replayed from a captured graph
     // or enqueued directly, so there is no host-indexed variant left.
@@ -813,7 +813,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       ++sequences[i]->position;
       // Only once the synchronize above confirms the round's device work
       // completed (mirrors `ignis_gqa_layer_step`'s own ordering, and the
-      // chunked prefill's). P3-06 (GitHub #111): both decode paths now read
+      // chunked prefill's). GitHub #111: both decode paths now read
       // their RoPE/attention positions from `sampling_decode_positions`
       // (staged from `seq->position`) rather than from this counter, but the
       // counter still feeds the per-token prefill route and the layer
@@ -826,7 +826,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         }
       }
     }
-    // P3-06 (GitHub #111): one traversal of the model per round, whatever
+    // GitHub #111: one traversal of the model per round, whatever
     // the batch width and whichever path ran it -- the dispatch count is the
     // layer count, not the layer count times the width. This is the leaf
     // instrumentation the issue's acceptance asks for: at B>1 it stays equal

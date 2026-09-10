@@ -1,5 +1,5 @@
-// ignis kernel leaf - P3-05 (GitHub #102, ADR 0019) and P3-06 (GitHub #111,
-// ADR 0020): the decode round's forward pass, and one CUDA graph capturing
+// ignis kernel leaf - P3-05 (GitHub #102, ADR 0019) and GitHub #111 (ADR
+// 0020): the decode round's forward pass, and one CUDA graph capturing
 // it per exact batch width 1..IGNIS_DECODE_MAX_BATCH. The program layer is
 // ours; every dispatched op is the ADR 0010 vendored reference
 // implementation, called through the graph-safe layer bodies
@@ -44,7 +44,7 @@ void set_error(std::string message) {
 
 } // namespace
 
-// P3-06 (GitHub #111): one decode round's complete forward pass as a single
+// GitHub #111: one decode round's complete forward pass as a single
 // `width`-wide traversal of the model -- embedding (every lane's token id
 // read from `decode_graph_token_ids`, a contiguous I32 [width]) -> every
 // decoder layer's graph-safe body once, with batch-shaped activations ->

@@ -635,7 +635,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     return -1;
   }
 
-  // P3-05 (GitHub #102, ADR 0019) / P3-06 (GitHub #111): the decode rounds'
+  // P3-05 (GitHub #102, ADR 0019) / GitHub #111: the decode rounds'
   // own scratch and staging buffers, reserved once here and never touched by
   // prefill -- so a chunk running between two replays can never alias what a
   // replay rereads. Sized for the widest round the leaf admits: one token

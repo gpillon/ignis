@@ -245,7 +245,7 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   }
 }
 
-// P3-06 (GitHub #111): the graph-safe counterpart of `run_gqa_layer` for a
+// GitHub #111: the graph-safe counterpart of `run_gqa_layer` for a
 // whole decode round -- `width` lanes at one token each, traversed once as a
 // [.., width] batch, not `width` times at batch 1. Every address either
 // belongs to the model/pool for their lifetime or is a stable staging
@@ -498,7 +498,7 @@ int32_t ignis_gqa_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
   return 0;
 }
 
-// P3-06 (GitHub #111): validates and dispatches `run_gqa_layer_graph` --
+// GitHub #111: validates and dispatches `run_gqa_layer_graph` --
 // called once per GQA layer per decode round (not per lane) by
 // `kernel/src/decode_graph.cu`, either while a graph is being captured or
 // when the round runs eagerly at a width whose capture failed. It does no

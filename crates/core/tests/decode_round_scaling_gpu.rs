@@ -1,4 +1,4 @@
-//! P3-06 measurement (GitHub #111): what a decode round costs at batch width
+//! Decode-round scaling measurement (GitHub #111): what a decode round costs at batch
 //! 4 relative to its own width-1 round.
 //!
 //! This is the issue's own no-profiler check that the round is a single
@@ -160,7 +160,7 @@ fn a_wide_decode_round_costs_about_what_its_single_lane_round_costs() {
 
     let ratio = wide.as_secs_f64() / single.as_secs_f64();
     println!(
-        "P3-06 measurement: decode round B=1 {:.2} ms, B={WIDE} {:.2} ms -> {ratio:.2}x \
+        "#111 measurement: decode round B=1 {:.2} ms, B={WIDE} {:.2} ms -> {ratio:.2}x \
          (#111's pre-fix baseline was 4.81x at B=4; the live reference pays 1.07x)",
         single.as_secs_f64() * 1e3,
         wide.as_secs_f64() * 1e3,

@@ -6,7 +6,7 @@ Accepted (2026-09-09) — P3-05, GitHub #102. Supersedes ADR 0008's staging-buff
 model (already superseded once by ADR 0009) with a design that actually fits
 the batched decode round P3-03 (GitHub #99) built.
 
-**Amended (2026-09-10) by ADR 0020** (P3-06, GitHub #111): the staging
+**Amended (2026-09-10) by ADR 0020** (GitHub #111): the staging
 buffers and device-resident slot indirection below stand unchanged, but the
 Decision's "keep the round's existing per-lane *sequential* structure" is
 reversed — a decode round is now one batch-wide traversal of the model, the

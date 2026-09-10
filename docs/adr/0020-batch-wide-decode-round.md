@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-09-10) — P3-06, GitHub #111. Amends ADR 0019: its staging and
+Accepted (2026-09-10) — GitHub #111. Amends ADR 0019: its staging and
 slot-indirection mechanism stands unchanged; its decision to keep the round's
 *per-lane sequential structure* is reversed here.
 

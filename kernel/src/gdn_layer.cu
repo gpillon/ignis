@@ -273,7 +273,7 @@ int32_t run_gdn_layer(ignis_model *model, ignis_seq_pool *pool, int32_t slot, ui
   }
 }
 
-// P3-06 (GitHub #111): the graph-safe counterpart of `run_gdn_layer` for a
+// GitHub #111: the graph-safe counterpart of `run_gdn_layer` for a
 // whole decode round -- `width` lanes at one token each, traversed once as a
 // [.., width] batch rather than `width` times at batch 1.
 // `causal_conv1d_silu_snapshot` / `gated_delta_net_snapshot` replace the
@@ -501,7 +501,7 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
   return 0;
 }
 
-// P3-06 (GitHub #111): validates and dispatches `run_gdn_layer_graph` --
+// GitHub #111: validates and dispatches `run_gdn_layer_graph` --
 // called once per GDN layer per decode round (not per lane) by
 // `kernel/src/decode_graph.cu`, either while a graph is being captured or
 // when the round runs eagerly at a width whose capture failed.

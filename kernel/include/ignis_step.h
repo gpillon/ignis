@@ -158,7 +158,7 @@ const char *ignis_step_last_error(void);
  * the number of program-layer dispatches in the latest step: the leaf's
  * stable, graph-independent dispatch counter, unaffected by whether that
  * step replayed a graph. For a decode round that is the model's layer
- * count, at every batch width and on either path (P3-06, GitHub #111: the
+ * count, at every batch width and on either path (GitHub #111: the
  * round is one batch-wide traversal, so its dispatch count no longer scales
  * with the width -- it did before, one complete traversal per lane).
  * `graph_launches` (P3-05, GitHub #102) is the number of `cudaGraphLaunch`
