@@ -178,15 +178,12 @@ wrong. `crates/core/src/step.rs:555` batches every lane into one
 2. Add the evidence-backed result to GitHub issue #110 without closing it.
 3. If another run is requested, reproduce both live/live legs under one fresh
    session; do not reuse one side of `g3-110-window-cancel-v3` with a new run.
-4. Propose resolving #110 as deferred, with the two halves split by metric:
-   the p95 to G4's hq-e8-2b KV, the p50 and decode throughput to the phase-6
-   overlap work. Both need their own issue.
-
-   Note this is a **substitution** of #110's own acceptance criterion, which
-   offers only "deferred to the phase-6 overlap work" as the escape hatch.
-   The evidence points the p95 half at phase 4 instead. That reassignment is
-   the repo owner's call, not the agent's, and #110 stays open until made.
+4. **Done.** #110 is resolved as deferred, split by metric: the p95 to phase
+   4's hq-e8-2b KV (#112), the p50 and decode throughput to the phase-6
+   overlap work (#113). This substitutes #110's own acceptance criterion,
+   which named only phase 6 as the escape hatch; the repo owner made that
+   reassignment on 2026-09-10.
 
 5. Raise the ITL decode cap for the next run, or record each lane's finish
    reason in the record so a cap-terminated leg is visible in the data rather
-   than only by inspecting token counts.
+   than only by inspecting token counts. Tracked as #114.

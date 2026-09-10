@@ -40,7 +40,8 @@ exhausted the cap before the window closed and had its lane refused.
 
 This does not invalidate these records. Every lane on both legs outlived the
 final prefill window, which is the property the pooling guard checks and the
-only one the metric depends on. It does mean a re-run should raise the cap.
+only one the metric depends on. It does mean a re-run should raise the cap
+and record each lane's finish reason, which is filed as #114.
 
 ## What the fixture now guarantees
 

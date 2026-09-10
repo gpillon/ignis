@@ -249,6 +249,18 @@ all four lanes alive throughout. A run in which a leg's lanes end on the cap
 is a run whose cap is load-bearing rather than spare, and the next fixture
 revision should raise it.
 
+**ITL p95 is deferred to phase 4 (GitHub #110, #112).** The live/live re-run
+on a valid fixture measured 1.106 against a 1.10 ceiling. During a prefill
+window the ITL floor is one chunk plus one decode round, so the p95 is
+effectively a second measurement of prefill throughput: ignis's intervals
+blocked behind a chunk average 180.8 ms against the reference's 155.4 ms,
+which is a 1.163 ratio on the quantity the p95 is actually reading. There is
+no phase-3 dial for that. The leading explanation is the KV precision the
+two engines run (BF16 against hq-e8-2b), which ADR 0015 records as a known
+inequality rather than correcting for, and which the v1 design schedules for
+phase 4. C=1 and C=4 pass; the ITL cell is recorded as a warning carried into
+phase 4, not waived. The separate p50 gap is ours and is tracked as #113.
+
 Alongside the three cells, two non-negotiables: the functional
 anti-serialization property above, proven by a CPU test rather than inferred
 from a permissive envelope; and the G2 correctness checks (teacher-forced
