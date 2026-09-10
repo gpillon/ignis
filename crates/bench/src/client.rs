@@ -102,6 +102,21 @@ pub trait Endpoint: Send + Sync {
     /// Send one request and return its outcome. Returns a human-readable error
     /// string on failure (the driver records a failed request, not a panic).
     fn complete(&self, req: &Request) -> Result<Outcome, String>;
+
+    /// Complete a request while reporting each content-token arrival. The
+    /// default preserves simple test endpoints; streaming transports should
+    /// override it so observers run as chunks arrive, not after completion.
+    fn complete_observed(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64),
+    ) -> Result<Outcome, String> {
+        let outcome = self.complete(req)?;
+        for &time_ms in &outcome.token_times_ms {
+            observer(time_ms);
+        }
+        Ok(outcome)
+    }
 }
 
 /// A mock endpoint for tests: returns canned outcomes in order and records the
@@ -275,6 +290,14 @@ impl Usage {
 
 impl Endpoint for HttpEndpoint {
     fn complete(&self, req: &Request) -> Result<Outcome, String> {
+        self.complete_observed(req, &mut |_| {})
+    }
+
+    fn complete_observed(
+        &self,
+        req: &Request,
+        observer: &mut dyn FnMut(f64),
+    ) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         // The trace line's prompt becomes a single user message (the trace
         // format is prompt-based; the shared "system + tools" prefix is
@@ -295,7 +318,7 @@ impl Endpoint for HttpEndpoint {
             return Err(format!("POST {url} -> {status}: {detail}"));
         }
         if req.stream {
-            self.read_sse(resp, start)
+            self.read_sse(resp, start, observer)
         } else {
             self.read_json(resp, start)
         }
@@ -336,7 +359,12 @@ impl HttpEndpoint {
     /// content chunk per token (a token's delta), a finish chunk (an empty
     /// delta + `finish_reason`), a terminal `[DONE]` marker. ttft is the
     /// first content chunk; the token count is the non-empty deltas.
-    fn read_sse(&self, resp: Response, start: Instant) -> Result<Outcome, String> {
+    fn read_sse(
+        &self,
+        resp: Response,
+        start: Instant,
+        observer: &mut dyn FnMut(f64),
+    ) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let reader = std::io::BufReader::new(resp);
         let mut n_tokens: u32 = 0;
@@ -382,6 +410,7 @@ impl HttpEndpoint {
                     first_token_ms = Some(now_ms);
                 }
                 token_times_ms.push(now_ms);
+                observer(now_ms);
                 output.push_str(delta);
                 n_tokens += 1;
             }

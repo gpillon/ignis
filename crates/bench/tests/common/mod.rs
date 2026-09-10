@@ -11,7 +11,7 @@
 //!
 //! Deterministic pacing: a fixed prefill before the first SSE chunk (the
 //! mock's "prefill" — what the client measures as ttft); the remaining
-//! chunks come back-to-back (keep the tests fast), and a non-streaming
+//! chunks arrive at a fixed decode cadence, and a non-streaming
 //! request's "generation" time is the prefill + a per-token decode interval.
 //! Token counts are capped (`MAX_TOKENS`) to keep the tests fast. The mock
 //! tracks how many requests are in flight (and the peak), so the tests can
@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -288,7 +289,7 @@ async fn completions(
         // The SSE response: hold the request for the prefill (the client's
         // "prefill" phase — its ttft), then emit the
         // `chat.completion.chunk` events (a content chunk per token, a
-        // `finish_reason` chunk, then `[DONE]`) back-to-back.
+        // `finish_reason` chunk, then `[DONE]`) at a fixed cadence.
         let guard = InFlightGuard::enter(state.inner.clone());
         tokio::time::sleep(PREFILL).await;
         let usage = req
@@ -297,7 +298,7 @@ async fn completions(
             .is_some_and(|o| o.include_usage)
             .then_some((prompt_tokens, cached));
         let events = paced_chunks(&id, &model, created, n, usage);
-        Sse::new(BackToBackSse::new(state.inner.clone(), n, guard, events)).into_response()
+        Sse::new(PacedSse::new(state.inner.clone(), n, guard, events)).into_response()
     } else {
         // Non-streaming: hold the request in flight for the "generation"
         // time (prefill + per-token decode), then the single JSON body.
@@ -430,7 +431,7 @@ fn usage_chunk(
 
 /// The SSE events for a request: a content chunk per token, the finish
 /// chunk (empty delta + `finish_reason`), then the `[DONE]` marker. The
-/// stream (`BackToBackSse`) emits them back-to-back; the prefill wait
+/// stream (`PacedSse`) emits them at the mock decode cadence; the prefill wait
 /// happens in the handler, before the stream is built.
 fn paced_chunks(
     id: &str,
@@ -500,20 +501,21 @@ impl Drop for InFlightGuard {
     }
 }
 
-// ── the back-to-back SSE stream ───────────────────────────────────────────
+// ── the paced SSE stream ──────────────────────────────────────────────────
 
-/// The back-to-back SSE stream: emits the pre-built events one per poll
+/// The paced SSE stream: emits the pre-built events at [`TOKEN`] cadence
 /// (the prefill wait happens in the handler, before the stream is built).
 /// The in-flight guard is released when the stream ends (a normal end or a
 /// drop).
-struct BackToBackSse {
+struct PacedSse {
     inner: Arc<Inner>,
     n: u32,
     events: VecDeque<Event>,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
     guard: Option<InFlightGuard>,
 }
 
-impl BackToBackSse {
+impl PacedSse {
     fn new(
         inner: Arc<Inner>,
         n: u32,
@@ -524,16 +526,23 @@ impl BackToBackSse {
             inner,
             n,
             events,
+            delay: None,
             guard: Some(guard),
         }
     }
 }
 
-impl Stream for BackToBackSse {
+impl Stream for PacedSse {
     type Item = Result<Event, Infallible>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let me = self.get_mut();
+        if let Some(delay) = &mut me.delay {
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            me.delay = None;
+        }
         if me.events.is_empty() {
             // The stream is done: record the completion and release the
             // in-flight guard (its drop decrements the count).
@@ -541,12 +550,15 @@ impl Stream for BackToBackSse {
             me.guard.take();
             return Poll::Ready(None);
         }
-        // One event per poll (they come back-to-back after the prefill).
-        Poll::Ready(Some(Ok(me.events.pop_front().expect("non-empty"))))
+        let event = me.events.pop_front().expect("non-empty");
+        if !me.events.is_empty() {
+            me.delay = Some(Box::pin(tokio::time::sleep(TOKEN)));
+        }
+        Poll::Ready(Some(Ok(event)))
     }
 }
 
-impl Drop for BackToBackSse {
+impl Drop for PacedSse {
     fn drop(&mut self) {
         // If the stream is aborted mid-way (the client drops the
         // connection), release the in-flight guard (a normal end already

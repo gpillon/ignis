@@ -47,7 +47,7 @@ fn config(session: &str, label: &str) -> G3Config {
             prefill_max_tokens: 4,
             prefill_count: 3,
             decode_prompt_tokens: 16,
-            decode_max_tokens: 6,
+            decode_max_tokens: 32,
             decode_lanes: 2,
         },
         corpus: None,
@@ -71,11 +71,29 @@ fn a_record_measures_all_three_cells_cold_over_real_http() {
     assert!(record.c1.aggregate_tok_s > 0.0);
     assert!(record.c4.aggregate_tok_s > 0.0);
 
-    assert!(record.itl.all_cold(), "void: {:?}", record.itl.void_prefillers());
+    assert!(
+        record.itl.all_cold(),
+        "void: {:?}; lanes: {:?}; error: {:?}; intervals: {}",
+        record.itl.void_prefillers(),
+        record.itl.lanes,
+        record.itl.error,
+        record.itl.intervals_ms.len()
+    );
     assert_eq!(record.itl.prefillers.len(), 3);
     assert_eq!(record.itl.lanes.len(), 2);
-    // Two lanes x (6 tokens -> 5 intervals) = 10 pooled intervals.
-    assert_eq!(record.itl.intervals_ms.len(), 10);
+    assert!(
+        record.itl.intervals_ms.len() < 62,
+        "only intervals overlapping a prefill window belong in the ITL sample"
+    );
+    assert!(!record.itl.intervals_ms.is_empty());
+    assert!(record.itl.prefillers.iter().all(|sample| sample.first_token_ms > sample.started_ms));
+    assert!(record.itl.lanes.iter().all(|lane| lane.started_ms >= 0.0));
+    let first_prefill_start = record.itl.prefillers[0].started_ms;
+    assert!(record.itl.lanes.iter().all(|lane| {
+        lane.token_times_ms
+            .first()
+            .is_some_and(|first| lane.started_ms + first <= first_prefill_start)
+    }));
     assert!(record.itl.p95_ms.is_some());
 
     assert_eq!(record.session, "S-cold");

@@ -234,6 +234,11 @@ pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
                 prefiller.void_reason.as_deref().unwrap_or("(no reason recorded)"),
             )));
         }
+        if itl.prefillers.iter().any(|p| p.first_token_ms <= p.started_ms) {
+            return Err(Refusal(format!(
+                "the {label} record's ITL cell has no valid shared timeline; re-record it with the current harness"
+            )));
+        }
         if itl.lanes.iter().any(|l| l.error.is_some()) {
             return Err(Refusal(format!(
                 "the {label} record's ITL cell has a decode lane that failed mid-series"
@@ -366,6 +371,8 @@ mod tests {
             prefillers: (0..10)
                 .map(|i| PrefillerSample {
                     index: i,
+                    started_ms: i as f64 * 1_000.0,
+                    first_token_ms: i as f64 * 1_000.0 + 900.0,
                     ttft_ms: 900.0,
                     computed_prefill_tokens: Some(32_768),
                     void: false,
@@ -374,6 +381,7 @@ mod tests {
                 .collect(),
             lanes: vec![DecodeLaneTrace {
                 id: "lane-0".into(),
+                started_ms: 0.0,
                 n_tokens: 300,
                 token_times_ms: vec![0.0, 10.0, 20.0],
                 error: None,
@@ -495,6 +503,19 @@ mod tests {
         reference.itl.prefillers[3].void_reason = Some("computed prefill short of the prompt".into());
         let refusal = check(&ours, &reference).expect_err("must refuse");
         assert!(refusal.0.contains("void prefiller"), "{refusal}");
+    }
+
+    #[test]
+    fn a_legacy_itl_record_without_the_shared_timeline_is_refused() {
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.0);
+        let mut reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        for prefiller in &mut reference.itl.prefillers {
+            prefiller.started_ms = 0.0;
+            prefiller.first_token_ms = 0.0;
+        }
+
+        let refusal = check(&ours, &reference).expect_err("must refuse an incomparable record");
+        assert!(refusal.0.contains("shared timeline"), "{refusal}");
     }
 
     #[test]
