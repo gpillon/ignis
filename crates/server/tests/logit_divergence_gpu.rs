@@ -145,7 +145,7 @@ fn token_zero_top_k_logits_for_the_divergent_canaries() {
 
     for canary in load_divergent_canaries() {
         let prompt_tokens: Vec<i32> = provider
-            .apply_chat_template(&[ChatMessage::text("user", canary.prompt.clone())], &thinking)
+            .apply_chat_template(&[ChatMessage::text("user", canary.prompt.clone())], &thinking, &[])
             .into_iter()
             .map(|id| i32::try_from(id).expect("token id fits i32"))
             .collect();

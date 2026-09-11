@@ -1217,6 +1217,14 @@
     {
       "path": "tests/test_state_store.cpp",
       "sha256": "f5b6c3dd1efd624649dfbaccbaa4200a3ebc7f65a022acd5a00b2c579d4ed210"
+    },
+    {
+      "path": "tools/test_kv/hq_dither_host.h",
+      "sha256": "90f9541f83c5bfd975c30bf9b466231e69fcd06b18241e0821c66bae52a41a45"
+    },
+    {
+      "path": "tools/test_kv/test_hq_codec.cu",
+      "sha256": "64f97e43ecad71a848a660236d4d6cee3e52f3117d86ebcbc08382ccb6189835"
     }
   ]
 }

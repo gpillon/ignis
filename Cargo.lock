@@ -689,6 +689,8 @@ name = "ignis-core"
 version = "0.1.0"
 dependencies = [
  "ignis-artifact",
+ "serde_json",
+ "sha2",
  "tracing",
  "tracing-subscriber",
 ]
