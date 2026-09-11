@@ -87,7 +87,12 @@ impl TemplateProvider for ArtifactTemplateProvider {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
                             arguments: serde_json::from_str(&call.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({})),
+                                .unwrap_or_else(|err| {
+                                    eprintln!(
+                                        "ignis-server: history tool_calls[].function.arguments is not valid JSON, degrading to {{}}: {err}"
+                                    );
+                                    serde_json::json!({})
+                                }),
                         })
                         .collect();
                 }
@@ -183,6 +188,10 @@ mod tests {
     use super::*;
     use ignis_artifact::fixture::{self, FixtureObject};
     use ignis_artifact::Reader;
+    use ignis_artifact::{
+        ChatMessage as ArtifactMessage, ChatTemplate, ToolCall as ArtifactToolCall,
+    };
+    use serde_json::json;
 
     /// A minimal word-level tokenizer (the `tokenizers` 0.21 schema: a
     /// `model` with a `WordLevel` type and a fixed five-word vocab, plus
@@ -398,5 +407,130 @@ mod tests {
         let (_fixture, _reader, provider) = build_provider_with(THINKING_TEMPLATE);
         let caps = provider.thinking_capabilities();
         assert!(!caps.can_disable, "THINKING_TEMPLATE raises on disable");
+    }
+
+    // -- tool calling, round-tripped against #121's own parser (#132) -------
+    //
+    // These render through `ignis_artifact::ChatTemplate` directly (no
+    // `FrontendSet`/tokenizer fixture — the round-trip a WordLevel test
+    // tokenizer would do on tag-heavy XML text is not faithful, so this is
+    // the level the earlier tools tests in `frontend.rs` already picked).
+    // `REAL_TOOL_DIALECT_TEMPLATE` is not a synthetic analogue: its `tools`
+    // and `tool_calls` branches are copied verbatim from the real Qwen3.8
+    // template's own `# Tools` system section and its assistant
+    // `<tool_call>` rendering (everything else trimmed to the minimum that
+    // still parses) — so a test against it exercises the exact tag dialect
+    // production actually emits, not an approximation of it.
+
+    const REAL_TOOL_DIALECT_TEMPLATE: &str = r##"
+{%- if tools and tools is iterable and tools is not mapping -%}
+{{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+{%- for tool in tools -%}
+{{- "\n" }}
+{{- tool | tojson }}
+{%- endfor -%}
+{{- "\n</tools>\n\n" }}
+{%- endif -%}
+{%- for m in messages -%}
+{{ m.role }}={{ m.content }}
+{%- if m.tool_calls and m.tool_calls is iterable and m.tool_calls is not mapping -%}
+    {%- for tool_call in m.tool_calls -%}
+        {%- if tool_call.function is defined -%}{%- set tool_call = tool_call.function -%}{%- endif -%}
+        {{- "\n<tool_call>\n<function=" + tool_call.name + ">\n" }}
+        {%- if tool_call.arguments is defined and tool_call.arguments != "" -%}
+            {%- for args_name, args_value in tool_call.arguments|items -%}
+                {{- "<parameter=" + args_name + ">\n" }}
+                {%- set args_value = args_value if args_value is string else (args_value | tojson) -%}
+                {{- args_value }}
+                {{- "\n</parameter>\n" }}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- "</function>\n</tool_call>" }}
+    {%- endfor -%}
+{%- endif -%}
+;{%- endfor -%}
+"##;
+
+    #[test]
+    fn the_real_templates_tools_system_section_renders_verbatim() {
+        // AC1 (GitHub #132): a well-formed `tools` array renders the real
+        // "# Tools" section, not just a synthetic stand-in for it.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let tools = [json!({
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        })];
+        let prompt = template
+            .render_with_thinking_and_tools(
+                &[ArtifactMessage::text(Role::User, "hi")],
+                true,
+                None,
+                Some(&tools),
+            )
+            .expect("render");
+        assert!(prompt.contains("# Tools\n\nYou have access to the following functions:"), "{prompt}");
+        assert!(prompt.contains("<tools>"), "{prompt}");
+        assert!(prompt.contains("get_weather"), "{prompt}");
+        assert!(prompt.contains("</tools>"), "{prompt}");
+    }
+
+    #[test]
+    fn an_assistant_history_tool_call_renders_the_real_tag_dialect_and_121_parses_it_back() {
+        // AC5 (GitHub #132): a prior assistant turn's `tool_calls` renders
+        // as the real `<tool_call>` block, and — closing the loop with
+        // #121 — `ToolCallScanner` (the exact parser the live response
+        // path uses) recovers the same call from that exact rendered text.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let history = ArtifactMessage {
+            role: Role::Assistant,
+            content: ignis_artifact::MessageContent::Text(String::new()),
+            tool_calls: vec![ArtifactToolCall {
+                id: Some("call_0".to_owned()),
+                name: "read_file".to_owned(),
+                arguments: json!({"path": "a.txt"}),
+            }],
+            reasoning_content: None,
+        };
+        let prompt = template.render(&[history]).expect("render");
+        assert!(prompt.contains("<tool_call>\n<function=read_file>\n"), "{prompt}");
+        assert!(prompt.contains("<parameter=path>\na.txt\n</parameter>"), "{prompt}");
+
+        let mut scanner = crate::toolcall::ToolCallScanner::new();
+        let mut events = scanner.feed(&prompt);
+        events.extend(scanner.finish());
+        let calls: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::toolcall::ToolEvent::Call(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{prompt}");
+        assert_eq!(calls[0].name, "read_file");
+        let args: JsonValue = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args, json!({"path": "a.txt"}));
+    }
+
+    #[test]
+    fn a_malformed_tool_call_arguments_string_degrades_to_an_empty_object_not_a_panic() {
+        // Acceptance: `ArtifactTemplateProvider::apply_chat_template`
+        // parses a history tool call's wire `arguments` (a JSON-encoded
+        // string) back into the object the template needs — a string that
+        // is not valid JSON must degrade to `{}`, never panic or corrupt
+        // the render (spec 07's documented posture).
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE);
+        let mut message = ChatMessage::text("assistant", "");
+        message.tool_calls = Some(vec![crate::template::ToolCallIn {
+            id: Some("call_0".to_owned()),
+            function: crate::template::FunctionIn {
+                name: "f".to_owned(),
+                arguments: "not json".to_owned(),
+            },
+        }]);
+        // Must not panic; `TEMPLATE` has no `tool_calls` branch of its own,
+        // so this only proves the degrade happens before the render call —
+        // the real dialect is exercised in the round-trip test above.
+        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools());
+        assert!(!tokens.is_empty(), "the render must still complete");
     }
 }

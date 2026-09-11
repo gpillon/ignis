@@ -67,10 +67,16 @@ impl ChatMessage {
 }
 
 /// One tool call an assistant history message carries (OpenAI wire shape).
+/// No `type` field: OpenAI's wire shape always carries `"type": "function"`
+/// here (the only tool type this protocol defines), so it is accepted and
+/// ignored the same way `tool_call_id` is on a `role: "tool"` message —
+/// there is nothing to branch on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallIn {
+    /// The call's id (OpenAI `id`), when the client sends one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// The function that was called.
     pub function: FunctionIn,
 }
 
@@ -78,7 +84,11 @@ pub struct ToolCallIn {
 /// the wire, matching #121's own response shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionIn {
+    /// The function name.
     pub name: String,
+    /// The arguments, as the JSON-encoded object string OpenAI's wire
+    /// shape carries (parsed back into an object where the template needs
+    /// one — see `artifact_template.rs`'s `apply_chat_template`).
     pub arguments: String,
 }
 

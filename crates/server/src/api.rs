@@ -294,24 +294,51 @@ fn resolve_thinking(
     })
 }
 
+/// The two `tool_choice` values this template has a lever for (GitHub
+/// #132). `"required"` and the named-function object form parse but are
+/// rejected outright ([`parse_tool_choice`]) rather than represented here
+/// — there is nothing a resolved value of this type could do with them,
+/// since this text-instruction template has no way to *force* a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolChoice {
+    /// The model decides (the default, and the only thing a text
+    /// instruction template can actually offer beyond "don't call").
+    Auto,
+    /// The model is never told tools exist at all.
+    None,
+}
+
+/// Parse `tool_choice`'s wire value: `"auto"` (default) or `"none"`.
+/// `"required"` and the named-function object form are a 400 explaining
+/// why, not a silently-ignored field (same posture as an unsupported
+/// `reasoning_effort`, GitHub #68).
+fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Response> {
+    match tool_choice {
+        None => Ok(ToolChoice::Auto),
+        Some(JsonValue::String(s)) if s == "auto" => Ok(ToolChoice::Auto),
+        Some(JsonValue::String(s)) if s == "none" => Ok(ToolChoice::None),
+        Some(JsonValue::String(s)) if s == "required" => Err(bad_request(
+            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+        )),
+        Some(JsonValue::Object(_)) => Err(bad_request(
+            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+        )),
+        Some(other) => Err(bad_request(&format!(
+            "tool_choice must be \"auto\" or \"none\", got {other}"
+        ))),
+    }
+}
+
 /// Validate and resolve `tools` + `tool_choice` (GitHub #132) into the
 /// tools slice that actually reaches the template.
 ///
-/// - Each `tools` entry must be `{"type": "function", "function": {"name":
-///   <non-empty string>, ...}}` — anything else is a 400 naming the entry
-///   and what is wrong with it. Extra fields (`description`, `parameters`,
-///   …) ride through untouched; they are opaque JSON to ignis, meaningful
-///   only to the template and the model.
-/// - `tool_choice` absent or `"auto"`: the validated tools (if any) reach
-///   the template.
-/// - `tool_choice: "none"`: validated, then discarded — the template
-///   never sees them, so the model is never told tools exist (the only
-///   lever a text-instruction template has for "must not call a
-///   function").
-/// - `tool_choice: "required"`, or the named-function object form: a 400.
-///   This template has no way to *force* a call — accepting the field and
-///   quietly not honouring it would be worse than refusing it (same
-///   posture as an unsupported `reasoning_effort`, GitHub #68).
+/// Each `tools` entry must be `{"type": "function", "function": {"name":
+/// <non-empty string>, ...}}` — anything else is a 400 naming the entry
+/// and what is wrong with it. Extra fields (`description`, `parameters`,
+/// …) ride through untouched; they are opaque JSON to ignis, meaningful
+/// only to the template and the model. [`ToolChoice::None`] discards the
+/// validated tools — the template never sees them, so the model is never
+/// told tools exist.
 fn resolve_tools(
     tools: Option<Vec<JsonValue>>,
     tool_choice: Option<JsonValue>,
@@ -330,19 +357,9 @@ fn resolve_tools(
             )));
         }
     }
-    match tool_choice {
-        None => Ok(tools),
-        Some(JsonValue::String(s)) if s == "auto" => Ok(tools),
-        Some(JsonValue::String(s)) if s == "none" => Ok(Vec::new()),
-        Some(JsonValue::String(s)) if s == "required" => Err(bad_request(
-            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
-        )),
-        Some(JsonValue::Object(_)) => Err(bad_request(
-            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
-        )),
-        Some(other) => Err(bad_request(&format!(
-            "tool_choice must be \"auto\" or \"none\", got {other}"
-        ))),
+    match parse_tool_choice(tool_choice)? {
+        ToolChoice::Auto => Ok(tools),
+        ToolChoice::None => Ok(Vec::new()),
     }
 }
 

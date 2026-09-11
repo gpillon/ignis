@@ -27,6 +27,10 @@ use ignis_server::template::{ChatMessage, TemplateProvider};
 use ignis_server::thinking::{ReasoningEffort, ThinkingCapabilities, ThinkingOptions};
 use ignis_server::Server;
 
+#[path = "support/mod.rs"]
+mod support;
+use support::SharedTemplate;
+
 const MODEL: &str = "test-model";
 
 /// A [`TemplateProvider`] double: templating always delegates to the
@@ -121,34 +125,13 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
         compute,
     );
     let template = Arc::new(template);
-    let server = Server::new(Engine::new(Box::new(scheduler)), {
-        // `Server::new` takes ownership of a boxed provider; the harness
-        // keeps its own `Arc` clone to inspect captured options afterward.
-        struct Shared(Arc<RecordingTemplateProvider>);
-        impl TemplateProvider for Shared {
-            fn apply_chat_template(
-                &self,
-                m: &[ChatMessage],
-                o: &ThinkingOptions,
-                tools: &[serde_json::Value],
-            ) -> Vec<TokenId> {
-                self.0.apply_chat_template(m, o, tools)
-            }
-            fn render_tokens(&self, t: &[TokenId]) -> String {
-                self.0.render_tokens(t)
-            }
-            fn thinking_capabilities(&self) -> ThinkingCapabilities {
-                self.0.thinking_capabilities()
-            }
-            fn token_decoder(&self) -> Box<dyn TokenDecoder> {
-                self.0.token_decoder()
-            }
-            fn decoder_starts_in_reasoning(&self, o: &ThinkingOptions) -> bool {
-                self.0.decoder_starts_in_reasoning(o)
-            }
-        }
-        Box::new(Shared(Arc::clone(&template)))
-    })
+    // `Server::new` takes ownership of a boxed provider; the harness keeps
+    // its own `Arc` clone (via `SharedTemplate`, GitHub #132) to inspect
+    // captured options afterward.
+    let server = Server::new(
+        Engine::new(Box::new(scheduler)),
+        Box::new(SharedTemplate(Arc::clone(&template))),
+    )
     .with_request_timeout(Duration::from_secs(5));
     Harness {
         app: server.app(),
