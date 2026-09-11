@@ -46,7 +46,8 @@
 //!       Refuses a verdict when the records are not live/live (different
 //!       sessions, a missing cell, a void/bad sample).
 //!   `g4      --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl>
-//!             [--label L] [--profile P] [--session S] [--conc N] [--out <record.json>]`
+//!             [--label L] [--profile P] [--session S] [--conc N] [--corpus <bank.ids>]
+//!             [--out <record.json>]`
 //!       The G4 measurement instrument (P4-01, ADR 0015/0021): replays the
 //!       load trace and measures the needle-retrieval cells (64K / 128K).
 //!       Writes one *launch* of one engine's record — the trace's SHA-256
@@ -124,7 +125,7 @@ fn print_usage() {
                  [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g3-gate --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
   ignis-bench g4 --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl> [--label ignis]
-                 [--profile <text>] [--session <id>] [--conc N] [--out <record.json>]
+                 [--profile <text>] [--session <id>] [--conc N] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g4-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
                       [--note <text>] [--out <verdict.json>]"
     );
@@ -854,6 +855,19 @@ fn cmd_g4(args: &[String]) -> ExitCode {
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let out = opt(args, "out");
     let conc = opt(args, "conc").and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+    let corpus = opt(args, "corpus").map(PathBuf::from);
+    if let Some(path) = &corpus {
+        // Fail before any request is sent: a missing corpus file would
+        // otherwise fail every needle cell with a late error.
+        if !path.is_file() {
+            eprintln!("error: --corpus file not found: {path:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "corpus mode: needle haystacks are cut from {path:?} (bounded generation, no filler \
+             growth — needed at the needle cell's 64K/128K scale)"
+        );
+    }
 
     let trace_bytes = match std::fs::read(&trace_path) {
         Ok(b) => b,
@@ -915,6 +929,7 @@ fn cmd_g4(args: &[String]) -> ExitCode {
         session,
         needle_context_tokens: vec![g4::NEEDLE_CONTEXT_64K, g4::NEEDLE_CONTEXT_128K],
         replay: ReplayConfig { max_concurrency: conc, time_scale: 1.0 },
+        corpus,
     };
     let record = g4::measure(ep, &frontend, engine, endpoint, &trace, &trace_bytes, &cfg);
     print!("{}", record.render());

@@ -23,7 +23,7 @@
 //! ratio (spec 04's Gate G4 table): the fact is retrieved or it is not,
 //! never averaged or compared against the reference's own number.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use crate::client::{replay, Endpoint, Request, ReplayConfig};
 use crate::metrics::Run;
 use crate::time::{unix_now, utc_timestamp};
 use crate::trace::{RequestClass, Trace};
-use crate::ttft::PromptTemplate;
+use crate::ttft::{load_corpus, PromptTemplate};
 
 // ── the needle-retrieval cell ────────────────────────────────────────────
 
@@ -174,15 +174,117 @@ fn build_haystack(
     Ok(render(&words))
 }
 
-/// Measure one needle-retrieval cell: build the haystack, ask the
-/// question, and check whether the planted fact came back.
-pub fn measure_needle(
-    ep: &dyn Endpoint,
+/// Splice `needle` into the middle of `body` (on the nearest word boundary
+/// after the midpoint) and append the question — the corpus path's render,
+/// sharing [`build_haystack`]'s shape (needle buried mid-text, question
+/// last) without its word-list representation.
+fn render_haystack_body(body: &str, needle: &str) -> String {
+    if body.is_empty() {
+        return format!("{needle} {NEEDLE_QUESTION}");
+    }
+    // The corpus decodes to real text and may carry multi-byte UTF-8 (a
+    // real tokenizer's vocabulary is not ASCII-only): `body.len() / 2` is a
+    // byte offset that can land inside a character, so walk forward to the
+    // next char boundary before slicing on it.
+    let mut mid = body.len() / 2;
+    while mid < body.len() && !body.is_char_boundary(mid) {
+        mid += 1;
+    }
+    let split_at = body[mid..].find(' ').map(|o| mid + o).unwrap_or(body.len());
+    let (head, tail) = body.split_at(split_at);
+    format!("{head} {needle}{tail} {NEEDLE_QUESTION}")
+}
+
+/// Build a haystack from a pre-tokenized corpus (the `--corpus` path):
+/// bounded generation instead of [`build_haystack`]'s word-by-word growth,
+/// which the 64K/128K needle cell pays for badly against a real tokenizer
+/// (the same tradeoff [`crate::ttft::generate_cell_prompts_from_corpus`]
+/// makes for G2/G3's own production-scale fixtures — a binary search over
+/// window *length*, since the re-encoded count is monotone in it, instead
+/// of one re-encode per appended word).
+///
+/// A real tokenizer's decode/encode round-trip can drift a few tokens
+/// (`ttft::land_corpus_window`'s doc comment), so after the search narrows
+/// down to a window length a small neighbourhood is scanned before this
+/// gives up and refuses rather than measuring a length it does not claim.
+fn build_haystack_from_corpus(
     template: &dyn PromptTemplate,
+    corpus: &[u32],
+    context_tokens: usize,
+    secret: &str,
+) -> Result<String, String> {
+    if corpus.is_empty() {
+        return Err("the corpus is empty: no window to cut".to_string());
+    }
+    let needle = needle_sentence(secret);
+    let overhead = template.encode_user_message(&render_haystack_body("", &needle))?.len();
+    if overhead >= context_tokens {
+        return Err(format!(
+            "the needle sentence + question alone is {overhead} tokens: a {context_tokens}-token \
+             needle cell is not reachable"
+        ));
+    }
+    // The corpus repeats (ttft.rs's doc comment: "a tiled rotation of a
+    // curated bank"), so a window longer than the bank itself is still a
+    // meaningful, if repetitive, haystack -- wrap rather than cap at
+    // `corpus.len()`.
+    let cut = |n: usize| -> Result<(String, usize), String> {
+        let n = n.max(1);
+        let ids: Vec<u32> = (0..n).map(|k| corpus[k % corpus.len()]).collect();
+        let body = template.decode(&ids)?;
+        let text = render_haystack_body(&body, &needle);
+        let count = template.encode_user_message(&text)?.len();
+        Ok((text, count))
+    };
+
+    let mut lo = 1usize;
+    let mut hi = context_tokens.saturating_mul(4).max(corpus.len()).max(2);
+    let mut closest: Option<usize> = None;
+    for _ in 0..64 {
+        if lo >= hi {
+            break;
+        }
+        let mid = lo + (hi - lo) / 2;
+        let (text, count) = cut(mid)?;
+        if count == context_tokens {
+            return Ok(text);
+        }
+        closest = Some(mid);
+        if count < context_tokens {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // The round-trip drift window: a handful of ids either side of where
+    // the search settled.
+    const SCAN_RADIUS: usize = 64;
+    let center = closest.unwrap_or(lo);
+    for delta in 0..SCAN_RADIUS {
+        for n in [center.saturating_sub(delta), center + delta] {
+            let (text, count) = cut(n)?;
+            if count == context_tokens {
+                return Ok(text);
+            }
+        }
+    }
+    Err(format!(
+        "cannot land the needle haystack on {context_tokens} tokens from this corpus after a \
+         bounded search"
+    ))
+}
+
+/// The needle-retrieval request for a haystack already built at
+/// `context_tokens`, and the [`NeedleResult`] its outcome (or a build
+/// failure) produces — shared by [`measure_needle`] and
+/// [`measure_needle_from_corpus`].
+fn send_needle_request(
+    ep: &dyn Endpoint,
     context_tokens: u32,
+    secret: String,
+    haystack: Result<String, String>,
 ) -> NeedleResult {
-    let secret = needle_secret(context_tokens);
-    let prompt = match build_haystack(template, context_tokens as usize, &secret) {
+    let prompt = match haystack {
         Ok(p) => p,
         Err(err) => {
             return NeedleResult {
@@ -193,12 +295,18 @@ pub fn measure_needle(
             }
         }
     };
+    // Streaming, like every other measurement request in this crate
+    // (g2/g3/replay): a non-streaming request leaves the connection
+    // carrying zero bytes for the whole prefill — tens of seconds at
+    // 64K/128K — which a live smoke test found closes the connection on at
+    // least one transport before the response ever arrives, even though
+    // the engine finishes the request normally on its own side.
     let req = Request {
         id: format!("needle-{context_tokens}"),
         class: RequestClass::Main,
         prompt,
         max_tokens: NEEDLE_MAX_TOKENS,
-        stream: false,
+        stream: true,
         include_usage: false,
         enable_thinking: Some(false),
     };
@@ -216,6 +324,33 @@ pub fn measure_needle(
             error: Some(format!("the request failed: {err}")),
         },
     }
+}
+
+/// Measure one needle-retrieval cell: build the haystack (the filler
+/// word-growth path), ask the question, and check whether the planted
+/// fact came back.
+pub fn measure_needle(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    context_tokens: u32,
+) -> NeedleResult {
+    let secret = needle_secret(context_tokens);
+    let haystack = build_haystack(template, context_tokens as usize, &secret);
+    send_needle_request(ep, context_tokens, secret, haystack)
+}
+
+/// [`measure_needle`] cut from a pre-tokenized corpus instead of grown word
+/// by word — the path a real tokenizer needs at 64K/128K (see
+/// [`build_haystack_from_corpus`]'s doc comment).
+pub fn measure_needle_from_corpus(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    corpus: &[u32],
+    context_tokens: u32,
+) -> NeedleResult {
+    let secret = needle_secret(context_tokens);
+    let haystack = build_haystack_from_corpus(template, corpus, context_tokens as usize, &secret);
+    send_needle_request(ep, context_tokens, secret, haystack)
 }
 
 // ── trace hashing ────────────────────────────────────────────────────────
@@ -345,6 +480,14 @@ pub struct G4Config {
     /// spec 04's 64K / 128K).
     pub needle_context_tokens: Vec<u32>,
     pub replay: ReplayConfig,
+    /// A pre-tokenized prompt bank (whitespace-separated ids) to cut the
+    /// needle haystacks from, when set (the `--corpus` flag): bounded
+    /// generation instead of the filler path's word-by-word growth, needed
+    /// at the needle cell's 64K/128K scale (`build_haystack_from_corpus`'s
+    /// doc comment — the same tradeoff `g3::G3Config::corpus` makes for its
+    /// 32,768-token prefiller fixture). Absent, the filler generator is
+    /// used (fine at the small lengths a unit test measures).
+    pub corpus: Option<PathBuf>,
 }
 
 impl Default for G4Config {
@@ -356,6 +499,7 @@ impl Default for G4Config {
             session: String::new(),
             needle_context_tokens: vec![NEEDLE_CONTEXT_64K, NEEDLE_CONTEXT_128K],
             replay: ReplayConfig::default(),
+            corpus: None,
         }
     }
 }
@@ -363,7 +507,11 @@ impl Default for G4Config {
 /// Measure a G4 record: replay `trace` against `ep`, then the
 /// needle-retrieval cells. `trace_bytes` is the trace file's raw content —
 /// hashed as-is, so the recorded identity is the bytes that were actually
-/// replayed, not a re-serialization of the parsed [`Trace`].
+/// replayed, not a re-serialization of the parsed [`Trace`]. A configured
+/// corpus (`cfg.corpus`) is loaded once and every needle cell is cut from
+/// it; a corpus that cannot be read fails every needle cell with that
+/// error rather than falling back to the (impractically slow, at this
+/// scale) filler generator.
 pub fn measure(
     ep: Arc<dyn Endpoint>,
     template: &dyn PromptTemplate,
@@ -376,10 +524,20 @@ pub fn measure(
     let trace_sha256 = sha256_hex(trace_bytes);
     let metrics = replay(Arc::clone(&ep), trace, &cfg.replay);
     let run = Run::new(cfg.label.clone(), metrics);
+    let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
     let needles = cfg
         .needle_context_tokens
         .iter()
-        .map(|&ctx| measure_needle(ep.as_ref(), template, ctx))
+        .map(|&ctx| match &corpus {
+            Some(Ok(ids)) => measure_needle_from_corpus(ep.as_ref(), template, ids, ctx),
+            Some(Err(error)) => NeedleResult {
+                context_tokens: ctx,
+                secret: needle_secret(ctx),
+                retrieved: false,
+                error: Some(error.clone()),
+            },
+            None => measure_needle(ep.as_ref(), template, ctx),
+        })
         .collect();
     Record {
         session: cfg.session.clone(),
@@ -504,6 +662,100 @@ mod tests {
         assert!(result.error.as_deref().unwrap().contains("failed"));
     }
 
+    /// The bank the corpus tests cut from: distinct-ish ids, large enough
+    /// to be rotated for a few different target lengths (mirrors
+    /// `g3.rs::corpus_bank`).
+    fn corpus_bank() -> Vec<u32> {
+        (0..2_000).map(|i| ((i * 37) % 900) as u32 + 100).collect()
+    }
+
+    #[test]
+    fn a_corpus_haystack_lands_on_the_exact_target_and_carries_the_needle_and_question() {
+        let template = MockTemplate;
+        let bank = corpus_bank();
+        let secret = needle_secret(500);
+        let prompt =
+            build_haystack_from_corpus(&template, &bank, 500, &secret).expect("a reachable haystack");
+        let count = template.encode_user_message(&prompt).unwrap().len();
+        assert_eq!(count, 500, "the corpus haystack must land on the exact target length");
+        assert!(prompt.contains(&secret), "the planted fact must be in the haystack");
+        assert!(prompt.ends_with(NEEDLE_QUESTION), "the question is asked last");
+    }
+
+    #[test]
+    fn a_corpus_haystack_reaches_needle_scale_without_the_ohn2_filler_path() {
+        // The regression this path exists to fix: at 64K the filler
+        // word-growth path re-encodes the whole (growing) prompt on every
+        // appended word against a real tokenizer, which is what made a
+        // live smoke test of this cell hang. The corpus path's binary
+        // search does a bounded number of encodes regardless of the
+        // target, so this must land quickly even at 64K/128K scale.
+        let template = MockTemplate;
+        let bank = corpus_bank();
+        for &target in &[NEEDLE_CONTEXT_64K, NEEDLE_CONTEXT_128K] {
+            let secret = needle_secret(target);
+            let prompt = build_haystack_from_corpus(&template, &bank, target as usize, &secret)
+                .unwrap_or_else(|e| panic!("{target}: {e}"));
+            let count = template.encode_user_message(&prompt).unwrap().len();
+            assert_eq!(count, target as usize, "{target}");
+        }
+    }
+
+    #[test]
+    fn an_empty_corpus_is_refused() {
+        let template = MockTemplate;
+        let err = build_haystack_from_corpus(&template, &[], 500, "123456").expect_err("no corpus");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    /// A template whose corpus decodes to multi-byte UTF-8 text (a real
+    /// tokenizer's vocabulary is not ASCII-only) — the regression a live
+    /// smoke test against the real corpus fixture caught: splitting the
+    /// decoded body on a byte offset that lands mid-character panics.
+    struct MultiByteTemplate;
+
+    impl PromptTemplate for MultiByteTemplate {
+        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+            Ok(content.split_whitespace().map(|w| w.chars().count() as u32).collect())
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            // Each id decodes to one multi-byte word ("本" is 3 bytes),
+            // repeated `id % 3 + 1` times, so the decoded body's midpoint
+            // byte offset lands inside a character for most `n`.
+            Ok(ids.iter().map(|id| "本".repeat((*id as usize % 3) + 1)).collect::<Vec<_>>().join(" "))
+        }
+    }
+
+    #[test]
+    fn a_multi_byte_corpus_body_does_not_panic_on_the_split() {
+        let template = MultiByteTemplate;
+        let bank: Vec<u32> = (0..500).collect();
+        let secret = needle_secret(120);
+        // The assertion is reaching this line at all: the char-boundary
+        // regression panicked before returning any `Result`. Landing
+        // exactly is secondary here (encode/decode are not exact inverses
+        // for a repeat-based mock).
+        let _ = build_haystack_from_corpus(&template, &bank, 120, &secret);
+    }
+
+    #[test]
+    fn measure_needle_from_corpus_retrieves_a_planted_fact() {
+        let bank = corpus_bank();
+        let secret = needle_secret(500);
+        let ep = MockEndpoint::new(vec![Outcome {
+            ttft_ms: 5.0,
+            total_ms: 5.0,
+            n_tokens: 1,
+            output: format!("The code is {secret}."),
+            prompt_tokens: Some(500),
+            cached_prompt_tokens: None,
+            token_times_ms: Vec::new(),
+            finish_reason: Some(FinishReason::Engine("stop".into())),
+        }]);
+        let result = measure_needle_from_corpus(&ep, &MockTemplate, &bank, 500);
+        assert!(result.passed(), "{result:?}");
+    }
+
     #[test]
     fn two_different_context_lengths_ask_different_questions() {
         let a = needle_secret(NEEDLE_CONTEXT_64K);
@@ -526,6 +778,7 @@ mod tests {
             session: "S1".into(),
             needle_context_tokens: vec![80, 160],
             replay: ReplayConfig { max_concurrency: 2, time_scale: 0.0 },
+            corpus: None,
         };
         let trace_bytes = b"irrelevant for this test's assertions, only the hash matters";
         let record = measure(ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &trace, trace_bytes, &cfg);
