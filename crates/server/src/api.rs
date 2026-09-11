@@ -43,6 +43,7 @@ use crate::template::{ChatMessage, TemplateProvider};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
+use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 ///
@@ -323,6 +324,31 @@ fn split_reasoning(
     )
 }
 
+/// [`split_reasoning`] plus tool-call extraction (GitHub #121): the content
+/// channel's text is fed through a fresh [`ToolCallScanner`] so the
+/// non-streaming path parses tool calls with exactly the same rules as the
+/// streaming path (a call left open by a truncated generation is dropped,
+/// never returned half-written — acceptance criterion 3).
+fn split_reasoning_and_tools(
+    template: &dyn TemplateProvider,
+    tokens: &[ignis_core::TokenId],
+    thinking: &ThinkingOptions,
+) -> (Option<String>, String, Vec<ScannedToolCall>) {
+    let (reasoning, content_text) = split_reasoning(template, tokens, thinking);
+    let mut scanner = ToolCallScanner::new();
+    let mut events = scanner.feed(&content_text);
+    events.extend(scanner.finish());
+    let mut content = String::new();
+    let mut calls = Vec::new();
+    for event in events {
+        match event {
+            ToolEvent::Content(text) => content.push_str(&text),
+            ToolEvent::Call(call) => calls.push(call),
+        }
+    }
+    (reasoning, content, calls)
+}
+
 /// Map a [`SubmitError`] from the engine's submit to the OpenAI-shaped
 /// error response (404 unknown model, 413 oversized, 503 engine full).
 fn submit_error(server: &Server, err: SubmitError) -> Response {
@@ -398,6 +424,46 @@ pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+    }
+}
+
+/// The OpenAI `finish_reason`, tool-calls aware (GitHub #121). A generation
+/// that stopped cleanly (its own EOS) after emitting at least one complete
+/// tool call reports `"tool_calls"`, matching what a real agent client
+/// branches on to decide whether to execute a call rather than just render
+/// text. A call left open when generation stopped (`mid_call`) never earns
+/// that label — it was dropped whole by [`ToolCallScanner`], so reporting
+/// `"tool_calls"` here would tell the client to run a call that was never
+/// actually delivered (acceptance criterion 3); the plain `stop`/`length`
+/// reason is reported instead, same as if no call had been attempted.
+pub(crate) fn resolve_finish_reason(
+    reason: FinishReason,
+    any_calls: bool,
+    mid_call: bool,
+) -> &'static str {
+    if !mid_call && any_calls && reason == FinishReason::Stop {
+        "tool_calls"
+    } else {
+        finish_reason_str(reason)
+    }
+}
+
+/// GitHub #70 via #121 acceptance criterion 5: a generation that reasoned
+/// but never produced content or a tool call must not pass silently —
+/// report it explicitly rather than let it look, on the wire, like an
+/// ordinary short (or empty) answer. Shared by both response paths so the
+/// message can't drift between them (each path computes `all_reasoning`
+/// its own way — a whole-string check non-streaming, incremental flags
+/// while streaming — since neither has the other's representation of the
+/// generation to reuse).
+fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reason: &'static str) {
+    if all_reasoning {
+        tracing::warn!(
+            id,
+            finish_reason,
+            "generation produced reasoning but no content or tool call \
+             (token budget exhausted before an answer began)"
+        );
     }
 }
 
@@ -543,9 +609,22 @@ async fn chat_completions(
     // timeout guards a wedged engine from hanging the client).
     match collect_tokens(&mut stream, server.request_timeout).await {
         Ok((tokens, reason)) => {
-            let (reasoning_content, content) =
-                split_reasoning(server.template.as_ref(), &tokens, &thinking);
+            let (reasoning_content, content, tool_calls) =
+                split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking);
             let completion_tokens = tokens.len() as u32;
+            let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
+            report_if_all_reasoning_no_content(
+                &id,
+                reasoning_content.as_deref().is_some_and(|r| !r.is_empty())
+                    && content.is_empty()
+                    && tool_calls.is_empty(),
+                finish_reason,
+            );
+            let tool_calls = if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls.into_iter().map(ToolCallOut::from).collect())
+            };
             Json(ChatCompletion {
                 id,
                 object: "chat.completion",
@@ -557,8 +636,9 @@ async fn chat_completions(
                         role: "assistant",
                         reasoning_content,
                         content,
+                        tool_calls,
                     },
-                    finish_reason: finish_reason_str(reason),
+                    finish_reason,
                 }],
                 usage: Usage {
                     prompt_tokens,
@@ -605,6 +685,41 @@ struct AssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     content: String,
+    /// Tool calls parsed out of the content channel (GitHub #121) — absent
+    /// when the generation made none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallOut>>,
+}
+
+/// One tool call, non-streaming wire shape (OpenAI: `message.tool_calls[]`).
+#[derive(Serialize)]
+struct ToolCallOut {
+    id: String,
+    r#type: &'static str,
+    function: FunctionOut,
+}
+
+#[derive(Serialize)]
+struct FunctionOut {
+    name: String,
+    /// A JSON-encoded object, e.g. `{"path":"a.txt"}` (never a
+    /// half-written fragment — GitHub #121 acceptance criterion 3: an
+    /// interrupted call is dropped entirely by `ToolCallScanner`, never
+    /// surfaced here truncated).
+    arguments: String,
+}
+
+impl From<ScannedToolCall> for ToolCallOut {
+    fn from(call: ScannedToolCall) -> Self {
+        ToolCallOut {
+            id: call.id,
+            r#type: "function",
+            function: FunctionOut {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        }
+    }
 }
 
 /// The usage figures (the prompt's templated-token count + the generated
@@ -636,14 +751,47 @@ struct ChunkChoice {
     finish_reason: Option<&'static str>,
 }
 
-/// The token delta. An empty `content` and absent `reasoning_content`
-/// serialize to `{}` (OpenAI's final chunk shape).
+/// The token delta. An empty `content`, absent `reasoning_content` and
+/// absent `tool_calls` serialize to `{}` (OpenAI's final chunk shape).
 #[derive(Serialize, Default)]
 struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     content: String,
+    /// A tool call's id + name + full arguments (GitHub #121) — delivered
+    /// as one complete delta per call rather than character-by-character
+    /// (the source is a closed XML block, not a token-streamed JSON
+    /// fragment, so there is nothing partial left to stream by the time a
+    /// call is known at all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// One streamed tool call delta (OpenAI: `delta.tool_calls[]`), keyed by
+/// `index` — the field a real agent client's reassembly buffer groups on,
+/// stable across chunks and never reused by two different calls (GitHub
+/// #121 acceptance criterion 2).
+#[derive(Serialize)]
+struct ToolCallDelta {
+    index: usize,
+    id: String,
+    r#type: &'static str,
+    function: FunctionOut,
+}
+
+impl From<ScannedToolCall> for ToolCallDelta {
+    fn from(call: ScannedToolCall) -> Self {
+        ToolCallDelta {
+            index: call.index,
+            id: call.id,
+            r#type: "function",
+            function: FunctionOut {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        }
+    }
 }
 
 /// The streaming half of a chat completion: the request's event stream
@@ -665,6 +813,9 @@ struct ChunkStream {
     /// byte- and marker-splitting state across this request's whole token
     /// stream (`crate::decoder::OutputDecoder`).
     decoder: OutputDecoder,
+    /// Scans the decoder's `Content` channel for `<tool_call>` blocks
+    /// (GitHub #121) — reasoning text never passes through it.
+    tool_scanner: ToolCallScanner,
     prompt_tokens: u32,
     /// `stream_options.include_usage` — gates the trailing usage chunk
     /// (OpenAI only sends it when the client opts in).
@@ -678,6 +829,11 @@ struct ChunkStream {
     pending: VecDeque<Event>,
     /// The `[DONE]` marker has been emitted (exactly once, at the end).
     done_sent: bool,
+    /// At least one non-empty `Reasoning` delta was ever queued (GitHub
+    /// #70 via #121 acceptance criterion 5).
+    emitted_reasoning: bool,
+    /// At least one `Content` delta or tool call was ever queued.
+    emitted_content_or_call: bool,
 }
 
 /// Cancels its request when dropped before the request has completed. An SSE
@@ -731,11 +887,51 @@ impl ChunkStream {
             created,
             model,
             decoder,
+            tool_scanner: ToolCallScanner::new(),
             prompt_tokens,
             include_usage,
             pending: VecDeque::new(),
             done_sent: false,
+            emitted_reasoning: false,
+            emitted_content_or_call: false,
         }
+    }
+
+    /// Routes one decoder delta to its SSE chunk(s): a `Reasoning` delta
+    /// streams straight through; a `Content` delta is fed to the tool-call
+    /// scanner first, since it may resolve to plain content, a complete
+    /// tool call, or nothing yet (GitHub #121).
+    fn queue_decoder_delta(&mut self, delta: crate::decoder::Delta) {
+        match delta.channel {
+            Channel::Reasoning => {
+                if !delta.text.is_empty() {
+                    self.emitted_reasoning = true;
+                }
+                let event = self.delta_chunk(delta);
+                self.pending.push_back(event);
+            }
+            Channel::Content => {
+                for tool_event in self.tool_scanner.feed(&delta.text) {
+                    self.queue_tool_event(tool_event);
+                }
+            }
+        }
+    }
+
+    /// Queues one tool-call-scanner event as its SSE chunk, tracking
+    /// `emitted_content_or_call` along the way — both `ToolEvent`
+    /// variants only ever carry non-empty payloads (`ToolCallScanner`
+    /// never emits an empty one), so every call here is real content.
+    fn queue_tool_event(&mut self, event: ToolEvent) {
+        self.emitted_content_or_call = true;
+        let chunk = match event {
+            ToolEvent::Content(text) => self.delta_chunk(crate::decoder::Delta {
+                channel: Channel::Content,
+                text,
+            }),
+            ToolEvent::Call(call) => self.tool_call_chunk(call),
+        };
+        self.pending.push_back(chunk);
     }
 
     /// One chunk (a decoded delta or the final `finish_reason` chunk).
@@ -763,13 +959,29 @@ impl ChunkStream {
             Channel::Reasoning => Delta {
                 reasoning_content: Some(delta.text),
                 content: String::new(),
+                tool_calls: None,
             },
             Channel::Content => Delta {
                 reasoning_content: None,
                 content: delta.text,
+                tool_calls: None,
             },
         };
         self.chunk(delta, None)
+    }
+
+    /// One complete tool call as its SSE chunk (GitHub #121): a `delta`
+    /// carrying only `tool_calls`, mirroring `delta_chunk`'s shape for the
+    /// reasoning/content channels.
+    fn tool_call_chunk(&self, call: ScannedToolCall) -> Event {
+        self.chunk(
+            Delta {
+                reasoning_content: None,
+                content: String::new(),
+                tool_calls: Some(vec![call.into()]),
+            },
+            None,
+        )
     }
 
     /// The final summary chunk: empty `choices`, populated `usage` (OpenAI's
@@ -830,20 +1042,35 @@ impl Stream for ChunkStream {
                         // decoder is holding back — loop to poll the next
                         // scheduler event rather than returning nothing.
                         for delta in this.decoder.push(&[token]) {
-                            this.pending.push_back(this.delta_chunk(delta));
+                            this.queue_decoder_delta(delta);
                         }
                     }
                     // The request completed: flush whatever the decoder
-                    // held back, then the finish-reason chunk, then (opt-in)
-                    // the usage chunk — all queued ahead of `[DONE]`.
+                    // and the tool-call scanner held back, then the
+                    // finish-reason chunk, then (opt-in) the usage chunk —
+                    // all queued ahead of `[DONE]`.
                     SchedEvent::Done { reason, tokens, .. } => {
                         this.cancel.completed();
                         for delta in this.decoder.finish() {
-                            this.pending.push_back(this.delta_chunk(delta));
+                            this.queue_decoder_delta(delta);
                         }
-                        this.pending.push_back(
-                            this.chunk(Delta::default(), Some(finish_reason_str(reason))),
+                        // Read before `finish()` clears it (GitHub #121
+                        // acceptance criterion 3): a stop/cancel landing
+                        // mid-call must never be reported as a clean
+                        // `tool_calls` finish.
+                        let mid_call = this.tool_scanner.is_mid_call();
+                        for tool_event in this.tool_scanner.finish() {
+                            this.queue_tool_event(tool_event);
+                        }
+                        let any_calls = this.tool_scanner.any_calls();
+                        let finish_reason = resolve_finish_reason(reason, any_calls, mid_call);
+                        report_if_all_reasoning_no_content(
+                            &this.id,
+                            this.emitted_reasoning && !this.emitted_content_or_call,
+                            finish_reason,
                         );
+                        this.pending
+                            .push_back(this.chunk(Delta::default(), Some(finish_reason)));
                         if this.include_usage {
                             this.pending.push_back(this.usage_chunk(tokens));
                         }
@@ -1057,6 +1284,7 @@ mod tests {
                 delta: Delta {
                     reasoning_content: None,
                     content: "hello".into(),
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1154,5 +1382,71 @@ mod tests {
             }
             _ => panic!("a message-list input must parse as Messages"),
         }
+    }
+
+    // ── GitHub #121: tool-call and finish-reason hardening ──────────────
+
+    #[test]
+    fn a_clean_stop_with_a_complete_call_reports_tool_calls() {
+        assert_eq!(
+            resolve_finish_reason(FinishReason::Stop, true, false),
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn a_clean_stop_with_no_call_reports_stop() {
+        assert_eq!(resolve_finish_reason(FinishReason::Stop, false, false), "stop");
+    }
+
+    #[test]
+    fn a_mid_call_stop_never_reports_tool_calls_even_though_one_was_seen() {
+        // Acceptance criterion 3: a call left open when generation stopped
+        // was dropped whole by `ToolCallScanner` — reporting `tool_calls`
+        // here would tell the client to run a call it never received.
+        assert_eq!(resolve_finish_reason(FinishReason::Stop, true, true), "stop");
+    }
+
+    #[test]
+    fn length_is_reported_regardless_of_calls_seen() {
+        assert_eq!(resolve_finish_reason(FinishReason::Length, true, false), "length");
+        assert_eq!(resolve_finish_reason(FinishReason::Length, false, false), "length");
+    }
+
+    #[test]
+    fn a_streamed_tool_call_delta_serializes_in_the_openai_shape() {
+        let delta = Delta {
+            reasoning_content: None,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCallDelta {
+                index: 0,
+                id: "call_0".into(),
+                r#type: "function",
+                function: FunctionOut {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            }]),
+        };
+        let json = serde_json::to_value(&delta).expect("delta serializes");
+        assert_eq!(json["tool_calls"][0]["index"], 0);
+        assert_eq!(json["tool_calls"][0]["id"], "call_0");
+        assert_eq!(json["tool_calls"][0]["type"], "function");
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "read_file");
+        // A delta with tool_calls but no text carries no `content` key
+        // (same "empty things are omitted" rule as `reasoning_content`).
+        assert!(json.get("content").is_none());
+    }
+
+    #[test]
+    fn an_assistant_message_with_no_tool_calls_omits_the_field_entirely() {
+        let message = AssistantMessage {
+            role: "assistant",
+            reasoning_content: None,
+            content: "hi".into(),
+            tool_calls: None,
+        };
+        let json = serde_json::to_value(&message).expect("message serializes");
+        assert!(json.as_object().unwrap().get("tool_calls").is_none());
     }
 }
