@@ -8,6 +8,10 @@ span, default chunked route (`run_program_chunk`, `kernel/src/step.cu`),
 This file answers **acceptance criterion 1 only**. The survey of directions
 (criterion 2), the CUDA-graph spike and any fix are deliberately not here.
 
+> Consolidated into `docs/discovery/0001-discovery-prefill-chunk-wall-time.md`,
+> which is the durable record. This file is the working writeup the #92
+> comments link to, kept as taken.
+
 ## The answer, first
 
 At the production 1,024-token chunk width, a chunk costs **98.6 ms of device
