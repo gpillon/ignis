@@ -221,6 +221,16 @@ leaf builds is derived from `--max-context`, not a flag of its own.
 
 1. every new or changed behavior has a test that covers it
 2. `cargo test` passes workspace-wide (machine-local skips allowed)
-3. kernel changes: `kernel/build.ps1` clean + the leaf's op tests green +
+3. `cargo check --workspace --features cuda --tests` is clean. The
+   cuda-gated test targets (`#![cfg(feature = "cuda")]`) are the ones
+   `cargo test` never compiles, so a signature change can leave them
+   uncompilable and nothing says so until someone runs the GPU profile
+   — which needs a free 5090 and so runs rarely. GitHub #132 did exactly
+   that: it added a third argument to `apply_chat_template`, missed two
+   call sites under `crates/server/tests/`, and blocked the next GPU
+   profile outright (found and fixed in #119). This check costs ~30s,
+   needs no GPU, and reports *every* broken site rather than stopping at
+   the first — which is how the second of those two was found at all.
+4. kernel changes: `kernel/build.ps1` clean + the leaf's op tests green +
    the GPU profile green on a free 5090 (`scripts/gpu-profile.ps1` —
    preflight passed, `IGNIS_GPU_PROFILE=1` for the run — never a skip)
