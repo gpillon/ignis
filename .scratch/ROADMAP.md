@@ -13,7 +13,7 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 | 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
 | 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `runtime/specs/02-real-prefill.md` |
 | 3 — serving loop: chunk-level prefill/decode interleaving, batched decode rounds, per-width CUDA graphs, sampling, request log | G3: three cells live/live (ADR 0015) — C=1 ≥ 99% of the live reference, C=4 aggregate ≥ 99%, p95 inter-token latency under a cold 32K prefill within the live envelope; plus the K-agnostic anti-serialization property | #64 | `runtime/specs/03-serving-loop.md` |
-| 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | to write when G3 lands |
+| 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | `runtime/specs/04-reference-feature-floor.md` |
 | 5 — speculative decoding: MTP + ReplaySSM, then DFlash2 | G5: ≥ 99% of reference MTP7-adaptive / DFlash2-7 committed tok/s @24K/98K/196K | #66 | to write when G4 lands |
 | 6 — beyond the reference (north star) | per-item gates | — | concurrent prefill / prefill-decode overlap, PDL + fusion, lazy graphs, hot reload, own artifact recipe |
 
@@ -144,7 +144,41 @@ both point at fixed per-chunk-boundary cost rather than chunk-proportional
 cost. Full verdict and records: `.scratch/REVIEW-2026-09-05.md` §6 Phase 3,
 `.scratch/g3-logs/`. #64 is closed on this verdict per its own text.
 
-## Phase 3–5 candidate decomposition (not published; refined when the gate before lands)
+## Phase 4 decomposition (G4, master #65)
 
-- **G4**: hq-e8-2b codec + attention routes + exact-key side store · device prefix reuse (page refcount, shared system+tools boundary) · KV-RAM tier snapshot/restore (all state sections) · tagged lanes · preserve-thinking / tool-call stream hardening · warmup/readiness · G4 gate (bench-03 trace).
+Tracer bullets from `.scratch/runtime/specs/04-reference-feature-floor.md`, cut
+in the grilling session of 2026-09-11. That session introduced **ADR 0022**
+(two KV formats, BF16 retained as the correctness oracle), **ADR 0023** (one
+eviction priority across GPU residency and the host tier) and **ADR 0024**
+(sequence state transfer: an opaque versioned blob, device-to-device cloning
+for prefix reuse). Ticket numbers go in this table when they are published.
+
+| # | Ticket | Blocked by | Delivers (verifiable) |
+|---|---|---|---|
+| P4-01 (#117) | Gate instrument: `replay --session`, `gate` refusing records that do not share one, the load trace's SHA-256 in both run records, per-class pooled verdict, needle-retrieval cells | — | Cells and refusals CPU-tested against a stub endpoint; no GPU |
+| P4-02 (#118) | Record the real "1 main + N subagents" load trace against the reference (human: needs ninfer and a real session) | — | A trace that loads through `replay`, kept out of git; its hash and shape committed |
+| P4-03 (#119) | hq codec + op tests: vendor the reference's hq op tests if they exist, else a codec round-trip with an error bound measured on real KV rows | — | hq op tests green at 27B geometry; the tolerance derived, not copied |
+| P4-04 (#122) | KV format as a load option: byte-budget pool with a CLI override, geometry and token capacity derived from the format, hq append path | P4-03 (#119) | A model loads under either format and reports the token capacity its budget bought |
+| P4-05 (#123) | hq attention routes + decode graphs under hq + the hq-vs-BF16 route agreement oracle | P4-04 (#122) | Replay matches eager at widths 1..8 under hq; route agreement within the derived tolerance |
+| P4-06 (#124) | State sections + real `ignis_seq_snapshot` / `ignis_seq_restore`: leaf-side section table, snapshot size and version query, opaque versioned blob | P4-04 (#122) | GPU test: snapshot, release, restore, continue decoding to the same tokens; a mismatched blob is refused |
+| P4-07 (#125) | KV-RAM tier bound to real state: pinned host buffers, byte budget, eviction at a chunk boundary on the refusal path, half-prefilled sequences included | P4-06 (#124) | An evicted sequence resumes without re-prefilling; evictions bounded under overflow |
+| P4-08 (#127) | Unified eviction priority (ADR 0023) across both levels, tag-aware | P4-07 (#125), P4-09 (#120) | An `Interactive` snapshot in probation outlives an `Agent` snapshot in protected |
+| P4-09 (#120) | Tagged lanes: the class as an ignis extension field, mapped to `RequestClass`, echoed in the request log and carried by the trace | — | Every request's class is attributable in the log; unknown maps to `Interactive` |
+| P4-10 (#126) | Device prefix reuse: leaf-owned page refcount and sharing, device-to-device clone of the mutable sections through the section machinery | P4-06 (#124) | A sibling claiming a prefix produces the same tokens as one that prefilled it; shared pages charged once |
+| P4-11 (#121) | Tool-call stream hardening and preserve-thinking against a real agent session | — | A recorded session's tool-call and thinking streams survive round-trip |
+| P4-12 (#128) | G4 gate run and verdict | all | **G4 GREEN** or a filed gap, never a waiver |
+
+Frontier at start: **#117**, **#118**, **#119**, **#120**, **#121** in
+parallel (P4-01 and P4-09 are Rust only, no GPU; P4-02 needs the owner and the
+reference, nothing of ignis).
+Critical path: #119 → #122 → #123 / #124 → #125 → #127 / #126 → #128.
+
+Out of the phase, tracked rather than dropped: the warmup / readiness split
+(**#129**, gates nothing); packed prefill (decided after **#92**);
+more than one active prefill and prefill preemption (built only if the
+per-class TTFT cell fails without them); the exact-key side store (built only
+if long-context retrieval under hq comes back short); a third request class.
+
+## Phase 5 candidate decomposition (not published; refined when the gate before lands)
+
 - **G5**: MTP round + pack + adaptive width + ReplaySSM records/fold · DFlash2 drafter load + draft kernels + RAM-tier carry · G5 gate.

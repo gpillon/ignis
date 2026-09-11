@@ -20,6 +20,10 @@ When output names a domain concept, use the term as defined here.
   tracked by a manifest (pinned commit, content hashes, recorded patches).
   Anything hand-written is not one, and carries no port claim (ADR 0010).
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
+- **Lane tag** — the request's own statement of its class, carried as an ignis
+  extension field on the request and echoed in the request log. Two classes,
+  `Interactive` and `Agent`; absent or unrecognized means `Interactive`. It is
+  what makes a per-class gate cell and the **eviction priority** mean anything.
 - **Prefill lane** — the single global prefill slot: exactly one request at a
   time holds device-resident **prefill progress** and consumes chunks, and
   every other prefill queues behind it. It is a slot, not a promise about
@@ -69,8 +73,17 @@ When output names a domain concept, use the term as defined here.
 - **NVFP4** — the weight quantization format of most of the model: E2M1 values,
   an E4M3 group scale per 16 stored in a separate **scale plane**
   (`blockscale-k16-m128x4-v1` layout), and a per-tensor **weight divisor**.
-- **hq-e8-2b** — the reference's HyperQuant KV cache format; the profile the
-  owner actually runs. Adopted at G4; bf16 KV until then.
+- **hq-e8-2b** — the reference's HyperQuant KV cache format, and the profile the
+  owner actually runs: a randomized Hadamard rotation, E8-lattice quantization
+  and Rice coding packed into a fixed per-row budget of 64 code bytes plus 8
+  metadata bytes per (token, KV head). Fixed bytes per token, so page
+  addressing and CUDA-graph address stability are unchanged. 9,216 bytes per
+  sequence-token against BF16's 65,536 — a factor of 7.11.
+- **KV format** — which of the two KV cache formats a load runs: **hq-e8-2b**,
+  the serving default from G4, or **BF16**, retained as the format every
+  correctness oracle runs against. A model-load option, fixed for the life of
+  the load; the pool is sized by a byte budget and its token capacity is
+  *derived* from the format rather than configured (ADR 0022).
 
 ## Sequence state
 
@@ -93,9 +106,32 @@ When output names a domain concept, use the term as defined here.
   same shape as the KV/GDN pools (one row per slot). Device-side sampling's
   presence/frequency penalties read and atomically update it; zeroed at
   `ignis_seq_alloc` like every other slot section.
-- **KV-RAM** — the host-RAM KV cache tier: snapshots GPU lanes so sibling requests
-  restore instead of re-prefilling; two-tier eviction (probation → protected).
-- **Prefix reuse** — concurrent requests sharing a prefix skip the redundant prefill.
+- **State section** — one part of what a sequence is made of: its KV pages, its
+  GDN slot, its conv taps, its position and last token, its penalty-count row.
+  Each is either shareable read-only (KV pages) or must be cloned per sequence
+  (everything mutable). The table of them lives inside the leaf, and adding one
+  is the act that re-earns the **snapshot point** permission rather than
+  inheriting it (ADR 0024).
+- **Snapshot blob** — the opaque, versioned byte image of a whole sequence that
+  crosses the ABI. Callers ask the leaf for its size and a format version and
+  never see the section layout; a restore validates the header and refuses a
+  stale or foreign one. Whole-sequence only: GDN state cannot be recomputed
+  without re-running the prefix a restore exists to avoid (ADR 0024).
+- **KV-RAM** — the host-RAM tier that holds **snapshot blobs** of evicted
+  sequences so they resume instead of re-prefilling. Bounded by a byte budget,
+  two-tier (probation → protected), and written only at a **chunk boundary**.
+  Control plane since v1; it moves real device state from G4.
+- **Prefix reuse** — concurrent requests sharing a prefix skip the redundant
+  prefill: the shared **KV pages** are refcounted and shared in place on the
+  device, and the mutable **state sections** are cloned device-to-device. It
+  never round-trips through host RAM, and sharing pages alone would save
+  nothing, since prefill must traverse every layer to produce the mutable
+  state (ADR 0024). Control plane since v1; it shares real pages from G4.
+- **Eviction priority** — the one ordering that decides what loses residency,
+  expressed at two levels: leaving the GPU is eligibility and protection, then
+  request class, then least-recently-used; leaving the host tier is request
+  class, then probation before protected, then least-recently-used. Protection
+  outranks class only where something is actively being served (ADR 0023).
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
   leaf knows how to loop over a span of any length; it is no longer the only
@@ -173,7 +209,9 @@ When output names a domain concept, use the term as defined here.
   a request generates therefore depends on its own seed alone, never on which
   lanes happened to share its round.
 - **N-lane concurrency** — 8 resident decode lanes (N=8), with overflow to the
-  host KV-RAM tier; sized for a ~10-subagent concurrent coding workload.
+  host KV-RAM tier; sized for a ~10-subagent concurrent coding workload. Real
+  at long context only under hq-e8-2b: eight lanes at a 40,960-token context
+  are ~20 GiB of BF16 KV against ~3.02 GB of hq (**KV format**).
 - **DFlash2** — the 5-layer sliding-window (2048) speculative-decoding drafter
   (hidden 5120, draft tokens 1..7, native acceptance 3.4–3.7 tokens/round).
 - **MTP** — the model's native multi-token-prediction heads (draft window 3,
@@ -291,5 +329,13 @@ When output names a domain concept, use the term as defined here.
   **not** token-agreement;
   correctness is self-checked (sane output, same model, greedy, fixed seed).
   It is the first of a ladder of performance gates (later gates TBD).
-- **Trace replay** — re-sending a recorded "1 main agent + N subagents" load trace
-  against the engine to compare scheduler behavior with the ninfer baseline.
+- **Trace replay** — re-sending a recorded "1 main agent + N subagents" load
+  trace against both engines to compare scheduler behavior, scored per **lane
+  tag**. The trace is the load, not the baseline: the reference's own run is
+  measured live in the same session (**live/live gate**), over at least two
+  launches per engine (ADR 0021), and the verdict is the pooled cell statistic.
+- **Load trace** — the recorded agent session a **trace replay** sends. It holds
+  real working content, so it is never committed: its SHA-256 and its shape
+  (request count, class split, arrival span, prompt-length distribution) ship
+  with the gate artifacts, and both run records carry the hash so a reader can
+  prove the two engines replayed the same load.
