@@ -1,0 +1,22 @@
+{
+  "trace_sha256": "b53186c51a36d590dd93af4fab6f8d9180551c2b321e5ea6794cb799f5af0a2b",
+  "requests": 5,
+  "class_split": { "main": 1, "sub": 4 },
+  "arrival_span_ms": 20336,
+  "prompt_length_chars": {
+    "min": 33484,
+    "p50": 48305,
+    "p90": 84631,
+    "max": 84631,
+    "unit": "utf-8 bytes of the raw JSON request body (the 'prompt' field), not tokens"
+  },
+  "recorded_against": {
+    "repo": "gpillon/ninfer",
+    "branch": "feat/dflash2-local",
+    "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+    "preset": "qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k",
+    "model_id": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k"
+  },
+  "recorded_via": "ignis-bench record --class first-is-main",
+  "note": "GitHub #118 first pass: 1 main + 4 subagents (not the full ~10-subagent load the issue calls for), each request a full real repository file or two pasted as context (33KB-85KB per request) with tool definitions, staggered launch every 5s but genuinely overlapping in flight (finish times 16-30s after launch, so several requests were in flight concurrently against the single global prefill lane). A smaller session used to validate the capture proxy end to end (record -> replay against a stub) before committing to the full-size G4 reference trace. No tool-call or thinking-stream damage observed (SSE forwarded byte-for-byte, clean finish_reason + [DONE] on every request). The trace file itself is not committed (real working content); only this shape summary is."
+}

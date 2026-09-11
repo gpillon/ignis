@@ -23,6 +23,15 @@ The trace lines follow the `TraceLine` shape (`crates/bench/src/trace.rs`):
 `{"id", "class" ("main"|"sub"), "t_arrive_ms", "prompt", "max_tokens", "stream"}`
 — one main agent + N subagents, arrivals staggered over time.
 
+**`<load>-trace.jsonl` is never committed** (it contains real working
+content — repository text, paths, whatever the recorded session touched;
+see `.gitignore`). What ships in git instead is `<load>-trace.meta.json`:
+the trace's SHA-256 and its shape (request count, class split, arrival
+span, prompt-length distribution) — enough for a later reader to audit a
+gate run without the trace itself. Both a gate run's own record (`g4.rs`'s
+`trace_sha256`) and this file carry the same hash, so a reader can prove
+which trace a given verdict replayed.
+
 ## Procedure (GPU-exclusive, ADR 0006)
 
 1. **Record the trace** against the reference stack as JSONL (the prompts

@@ -27,3 +27,7 @@ __pycache__/
 
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/
+
+# recorded G4 load traces (real working-session content, GitHub #118) — only
+# the SHA-256 + shape summary (*.meta.json) is committed, never the trace
+bench/traces/*-trace.jsonl
