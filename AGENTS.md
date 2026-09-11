@@ -28,6 +28,11 @@ See `docs/agents/triage-labels.md`.
 Single-context — root `CONTEXT.md` for the glossary, `docs/adr/` for ADRs.
 See `docs/agents/domain.md`.
 
+### Findings
+
+When recording or consulting durable findings from discovery, research, or
+experiments, start from `docs/findings/README.md`.
+
 ### Testing
 
 Every code change ships with a test, and the task is not complete until
