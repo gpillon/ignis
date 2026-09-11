@@ -1,0 +1,23 @@
+{
+  "trace_sha256": "1a9fa9498b2ae529bef1fe608fad4910b78712b69a69f24436f62a8e13286f3a",
+  "requests": 83,
+  "class_split": { "main": 1, "sub": 82 },
+  "arrival_span_ms": 793326,
+  "prompt_length_chars": {
+    "min": 2444,
+    "p50": 45828,
+    "p90": 310558,
+    "max": 376357,
+    "unit": "utf-8 bytes of the raw JSON request body (the 'prompt' field), not tokens"
+  },
+  "recorded_against": {
+    "repo": "gpillon/ninfer",
+    "branch": "feat/dflash2-local",
+    "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+    "preset": "qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k",
+    "model_id": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k"
+  },
+  "recorded_via": "a real Qwen Code CLI session (0.23.0), pointed at the capture proxy via ~/.qwen/settings.json (model/@lane suffix, not the ignis-bench record --class marker header)",
+  "purpose": "supplementary: exercising the capture proxy against a genuine agent client, not the shape-bearing G4 trace (bench/traces/g4-load-trace.jsonl is that). Kept as a second artifact because it is real evidence of a different question than the scripted session answers.",
+  "note": "83 requests over ~13.2 minutes of real interactive use. No corruption, no error/warn/panic in the reference's log across the whole session -- the capture proxy's byte-for-byte SSE forwarding held up against a real client (this ticket's 'tool-call/thinking-stream damage' criterion: none observed, nothing to file). Model-id tags actually sent: 56x '@classifier', 27x '@main', 0x '@agents' -- confirms the user's own observation live: Qwen Code's subagent/explore path (configured to route through the '@agents' lane, agents.builtin.exploreModel / modelGrades.agents in settings.json) never fired a single request in this session, despite the main+classifier lanes working end to end (config -> capture proxy -> pinned reference, all healthy). The gap is client-side subagent orchestration not invoking its configured model at all, not a proxy or reference defect -- out of #118's scope to diagnose further; noted here as the concrete evidence for the ticket. Seven distinct system-prompt roles were seen across the session (main CLI agent, plus Qwen Code's own housekeeping calls: memory extraction, memory selection, a 'memory dream' reflective pass, chat-title generation, tool-call summary labels, and a security classifier) -- real client traffic is shaped very differently from a scripted 'N coding subagents' burst, which is exactly why this is kept as a separate, clearly-labeled artifact rather than folded into the shape-bearing trace."
+}

@@ -1,0 +1,22 @@
+{
+  "trace_sha256": "478a6d284e7dfea7ab0c1f80354b34c543f11d03d281c4db040d3fcbc79b69a1",
+  "requests": 11,
+  "class_split": { "main": 1, "sub": 10 },
+  "arrival_span_ms": 20688,
+  "prompt_length_chars": {
+    "min": 30225,
+    "p50": 48138,
+    "p90": 66110,
+    "max": 84769,
+    "unit": "utf-8 bytes of the raw JSON request body (the 'prompt' field), not tokens"
+  },
+  "recorded_against": {
+    "repo": "gpillon/ninfer",
+    "branch": "feat/dflash2-local",
+    "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
+    "preset": "qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k",
+    "model_id": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k"
+  },
+  "recorded_via": "bench/sim/simulate-session.ps1 -> ignis-bench record --class first-is-main",
+  "note": "GitHub #118: 1 main + 10 subagents, each request a full real repository file or two pasted as context (30KB-85KB per request, max_tokens 16000 main / 12000 sub) with tool definitions. Requests launched 2s apart but genuinely overlapping in flight: individual completions ranged 28s-170s, so the session's dense concurrent window spans roughly 19:26:37-19:29:36 (~3 minutes wall clock) against the single global prefill lane. 10 of 11 requests finished naturally on finish_reason=tool_calls; only one hit the max_tokens cap. No tool-call or thinking-stream damage observed (SSE forwarded byte-for-byte, clean finish_reason + [DONE] on every request). The trace file itself is not committed (real working content); only this shape summary is."
+}

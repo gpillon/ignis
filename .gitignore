@@ -27,3 +27,10 @@ __pycache__/
 
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/
+
+# recorded G4 load traces (real working-session content, GitHub #118) — only
+# the SHA-256 + shape summary (*.meta.json) is committed, never the trace.
+# Every trace file lives here as *.jsonl regardless of name (a narrower
+# "*-trace.jsonl" pattern missed "...-real-client.jsonl" once — broadened
+# on purpose, never narrow this back).
+bench/traces/*.jsonl
