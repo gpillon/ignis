@@ -256,3 +256,44 @@ add_test(NAME ignis_kernel_paged_kv_budget_test COMMAND ignis_kernel_paged_kv_bu
 add_executable(ignis_kernel_seq_alloc_test test_seq_alloc.cpp)
 target_link_libraries(ignis_kernel_seq_alloc_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_alloc_test COMMAND ignis_kernel_seq_alloc_test)
+
+# P4-03 (GitHub #119): the hq-e8-2b row codec's own op-level oracle. It was
+# FOUND in the reference at `tools/test_kv/`, not `tests/ops/` — that is why
+# no hq arm existed in the vendored `test_gqa_attention.cpp` (P1-15, GitHub
+# #51): the reference never put codec-level coverage under `tests/ops/` in
+# the first place, it lives here as its own tool with its own `main()`.
+# Vendored verbatim (`tools/test_kv/test_hq_codec.cu`, `hq_dither_host.h`):
+# exhaustive FP64 2*E8 nearest-point check, device encode/decode round-trip
+# vs an FP64 oracle, bit-budget invariant, determinism, 8-lane group-decode
+# equivalence, escalation + terminal-fallback census on a heavy-tailed
+# corpus, Rice-k invariant, and a synthetic k>0 general-fallback arm.
+# `hq_codec.cuh` is a header-only device header over the vendored substrate
+# (already vendored by P1-15), so this links only ignis_vendor, not
+# ignis_kernel. `tools/test_kv` is a private include directory so the oracle
+# can include its sibling `hq_dither_host.h` unqualified, same pattern as
+# the other vendored test roots above. Same no-SKIP_RETURN_CODE rule as
+# every other GPU test here (ADR 0006).
+add_executable(ignis_hq_codec_test ${IGNIS_VENDOR_DIR}/tools/test_kv/test_hq_codec.cu)
+target_include_directories(ignis_hq_codec_test PRIVATE ${IGNIS_VENDOR_DIR}/tools/test_kv)
+target_link_libraries(ignis_hq_codec_test PRIVATE ignis_vendor)
+add_test(NAME ignis_hq_codec_test COMMAND ignis_hq_codec_test)
+
+# P4-03 (GitHub #119): OURS, not vendored -- the measured-tolerance test at
+# this model's real 27B geometry. The vendored ignis_hq_codec_test above
+# already proves the codec's internal correctness against an FP64 brute
+# force on a synthetic corpus with random signs and a fixed seed; this test
+# covers only what that one cannot: round-trip error on real captured K/V
+# rows (kernel/tests/fixtures/hq_kv_rows_27b.bin, captured by
+# crates/core/tests/hq_kv_fixture_capture_gpu.rs), through the engine's real
+# rotation and real per-row dither seeding, broken down per GQA layer
+# ordinal and per role, with its enforced tolerance derived from that
+# measurement (see the test file's own "derived tolerance" comment).
+# IGNIS_HQ_KV_FIXTURE_PATH is an absolute path baked in at configure time so
+# the test does not depend on CTest's working directory. Same
+# no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006): a
+# missing or corrupt fixture is this test's own hard failure, not a skip.
+add_executable(ignis_hq_codec_kv_rows_test test_hq_codec_kv_rows.cu)
+target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
+add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)

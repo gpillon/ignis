@@ -101,6 +101,31 @@ pub(crate) mod ffi {
 
         pub fn ignis_seq_last_error() -> *const c_char;
     }
+
+    // Test-only diagnostic seam (`kernel/include/ignis_kv_capture.h`,
+    // GitHub #119) -- not part of the public flat C ABI above, and gated
+    // behind the non-default `kv-capture` feature (this crate's
+    // Cargo.toml): the .cu file does compile into ignis_kernel.lib
+    // regardless (kernel/CMakeLists.txt globs every kernel/src/*.cu), but
+    // nothing in a production build ever references these symbols unless
+    // this feature is on, and it never is in one. See
+    // [`super::Seq::capture_kv_rows_for_test`].
+    #[cfg(feature = "kv-capture")]
+    unsafe extern "C" {
+        pub fn ignis_kv_capture_rows(
+            pool: *const IgnisSeqPool,
+            seq: *const IgnisSeq,
+            gqa_layer_ordinal: i32,
+            role: i32,
+            kv_head: i32,
+            first_position: i32,
+            row_count: i32,
+            head_dim: i32,
+            out_rows: *mut u16,
+        ) -> i32;
+
+        pub fn ignis_kv_capture_last_error() -> *const c_char;
+    }
 }
 
 pub use ffi::{IgnisSeqPoolStats, IgnisSeqStats};
@@ -112,6 +137,12 @@ pub const NOT_IMPLEMENTED: i32 = -2;
 
 fn last_error() -> String {
     let msg = unsafe { CStr::from_ptr(ffi::ignis_seq_last_error()) };
+    msg.to_string_lossy().into_owned()
+}
+
+#[cfg(feature = "kv-capture")]
+fn kv_capture_last_error() -> String {
+    let msg = unsafe { CStr::from_ptr(ffi::ignis_kv_capture_last_error()) };
     msg.to_string_lossy().into_owned()
 }
 
@@ -249,6 +280,55 @@ impl Seq<'_> {
     /// exposed outside this crate (mirrors the handle's C-ABI opacity).
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeq {
         self.handle
+    }
+
+    /// Test-only diagnostic for the #119 hq-e8-2b fixture capture
+    /// (`crates/core/tests/hq_kv_fixture_capture_gpu.rs`): reads back
+    /// `row_count` consecutive (position, kv_head) rows of one GQA layer's
+    /// K or V plane, starting at `first_position`, as their raw BF16 bit
+    /// patterns (`kernel/include/ignis_kv_capture.h`).
+    ///
+    /// Gated behind the non-default `kv-capture` feature (never enabled in
+    /// a production build, see this crate's `Cargo.toml`) -- that gate,
+    /// not the `pub` visibility below, is what keeps this off the engine's
+    /// forward-pass ABI. `pub` rather than `pub(crate)` only because it is
+    /// exercised from an integration test in `crates/core/tests/` (outside
+    /// this crate's privacy boundary); no production caller uses it, and
+    /// it exists only so the committed fixture can be re-captured if the
+    /// artifact or the capture prompt ever changes. `gqa_layer_ordinal` is
+    /// `Seq`/`ignis_seq_internal.h`'s own 0..kIgnisGqaLayerCount-1 index,
+    /// not an absolute backbone layer; `role` is 0 for K, 1 for V;
+    /// `head_dim` must match the pool's actual geometry (the leaf
+    /// validates it rather than trusting it silently).
+    #[cfg(feature = "kv-capture")]
+    pub fn capture_kv_rows_for_test(
+        &self,
+        gqa_layer_ordinal: i32,
+        role: i32,
+        kv_head: i32,
+        first_position: i32,
+        row_count: i32,
+        head_dim: i32,
+    ) -> Result<Vec<u16>, String> {
+        let mut out = vec![0u16; (row_count.max(0) as usize) * (head_dim.max(0) as usize)];
+        let rc = unsafe {
+            ffi::ignis_kv_capture_rows(
+                self.pool,
+                self.handle,
+                gqa_layer_ordinal,
+                role,
+                kv_head,
+                first_position,
+                row_count,
+                head_dim,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 {
+            Ok(out)
+        } else {
+            Err(kv_capture_last_error())
+        }
     }
 
     /// Detach the compile-time borrow tying this sequence to its pool

@@ -1,0 +1,34 @@
+{
+  "artifact_path": "F:\\ai\\q38\\ninfer-models\\qwen3_8_27b_nvfp4full-v2.ninfer",
+  "artifact_sha256": "abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af",
+  "bin_bytes": 4194368,
+  "bin_sha256": "7513c00634557473ebcb76b95e40e733a7f213776d0b15d43bacbec6f1f764f3",
+  "capture_date_utc": "2026-09-11T22:26:04Z",
+  "captured_by": "crates/core/tests/hq_kv_fixture_capture_gpu.rs",
+  "first_position": 0,
+  "fixture_format": {
+    "checksum": "FNV-1a 64 over the row payload bytes only, little-endian u64 in the header (corruption detection, not cryptography)",
+    "format_version": 1,
+    "magic": "IGNHQKV1"
+  },
+  "gqa_layer_ordinals": [
+    0,
+    5,
+    10,
+    15
+  ],
+  "head_dim": 256,
+  "kv_heads": 4,
+  "max_context_tokens": 1024,
+  "model_id": "qwen3.8-27b-nvfp4full-v2",
+  "prompt": "Keeper's Log, Third Year at the Point\n\nThe lighthouse stood at the far end of the point, where the land narrowed to a spit of grey stone and the sea took over completely. I had come there in early September, when the tourists had gone home and the ferry ran only twice a week, carrying mail, diesel, and whoever was fool enough to want the job. My predecessor left a short note pinned to the inside of the pantry door: the paraffin runs low faster in the northeast wind, mind the fog signal's compressor on wet mornings, and never trust the barometer during a falling glass in October. I read it three times before I understood he meant it as a warning, not a joke.\n\nThe first winter taught me more about the mechanism than any manual could. The lamp itself was modest by then, an electric bulb behind a rotating Fresnel lens that had been ground somewhere in France a century earlier, its panels beveled to bend light into a single disciplined beam. The old clockwork that once turned the lens by falling weights had been replaced by a small motor, but the housing still smelled faintly of the whale oil it once burned, a smell that never quite left the brass fittings no matter how many coats of paint went over them. I would climb the spiral stair twice a day, once at dusk to light the lamp and once before dawn to check the logbook and the weather glass, and each time the iron treads rang a little differently underfoot depending on how much damp had gotten into the tower overnight.\n\nFog was the real adversary, not storms. A storm announces itself: the barometer falls, the gulls go quiet, the swell builds a day in advance if you know how to read it. Fog arrives without ceremony, rolling in off the bank in a matter of minutes, swallowing the beam whole so that from the rocks below you could no longer tell the light was burning at all. That was what the horn was for, a compressed-air signal that groaned out over the water every thirty seconds, a sound with no beauty in it but enormous purpose. On the worst nights, when the compressor iced up and had to be hand-cranked, I understood why keepers before me had gone a little strange out here, talking to the gulls, keeping elaborate private calendars, arguing with the sea as if it could be reasoned with.\n\nSupplies came by boat, weather permitting, and in a bad month permitting meant nothing at all. I learned to stretch a fortnight's stores into six weeks, to ration paraffin and flour and the handful of books I had brought with me, rereading each one until the spines gave out. The isolation was not the hardship people imagine from the mainland; the hardship was the waiting, the long stretches when nothing at all happened and the only variable in the day was which direction the wind chose to blow the rain. I kept the log meticulously anyway, noting wind speed and direction, visibility, any vessel sighted, any bird blown far off its course and found resting, exhausted, on the gallery rail. Entry after entry, most of them identical, until an entry that was not, and those were the ones I remembered.\n\nThere was a night in November when a trawler lost its bearings in the fog and came in far closer to the point than any vessel had a right to. I heard the engine before I saw the running lights, a low diesel throb underneath the horn's groan, and for a long minute I stood on the gallery convinced I was about to watch a wreck happen a few hundred yards from where I stood, powerless to do anything but keep the light turning and the horn sounding. The engine note changed, sharpened, and the lights swung hard away into the murk. I never learned who was aboard or how close it truly came; the log entry for that night is three lines long and says nothing about how my hands would not stop shaking afterward.\n\nBy the second spring I had stopped counting the days until relief and started noticing the place instead: the seals that hauled out on the lee rocks every low tide, indifferent to the horn and the light both; the exact week in April when the terns returned and began their furious, repetitive defense of a rock they had claimed the year before and would claim again; the particular green the sea turned in the hour before a storm, a color I never managed to describe adequately in the log no matter how many adjectives I tried. The mechanism I had once found intimidating became, by then, almost meditative to maintain: the daily climb, the cleaning of the lens panels with a soft cloth and a prescribed solvent, the careful winding and checking of the backup mechanism in case the motor failed, the logging of every observation in the same terse, factual hand my predecessor had used, and his predecessor before him, an unbroken chain of keepers each adding their few lines to a record that would outlast every one of us individually.\n\nWhen my relief finally came, on a clear morning in late May with the sea flat calm and the terns already screaming over their rock, I found I did not want to leave nearly as much as I had expected to. I wrote the final entry, packed the two books I had not yet finished, and climbed down the spiral stair one last time, counting the rings of the iron treads out of habit, already missing a sound I would not hear again for a long while.",
+  "prompt_token_count_full": 1114,
+  "prompt_token_count_used": 1024,
+  "roles": {
+    "0": "K",
+    "1": "V"
+  },
+  "row_order": "for layer in gqa_layer_ordinals { for role in [K, V] { for kv_head in 0..kv_heads { for position in first_position..first_position+rows_per_block { head_dim x bf16-bit-pattern u16 LE } } } }",
+  "rows_per_block": 256,
+  "total_rows": 8192
+}

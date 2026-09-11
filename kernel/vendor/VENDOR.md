@@ -443,6 +443,25 @@ P3-03 (GitHub #99) vendors the token sampler:
   ours, not vendored — `ops::sample`'s contract only supplies the op, not the
   ABI or the per-sequence state it reads from.
 
+P4-03 (GitHub #119) vendors the hq-e8-2b row codec's op-level oracle:
+
+- **its reference test** — `tools/test_kv/test_hq_codec.cu` plus
+  `tools/test_kv/hq_dither_host.h` (host mirrors of the codec's subtractive-
+  dither hashes it includes), both vendored verbatim, unpatched. It lives
+  under `tools/test_kv/` in the reference rather than `tests/ops/`, which is
+  why P1-15/#51's vendored `test_gqa_attention.cpp` carried no hq arm — the
+  reference never put codec-level coverage there in the first place, only
+  the attention-route coverage that ticket gated to bf16. The oracle itself
+  is exhaustive FP64 2*E8 nearest-point checking of the device quantizer,
+  device encode/decode round-tripped against an independent FP64 oracle,
+  the per-row bit-budget invariant, cross-run determinism, 8-lane group-
+  decode equivalence, an escalation/terminal-fallback census over a heavy-
+  tailed corpus, the Rice-k invariant, and a synthetic k>0 general-fallback
+  arm. `ops/kernel/hq_codec.cuh` (already vendored, P1-15/#51) is a header-
+  only device header over the vendored substrate, so this needs no
+  `ignis_kernel` link. Its own CTest executable, `ignis_hq_codec_test`,
+  since it brings its own `main()` like every other tool/test file above.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;

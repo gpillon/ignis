@@ -4,6 +4,7 @@ kernel/build/
 kernel/build-a/
 kernel/build-b/
 kernel/build-c/
+kernel/build-119/
 
 # webui (later phase)
 node_modules/
