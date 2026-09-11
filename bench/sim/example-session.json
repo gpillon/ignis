@@ -1,0 +1,87 @@
+{
+  "model": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "staggerSeconds": 2,
+  "requests": [
+    {
+      "name": "main",
+      "maxTokens": 16000,
+      "system": "You are the main coding agent working in the ignis repository (F:/ai/opencode/inference), a Rust + CUDA inference engine that is porting a reference C++/CUDA engine (ninfer) feature-for-feature under gated performance/correctness checks (ADRs in docs/adr/, gates in crates/bench). You have read_file, bash, edit_file, and spawn_subagent tools. You coordinate subagents for well-scoped subtasks instead of doing everything inline yourself. Always cite file paths and line numbers. Never guess at code you have not been shown in this conversation -- ask a subagent to read it first. Be thorough: give a complete, detailed plan, not a summary.",
+      "files": [
+        ".scratch/runtime/specs/04-reference-feature-floor.md",
+        "crates/core/src/admission.rs",
+        "crates/core/src/types.rs"
+      ],
+      "task": "Task: give me a complete, detailed implementation plan for spec 04 section 6 only (tagged lanes), referencing exact function names and line numbers from the files above, covering every user story in the spec that touches admission or the HTTP class field. Then spawn ten subagents in parallel with fully self-contained instructions (paste them the exact file content they need -- they cannot see this conversation) covering: call-site tracing of the admission fairness invariants, the HTTP @tag parser, the eviction-priority test, capture-proxy class parity, BackfillClass interaction with tagged lanes, the bench trace format, the HTTP error-code surface, KV pool byte-budget interaction with reserved lanes, prefix refcount interaction with a reserved lane, and a full eviction-priority trace end to end. Do not touch admission.rs's fairness state machine yourself -- wait for the ten reports and be exhaustive about what each one should check."
+    },
+    {
+      "name": "sub01",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/admission.rs"],
+      "task": "Task: trace every call site of `find_admission_lane` and `try_admit_one`, and report which invariants each one reads or mutates, out of {protection_, BackfillClass, temporal_credit, frontier_distance}. Then say, in detail, whether adding a `RequestClass`-based lane reservation (spec 04 section 6, tagged lanes: a static reserve, e.g. lane 0 only for @main, preemptable-but-not-preempting) can be implemented by changing only *which lanes are candidates* before this logic runs, without touching the fairness invariants themselves. Walk through every function in the module and classify it as touched or untouched by the change."
+    },
+    {
+      "name": "sub02",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/server/src/api.rs", "crates/server/src/toolcall.rs"],
+      "task": "Task: draft the `@tag` suffix parser for the model id, in full, as a diff. Accept `<model_id>@<tag>`, validate `<model_id>` exactly as today (still 404 if it doesn't match the loaded model), and extract `<tag>` into a `RequestClass` (Interactive or Agent). An absent or unrecognized tag must map to Interactive, never a 400, so old clients don't break. Show the diff against crates/server/src/api.rs and note anywhere crates/server/src/toolcall.rs would need to change too. Walk through every request-parsing function in both files and say whether it needs to change."
+    },
+    {
+      "name": "sub03",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/host.rs", "crates/core/src/prefix.rs"],
+      "task": "Task: write the eviction-priority CPU test from runtime spec 04's Testing Decisions in full: 'CPU tests over both orderings, including the case the policy exists for -- an Interactive snapshot in probation outliving an Agent snapshot in protected.' This is ADR 0023's asymmetry. Find wherever the host tier's eviction ordering lives in the two files below and write the test against whatever you find; if the two-level ordering does not exist yet, write it against the policy function's intended signature and mark it ignored, and say which is the case."
+    },
+    {
+      "name": "sub04",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/bench/src/record.rs", "crates/server/src/toolcall.rs"],
+      "task": "Task: this dogfood session is itself the G4 load-trace capture (GitHub #118). Audit the capture proxy and the server's tool-call handling below, in full, for any place where the proxy's byte-for-byte SSE forwarding could split a multi-chunk tool_calls delta or reasoning_content delta across a buffer boundary and corrupt it. Also confirm whether crates/bench/src/trace.rs's RequestClass (main/sub) and crates/core/src/types.rs's RequestClass (Interactive/Agent) are really two different enums with the same name, and flag it as a rename-worthy naming collision if so."
+    },
+    {
+      "name": "sub05",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/types.rs", "crates/core/src/admission.rs"],
+      "task": "Task: `BackfillClass` (Persistent / Temporal) and `RequestClass` (Interactive / Agent, spec 04's tagged-lanes concept) are both classifications on the same request but answer different questions. Read both files below in full and report every place they interact today, and every place they *would* interact once a request also carries a lane-reservation tag: does a Persistent backfill under a protection ever need to know the request's RequestClass, or are the two orthogonal all the way through?"
+    },
+    {
+      "name": "sub06",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/bench/src/trace.rs", "crates/bench/src/client.rs"],
+      "task": "Task: read the bench trace format below in full and report: (1) every field TraceLine carries and what each is for; (2) exactly how RequestClass (main/sub) round-trips through JSON; (3) whether the trace format could carry an *additional* class field (the admission RequestClass, Interactive/Agent) without breaking the 'at most one main' invariant or the replay driver, and sketch the shape it would take."
+    },
+    {
+      "name": "sub07",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/server/src/api.rs"],
+      "task": "Task: read crates/server/src/api.rs in full and produce a complete table of every HTTP error code it can return (400, 404, 413, 503, etc.), the exact condition that triggers each one, and the exact response body shape. Then say which of these an unrecognized `@tag` suffix on the model id should map to, given spec 04 section 6 says an absent or unrecognized tag must map to Interactive and never a 400."
+    },
+    {
+      "name": "sub08",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/host.rs", "crates/bench/src/record.rs"],
+      "task": "Task: spec 04 says the KV pool is a byte budget and a lane reservation for @main must be a *static* reserve (e.g. lane 0), not a token-count reservation. Read the host tier below in full and report exactly where the byte budget is enforced today, whether a reserved-lane concept can be expressed purely in terms of lane *indices* without touching the byte-budget arithmetic at all, and any place the two would collide."
+    },
+    {
+      "name": "sub09",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/prefix.rs", "crates/core/src/types.rs"],
+      "task": "Task: read the prefix-reuse refcounting code below in full and report every function that touches a refcount, whether a request tagged @main vs @agents changes any refcount decision today (it should not -- prefix sharing is content-addressed, not class-addressed), and confirm that in writing with the specific function(s) that prove it."
+    },
+    {
+      "name": "sub10",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/host.rs", "crates/core/src/admission.rs"],
+      "task": "Task: produce one full worked trace, step by step, of the eviction-priority scenario spec 04 exists to fix: an Interactive request's snapshot sits in probation while an Agent request's snapshot sits in protected, and the host tier must evict something. Walk through the ordering logic in the file below function by function and state, at each decision point, which snapshot is chosen and why, ending with a concrete assertion suitable for a unit test."
+    }
+  ]
+}

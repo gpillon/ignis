@@ -36,7 +36,10 @@ which trace a given verdict replayed.
 
 1. **Record the trace** against the reference stack as JSONL (the prompts
    and arrival offsets both engines will see — the reference side is the
-   speed reference only, ADR 0005).
+   speed reference only, ADR 0005). A live coding-agent client works, or
+   `bench/sim/simulate-session.ps1` for a scripted "1 main + N subagents"
+   session when standing one up by hand is too slow to reproduce — see
+   `bench/sim/README.md`.
 2. **Reference run (the baseline):** start the reference engine, then
    `ignis-bench replay --trace bench/traces/<load>-trace.jsonl --endpoint <ref-url> --label ninfer --out bench/traces/<load>-ninfer.json`
 3. **ignis run:** start `ignis-server`, then
