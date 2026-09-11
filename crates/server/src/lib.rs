@@ -29,6 +29,7 @@ pub mod runtime;
 pub mod telemetry;
 pub mod template;
 pub mod thinking;
+pub mod toolcall;
 
 use std::time::Duration;
 
