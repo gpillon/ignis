@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::trace::RequestClass;
 
 /// Per-request metrics for a single request in a run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestMetrics {
     /// Stable request id (matches the trace line and the reference run).
     pub id: String,
@@ -72,7 +72,7 @@ pub struct ClassStats {
 }
 
 /// One harness run: a label plus the per-request metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
     pub label: String,
     pub metrics: Vec<RequestMetrics>,

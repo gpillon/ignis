@@ -46,12 +46,22 @@
 //! OpenAI-compatible endpoint, reusing `ttft`'s exact-length prompt
 //! generator and cold-prefix rule; `g3_gate` turns two such records into
 //! the G3 verdict, with the same live/live refusal discipline as `g2`.
+//!
+//! The G4 measurement instrument (`g4` + `g4_gate`, P4-01) is the phase-4
+//! gate tooling (ADR 0015, ADR 0021, spec 04): `g4` replays the trace-replay
+//! load and measures the needle-retrieval correctness floor, with every run
+//! record carrying its measurement session and the SHA-256 of the load
+//! trace it replayed; `g4_gate` pools at least two independent process
+//! launches per engine into one verdict — the per-class / aggregate pooled
+//! throughput ratio, and the needle floor, never folded into a ratio.
 
 pub mod canary;
 pub mod client;
 pub mod g2;
 pub mod g3;
 pub mod g3_gate;
+pub mod g4;
+pub mod g4_gate;
 pub mod gate;
 pub mod metrics;
 pub mod oracle;
