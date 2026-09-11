@@ -35,6 +35,12 @@ tokio = { version = "1", features = ["full"] }
 # `cuda` feature is off), same path-dependency pattern as `crates/server`
 # and `crates/core`.
 ignis-artifact = { path = "../artifact" }
+# The G4 measurement instrument (`g4`, P4-01): a run record carries the
+# SHA-256 of the load trace it replayed, so the live/live gate check can
+# refuse a verdict when two records replayed different traces (spec 04).
+# Inline dependency: a parallel actor owns the workspace manifest (the root
+# `Cargo.toml` is not edited by this ticket).
+sha2 = "0.10"
 
 [dev-dependencies]
 # The in-process mock engine (the tests): a small axum router mimicking the

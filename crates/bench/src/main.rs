@@ -45,6 +45,22 @@
 //!       ratio against 99%, ITL p95 ratio against the reference's own p95.
 //!       Refuses a verdict when the records are not live/live (different
 //!       sessions, a missing cell, a void/bad sample).
+//!   `g4      --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl>
+//!             [--label L] [--profile P] [--session S] [--conc N] [--corpus <bank.ids>]
+//!             [--out <record.json>]`
+//!       The G4 measurement instrument (P4-01, ADR 0015/0021): replays the
+//!       load trace and measures the needle-retrieval cells (64K / 128K).
+//!       Writes one *launch* of one engine's record — the trace's SHA-256
+//!       and the session id ride along, so `g4-gate` can enforce live/live.
+//!   `g4-gate --ours <launch1.json> --ours <launch2.json> [...]
+//!             --ref <launch1.json> --ref <launch2.json> [...]
+//!             [--note <text>] [--out <verdict.json>]`
+//!       The pooled G4 verdict over at least two launches per engine
+//!       (ADR 0021): the per-class / aggregate pooled throughput ratio
+//!       against 99%, and the needle-retrieval floor. Refuses a verdict
+//!       when the launches are not live/live (different sessions, different
+//!       trace hashes, a missing cell) or fewer than two launches are given
+//!       per side.
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
@@ -58,7 +74,7 @@ use std::sync::Arc;
 use ignis_bench::{
     canary::{self, CanaryResult},
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
-    g2, g3, g3_gate,
+    g2, g3, g3_gate, g4, g4_gate,
     gate::GateReport,
     metrics::Run,
     oracle::{self, Fixture},
@@ -82,6 +98,8 @@ fn main() -> ExitCode {
         Some("g2") => cmd_g2(&args[1..]),
         Some("g3") => cmd_g3(&args[1..]),
         Some("g3-gate") => cmd_g3_gate(&args[1..]),
+        Some("g4") => cmd_g4(&args[1..]),
+        Some("g4-gate") => cmd_g4_gate(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -105,7 +123,11 @@ fn print_usage() {
   ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
   ignis-bench g3 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
                  [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
-  ignis-bench g3-gate --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]"
+  ignis-bench g3-gate --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
+  ignis-bench g4 --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl> [--label ignis]
+                 [--profile <text>] [--session <id>] [--conc N] [--corpus <bank.ids>] [--out <record.json>]
+  ignis-bench g4-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
+                      [--note <text>] [--out <verdict.json>]"
     );
 }
 
@@ -802,6 +824,189 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
             "G3 gate FAILED (ADR 0015: tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
              <= {} tolerated-with-warning)",
             verdict.throughput_threshold, verdict.itl_pass_threshold, verdict.itl_fail_threshold
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `g4` (P4-01, GitHub #117): replay the load trace and measure the
+/// needle-retrieval cells against one OpenAI-compatible endpoint. The
+/// record it writes is one *launch* of one engine; `g4-gate` pools at
+/// least two of them per engine (ADR 0021) into a verdict.
+fn cmd_g4(args: &[String]) -> ExitCode {
+    let (endpoint, artifact, trace_path) = match (
+        require(args, "endpoint"),
+        require(args, "artifact"),
+        require(args, "trace"),
+    ) {
+        (Ok(e), Ok(a), Ok(t)) => (e, a, t),
+        (e, a, t) => {
+            for err in [e.err(), a.err(), t.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
+    let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
+    // Live/live (ADR 0015): the *same* session id must be passed to every
+    // launch of both engines.
+    let session = opt(args, "session").unwrap_or_else(new_session_id);
+    let out = opt(args, "out");
+    let conc = opt(args, "conc").and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+    let corpus = opt(args, "corpus").map(PathBuf::from);
+    if let Some(path) = &corpus {
+        // Fail before any request is sent: a missing corpus file would
+        // otherwise fail every needle cell with a late error.
+        if !path.is_file() {
+            eprintln!("error: --corpus file not found: {path:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "corpus mode: needle haystacks are cut from {path:?} (bounded generation, no filler \
+             growth — needed at the needle cell's 64K/128K scale)"
+        );
+    }
+
+    let trace_bytes = match std::fs::read(&trace_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: read {trace_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The bytes are hashed as-is (`trace_sha256`), so parsing must fail
+    // loudly on invalid UTF-8 rather than lossily substitute — a mangled
+    // trace would parse to something other than the bytes the hash
+    // actually names (`Trace::from_path`'s `read_to_string` has the same
+    // strictness; this path keeps the raw bytes around for the hash, so it
+    // cannot reuse that helper directly).
+    let trace_text = match String::from_utf8(trace_bytes.clone()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {trace_path} is not valid UTF-8: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let trace = match Trace::from_jsonl(&trace_text) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ep = HttpEndpoint::new(&endpoint);
+    let engine = match ep.list_models() {
+        Ok(models) if !models.is_empty() => {
+            eprintln!("engine {endpoint}: {}", models.join(", "));
+            models[0].clone()
+        }
+        Ok(_) => {
+            eprintln!("error: engine {endpoint} reports no loaded model");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("g4 session {session}: trace replay + needle retrieval against {label}");
+
+    let ep: Arc<dyn Endpoint> = Arc::new(ep);
+    let cfg = g4::G4Config {
+        label,
+        profile,
+        artifact,
+        session,
+        needle_context_tokens: vec![g4::NEEDLE_CONTEXT_64K, g4::NEEDLE_CONTEXT_128K],
+        replay: ReplayConfig { max_concurrency: conc, time_scale: 1.0 },
+        corpus,
+    };
+    let record = g4::measure(ep, &frontend, engine, endpoint, &trace, &trace_bytes, &cfg);
+    print!("{}", record.render());
+
+    if let Some(path) = &out {
+        if let Err(e) = record.write(Path::new(path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    let all_needles_ok = record.needles.iter().all(|n| n.passed());
+    if all_needles_ok {
+        eprintln!("all needle cells retrieved; pass --session {} to the other launches", cfg.session);
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "error: at least one needle-retrieval cell missed or failed — this record still \
+             writes, but a G4 verdict built from it will fail that floor"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `g4-gate` (P4-01, GitHub #117): the pooled G4 verdict over at least two
+/// launches per engine (ADR 0021). Refuses outright — rather than
+/// reporting a failure — when the launches do not support a live/live
+/// comparison (different sessions, different trace hashes, a missing
+/// cell).
+fn cmd_g4_gate(args: &[String]) -> ExitCode {
+    let ours_paths = repeated_opt(args, "ours");
+    let ref_paths = repeated_opt(args, "ref");
+    if ours_paths.is_empty() || ref_paths.is_empty() {
+        eprintln!("--ours and --ref must each be passed at least once (repeat the flag per launch)");
+        print_usage();
+        return ExitCode::FAILURE;
+    }
+    let load = |paths: &[String]| -> Result<Vec<g4::Record>, String> {
+        paths.iter().map(|p| g4::Record::read(Path::new(p))).collect()
+    };
+    let ours = match load(&ours_paths) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference = match load(&ref_paths) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut verdict = match g4_gate::check(&ours, &reference) {
+        Ok(v) => v,
+        Err(refusal) => {
+            eprintln!("G4 gate check REFUSED: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    verdict.notes.extend(repeated_opt(args, "note"));
+    print!("{}", verdict.render());
+    if let Some(path) = opt(args, "out") {
+        if let Err(e) = verdict.write(Path::new(&path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    if verdict.passed {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "G4 gate FAILED (ADR 0021: pooled tok/s ratio >= {} per class and aggregate, every \
+             needle cell retrieved)",
+            verdict.threshold
         );
         ExitCode::FAILURE
     }
