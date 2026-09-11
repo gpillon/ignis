@@ -234,6 +234,96 @@ traversal and packing is worthless. G4's subagent-burst trace is many short
 prompts, which is exactly the regime where the table above pays — which is
 where that item already proposed to measure it.
 
+## Second addendum — the hardware counters, and a VRAM audit
+
+Two things the first addendum left open: the saturation question it could not
+answer (`ERR_NVGPUCTRPERM`), and whether the sweeps were spilling the card
+into system memory and inflating their own numbers.
+
+### The counters (permission opened, so these are real)
+
+`ncu` over the dominant NVFP4 projections, one traversal width per run,
+`launch__grid_size` read against this card's 170 SMs (`ncu_summary.py`):
+
+**T = 256 tokens** — the engine takes the `mma` route here:
+
+| kernel | grid | waves | SM % | tensor pipe % |
+| --- | ---: | ---: | ---: | ---: |
+| `nvfp4_w4a4_mma<5120,17408>` (MLP down) | 80 | **0.47** | 21.0 | 45.7 |
+| `nvfp4_w4a4_mma<5120,6144>` (GDN out) | 80 | **0.47** | 19.0 | 42.1 |
+| `nvfp4_w4a4_mma<16384,5120>` (GDN qkvz) | 256 | 1.51 | 42.6 | 52.9 |
+| `nvfp4_w4a4_mma<34816,5120>` (MLP gate/up) | 544 | 3.20 | 45.3 | 54.7 |
+
+**T = 1024 tokens** — a *different* kernel runs; the `mma` variant is not
+launched at all at this width:
+
+| kernel | grid | waves | SM % | tensor pipe % |
+| --- | ---: | ---: | ---: | ---: |
+| `nvfp4_linear_swiglu_w4a4_tma` | 1088 | 6.40 | 50.4 | 61.7 |
+| `nvfp4_w4a4_tma<5120,17408>` | 160 | **0.94** | 65.0 | 75.1 |
+| `nvfp4_w4a4_tma<5120,6144>` | 160 | **0.94** | 57.7 | 66.0 |
+| `nvfp4_w4a4_tma<16384,5120>` | 512 | 3.01 | 61.6 | 73.5 |
+
+So the objection was right, and now it has a number. At 256 tokens two of the
+four dominant GEMMs launch **80 blocks onto a 170-SM card** — under half the
+machine has any work at all — and run at ~20 % SM throughput. Filling the
+traversal fixes both halves at once: the grids double, *and* the engine
+crosses into the TMA route, taking SM throughput to 58-65 % and the tensor
+pipe to 66-75 %.
+
+That the route switches with token count is worth recording on its own. The
+1.77x in the first addendum is not one effect but two, and neither of them is
+the "8 semaphores".
+
+Nothing is saturated even at 1,024 tokens: `<5120,17408>` is still at 0.94
+waves, so ~10 SMs sit idle through it, and the tensor pipe tops out at 75 %.
+But the wall clock says pushing past 1,024 tokens does not convert that
+headroom into speed — the limiter above that width is inside the kernels, not
+in how many tokens the traversal carries.
+
+### VRAM audit
+
+The sweeps now print the leaf's own reservation (`ignis_program_stats`:
+weights + prefill scratch arena + KV and GDN pools + sampling and
+decode-graph buffers) per row:
+
+| tokens per traversal | leaf VRAM (GiB) |
+| ---: | ---: |
+| 256 | 17.42 |
+| 512 | 17.50 |
+| 1024 | 17.66 |
+| 2048 | 17.98 |
+| 4096 | 18.61 |
+| 8192 | 19.88 |
+
+The baseline is flat and the growth is the prefill scratch arena, which
+`ignis_model_load` sizes for the traversal width (P2-01, GitHub #83): about
+2.5 GiB from the narrowest row to the widest.
+
+The KV pool is not the driver. This budget is 258 page groups of 64 tokens
+over 16 GQA layers at 4 KV heads x 256 head dim, K and V, BF16:
+258 * 64 * 16 * 4 * 256 * 2 * 2 = **1.01 GiB**, plus 2 slots of GDN state
+(48 layers x 48 heads x 128x128) at 151 MiB.About 1.2 GiB of a 17.4 GiB
+baseline, and identical in every row — it cannot explain a difference between
+rows, and it is not close to the card's limit.
+
+Sampled during an `ncu` run at T=1024 (`\GPU Process Memory(*)` counters):
+**dedicated peak 21,367 MiB, shared peak 195 MiB** of a 32,607 MiB card. No
+spill into system memory was reproduced, so the wide rows stand as measured.
+
+Two cautions that came out of the audit:
+
+- `cudaMemGetInfo` is what the load-time guard checks before reserving the
+  arena (`kernel/src/model.cu`), and on WDDM a reservation that exceeds free
+  device memory is served from system memory rather than refused. The guard
+  cannot catch an overcommit on this platform. Nothing here overcommitted,
+  but a wider chunk on a busier card would, silently.
+- **Watching GPU memory perturbs the measurement.** Any concurrent sampler
+  (an `nvidia-smi` poll loop, `Get-Counter`, or Task Manager's GPU page)
+  inflated every row by roughly 20 %: 48.4 / 110.7 / 922.4 ms at 256 / 1024 /
+  8192 tokens while sampling, against 39.3 / 88.6 / 784.8 ms clean. Only the
+  unsampled runs are quoted as timings anywhere in this file.
+
 ## Reproducing
 
 ```

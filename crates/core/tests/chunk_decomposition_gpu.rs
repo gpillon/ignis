@@ -38,7 +38,7 @@ use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
-use ignis_core::step::prefill_program;
+use ignis_core::step::{prefill_program, program_stats};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 /// The G2 gate's 8K cell, the span every existing reading on this ticket
@@ -125,7 +125,7 @@ fn chunk_wall_time_decomposition() {
         Err(_) => WIDTHS.to_vec(),
     };
     println!("#92 decomposition: span {SPAN_TOKENS} tokens, {reps} timed reps per width");
-    println!("width  chunks   wall_ms(mean)   wall_ms(min)   ms/chunk(mean)   ms/token(mean)");
+    println!("width  chunks   wall_ms(mean)   wall_ms(min)   ms/chunk   ms/token   leaf VRAM GiB");
     for &width in &widths {
         // One model per width: the chunk width is fixed at load (it sizes the
         // leaf's scratch arena), so the sweep has to reload. The materialized
@@ -161,8 +161,12 @@ fn chunk_wall_time_decomposition() {
         let chunks = SPAN_TOKENS.div_ceil(width as usize);
         let mean = walls_ms.iter().sum::<f64>() / walls_ms.len() as f64;
         let min = walls_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let vram_gib = program_stats(&model, &pool)
+            .unwrap_or_else(|e| panic!("program_stats({width}): {e}"))
+            .vram_bytes as f64
+            / (1024.0 * 1024.0 * 1024.0);
         println!(
-            "{width:5}  {chunks:6}   {mean:13.1}   {min:12.1}   {:14.2}   {:14.4}",
+            "{width:5}  {chunks:6}   {mean:13.1}   {min:12.1}   {:10.2}   {:10.4}   {vram_gib:11.2}",
             mean / chunks as f64,
             mean / SPAN_TOKENS as f64,
         );
@@ -217,14 +221,28 @@ fn tokens_per_traversal_sets_the_per_token_cost() {
     };
     let cfg = ModelConfig::qwen38_27b();
     let vocab = cfg.vocab as usize;
-    let longest = *SPANS.iter().max().expect("SPANS is not empty");
+    // `IGNIS_DECOMP_SPANS=256` narrows the sweep to one span length, so a
+    // kernel profiler can be pointed at a run containing only that shape.
+    let spans: Vec<usize> = match std::env::var("IGNIS_DECOMP_SPANS") {
+        Ok(list) => list
+            .split(',')
+            .filter(|piece| !piece.trim().is_empty())
+            .map(|piece| piece.trim().parse().unwrap_or_else(|e| panic!("IGNIS_DECOMP_SPANS: {e}")))
+            .collect(),
+        Err(_) => SPANS.to_vec(),
+    };
+    let reps: usize = std::env::var("IGNIS_DECOMP_REPS")
+        .ok()
+        .map(|v| v.trim().parse().unwrap_or_else(|e| panic!("IGNIS_DECOMP_REPS: {e}")))
+        .unwrap_or(REPS);
+    let longest = *spans.iter().max().expect("at least one span length");
     let span = token_span(&frontend, longest);
     let mut logits = vec![0f32; vocab];
 
     println!("#92 packing proxy: one span, one chunk, no KV prefix");
-    println!("tokens  wall_ms(min)   ms/token   speedup vs 256");
+    println!("tokens  wall_ms(min)   ms/token   vs 256   leaf VRAM GiB");
     let mut baseline: Option<f64> = None;
-    for &tokens in SPANS {
+    for &tokens in &spans {
         let width = u32::try_from(tokens).expect("span fits u32");
         let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT)
             .unwrap_or_else(|e| panic!("ignis_model_load(chunk={width}): {e}"));
@@ -244,8 +262,8 @@ fn tokens_per_traversal_sets_the_per_token_cost() {
             prefill_program(&model, &pool, &mut seq, prompt, 0, Some(&mut logits))
                 .unwrap_or_else(|e| panic!("warm-up prefill({tokens}): {e}"));
         }
-        let mut walls_ms: Vec<f64> = Vec::with_capacity(REPS);
-        for rep in 0..REPS {
+        let mut walls_ms: Vec<f64> = Vec::with_capacity(reps);
+        for rep in 0..reps {
             let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
             let start = Instant::now();
             prefill_program(&model, &pool, &mut seq, prompt, 0, Some(&mut logits))
@@ -255,7 +273,21 @@ fn tokens_per_traversal_sets_the_per_token_cost() {
         let min = walls_ms.iter().cloned().fold(f64::INFINITY, f64::min);
         let per_token = min / tokens as f64;
         let base = *baseline.get_or_insert(per_token);
-        println!("{tokens:6}  {min:12.1}   {per_token:8.4}   {:14.2}x", base / per_token);
+        // The leaf's own reservation (weights + prefill scratch arena + KV and
+        // GDN pools + sampling/decode-graph buffers). The pool budget is fixed
+        // across rows, so the growth from row to row is the prefill scratch
+        // arena, which `ignis_model_load` sizes for this traversal width
+        // (P2-01, GitHub #83). Printed because a reservation that overcommits
+        // the card is served from system memory on WDDM rather than refused,
+        // and a row that paid for that over PCIe is not a row to trust.
+        let vram_gib = program_stats(&model, &pool)
+            .unwrap_or_else(|e| panic!("program_stats({tokens}): {e}"))
+            .vram_bytes as f64
+            / (1024.0 * 1024.0 * 1024.0);
+        println!(
+            "{tokens:6}  {min:12.1}   {per_token:8.4}   {:9.2}x   {vram_gib:11.2}",
+            base / per_token,
+        );
     }
     println!("#92 packing proxy: done");
 }
