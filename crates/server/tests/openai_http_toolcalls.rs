@@ -51,8 +51,13 @@ impl RecordingTemplateProvider {
 }
 
 impl TemplateProvider for RecordingTemplateProvider {
-    fn apply_chat_template(&self, messages: &[ChatMessage], options: &ThinkingOptions) -> Vec<TokenId> {
-        self.inner.apply_chat_template(messages, options)
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[serde_json::Value],
+    ) -> Vec<TokenId> {
+        self.inner.apply_chat_template(messages, options, tools)
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {

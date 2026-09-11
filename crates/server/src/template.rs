@@ -19,6 +19,7 @@
 
 use ignis_core::TokenId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
@@ -29,7 +30,7 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 /// form is rejected at the API boundary with a 400).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
-    /// The message role (`system`, `user`, `assistant`, …).
+    /// The message role (`system`, `user`, `assistant`, `tool`, …).
     pub role: String,
     /// The message text.
     pub content: String,
@@ -37,17 +38,48 @@ pub struct ChatMessage {
     /// rendering unless the request sets `preserve_thinking: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// A prior assistant turn's tool calls (GitHub #132) — the OpenAI wire
+    /// shape, `function.arguments` a JSON-encoded string, matching what
+    /// this server's own response side emits (#121). Absent on every role
+    /// but a prior assistant turn that called a tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallIn>>,
+    /// A `role: "tool"` message's correlation id (OpenAI wire field).
+    /// Accepted and otherwise unused: the loaded chat template correlates
+    /// a tool result to its call sequentially, not by id (verified against
+    /// `.qwen/tmp/chat_template.jinja`'s `role == "tool"` branch) — kept
+    /// only so a real client that always sends it is not rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    /// A message with plain content and no prior reasoning.
+    /// A message with plain content and no prior reasoning or tool calls.
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
             content: content.into(),
             reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
+}
+
+/// One tool call an assistant history message carries (OpenAI wire shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub function: FunctionIn,
+}
+
+/// A tool call's function half: name + arguments (a JSON-encoded string on
+/// the wire, matching #121's own response shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionIn {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// The template / tokenizer seam (artifact-02 plugs the real implementation
@@ -61,9 +93,16 @@ impl ChatMessage {
 pub trait TemplateProvider: Send + Sync {
     /// Apply the chat template: the templated prompt tokens for
     /// `messages` (the scheduler prompt — role markers, delimiters, etc.),
-    /// with `options` (GitHub #68) the second — and only other — thing that
-    /// crosses this seam.
-    fn apply_chat_template(&self, messages: &[ChatMessage], options: &ThinkingOptions) -> Vec<TokenId>;
+    /// with `options` (GitHub #68) and `tools` (GitHub #132) the only other
+    /// things that cross this seam. `tools` is the client's own OpenAI
+    /// `tools` array, opaque JSON — empty means the request never
+    /// mentioned tools at all.
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Vec<TokenId>;
 
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
@@ -112,11 +151,17 @@ pub trait TemplateProvider: Send + Sync {
 pub struct SimpleTemplateProvider;
 
 impl TemplateProvider for SimpleTemplateProvider {
-    fn apply_chat_template(&self, messages: &[ChatMessage], _options: &ThinkingOptions) -> Vec<TokenId> {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        _options: &ThinkingOptions,
+        _tools: &[JsonValue],
+    ) -> Vec<TokenId> {
         // The placeholder has no jinja template to bind thinking variables
-        // into — it ignores `options` (a test-only `TemplateProvider` that
-        // wants to observe the resolved options records them itself; see
-        // `openai_http.rs`'s recording double).
+        // or tools into — it ignores both (a test-only `TemplateProvider`
+        // that wants to observe them records them itself; see
+        // `openai_http_thinking.rs`'s / `openai_http_toolcalls.rs`'s
+        // recording doubles).
         messages
             .iter()
             .flat_map(|m| {
@@ -198,33 +243,37 @@ mod tests {
         ThinkingOptions::default()
     }
 
+    fn no_tools() -> &'static [JsonValue] {
+        &[]
+    }
+
     #[test]
     fn template_is_deterministic() {
         let p = SimpleTemplateProvider;
         let messages = [msg("user", "hello world"), msg("assistant", "hi")];
-        let a = p.apply_chat_template(&messages, &opts());
-        let b = p.apply_chat_template(&messages, &opts());
+        let a = p.apply_chat_template(&messages, &opts(), no_tools());
+        let b = p.apply_chat_template(&messages, &opts(), no_tools());
         assert_eq!(a, b, "the same conversation must template identically");
     }
 
     #[test]
     fn one_token_per_word_and_role_scoped() {
         let p = SimpleTemplateProvider;
-        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts());
+        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts(), no_tools());
         assert_eq!(tokens.len(), 3, "one token per whitespace word");
         // The same word under a different role is a different token (the
         // role is part of the hashed key).
-        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts());
-        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts());
+        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts(), no_tools());
+        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts(), no_tools());
         assert_ne!(other, user_a);
     }
 
     #[test]
     fn empty_conversation_has_no_tokens() {
         let p = SimpleTemplateProvider;
-        assert!(p.apply_chat_template(&[], &opts()).is_empty());
+        assert!(p.apply_chat_template(&[], &opts(), no_tools()).is_empty());
         assert!(p
-            .apply_chat_template(&[msg("user", "   ")], &opts())
+            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools())
             .is_empty());
     }
 

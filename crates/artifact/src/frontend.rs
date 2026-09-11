@@ -413,7 +413,7 @@ impl ChatTemplate {
     /// that binds nothing, so callers that do not care about thinking are
     /// unaffected (GitHub #68).
     pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_context(messages, None)
+        self.render_context(messages, None, None)
     }
 
     /// Render a conversation with the thinking controls bound as template
@@ -433,13 +433,31 @@ impl ChatTemplate {
         enable_thinking: bool,
         effort: Option<ReasoningEffort>,
     ) -> Result<String> {
-        self.render_context(messages, Some((enable_thinking, effort)))
+        self.render_context(messages, Some((enable_thinking, effort)), None)
+    }
+
+    /// [`Self::render_with_thinking`] plus tool definitions (GitHub #132):
+    /// `tools` is the client's own OpenAI `tools` array, opaque JSON,
+    /// bound as-is — the template's `tools` branch renders each entry with
+    /// `tojson`, so no ignis-side schema is needed. `None`/empty leaves the
+    /// `tools` variable unbound, same as a request that never mentioned
+    /// tools at all (the template's own `{%- if tools and ... %}` guard
+    /// then never fires).
+    pub fn render_with_thinking_and_tools(
+        &self,
+        messages: &[ChatMessage],
+        enable_thinking: bool,
+        effort: Option<ReasoningEffort>,
+        tools: Option<&[JsonValue]>,
+    ) -> Result<String> {
+        self.render_context(messages, Some((enable_thinking, effort)), tools)
     }
 
     fn render_context(
         &self,
         messages: &[ChatMessage],
         thinking: Option<(bool, Option<ReasoningEffort>)>,
+        tools: Option<&[JsonValue]>,
     ) -> Result<String> {
         let mut context = serde_json::Map::new();
         context.insert(
@@ -452,6 +470,9 @@ impl ChatTemplate {
             if let Some(effort) = effort {
                 context.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
             }
+        }
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            context.insert("tools".to_owned(), json!(tools));
         }
         let template = self
             .env
@@ -853,6 +874,68 @@ mod tests {
         let prompt = template.render(&messages).expect("render");
         assert!(prompt.contains("what is in this picture?"), "{prompt}");
         assert!(prompt.ends_with("END"), "{prompt}");
+    }
+
+    // -- tool calling (GitHub #132) ------------------------------------------
+
+    /// A template that reacts to `tools` and to a message's `tool_calls` —
+    /// enough to pin that both reach the render context, with no need for
+    /// the real Qwen template's much larger "# Tools" section.
+    const TOOLS_TEMPLATE: &str = "{%- if tools is defined -%}TOOLS={{ tools | tojson }};{%- endif -%}\
+{%- for m in messages -%}{{ m.role }}={{ m.content }}\
+{%- if m.tool_calls is defined -%}{% for c in m.tool_calls %} CALL={{ c.function.name }}({{ c.function.arguments | tojson }}){% endfor %}\
+{%- endif -%};{%- endfor -%}";
+
+    #[test]
+    fn render_with_thinking_and_tools_binds_the_tools_array() {
+        let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
+        let tools = [json!({
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        })];
+        let prompt = template
+            .render_with_thinking_and_tools(
+                &[ChatMessage::text(Role::User, "hi")],
+                true,
+                None,
+                Some(&tools),
+            )
+            .expect("render");
+        assert!(prompt.contains("TOOLS="), "{prompt}");
+        assert!(prompt.contains("get_weather"), "{prompt}");
+    }
+
+    #[test]
+    fn render_with_thinking_and_tools_leaves_tools_unbound_when_absent_or_empty() {
+        let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
+        let messages = [ChatMessage::text(Role::User, "hi")];
+        let without = template
+            .render_with_thinking_and_tools(&messages, true, None, None)
+            .expect("render");
+        assert!(!without.contains("TOOLS="), "{without}");
+        let empty: [JsonValue; 0] = [];
+        let with_empty = template
+            .render_with_thinking_and_tools(&messages, true, None, Some(&empty))
+            .expect("render");
+        assert!(!with_empty.contains("TOOLS="), "{with_empty}");
+    }
+
+    #[test]
+    fn message_to_json_carries_tool_calls_in_the_openai_shape() {
+        let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
+        let messages = [ChatMessage {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_calls: vec![ToolCall {
+                id: Some("call_0".to_owned()),
+                name: "read_file".to_owned(),
+                arguments: json!({"path": "a.txt"}),
+            }],
+            reasoning_content: None,
+        }];
+        let prompt = template.render(&messages).expect("render");
+        assert!(prompt.contains("CALL=read_file"), "{prompt}");
+        assert!(prompt.contains("a.txt"), "{prompt}");
     }
 
     #[test]

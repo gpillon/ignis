@@ -121,6 +121,7 @@ fn build_request(
     messages: &[ChatMessage],
     params: DecodeParams,
     thinking: &ThinkingOptions,
+    tools: &[JsonValue],
 ) -> (RequestInput, String, u32) {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
@@ -131,7 +132,7 @@ fn build_request(
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let tokens = server.template.apply_chat_template(messages, thinking);
+    let tokens = server.template.apply_chat_template(messages, thinking, tools);
     let prompt_tokens = tokens.len() as u32;
     let input = RequestInput {
         model: model.clone(),
@@ -291,6 +292,58 @@ fn resolve_thinking(
             message,
         ),
     })
+}
+
+/// Validate and resolve `tools` + `tool_choice` (GitHub #132) into the
+/// tools slice that actually reaches the template.
+///
+/// - Each `tools` entry must be `{"type": "function", "function": {"name":
+///   <non-empty string>, ...}}` — anything else is a 400 naming the entry
+///   and what is wrong with it. Extra fields (`description`, `parameters`,
+///   …) ride through untouched; they are opaque JSON to ignis, meaningful
+///   only to the template and the model.
+/// - `tool_choice` absent or `"auto"`: the validated tools (if any) reach
+///   the template.
+/// - `tool_choice: "none"`: validated, then discarded — the template
+///   never sees them, so the model is never told tools exist (the only
+///   lever a text-instruction template has for "must not call a
+///   function").
+/// - `tool_choice: "required"`, or the named-function object form: a 400.
+///   This template has no way to *force* a call — accepting the field and
+///   quietly not honouring it would be worse than refusing it (same
+///   posture as an unsupported `reasoning_effort`, GitHub #68).
+fn resolve_tools(
+    tools: Option<Vec<JsonValue>>,
+    tool_choice: Option<JsonValue>,
+) -> Result<Vec<JsonValue>, Response> {
+    let tools = tools.unwrap_or_default();
+    for (index, tool) in tools.iter().enumerate() {
+        let is_type_function = tool.get("type").and_then(JsonValue::as_str) == Some("function");
+        let has_name = tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|name| !name.is_empty());
+        if !is_type_function || !has_name {
+            return Err(bad_request(&format!(
+                "tools[{index}] must be {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}"
+            )));
+        }
+    }
+    match tool_choice {
+        None => Ok(tools),
+        Some(JsonValue::String(s)) if s == "auto" => Ok(tools),
+        Some(JsonValue::String(s)) if s == "none" => Ok(Vec::new()),
+        Some(JsonValue::String(s)) if s == "required" => Err(bad_request(
+            "tool_choice: \"required\" is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+        )),
+        Some(JsonValue::Object(_)) => Err(bad_request(
+            "tool_choice naming a specific function is not supported — this template has no way to force a tool call; use \"auto\" and let the model decide, or \"none\"",
+        )),
+        Some(other) => Err(bad_request(&format!(
+            "tool_choice must be \"auto\" or \"none\", got {other}"
+        ))),
+    }
 }
 
 /// Split a finished generation's tokens into `reasoning_content` /
@@ -536,6 +589,12 @@ struct ChatCompletionsRequest {
     reasoning_effort: Option<JsonValue>,
     preserve_thinking: Option<JsonValue>,
     chat_template_kwargs: Option<JsonValue>,
+    /// The tool definitions (GitHub #132) — opaque JSON, validated
+    /// shallowly and passed to the template as-is (`resolve_tools`).
+    tools: Option<Vec<JsonValue>>,
+    /// `"auto"` (default) or `"none"`; anything else is a 400
+    /// (`resolve_tools`) — this template has no lever to *force* a call.
+    tool_choice: Option<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -573,8 +632,12 @@ async fn chat_completions(
         Ok(t) => t,
         Err(response) => return response,
     };
+    let tools = match resolve_tools(req.tools, req.tool_choice) {
+        Ok(tools) => tools,
+        Err(response) => return response,
+    };
     let (input, model, prompt_tokens) =
-        build_request(&server, req.model, &req.messages, params, &thinking);
+        build_request(&server, req.model, &req.messages, params, &thinking, &tools);
     let (request_id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await
     {
         Ok(x) => x,
@@ -1164,6 +1227,10 @@ async fn responses_api(
             ..DecodeParams::default()
         },
         &thinking,
+        // The responses API carries no `tools` field (GitHub #132: only
+        // `/v1/chat/completions` gets tool-calling support, matching the
+        // scope this endpoint already keeps for reasoning/tool_calls).
+        &[],
     );
     let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
         Ok(x) => x,
@@ -1448,5 +1515,66 @@ mod tests {
         };
         let json = serde_json::to_value(&message).expect("message serializes");
         assert!(json.as_object().unwrap().get("tool_calls").is_none());
+    }
+
+    // ── GitHub #132: tools / tool_choice validation ─────────────────────
+
+    fn tool(name: &str) -> JsonValue {
+        serde_json::json!({"type": "function", "function": {"name": name}})
+    }
+
+    #[test]
+    fn no_tools_and_no_tool_choice_resolves_to_empty() {
+        assert_eq!(resolve_tools(None, None).unwrap(), Vec::<JsonValue>::new());
+    }
+
+    #[test]
+    fn well_formed_tools_pass_through_unchanged() {
+        let tools = vec![tool("a"), tool("b")];
+        assert_eq!(resolve_tools(Some(tools.clone()), None).unwrap(), tools);
+    }
+
+    #[test]
+    fn a_tool_missing_type_is_rejected() {
+        let bad = serde_json::json!({"function": {"name": "a"}});
+        let err = resolve_tools(Some(vec![bad]), None).unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_tool_with_a_non_string_name_is_rejected() {
+        let bad = serde_json::json!({"type": "function", "function": {"name": 5}});
+        assert!(resolve_tools(Some(vec![bad]), None).is_err());
+    }
+
+    #[test]
+    fn tool_choice_none_drops_validated_tools() {
+        let tools = vec![tool("a")];
+        let resolved = resolve_tools(Some(tools), Some(serde_json::json!("none"))).unwrap();
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn tool_choice_auto_keeps_tools() {
+        let tools = vec![tool("a")];
+        let resolved =
+            resolve_tools(Some(tools.clone()), Some(serde_json::json!("auto"))).unwrap();
+        assert_eq!(resolved, tools);
+    }
+
+    #[test]
+    fn tool_choice_required_is_rejected() {
+        assert!(resolve_tools(None, Some(serde_json::json!("required"))).is_err());
+    }
+
+    #[test]
+    fn tool_choice_naming_a_function_object_is_rejected() {
+        let choice = serde_json::json!({"type": "function", "function": {"name": "a"}});
+        assert!(resolve_tools(None, Some(choice)).is_err());
+    }
+
+    #[test]
+    fn an_unknown_tool_choice_string_is_rejected() {
+        assert!(resolve_tools(None, Some(serde_json::json!("sometimes"))).is_err());
     }
 }

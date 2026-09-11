@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use ignis_artifact::{DecodeStreamState, FrontendSet, Role};
 use ignis_core::TokenId;
+use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
 use crate::template::{ChatMessage, TemplateProvider};
@@ -53,7 +54,12 @@ impl ArtifactTemplateProvider {
 }
 
 impl TemplateProvider for ArtifactTemplateProvider {
-    fn apply_chat_template(&self, messages: &[ChatMessage], options: &ThinkingOptions) -> Vec<TokenId> {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Vec<TokenId> {
         let templated: Vec<ignis_artifact::ChatMessage> = messages
             .iter()
             .map(|message| {
@@ -66,13 +72,33 @@ impl TemplateProvider for ArtifactTemplateProvider {
                 if options.preserve_thinking {
                     templated.reasoning_content = message.reasoning_content.clone();
                 }
+                // A prior assistant turn's tool calls (GitHub #132): each
+                // call's `arguments` is a JSON-encoded string on the wire
+                // (matching #121's own response shape) and the template
+                // needs the parsed object (`arguments|items`) — a call
+                // whose string does not parse as a JSON object degrades to
+                // an empty one rather than failing the whole render (the
+                // same "never panic, degrade" posture as the render/encode
+                // failures below).
+                if let Some(calls) = &message.tool_calls {
+                    templated.tool_calls = calls
+                        .iter()
+                        .map(|call| ignis_artifact::ToolCall {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            arguments: serde_json::from_str(&call.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        })
+                        .collect();
+                }
                 templated
             })
             .collect();
-        let prompt = match self.set.chat_template().render_with_thinking(
+        let prompt = match self.set.chat_template().render_with_thinking_and_tools(
             &templated,
             options.enable_thinking,
             options.reasoning_effort,
+            Some(tools),
         ) {
             Ok(prompt) => prompt,
             Err(err) => {
@@ -224,6 +250,10 @@ mod tests {
         ThinkingOptions::default()
     }
 
+    fn no_tools() -> &'static [JsonValue] {
+        &[]
+    }
+
     #[test]
     fn apply_chat_template_uses_the_real_template_and_tokenizer() {
         let (_fixture, _reader, provider) = build_provider();
@@ -231,11 +261,11 @@ mod tests {
             ChatMessage::text("user", "hello world"),
             ChatMessage::text("assistant", "hi there"),
         ];
-        let tokens = provider.apply_chat_template(&messages, &opts());
+        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
         assert!(!tokens.is_empty(), "the rendered prompt must tokenize");
         // Determinism: the same conversation templates identically (the
         // trait's contract).
-        assert_eq!(tokens, provider.apply_chat_template(&messages, &opts()));
+        assert_eq!(tokens, provider.apply_chat_template(&messages, &opts(), no_tools()));
         // Property assertion (not an exact string): the templated prompt
         // contains the user's message text, decoded by the same tokenizer.
         let text = provider.render_tokens(&tokens);
@@ -256,7 +286,7 @@ mod tests {
         let messages = [ChatMessage::text("bogus", "hello")];
         // The foreign role must not panic: it templates as `user` (the
         // documented v1 fallback), and the prompt still renders.
-        let tokens = provider.apply_chat_template(&messages, &opts());
+        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
         assert!(!tokens.is_empty());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("hello"), "{text}");
@@ -319,7 +349,8 @@ mod tests {
             reasoning_effort: Some(ignis_artifact::ReasoningEffort::Low),
             preserve_thinking: false,
         };
-        let tokens = provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options);
+        let tokens =
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("true"), "{text}");
         assert!(text.contains("low"), "{text}");
@@ -336,7 +367,8 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: false,
         };
-        let tokens = provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options);
+        let tokens =
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
         assert!(tokens.is_empty(), "a raising render must degrade to no tokens");
     }
 
@@ -346,7 +378,7 @@ mod tests {
         let mut message = ChatMessage::text("assistant", "the answer");
         message.reasoning_content = Some("scratch work".to_owned());
 
-        let dropped = provider.apply_chat_template(&[message.clone()], &opts());
+        let dropped = provider.apply_chat_template(&[message.clone()], &opts(), no_tools());
         let dropped_text = provider.render_tokens(&dropped);
         assert!(!dropped_text.contains("scratch"), "{dropped_text}");
         assert!(!dropped_text.contains("work"), "{dropped_text}");
@@ -355,7 +387,7 @@ mod tests {
             preserve_thinking: true,
             ..opts()
         };
-        let preserved = provider.apply_chat_template(&[message], &preserved_options);
+        let preserved = provider.apply_chat_template(&[message], &preserved_options, no_tools());
         let preserved_text = provider.render_tokens(&preserved);
         assert!(preserved_text.contains("scratch"), "{preserved_text}");
         assert!(preserved_text.contains("work"), "{preserved_text}");

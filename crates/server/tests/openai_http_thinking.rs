@@ -62,9 +62,14 @@ impl RecordingTemplateProvider {
 }
 
 impl TemplateProvider for RecordingTemplateProvider {
-    fn apply_chat_template(&self, messages: &[ChatMessage], options: &ThinkingOptions) -> Vec<TokenId> {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[serde_json::Value],
+    ) -> Vec<TokenId> {
         self.captured.lock().unwrap().push(*options);
-        self.inner.apply_chat_template(messages, options)
+        self.inner.apply_chat_template(messages, options, tools)
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -121,8 +126,13 @@ fn harness_with(template: RecordingTemplateProvider) -> Harness {
         // keeps its own `Arc` clone to inspect captured options afterward.
         struct Shared(Arc<RecordingTemplateProvider>);
         impl TemplateProvider for Shared {
-            fn apply_chat_template(&self, m: &[ChatMessage], o: &ThinkingOptions) -> Vec<TokenId> {
-                self.0.apply_chat_template(m, o)
+            fn apply_chat_template(
+                &self,
+                m: &[ChatMessage],
+                o: &ThinkingOptions,
+                tools: &[serde_json::Value],
+            ) -> Vec<TokenId> {
+                self.0.apply_chat_template(m, o, tools)
             }
             fn render_tokens(&self, t: &[TokenId]) -> String {
                 self.0.render_tokens(t)
