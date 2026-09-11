@@ -184,7 +184,7 @@ inside an 8,192-token span and still attends to up to 8K of KV prefix, so its
 per-token cost carries attention work a standalone 256-token request would
 never do. Here each span is prefilled on its own, from position zero, in
 exactly one chunk of its own width
-(`tokens_per_traversal_sets_the_per_token_cost`):
+(the second sweep of `prefill_chunk_and_traversal_sweeps`):
 
 | tokens in the traversal | wall min (ms) | ms/token | vs 256 |
 | ---: | ---: | ---: | ---: |
@@ -317,6 +317,20 @@ spill into system memory was reproduced, so the wide rows stand as measured.
 
 Two cautions that came out of the audit:
 
+- **The preflight cannot tell a quiet card from a slow one, and this bit.**
+  Re-running hours later on the same machine, the repo's own pre-existing
+  diagnostic (`chunk_timing_diagnostic_gpu`, historically 94.9 ms/chunk)
+  reported **122.8 ms/chunk**, and every row of both sweeps moved by the same
+  ~25-30 %. Nothing about the engine had changed: profiling on against off
+  measured 1008.0 against 991.7 ms on the same shape, and the control test is
+  one nobody here touched. `nvidia-smi` showed the card idle at 5 % with
+  2,969 MiB resident, so `scripts/gpu-preflight.ps1` passed it -- it checks
+  free memory and the absence of ninfer, not whether the card will clock up.
+  Under load the SM clock sat at 1,980 MHz against a 3,090 MHz maximum, at
+  360 W of a 575 W limit, with `SW Power Capping` showing 219 ms accumulated.
+  Every number published here comes from the earlier session, where the same
+  control reproduced its historical value. **Re-take the control diagnostic
+  before trusting any new reading against these tables.**
 - `cudaMemGetInfo` is what the load-time guard checks before reserving the
   arena (`kernel/src/model.cu`), and on WDDM a reservation that exceeds free
   device memory is served from system memory rather than refused. The guard
@@ -335,8 +349,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .scratch/issue-92/run.ps1
 python .scratch/issue-92/analyze.py
 
 # the addendum's packing proxy (free card, preflight on record, IGNIS_GPU_PROFILE=1):
-cargo test -p ignis-core --features cuda --test chunk_decomposition_gpu \n  tokens_per_traversal -- --ignored --nocapture --test-threads=1
+cargo test -p ignis-core --features cuda --test chunk_decomposition_gpu \
+  -- --ignored --nocapture --test-threads=1
 ```
+
+The default sweeps stop at 4,096 tokens so a standing run does not sit near
+the card's limit; the 8,192 rows above need `IGNIS_DECOMP_WIDTHS=8192` and
+`IGNIS_DECOMP_SPANS=8192`.
 
 For the Nsight Systems pass (a free card, preflight on record,
 `IGNIS_GPU_PROFILE=1`, `IGNIS_DECOMP_WIDTHS=1024`):

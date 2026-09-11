@@ -38,7 +38,7 @@ Two decisions were waiting on the answer:
 | artifact | what it is |
 | --- | --- |
 | `ChunkProfiler` in `kernel/src/step.cu` | CUDA events on the model's own stream around the chunk, each of the 64 layer bodies and the head. Emits one JSONL record per chunk after the chunk's existing synchronize. Inert unless `IGNIS_CHUNK_PROFILE` names a file: one cached boolean test per chunk, no event created. |
-| `crates/core/tests/chunk_decomposition_gpu.rs` | Two GPU tests. `chunk_wall_time_decomposition` sweeps chunk width over a fixed 8,192-token span. `tokens_per_traversal_sets_the_per_token_cost` prefills isolated spans, one chunk each, from position zero. Both print the leaf's own VRAM reservation per row. |
+| `crates/core/tests/chunk_decomposition_gpu.rs` | One GPU test, `prefill_chunk_and_traversal_sweeps`, running two sweeps off a single materialization: chunk width over a fixed 8,192-token span, then isolated spans one chunk each from position zero. Both print the leaf's own VRAM reservation per row. It is one test rather than two because two `materialize` calls do not fit on a 32 GiB card at this model's size -- the second leaves `ignis_model_load` with zero free bytes. Integration tests in separate files get separate processes and never meet this. |
 | `.scratch/issue-92/run.ps1` | Drives two passes, clean and instrumented, each with its own preflight. |
 | `.scratch/issue-92/analyze.py` | Regresses the sweep and aggregates the JSONL records. |
 | `.scratch/issue-92/nsys_gap_report.py` | Reads an Nsight Systems capture and splits the device timeline into busy and idle. |
@@ -297,6 +297,20 @@ measured.
   inflated every row by roughly 20 %: 48.4 / 110.7 / 922.4 ms at 256 / 1024 /
   8192 tokens while sampling, against 39.3 / 88.6 / 784.8 ms clean. Only
   unsampled runs are quoted as timings in this document.
+- **The preflight cannot tell a quiet card from a slow one, and this bit.**
+  Re-running hours later on the same machine, the repo's own pre-existing
+  diagnostic (`chunk_timing_diagnostic_gpu`, historically 94.9 ms/chunk)
+  reported **122.8 ms/chunk**, and every row of both sweeps moved by the same
+  ~25-30 %. Nothing about the engine had changed: profiling on against off
+  measured 1008.0 against 991.7 ms on the same shape, and the control test is
+  one nobody here touched. `nvidia-smi` showed the card idle at 5 % with
+  2,969 MiB resident, so `scripts/gpu-preflight.ps1` passed it -- it checks
+  free memory and the absence of ninfer, not whether the card will clock up.
+  Under load the SM clock sat at 1,980 MHz against a 3,090 MHz maximum, at
+  360 W of a 575 W limit, with `SW Power Capping` showing 219 ms accumulated.
+  Every number published here comes from the earlier session, where the same
+  control reproduced its historical value. **Re-take the control diagnostic
+  before trusting any new reading against these tables.**
 - **`ncu` needs the performance-counter permission.** Without it every run
   fails with `ERR_NVGPUCTRPERM`. It is a driver-level setting, not something
   the harness can set.
@@ -350,10 +364,14 @@ All of it needs a free card and a preflight pass on record
 powershell -NoProfile -ExecutionPolicy Bypass -File .scratch/issue-92/run.ps1
 python .scratch/issue-92/analyze.py
 
-# measurement 4 -- the packing proxy
+# measurements 1 and 4 -- both sweeps, one process
 cargo test -p ignis-core --features cuda --test chunk_decomposition_gpu \
-  tokens_per_traversal -- --ignored --nocapture --test-threads=1
+  -- --ignored --nocapture --test-threads=1
 ```
+
+The default sweeps stop at 4,096 tokens so a standing run does not sit near
+the card's limit; the 8,192 rows above need `IGNIS_DECOMP_WIDTHS=8192` and
+`IGNIS_DECOMP_SPANS=8192`.
 
 Measurement 3, Nsight Systems, with `IGNIS_GPU_PROFILE=1` and
 `IGNIS_DECOMP_WIDTHS=1024`:
@@ -376,7 +394,7 @@ sm__warps_active.avg.pct_of_peak_sustained_active,\
 launch__grid_size,gpu__time_duration.sum \
   -k "regex:nvfp4" -s 40 -c 30 --csv \
   target/x86_64-pc-windows-msvc/debug/deps/chunk_decomposition_gpu-*.exe \
-  --ignored --test-threads=1 tokens_per_traversal > .scratch/issue-92/ncu-tN.csv
+  --ignored --test-threads=1 > .scratch/issue-92/ncu-tN.csv
 python .scratch/issue-92/ncu_summary.py .scratch/issue-92/ncu-tN.csv
 ```
 

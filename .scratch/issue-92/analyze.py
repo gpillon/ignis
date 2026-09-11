@@ -121,15 +121,18 @@ def main():
         print("  (no records -- was IGNIS_CHUNK_PROFILE set?)")
         return 0
 
+    # Keyed by (thread, width): `span` and `chunk` are per-thread counters in
+    # the leaf, so records from two profiling threads must not be pooled.
     by_width = {}
     for rec in chunk_recs:
-        by_width.setdefault(rec["chunk_width"], []).append(rec)
+        by_width.setdefault((rec.get("thread", 0), rec["chunk_width"]), []).append(rec)
 
     header = ("  width  chunk_ms  enqueue  sync_stall  entry_gap  embed   layers"
               "  head    layer_gap   gpu_span  layers/token  n")
     print(header)
-    for width in sorted(by_width):
-        recs = by_width[width]
+    for key in sorted(by_width):
+        width = key[1]
+        recs = by_width[key]
         warm_up_span = min(r["span"] for r in recs)
         recs = [r for r in recs if r["span"] != warm_up_span]
         if not recs:

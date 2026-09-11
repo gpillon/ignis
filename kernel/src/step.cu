@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -381,8 +382,15 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
 // completed.
 class ChunkProfiler {
 public:
+  // One profiler per thread. The CUDA events below bracket one chunk's work,
+  // so two threads prefilling at once must not share them. They cannot today
+  // -- `model->scratch` is a bump allocator with no synchronization and the
+  // model owns a single stream, so concurrent prefill on one model is already
+  // excluded -- but roadmap phase 6 is exactly about lifting that, and this
+  // should not be the thing that then has to be found. The destination file
+  // stays process-wide, so every thread's records land in one place.
   static ChunkProfiler &instance() {
-    static ChunkProfiler profiler;
+    thread_local ChunkProfiler profiler;
     return profiler;
   }
 
@@ -451,11 +459,13 @@ public:
     const double layer_gap_ms = gpu_span_ms - embed_ms - layers_ms - head_ms;
     const double entry_gap_ms = have_prev_end_ ? elapsed(end_[1 - parity_], begin_) : 0.0;
     std::fprintf(out_,
-                 "{\"span\":%llu,\"span_tokens\":%llu,\"chunk_width\":%u,\"chunk\":%llu,"
+                 "{\"thread\":%llu,\"span\":%llu,\"span_tokens\":%llu,"
+                 "\"chunk_width\":%u,\"chunk\":%llu,"
                  "\"chunk_offset\":%llu,\"chunk_tokens\":%llu,\"last\":%d,\"layers\":%llu,"
                  "\"cpu_enqueue_ms\":%.4f,\"sync_ms\":%.4f,\"entry_gap_ms\":%.4f,"
                  "\"gpu_span_ms\":%.4f,\"embed_ms\":%.4f,\"layers_ms\":%.4f,\"head_ms\":%.4f,"
                  "\"layer_gap_ms\":%.4f}\n",
+                 static_cast<unsigned long long>(thread_key_),
                  static_cast<unsigned long long>(span_index_),
                  static_cast<unsigned long long>(span_tokens_), span_chunk_width_,
                  static_cast<unsigned long long>(chunk_index_),
@@ -476,8 +486,10 @@ public:
     if (!enabled() || !per_layer_) { return; }
     for (std::size_t layer = 0; layer < layers; ++layer) {
       std::fprintf(out_,
-                   "{\"span\":%llu,\"chunk_offset\":%llu,\"layer\":%llu,\"layer_ms\":%.4f,"
+                   "{\"thread\":%llu,\"span\":%llu,\"chunk_offset\":%llu,"
+                   "\"layer\":%llu,\"layer_ms\":%.4f,"
                    "\"gap_before_ms\":%.4f}\n",
+                   static_cast<unsigned long long>(thread_key_),
                    static_cast<unsigned long long>(span_index_),
                    static_cast<unsigned long long>(chunk_offset),
                    static_cast<unsigned long long>(layer),
@@ -489,12 +501,33 @@ public:
   }
 
 private:
-  ChunkProfiler() {
-    const char *path = std::getenv("IGNIS_CHUNK_PROFILE");
-    if (path == nullptr || path[0] == '\0') { return; }
-    out_ = std::fopen(path, "ab");
-    per_layer_ = std::getenv("IGNIS_CHUNK_PROFILE_LAYERS") != nullptr;
+  // Opened once for the process, on whichever thread profiles first. A shared
+  // `std::FILE *` needs no lock of ours: `std::fprintf` locks the stream
+  // internally on both MSVC and POSIX, so records interleave whole rather
+  // than tearing.
+  static std::FILE *shared_sink() {
+    static std::FILE *const sink = []() -> std::FILE * {
+      const char *path = std::getenv("IGNIS_CHUNK_PROFILE");
+      if (path == nullptr || path[0] == 0) { return nullptr; }
+      return std::fopen(path, "ab");
+    }();
+    return sink;
   }
+
+  static bool shared_per_layer() {
+    static const bool on = std::getenv("IGNIS_CHUNK_PROFILE_LAYERS") != nullptr;
+    return on;
+  }
+
+  // A small dense id per profiling thread, in first-chunk order, so records
+  // from different threads stay separable: `span` and `chunk` below are
+  // per-thread counters and would otherwise collide.
+  static uint64_t next_thread_key() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  ChunkProfiler() : out_(shared_sink()), per_layer_(shared_per_layer()) {}
 
   static double elapsed(cudaEvent_t from, cudaEvent_t to) {
     float ms = 0.0F;
@@ -504,6 +537,7 @@ private:
 
   std::FILE *out_ = nullptr;
   bool per_layer_ = false;
+  const uint64_t thread_key_ = next_thread_key();
   std::vector<cudaEvent_t> layer_begin_;
   std::vector<cudaEvent_t> layer_end_;
   cudaEvent_t begin_ = nullptr;
