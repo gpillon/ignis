@@ -448,6 +448,25 @@ pub(crate) fn resolve_finish_reason(
     }
 }
 
+/// GitHub #70 via #121 acceptance criterion 5: a generation that reasoned
+/// but never produced content or a tool call must not pass silently —
+/// report it explicitly rather than let it look, on the wire, like an
+/// ordinary short (or empty) answer. Shared by both response paths so the
+/// message can't drift between them (each path computes `all_reasoning`
+/// its own way — a whole-string check non-streaming, incremental flags
+/// while streaming — since neither has the other's representation of the
+/// generation to reuse).
+fn report_if_all_reasoning_no_content(id: &str, all_reasoning: bool, finish_reason: &'static str) {
+    if all_reasoning {
+        tracing::warn!(
+            id,
+            finish_reason,
+            "generation produced reasoning but no content or tool call \
+             (token budget exhausted before an answer began)"
+        );
+    }
+}
+
 /// The Unix epoch seconds (OpenAI's `created` / `created_at` fields).
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -594,19 +613,13 @@ async fn chat_completions(
                 split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking);
             let completion_tokens = tokens.len() as u32;
             let finish_reason = resolve_finish_reason(reason, !tool_calls.is_empty(), false);
-            // GitHub #70 via #121 acceptance criterion 5: see the matching
-            // comment in `ChunkStream`'s `Done` handling.
-            if reasoning_content.as_deref().is_some_and(|r| !r.is_empty())
-                && content.is_empty()
-                && tool_calls.is_empty()
-            {
-                tracing::warn!(
-                    request_id,
-                    finish_reason,
-                    "generation produced reasoning but no content or tool call \
-                     (token budget exhausted before an answer began)"
-                );
-            }
+            report_if_all_reasoning_no_content(
+                &id,
+                reasoning_content.as_deref().is_some_and(|r| !r.is_empty())
+                    && content.is_empty()
+                    && tool_calls.is_empty(),
+                finish_reason,
+            );
             let tool_calls = if tool_calls.is_empty() {
                 None
             } else {
@@ -1051,19 +1064,11 @@ impl Stream for ChunkStream {
                         }
                         let any_calls = this.tool_scanner.any_calls();
                         let finish_reason = resolve_finish_reason(reason, any_calls, mid_call);
-                        // GitHub #70 via #121 acceptance criterion 5: a
-                        // generation that reasoned but never produced
-                        // content or a tool call must not pass silently —
-                        // report it explicitly rather than let it look
-                        // like an ordinary short (or empty) answer.
-                        if this.emitted_reasoning && !this.emitted_content_or_call {
-                            tracing::warn!(
-                                id = %this.id,
-                                finish_reason,
-                                "generation produced reasoning but no content or tool call \
-                                 (token budget exhausted before an answer began)"
-                            );
-                        }
+                        report_if_all_reasoning_no_content(
+                            &this.id,
+                            this.emitted_reasoning && !this.emitted_content_or_call,
+                            finish_reason,
+                        );
                         this.pending
                             .push_back(this.chunk(Delta::default(), Some(finish_reason)));
                         if this.include_usage {
