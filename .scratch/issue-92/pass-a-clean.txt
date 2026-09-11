@@ -1,0 +1,15 @@
+
+running 1 test
+test chunk_wall_time_decomposition ... #92 decomposition: span 8192 tokens, 3 timed reps per width
+width  chunks   wall_ms(mean)   wall_ms(min)   ms/chunk(mean)   ms/token(mean)
+  256      32          1316.4         1304.9            41.14           0.1607
+  512      16           942.2          938.8            58.89           0.1150
+ 1024       8           797.8          785.2            99.73           0.0974
+ 2048       4           775.7          768.7           193.93           0.0947
+ 4096       2           767.0          764.8           383.49           0.0936
+ 8192       1           790.2          768.9           790.20           0.0965
+#92 decomposition: done
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.27s
+

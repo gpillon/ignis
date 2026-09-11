@@ -1,0 +1,15 @@
+﻿
+running 1 test
+test tokens_per_traversal_sets_the_per_token_cost ... #92 packing proxy: one span, one chunk, no KV prefix
+tokens  wall_ms(min)   ms/token   speedup vs 256
+   256          39.3     0.1534             1.00x
+   512          55.1     0.1077             1.42x
+  1024          88.6     0.0865             1.77x
+  2048         181.3     0.0885             1.73x
+  4096         370.0     0.0903             1.70x
+  8192         784.8     0.0958             1.60x
+#92 packing proxy: done
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 16.82s
+

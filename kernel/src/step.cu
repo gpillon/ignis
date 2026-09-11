@@ -30,6 +30,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -348,6 +351,206 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// GitHub #92, acceptance criterion 1: where per-chunk prefill wall time goes.
+//
+// Diagnostic scaffolding, not a production path. It is inert unless the
+// environment names a file in IGNIS_CHUNK_PROFILE; with the variable unset
+// (every production run and every other test) the cost is one cached boolean
+// test per chunk and not one CUDA event is created or recorded.
+//
+// Per chunk it separates, into one JSONL record:
+//   cpu_enqueue_ms  host wall issuing the chunk's launches (chunk entry up to
+//                   just before cudaStreamSynchronize) -- the dispatch cost
+//                   as the host pays it
+//   sync_ms         host wall blocked inside cudaStreamSynchronize
+//   entry_gap_ms    device idle between the PREVIOUS chunk's last op and this
+//                   chunk's first -- the bubble the forced per-chunk
+//                   synchronization actually opens on the device
+//   gpu_span_ms     device wall from this chunk's first enqueued op to its
+//                   last
+//   embed_ms        device span of the id memcpy + embedding
+//   layers_ms       sum of the 64 layer bodies' own device spans (compute)
+//   head_ms         device span of the final norm / head / sample (last chunk
+//                   of a span only; 0 elsewhere)
+//   layer_gap_ms    gpu_span - embed - layers - head: device idle *between*
+//                   layer bodies, i.e. launch latency the host failed to hide
+//
+// Events are recorded on the model's own stream, so they order with the work
+// they bracket and add no synchronization of their own; every elapsed time is
+// read after the chunk's existing synchronize, when all of them have
+// completed.
+class ChunkProfiler {
+public:
+  // One profiler per thread. The CUDA events below bracket one chunk's work,
+  // so two threads prefilling at once must not share them. They cannot today
+  // -- `model->scratch` is a bump allocator with no synchronization and the
+  // model owns a single stream, so concurrent prefill on one model is already
+  // excluded -- but roadmap phase 6 is exactly about lifting that, and this
+  // should not be the thing that then has to be found. The destination file
+  // stays process-wide, so every thread's records land in one place.
+  static ChunkProfiler &instance() {
+    thread_local ChunkProfiler profiler;
+    return profiler;
+  }
+
+  bool enabled() const { return out_ != nullptr; }
+
+  // A new prefill span: resets the chunk counter and drops the carried-over
+  // end event, so the first chunk of a span reports no entry gap (the gap
+  // before it is the caller's, not the chunk loop's).
+  void begin_span(uint64_t num_tokens, uint32_t chunk_width) {
+    if (!enabled()) { return; }
+    ++span_index_;
+    chunk_index_ = 0;
+    have_prev_end_ = false;
+    span_tokens_ = num_tokens;
+    span_chunk_width_ = chunk_width;
+  }
+
+  // Grows the event pool to cover `layers` layer bodies. Called on the chunk
+  // path before the first record of a chunk.
+  void ensure_events(std::size_t layers) {
+    if (!enabled()) { return; }
+    if (begin_ == nullptr) {
+      cudaEventCreate(&begin_);
+      cudaEventCreate(&head_begin_);
+      cudaEventCreate(&end_[0]);
+      cudaEventCreate(&end_[1]);
+    }
+    while (layer_begin_.size() < layers) {
+      cudaEvent_t b = nullptr;
+      cudaEvent_t e = nullptr;
+      cudaEventCreate(&b);
+      cudaEventCreate(&e);
+      layer_begin_.push_back(b);
+      layer_end_.push_back(e);
+    }
+  }
+
+  void record_begin(cudaStream_t stream) {
+    if (enabled()) { cudaEventRecord(begin_, stream); }
+  }
+  void record_layer_begin(std::size_t layer, cudaStream_t stream) {
+    if (enabled()) { cudaEventRecord(layer_begin_[layer], stream); }
+  }
+  void record_layer_end(std::size_t layer, cudaStream_t stream) {
+    if (enabled()) { cudaEventRecord(layer_end_[layer], stream); }
+  }
+  void record_head_begin(cudaStream_t stream) {
+    if (enabled()) { cudaEventRecord(head_begin_, stream); }
+  }
+  void record_end(cudaStream_t stream) {
+    if (enabled()) { cudaEventRecord(end_[parity_], stream); }
+  }
+
+  // Called after the chunk's own cudaStreamSynchronize returned success, so
+  // every event above has completed and is readable without blocking.
+  void report(std::size_t layers, uint64_t chunk_offset, uint64_t chunk_tokens,
+              bool compute_output, double cpu_enqueue_ms, double sync_ms) {
+    if (!enabled()) { return; }
+    const double gpu_span_ms = elapsed(begin_, end_[parity_]);
+    const double embed_ms = layers > 0 ? elapsed(begin_, layer_begin_[0]) : 0.0;
+    double layers_ms = 0.0;
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+      layers_ms += elapsed(layer_begin_[layer], layer_end_[layer]);
+    }
+    const double head_ms = elapsed(head_begin_, end_[parity_]);
+    const double layer_gap_ms = gpu_span_ms - embed_ms - layers_ms - head_ms;
+    const double entry_gap_ms = have_prev_end_ ? elapsed(end_[1 - parity_], begin_) : 0.0;
+    std::fprintf(out_,
+                 "{\"thread\":%llu,\"span\":%llu,\"span_tokens\":%llu,"
+                 "\"chunk_width\":%u,\"chunk\":%llu,"
+                 "\"chunk_offset\":%llu,\"chunk_tokens\":%llu,\"last\":%d,\"layers\":%llu,"
+                 "\"cpu_enqueue_ms\":%.4f,\"sync_ms\":%.4f,\"entry_gap_ms\":%.4f,"
+                 "\"gpu_span_ms\":%.4f,\"embed_ms\":%.4f,\"layers_ms\":%.4f,\"head_ms\":%.4f,"
+                 "\"layer_gap_ms\":%.4f}\n",
+                 static_cast<unsigned long long>(thread_key_),
+                 static_cast<unsigned long long>(span_index_),
+                 static_cast<unsigned long long>(span_tokens_), span_chunk_width_,
+                 static_cast<unsigned long long>(chunk_index_),
+                 static_cast<unsigned long long>(chunk_offset),
+                 static_cast<unsigned long long>(chunk_tokens), compute_output ? 1 : 0,
+                 static_cast<unsigned long long>(layers), cpu_enqueue_ms, sync_ms, entry_gap_ms,
+                 gpu_span_ms, embed_ms, layers_ms, head_ms, layer_gap_ms);
+    std::fflush(out_);
+    ++chunk_index_;
+    have_prev_end_ = true;
+    parity_ = 1 - parity_;
+  }
+
+  // Per-layer device spans for one chunk, emitted separately so the JSONL
+  // above stays one line per chunk. Written only when the profile asked for
+  // the per-layer detail (IGNIS_CHUNK_PROFILE_LAYERS set).
+  void report_layers(std::size_t layers, uint64_t chunk_offset) {
+    if (!enabled() || !per_layer_) { return; }
+    for (std::size_t layer = 0; layer < layers; ++layer) {
+      std::fprintf(out_,
+                   "{\"thread\":%llu,\"span\":%llu,\"chunk_offset\":%llu,"
+                   "\"layer\":%llu,\"layer_ms\":%.4f,"
+                   "\"gap_before_ms\":%.4f}\n",
+                   static_cast<unsigned long long>(thread_key_),
+                   static_cast<unsigned long long>(span_index_),
+                   static_cast<unsigned long long>(chunk_offset),
+                   static_cast<unsigned long long>(layer),
+                   elapsed(layer_begin_[layer], layer_end_[layer]),
+                   layer == 0 ? elapsed(begin_, layer_begin_[0])
+                              : elapsed(layer_end_[layer - 1], layer_begin_[layer]));
+    }
+    std::fflush(out_);
+  }
+
+private:
+  // Opened once for the process, on whichever thread profiles first. A shared
+  // `std::FILE *` needs no lock of ours: `std::fprintf` locks the stream
+  // internally on both MSVC and POSIX, so records interleave whole rather
+  // than tearing.
+  static std::FILE *shared_sink() {
+    static std::FILE *const sink = []() -> std::FILE * {
+      const char *path = std::getenv("IGNIS_CHUNK_PROFILE");
+      if (path == nullptr || path[0] == 0) { return nullptr; }
+      return std::fopen(path, "ab");
+    }();
+    return sink;
+  }
+
+  static bool shared_per_layer() {
+    static const bool on = std::getenv("IGNIS_CHUNK_PROFILE_LAYERS") != nullptr;
+    return on;
+  }
+
+  // A small dense id per profiling thread, in first-chunk order, so records
+  // from different threads stay separable: `span` and `chunk` below are
+  // per-thread counters and would otherwise collide.
+  static uint64_t next_thread_key() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  ChunkProfiler() : out_(shared_sink()), per_layer_(shared_per_layer()) {}
+
+  static double elapsed(cudaEvent_t from, cudaEvent_t to) {
+    float ms = 0.0F;
+    if (cudaEventElapsedTime(&ms, from, to) != cudaSuccess) { return -1.0; }
+    return static_cast<double>(ms);
+  }
+
+  std::FILE *out_ = nullptr;
+  bool per_layer_ = false;
+  const uint64_t thread_key_ = next_thread_key();
+  std::vector<cudaEvent_t> layer_begin_;
+  std::vector<cudaEvent_t> layer_end_;
+  cudaEvent_t begin_ = nullptr;
+  cudaEvent_t head_begin_ = nullptr;
+  cudaEvent_t end_[2] = {nullptr, nullptr};
+  int parity_ = 0;
+  bool have_prev_end_ = false;
+  uint64_t span_index_ = 0;
+  uint64_t chunk_index_ = 0;
+  uint64_t span_tokens_ = 0;
+  uint32_t span_chunk_width_ = 0;
+};
+
 // P2-02 (GitHub #84): runs one prefill chunk -- embedding for the whole
 // chunk, every decoder layer's body dispatched once over the chunk's
 // `num_tokens` tokens with no per-layer synchronization, then (only when
@@ -367,8 +570,13 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
+  // GitHub #92 criterion 1: inert unless IGNIS_CHUNK_PROFILE is set.
+  ChunkProfiler &profiler = ChunkProfiler::instance();
+  profiler.ensure_events(model->layers.size());
+  const auto cpu_chunk_start = std::chrono::steady_clock::now();
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
   try {
+    profiler.record_begin(model->stream);
     ninfer::Tensor ids = model->scratch->alloc(ninfer::DType::I32, {T, 1, 1, 1});
     cudaError_t err =
         cudaMemcpyAsync(ids.data, token_ids, static_cast<std::size_t>(T) * sizeof(int32_t),
@@ -384,6 +592,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      profiler.record_layer_begin(layer, model->stream);
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
           ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
                                      mode)
@@ -399,9 +608,11 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                   detail);
         return -1;
       }
+      profiler.record_layer_end(layer, model->stream);
       std::swap(left, right);
       ++dispatches;
     }
+    profiler.record_head_begin(model->stream);
 
     // `left` and `right` were swapped once per layer, so after an even
     // layer count the final residual is back in `left`.
@@ -445,6 +656,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     // layer's body above only enqueues work, and (when present) so does the
     // output head, so this confirms the entire chunk -- not one layer --
     // completed before the caller advances `seq`'s position state.
+    profiler.record_end(model->stream);
+    const auto cpu_enqueue_end = std::chrono::steady_clock::now();
     err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error("ignis_program_prefill: chunk at span offset " + std::to_string(chunk_offset) +
@@ -452,6 +665,16 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                 std::to_string(seq->slot) +
                 " failed: cudaStreamSynchronize: " + cudaGetErrorString(err));
       return -1;
+    }
+    if (profiler.enabled()) {
+      const auto cpu_sync_end = std::chrono::steady_clock::now();
+      const auto to_ms = [](std::chrono::steady_clock::duration d) {
+        return std::chrono::duration<double, std::milli>(d).count();
+      };
+      profiler.report_layers(model->layers.size(), chunk_offset);
+      profiler.report(model->layers.size(), chunk_offset, num_tokens, compute_output,
+                      to_ms(cpu_enqueue_end - cpu_chunk_start),
+                      to_ms(cpu_sync_end - cpu_enqueue_end));
     }
 
     if (compute_output && out_logits != nullptr) {
@@ -494,6 +717,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     const ignis_sampling_params &sampling, float *out_logits,
                                     LinearPolicyMode mode) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
+  ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   uint64_t offset = 0;
   while (offset < num_tokens) {
     const uint64_t chunk_len = std::min<uint64_t>(chunk_width, num_tokens - offset);
