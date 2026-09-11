@@ -303,7 +303,7 @@ The baseline is flat and the growth is the prefill scratch arena, which
 The KV pool is not the driver. This budget is 258 page groups of 64 tokens
 over 16 GQA layers at 4 KV heads x 256 head dim, K and V, BF16:
 258 * 64 * 16 * 4 * 256 * 2 * 2 = **1.01 GiB**, plus 2 slots of GDN state
-(48 layers x 48 heads x 128x128) at 151 MiB.About 1.2 GiB of a 17.4 GiB
+(48 layers x 48 heads x 128x128) at 151 MiB. About 1.2 GiB of a 17.4 GiB
 baseline, and identical in every row — it cannot explain a difference between
 rows, and it is not close to the card's limit.
 
