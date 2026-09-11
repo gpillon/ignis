@@ -51,6 +51,9 @@ const MAX_CONTEXT: u32 = (SPAN_TOKENS + 64) as u32;
 const WIDTHS: &[u32] = &[256, 512, 1024, 2048, 4096, 8192];
 /// Timed repetitions per width, after one untimed warm-up at that width.
 const REPS: usize = 3;
+/// Span lengths the packing proxy visits, each prefilled on its own in a
+/// single chunk of its own width.
+const SPANS: &[usize] = &[256, 512, 1024, 2048, 4096, 8192];
 
 fn pages_for(max_context_tokens: u32) -> u32 {
     max_context_tokens.div_ceil(64)
@@ -102,6 +105,13 @@ fn chunk_wall_time_decomposition() {
     let vocab = cfg.vocab as usize;
     let span = token_span(&frontend, SPAN_TOKENS);
     let mut logits = vec![0f32; vocab];
+    // `IGNIS_DECOMP_REPS=1` shortens the run for an external profiler that
+    // serializes every launch (Nsight Compute), where three timed reps cost
+    // minutes for no extra signal.
+    let reps: usize = std::env::var("IGNIS_DECOMP_REPS")
+        .ok()
+        .map(|v| v.trim().parse().unwrap_or_else(|e| panic!("IGNIS_DECOMP_REPS: {e}")))
+        .unwrap_or(REPS);
 
     // `IGNIS_DECOMP_WIDTHS=1024` narrows the sweep to one width, so an
     // external profiler (Nsight Systems) can be pointed at a run that
@@ -114,7 +124,7 @@ fn chunk_wall_time_decomposition() {
             .collect(),
         Err(_) => WIDTHS.to_vec(),
     };
-    println!("#92 decomposition: span {SPAN_TOKENS} tokens, {REPS} timed reps per width");
+    println!("#92 decomposition: span {SPAN_TOKENS} tokens, {reps} timed reps per width");
     println!("width  chunks   wall_ms(mean)   wall_ms(min)   ms/chunk(mean)   ms/token(mean)");
     for &width in &widths {
         // One model per width: the chunk width is fixed at load (it sizes the
@@ -140,8 +150,8 @@ fn chunk_wall_time_decomposition() {
                 .unwrap_or_else(|e| panic!("warm-up prefill(chunk={width}): {e}"));
         }
 
-        let mut walls_ms: Vec<f64> = Vec::with_capacity(REPS);
-        for rep in 0..REPS {
+        let mut walls_ms: Vec<f64> = Vec::with_capacity(reps);
+        for rep in 0..reps {
             let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
             let start = Instant::now();
             prefill_program(&model, &pool, &mut seq, &span, 0, Some(&mut logits))
@@ -158,4 +168,94 @@ fn chunk_wall_time_decomposition() {
         );
     }
     println!("#92 decomposition: done");
+}
+
+
+/// The packing proxy: what a traversal's *token count* alone is worth.
+///
+/// The width sweep above cannot answer "would packing four requests into one
+/// traversal go faster", because it varies chunk width inside a single
+/// 8,192-token span: a 256-token chunk there still attends to up to 8K of KV
+/// prefix, so its per-token cost carries attention work a standalone
+/// 256-token request would never do. This test removes that confound. Each
+/// span is prefilled on its own, from position zero, in exactly one chunk of
+/// its own width -- so `ms/token` is the cost of a traversal of that many
+/// tokens with no prefix behind it.
+///
+/// Read it as: packing N requests of L tokens gives every projection and FFN
+/// GEMM the shapes of a single N*L-token traversal. The row at N*L against
+/// the row at L bounds what that packing can buy. It is a conservative bound
+/// -- one N*L-token span does *more* attention work than N separate L-token
+/// spans -- so a real packed traversal can only beat the figure here.
+#[test]
+#[ignore = "GPU profile only: .scratch/issue-92/run.ps1"]
+fn tokens_per_traversal_sets_the_per_token_cost() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let cfg = ModelConfig::qwen38_27b();
+    let vocab = cfg.vocab as usize;
+    let longest = *SPANS.iter().max().expect("SPANS is not empty");
+    let span = token_span(&frontend, longest);
+    let mut logits = vec![0f32; vocab];
+
+    println!("#92 packing proxy: one span, one chunk, no KV prefix");
+    println!("tokens  wall_ms(min)   ms/token   speedup vs 256");
+    let mut baseline: Option<f64> = None;
+    for &tokens in SPANS {
+        let width = u32::try_from(tokens).expect("span fits u32");
+        let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT)
+            .unwrap_or_else(|e| panic!("ignis_model_load(chunk={width}): {e}"));
+        let pool = SeqPool::create(
+            &cfg,
+            &SeqPoolBudget {
+                kv_page_group_count: pages_for(MAX_CONTEXT) * 2,
+                max_context_tokens: MAX_CONTEXT,
+                slot_count: 2,
+            },
+        )
+        .unwrap_or_else(|e| panic!("seq pool create({tokens}): {e}"));
+        let prompt = &span[..tokens];
+
+        {
+            let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
+            prefill_program(&model, &pool, &mut seq, prompt, 0, Some(&mut logits))
+                .unwrap_or_else(|e| panic!("warm-up prefill({tokens}): {e}"));
+        }
+        let mut walls_ms: Vec<f64> = Vec::with_capacity(REPS);
+        for rep in 0..REPS {
+            let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
+            let start = Instant::now();
+            prefill_program(&model, &pool, &mut seq, prompt, 0, Some(&mut logits))
+                .unwrap_or_else(|e| panic!("prefill({tokens}, rep={rep}): {e}"));
+            walls_ms.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        let min = walls_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let per_token = min / tokens as f64;
+        let base = *baseline.get_or_insert(per_token);
+        println!("{tokens:6}  {min:12.1}   {per_token:8.4}   {:14.2}x", base / per_token);
+    }
+    println!("#92 packing proxy: done");
 }

@@ -155,11 +155,93 @@ end). At 0.5 % of wall, that is a large contract change for a small number.
 The #110 probe already measured the serving-level version of this: skipping
 the non-final-chunk sync moved the ITL p95 ratio 1.130 to 1.110.
 
+## Addendum — "busy" is not "saturated", and packing is a separate question
+
+Raised after the first reading: 90.2 % of the device timeline being inside a
+kernel says the device is not *idle*. It says nothing about whether that
+kernel is using the SMs and tensor cores well. A GEMM that occupies a quarter
+of the machine still counts as 100 % busy on the timeline. So "compute-bound"
+above must be read narrowly: **the wall time is spent in kernels, not in
+synchronization or dispatch.** It is not a claim that the math is at peak.
+
+Nsight Compute would answer the saturation question directly, and it refuses
+here: `ERR_NVGPUCTRPERM`, hardware performance counters are not readable
+without the driver's "Manage GPU Performance Counters" permission opened to
+all users (or an elevated session). That measurement is still outstanding.
+
+What can be measured without counters is the thing the question is really
+about: **does a traversal carrying more tokens cost less per token?** Packing
+N requests into one traversal gives every projection and FFN GEMM the shapes
+of a single N*L-token traversal, and those GEMMs are ~75 % of kernel time. So
+sweep the token count of an isolated traversal.
+
+This is *not* the width sweep in section 1. There, a 256-token chunk sits
+inside an 8,192-token span and still attends to up to 8K of KV prefix, so its
+per-token cost carries attention work a standalone 256-token request would
+never do. Here each span is prefilled on its own, from position zero, in
+exactly one chunk of its own width
+(`tokens_per_traversal_sets_the_per_token_cost`):
+
+| tokens in the traversal | wall min (ms) | ms/token | vs 256 |
+| ---: | ---: | ---: | ---: |
+| 256 | 39.3 | 0.1534 | 1.00x |
+| 512 | 55.1 | 0.1077 | 1.42x |
+| **1024** | **88.6** | **0.0865** | **1.77x** |
+| 2048 | 181.3 | 0.0885 | 1.73x |
+| 4096 | 370.0 | 0.0903 | 1.70x |
+| 8192 | 784.8 | 0.0958 | 1.60x |
+
+Per-token cost bottoms out at **~1,024 tokens per traversal**. Below it the
+traversal is shape-starved and packing pays: four 256-token prompts in one
+traversal is **1.77x** cheaper per token than four separate ones. Above it the
+curve turns back up, but that rise is attention, not saturation — one
+8,192-token span attends to a longer average prefix than eight independent
+1,024-token spans would, so this table is a conservative floor for packing at
+the wide end, not a ceiling.
+
+Splitting that 1.77x by mechanism, using the ~9.2 ms of per-traversal launch
+idle measured in section 3 (roughly constant, since a traversal is ~1,160
+kernels regardless of its token count):
+
+| | 256-token traversal | 1,024-token traversal |
+| --- | ---: | ---: |
+| wall | 39.3 ms | 88.6 ms |
+| launch idle (approximately fixed per traversal) | ~9.2 ms (23 %) | ~9.2 ms (10 %) |
+| kernels executing, per token | ~0.1176 ms | ~0.0775 ms |
+
+So roughly **1.5x of the win is GEMM shape** and **1.17x is dispatch
+amortization**. The dispatch part is the one the ticket's premise predicted,
+and it is the smaller half — and note it is amortizing the *launch* overhead
+(9 %), not the synchronization (0.5 %).
+
+### What this means for packed prefill (`DEFERRED-DECISIONS.md` item 1)
+
+The conclusion there needs restating, because the reason given for it is wrong
+and the answer still comes out "worth building", for a different reason and
+under a condition:
+
+- **Wrong reason:** "per-chunk cost is dominated by synchronization and
+  dispatch, so packing amortizes it across N". Synchronization is 0.5 % and
+  dispatch 9 %. There is no dominant overhead to amortize.
+- **Right reason, conditional on prompt length:** below ~1,024 tokens per
+  traversal the model is shape-starved, and packing is what fills the
+  traversal. At 256-token prompts that is a 1.77x prefill win; at 1,024-token
+  prompts and above it is nothing.
+
+So the phase question turns on the workload, not on this ticket's overhead
+numbers. The gates measure 8K prompts, where one request already fills a
+traversal and packing is worthless. G4's subagent-burst trace is many short
+prompts, which is exactly the regime where the table above pays — which is
+where that item already proposed to measure it.
+
 ## Reproducing
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File .scratch/issue-92/run.ps1
 python .scratch/issue-92/analyze.py
+
+# the addendum's packing proxy (free card, preflight on record, IGNIS_GPU_PROFILE=1):
+cargo test -p ignis-core --features cuda --test chunk_decomposition_gpu \n  tokens_per_traversal -- --ignored --nocapture --test-threads=1
 ```
 
 For the Nsight Systems pass (a free card, preflight on record,
