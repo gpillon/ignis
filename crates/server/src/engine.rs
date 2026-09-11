@@ -78,7 +78,7 @@ enum Command {
 /// already-running consumer without ever sharing a lock with the model
 /// thread.
 enum TelemetryFact {
-    Submitted(RequestId, u32),
+    Submitted(RequestId, u32, RequestClass),
     Routed(SchedEvent),
     Tick,
     SetSink(Arc<dyn LineSink>),
@@ -297,7 +297,7 @@ fn handle_command(
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
-                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens));
+                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class));
                 (id, stream)
             });
             // A dropped receiver (the caller gave up) is not an error here.
@@ -368,7 +368,9 @@ async fn telemetry_task(
 ) {
     while let Some(fact) = facts.recv().await {
         match fact {
-            TelemetryFact::Submitted(id, prompt_tokens) => telemetry.note_submit(id, prompt_tokens),
+            TelemetryFact::Submitted(id, prompt_tokens, class) => {
+                telemetry.note_submit(id, prompt_tokens, class)
+            }
             TelemetryFact::Routed(event) => match event {
                 SchedEvent::Admitted { request, lane, .. } => telemetry.on_admitted(request, lane),
                 SchedEvent::Token { request, .. } => telemetry.on_token(request),

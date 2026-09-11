@@ -142,6 +142,63 @@ fn build_request(
     (input, model, prompt_tokens)
 }
 
+/// Split an optional `model` into its base id and any Lane tag (`CONTEXT.md`:
+/// "the request's own statement of its class") named by an "@<lane>" suffix
+/// (GitHub #120: the OpenAI `model` field has no room of its own for an
+/// extension, so this is the second entry point for the `class` ignis
+/// extension besides the `class` field itself, e.g. `"qwen2.5-7b@agent"`).
+/// The suffix is always stripped from the returned model — including an
+/// unrecognized one — since it is never part of the model id the scheduler
+/// looks up; an empty base (`"@agent"`) is treated as having no suffix at
+/// all, leaving the whole string as the model name.
+fn split_model_lane(model: Option<String>) -> (Option<String>, Option<RequestClass>) {
+    match model {
+        None => (None, None),
+        Some(m) => match m.rsplit_once('@') {
+            Some((base, lane)) if !base.is_empty() => {
+                (Some(base.to_string()), Some(RequestClass::from_extension(lane)))
+            }
+            _ => (Some(m), None),
+        },
+    }
+}
+
+/// Resolve the request's [`RequestClass`] from its two possible wire entry
+/// points (GitHub #120): the `class` JSON extension field, and `from_model`
+/// (any class already read off the model's "@<lane>" suffix by
+/// [`split_model_lane`]). An explicit `class` field wins when both are set.
+/// A `class` of the wrong JSON shape is refused — the same "honoured or
+/// refused, never silently dropped" contract `top_k` uses (#101) — but an
+/// absent field, a `null`, or a recognized-shape-but-unrecognized string all
+/// fall through to [`RequestClass::from_extension`]'s own documented
+/// default (`Interactive`), same as an untagged model.
+fn resolve_class(
+    class: Option<JsonValue>,
+    from_model: Option<RequestClass>,
+) -> Result<RequestClass, String> {
+    match class {
+        None | Some(JsonValue::Null) => Ok(from_model.unwrap_or_default()),
+        Some(JsonValue::String(s)) => Ok(RequestClass::from_extension(&s)),
+        Some(other) => Err(format!(
+            "class is an ignis extension and must be a string (\"interactive\" or \"agent\"), got {other}"
+        )),
+    }
+}
+
+/// `model` and its Lane tag, resolved together (GitHub #120): strip any
+/// "@<lane>" suffix ([`split_model_lane`]) and fold it with the explicit
+/// `class` field ([`resolve_class`]) into the class to submit under. The one
+/// path both completion endpoints share, so the two-entry-point resolution
+/// lives in a single place rather than being repeated per handler.
+fn resolve_model_and_class(
+    model: Option<String>,
+    class: Option<JsonValue>,
+) -> Result<(Option<String>, RequestClass), String> {
+    let (model, model_class) = split_model_lane(model);
+    let class = resolve_class(class, model_class)?;
+    Ok((model, class))
+}
+
 /// The sampling fields accepted by chat completions. Values stay as JSON at
 /// the wire boundary so type, integer-width, and narrowing failures all use
 /// the same OpenAI-shaped sampling error instead of Axum's generic rejection.
@@ -612,6 +669,12 @@ struct ChatCompletionsRequest {
     /// `"auto"` (default) or `"none"`; anything else is a 400
     /// (`resolve_tools`) — this template has no lever to *force* a call.
     tool_choice: Option<JsonValue>,
+    /// The Lane tag (GitHub #120, `CONTEXT.md`): an ignis extension, not an
+    /// OpenAI parameter (the way `top_k` went in at #101). `"interactive"`
+    /// (default) or `"agent"`, the admission class `admission.rs` schedules
+    /// the request under. Also settable via an "@<lane>" suffix on `model`
+    /// (`split_model_lane`); this field wins if both are set.
+    class: Option<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -653,10 +716,13 @@ async fn chat_completions(
         Ok(tools) => tools,
         Err(response) => return response,
     };
+    let (model, class) = match resolve_model_and_class(req.model, req.class) {
+        Ok(x) => x,
+        Err(message) => return bad_request(&message),
+    };
     let (input, model, prompt_tokens) =
-        build_request(&server, req.model, &req.messages, params, &thinking, &tools);
-    let (request_id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await
-    {
+        build_request(&server, model, &req.messages, params, &thinking, &tools);
+    let (request_id, mut stream) = match server.engine.submit(input, class).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1187,6 +1253,9 @@ struct ResponsesRequest {
     reasoning_effort: Option<JsonValue>,
     preserve_thinking: Option<JsonValue>,
     chat_template_kwargs: Option<JsonValue>,
+    /// An ignis extension, not an OpenAI parameter (GitHub #120) — see the
+    /// matching field on `ChatCompletionsRequest`.
+    class: Option<JsonValue>,
 }
 
 /// The responses API's `input` (a string or a message list).
@@ -1233,9 +1302,13 @@ async fn responses_api(
         Ok(t) => t,
         Err(response) => return response,
     };
+    let (model, class) = match resolve_model_and_class(req.model, req.class) {
+        Ok(x) => x,
+        Err(message) => return bad_request(&message),
+    };
     let (input, model, prompt_tokens) = build_request(
         &server,
-        req.model,
+        model,
         &messages,
         DecodeParams {
             max_tokens: req.max_output_tokens,
@@ -1249,7 +1322,7 @@ async fn responses_api(
         // scope this endpoint already keeps for reasoning/tool_calls).
         &[],
     );
-    let (id, mut stream) = match server.engine.submit(input, RequestClass::Interactive).await {
+    let (id, mut stream) = match server.engine.submit(input, class).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1426,6 +1499,128 @@ mod tests {
         assert_eq!(json["usage"]["prompt_tokens"], 58);
         assert_eq!(json["usage"]["completion_tokens"], 1500);
         assert_eq!(json["usage"]["total_tokens"], 1558);
+    }
+
+    // ── GitHub #120: tagged lanes (the `class` extension + "@<lane>") ────
+
+    #[test]
+    fn a_lane_suffix_on_model_is_stripped_and_parsed() {
+        let (model, class) = split_model_lane(Some("qwen2.5-7b@agent".into()));
+        assert_eq!(model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(class, Some(RequestClass::Agent));
+    }
+
+    #[test]
+    fn an_unrecognized_lane_suffix_still_strips_and_defaults_to_interactive() {
+        let (model, class) = split_model_lane(Some("qwen2.5-7b@classifier".into()));
+        assert_eq!(model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(class, Some(RequestClass::Interactive));
+    }
+
+    #[test]
+    fn a_model_with_no_at_sign_carries_no_lane() {
+        let (model, class) = split_model_lane(Some("qwen2.5-7b".into()));
+        assert_eq!(model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(class, None);
+    }
+
+    #[test]
+    fn a_bare_at_prefix_with_no_model_id_is_left_untouched() {
+        // No model name precedes "@" — nothing sensible to strip, so the
+        // whole string stands as the model (and is rejected downstream as
+        // an unknown model, same as today).
+        let (model, class) = split_model_lane(Some("@agent".into()));
+        assert_eq!(model.as_deref(), Some("@agent"));
+        assert_eq!(class, None);
+    }
+
+    #[test]
+    fn no_model_at_all_carries_no_lane() {
+        assert_eq!(split_model_lane(None), (None, None));
+    }
+
+    #[test]
+    fn an_explicit_class_field_wins_over_the_model_suffix() {
+        let class = resolve_class(
+            Some(serde_json::json!("interactive")),
+            Some(RequestClass::Agent),
+        )
+        .expect("a string class resolves");
+        assert_eq!(class, RequestClass::Interactive);
+    }
+
+    #[test]
+    fn the_model_suffix_applies_when_no_explicit_class_is_set() {
+        let class = resolve_class(None, Some(RequestClass::Agent)).expect("resolves");
+        assert_eq!(class, RequestClass::Agent);
+    }
+
+    #[test]
+    fn absent_class_and_untagged_model_default_to_interactive() {
+        assert_eq!(resolve_class(None, None).unwrap(), RequestClass::Interactive);
+        assert_eq!(
+            resolve_class(Some(serde_json::Value::Null), None).unwrap(),
+            RequestClass::Interactive
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_class_string_defaults_to_interactive_rather_than_erroring() {
+        assert_eq!(
+            resolve_class(Some(serde_json::json!("classifier")), None).unwrap(),
+            RequestClass::Interactive
+        );
+    }
+
+    #[test]
+    fn a_non_string_class_is_refused_like_top_k() {
+        let err = resolve_class(Some(serde_json::json!(1)), None).unwrap_err();
+        assert!(err.contains("ignis extension"), "message: {err}");
+    }
+
+    #[test]
+    fn resolve_model_and_class_combines_the_lane_suffix_and_the_explicit_field() {
+        // No explicit `class`: the "@<lane>" suffix decides, and is
+        // stripped from the model handed back.
+        let (model, class) =
+            resolve_model_and_class(Some("qwen2.5-7b@agent".into()), None).expect("resolves");
+        assert_eq!(model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(class, RequestClass::Agent);
+
+        // An explicit `class` field overrides a conflicting suffix.
+        let (model, class) = resolve_model_and_class(
+            Some("qwen2.5-7b@agent".into()),
+            Some(serde_json::json!("interactive")),
+        )
+        .expect("resolves");
+        assert_eq!(model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(class, RequestClass::Interactive);
+
+        // A badly-typed `class` is still refused even with a valid suffix.
+        assert!(
+            resolve_model_and_class(Some("qwen2.5-7b@agent".into()), Some(serde_json::json!(1)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_chat_completions_request_parses_the_class_extension_field() {
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "class": "agent",
+        }))
+        .expect("class parses as a chat-completions field");
+        assert_eq!(req.class, Some(serde_json::json!("agent")));
+    }
+
+    #[test]
+    fn a_responses_request_parses_the_class_extension_field() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "input": "hi",
+            "class": "agent",
+        }))
+        .expect("class parses as a responses field");
+        assert_eq!(req.class, Some(serde_json::json!("agent")));
     }
 
     #[test]
