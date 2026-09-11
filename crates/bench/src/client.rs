@@ -319,6 +319,11 @@ fn request_body(req: &Request) -> serde_json::Value {
         "temperature": 0,
         "seed": 0,
         "stream": req.stream,
+        // GitHub #120: the trace's own main/sub class survives replay into
+        // the engine's `class` ignis extension, rather than being dropped
+        // at the client — the engine's request log then attributes a
+        // per-class gate cell without a second run.
+        "class": req.class.as_ignis_extension_str(),
     });
     if let Some(enable_thinking) = req.enable_thinking {
         body["enable_thinking"] = serde_json::json!(enable_thinking);
@@ -685,6 +690,22 @@ mod tests {
             enable_thinking: Some(false),
         };
         assert_eq!(request_body(&req)["enable_thinking"], false);
+    }
+
+    #[test]
+    fn request_body_carries_the_ignis_class_extension_for_each_trace_class() {
+        let mut req = Request {
+            id: "main".into(),
+            class: RequestClass::Main,
+            prompt: "p".into(),
+            max_tokens: 4,
+            stream: false,
+            include_usage: false,
+            enable_thinking: None,
+        };
+        assert_eq!(request_body(&req)["class"], "interactive");
+        req.class = RequestClass::Sub;
+        assert_eq!(request_body(&req)["class"], "agent");
     }
 
     #[test]

@@ -32,6 +32,20 @@ pub enum RequestClass {
     Sub,
 }
 
+impl RequestClass {
+    /// The engine's `class` ignis extension value for this trace class
+    /// (GitHub #120: `ignis-bench replay` sends each line's class so a
+    /// replayed trace produces per-class attribution in the engine's own
+    /// request log, not just this harness's). The main agent is
+    /// foreground/interactive traffic; a subagent is the background class.
+    pub fn as_ignis_extension_str(&self) -> &'static str {
+        match self {
+            RequestClass::Main => "interactive",
+            RequestClass::Sub => "agent",
+        }
+    }
+}
+
 fn default_class() -> RequestClass {
     RequestClass::Sub
 }

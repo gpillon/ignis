@@ -144,6 +144,43 @@ async fn a_real_request_emits_interval_and_request_lines() {
     );
 }
 
+/// GitHub #120: the request's admission class rides the canonical
+/// `ignis.request.*` events, so a per-class gate cell is attributable
+/// without a second run. Submitted directly through `Engine::submit`
+/// (bypassing HTTP) — this is the seam `api.rs`'s `class`/"@<lane>"
+/// resolution feeds into; that resolution is covered at the HTTP layer by
+/// `crates/server/src/api.rs`'s own unit tests.
+#[tokio::test]
+async fn the_request_class_rides_the_canonical_request_events() {
+    let sink = Arc::new(MemorySink::new());
+    let (log_sink, _guard) = capture_request_events();
+    let engine = engine_with_sink(sink);
+    let (_id, mut rx) = engine
+        .submit(input(vec![1, 2, 3], 4), RequestClass::Agent)
+        .await
+        .expect("submit");
+    collect_tokens(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("the request completes");
+    nudge().await;
+
+    let lines = log_sink.lines();
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for name in ["ignis.request.admitted", "ignis.request.ttft", "ignis.request.done"] {
+        let event = events
+            .iter()
+            .find(|e| e["event_name"] == name)
+            .unwrap_or_else(|| panic!("a {name} event: {events:?}"));
+        assert_eq!(
+            event["attributes"]["class"], "agent",
+            "{name} should carry the Agent class: {event:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_interval_counters_track_inflight_requests() {
     let sink = Arc::new(MemorySink::new());

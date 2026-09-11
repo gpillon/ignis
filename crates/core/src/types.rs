@@ -116,14 +116,47 @@ pub enum RequestState {
 
 /// Admission / backfill class for the admission state machine (ADR 0004).
 /// Drives protection, backfill priority, and eviction ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// GitHub #120: reachable from HTTP as the **Lane tag** (`CONTEXT.md`: "the
+/// request's own statement of its class"), the `class` ignis extension field
+/// (an unrecognized or absent wire value maps to `Interactive` — [`Default`]
+/// mirrors that so every call site that has not yet heard otherwise gets the
+/// same safe default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RequestClass {
     /// Foreground interactive request — highest priority, protected from
     /// eviction while active.
+    #[default]
     Interactive,
     /// Background agent subtask — the backfill class that fills lanes left
     /// free by interactive traffic.
     Agent,
+}
+
+impl RequestClass {
+    /// Parse the `class` ignis extension's wire value (GitHub #120):
+    /// `"agent"` (case-insensitive) is [`RequestClass::Agent`]; anything
+    /// else — including a value nobody has defined yet — maps to
+    /// [`RequestClass::Interactive`], the documented safe default. Same
+    /// mapping for the "@<lane>" suffix on the `model` field, ignis's second
+    /// entry point for this same class.
+    pub fn from_extension(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("agent") {
+            RequestClass::Agent
+        } else {
+            RequestClass::Interactive
+        }
+    }
+
+    /// The wire string for the `class` extension and the canonical
+    /// `ignis.request.*` events (GitHub #120) — the inverse of
+    /// [`RequestClass::from_extension`] for the two recognized classes.
+    pub fn as_extension_str(&self) -> &'static str {
+        match self {
+            RequestClass::Interactive => "interactive",
+            RequestClass::Agent => "agent",
+        }
+    }
 }
 
 /// The backfill class a request was admitted under by the admission state
@@ -265,3 +298,40 @@ impl std::fmt::Display for ComputeError {
 }
 
 impl std::error::Error for ComputeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognized_extension_values_parse_case_insensitively() {
+        assert_eq!(RequestClass::from_extension("agent"), RequestClass::Agent);
+        assert_eq!(RequestClass::from_extension("Agent"), RequestClass::Agent);
+        assert_eq!(RequestClass::from_extension("AGENT"), RequestClass::Agent);
+        assert_eq!(
+            RequestClass::from_extension("interactive"),
+            RequestClass::Interactive
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_or_empty_value_maps_to_the_safe_default() {
+        assert_eq!(
+            RequestClass::from_extension("classifier"),
+            RequestClass::Interactive
+        );
+        assert_eq!(RequestClass::from_extension(""), RequestClass::Interactive);
+    }
+
+    #[test]
+    fn default_is_interactive() {
+        assert_eq!(RequestClass::default(), RequestClass::Interactive);
+    }
+
+    #[test]
+    fn as_extension_str_round_trips_through_from_extension() {
+        for class in [RequestClass::Interactive, RequestClass::Agent] {
+            assert_eq!(RequestClass::from_extension(class.as_extension_str()), class);
+        }
+    }
+}
