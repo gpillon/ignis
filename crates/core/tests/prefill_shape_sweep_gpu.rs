@@ -108,7 +108,7 @@ fn prefill_wall_time_across_the_load_shapes() {
 
     println!("--- #93 prefill shape sweep (chunk {PREFILL_CHUNK}) ---");
     for &(label, max_context, kv_pool_tokens, slot_count) in SHAPES {
-        let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, max_context)
+        let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, max_context, ignis_core::KvFormat::Bf16)
             .unwrap_or_else(|e| panic!("{label}: model load: {e}"));
         let pool = SeqPool::create(
             &cfg,

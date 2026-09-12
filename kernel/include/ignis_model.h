@@ -131,15 +131,27 @@ struct ignis_model_stats {
  * `prefill_chunk_tokens` (a chunk wider than the sequence pool's own
  * context bound could never be prefilled anyway).
  *
+ * `kv_format` (one of `enum ignis_kv_format`, ignis_seq.h) is the KV
+ * storage format every sequence pool used with this handle will be built in
+ * (P4-05, GitHub #123). It is a load argument rather than something read off
+ * the pool because the GQA attention workspace is part of the scratch
+ * reservation above and its size depends on the format: the hq-e8-2b prompt
+ * route materializes the envelope's visible history into two rotated-frame
+ * BF16 scratch planes, which BF16's own prompt route has no counterpart for.
+ * A pool whose format differs from this argument is refused by the layer
+ * entry points rather than run against an arena sized for the other format.
+ *
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate
  * name, a missing or extra bound tensor, a tensor whose shape does not
  * match the one `topology` implies, an invalid `prefill_chunk_tokens` /
- * `max_context_tokens`, or a chunk width whose scratch reservation does not
- * fit the device's free memory -- a load is all-or-nothing. */
+ * `max_context_tokens` / `kv_format`, or a chunk width whose scratch
+ * reservation does not fit the device's free memory -- a load is
+ * all-or-nothing. */
 int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                           const struct ignis_topology *topology, uint32_t prefill_chunk_tokens,
-                          uint32_t max_context_tokens, struct ignis_model **out_model);
+                          uint32_t max_context_tokens, int32_t kv_format,
+                          struct ignis_model **out_model);
 
 /* Statistics of a loaded model. Returns 0 on success, -1 on a null
  * argument. */

@@ -11,13 +11,15 @@
 // strides. If the two formats disagreed about where a (position, kv_head)
 // row lives, one of the two readbacks would come back zero.
 //
-// It is a CTest rather than a Rust GPU test on purpose: hq cannot serve a
-// token until the attention routes land (GitHub #123), so no production Rust
-// path reaches the hq append, and reaching it from Rust would mean widening
-// the step ABI for a test. Here the internal pool definitions
-// (ignis_seq_internal.h) are already in scope, the same way
+// It is a CTest rather than a Rust GPU test on purpose. A2 (`gqa_kv_append`)
+// is no longer on the serving path at all -- P2-04 (GitHub #86) fused the
+// append into A1 -- so no Rust caller reaches it, and reaching it from Rust
+// would mean widening the step ABI for a test. Here the internal pool
+// definitions (ignis_seq_internal.h) are already in scope, the same way
 // test_seq_alloc.cpp uses them, and the whole thing runs inside the GPU
-// profile's `kernel/build.ps1 -Test` leg with no cargo feature gate.
+// profile's `kernel/build.ps1 -Test` leg with no cargo feature gate. The
+// serving path's own version of this claim is
+// kernel/tests/test_hq_route_agreement.cu (GitHub #123), which drives A1.
 //
 // Rows are the committed real-activation fixture from P4-03
 // (kernel/tests/fixtures/hq_kv_rows_27b.bin, captured from a real prefill of

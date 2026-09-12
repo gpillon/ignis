@@ -64,6 +64,14 @@ impl Drop for Harness {
 /// Build the harness, or `None` when the GPU profile says to skip
 /// (artifact absent / CUDA unavailable outside the profile — a hard
 /// failure under it, via `gpu_profile::skip_or_fail`).
+///
+/// `EngineShape::default()` on purpose, so these run in the shape an
+/// operator gets with no flags — which since GitHub #123 means hq-e8-2b KV
+/// (ADR 0022's serving default). Nothing here is a tolerance-bearing
+/// oracle: the assertions are the HTTP surface's own (non-empty text, a
+/// real finish reason, internally consistent usage counts). The correctness
+/// oracles ask for BF16 by name instead — `oracle_teacher_forced_gpu.rs`,
+/// `chunked_prefill_self_oracle_gpu.rs`, `logit_divergence_gpu.rs`.
 fn harness() -> Option<Harness> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {

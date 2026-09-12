@@ -132,7 +132,7 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
 
     let vocab = ModelConfig::qwen38_27b().vocab as usize;

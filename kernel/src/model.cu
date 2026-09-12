@@ -322,9 +322,17 @@ std::size_t i32_bytes(int64_t elements) {
 // workspace queries. The attention query is per-row (`batch_size`, widths
 // over [1, T]); the projections see one matrix of `T * batch` columns and
 // are queried that way.
+//
+// `cache_dtype` is the KV format's own declared element type (P4-05, GitHub
+// #123): the layer asks the attention query under exactly this dtype, and
+// the hq (U8) prompt route's answer is far larger than BF16's -- it
+// materializes the envelope's visible history into two rotated-frame BF16
+// scratch planes before the shared FA2 kernel runs over it. Sizing the
+// arena as BF16 and then dispatching hq is the one way this reservation can
+// be wrong, so the format reaches here rather than being assumed.
 std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLayerWeights &w,
                                      std::int32_t T, uint32_t max_context_tokens,
-                                     std::int32_t batch) {
+                                     ninfer::DType cache_dtype, std::int32_t batch) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto q_width = static_cast<std::int32_t>(topology.num_q_heads * topology.head_dim);
   const auto kv_width = static_cast<std::int32_t>(topology.num_kv_heads * topology.head_dim);
@@ -349,7 +357,7 @@ std::size_t gqa_layer_scratch_bytes(const ignis_topology &topology, const GqaLay
   const ninfer::ops::GqaExecutionEnvelope envelope{
       /*min_visible_keys=*/1, /*max_visible_keys=*/max_context_tokens};
   bytes += round_up_arena_align(ninfer::ops::gqa_attention_workspace_capacity_bytes(
-      q_heads, ninfer::DType::BF16, envelope, /*batch_size=*/batch, /*min_width=*/1,
+      q_heads, cache_dtype, envelope, /*batch_size=*/batch, /*min_width=*/1,
       /*max_width=*/T));
   bytes += round_up_arena_align(ninfer::ops::attn_input_proj_workspace_capacity_bytes(
       w.query_key_gate_value.qtype, w.query_key_gate_value.n, w.query_key_gate_value.k,
@@ -452,11 +460,11 @@ std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int
 // ever live alongside the outer scope's).
 std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_topology &topology,
                                           std::int32_t chunk, uint32_t max_context_tokens,
-                                          std::int32_t batch) {
+                                          ninfer::DType cache_dtype, std::int32_t batch) {
   std::size_t layer_peak = 0;
   for (const auto &layer : model.layers) {
     const std::size_t layer_bytes = layer.kind == IGNIS_LAYER_GQA
-        ? gqa_layer_scratch_bytes(topology, layer.gqa, chunk, max_context_tokens, batch)
+        ? gqa_layer_scratch_bytes(topology, layer.gqa, chunk, max_context_tokens, cache_dtype, batch)
         : gdn_layer_scratch_bytes(topology, layer.gdn, chunk, batch);
     layer_peak = std::max(layer_peak, layer_bytes);
   }
@@ -468,7 +476,7 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                                      const struct ignis_topology *topology,
                                      uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
-                                     struct ignis_model **out_model) {
+                                     int32_t kv_format, struct ignis_model **out_model) {
   if (out_model != nullptr) {
     *out_model = nullptr;
   }
@@ -508,6 +516,16 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
               ") must not exceed max_context_tokens (" + std::to_string(max_context_tokens) + ")");
     return -1;
   }
+  // P4-05 (GitHub #123): the format both scratch reservations below are
+  // sized for. Refused here rather than defaulted to BF16 -- an unrecognized
+  // value would otherwise reserve one format's arena and let the layers run
+  // the other's routes out of it.
+  if (kv_format != IGNIS_KV_FORMAT_BF16 && kv_format != IGNIS_KV_FORMAT_HQ_E8_2B) {
+    set_error("ignis_model_load: kv_format " + std::to_string(kv_format) +
+              " is not an ignis_kv_format");
+    return -1;
+  }
+  const ninfer::DType cache_dtype = ignis_kv_cache_dtype(kv_format);
 
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {
@@ -559,6 +577,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // conservative GqaExecutionEnvelope (every capture and every replay uses
   // this cap, never a lane's actual current position).
   model->max_context_tokens = max_context_tokens;
+  // P4-05 (GitHub #123): what the two arenas below are reserved for, and
+  // what `kernel/src/gqa_layer.cu` checks a sequence pool against.
+  model->kv_format = kv_format;
 
   const cudaError_t stream_err = cudaStreamCreate(&model->stream);
   if (stream_err != cudaSuccess) {
@@ -576,7 +597,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   try {
     scratch_bytes = compute_program_scratch_bytes(
         *model, *topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
-        /*batch=*/1);
+        cache_dtype, /*batch=*/1);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: prefill scratch sizing failed: ") + e.what());
     cudaStreamDestroy(model->stream);
@@ -645,8 +666,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // Capture itself (`ignis_decode_graph_capture`) happens later, once the
   // sequence pool exists.
   try {
-    const std::size_t decode_graph_scratch_bytes = compute_program_scratch_bytes(
-        *model, *topology, /*chunk=*/1, max_context_tokens, /*batch=*/IGNIS_DECODE_MAX_BATCH);
+    const std::size_t decode_graph_scratch_bytes =
+        compute_program_scratch_bytes(*model, *topology, /*chunk=*/1, max_context_tokens,
+                                      cache_dtype, /*batch=*/IGNIS_DECODE_MAX_BATCH);
     model->decode_graph_scratch =
         std::make_unique<ninfer::DeviceArena>(decode_graph_scratch_bytes);
     model->decode_graph_token_ids =

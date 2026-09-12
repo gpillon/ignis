@@ -71,7 +71,7 @@ Kernel leaf (kernel/, C++/CUDA static lib — CMake + nvcc, SM120a)
   │            sequence state (KV pages, fp32 GDN slots, conv taps)
   └── vendored ops (verbatim from the reference, ADR 0010)
       ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T; W4A4 + TMA since G2)
-      ├── GQA attention (bf16 paged decode + prefill; i8/hq in progress at G4)
+      ├── GQA attention (bf16 + hq-e8-2b paged decode + prefill; i8 unused)
       ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked since G2)
       ├── norms / embedding / sampling
       └── per-width decode CUDA graphs *(shipped: G3, widths 1..8)*
@@ -85,8 +85,10 @@ ceiling; the paged KV pool is sized by a **byte** budget (`--kv-pool-bytes`,
 4 GiB by default, raised if one full context would not fit) rather than from
 free VRAM — auto-sizing it from the leaf's real free-VRAM headroom is
 deferred work. What that budget is worth in tokens is derived from the KV
-format in force (`--kv-format`): 65536 sequence-tokens under BF16, 7.11x that
-under hq-e8-2b, reported at load. The target max concurrency is N=8 (resident
+format in force (`--kv-format`, hq-e8-2b by default since its attention
+routes landed): 65536 sequence-tokens under BF16, 7.11x that under hq-e8-2b,
+reported at load. BF16 is retained and is the format every correctness
+oracle runs against (ADR 0022). The target max concurrency is N=8 (resident
 lanes with host-tier overflow, sized for a ~10-subagent concurrent workload).
 
 ## Repo layout
@@ -211,7 +213,8 @@ evolve as the engine matures.
 > **Real completions on the GPU.** Built with `--features cuda` and a
 > verified `IGNIS_ARTIFACT`, the server loads the ~19 GB of weights into
 > VRAM, builds a paged KV pool from a 4 GiB byte budget across 8 decode
-> slots — 65536 sequence-tokens under the default BF16 KV format, each
+> slots — 465984 sequence-tokens under the default hq-e8-2b KV format
+> (65536 under BF16), each
 > sequence capped at the 40960-token default context; auto-sizing the budget
 > from the leaf's real free-VRAM headroom is later
 > work, `ignis_runtime::CudaLeafConfig`), and drives the real 64-layer
@@ -240,7 +243,7 @@ full, always-current table.
 | `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |
 | `IGNIS_PREFILL_CHUNK` | `--prefill-chunk <tokens>` | — | `1024` | The prefill chunk width (a nonzero multiple of 128); the program's prefill scratch is reserved for it at load. |
 | `IGNIS_MAX_CONTEXT` | `--max-context <tokens>` | — | `40960` | The max per-sequence context (prompt + generation); the KV pool must be able to hold one of them. |
-| `IGNIS_KV_FORMAT` | `--kv-format <fmt>` | — | `bf16` | The KV cache format for this load: `bf16` or `hq-e8-2b` (ADR 0022). Decides what a pool byte budget is worth in tokens. |
+| `IGNIS_KV_FORMAT` | `--kv-format <fmt>` | — | `hq-e8-2b` | The KV cache format for this load: `hq-e8-2b` (the serving default) or `bf16` (retained, and the format every correctness oracle runs against) — ADR 0022. Decides what a pool byte budget is worth in tokens. |
 | `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | auto (4 GiB) | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context` fails the load by name. |
 | `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | — | `--help` | `-h` | — | Print the flag table and exit. |

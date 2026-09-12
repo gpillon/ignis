@@ -13,6 +13,13 @@
 //! untouched eager path. This lets one test compare both paths on the
 //! identical model/pool geometry without a second code path of its own.
 //!
+//! Every property is checked under **both** KV formats (P4-05, GitHub
+//! #123): the widths stay exactly 1..8 and unpadded under hq-e8-2b, and one
+//! capture set still serves a whole process, because the codec keeps fixed
+//! bytes per row and its escalation path is bounded, deterministic and
+//! host-free -- so the addresses a graph bakes in do not move (ADR 0019 /
+//! 0022).
+//!
 //! One `#[test]`, several `Model`/`SeqPool` loads against one shared
 //! `materialize()` (mirrors `sampling_gpu.rs`'s own note: materialized
 //! device weights are never freed until the artifact drops, so more than
@@ -27,6 +34,7 @@
 use std::path::Path;
 
 use ignis_artifact::{CudaDevice, Reader, bind_text_scope_27b, materialize};
+use ignis_core::KvFormat;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::{Model, load_qwen38_27b};
@@ -45,11 +53,11 @@ const ROUNDS: usize = 3;
 /// `64 * B`, because it ran B complete per-lane forwards.
 const LAYERS: u64 = 64;
 
-fn new_pool(slot_count: u32) -> Result<SeqPool, String> {
+fn new_pool(kv_format: KvFormat, slot_count: u32) -> Result<SeqPool, String> {
     SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
-            kv_format: ignis_core::KvFormat::Bf16,
+            kv_format,
             kv_page_group_count: MAX_CONTEXT.div_ceil(64) * slot_count,
             max_context_tokens: MAX_CONTEXT,
             slot_count,
@@ -214,14 +222,43 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         }
     };
 
+    // P4-05 (GitHub #123): every property below has to hold under both KV
+    // formats, and the claim that it does is not free. A captured graph bakes
+    // in device addresses (ADR 0019), so it is only safe over a cache whose
+    // row addressing does not move; the hq codec keeps fixed bytes per row
+    // with a bounded, deterministic, host-free escalation path, which is
+    // exactly the property that keeps the widths at 1..8 unpadded and the
+    // capture set one per process (ADR 0022). This loop is what turns that
+    // argument into a check.
+    for kv_format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+        exercise_decode_graphs(&reader, &artifact, &handles, kv_format);
+    }
+}
+
+/// Every decode-graph property under one KV format: replay equals eager at
+/// each exact width 1..=8, which row of the round a sequence occupies does not
+/// change what it generates, and a prefill chunk between two replays changes
+/// nothing.
+///
+/// Takes the already-materialized weights: one `materialize()` per process
+/// (see the caller's note), so both formats share them and only the pool and
+/// the model handle's own scratch differ.
+fn exercise_decode_graphs(
+    reader: &Reader,
+    artifact: &ignis_artifact::MaterializedArtifact,
+    handles: &[ignis_artifact::ObjectHandle],
+    kv_format: KvFormat,
+) {
+    let fmt = kv_format.as_str();
+
     // --- replay-vs-eager token equality at every exact width 1..=8 --------
     for width in 1..=8usize {
         let order = in_prompt_order(width);
 
         // --- eager: same geometry, capture never called ---------------
-        let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-            .unwrap_or_else(|e| panic!("model load (eager, width {width}): {e}"));
-        let eager_pool = new_pool(width as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
+        let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
+            .unwrap_or_else(|e| panic!("{fmt}: model load (eager, width {width}): {e}"));
+        let eager_pool = new_pool(kv_format, width as u32).unwrap_or_else(|e| panic!("{fmt}: seq pool create: {e}"));
         let eager = run_lanes(&model, &eager_pool, &order, greedy_for);
         drop(eager_pool);
         drop(model);
@@ -230,14 +267,14 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         // would exist in production (StepLeaf::load_model's own sequence),
         // and the run stays on that same pool -- a captured graph holds the
         // pool's planes at their capture-time addresses (ADR 0019).
-        let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-            .unwrap_or_else(|e| panic!("model load (graph, width {width}): {e}"));
-        let graph_pool = new_pool(width as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
+        let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
+            .unwrap_or_else(|e| panic!("{fmt}: model load (graph, width {width}): {e}"));
+        let graph_pool = new_pool(kv_format, width as u32).unwrap_or_else(|e| panic!("{fmt}: seq pool create: {e}"));
         let capture = capture_decode_graphs(&model, &graph_pool)
-            .unwrap_or_else(|e| panic!("decode graph capture: {e}"));
+            .unwrap_or_else(|e| panic!("{fmt}: decode graph capture: {e}"));
         assert!(
             capture.is_ready(width as u32),
-            "width {width} did not capture a decode graph (ready_mask {:#010b})",
+            "{fmt}: width {width} did not capture a decode graph (ready_mask {:#010b})",
             capture.ready_mask
         );
         let graph = run_lanes(&model, &graph_pool, &order, greedy_for);
@@ -246,7 +283,7 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
 
         assert_eq!(
             eager, graph,
-            "width {width}: graph replay diverged from the same traversal run eagerly"
+            "{fmt}: width {width}: graph replay diverged from the same traversal run eagerly"
         );
     }
 
@@ -265,15 +302,15 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     // generates depends on its own seed and never on which lanes shared its
     // round -- which a greedy round cannot exercise at all.
     const PERMUTED_WIDTH: usize = 4;
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-        .unwrap_or_else(|e| panic!("model load (row order): {e}"));
+    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
+        .unwrap_or_else(|e| panic!("{fmt}: model load (row order): {e}"));
     let row_order_pool =
-        new_pool(PERMUTED_WIDTH as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
+        new_pool(kv_format, PERMUTED_WIDTH as u32).unwrap_or_else(|e| panic!("{fmt}: seq pool create: {e}"));
     let capture = capture_decode_graphs(&model, &row_order_pool)
-        .unwrap_or_else(|e| panic!("decode graph capture: {e}"));
+        .unwrap_or_else(|e| panic!("{fmt}: decode graph capture: {e}"));
     assert!(
         capture.is_ready(PERMUTED_WIDTH as u32),
-        "row-order run: width {PERMUTED_WIDTH} did not capture a decode graph"
+        "{fmt}: row-order run: width {PERMUTED_WIDTH} did not capture a decode graph"
     );
     let in_row_order = run_lanes(&model, &row_order_pool, &[0, 1, 2, 3], per_lane_sampling_for);
     let reversed_rows = run_lanes(&model, &row_order_pool, &[3, 2, 1, 0], per_lane_sampling_for);
@@ -287,11 +324,11 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     drop(model);
     assert_ne!(
         in_row_order, greedy_rows,
-        "the per-lane seeds, temperatures and penalties never reached the sampler, so the          row-order comparison proves nothing about them"
+        "{fmt}: the per-lane seeds, temperatures and penalties never reached the sampler, so the row-order comparison proves nothing about them"
     );
     assert_eq!(
         in_row_order, reversed_rows,
-        "which row of the decode round a sequence occupies changed what it generated"
+        "{fmt}: which row of the decode round a sequence occupies changed what it generated"
     );
 
     // --- interleaving: a prefill chunk between two replays must not
@@ -300,13 +337,13 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     const PROMPT: [i32; 6] = [5, 9, 20, 42, 7, 3];
 
     // --- baseline: two replays back to back, nothing in between ---------
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-        .unwrap_or_else(|e| panic!("model load (baseline): {e}"));
-    let pool = new_pool(WIDTH as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
-    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
+        .unwrap_or_else(|e| panic!("{fmt}: model load (baseline): {e}"));
+    let pool = new_pool(kv_format, WIDTH as u32).unwrap_or_else(|e| panic!("{fmt}: seq pool create: {e}"));
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("{fmt}: capture: {e}"));
     assert!(
         capture.is_ready(WIDTH as u32),
-        "interleaving baseline: width {WIDTH} did not capture a decode graph -- \
+        "{fmt}: interleaving baseline: width {WIDTH} did not capture a decode graph -- \
          both runs would silently take the eager path and prove nothing"
     );
     let mut lanes: Vec<Seq<'_>> = (0..WIDTH)
@@ -327,7 +364,7 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert_eq!(
             stats.graph_launches, 1,
-            "interleaving baseline: decode round did not replay a graph"
+            "{fmt}: interleaving baseline: decode round did not replay a graph"
         );
     }
     drop(lanes);
@@ -338,13 +375,13 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
     // the same two replays -- it only ever touches `scratch`, never the
     // decode graph's dedicated `decode_graph_scratch` (ADR 0019), so the
     // second replay must read exactly what it would have read anyway.
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-        .unwrap_or_else(|e| panic!("model load (interleaved): {e}"));
-    let pool = new_pool(WIDTH as u32 + 1).unwrap_or_else(|e| panic!("seq pool create: {e}"));
-    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
+        .unwrap_or_else(|e| panic!("{fmt}: model load (interleaved): {e}"));
+    let pool = new_pool(kv_format, WIDTH as u32 + 1).unwrap_or_else(|e| panic!("{fmt}: seq pool create: {e}"));
+    let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("{fmt}: capture: {e}"));
     assert!(
         capture.is_ready(WIDTH as u32),
-        "interleaved run: width {WIDTH} did not capture a decode graph -- \
+        "{fmt}: interleaved run: width {WIDTH} did not capture a decode graph -- \
          the interleaving property would go unexercised"
     );
     let mut lanes: Vec<Seq<'_>> = (0..WIDTH)
@@ -364,7 +401,7 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert_eq!(
             stats.graph_launches, 1,
-            "interleaved run: first decode round did not replay a graph"
+            "{fmt}: interleaved run: first decode round did not replay a graph"
         );
     }
     let mut interloper = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc interloper: {e}"));
@@ -388,7 +425,7 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
         let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert_eq!(
             stats.graph_launches, 1,
-            "interleaved run: second decode round (after the prefill chunk) did not replay a graph"
+            "{fmt}: interleaved run: second decode round (after the prefill chunk) did not replay a graph"
         );
     }
     drop(lanes);
@@ -397,6 +434,6 @@ fn decode_cuda_graphs_replay_matches_eager_and_survive_interleaving() {
 
     assert_eq!(
         baseline, interleaved,
-        "a prefill chunk between two decode graph replays must not change the second replay's output"
+        "{fmt}: a prefill chunk between two decode graph replays must not change the second replay's output"
     );
 }

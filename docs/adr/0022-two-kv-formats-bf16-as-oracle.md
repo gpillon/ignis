@@ -40,11 +40,12 @@ Both KV formats ship. The format is a **model-load option**, fixed for the life
 of a load.
 
 - **hq-e8-2b is the serving default**, and the format both engines run in for
-  the G4 gate. *Not yet in force:* P4-04 (GitHub #122) shipped the format as a
-  load option with `bf16` as the CLI default, because hq cannot serve a token
-  until its attention routes land (P4-05, GitHub #123) — an hq forward pass is
-  refused by name until then. Flipping the default to `hq-e8-2b` belongs to
-  #123, which is the first ticket at which the default above can be true.
+  the G4 gate. *In force since P4-05 (GitHub #123).* P4-04 (GitHub #122)
+  shipped the format as a load option with `bf16` as the CLI default, because
+  hq could not serve a token until its attention routes landed — an hq forward
+  pass was refused by name until then. #123 wired the prefill and decode
+  routes and their decode graphs and flipped the default, which is what made
+  the sentence above true rather than planned.
 - **BF16 is retained**, and is the format every correctness oracle runs
   against. The GPU profile keeps its correctness checks on BF16.
 - **hq earns its own acceptance in-house**: op-level codec error measured on

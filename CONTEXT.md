@@ -84,8 +84,8 @@ When output names a domain concept, use the term as defined here.
   correctness oracle runs against. A model-load option, fixed for the life of
   the load; the pool is sized by a byte budget and its token capacity is
   *derived* from the format rather than configured (ADR 0022). The CLI default
-  is still `bf16` until hq's attention routes land (#123): hq loads, reports
-  its capacity and accepts KV appends, but refuses a forward pass.
+  is `hq-e8-2b` since #123 wired its prefill and decode attention routes and
+  captured its decode graphs; a correctness oracle asks for `bf16` by name.
 
 ## Sequence state
 

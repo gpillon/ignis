@@ -228,7 +228,7 @@ fn gqa_layers_match_f64_reference() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
     let cfg = ModelConfig::qwen38_27b();
     let pool = SeqPool::create(
@@ -266,4 +266,50 @@ fn gqa_layers_match_f64_reference() {
             return;
         }
     }
+
+    // P4-05 (GitHub #123): the KV format is fixed for the life of a load
+    // (ADR 0022), and the layer enforces that rather than trusting it. The
+    // model above was loaded as BF16 and its attention workspace reserved
+    // accordingly; a pool built in the other format would have the layer
+    // dispatch the hq routes out of an arena sized for BF16's, which fails
+    // quietly (an arena throw deep inside a chunk) if nobody checks. The
+    // layer refuses it before any device work, which is also why the
+    // uninitialized buffers below are safe to hand it.
+    let mismatched = SeqPool::create(
+        &cfg,
+        &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::HqE8_2b,
+            kv_page_group_count: 4,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            slot_count: 1,
+        },
+    )
+    .unwrap_or_else(|e| panic!("hq seq pool create: {e}"));
+    let mismatched_seq = mismatched
+        .alloc(MAX_CONTEXT_TOKENS)
+        .unwrap_or_else(|e| panic!("hq sequence alloc: {e}"));
+    let token_bytes = (HIDDEN * std::mem::size_of::<u16>()) as u64;
+    let in_buf = device
+        .allocate(token_bytes)
+        .unwrap_or_else(|e| panic!("allocate input: {e}"));
+    let out_buf = device
+        .allocate(token_bytes)
+        .unwrap_or_else(|e| panic!("allocate output: {e}"));
+    let error = run_gqa_layer(
+        &model,
+        &mismatched,
+        &mismatched_seq,
+        BF16_GQA_LAYER,
+        &in_buf,
+        &out_buf,
+        1,
+    )
+    .expect_err("a pool in the other KV format must be refused, not served");
+    // Both names, so the operator can see which two disagreed — and so a
+    // message that named only one, or printed the raw enum ordinal, fails
+    // here.
+    assert!(
+        error.contains("hq-e8-2b") && error.contains("bf16"),
+        "the refusal must name both formats: {error}"
+    );
 }

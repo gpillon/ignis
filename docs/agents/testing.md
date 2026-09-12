@@ -199,12 +199,21 @@ cargo run -p ignis-bench -- g2 `
 own env var, each validated before any loader work starts): `--prefill-chunk`
 (default 1024, a nonzero multiple of 128), `--max-context` (default
 40960 — a 32K prompt plus an 8K generation budget), `--kv-format` (`bf16`
-or `hq-e8-2b`, default `bf16` until the hq attention routes land) and
+or `hq-e8-2b`, default `hq-e8-2b` since GitHub #123 wired its attention
+routes — ADR 0022's serving default) and
 `--kv-pool-bytes` (default auto: 4 GiB, raised if one `--max-context`
 sequence would not fit). The paged-KV pool is sized in **bytes**; the
 resident-token capacity that budget buys is derived from the format and
 logged at load as `ignis.runtime.kv_pool`, so a run's KV profile is read off
 that event rather than computed from a flag.
+
+**BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
+profile asks for it by name — `--kv-format bf16` at the server, and
+`ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`
+in a test that drives the leaf directly. A test that inherits the default
+runs hq, which is right for the serving-shape checks (the HTTP surface, the
+TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
+a derived tolerance.
 
 ## Where tests live
 

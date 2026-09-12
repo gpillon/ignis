@@ -4,9 +4,10 @@
 //! Two formats exist, and which one a model load runs on is a load option
 //! fixed for the life of that load: [`KvFormat::Bf16`] (what every
 //! correctness oracle loads) and [`KvFormat::HqE8_2b`] (the reference's own
-//! serving format). Both keep the paged-KV contract's fixed-bytes-per-token
-//! property, so the only thing the format changes about the pool is how
-//! many bytes one (token, KV head) row costs.
+//! serving format, and this engine's serving default since P4-05, GitHub
+//! #123, wired its attention routes). Both keep the paged-KV contract's
+//! fixed-bytes-per-token property, so the only thing the format changes
+//! about the pool is how many bytes one (token, KV head) row costs.
 //!
 //! Because of that, the pool is described in **bytes**, never in tokens: a
 //! byte budget buys a whole number of physical pages, and the token
@@ -127,12 +128,19 @@ impl KvGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KvFormat {
     /// Unquantized BF16 K/V rows. The format every correctness oracle
-    /// loads, and — until the hq attention routes land (GitHub #123) — the
-    /// only one that serves a token.
-    #[default]
+    /// loads, and the one this engine answers "is this hq's fault?" with by
+    /// reloading (ADR 0022). Retained, never the serving default.
     Bf16,
     /// The reference's HyperQuant KV format: a fixed 64-byte code row plus
     /// an 8-byte metadata row per (token, KV head).
+    ///
+    /// The serving default since P4-05 (GitHub #123) wired its attention
+    /// routes — the default ADR 0022 named and #122 could not yet honour. It
+    /// is the format the reference has run in production the whole time, and
+    /// the one both engines run for the G4 gate; at 9,216 bytes per
+    /// sequence-token against BF16's 65,536 it is what makes N-lane
+    /// concurrency a long-context promise rather than a short-context one.
+    #[default]
     HqE8_2b,
 }
 
@@ -522,9 +530,12 @@ mod tests {
     }
 
     #[test]
-    fn bf16_is_the_default_format_until_the_hq_routes_land() {
-        // GitHub #123 owns the attention routes; until then a load that
-        // names no format must be one that can serve a token.
-        assert_eq!(KvFormat::default(), KvFormat::Bf16);
+    fn hq_is_the_serving_default_now_that_its_routes_are_wired() {
+        // ADR 0022: "hq-e8-2b is the serving default, and the format both
+        // engines run in for the G4 gate. In force since P4-05 (GitHub
+        // #123)." A load that names no format runs the format the reference
+        // serves in and the G4 gate measures; BF16 is retained and is what
+        // every correctness oracle asks for by name.
+        assert_eq!(KvFormat::default(), KvFormat::HqE8_2b);
     }
 }

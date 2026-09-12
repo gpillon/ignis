@@ -120,6 +120,13 @@ struct ignis_model {
   // lane's actual position) needs no second parameter threaded through
   // capture.
   uint32_t max_context_tokens = 0;
+  // P4-05 (GitHub #123): the KV storage format (`enum ignis_kv_format`) the
+  // two scratch arenas above were reserved for. Both attention workspace
+  // queries are asked under this format's cache dtype, and the GQA layer
+  // entry points refuse a sequence pool built in the other one -- the format
+  // is fixed for the life of a load (ADR 0022), and here that is not a
+  // convention but an arena-sizing fact.
+  int32_t kv_format = IGNIS_KV_FORMAT_BF16;
   // Separate from `scratch` above: a graph replays fixed device addresses,
   // and a prefill chunk (which only ever uses `scratch`) landing between two
   // replays must never alias what a replay rereads. Sized once for one

@@ -255,7 +255,7 @@ fn gdn_layer_matches_f64_reference() {
     // host-side name/shape matching against already-uploaded pointers), so
     // its error is a real contract bug, never GPU contention -- a hard
     // failure under and outside the profile alike (mirrors model_load_gpu.rs).
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
 
     // The sequence pool (the GDN state: conv taps + fp32 recurrent slot),
