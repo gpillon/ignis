@@ -84,12 +84,40 @@ verdict is carried across to Rust by that marker.
 
 `scripts/gpu-profile.ps1` is the entry point that ties it together: it runs
 the preflight, and only on a pass sets `IGNIS_GPU_PROFILE=1` and runs the
-GPU-gated work (`kernel/build.ps1 -Test`, then
-`cargo test --workspace --features cuda -- --ignored`). It consumes the marker — both it and
+GPU-gated work. It consumes the marker — both it and
 the env var are cleared before the script exits, pass or fail — so one
 preflight authorizes exactly one run. A pass also ages out after 30 minutes,
 which only matters if a run was killed before it could clean up.
 **This script is the normal, documented way to run the GPU profile.**
+
+It runs three stages and reports each one's wall time at the end, so a slow
+run says where the time went without anyone adding up per-test output
+(GitHub #135):
+
+| Stage | What it runs | Parallelism |
+|-------|--------------|-------------|
+| `kernel/build.ps1 -Test` | the leaf's own op tests (CTest) | CTest's own |
+| `cpu f64 layer oracle` | `layer_reference_real`, `--ignored` | libtest default |
+| `gpu tests (serialized)` | everything else `--ignored` | `--test-threads=1` |
+
+The middle stage exists because the f64 layer oracle touches no GPU: it
+reads the stored weights through a memory map and evaluates them on the CPU.
+It was paying for ADR 0006's exclusivity that it never needed, so it now
+runs at full parallelism and the serialized stage skips it by name. It still
+runs under `IGNIS_GPU_PROFILE=1`, so a missing artifact is a hard failure
+there too.
+
+**The test profile is optimized** (`[profile.dev]` and `[profile.test]`,
+`opt-level = 2`). The f64 oracles are CPU-bound on scalar `f64` with
+per-element NVFP4/W8 dequantization, and at the default `opt-level = 0` they
+dominated the serialized stage. Rust applies no fast-math, so every `f64`
+result and every measured tolerance is bit-identical to an unoptimized
+build; `debug-assertions` and the overflow checks that follow them stay on.
+The oracle also spreads its output rows over threads, which for the same
+reason cannot move a bit: a row's sum is computed by the same code in the
+same order whatever the split, pinned by a unit test that compares schedules
+bit-for-bit and by `layer_reference_real` still matching the committed
+fixtures, which were recorded by the scalar path.
 
 Runbook:
 
@@ -101,8 +129,8 @@ Runbook:
 #    then clears it.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 # -ThresholdMiB <n>    forwarded to gpu-preflight.ps1
-# -SkipKernelBuild     Rust GPU tests only, skip kernel/build.ps1 -Test
-# -SkipCargoTests      kernel leaf only, skip cargo test --workspace --features cuda -- --ignored
+# -SkipKernelBuild     Rust tests only, skip kernel/build.ps1 -Test
+# -SkipCargoTests      kernel leaf only, skip both cargo stages
 # 3. Restart ninfer.
 ```
 
