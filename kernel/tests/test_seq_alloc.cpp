@@ -214,13 +214,10 @@ int main() {
   expect(slot_is_zero(*pool, spec.gdn_num_layers, d_stats.slot),
         "re-allocated sequence's GDN slot is zero");
 
-  // Snapshot/restore: declared, not implemented (G4) -- exercise on the
-  // still-live handle before releasing it.
-  unsigned char scratch[16];
-  expect_rc(ignis_seq_snapshot(seq_d, scratch, sizeof(scratch)), IGNIS_SEQ_ERR_NOT_IMPLEMENTED,
-           "snapshot is not-implemented");
-  expect_rc(ignis_seq_restore(seq_d, scratch, sizeof(scratch)), IGNIS_SEQ_ERR_NOT_IMPLEMENTED,
-           "restore is not-implemented");
+  // Snapshot / restore live in their own test (kernel/tests/test_seq_snapshot.cu,
+  // P4-06 / GitHub #124): they need a dirtied sequence and a second one to
+  // restore into, which is more setup than this file's alloc/release
+  // accounting.
 
   ignis_seq_release(pool, seq_d);
   ignis_seq_release(pool, seq_b);

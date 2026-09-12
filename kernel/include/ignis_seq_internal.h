@@ -132,6 +132,14 @@ struct ignis_seq_pool {
     auto *base = static_cast<std::int32_t *>(sampling_counts.p);
     return base + static_cast<std::ptrdiff_t>(slot) * vocab;
   }
+
+  // The same row for a read-only caller: `ignis_seq_snapshot` takes the pool
+  // by const pointer, because capturing a sequence must not be able to
+  // change one (P4-06, GitHub #124).
+  const std::int32_t *token_counts_for(std::int32_t slot) const {
+    const auto *base = static_cast<const std::int32_t *>(sampling_counts.p);
+    return base + static_cast<std::ptrdiff_t>(slot) * vocab;
+  }
 };
 
 struct ignis_seq {

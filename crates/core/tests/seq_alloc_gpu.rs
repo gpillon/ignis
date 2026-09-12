@@ -114,9 +114,17 @@ fn zero_context_tokens_is_rejected() {
     assert!(pool.alloc(0).is_err(), "context_tokens == 0 is a clean error, not a 0-page sequence");
 }
 
+/// A fresh sequence has written nothing, so its snapshot is the floor the
+/// spec prices — the GDN slot, the conv taps and the penalty-count row, paid
+/// regardless of prompt length — and no KV history at all (P4-06, GitHub
+/// #124).
+///
+/// The transfer itself (the round trip, every refusal, and the cost at the
+/// real geometry) is covered by `seq_snapshot_gpu.rs` and the leaf's own
+/// `kernel/tests/test_seq_snapshot.cpp`.
 #[test]
 #[ignore]
-fn snapshot_and_restore_report_not_implemented() {
+fn a_fresh_sequence_snapshots_to_its_state_floor() {
     let Some(_device) = cuda_device_or_skip() else { return };
 
     let cfg = ModelConfig::synthetic();
@@ -128,9 +136,17 @@ fn snapshot_and_restore_report_not_implemented() {
     };
     let pool =
         SeqPool::create(&cfg, &budget).unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
-    let mut seq = pool.alloc(64).unwrap_or_else(|e| panic!("alloc: {e}"));
+    let seq = pool.alloc(64).unwrap_or_else(|e| panic!("alloc: {e}"));
 
-    let mut buf = [0u8; 16];
-    assert_eq!(seq.snapshot(&mut buf), Err(ignis_core::seq::NOT_IMPLEMENTED));
-    assert_eq!(seq.restore(&buf), Err(ignis_core::seq::NOT_IMPLEMENTED));
+    let bytes = seq
+        .snapshot_bytes()
+        .unwrap_or_else(|e| panic!("snapshot size: {e}"));
+    assert!(bytes > 0, "even an unwritten sequence carries its GDN state");
+
+    let blob = seq.snapshot().unwrap_or_else(|e| panic!("snapshot: {e}"));
+    assert_eq!(blob.len() as u64, bytes, "a snapshot writes exactly the reported size");
+
+    // The version is reported by the leaf, not read out of the blob by the
+    // caller: a caller that persists blobs records it beside them.
+    assert!(ignis_core::seq::snapshot_format_version() > 0);
 }

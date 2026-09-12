@@ -11,12 +11,19 @@
 // core/linear_attention_state.h's slot addressing are both private/caller
 // driven).
 //
+// P4-06 (GitHub #124, ADR 0024) adds state transfer on top: a snapshot size
+// query, a blob format version, and the two whole-sequence transfers
+// themselves. Everything about what a sequence is made of comes from one
+// table (ignis_seq_sections.h) -- this file only moves bytes and decides
+// what to refuse.
+//
 // Style follows model.cu: explicit pointers + sizes, int32 return codes (0
-// = ok, -1 = error, IGNIS_SEQ_ERR_NOT_IMPLEMENTED for the snapshot/restore
-// stubs), no C++ types across the boundary.
+// = ok, -1 = error, IGNIS_SEQ_ERR_NOT_AT_BOUNDARY / _BAD_SNAPSHOT for the
+// two refusals state transfer makes), no C++ types across the boundary.
 
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
+#include "ignis_seq_sections.h"
 
 #include "ops/kernel/hq_codec.cuh"
 
@@ -33,9 +40,11 @@ static_assert(kIgnisHqMetaRowBytes == ninfer::ops::kHqMetaBytes,
 static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
               "kIgnisHqHeadDim has drifted from the vendored kHqHeadDim");
 
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -75,6 +84,167 @@ void push_layer_planes(ninfer::PagedKVPoolSpec &spec, int32_t kv_format, uint32_
 
 bool known_kv_format(int32_t kv_format) {
   return kv_format == IGNIS_KV_FORMAT_BF16 || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
+}
+
+// ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
+
+// Whether `seq` was actually drawn from `pool`. Both transfer paths hand
+// the sequence and the pool to the vendored pools together, and the
+// vendored side's own mismatch check aborts the process (CUDA_CHECK /
+// std::invalid_argument out of a noexcept path), so the pairing is checked
+// here first and refused as a plain bad argument.
+bool seq_belongs_to(const ignis_seq_pool &pool, const ignis_seq &seq) {
+  return seq.kv.valid() && seq.kv.belongs_to(pool.kv_pool) && seq.slot >= 0 &&
+         seq.slot < pool.gdn_pool.slot_count();
+}
+
+// The offset of `kind` in `sections`. The table always carries every kind
+// (ignis_seq_section_table builds it unconditionally), so a miss is a
+// programming error in this file rather than a caller's.
+std::uint64_t section_offset(const std::vector<ignis_seq_section> &sections, int32_t kind) {
+  for (const ignis_seq_section &section : sections) {
+    if (section.kind == kind) {
+      return section.offset;
+    }
+  }
+  throw std::logic_error(std::string("state-section table has no ") +
+                         ignis_seq_section_name(kind) + " section");
+}
+
+// The host-side scalars of IGNIS_SEQ_SECTION_PROGRESS.
+ignis_seq_progress_image progress_of(const ignis_seq &seq) {
+  ignis_seq_progress_image image{};
+  image.position      = seq.position;
+  image.pending_token = seq.pending_token;
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
+    image.gqa_positions[i] = seq.gqa_positions[i];
+  }
+  return image;
+}
+
+// One host<->device copy on the default stream, as a checked error rather
+// than the vendored CUDA_CHECK's abort.
+void checked_memcpy_async(void *dst, const void *src, std::size_t bytes, cudaMemcpyKind kind,
+                          const char *what) {
+  if (bytes == 0) {
+    return;
+  }
+  const cudaError_t err = cudaMemcpyAsync(dst, src, bytes, kind, nullptr);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemcpyAsync(") + what +
+                             ") failed: " + cudaGetErrorString(err));
+  }
+}
+
+// Why `header` cannot be restored into `seq` of `pool`, or an empty string
+// if it can.
+//
+// Every check here is a pure host-side comparison, which is what lets
+// ignis_seq_restore run all of them before it writes a single byte: a
+// refused restore leaves the target sequence exactly as it was (ADR 0024).
+std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
+                             const ignis_seq_snapshot_header &header,
+                             const std::vector<ignis_seq_section> &records,
+                             std::uint64_t src_bytes) {
+  const auto mismatch = [](const char *field, std::uint64_t blob, std::uint64_t target) {
+    return std::string("snapshot ") + field + " is " + std::to_string(blob) + ", this pool's is " +
+           std::to_string(target);
+  };
+
+  if (header.magic != kIgnisSeqSnapshotMagic) {
+    return "buffer is not an ignis sequence snapshot (bad magic)";
+  }
+  if (header.format_version != kIgnisSeqSnapshotFormatVersion) {
+    return "snapshot format version " + std::to_string(header.format_version) +
+           ", this leaf writes and accepts " + std::to_string(kIgnisSeqSnapshotFormatVersion);
+  }
+  if (header.header_bytes != sizeof(ignis_seq_snapshot_header) ||
+      header.section_record_bytes != sizeof(ignis_seq_section)) {
+    return "snapshot header/record sizes do not match this leaf's";
+  }
+  ignis_seq_snapshot_header bare = header;
+  bare.header_checksum           = 0;
+  if (ignis_seq_fnv1a(&bare, sizeof(bare)) != header.header_checksum) {
+    return "snapshot header checksum mismatch";
+  }
+  if (header.total_bytes != src_bytes) {
+    return mismatch("size", header.total_bytes, src_bytes);
+  }
+
+  if (header.kv_format != pool.kv_format) {
+    return mismatch("kv_format", static_cast<std::uint64_t>(header.kv_format),
+                    static_cast<std::uint64_t>(pool.kv_format));
+  }
+  if (header.kv_num_kv_heads != static_cast<std::uint32_t>(pool.kv_num_kv_heads)) {
+    return mismatch("num_kv_heads", header.kv_num_kv_heads,
+                    static_cast<std::uint64_t>(pool.kv_num_kv_heads));
+  }
+  if (header.kv_head_dim != static_cast<std::uint32_t>(pool.kv_head_dim)) {
+    return mismatch("head_dim", header.kv_head_dim, static_cast<std::uint64_t>(pool.kv_head_dim));
+  }
+  if (header.kv_page_size != static_cast<std::uint32_t>(ninfer::kPagedKVPageSize)) {
+    return mismatch("kv page size", header.kv_page_size,
+                    static_cast<std::uint64_t>(ninfer::kPagedKVPageSize));
+  }
+  if (header.kv_plane_count != static_cast<std::uint32_t>(pool.kv_pool.plane_count())) {
+    return mismatch("kv plane count", header.kv_plane_count, pool.kv_pool.plane_count());
+  }
+  if (header.kv_page_bytes != pool.kv_page_bytes) {
+    return mismatch("kv page bytes", header.kv_page_bytes, pool.kv_page_bytes);
+  }
+  if (header.gqa_layer_count != static_cast<std::uint32_t>(kIgnisGqaLayerCount)) {
+    return mismatch("gqa layer count", header.gqa_layer_count,
+                    static_cast<std::uint64_t>(kIgnisGqaLayerCount));
+  }
+
+  const ninfer::LinearAttentionStatePoolSpec &gdn = pool.gdn_pool.spec;
+  if (header.gdn_num_layers != gdn.layers) {
+    return mismatch("gdn layers", header.gdn_num_layers, gdn.layers);
+  }
+  if (header.gdn_conv_channels != static_cast<std::uint32_t>(gdn.conv_channels) ||
+      header.gdn_conv_width != static_cast<std::uint32_t>(gdn.conv_width) ||
+      header.gdn_conv_slot_bytes != pool.gdn_pool.conv_slot_bytes()) {
+    return "snapshot GDN conv geometry does not match this pool's";
+  }
+  if (header.gdn_value_heads != static_cast<std::uint32_t>(gdn.value_heads) ||
+      header.gdn_head_dim != static_cast<std::uint32_t>(gdn.value_head_dim) ||
+      header.gdn_recurrent_slot_bytes != pool.gdn_pool.recurrent_slot_bytes()) {
+    return "snapshot GDN recurrent geometry does not match this pool's";
+  }
+  if (header.vocab != static_cast<std::uint32_t>(pool.vocab)) {
+    return mismatch("vocab", header.vocab, static_cast<std::uint64_t>(pool.vocab));
+  }
+
+  // The one requirement on the target beyond matching geometry: it must
+  // have room for the history the blob carries. A larger reservation is
+  // fine -- a restored sequence keeps generating into its own.
+  if (header.kv_page_count > seq.kv.mapped_page_count()) {
+    return "snapshot carries " + std::to_string(header.kv_page_count) +
+           " KV pages, the target sequence maps " + std::to_string(seq.kv.mapped_page_count());
+  }
+
+  // The blob's own layout against the table this leaf would build for it.
+  // This is what refuses a blob from a build whose section table differed
+  // without the version having been bumped: the version says "same format",
+  // the records say otherwise, and the records win.
+  const std::vector<ignis_seq_section> expected =
+      ignis_seq_section_table(pool, header.kv_page_count);
+  if (records.size() != expected.size()) {
+    return "snapshot lists " + std::to_string(records.size()) + " state sections, this leaf has " +
+           std::to_string(expected.size());
+  }
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (records[i].kind != expected[i].kind || records[i].transfer != expected[i].transfer ||
+        records[i].offset != expected[i].offset || records[i].bytes != expected[i].bytes) {
+      return std::string("snapshot section ") + ignis_seq_section_name(records[i].kind) +
+             " does not match this leaf's " + ignis_seq_section_name(expected[i].kind) +
+             " section";
+    }
+  }
+  if (ignis_seq_snapshot_bytes(expected) != header.total_bytes) {
+    return mismatch("total size", header.total_bytes, ignis_seq_snapshot_bytes(expected));
+  }
+  return {};
 }
 
 } // namespace
@@ -281,18 +451,223 @@ extern "C" int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq
   return 0;
 }
 
-extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq *seq, void *dst, uint64_t dst_bytes) {
-  (void)seq;
-  (void)dst;
-  (void)dst_bytes;
-  return IGNIS_SEQ_ERR_NOT_IMPLEMENTED;
+extern "C" uint32_t ignis_seq_snapshot_format_version(void) {
+  return kIgnisSeqSnapshotFormatVersion;
 }
 
-extern "C" int32_t ignis_seq_restore(struct ignis_seq *seq, const void *src, uint64_t src_bytes) {
-  (void)seq;
-  (void)src;
-  (void)src_bytes;
-  return IGNIS_SEQ_ERR_NOT_IMPLEMENTED;
+extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
+                                            const struct ignis_seq *seq, uint64_t *out_bytes) {
+  if (out_bytes != nullptr) {
+    *out_bytes = 0;
+  }
+  if (pool == nullptr || seq == nullptr || out_bytes == nullptr) {
+    set_error("ignis_seq_snapshot_size: null argument");
+    return -1;
+  }
+  if (!seq_belongs_to(*pool, *seq)) {
+    set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (!ignis_seq_at_chunk_boundary(*seq)) {
+    set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
+              " is mid-chunk (program frontier " + std::to_string(seq->position) +
+              "); a snapshot is taken only at a chunk boundary");
+    return IGNIS_SEQ_ERR_NOT_AT_BOUNDARY;
+  }
+  try {
+    const std::uint32_t pages = ignis_seq_snapshot_page_count(*seq);
+    *out_bytes = ignis_seq_snapshot_bytes(ignis_seq_section_table(*pool, pages));
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_seq_snapshot_size: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
+                                       const struct ignis_seq *seq, void *dst,
+                                       uint64_t dst_bytes) {
+  if (pool == nullptr || seq == nullptr || dst == nullptr) {
+    set_error("ignis_seq_snapshot: null argument");
+    return -1;
+  }
+  if (!seq_belongs_to(*pool, *seq)) {
+    set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (!ignis_seq_at_chunk_boundary(*seq)) {
+    set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
+              " is mid-chunk (program frontier " + std::to_string(seq->position) +
+              "); its state sections are not consistent with one another");
+    return IGNIS_SEQ_ERR_NOT_AT_BOUNDARY;
+  }
+
+  // Every copy below runs on the default stream and is confirmed by this
+  // call's own synchronize before it returns. That is sufficient without
+  // knowing the model's stream: the program's entry points each synchronize
+  // before returning (kernel/src/step.cu), so a caller can only reach this
+  // function with the sequence's device work already complete -- which is
+  // the same fact the chunk-boundary check above rests on.
+  try {
+    const std::uint32_t pages = ignis_seq_snapshot_page_count(*seq);
+    const std::vector<ignis_seq_section> sections = ignis_seq_section_table(*pool, pages);
+    const ignis_seq_snapshot_header header = ignis_seq_snapshot_header_for(*pool, pages, sections);
+    if (dst_bytes < header.total_bytes) {
+      set_error("ignis_seq_snapshot: destination holds " + std::to_string(dst_bytes) +
+                " bytes, this snapshot is " + std::to_string(header.total_bytes));
+      return -1;
+    }
+
+    auto *base = static_cast<unsigned char *>(dst);
+    std::memcpy(base, &header, sizeof(header));
+    std::memcpy(base + sizeof(header), sections.data(),
+                sections.size() * sizeof(ignis_seq_section));
+    const std::uint64_t recurrent_at = section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT);
+
+    for (const ignis_seq_section &section : sections) {
+      unsigned char *at = base + section.offset;
+      switch (section.kind) {
+      case IGNIS_SEQ_SECTION_KV_PAGES:
+        ninfer::pack_paged_kv_allocation_to_host(seq->kv, pool->kv_pool, pages, at, nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_GDN_CONV:
+        // The vendored state pool moves a slot's conv taps and recurrent
+        // matrices in one call into two destinations, so this case writes
+        // both sections and the recurrent case below writes none. They stay
+        // two rows of the table because they are separately sized and
+        // separately classified -- the table describes the state, not the
+        // memcpy that happens to move it.
+        pool->gdn_pool.pack_slot_to_host(seq->slot, at, base + recurrent_at, nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+        break;
+      case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+        checked_memcpy_async(at, pool->token_counts_for(seq->slot),
+                             static_cast<std::size_t>(section.bytes), cudaMemcpyDeviceToHost,
+                             "penalty counts");
+        break;
+      case IGNIS_SEQ_SECTION_PROGRESS: {
+        const ignis_seq_progress_image image = progress_of(*seq);
+        std::memcpy(at, &image, sizeof(image));
+        break;
+      }
+      default:
+        // ADR 0024's "carried by all three or by none": a section added to
+        // the table but not to this switch is a loud failure here rather
+        // than a silently unsnapshotted piece of a sequence.
+        throw std::logic_error(std::string("state section ") +
+                               ignis_seq_section_name(section.kind) +
+                               " has no snapshot implementation");
+      }
+    }
+
+    const cudaError_t err = cudaStreamSynchronize(nullptr);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_seq_snapshot: cudaStreamSynchronize failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_seq_snapshot: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq,
+                                      const void *src, uint64_t src_bytes) {
+  if (pool == nullptr || seq == nullptr || src == nullptr) {
+    set_error("ignis_seq_restore: null argument");
+    return -1;
+  }
+  if (!seq_belongs_to(*pool, *seq)) {
+    set_error("ignis_seq_restore: the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (src_bytes < sizeof(ignis_seq_snapshot_header)) {
+    set_error("ignis_seq_restore: " + std::to_string(src_bytes) +
+              " bytes is smaller than a snapshot header");
+    return IGNIS_SEQ_ERR_BAD_SNAPSHOT;
+  }
+
+  // Read the header and the records out of the caller's buffer before
+  // believing any of it: the buffer is host memory of unknown provenance
+  // and unknown alignment, so nothing is accessed in place.
+  const auto *base = static_cast<const unsigned char *>(src);
+  ignis_seq_snapshot_header header{};
+  std::memcpy(&header, base, sizeof(header));
+
+  std::vector<ignis_seq_section> records;
+  if (header.section_record_bytes == sizeof(ignis_seq_section) && header.section_count != 0 &&
+      header.section_count <= 64) {
+    const std::uint64_t records_end =
+        sizeof(ignis_seq_snapshot_header) +
+        static_cast<std::uint64_t>(header.section_count) * sizeof(ignis_seq_section);
+    if (records_end <= src_bytes) {
+      records.resize(header.section_count);
+      std::memcpy(records.data(), base + sizeof(ignis_seq_snapshot_header),
+                  records.size() * sizeof(ignis_seq_section));
+    }
+  }
+
+  try {
+    const std::string refusal = snapshot_refusal(*pool, *seq, header, records, src_bytes);
+    if (!refusal.empty()) {
+      set_error("ignis_seq_restore: " + refusal + "; the target sequence is unchanged");
+      return IGNIS_SEQ_ERR_BAD_SNAPSHOT;
+    }
+
+    const std::uint64_t recurrent_at = section_offset(records, IGNIS_SEQ_SECTION_GDN_RECURRENT);
+    ignis_seq_progress_image image{};
+    for (const ignis_seq_section &section : records) {
+      const unsigned char *at = base + section.offset;
+      switch (section.kind) {
+      case IGNIS_SEQ_SECTION_KV_PAGES:
+        ninfer::unpack_paged_kv_allocation_from_host(seq->kv, pool->kv_pool, at,
+                                                     header.kv_page_count, header.kv_page_count,
+                                                     nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_GDN_CONV:
+        // Packed together with the recurrent section (see ignis_seq_snapshot).
+        pool->gdn_pool.unpack_slot_from_host(seq->slot, at, base + recurrent_at, nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+        break;
+      case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+        checked_memcpy_async(pool->token_counts_for(seq->slot), at,
+                             static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice,
+                             "penalty counts");
+        break;
+      case IGNIS_SEQ_SECTION_PROGRESS:
+        std::memcpy(&image, at, sizeof(image));
+        break;
+      default:
+        throw std::logic_error(std::string("state section ") +
+                               ignis_seq_section_name(section.kind) +
+                               " has no restore implementation");
+      }
+    }
+
+    const cudaError_t err = cudaStreamSynchronize(nullptr);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_seq_restore: cudaStreamSynchronize failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    // The progress scalars last, once the synchronize above has confirmed
+    // every section actually landed -- the same ordering the chunk loop
+    // uses for its own position advance (kernel/src/step.cu).
+    seq->position      = image.position;
+    seq->pending_token = image.pending_token;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
+      seq->gqa_positions[i] = image.gqa_positions[i];
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_seq_restore: ") + e.what());
+    return -1;
+  }
 }
 
 extern "C" const char *ignis_seq_last_error(void) {
