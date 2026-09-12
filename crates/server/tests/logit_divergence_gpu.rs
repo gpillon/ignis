@@ -154,6 +154,7 @@ fn token_zero_top_k_logits_for_the_divergent_canaries() {
         let pool = SeqPool::create(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
+                kv_format: ignis_core::KvFormat::Bf16,
                 kv_page_group_count: 8,
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,

@@ -333,8 +333,8 @@ fn oversized_requests_are_rejected_at_submit() {
 fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatches_a_refusal() {
     // 64-token pages (the leaf's fixed `kPagedKVPageSize`), 8 physical
     // pages of 64 KiB each — exactly what `ignis_seq_pool_stats` would
-    // report for a small pool. The scheduler's own formula (here, a stand-
-    // in for `kv_pool_pages(kv_pool_tokens)`) agrees with it, so the
+    // report for a small pool. The scheduler's own page count (here, a
+    // stand-in for `CudaLeafConfig::kv_pool_plan`'s) agrees with it, so the
     // verification succeeds and hands back the real pool.
     let leaf_geometry = ignis_core::kv::LeafPoolGeometry {
         page_count: 8,

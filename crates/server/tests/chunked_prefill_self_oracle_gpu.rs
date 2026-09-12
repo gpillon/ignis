@@ -157,6 +157,7 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::Bf16,
             kv_page_group_count: pages_per_slot * 2,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,

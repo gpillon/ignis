@@ -113,6 +113,7 @@ fn prefill_wall_time_across_the_load_shapes() {
         let pool = SeqPool::create(
             &cfg,
             &SeqPoolBudget {
+                kv_format: ignis_core::KvFormat::Bf16,
                 kv_page_group_count: pages_for(kv_pool_tokens),
                 max_context_tokens: max_context,
                 slot_count,

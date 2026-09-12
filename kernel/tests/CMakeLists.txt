@@ -297,3 +297,19 @@ target_compile_definitions(ignis_hq_codec_kv_rows_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
 target_link_libraries(ignis_hq_codec_kv_rows_test PRIVATE ignis_vendor)
 add_test(NAME ignis_hq_codec_kv_rows_test COMMAND ignis_hq_codec_kv_rows_test)
+
+# P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
+# storage formats. It builds two sequence pools differing only in
+# `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a
+# sequence from each through the same vendored A2 (`gqa_kv_append`), and
+# reads both back through one block-table-driven row-address helper, so "the
+# hq append writes fixed-budget rows through the same page addressing BF16
+# uses" is a check rather than a claim. It links ignis_kernel (for
+# ignis_seq_pool_create and ignis_seq_internal.h) as well as ignis_vendor,
+# unlike the codec tests above, and reuses the same committed fixture. Same
+# no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006).
+add_executable(ignis_kernel_kv_append_format_test test_kv_append_format.cu)
+target_compile_definitions(ignis_kernel_kv_append_format_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_link_libraries(ignis_kernel_kv_append_format_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_kv_append_format_test COMMAND ignis_kernel_kv_append_format_test)

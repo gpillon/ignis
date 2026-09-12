@@ -47,6 +47,7 @@ fn alloc_release_realloc_cycles_balance_the_pools() {
 
     let cfg = ModelConfig::synthetic();
     let budget = SeqPoolBudget {
+        kv_format: ignis_core::KvFormat::Bf16,
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 2,
@@ -102,6 +103,7 @@ fn zero_context_tokens_is_rejected() {
 
     let cfg = ModelConfig::synthetic();
     let budget = SeqPoolBudget {
+        kv_format: ignis_core::KvFormat::Bf16,
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 1,
@@ -119,6 +121,7 @@ fn snapshot_and_restore_report_not_implemented() {
 
     let cfg = ModelConfig::synthetic();
     let budget = SeqPoolBudget {
+        kv_format: ignis_core::KvFormat::Bf16,
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 1,

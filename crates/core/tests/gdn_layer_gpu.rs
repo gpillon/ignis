@@ -264,6 +264,7 @@ fn gdn_layer_matches_f64_reference() {
     // here).
     let cfg = ModelConfig::qwen38_27b();
     let budget = SeqPoolBudget {
+        kv_format: ignis_core::KvFormat::Bf16,
         kv_page_group_count: 4,
         max_context_tokens: MAX_CONTEXT_TOKENS,
         slot_count: 2,

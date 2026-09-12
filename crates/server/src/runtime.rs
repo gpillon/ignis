@@ -32,10 +32,12 @@ pub struct EngineShape {
     pub prefill_chunk: u32,
     /// The maximum per-sequence context, in tokens.
     pub max_context: u32,
-    /// The paged-KV pool budget, in sequence-tokens: derived from
-    /// `max_context` ([`ignis_runtime::kv_pool_tokens_for`]), not an
-    /// independent flag.
-    pub kv_pool_tokens: u32,
+    /// The KV storage format the load runs on (`--kv-format`, GitHub #122).
+    pub kv_format: ignis_core::KvFormat,
+    /// The paged-KV pool budget, in bytes (`--kv-pool-bytes`, or
+    /// [`ignis_runtime::auto_kv_pool_bytes`] for the resolved format and
+    /// context when the operator names none).
+    pub kv_pool_bytes: u64,
 }
 
 impl Default for EngineShape {
@@ -46,7 +48,11 @@ impl Default for EngineShape {
         Self {
             prefill_chunk: ignis_runtime::DEFAULT_PREFILL_CHUNK,
             max_context: ignis_runtime::DEFAULT_MAX_CONTEXT,
-            kv_pool_tokens: ignis_runtime::kv_pool_tokens_for(ignis_runtime::DEFAULT_MAX_CONTEXT),
+            kv_format: ignis_core::KvFormat::default(),
+            kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(
+                ignis_core::KvFormat::default(),
+                ignis_runtime::DEFAULT_MAX_CONTEXT,
+            ),
         }
     }
 }
@@ -56,7 +62,8 @@ impl From<&crate::config::Config> for EngineShape {
         Self {
             prefill_chunk: config.prefill_chunk,
             max_context: config.max_context,
-            kv_pool_tokens: config.kv_pool_tokens,
+            kv_format: config.kv_format,
+            kv_pool_bytes: config.kv_pool_bytes,
         }
     }
 }
@@ -94,7 +101,7 @@ pub fn cuda_scheduler(
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
     use ignis_artifact::{CudaDevice, Reader, bind_text_scope_27b, materialize};
-    use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS, kv_pool_pages};
+    use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     let (plan, handles) =
@@ -105,23 +112,31 @@ pub fn cuda_scheduler(
 
     let leaf_config = CudaLeafConfig {
         max_context_tokens: shape.max_context,
-        kv_pool_tokens: shape.kv_pool_tokens,
+        kv_format: shape.kv_format,
+        kv_pool_bytes: shape.kv_pool_bytes,
         prefill_chunk_tokens: shape.prefill_chunk,
         ..CudaLeafConfig::default()
     };
-    let kv_pool_tokens = leaf_config.kv_pool_tokens;
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
-    let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
 
     // Match the scheduler's KV admission accounting to the pool the leaf
-    // actually built. Both sides derive the page count from
-    // `kv_pool_tokens` through the same `kv_pool_pages`, so growing the
-    // configured context (or the pool) can never let admission promise
-    // capacity the GPU does not have. The slot count is
-    // `CudaLeafConfig::default()`'s `N_DECODE_LANES` (8), so the
-    // scheduler's own lane count (`SchedulerConfig::default()`'s
-    // `max_in_flight`) still matches it.
-    let expected_pages = kv_pool_pages(kv_pool_tokens);
+    // actually built. Both sides read the page count from the *same*
+    // `kv_pool_plan` call — one byte budget, one format, one derived page
+    // count — so growing the configured context (or the pool, or changing
+    // the format) can never let admission promise capacity the GPU does not
+    // have. The slot count is `CudaLeafConfig::default()`'s
+    // `N_DECODE_LANES` (8), so the scheduler's own lane count
+    // (`SchedulerConfig::default()`'s `max_in_flight`) still matches it.
+    //
+    // Planned before the load so a budget too small for the configured
+    // context is refused here, naming the budget, the format and the
+    // capacity it bought, rather than after a ~19 GB weight upload.
+    let expected_pages = leaf_config
+        .kv_pool_plan()
+        .map_err(|e| e.to_string())?
+        .page_count;
+
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
+    let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
 
     // GitHub #98 (P3-02): do not just trust that formula — ask the leaf
     // what it actually built (`ignis_seq_pool_stats`, surfaced through
@@ -169,7 +184,8 @@ mod tests {
         let shape = EngineShape {
             prefill_chunk: 512,
             max_context: 65_536,
-            kv_pool_tokens: 524_288,
+            kv_format: ignis_core::KvFormat::Bf16,
+            kv_pool_bytes: 8 * 1024 * 1024 * 1024,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);

@@ -39,6 +39,7 @@ pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
 pub mod kv;
+pub mod kv_format;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
@@ -60,6 +61,10 @@ pub use concrete::{
     ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, SchedulerConfig, resolve_serving_chunk_tokens,
 };
 pub use host::{HostEntry, HostError, HostTier, Tier};
+pub use kv_format::{
+    DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
+    KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,
+};
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};

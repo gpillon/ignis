@@ -184,6 +184,7 @@ fn prefill_chunk_and_traversal_sweeps() {
     let spans: Vec<usize> = list_from_env("IGNIS_DECOMP_SPANS", SPANS);
 
     let budget = SeqPoolBudget {
+        kv_format: ignis_core::KvFormat::Bf16,
         kv_page_group_count: pages_for(MAX_CONTEXT) * 2,
         max_context_tokens: MAX_CONTEXT,
         slot_count: 2,

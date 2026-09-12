@@ -66,8 +66,9 @@ pub const C4_CONCURRENCY: usize = 4;
 /// fixture can buy. Admission reserves `ceil((prompt + token budget) / 64)`
 /// pages up front and never over-allocates mid-generation
 /// (`ignis_core::admission`), and the engine's pool is 65,536 tokens =
-/// 1,024 pages (`ignis_runtime::kv_pool_tokens_for` at the default
-/// 40,960-token `--max-context`). Peak concurrent demand is the four lanes
+/// 1,024 pages (`ignis_runtime::auto_kv_pool_bytes`'s 4 GiB default budget
+/// under BF16 KV, at the default 40,960-token `--max-context`; under
+/// hq-e8-2b the same budget buys 7.11x that, GitHub #122). Peak concurrent demand is the four lanes
 /// plus the one in-flight prefiller:
 ///
 ///   lane      ceil((4,096 + 4,032) / 64) = 127 pages,  x4 = 508
@@ -1335,8 +1336,9 @@ mod tests {
     /// the arithmetic that says so is checked rather than asserted in a
     /// comment. Admission reserves the full `ceil((prompt + budget) /
     /// page)` up front (`ignis_core::admission::AdmissionResources`), and
-    /// the pool is `ignis_runtime::kv_pool_tokens_for`'s 65,536 tokens at
-    /// the server's default `--max-context`. Those two numbers are mirrored
+    /// the pool is the 65,536 tokens `ignis_runtime::auto_kv_pool_bytes`'s
+    /// 4 GiB default buys under BF16 KV at the server's default
+    /// `--max-context`. Those two numbers are mirrored
     /// here rather than imported: this crate measures any OpenAI-compatible
     /// engine and does not depend on ignis's own runtime.
     #[test]

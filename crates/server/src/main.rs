@@ -131,7 +131,8 @@ fn cuda_scheduler(
                 eos,
                 prefill_chunk = shape.prefill_chunk,
                 max_context = shape.max_context,
-                kv_pool_tokens = shape.kv_pool_tokens,
+                kv_format = shape.kv_format.as_str(),
+                kv_pool_bytes = shape.kv_pool_bytes,
                 "model loaded on the GPU"
             );
             Box::new(scheduler)
@@ -199,7 +200,8 @@ async fn main() {
         reasoning_effort: default_reasoning_effort,
         prefill_chunk: _,
         max_context: _,
-        kv_pool_tokens: _,
+        kv_format: _,
+        kv_pool_bytes: _,
         request_timeout_secs,
     } = config;
 

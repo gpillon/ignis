@@ -11,10 +11,13 @@
 #ifndef IGNIS_SEQ_INTERNAL_H
 #define IGNIS_SEQ_INTERNAL_H
 
+#include "ignis_seq.h"
+
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -35,12 +38,62 @@ inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
  * one K/V-plane pair and one frontier per GQA layer. */
 inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
+/* The hq-e8-2b per-row plane extents (`ops/kernel/hq_codec.cuh`'s
+ * kHqRowBudgetBytes / kHqMetaBytes, restated here so this header stays
+ * free of the codec's CUDA includes) and the quant_group the vendored
+ * gqa_attention wrapper requires an hq cache view to declare. */
+inline constexpr int32_t kIgnisHqCodeRowBytes = 64;
+inline constexpr int32_t kIgnisHqMetaRowBytes = 8;
+inline constexpr int32_t kIgnisHqQuantGroup   = 32;
+
+/* Planes one GQA layer's K/V history occupies, per format: BF16 stores one
+ * plane per role, hq-e8-2b a code plane and a metadata plane per role. The
+ * plane order is (K..., V...) in both, so a layer's planes are a contiguous
+ * run and `ignis_kv_plane_index` below is the only place that knows the
+ * stride. */
+inline constexpr int32_t kIgnisKvPlanesPerLayerBf16 = 2;
+inline constexpr int32_t kIgnisKvPlanesPerLayerHq   = 4;
+
+inline constexpr int32_t ignis_kv_planes_per_layer(int32_t kv_format) {
+  return kv_format == IGNIS_KV_FORMAT_HQ_E8_2B ? kIgnisKvPlanesPerLayerHq
+                                               : kIgnisKvPlanesPerLayerBf16;
+}
+
+/* Plane roles inside one layer's run, in allocation order. Under BF16 only
+ * the two value planes exist; under hq each role's value plane is the code
+ * plane and is followed by its metadata plane. */
+enum ignis_kv_plane_role {
+  IGNIS_KV_PLANE_K       = 0,
+  IGNIS_KV_PLANE_K_META  = 1,
+  IGNIS_KV_PLANE_V       = 2,
+  IGNIS_KV_PLANE_V_META  = 3
+};
+
+/* The pool plane index of one GQA layer's `role` plane.
+ *
+ * BF16 has no metadata planes at all, so its V plane sits at offset 1, not
+ * 2; a BF16 caller asking for a metadata role gets its own role's value
+ * plane back, which is a caller bug (check the format first, as
+ * kernel/src/gqa_layer.cu's `cache_view` does) and never a metadata row. */
+inline constexpr std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
+                                                  ignis_kv_plane_role role) {
+  const bool is_v      = role == IGNIS_KV_PLANE_V || role == IGNIS_KV_PLANE_V_META;
+  const int32_t within = kv_format == IGNIS_KV_FORMAT_HQ_E8_2B ? static_cast<int32_t>(role)
+                                                               : (is_v ? 1 : 0);
+  return static_cast<std::size_t>(gqa_layer) *
+             static_cast<std::size_t>(ignis_kv_planes_per_layer(kv_format)) +
+         static_cast<std::size_t>(within);
+}
+
 struct ignis_seq_pool {
   ninfer::DeviceArena kv_arena;
   ninfer::PagedKVPool kv_pool;
   ninfer::DeviceArena gdn_arena;
   ninfer::LinearAttentionStatePool gdn_pool;
   std::uint64_t kv_page_bytes = 0;
+  /* One of enum ignis_kv_format: what every plane above stores, fixed for
+   * the life of this pool (ADR 0022). */
+  std::int32_t kv_format = IGNIS_KV_FORMAT_BF16;
   std::vector<std::int32_t> free_slots;
 
   // P3-03 (GitHub #99): one int32 occurrence count per vocab entry, per slot

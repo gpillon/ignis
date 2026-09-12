@@ -25,7 +25,10 @@ use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step;
-use ignis_core::{DecodeParams, ModelConfig, N_DECODE_LANES, TokenId};
+use ignis_core::{
+    DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, TokenId,
+    plan_kv_pool_for_context,
+};
 
 use crate::{RuntimeStats, StepLeaf};
 
@@ -38,10 +41,17 @@ pub struct CudaLeafConfig {
     /// for (P2-01, GitHub #83) — must not be raised without also rebuilding
     /// the model handle.
     pub max_context_tokens: u32,
-    /// The paged-KV pool budget, in sequence-tokens: the pool every live
-    /// sequence draws its pages from. Sized independently of
-    /// `slot_count * max_context_tokens` — see [`CudaLeafConfig::default`].
-    pub kv_pool_tokens: u32,
+    /// The KV storage format this load runs on (ADR 0022, GitHub #122),
+    /// fixed for the life of the model handle. It decides the pool's
+    /// planes, so the same `kv_pool_bytes` buys 7.11x the tokens under
+    /// hq-e8-2b as under BF16.
+    pub kv_format: KvFormat,
+    /// The paged-KV pool budget, in **bytes**: the pool every live sequence
+    /// draws its pages from. Never in tokens — what this budget is worth in
+    /// tokens is derived from `kv_format` and reported at load. Sized
+    /// independently of `slot_count * max_context_tokens` — see
+    /// [`CudaLeafConfig::default`].
+    pub kv_pool_bytes: u64,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
@@ -59,15 +69,21 @@ impl Default for CudaLeafConfig {
     fn default() -> Self {
         Self {
             // The same defaults `ignis_server::config` falls back to
-            // (`crate::{DEFAULT_MAX_CONTEXT, kv_pool_tokens_for,
+            // (`crate::{DEFAULT_MAX_CONTEXT, auto_kv_pool_bytes,
             // DEFAULT_PREFILL_CHUNK}`, defined once alongside this module
             // rather than restated here): `cuda_scheduler` always
-            // overrides these three fields from the operator's resolved
+            // overrides these fields from the operator's resolved
             // `EngineShape`, so this default only matters to a caller that
             // builds a leaf directly (the GPU layer/program tests) rather
             // than through the server.
             max_context_tokens: crate::DEFAULT_MAX_CONTEXT,
-            kv_pool_tokens: crate::kv_pool_tokens_for(crate::DEFAULT_MAX_CONTEXT),
+            // BF16 until the hq attention routes land (GitHub #123): a load
+            // that names no format must be one that can serve a token.
+            kv_format: KvFormat::default(),
+            kv_pool_bytes: crate::auto_kv_pool_bytes(
+                KvFormat::default(),
+                crate::DEFAULT_MAX_CONTEXT,
+            ),
             slot_count: N_DECODE_LANES as u32,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
         }
@@ -126,16 +142,23 @@ impl Drop for CudaLeaf {
     }
 }
 
-/// The leaf's fixed paged-KV page size, in tokens
-/// (`kernel/vendor/src/core/paged_kv_cache.h`'s `kPagedKVPageSize`).
-pub const KV_PAGE_TOKENS: u32 = 64;
-
-/// The page count a `kv_pool_tokens` budget buys, at the leaf's fixed page
-/// size. The scheduler's admission accounting
-/// (`ignis_server::runtime::cuda_scheduler`) is derived from this same
-/// function, so the two can never drift.
-pub fn kv_pool_pages(kv_pool_tokens: u32) -> u32 {
-    kv_pool_tokens.div_ceil(KV_PAGE_TOKENS)
+impl CudaLeafConfig {
+    /// What this config's byte budget buys under its format: the pool the
+    /// leaf will build and the token capacity it holds.
+    ///
+    /// `Err` (a **load** failure, GitHub #122) when the budget cannot hold
+    /// one `max_context_tokens` sequence, naming the budget, the format and
+    /// the capacity it bought. The scheduler's admission accounting
+    /// (`ignis_server::runtime::cuda_scheduler`) reads the page count from
+    /// this same call, so the two can never drift.
+    pub fn kv_pool_plan(&self) -> Result<KvPoolPlan, ignis_core::KvBudgetTooSmall> {
+        plan_kv_pool_for_context(
+            self.kv_format,
+            KvGeometry::qwen38_27b(),
+            self.kv_pool_bytes,
+            self.max_context_tokens,
+        )
+    }
 }
 
 /// The leaf's model handle: the loaded weights plus the sequence-state
@@ -181,6 +204,15 @@ impl StepLeaf for CudaLeaf {
     type Sequence = Seq<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
+        // P4-04 (GitHub #122): plan the pool before the weights go up. A
+        // byte budget that cannot hold one configured context fails the
+        // load here — naming the budget, the format and the capacity it
+        // bought — rather than after a ~19 GB upload, or later still as an
+        // admission promise the leaf can never honour.
+        let plan = self
+            .config
+            .kv_pool_plan()
+            .map_err(|e| leaf_error("kv pool plan", e.to_string()))?;
         let model = model_load::load_qwen38_27b(
             &self.reader,
             &self.artifact,
@@ -190,28 +222,59 @@ impl StepLeaf for CudaLeaf {
         )
         .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
-        // The leaf's fixed paged-KV page size (`kPagedKVPageSize`, 64
-        // tokens). The pool holds `kv_pool_tokens` worth of pages, shared
-        // across the slots; `max_context_tokens` is the per-sequence cap
-        // drawn against it. `ignis_server::runtime::cuda_scheduler` derives
-        // the scheduler's admission accounting from the same two numbers
-        // with the same arithmetic, so admission can never promise more
-        // pages than this pool holds.
+        // The pool holds the pages the byte budget bought under this load's
+        // format, shared across the slots; `max_context_tokens` is the
+        // per-sequence cap drawn against it.
+        // `ignis_server::runtime::cuda_scheduler` reads the same plan, so
+        // admission can never promise more pages than this pool holds.
         let pool = SeqPool::create(
             &cfg,
             &SeqPoolBudget {
-                kv_page_group_count: kv_pool_pages(self.config.kv_pool_tokens),
+                kv_format: self.config.kv_format,
+                kv_page_group_count: plan.page_count,
                 max_context_tokens: self.config.max_context_tokens,
                 slot_count: self.config.slot_count,
             },
         )
         .map_err(|e| leaf_error("seq pool create", e))?;
+        // GitHub #122: report what the budget actually bought, read back
+        // from the pool the leaf built rather than from the plan that asked
+        // for it — a format change has to show up here as a number, not as
+        // a surprise under load. Fires once per model load, the same
+        // frequency class as `ignis.process.started`.
+        let pool_stats = pool.stats();
+        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
+        tracing::info!(
+            name: "ignis.runtime.kv_pool",
+            kv_format = self.config.kv_format.as_str(),
+            budget_bytes = self.config.kv_pool_bytes,
+            pool_bytes = plan.pool_bytes,
+            bytes_per_token = pool_stats.kv_bytes_per_token,
+            page_count = pool_stats.kv_page_group_count,
+            token_capacity = pool_stats.kv_token_capacity,
+            max_context_tokens = self.config.max_context_tokens,
+            "kv pool"
+        );
         // P3-05 (GitHub #102, ADR 0019): capture the decode graphs once,
         // right after the pool exists and before any sequence is ever
         // allocated -- a per-width capture failure degrades that width to
         // the eager per-lane loop, never model load. `capture_decode_graphs`
         // itself never returns Err for that reason; only a null model/pool
         // (impossible here) would.
+        //
+        // Skipped outright under hq-e8-2b (GitHub #122): a decode round is
+        // an attention call, and the hq attention routes are GitHub #123 —
+        // so every width would fail capture and log its own refusal. One
+        // line saying the format is why beats eight saying it again.
+        if self.config.kv_format != KvFormat::Bf16 {
+            // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
+            tracing::warn!(
+                name: "ignis.runtime.decode_graph_capture_skipped",
+                kv_format = self.config.kv_format.as_str(),
+                "decode graph capture skipped: this KV format cannot serve a token yet (GitHub #123)"
+            );
+            return Ok(CudaModel { model, pool });
+        }
         let capture = step::capture_decode_graphs(&model, &pool)
             .map_err(|e| leaf_error("decode graph capture", e))?;
         // Reported unconditionally (GitHub #102's acceptance: "startup cost
@@ -355,16 +418,15 @@ mod tests {
     // feature is built, without needing the GPU profile (ADR 0006).
 
     #[test]
-    fn kv_pool_pages_rounds_up_to_a_whole_page() {
-        assert_eq!(kv_pool_pages(0), 0);
+    fn the_pool_plan_reports_whole_pages_of_the_configured_format() {
+        let config = CudaLeafConfig::default();
+        let plan = config.kv_pool_plan().expect("the auto default always fits");
+        assert_eq!(plan.format, KvFormat::Bf16);
         assert_eq!(
-            kv_pool_pages(1),
-            1,
-            "a partial page still reserves one whole page"
+            u64::from(plan.page_count) * u64::from(ignis_core::KV_PAGE_TOKENS),
+            plan.token_capacity
         );
-        assert_eq!(kv_pool_pages(KV_PAGE_TOKENS), 1);
-        assert_eq!(kv_pool_pages(KV_PAGE_TOKENS + 1), 2);
-        assert_eq!(kv_pool_pages(65_536), 65_536 / KV_PAGE_TOKENS);
+        assert!(plan.pool_bytes <= config.kv_pool_bytes);
     }
 
     #[test]
@@ -374,9 +436,44 @@ mod tests {
         // when it builds a leaf directly, and it must not promise a context
         // the pool it also defaults to cannot serve.
         let config = CudaLeafConfig::default();
-        assert!(config.kv_pool_tokens >= config.max_context_tokens);
+        let plan = config.kv_pool_plan().expect("the auto default always fits");
+        assert!(plan.token_capacity >= u64::from(config.max_context_tokens));
         assert_eq!(config.max_context_tokens, crate::DEFAULT_MAX_CONTEXT);
         assert_eq!(config.prefill_chunk_tokens, crate::DEFAULT_PREFILL_CHUNK);
+    }
+
+    #[test]
+    fn a_byte_budget_too_small_for_the_context_fails_the_load_naming_the_numbers() {
+        // GitHub #122: the refusal happens in `load_model`, before the
+        // weights go up — and the message has to name the budget, the
+        // format and the capacity it bought.
+        let config = CudaLeafConfig {
+            kv_pool_bytes: 1024 * 1024,
+            ..CudaLeafConfig::default()
+        };
+        let err = config.kv_pool_plan().expect_err("1 MiB holds no full context");
+        let message = err.to_string();
+        assert!(message.contains("1048576"), "{message}");
+        assert!(message.contains("bf16"), "{message}");
+        assert!(
+            message.contains(&crate::DEFAULT_MAX_CONTEXT.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_same_budget_buys_more_tokens_under_hq_than_under_bf16() {
+        // The load option is a real option: nothing but the format changes
+        // between these two plans.
+        let bf16 = CudaLeafConfig::default();
+        let hq = CudaLeafConfig {
+            kv_format: KvFormat::HqE8_2b,
+            ..CudaLeafConfig::default()
+        };
+        assert_eq!(bf16.kv_pool_bytes, hq.kv_pool_bytes);
+        let bf16_capacity = bf16.kv_pool_plan().expect("bf16 plan").token_capacity;
+        let hq_capacity = hq.kv_pool_plan().expect("hq plan").token_capacity;
+        assert!(hq_capacity > 7 * bf16_capacity, "{hq_capacity} vs {bf16_capacity}");
     }
 
     #[test]

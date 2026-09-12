@@ -147,6 +147,7 @@ fn larger_prefill_chunk_reserves_more_program_vram() {
         let pool = SeqPool::create(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
+                kv_format: ignis_core::KvFormat::Bf16,
                 kv_page_group_count: 8,
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,

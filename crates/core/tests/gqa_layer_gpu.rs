@@ -234,6 +234,7 @@ fn gqa_layers_match_f64_reference() {
     let pool = SeqPool::create(
         &cfg,
         &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::Bf16,
             kv_page_group_count: 4,
             max_context_tokens: MAX_CONTEXT_TOKENS,
             slot_count: 2,

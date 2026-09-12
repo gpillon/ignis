@@ -84,6 +84,7 @@ fn chunked_prefill_reports_its_per_chunk_wall_time() {
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::Bf16,
             kv_page_group_count: pages_for(MAX_CONTEXT) * 2,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
