@@ -662,6 +662,7 @@ dependencies = [
 name = "ignis-artifact"
 version = "0.1.0"
 dependencies = [
+ "ignis-core",
  "libc",
  "memmap2",
  "minijinja",

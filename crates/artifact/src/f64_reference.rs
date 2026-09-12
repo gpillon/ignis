@@ -307,6 +307,23 @@ impl<'a> Matrix<'a> {
             )))
     }
     fn product(&self, input: &[f64]) -> Result<Vec<f64>> {
+        // Below this much work a thread costs more than the rows it saves,
+        // and the oracle calls this for small projections too.
+        const SERIAL_BELOW_ELEMENTS: usize = 1 << 16;
+        let threads = if self.rows.saturating_mul(self.cols) < SERIAL_BELOW_ELEMENTS {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        };
+        self.product_with_threads(input, threads)
+    }
+    /// One matrix-vector product, its output rows spread over `threads`.
+    ///
+    /// Every row is summed by the same code in the same order regardless of
+    /// the split, so the schedule cannot move a bit of the result (GitHub
+    /// #135) -- an oracle carrying a measured tolerance may not depend on
+    /// the core count it happened to run on.
+    fn product_with_threads(&self, input: &[f64], threads: usize) -> Result<Vec<f64>> {
         if input.len() != self.cols {
             return Err(fail(
                 "host matrix product input width differs from weight K",
@@ -315,14 +332,14 @@ impl<'a> Matrix<'a> {
         let mut out = vec![0.; self.rows];
         match (self.format, self.layout) {
             (NumericFormat::Bf16, StorageLayout::ContiguousLeV1) => {
-                for (row, target) in out.iter_mut().enumerate() {
+                fill_rows(&mut out, threads, |row| {
                     let words = &self.payload[row * self.cols * 2..(row + 1) * self.cols * 2];
-                    *target = words
+                    words
                         .chunks_exact(2)
                         .zip(input)
                         .map(|(word, x)| bf16(u16::from_le_bytes(word.try_into().unwrap())) * x)
-                        .sum();
-                }
+                        .sum()
+                });
             }
             (NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1) => {
                 let shape = [self.rows as u64, self.cols as u64];
@@ -337,7 +354,7 @@ impl<'a> Matrix<'a> {
                 let tiles = self.cols / 64;
                 let scales = &self.payload[g.scale_plane_offset as usize
                     ..g.scale_plane_offset as usize + g.scale_plane_bytes as usize];
-                for (row, target) in out.iter_mut().enumerate() {
+                fill_rows(&mut out, threads, |row| {
                     let codes = &self.payload[row * self.cols / 2..(row + 1) * self.cols / 2];
                     let inner = row % 128;
                     let row_tile = row / 128;
@@ -359,8 +376,8 @@ impl<'a> Matrix<'a> {
                             total += e2m1(code) * scale * input[column];
                         }
                     }
-                    *target = total;
-                }
+                    total
+                });
             }
             (NumericFormat::W8G32F16S, StorageLayout::RowSplitK128V1) => {
                 let g = row_split_geometry(
@@ -368,7 +385,7 @@ impl<'a> Matrix<'a> {
                     &[self.rows as u64, self.cols as u64],
                 )?;
                 let scales = &self.payload[g.scale_plane_offset as usize..];
-                for (row, target) in out.iter_mut().enumerate() {
+                fill_rows(&mut out, threads, |row| {
                     let mut total = 0.;
                     for group in 0..self.cols / 32 {
                         let scale = f16(u16::from_le_bytes(
@@ -384,8 +401,8 @@ impl<'a> Matrix<'a> {
                                 * input[group * 32 + within];
                         }
                     }
-                    *target = total;
-                }
+                    total
+                });
             }
             _ => {
                 return Err(fail(
@@ -395,6 +412,42 @@ impl<'a> Matrix<'a> {
         }
         Ok(out)
     }
+}
+
+/// Fill every element of `out` with `row_value(index)`, spreading the work
+/// over at most `threads` scoped threads.
+///
+/// Rows are independent, so this only chooses *who* computes a row, never
+/// *how*: `row_value` sees the same index and runs the same arithmetic in
+/// the same order whatever the split (GitHub #135). A matrix narrower than
+/// the thread count simply uses fewer threads, and an empty one spawns none.
+fn fill_rows<F>(out: &mut [f64], threads: usize, row_value: F)
+where
+    F: Fn(usize) -> f64 + Sync,
+{
+    let rows = out.len();
+    if rows == 0 {
+        return;
+    }
+    let threads = threads.clamp(1, rows);
+    if threads == 1 {
+        for (row, target) in out.iter_mut().enumerate() {
+            *target = row_value(row);
+        }
+        return;
+    }
+    let chunk = rows.div_ceil(threads);
+    let row_value = &row_value;
+    std::thread::scope(|scope| {
+        for (index, slice) in out.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                let base = index * chunk;
+                for (offset, target) in slice.iter_mut().enumerate() {
+                    *target = row_value(base + offset);
+                }
+            });
+        }
+    });
 }
 
 struct CommonWeights<'a> {
@@ -765,5 +818,155 @@ mod tests {
     fn gdn_unit_vector_is_normalized_with_epsilon() {
         let v = unit(&[3., 4.]);
         assert!((v[0] * v[0] + v[1] * v[1] - 1.).abs() < 1e-6);
+    }
+
+    /// Every thread split must agree with the serial one bit for bit.
+    fn assert_schedule_is_bit_identical(what: &str, matrix: &Matrix<'_>) {
+        let input: Vec<f64> = (0..matrix.cols).map(|i| (i as f64 * 0.37).sin()).collect();
+        let serial = matrix
+            .product_with_threads(&input, 1)
+            .unwrap_or_else(|e| panic!("{what} serial product: {e}"));
+        assert!(
+            serial.iter().any(|value| *value != 0.),
+            "{what}: degenerate payload proves nothing"
+        );
+        assert!(
+            serial.iter().all(|value| value.is_finite()),
+            "{what}: payload decodes to a non-finite value"
+        );
+        // Coprime with the row counts, so the last chunk is short, plus one
+        // count far above the rows (every thread but the first gets nothing).
+        for threads in [2, 3, 7, 64, 4096] {
+            let parallel = matrix
+                .product_with_threads(&input, threads)
+                .unwrap_or_else(|e| panic!("{what} over {threads} threads: {e}"));
+            assert_eq!(parallel.len(), serial.len(), "{what}: row count");
+            for (row, (got, want)) in parallel.iter().zip(&serial).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{what}: row {row} differs over {threads} threads"
+                );
+            }
+        }
+    }
+
+    /// GitHub #135: the oracle spreads its output rows over threads. Each row
+    /// is still summed by the same code in the same order, so the schedule
+    /// must not move a single bit -- an oracle whose value depends on the
+    /// core count it happened to run on could not carry a measured tolerance.
+    ///
+    /// All three decode arms are covered. `layer_reference_real` also pins
+    /// this against the committed fixtures, which were recorded before the
+    /// rows were split, but it is `#[ignore]`d and needs the real artifact,
+    /// so on its own it would leave the default CPU gate proving nothing
+    /// about two of the three arms.
+    #[test]
+    fn the_row_schedule_does_not_change_a_single_bit_of_any_decode_arm() {
+        // BF16: a flat little-endian plane, two bytes per element.
+        const BF16_ROWS: usize = 131;
+        const BF16_COLS: usize = 64;
+        let bf16_payload: Vec<u8> = (0..BF16_ROWS * BF16_COLS * 2)
+            .map(|i| ((i * 37 + i / 11) % 251) as u8)
+            .collect();
+        assert_schedule_is_bit_identical(
+            "bf16",
+            &Matrix {
+                rows: BF16_ROWS,
+                cols: BF16_COLS,
+                format: NumericFormat::Bf16,
+                layout: StorageLayout::ContiguousLeV1,
+                payload: &bf16_payload,
+            },
+        );
+
+        // NVFP4: a code plane, an E4M3 scale plane, then the FP32 divisor.
+        // Rows must divide 128 and columns 64 for the geometry to exist.
+        const NVFP4_ROWS: usize = 256;
+        const NVFP4_COLS: usize = 64;
+        let g = block_scale_geometry(
+            NumericFormat::Nvfp4,
+            &[NVFP4_ROWS as u64, NVFP4_COLS as u64],
+        )
+        .expect("nvfp4 geometry");
+        let mut nvfp4_payload = vec![0u8; g.encoded_bytes as usize];
+        for (i, byte) in nvfp4_payload[..g.code_plane_bytes as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = ((i * 53 + i / 7) % 256) as u8;
+        }
+        // E4M3 codes near 1.0: an arbitrary byte here can decode to NaN,
+        // which would make the comparison vacuous rather than wrong.
+        let scale_at = g.scale_plane_offset as usize;
+        for (i, byte) in nvfp4_payload[scale_at..scale_at + g.scale_plane_bytes as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = 0x34 + (i % 9) as u8;
+        }
+        let divisor_at = g.weight_divisor_offset as usize;
+        nvfp4_payload[divisor_at..divisor_at + 4].copy_from_slice(&1.5f32.to_le_bytes());
+        assert_schedule_is_bit_identical(
+            "nvfp4",
+            &Matrix {
+                rows: NVFP4_ROWS,
+                cols: NVFP4_COLS,
+                format: NumericFormat::Nvfp4,
+                layout: StorageLayout::BlockScaleK16M128x4V1,
+                payload: &nvfp4_payload,
+            },
+        );
+
+        // W8G32: an i8 code plane and an F16 per-group scale plane.
+        const W8_ROWS: usize = 67;
+        const W8_COLS: usize = 128;
+        let g = row_split_geometry(
+            NumericFormat::W8G32F16S,
+            &[W8_ROWS as u64, W8_COLS as u64],
+        )
+        .expect("w8 geometry");
+        let mut w8_payload = vec![0u8; g.encoded_bytes as usize];
+        for (i, byte) in w8_payload[..g.low_plane_bytes as usize]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = ((i * 29 + i / 5) % 256) as u8;
+        }
+        // F16 scales around 1.0 (0x3C00), for the same reason as above.
+        let scale_at = g.scale_plane_offset as usize;
+        for (group, pair) in w8_payload[scale_at..scale_at + g.scale_plane_bytes as usize]
+            .chunks_exact_mut(2)
+            .enumerate()
+        {
+            pair.copy_from_slice(&(0x3C00u16 + (group % 97) as u16).to_le_bytes());
+        }
+        assert_schedule_is_bit_identical(
+            "w8g32",
+            &Matrix {
+                rows: W8_ROWS,
+                cols: W8_COLS,
+                format: NumericFormat::W8G32F16S,
+                layout: StorageLayout::RowSplitK128V1,
+                payload: &w8_payload,
+            },
+        );
+    }
+
+    /// A thread count above the row count must not panic on an empty chunk,
+    /// and a zero-row matrix must not spawn anything.
+    #[test]
+    fn a_product_wider_than_its_row_count_is_still_well_formed() {
+        let matrix = Matrix {
+            rows: 0,
+            cols: 4,
+            format: NumericFormat::Bf16,
+            layout: StorageLayout::ContiguousLeV1,
+            payload: &[],
+        };
+        assert!(matrix
+            .product_with_threads(&[1., 2., 3., 4.], 8)
+            .expect("empty product")
+            .is_empty());
     }
 }

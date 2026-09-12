@@ -28,6 +28,15 @@ tokenizers = "0.21"
 # filter the container chat template uses for tool definitions.
 minijinja = { version = "2", features = ["json"] }
 
+[dev-dependencies]
+# GitHub #135: `tests/layer_reference_real.rs` is a CPU-only oracle, but it
+# still runs under the explicit profile and so must decide a missing
+# artifact through `ignis_core::gpu_profile` rather than a self-skip
+# (docs/agents/testing.md). A dev-dependency back onto `ignis-core` (which
+# depends on this crate) is the one cycle Cargo allows, and it reaches only
+# this crate's test targets -- never the library or the inspect binary.
+ignis-core = { path = "../core" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 

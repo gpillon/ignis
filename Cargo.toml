@@ -6,6 +6,27 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 
+# GitHub #135. The GPU profile's f64 layer oracles are CPU-bound on scalar
+# `f64` with per-element NVFP4 / W8 dequantization, and at the default
+# `opt-level = 0` they dominated the serialized `--ignored` stage. The real
+# two-layer oracle (`layer_reference_real`) took 123.94 s there; optimizing
+# alone brought it to ~25 s, and with the oracle's rows spread over threads
+# it runs in ~3.9 s. The oracle lives in a library crate, so `[profile.test]`
+# alone would not reach it -- `cargo test` builds dependencies with `dev`,
+# and only the test targets themselves with `test`.
+#
+# Rust applies no fast-math, so every `f64` result -- and therefore every
+# measured tolerance in the profile -- is bit-identical to the unoptimized
+# build. `debug-assertions` (and the overflow checks that follow them) stay
+# on in both profiles: this buys speed, never fewer checks.
+[profile.dev]
+opt-level = 2
+debug-assertions = true
+
+[profile.test]
+opt-level = 2
+debug-assertions = true
+
 [workspace.dependencies]
 memmap2 = "0.9"
 arc-swap = "1"

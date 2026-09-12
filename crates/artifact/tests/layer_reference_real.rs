@@ -1,9 +1,20 @@
 //! Explicit real-artifact acceptance for P1-20 (GitHub #56).
 //!
 //! It is ignored in the normal CPU gate because an f64 traversal of two real
-//! layers is deliberately slow; run it in release with:
-//! `cargo test -p ignis-artifact --release --test layer_reference_real -- --ignored`.
-//! The only environmental skip is a missing locally cached artifact.
+//! layers is deliberately slow. It touches **no GPU**: it reads the stored
+//! weights through a memory map and evaluates them on the CPU. So
+//! `scripts/gpu-profile.ps1` runs it as its own unserialized stage rather
+//! than inside the `--test-threads=1` sweep, where it was paying for a GPU
+//! exclusivity it never needed (GitHub #135, ADR 0006).
+//!
+//! Standalone: `cargo test -p ignis-artifact --test layer_reference_real -- --ignored`.
+//!
+//! The only environmental condition is a missing locally cached artifact,
+//! and it is decided by `ignis_core::gpu_profile` like every other test in
+//! the profile -- a quiet skip outside it, a hard failure under it. Before
+//! #135 this file self-skipped with a bare `eprintln!`, so an absent
+//! fixture passed silently even under `IGNIS_GPU_PROFILE=1`
+//! (docs/agents/testing.md).
 
 use std::path::Path;
 
@@ -11,6 +22,7 @@ use ignis_artifact::{
     f64_reference::{evaluate_layer, LayerFixture, LayerInput, HIDDEN},
     Reader,
 };
+use ignis_core::gpu_profile;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
@@ -22,11 +34,10 @@ fn input(tokens: usize) -> LayerInput {
 }
 
 #[test]
-#[ignore = "real-artifact f64 layer oracle; run explicitly in release"]
+#[ignore = "real-artifact f64 layer oracle; its own stage in scripts/gpu-profile.ps1"]
 fn gqa_and_gdn_references_cover_two_tokens() {
     let path = Path::new(ARTIFACT);
-    if !path.exists() {
-        eprintln!("skip: {ARTIFACT} does not exist");
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
     }
     let reader = Reader::open(path).expect("open real artifact");
