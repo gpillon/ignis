@@ -184,6 +184,16 @@ pub(crate) mod ffi {
         ) -> i32;
 
         pub fn ignis_seq_last_error() -> *const c_char;
+
+        /// Pinned (page-locked) host memory (P4-07, GitHub #125): the host
+        /// tier's snapshot transport. Returns 0 and the host pointer in
+        /// `out_ptr`, or -1 on a null `out_ptr` or a CUDA allocation
+        /// failure (see `ignis_seq_last_error`).
+        pub fn ignis_host_pinned_alloc(bytes: u64, out_ptr: *mut *mut c_void) -> i32;
+
+        /// Free a region [`ignis_host_pinned_alloc`] returned. NULL is a
+        /// no-op.
+        pub fn ignis_host_pinned_free(ptr: *mut c_void);
     }
 
     // Test-only diagnostic seam (`kernel/include/ignis_kv_capture.h`,
@@ -708,6 +718,73 @@ impl Drop for Seq<'_> {
         unsafe { ffi::ignis_seq_release(self.pool, self.handle) };
     }
 }
+
+/// Pinned (page-locked) host memory (P4-07, GitHub #125): what
+/// [`Seq::snapshot_into`] writes into and [`Seq::restore`] reads from when
+/// the host tier evicts a sequence. Pinned rather than a plain `Vec<u8>` is
+/// what makes the D2H capture and H2D restore run at pinned PCIe rates
+/// (`ignis_seq.h`'s own doc comment on `ignis_seq_snapshot`).
+pub struct PinnedBuffer {
+    ptr: *mut c_void,
+    len: usize,
+}
+
+impl PinnedBuffer {
+    /// Allocate `bytes` of pinned host memory, zeroed by neither this call
+    /// nor the leaf — a snapshot always overwrites every byte before it is
+    /// read back, so zeroing would only cost time.
+    pub fn new(bytes: u64) -> Result<Self, String> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { ffi::ignis_host_pinned_alloc(bytes, &mut ptr) };
+        if rc != 0 || ptr.is_null() {
+            return Err(last_error());
+        }
+        Ok(Self {
+            ptr,
+            len: bytes as usize,
+        })
+    }
+}
+
+impl std::ops::Deref for PinnedBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // Safety: `ptr` is a live `ignis_host_pinned_alloc` region of `len`
+        // bytes for the lifetime of `self` (freed only in `Drop`).
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for PinnedBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // Safety: see `Deref` above; `&mut self` guarantees exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for PinnedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for PinnedBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_pinned_free(self.ptr) };
+    }
+}
+
+// Not `Sync` (the default for a raw-pointer field), but `Send`: a buffer
+// moves from the model thread (capture, at eviction) to itself again
+// (restore) — never accessed from two threads at once, matching every other
+// handle in this module.
+unsafe impl Send for PinnedBuffer {}
 
 // A `Seq` is moved into the scheduler's `Mutex`-guarded live-sequence map
 // (never accessed from more than one thread at a time — the engine drives

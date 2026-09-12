@@ -23,7 +23,7 @@
 
 use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
-use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, SeqPrefix};
+use ignis_core::seq::{PinnedBuffer, Seq, SeqPool, SeqPoolBudget, SeqPrefix};
 use ignis_core::step;
 use ignis_core::{
     DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, TokenId,
@@ -205,6 +205,7 @@ impl StepLeaf for CudaLeaf {
     type Model = CudaModel;
     type Sequence = Seq<'static>;
     type Prefix = SeqPrefix<'static>;
+    type SnapshotBuf = PinnedBuffer;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         // P4-04 (GitHub #122): plan the pool before the weights go up. A
@@ -430,6 +431,38 @@ impl StepLeaf for CudaLeaf {
         )
         .map_err(|e| leaf_error("decode", e))?;
         Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
+    fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
+        PinnedBuffer::new(bytes).map_err(|e| leaf_error("snapshot alloc", e))
+    }
+
+    fn snapshot_bytes(&self, _model: &Self::Model, sequence: &Self::Sequence) -> Result<u64, i32> {
+        sequence
+            .snapshot_bytes()
+            .map_err(|e| leaf_error("snapshot size", e.to_string()))
+    }
+
+    fn snapshot_into(
+        &self,
+        _model: &Self::Model,
+        sequence: &Self::Sequence,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        sequence
+            .snapshot_into(dst)
+            .map_err(|e| leaf_error("snapshot", e.to_string()))
+    }
+
+    fn restore_sequence(
+        &self,
+        _model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        src: &[u8],
+    ) -> Result<(), i32> {
+        sequence
+            .restore(src)
+            .map_err(|e| leaf_error("restore", e.to_string()))
     }
 }
 

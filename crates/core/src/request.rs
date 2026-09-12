@@ -36,6 +36,16 @@ pub struct Request {
     pub state: RequestState,
     /// The resident decode lane held while `Running` (else `None`).
     pub lane: Option<LaneId>,
+    /// Whether the leaf currently holds a materialized sequence for this
+    /// request (P4-07, GitHub #125): KV pages, GDN slot and conv taps
+    /// reserved — true from the first successful prefill chunk (durable
+    /// across every later chunk and the eventual decode-lane deal) until
+    /// completion, cancellation, or eviction. **Independent of `lane`**: a
+    /// `Prefilling` request is resident with no lane at all, which is
+    /// exactly the gap this ticket closes (`admission.rs`'s
+    /// `resident_slots` dimension is charged/released off this flag, never
+    /// off `lane`).
+    pub resident: bool,
     /// Tokens generated so far for this request.
     pub tokens: u32,
     /// The resources this request reserves while it holds a lane (core-05:
@@ -115,6 +125,7 @@ impl Request {
             input,
             state: RequestState::Admitted,
             lane: None,
+            resident: false,
             tokens: 0,
             resources,
             remaining_work,
@@ -132,19 +143,34 @@ impl Request {
 
     /// Whether a transition `from → to` is a valid lifecycle step.
     ///
-    /// The lifecycle is a strict pipeline:
-    /// `Admitted → Prefilling → Running → Done`, plus — since core-06 — the
-    /// host-tier detour `Running → Evicted → Running` (a request evicted to
-    /// the host KV-RAM tier is suspended and later restored to a lane
-    /// without re-prefilling), and the re-queue `Evicted → Admitted` (a
-    /// request whose snapshot was discarded from the host tier is re-queued
-    /// for re-prefill). No skipping, no other backwards steps.
+    /// The lifecycle is a strict pipeline: `Admitted → Prefilling → Running
+    /// → Done`, plus — since core-06 — two host-tier detours through
+    /// `Evicted` (P4-07, GitHub #125 added the first: a half-prefilled
+    /// request is GPU-resident, and so evictable, well before it ever holds
+    /// a decode lane):
+    /// - `Prefilling → Evicted → Prefilling` — a half-prefilled request is
+    ///   suspended and later restored to resume prefilling from its
+    ///   snapshotted chunk boundary (not from zero); it re-earns a decode
+    ///   lane the normal way, once prefill completes.
+    /// - `Running → Evicted → Running` — a request evicted from a decode
+    ///   lane is suspended and later restored straight back onto one,
+    ///   resuming generation without re-prefilling.
+    ///
+    /// Either detour may also end in the re-queue `Evicted → Admitted` (the
+    /// host-tier snapshot was discarded, so the request re-prefills from
+    /// the start). No skipping, no other backwards steps.
     pub fn valid_transition(from: RequestState, to: RequestState) -> bool {
         match from {
             RequestState::Admitted => to == RequestState::Prefilling,
-            RequestState::Prefilling => to == RequestState::Running,
+            RequestState::Prefilling => {
+                to == RequestState::Running || to == RequestState::Evicted
+            }
             RequestState::Running => to == RequestState::Done || to == RequestState::Evicted,
-            RequestState::Evicted => to == RequestState::Running || to == RequestState::Admitted,
+            RequestState::Evicted => {
+                to == RequestState::Running
+                    || to == RequestState::Prefilling
+                    || to == RequestState::Admitted
+            }
             RequestState::Done => false,
         }
     }
@@ -219,11 +245,11 @@ impl Request {
         true
     }
 
-    /// Evict the request from its decode lane to the host KV-RAM tier
-    /// (core-06): transition `Running → Evicted` and release the lane.
-    /// Fails (returns `false`) when the request is not `Running` — only a
-    /// lane-holding request can be evicted (a `Prefilling` / `Admitted`
-    /// request has no warmed KV to snapshot, so it is never a victim).
+    /// Evict a `Running` request from its decode lane to the host KV-RAM
+    /// tier (core-06): transition `Running → Evicted` and release the lane.
+    /// Fails (returns `false`) when the request is not `Running`. Restores
+    /// back onto a lane via [`Request::restore_lane`] — see
+    /// [`Request::evict_prefilling`] for the half-prefilled counterpart.
     pub fn evict(&mut self) -> bool {
         if self.state != RequestState::Running {
             return false;
@@ -233,17 +259,48 @@ impl Request {
         true
     }
 
-    /// Restore a previously-evicted request onto a decode lane (core-06):
-    /// transition `Evicted → Running` and (re-)acquire the lane. Fails
-    /// (returns `false`) when the request is not in the `Evicted` state —
-    /// only a suspended (host-tier) request can be restored, and it resumes
-    /// from where it was evicted (no re-prefill).
+    /// Evict a half-prefilled `Prefilling` request to the host KV-RAM tier
+    /// (P4-07, GitHub #125): transition `Prefilling → Evicted`. Holds no
+    /// lane to release — a `Prefilling` request is device-resident (KV
+    /// pages, GDN slot, conv taps) well before it ever holds one, which is
+    /// exactly what makes it evictable at all. Fails (returns `false`) when
+    /// the request is not `Prefilling`. Restores back into `Prefilling` via
+    /// [`Request::restore_prefilling`], never straight to `Running` — its
+    /// prefill was not complete when it was evicted, and a decode lane is
+    /// earned the normal way once it is.
+    pub fn evict_prefilling(&mut self) -> bool {
+        if self.state != RequestState::Prefilling {
+            return false;
+        }
+        self.state = RequestState::Evicted;
+        true
+    }
+
+    /// Restore a previously-evicted `Running` request onto a decode lane
+    /// (core-06): transition `Evicted → Running` and (re-)acquire the lane.
+    /// Fails (returns `false`) when the request is not in the `Evicted`
+    /// state. Resumes from where it was evicted (no re-prefill).
     pub fn restore_lane(&mut self, lane: LaneId) -> bool {
         if self.state != RequestState::Evicted {
             return false;
         }
         self.lane = Some(lane);
         self.state = RequestState::Running;
+        true
+    }
+
+    /// Restore a previously-evicted half-prefilled request into `Prefilling`
+    /// (P4-07, GitHub #125): transition `Evicted → Prefilling`, no lane
+    /// involved. The caller (the scheduler's snapshot restore) is
+    /// responsible for putting [`Request::prefill_progress`] back at the
+    /// chunk boundary the snapshot was taken at, so prefill resumes there
+    /// rather than from zero. Fails (returns `false`) when the request is
+    /// not in the `Evicted` state.
+    pub fn restore_prefilling(&mut self) -> bool {
+        if self.state != RequestState::Evicted {
+            return false;
+        }
+        self.state = RequestState::Prefilling;
         true
     }
 
@@ -434,5 +491,58 @@ mod tests {
         assert!(requests[0].lane.is_none()); // Interactive id 9 deferred
         assert!(requests[2].lane.is_none()); // Agent deferred
         assert!(free.is_empty());
+    }
+
+    // ── P4-07 (GitHub #125): half-prefilled eviction ─────────────────────
+
+    #[test]
+    fn a_prefilling_request_can_be_evicted_and_restored_to_prefilling() {
+        let mut r = req(0, RequestClass::Agent, RequestState::Prefilling);
+        assert!(r.evict_prefilling());
+        assert_eq!(r.state, RequestState::Evicted);
+        assert_eq!(r.lane, None, "a Prefilling request held no lane to release");
+        assert!(r.restore_prefilling());
+        assert_eq!(r.state, RequestState::Prefilling);
+        assert_eq!(r.lane, None, "restoring to Prefilling acquires no lane");
+    }
+
+    #[test]
+    fn evict_prefilling_only_accepts_the_prefilling_state() {
+        let mut r = req(0, RequestClass::Agent, RequestState::Admitted);
+        assert!(!r.evict_prefilling(), "Admitted holds no device state to evict");
+        let mut r = req(0, RequestClass::Agent, RequestState::Running);
+        assert!(!r.evict_prefilling(), "Running evicts via `evict`, not this");
+    }
+
+    #[test]
+    fn restore_prefilling_only_accepts_the_evicted_state() {
+        let mut r = req(0, RequestClass::Agent, RequestState::Prefilling);
+        assert!(!r.restore_prefilling(), "not suspended: nothing to restore");
+    }
+
+    #[test]
+    fn both_eviction_detours_are_valid_transitions() {
+        assert!(Request::valid_transition(
+            RequestState::Prefilling,
+            RequestState::Evicted
+        ));
+        assert!(Request::valid_transition(
+            RequestState::Evicted,
+            RequestState::Prefilling
+        ));
+        assert!(Request::valid_transition(
+            RequestState::Running,
+            RequestState::Evicted
+        ));
+        assert!(Request::valid_transition(
+            RequestState::Evicted,
+            RequestState::Running
+        ));
+        // Still no skipping: an evicted-while-prefilling request cannot
+        // resume straight into Admitted's *sibling* states.
+        assert!(!Request::valid_transition(
+            RequestState::Admitted,
+            RequestState::Evicted
+        ));
     }
 }

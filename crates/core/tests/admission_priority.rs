@@ -35,7 +35,13 @@ fn lanes_are_dealt_by_class_priority_then_fifo() {
         model: "qwen3.8-27b".into(),
         max_in_flight: 14, // 8 filler lanes + 6 queued (pre-host-tier knob)
         max_prefill_batch: 8,
-        host_capacity_pages: 0, // host tier disabled: class-priority + FIFO
+        // P4-07, GitHub #125: generous — this test means class-priority +
+        // FIFO over *lanes* to be the constraint. Left at the default
+        // (== N_DECODE_LANES) the 6 queued requests could never even
+        // materialize while the 8 fillers hold every resident slot, which
+        // would block them before lane assignment ever ran at all.
+        resident_slot_capacity: 14,
+        host_capacity_bytes: 0, // host tier disabled: class-priority + FIFO
         // is the constraint (core-05).
         ..SchedulerConfig::default()
     };

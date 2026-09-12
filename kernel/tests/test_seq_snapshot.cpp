@@ -571,7 +571,55 @@ void check_both_formats() {
 
 // ---- 5. the measured transfer cost -----------------------------------------
 
-// The tier's whole justification is that a restore is orders of magnitude
+// The host tier's own allocator (P4-07, GitHub #125): a round trip through
+// ignis_host_pinned_alloc / ignis_host_pinned_free rather than the test's
+// own cudaMallocHost (used above only because it predates this ABI) --
+// proving the entry point the host tier actually calls, not a stand-in for
+// it.
+void check_pinned_alloc() {
+  expect_rc(ignis_host_pinned_alloc(4096, nullptr), -1, "pinned alloc: null out_ptr refused");
+
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  if (ignis_seq_pool_create(&spec, &pool) != 0) {
+    std::fprintf(stderr, "FAIL: pinned alloc: pool create: %s\n", ignis_seq_last_error());
+    ++failures;
+    return;
+  }
+  ignis_seq *source = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 64, &source), 0, "pinned alloc: alloc source");
+  give_history(*pool, *source, 64, 7);
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), 0, "pinned alloc: snapshot size");
+
+  void *pinned = nullptr;
+  expect_rc(ignis_host_pinned_alloc(bytes, &pinned), 0, "pinned alloc: alloc");
+  if (pinned == nullptr) {
+    std::fprintf(stderr, "FAIL: pinned alloc: alloc returned rc 0 with a null pointer\n");
+    ++failures;
+    ignis_seq_release(pool, source);
+    ignis_seq_pool_free(pool);
+    return;
+  }
+  expect_rc(ignis_seq_snapshot(pool, source, pinned, bytes), 0, "pinned alloc: snapshot into pinned");
+  ignis_seq_release(pool, source);
+
+  ignis_seq *target = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 64, &target), 0, "pinned alloc: alloc target");
+  expect_rc(ignis_seq_restore(pool, target, pinned, bytes), 0, "pinned alloc: restore from pinned");
+
+  const std::vector<unsigned char> restored = snapshot_of(*pool, *target, "pinned alloc: re-snapshot");
+  expect(restored.size() == bytes && std::memcmp(restored.data(), pinned, bytes) == 0,
+         "pinned alloc: the pinned region round-trips byte-identical");
+
+  ignis_host_pinned_free(pinned);
+  ignis_host_pinned_free(nullptr); // a no-op, must not crash
+  ignis_seq_release(pool, target);
+  ignis_seq_pool_free(pool);
+}
+
+// A full sequence's worth of restore/re-prefill cost comparison: restore is
 // cheaper than the re-prefill it replaces, and the ticket asks for that to
 // be measured rather than assumed. Both directions are timed over pinned
 // host memory -- the transport the host tier uses (GitHub #125) -- at a
@@ -657,6 +705,7 @@ int main() {
                    "hq-e8-2b, 27B geometry");
   check_refusals();
   check_both_formats();
+  check_pinned_alloc();
   // 128 tokens is the "short sequence" the spec prices at the snapshot's
   // floor (the GDN slot plus the conv taps and the penalty-count row);
   // 40,960 is the engine's own default context, where KV dominates.

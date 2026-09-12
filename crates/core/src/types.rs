@@ -106,9 +106,13 @@ pub enum RequestState {
     Prefilling,
     /// Holds a resident decode lane, generating.
     Running,
-    /// Evicted from its lane to the host KV-RAM tier (core-06): suspended
-    /// with its state retained in host RAM; it can be restored to a lane
-    /// without re-prefilling.
+    /// Evicted to the host KV-RAM tier (core-06, GitHub #125): suspended
+    /// with its state retained in host RAM. Reachable from `Running`
+    /// (restores back onto a lane, no re-prefill) and from `Prefilling`
+    /// (a half-prefilled request — GPU-resident but holding no decode
+    /// lane — restores back into `Prefilling` at the chunk boundary it
+    /// was snapshotted at, and re-earns a lane the normal way once its
+    /// prefill completes).
     Evicted,
     /// Finished (reached `max_tokens` / EOS).
     Done,
@@ -222,10 +226,25 @@ pub enum SchedEvent {
     },
     /// A request was evicted from a decode lane to the host KV-RAM tier
     /// (sibling prefix reuse will restore it instead of re-prefilling).
-    Evicted { request: RequestId },
-    /// A request was restored from the host KV-RAM tier onto a decode lane
-    /// (its KV + GDN state came back from host RAM — no re-prefill, core-06).
-    Restored { request: RequestId, lane: LaneId },
+    /// `snapshot_micros` is the wall time [`Compute::evict`](crate::scheduler::Compute::evict)
+    /// took (GitHub #125) — the request log's own attribution of the
+    /// tier's cost, alongside [`SchedEvent::Restored::restore_micros`].
+    Evicted {
+        request: RequestId,
+        snapshot_micros: u64,
+    },
+    /// A request was restored from the host KV-RAM tier (its KV + GDN state
+    /// came back from host RAM — no re-prefill, core-06). `lane` is the
+    /// decode lane it was restored onto, or `None` for a half-prefilled
+    /// request restored back into `Prefilling` (P4-07, GitHub #125), which
+    /// holds no lane until its prefill completes. `restore_micros` is the
+    /// wall time [`Compute::restore`](crate::scheduler::Compute::restore)
+    /// took.
+    Restored {
+        request: RequestId,
+        lane: Option<LaneId>,
+        restore_micros: u64,
+    },
     /// A request was re-queued for re-prefill (core-06): its host-tier
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.

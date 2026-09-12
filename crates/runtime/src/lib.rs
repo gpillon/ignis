@@ -117,6 +117,12 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// several sequences address, plus the mutable state each claimant
     /// clones. Released when the scheduler's last claimant is gone.
     type Prefix: Send + 'static;
+    /// Host-memory buffer a snapshot is captured into / restored from
+    /// (P4-07, GitHub #125): pinned host memory in the production leaf
+    /// (`CudaLeaf` — `ignis_core::seq::PinnedBuffer`, pinned being what
+    /// makes the D2H/H2D crossing fast) and a plain `Vec<u8>` in a CPU-only
+    /// stub, which never touches a real PCIe bus.
+    type SnapshotBuf: AsRef<[u8]> + AsMut<[u8]> + Send + 'static;
 
     /// Load a model handle.
     fn load_model(&self) -> Result<Self::Model, i32>;
@@ -174,6 +180,33 @@ pub trait StepLeaf: Send + Sync + 'static {
         sequences: &mut [&mut Self::Sequence],
         params: &[DecodeParams],
     ) -> Result<Vec<TokenId>, i32>;
+
+    // ── state transfer (P4-07, GitHub #125, ADR 0024) ────────────────────
+
+    /// Allocate a snapshot buffer of at least `bytes` (pinned host memory
+    /// in production).
+    fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32>;
+    /// Bytes a snapshot of `sequence` would need right now. `Err` with
+    /// `ignis_core::seq::NOT_AT_BOUNDARY` while mid-chunk.
+    fn snapshot_bytes(&self, model: &Self::Model, sequence: &Self::Sequence) -> Result<u64, i32>;
+    /// Write `sequence`'s whole device state into `dst`, which must be at
+    /// least [`StepLeaf::snapshot_bytes`] long. `sequence` is never
+    /// modified.
+    fn snapshot_into(
+        &self,
+        model: &Self::Model,
+        sequence: &Self::Sequence,
+        dst: &mut [u8],
+    ) -> Result<(), i32>;
+    /// Restore `sequence` (freshly drawn from [`StepLeaf::allocate_sequence`])
+    /// from a blob [`StepLeaf::snapshot_into`] wrote. `Err` (e.g.
+    /// `ignis_core::seq::BAD_SNAPSHOT`) leaves `sequence` untouched.
+    fn restore_sequence(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        src: &[u8],
+    ) -> Result<(), i32>;
 }
 
 /// A loaded model whose leaf handle is released exactly once on drop.
@@ -217,6 +250,15 @@ struct LiveSequence<S> {
     generated: u32,
 }
 
+/// A request evicted to the host tier (P4-07, GitHub #125): its snapshot
+/// blob and the decode progress it resumes from, held here (not in
+/// `ignis_core::host::HostTier`, which is pure CPU bookkeeping) because
+/// only this side ever touches real device state.
+struct EvictedSequence<B> {
+    buf: B,
+    generated: u32,
+}
+
 /// Scheduler adapter over a loaded step-ABI model.
 ///
 /// A request gains a sequence on its first prefill. The map is private, so a
@@ -230,6 +272,10 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// prefix outlives its publisher, so its handle cannot hang off the
     /// publisher's sequence.
     prefixes: Mutex<HashMap<RequestId, L::Prefix>>,
+    /// Requests currently suspended in the host tier (P4-07, GitHub #125):
+    /// their snapshot blob, held here until [`Compute::restore`] or
+    /// [`Compute::discard_snapshot`] consumes it.
+    evicted: Mutex<HashMap<RequestId, EvictedSequence<L::SnapshotBuf>>>,
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
@@ -241,6 +287,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             eos,
             sequences: Mutex::new(HashMap::new()),
             prefixes: Mutex::new(HashMap::new()),
+            evicted: Mutex::new(HashMap::new()),
         }
     }
 
@@ -253,6 +300,12 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// GitHub #126) — the CPU-stub observation point for prefix lifetime.
     pub fn live_prefixes(&self) -> usize {
         self.prefixes.lock().unwrap().len()
+    }
+
+    /// Number of requests currently suspended in the host tier (the
+    /// CPU-stub observation point for eviction round trips).
+    pub fn evicted_sequences(&self) -> usize {
+        self.evicted.lock().unwrap().len()
     }
 
     fn release_sequence(&self, sequence: L::Sequence) {
@@ -492,6 +545,100 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         if let Some(prefix) = prefix {
             self.release_prefix_handle(prefix);
         }
+    }
+
+    fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {
+        let sequences = self.sequences.lock().unwrap();
+        let Some(live) = sequences.get(&request) else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        self.model
+            .leaf
+            .snapshot_bytes(self.model.handle(), &live.handle)
+            .map_err(|code| RuntimeError::Leaf(code).into())
+    }
+
+    fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
+        let mut sequences = self.sequences.lock().unwrap();
+        let Some(live) = sequences.remove(&request) else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let bytes = match self.model.leaf.snapshot_bytes(self.model.handle(), &live.handle) {
+            Ok(bytes) => bytes,
+            Err(code) => {
+                sequences.insert(request, live);
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+        let mut buf = match self.model.leaf.alloc_snapshot_buf(bytes) {
+            Ok(buf) => buf,
+            Err(code) => {
+                sequences.insert(request, live);
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+        if let Err(code) =
+            self.model
+                .leaf
+                .snapshot_into(self.model.handle(), &live.handle, buf.as_mut())
+        {
+            sequences.insert(request, live);
+            return Err(RuntimeError::Leaf(code).into());
+        }
+        drop(sequences);
+        self.release_sequence(live.handle);
+        self.evicted.lock().unwrap().insert(
+            request,
+            EvictedSequence {
+                buf,
+                generated: live.generated,
+            },
+        );
+        Ok(bytes)
+    }
+
+    fn restore(&self, request: RequestId, context_tokens: u32) -> Result<(), ComputeError> {
+        let Some(evicted) = self.evicted.lock().unwrap().remove(&request) else {
+            return Err(ComputeError::Kernel(-1));
+        };
+        let mut handle = match self
+            .model
+            .leaf
+            .allocate_sequence(self.model.handle(), context_tokens)
+        {
+            Ok(handle) => handle,
+            Err(code) => {
+                self.evicted.lock().unwrap().insert(request, evicted);
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+        if let Err(code) =
+            self.model
+                .leaf
+                .restore_sequence(self.model.handle(), &mut handle, evicted.buf.as_ref())
+        {
+            // A refused restore (e.g. a stale/foreign blob) leaves `handle`
+            // untouched but unusable for this request — nothing to resume
+            // into. Release it and surface the failure; the scheduler falls
+            // back to discarding the (already-consumed) snapshot and
+            // re-prefilling.
+            self.model.leaf.release_sequence(self.model.handle(), handle);
+            return Err(RuntimeError::Leaf(code).into());
+        }
+        self.sequences.lock().unwrap().insert(
+            request,
+            LiveSequence {
+                handle,
+                generated: evicted.generated,
+            },
+        );
+        Ok(())
+    }
+
+    fn discard_snapshot(&self, request: RequestId) {
+        // Dropping the entry frees its buffer (`PinnedBuffer::drop` calls
+        // `ignis_host_pinned_free` in production).
+        self.evicted.lock().unwrap().remove(&request);
     }
 }
 

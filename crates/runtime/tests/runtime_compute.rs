@@ -24,6 +24,8 @@ struct Calls {
     prefixes_published: Vec<u32>,
     shared_allocations: Vec<u32>,
     prefixes_released: u32,
+    snapshots_taken: u32,
+    restores: u32,
 }
 
 struct StubLeaf {
@@ -98,6 +100,7 @@ impl StepLeaf for StubLeaf {
     /// The tokens the prefix covers — enough for a stub to prove a claimant
     /// was handed the right entry.
     type Prefix = u32;
+    type SnapshotBuf = Vec<u8>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         Ok(())
@@ -211,7 +214,45 @@ impl StepLeaf for StubLeaf {
             .map(|_| tokens.pop_front().unwrap_or(7))
             .collect())
     }
+
+    fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
+        Ok(vec![0u8; bytes as usize])
+    }
+
+    fn snapshot_bytes(&self, _model: &Self::Model, _sequence: &Self::Sequence) -> Result<u64, i32> {
+        Ok(SNAPSHOT_MARKER.len() as u64)
+    }
+
+    fn snapshot_into(
+        &self,
+        _model: &Self::Model,
+        _sequence: &Self::Sequence,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        dst.copy_from_slice(SNAPSHOT_MARKER);
+        self.calls.lock().unwrap().snapshots_taken += 1;
+        Ok(())
+    }
+
+    fn restore_sequence(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        src: &[u8],
+    ) -> Result<(), i32> {
+        if src != SNAPSHOT_MARKER {
+            return Err(-4); // BAD_SNAPSHOT-equivalent for this stub
+        }
+        self.calls.lock().unwrap().restores += 1;
+        Ok(())
+    }
 }
+
+/// The stub leaf has no real device state (`Sequence = ()`), so it writes a
+/// fixed marker instead of real bytes — enough to prove `RuntimeCompute`
+/// threads a snapshot through `alloc_snapshot_buf` → `snapshot_into` →
+/// `restore_sequence` intact, without needing a real sequence to snapshot.
+const SNAPSHOT_MARKER: &[u8] = &[0xAB, 0xCD, 0xEF, 0x01];
 
 #[test]
 fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
@@ -669,7 +710,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         SchedulerConfig {
             model: "stub".into(),
             max_in_flight: 9,
-            host_capacity_pages: 64,
+            host_capacity_bytes: 64,
             ..SchedulerConfig::default()
         },
         compute,
@@ -691,7 +732,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
     }
 
     scheduler.advance();
-    let events = scheduler.advance();
+    let mut events = scheduler.advance();
 
     assert!(
         events
@@ -699,4 +740,27 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
             .any(|event| matches!(event, ignis_core::SchedEvent::Evicted { .. }))
     );
     assert_eq!(leaf.calls.lock().unwrap().sequences_released, 1);
+    // P4-07, GitHub #125: eviction snapshots through the real leaf seam
+    // (`StepLeaf::snapshot_bytes` / `alloc_snapshot_buf` / `snapshot_into`)
+    // before releasing the sequence — not a bare `release`.
+    assert_eq!(
+        leaf.calls.lock().unwrap().snapshots_taken, 1,
+        "eviction takes a real snapshot through the leaf before releasing"
+    );
+
+    // Run to idle: the evicted request is restored (through
+    // `StepLeaf::restore_sequence`) and completes.
+    while !scheduler.is_idle() {
+        events.extend(scheduler.advance());
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ignis_core::SchedEvent::Restored { .. })),
+        "the evicted request is restored, not re-prefilled"
+    );
+    assert_eq!(
+        leaf.calls.lock().unwrap().restores, 1,
+        "restore threads the snapshot back through `StepLeaf::restore_sequence`"
+    );
 }

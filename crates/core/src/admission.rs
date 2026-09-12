@@ -54,7 +54,7 @@ use crate::types::{BackfillClass, LaneId, RequestClass, RequestId};
 /// reservation, and its speculative-backend page reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AdmissionResources {
-    /// Decode lanes held (v1: 1 per request).
+    /// Decode lanes held (v1: 1 per request) — held only while `Running`.
     pub lanes: u32,
     /// KV pages reserved in the main pool: `ceil((prompt + token budget)
     /// / page_tokens)`. The reservation is the *full* budget (over-
@@ -64,6 +64,16 @@ pub struct AdmissionResources {
     /// backend pool lands with DFlash2 / MTP, v1.2 / v1.3; the dimension
     /// is carried so the arithmetic stays the reference's).
     pub backend_pages: u32,
+    /// Device-resident sequence/state slots held (P4-07, GitHub #125): a
+    /// **separate** dimension from `lanes`. The leaf materializes a
+    /// sequence (KV pages, GDN slot, conv taps) at a request's *first*
+    /// prefill chunk — `Prefilling`, before it ever holds a decode lane —
+    /// and that slot is a real, finite leaf resource (`ignis_seq_pool`'s
+    /// `slot_count`) independent of how many of those resident sequences
+    /// happen to be decoding right now. Conflating the two let a
+    /// half-prefilled request hold real GPU state while looking, to
+    /// admission, like it held nothing at all.
+    pub resident_slots: u32,
 }
 
 impl AdmissionResources {
@@ -73,6 +83,7 @@ impl AdmissionResources {
             lanes: self.lanes + other.lanes,
             kv_pages: self.kv_pages + other.kv_pages,
             backend_pages: self.backend_pages + other.backend_pages,
+            resident_slots: self.resident_slots + other.resident_slots,
         }
     }
 
@@ -84,6 +95,7 @@ impl AdmissionResources {
             lanes: self.lanes.checked_sub(other.lanes)?,
             kv_pages: self.kv_pages.checked_sub(other.kv_pages)?,
             backend_pages: self.backend_pages.checked_sub(other.backend_pages)?,
+            resident_slots: self.resident_slots.checked_sub(other.resident_slots)?,
         })
     }
 
@@ -94,6 +106,7 @@ impl AdmissionResources {
         self.lanes <= capacity.lanes
             && self.kv_pages <= capacity.kv_pages
             && self.backend_pages <= capacity.backend_pages
+            && self.resident_slots <= capacity.resident_slots
     }
 }
 
@@ -449,10 +462,16 @@ mod tests {
     use super::*;
 
     fn res(lanes: u32, kv_pages: u32, backend_pages: u32) -> AdmissionResources {
+        // `resident_slots` (P4-07, GitHub #125) is orthogonal to this
+        // module's own protection/backfill invariants (which only ever
+        // reason about lane-holding, i.e. already-materialized, requests),
+        // so every test here leaves it at 0 — see `concrete.rs` for the
+        // dimension's own dedicated coverage.
         AdmissionResources {
             lanes,
             kv_pages,
             backend_pages,
+            resident_slots: 0,
         }
     }
 
@@ -584,16 +603,19 @@ mod tests {
         lanes: 3,
         kv_pages: 10,
         backend_pages: 0,
+        resident_slots: 0,
     };
     const LARGE: AdmissionResources = AdmissionResources {
         lanes: 1,
         kv_pages: 4,
         backend_pages: 0,
+        resident_slots: 0,
     };
     const TINY: AdmissionResources = AdmissionResources {
         lanes: 1,
         kv_pages: 2,
         backend_pages: 0,
+        resident_slots: 0,
     };
 
     fn two_large() -> [ActiveAdmissionSnapshot; 2] {

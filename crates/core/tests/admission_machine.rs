@@ -9,11 +9,23 @@
 //! small so the resource arithmetic is exact: a request reserves
 //! `ceil((prompt + max_tokens) / kv_page_tokens)` pages at submit, and the
 //! machine admits a backfill only while it fits the protection's invariants.
+//!
+//! **P4-07 (GitHub #125) moved KV-page charging off the decode-lane deal
+//! and onto first materialization** (a request's first `Prefilling` chunk —
+//! mirroring `ignis_seq_alloc`'s own real reservation timing). One
+//! consequence for *this* file specifically: a page-tight, lane-plentiful
+//! pool can no longer reach Phase 2 (the protection/backfill machinery)
+//! at all — page pressure is now resolved earlier, at admission. See
+//! `kv_page_pressure_holds_a_fresh_candidate_until_room_frees`'s own doc
+//! comment for the full reasoning, and the note left where scenario 4
+//! (a persistent-backfill integration scenario built on that now-
+//! unreachable shape) used to live.
 
 use std::sync::Arc;
 
 use ignis_core::types::{
-    BackfillClass, DecodeParams, RequestClass, RequestInput, SchedEvent, SubmitError,
+    BackfillClass, DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent,
+    SubmitError,
 };
 use ignis_core::{ConcreteScheduler, MockCompute, ProtectionPhase, Scheduler, SchedulerConfig};
 
@@ -41,10 +53,15 @@ fn small_pool() -> SchedulerConfig {
         kv_page_tokens: 16,
         max_sequence_tokens: 1024,
         kv_capacity_pages: 16,
+        // P4-07, GitHub #125: generous — these scenarios exercise the
+        // core-05 admission machine's lane/kv_pages dimensions in
+        // isolation; a tight resident-slot budget is a different
+        // scheduler.rs test's concern (host_tier.rs).
+        resident_slot_capacity: 16,
         // The core-05 scenarios exercise the admission machine in isolation:
         // the host tier is disabled (no overflow), so a blocked head waits
         // for its donors instead of being admitted via a lane eviction.
-        host_capacity_pages: 0,
+        host_capacity_bytes: 0,
         serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
     }
 }
@@ -79,123 +96,83 @@ fn protections(events: &[SchedEvent]) -> Vec<&SchedEvent> {
         .collect()
 }
 
-/// Scenario 1 — a protected head freezes a protection and classifies its
-/// backfills: a candidate that fits the pool *now* but overflows the head's
-/// *future* capacity is admitted as **temporal** (spending the protection's
-/// temporal credit), a second candidate that no longer fits the pool is
-/// held, and the head is dealt normally only once its donors release.
+/// Scenario 1 — KV-page pressure holds a fresh candidate at admission,
+/// *before* it ever reaches the protection machinery below (P4-07, GitHub
+/// #125): a request's KV pages are now charged the moment it first
+/// materializes on the leaf (its first `Prefilling` chunk,
+/// `Self::fits_for_materialization`), not at its later decode-lane deal —
+/// mirroring `ignis_seq_alloc`'s own real reservation timing, so admission
+/// and the leaf never disagree about how full the pool is. A candidate
+/// that cannot yet fit is never dispatched to the compute backend at all;
+/// it waits `Admitted`, exactly like any other admission refusal with
+/// nowhere to evict to (the host tier is disabled here).
+///
+/// This is also why the *old* shape of this test — a page-tight pool
+/// leaving decode lanes plentiful, so a backfill could be classified
+/// Persistent/Temporal purely on page pressure while a lane sat free for
+/// it — no longer reaches Phase 2 at all: page pressure is now resolved
+/// here, before a request is ever `Prefilling`-complete. That policy
+/// (donor selection, temporal credit decay, persistent-vs-temporal
+/// classification) is still fully exercised at the pure-function level in
+/// `admission.rs`'s own tests; scenario 2 below covers the one dimension
+/// that *can* still block an already-materialized head at Phase 2: decode
+/// lanes.
 #[test]
-fn blocked_head_freezes_protection_and_classifies_backfills() {
-    // Pool 12, 16-token pages. Two 4-page incumbents (8 pages) + a 5-page
-    // head = 13 > 12, so the head is blocked while the donors run.
+fn kv_page_pressure_holds_a_fresh_candidate_until_room_frees() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
-            kv_capacity_pages: 12,
+            kv_capacity_pages: 8,
             ..small_pool()
         },
-        compute,
+        compute.clone(),
     );
 
-    // Phase A: two incumbents (4 pages each, work 63) fill 8 of the 12
-    // pool pages.
-    let n1 = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // ceil(64/16) = 4 pages
-    let n2 = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
-    sched.advance(); // step 1: both prefilled + dealt (8 pages in use)
+    // One incumbent (4 pages) leaves only 4 of the 8-page pool free.
+    sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // ceil(64/16) = 4 pages
+    let ev1 = sched.advance(); // step 1: n1 materializes and is dealt a lane
 
-    // Phase B: the Interactive head (5 pages) and two 4-page temporal
-    // candidates are queued behind the incumbents.
-    let head = sched
-        .submit(input(&[1], 79), RequestClass::Interactive)
-        .unwrap(); // ceil(80/16) = 5 pages
-    let t1 = sched.submit(input(&[1], 61), RequestClass::Agent).unwrap(); // ceil(62/16) = 4 pages, work 61
-    let t2 = sched.submit(input(&[1], 61), RequestClass::Agent).unwrap(); // 4 pages, work 61
-    let ev2 = sched.advance(); // step 2: prefill all three; admission below
+    // A 5-page candidate cannot materialize (4 + 5 = 9 > 8), and the host
+    // tier is disabled (nothing to evict into) — it must wait `Admitted`,
+    // never reaching the compute backend at all.
+    let waiting = sched.submit(input(&[1], 79), RequestClass::Agent).unwrap(); // ceil(80/16) = 5 pages
+    let ev2 = sched.advance(); // step 2: n1 keeps decoding; `waiting` is held
 
-    // Step 2: the head (8 + 5 = 13 > 12 pages) is blocked → a protection
-    // freezes. t1 fits *now* (8 + 4 = 12 ≤ 12) but overflows the head's
-    // *future* (head 5 + n2 4 + t1 4 = 13 > 12) → admitted as **temporal**
-    // (work 61 ≤ frontier 62 ∧ credit 62), decaying the credit to 1. t2
-    // (12 + 4 = 16 > 12) no longer fits the pool → held.
-    let protected = protections(&ev2);
-    assert_eq!(protected.len(), 1, "one protection for the blocked head");
-    let SchedEvent::Protected {
-        epoch,
-        head: phead,
-        donors,
-    } = protected[0]
-    else {
-        unreachable!()
-    };
-    assert_eq!(*phead, head, "the blocked head is protected");
-    assert_eq!(*epoch, 1, "first protection epoch");
-    assert!(
-        donors.iter().any(|d| *d == n1),
-        "the earliest-completion incumbent (n1) is a donor"
+    assert_eq!(
+        sched.request_state(waiting),
+        Some(RequestState::Admitted),
+        "KV-page pressure holds the candidate before it ever materializes"
     );
     assert!(
-        !donors.iter().any(|d| *d == n2),
-        "n1 alone releases enough: the donor prefix stops at n1"
+        compute
+            .prefill_calls()
+            .iter()
+            .flatten()
+            .all(|job| job.request != waiting),
+        "a candidate that cannot fit the pool is never dispatched to the leaf"
     );
+    assert!(
+        !ev2.iter()
+            .any(|e| matches!(e, SchedEvent::Admitted { request, .. } if *request == waiting)),
+        "no Admitted event for a request that never materialized"
+    );
+    assert_eq!(sched.kv_used_pages(), 4, "only n1's pages are charged so far");
 
-    assert_eq!(
-        backfill_of(&ev2, t1),
-        Some(BackfillClass::Temporal),
-        "t1 overflows the head's future → admitted as a temporal backfill"
-    );
-    assert_eq!(
-        backfill_of(&ev2, t2),
-        None,
-        "t2 no longer fits the pool (8 + 4 + 4 > 12) → held"
-    );
-    let prot = sched.protection().expect("a protection is open");
-    assert_eq!(prot.epoch_id, 1);
-    assert_eq!(prot.head_request_id, head);
-    assert!(prot.donor_ids.iter().any(|d| *d == n1));
-    assert_eq!(
-        prot.temporal_credit, 1,
-        "the temporal credit decays by t1's own work (62 − 61)"
-    );
-    assert_eq!(
-        sched.kv_used_pages(),
-        12,
-        "the pool is full: 8 (n1 + n2) + 4 (t1)"
-    );
-
-    // Let the machine run to idle: t1 finishes (work 61), the donors finish
-    // (work 63), the head is dealt normally, and t2 — still queued — takes a
-    // normal (non-backfill) deal once the pool has room.
+    // Once n1 completes and its 4 pages return, `waiting` finally
+    // materializes and runs to completion.
     let rest = run_to_idle(&mut sched);
-    let events = ev2.into_iter().chain(rest).collect::<Vec<_>>();
-
-    assert_eq!(protections(&events).len(), 1, "exactly one protection");
-    assert_eq!(
-        backfill_of(&events, t2),
-        Some(BackfillClass::None),
-        "t2 is dealt normally once the pool has room"
-    );
-    assert_eq!(
-        backfill_of(&events, head),
-        Some(BackfillClass::None),
-        "the protected head is dealt normally after its donors release"
-    );
-    // The temporal backfill is dealt *before* the head (that is the point of
-    // backfilling a blocked head).
-    let t1_admitted = events
-        .iter()
-        .position(|e| matches!(e, SchedEvent::Admitted { request: r, .. } if *r == t1))
-        .unwrap();
-    let head_admitted = events
-        .iter()
-        .position(|e| matches!(e, SchedEvent::Admitted { request: r, .. } if *r == head))
-        .unwrap();
+    let events = ev1.into_iter().chain(ev2).chain(rest).collect::<Vec<_>>();
     assert!(
-        t1_admitted < head_admitted,
-        "the temporal backfill precedes the protected head"
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Admitted { request, .. } if *request == waiting)),
+        "the held candidate is dealt once room frees"
     );
     assert!(
-        sched.protection().is_none(),
-        "the protection is cleared once its head is dealt"
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == waiting)),
+        "the held candidate completes normally"
     );
     assert_eq!(sched.kv_used_pages(), 0, "all reservations released");
     assert!(sched.is_idle());
@@ -224,7 +201,13 @@ fn lane_pressure_holds_head_and_backfills_until_a_lane_frees() {
         model: "qwen3.8-27b".into(),
         max_in_flight: 16,
         max_prefill_batch: 8,
-        host_capacity_pages: 0, // host tier disabled: lane pressure is the
+        // P4-07, GitHub #125: generous — this scenario means *lanes* to be
+        // the sole constraint. Left at the default (== N_DECODE_LANES) a
+        // 9th request could never even reach `Prefilling`-complete while
+        // 8 fillers hold every resident slot, which would block it before
+        // Phase 2 (the admission machine this test exercises) ever saw it.
+        resident_slot_capacity: 16,
+        host_capacity_bytes: 0, // host tier disabled: lane pressure is the
         // constraint (the head waits for a lane to free, core-05).
         ..SchedulerConfig::default() // 4096-page pool: pages are never tight
     };
@@ -351,7 +334,8 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             kv_page_tokens: 64,
             max_sequence_tokens: 1024,
             kv_capacity_pages: pool.block_count() as u32,
-            host_capacity_pages: 0,
+            resident_slot_capacity: 16,
+            host_capacity_bytes: 0,
             serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
         },
         compute.clone(),
@@ -380,75 +364,18 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
     // job — the assertion above is the positive half of that same guarantee.
 }
 
-/// Scenario 4 — a **persistent** backfill: a candidate that fits the head's
-/// *future* capacity (head + non-donors + this backfill ≤ pool) is admitted
-/// as `Persistent` — it never borrows the donor's reserved pages, so it is
-/// safe even though a protection is open.
-#[test]
-fn persistent_backfill_fits_the_protected_future() {
-    let compute = Arc::new(MockCompute::new());
-    let mut sched = ConcreteScheduler::with_config(
-        SchedulerConfig {
-            kv_capacity_pages: 12,
-            ..small_pool()
-        },
-        compute,
-    );
-
-    // Two 4-page incumbents (8 pages) + a 5-page head = 13 > 12 → the head is
-    // blocked. A 1-page backfill fits the pool now (8 + 1 = 9 ≤ 12) and the
-    // head's future (head 5 + the non-donor 4 + 1 = 10 ≤ 12) → it is
-    // admitted as **persistent**.
-    let a = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
-    let b = sched.submit(input(&[1], 63), RequestClass::Agent).unwrap(); // 4 pages
-    let ev1 = sched.advance(); // step 1: the two incumbents are dealt (8 pages)
-
-    // The head and the backfill are submitted *after* the pool is loaded,
-    // so the head queues behind the incumbents and is the one that gets
-    // blocked (an earlier submission would let it take a lane at step 1).
-    let head = sched
-        .submit(input(&[1], 79), RequestClass::Interactive)
-        .unwrap(); // ceil(80/16) = 5 pages — blocked
-    let p = sched.submit(input(&[1], 8), RequestClass::Agent).unwrap(); // ceil(9/16) = 1 page
-    let ev2 = sched.advance(); // step 2: head blocked → protection; p dealt
-
-    assert_eq!(
-        backfill_of(&ev2, p),
-        Some(BackfillClass::Persistent),
-        "a 1-page backfill fits the head's future (5 + 4 + 1 = 10 ≤ 12)"
-    );
-    assert_eq!(
-        backfill_of(&ev2, head),
-        None,
-        "the head is still blocked while the donors run"
-    );
-
-    // Let it run: the 1-page backfill finishes early (work 8), the donors
-    // finish (work 63), and the head is dealt normally.
-    let events = ev1
-        .into_iter()
-        .chain(ev2)
-        .chain(run_to_idle(&mut sched))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        backfill_of(&events, head),
-        Some(BackfillClass::None),
-        "the protected head is dealt normally after its donors release"
-    );
-    // The persistent backfill is dealt *before* the head (it rides the
-    // protection, the head waits for the donors).
-    let p_admitted = events
-        .iter()
-        .position(|e| matches!(e, SchedEvent::Admitted { request: r, .. } if *r == p))
-        .unwrap();
-    let head_admitted = events
-        .iter()
-        .position(|e| matches!(e, SchedEvent::Admitted { request: r, .. } if *r == head))
-        .unwrap();
-    assert!(
-        p_admitted < head_admitted,
-        "the persistent backfill precedes the protected head"
-    );
-    assert!(sched.is_idle());
-    let _ = (a, b);
-}
+// Scenario 4 (persistent backfill fitting the protected future) used to
+// live here, blocked on page pressure while lanes stayed plentiful — the
+// same shape scenario 1's page-tight pool used to take, before GitHub #125
+// moved page-pressure resolution off the lane-deal path entirely (see
+// scenario 1's doc comment). It is not replaced 1:1: a page-tight,
+// lane-plentiful integration scenario can no longer reach Phase 2 at all,
+// and a lane-tight one (the only dimension that still can) never reaches a
+// Persistent/Temporal classification either — blocking a head on lanes
+// specifically means every lane is already taken, leaving none for a
+// backfill to ride (`ConcreteScheduler::try_admit` pops a real lane before
+// recording anything). The persistent-backfill *policy* itself — the
+// future-capacity fit this scenario existed to check — is still fully
+// exercised at the pure-function level:
+// `admission::tests::persistent_backfill_respects_the_protected_future_capacity`
+// and `admission::tests::a_second_backfill_sees_the_first_persistent_occupant`.

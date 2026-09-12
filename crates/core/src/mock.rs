@@ -152,6 +152,24 @@ impl Compute for MockCompute {
             })
             .collect())
     }
+
+    // core-06 (P4-07, GitHub #125): the mock holds no real GPU sequence, so
+    // it has no real snapshot to move — but a host-tier eviction scenario
+    // still needs *some* nonzero, deterministic byte cost per request for
+    // the byte-budget bookkeeping to be exercisable at all (a `Compute`
+    // that always reports 0, the trait's own default, would make a tier of
+    // any size always "fit," and no eviction test could ever force a
+    // discard). One nominal byte per snapshot, uniform across every
+    // request, is exactly what the existing page-based scenarios already
+    // assumed before this ticket's byte-budget rewrite: a fixed per-entry
+    // cost that scales purely with entry *count*.
+    fn snapshot_size(&self, _request: RequestId) -> Result<u64, ComputeError> {
+        Ok(1)
+    }
+
+    fn evict(&self, _request: RequestId) -> Result<u64, ComputeError> {
+        Ok(1)
+    }
 }
 
 impl MockCompute {
@@ -248,5 +266,21 @@ impl Compute for GatedCompute {
 
     fn release(&self, request: RequestId) {
         self.inner.release(request);
+    }
+
+    fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {
+        self.inner.snapshot_size(request)
+    }
+
+    fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
+        self.inner.evict(request)
+    }
+
+    fn restore(&self, request: RequestId, context_tokens: u32) -> Result<(), ComputeError> {
+        self.inner.restore(request, context_tokens)
+    }
+
+    fn discard_snapshot(&self, request: RequestId) {
+        self.inner.discard_snapshot(request);
     }
 }
