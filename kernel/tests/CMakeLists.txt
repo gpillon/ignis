@@ -313,3 +313,23 @@ target_compile_definitions(ignis_kernel_kv_append_format_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
 target_link_libraries(ignis_kernel_kv_append_format_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_kv_append_format_test COMMAND ignis_kernel_kv_append_format_test)
+
+# P4-06 (GitHub #124): OURS, not vendored -- sequence state transfer. It
+# checks the leaf-internal state-section table against the blob a snapshot
+# actually writes, round-trips a dirtied sequence through release and
+# re-allocation, and drives every refusal (stale version, foreign buffer,
+# disagreeing size, edited layout, foreign geometry, too-small target,
+# mid-chunk source) past the guarantee that a refused restore leaves the
+# target untouched -- which needs ignis_seq_internal.h to set a sequence's
+# frontier and read its device state, so it cannot live in Rust.
+#
+# It also PRINTS the measured snapshot/restore cost at the real 27B
+# geometry for a short and a full-context sequence (the ticket's "measured
+# rather than assumed"); the numbers are recorded in
+# docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md. That arm
+# allocates a full-context KV pool plus a 144 MiB GDN slot and ~532 MB of
+# pinned host memory, so it wants the card to itself -- which ADR 0006
+# already requires of every test here. Same no-SKIP_RETURN_CODE rule.
+add_executable(ignis_kernel_seq_snapshot_test test_seq_snapshot.cpp)
+target_link_libraries(ignis_kernel_seq_snapshot_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_snapshot_test COMMAND ignis_kernel_seq_snapshot_test)

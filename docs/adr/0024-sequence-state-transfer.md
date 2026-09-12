@@ -75,3 +75,9 @@ a different transport over the same description.
   full-context snapshot is about 528 MB and near 21 ms per direction over
   pinned PCIe — still two orders of magnitude cheaper than the ~4.6 s
   re-prefill it replaces.
+  - **Measured (P4-06, GitHub #124):** 508 MiB and **~45 ms per direction**,
+    not 21 ms. This host caps the 5090 at PCIe Gen 3 x16, so both directions
+    run at ~12 GB/s. The asymmetry is around 100x rather than ~220x, which
+    leaves the decision unchanged; the estimate above was made at PCIe 5.0
+    rates. See
+    [Sequence snapshot transfer cost](../findings/2026-09-12-sequence-snapshot-transfer-cost.md).

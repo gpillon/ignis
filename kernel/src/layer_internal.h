@@ -181,6 +181,19 @@ inline uint32_t ignis_gqa_relative_layer(uint32_t layer) {
   return (layer - 3) / 4;
 }
 
+// The same for a GDN layer (0..47). The GQA layers sit at 3, 7, 11, ..., so
+// the count of them at or before `layer` is `(layer + 1) / 4`; subtracting
+// that out of the absolute index gives the GDN-relative one the state pool
+// is sized and addressed by (GitHub #55).
+//
+// Exposed here for the same reason as the GQA formula above: a chunk loop
+// and a decode round advance `seq->gdn_positions` themselves once their own
+// synchronization succeeds (P4-06, GitHub #124), instead of each restating
+// the topology.
+inline uint32_t ignis_gdn_relative_layer(uint32_t layer) {
+  return layer - (layer + 1) / 4;
+}
+
 // The widest compute policy `qtype`'s own registered arm admits (only
 // NVFP4 admits AllowA4; every other registered qtype in the real 27B
 // artifact -- BF16_CTRL, W8G32_F16S -- admits only A16Only). Used only for

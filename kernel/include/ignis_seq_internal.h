@@ -39,6 +39,12 @@ inline constexpr int32_t kIgnisGdnConvStateWidth = kIgnisGdnConvKernel - 1;
  * one K/V-plane pair and one frontier per GQA layer. */
 inline constexpr int32_t kIgnisGqaLayerCount = 16;
 
+/* The other 48 of the 64 backbone layers: 0, 1, 2, 4, 5, 6, 8, ... Each keeps
+ * its own conv taps and recurrent state in the linear-attention state pool,
+ * so the pool is sized by this count and `ignis_seq::gdn_positions` carries
+ * one frontier per layer, exactly as `gqa_positions` does for the 16 above. */
+inline constexpr int32_t kIgnisGdnLayerCount = 48;
+
 /* The hq-e8-2b per-row plane extents (`ops/kernel/hq_codec.cuh`'s
  * kHqRowBudgetBytes / kHqMetaBytes, restated here so this header stays
  * free of the codec's CUDA includes) and the quant_group the vendored
@@ -132,6 +138,14 @@ struct ignis_seq_pool {
     auto *base = static_cast<std::int32_t *>(sampling_counts.p);
     return base + static_cast<std::ptrdiff_t>(slot) * vocab;
   }
+
+  // The same row for a read-only caller: `ignis_seq_snapshot` takes the pool
+  // by const pointer, because capturing a sequence must not be able to
+  // change one (P4-06, GitHub #124).
+  const std::int32_t *token_counts_for(std::int32_t slot) const {
+    const auto *base = static_cast<const std::int32_t *>(sampling_counts.p);
+    return base + static_cast<std::ptrdiff_t>(slot) * vocab;
+  }
 };
 
 struct ignis_seq {
@@ -146,6 +160,14 @@ struct ignis_seq {
   // (G4) already needs for those two.
   std::int32_t slot = -1;
   std::array<std::uint32_t, kIgnisGqaLayerCount> gqa_positions{};
+  // The GDN layers' own frontiers (P4-06, GitHub #124). Unlike `gqa_positions`
+  // no kernel reads these -- a GDN layer's state is updated in place and
+  // carries its own history -- but something has to be able to say whether
+  // every layer has consumed the same tokens, and for the 48 GDN layers
+  // nothing could. `ignis_seq_at_chunk_boundary` needs both arrays: a
+  // sequence stepped one GDN layer at a time has state ahead of its KV, and
+  // a snapshot taken there would restore into a subtly wrong sequence.
+  std::array<std::uint32_t, kIgnisGdnLayerCount> gdn_positions{};
   // The token which is ready to be emitted on the next decode round.  Prefill
   // consumes the complete prompt and computes this greedy successor; decode
   // returns it while consuming it to prepare the following round.
