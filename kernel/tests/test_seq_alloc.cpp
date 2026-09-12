@@ -268,6 +268,88 @@ int main() {
            "zero vocab is rejected (P3-03, GitHub #99)");
   expect(bad_vocab_pool == nullptr, "zero vocab produced no handle");
 
+  // ---- the KV format as a load option (P4-04, GitHub #122) ----------------
+  //
+  // The same byte-for-byte pool geometry under each format, at the real 27B
+  // head shape (4 KV heads of 256), so the reported per-token cost is the
+  // one the capacity finding recorded: 65,536 bytes under BF16 and 9,216
+  // under hq-e8-2b. Both numbers come out of the planes the pool actually
+  // planned, not from a per-format constant, which is what makes a token
+  // capacity derived rather than configured.
+  ignis_seq_pool_spec format_spec   = spec;
+  format_spec.num_kv_heads          = 4;
+  format_spec.head_dim              = 256;
+  format_spec.kv_page_group_count   = 8;
+  format_spec.max_context_tokens    = 128;
+
+  ignis_seq_pool_spec bf16_spec = format_spec;
+  bf16_spec.kv_format           = IGNIS_KV_FORMAT_BF16;
+  ignis_seq_pool *bf16_pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&bf16_spec, &bf16_pool), 0, "bf16 pool create");
+  struct ignis_seq_pool_stats bf16_stats{};
+  expect_rc(ignis_seq_pool_stats(bf16_pool, &bf16_stats), 0, "bf16 pool stats");
+  expect(bf16_stats.kv_format == IGNIS_KV_FORMAT_BF16, "bf16: reported format");
+  expect(bf16_stats.kv_bytes_per_token == 65536, "bf16: 65,536 bytes per sequence-token");
+  expect(bf16_stats.kv_token_capacity == 8 * 64, "bf16: capacity is pages x page tokens");
+  expect(bf16_pool->kv_pool.plane_count() == 2 * kIgnisGqaLayerCount,
+        "bf16: two planes per GQA layer");
+
+  ignis_seq_pool_spec hq_spec = format_spec;
+  hq_spec.kv_format           = IGNIS_KV_FORMAT_HQ_E8_2B;
+  ignis_seq_pool *hq_pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&hq_spec, &hq_pool), 0, "hq pool create");
+  struct ignis_seq_pool_stats hq_stats{};
+  expect_rc(ignis_seq_pool_stats(hq_pool, &hq_stats), 0, "hq pool stats");
+  expect(hq_stats.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B, "hq: reported format");
+  expect(hq_stats.kv_bytes_per_token == 9216, "hq: 9,216 bytes per sequence-token");
+  expect(hq_stats.kv_token_capacity == 8 * 64, "hq: capacity is pages x page tokens");
+  expect(hq_pool->kv_pool.plane_count() == 4 * kIgnisGqaLayerCount,
+        "hq: a code and a metadata plane per role per GQA layer");
+  // The same page count is 7.11x the tokens per byte, which is the whole
+  // reason this format is a load option at all.
+  expect(hq_stats.kv_page_bytes * 7 < bf16_stats.kv_page_bytes,
+        "hq pages are more than 7x denser than BF16 pages");
+  // Each layer's planes carry the codec's fixed row budgets, addressed
+  // page-major exactly like the BF16 value planes beside them.
+  const ninfer::Tensor &hq_codes =
+      hq_pool->kv_pool.plane(ignis_kv_plane_index(IGNIS_KV_FORMAT_HQ_E8_2B, 3, IGNIS_KV_PLANE_V));
+  const ninfer::Tensor &hq_meta = hq_pool->kv_pool.plane(
+      ignis_kv_plane_index(IGNIS_KV_FORMAT_HQ_E8_2B, 3, IGNIS_KV_PLANE_V_META));
+  expect(hq_codes.ne[0] == kIgnisHqCodeRowBytes, "hq: 64-byte code rows");
+  expect(hq_meta.ne[0] == kIgnisHqMetaRowBytes, "hq: 8-byte metadata rows");
+  expect(hq_codes.ne[1] == ninfer::kPagedKVPageSize && hq_meta.ne[1] == ninfer::kPagedKVPageSize,
+        "hq: both planes are page-major");
+
+  // A sequence draws pages from either pool identically -- the format
+  // changes what a page holds, never how many a context needs.
+  ignis_seq *hq_seq = nullptr;
+  expect_rc(ignis_seq_alloc(hq_pool, 128, &hq_seq), 0, "hq alloc");
+  struct ignis_seq_stats hq_seq_stats{};
+  expect_rc(ignis_seq_stats(hq_seq, &hq_seq_stats), 0, "hq seq stats");
+  expect(hq_seq_stats.token_capacity == 128, "hq: a 128-token sequence maps 128 tokens");
+  ignis_seq_release(hq_pool, hq_seq);
+
+  ignis_seq_pool_free(hq_pool);
+  ignis_seq_pool_free(bf16_pool);
+
+  // An unknown format is refused rather than quietly treated as BF16.
+  ignis_seq_pool_spec bad_format_spec = format_spec;
+  bad_format_spec.kv_format           = 7;
+  ignis_seq_pool *bad_format_pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&bad_format_spec, &bad_format_pool), -1,
+           "an unknown kv_format is rejected");
+  expect(bad_format_pool == nullptr, "an unknown kv_format produced no handle");
+
+  // The codec's row budget is defined for a 256-dimension row only, so an hq
+  // pool at any other head_dim would plan planes its append path cannot fill.
+  ignis_seq_pool_spec bad_hq_spec = format_spec;
+  bad_hq_spec.kv_format           = IGNIS_KV_FORMAT_HQ_E8_2B;
+  bad_hq_spec.head_dim            = 128;
+  ignis_seq_pool *bad_hq_pool     = nullptr;
+  expect_rc(ignis_seq_pool_create(&bad_hq_spec, &bad_hq_pool), -1,
+           "hq at a head_dim other than 256 is rejected");
+  expect(bad_hq_pool == nullptr, "a bad hq head_dim produced no handle");
+
   ignis_seq_pool_free(pool);
 
   if (failures != 0) {

@@ -83,7 +83,9 @@ When output names a domain concept, use the term as defined here.
   the serving default from G4, or **BF16**, retained as the format every
   correctness oracle runs against. A model-load option, fixed for the life of
   the load; the pool is sized by a byte budget and its token capacity is
-  *derived* from the format rather than configured (ADR 0022).
+  *derived* from the format rather than configured (ADR 0022). The CLI default
+  is still `bf16` until hq's attention routes land (#123): hq loads, reports
+  its capacity and accepts KV appends, but refuses a forward pass.
 
 ## Sequence state
 

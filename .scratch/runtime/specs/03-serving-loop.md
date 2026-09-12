@@ -270,7 +270,9 @@ one. The arithmetic, redone: admission reserves the full
 `ceil((prompt + token budget) / 64)` pages up front and never over-allocates
 mid-generation (`ignis_core::admission::AdmissionResources`), and the pool
 is 65,536 tokens, so 1,024 pages, at the server's default 40,960-token
-`--max-context` (`ignis_runtime::kv_pool_tokens_for`). Peak concurrent
+`--max-context` (the 4 GiB `ignis_runtime::auto_kv_pool_bytes` default under
+BF16 KV; P4-04 / GitHub #122 replaced the former `kv_pool_tokens_for` token
+target with that byte budget, leaving this figure unchanged). Peak concurrent
 demand is the four lanes plus the single in-flight prefiller:
 
 | holder | reservation | pages |

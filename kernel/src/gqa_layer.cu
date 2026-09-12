@@ -45,20 +45,6 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &weight, ninfer::DType dtype,
   return ninfer::Tensor(const_cast<void *>(weight.qdata), dtype, shape);
 }
 
-// The P1-19 pool stores one BF16 K,V pair for every GQA layer and allocates
-// one block-table row per sequence slot. This view is non-owning: the
-// sequence's allocation keeps the mapping and pages alive for the full call.
-ninfer::PagedKVLayerView cache_view(ignis_seq_pool *pool, ignis_seq *seq, uint32_t gqa_layer) {
-  ninfer::PagedKVLayerView view;
-  view.k_pages = pool->kv_pool.plane(2 * gqa_layer);
-  view.v_pages = pool->kv_pool.plane(2 * gqa_layer + 1);
-  view.block_table = seq->kv.block_table();
-  view.head_dim = 256;
-  view.num_kv_heads = 4;
-  view.dtype = ninfer::DType::BF16;
-  return view;
-}
-
 int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       uint32_t layer, void *in_residual, void *out_residual,
                       uint32_t gqa_layer, uint64_t num_tokens, LinearPolicyMode mode) {
@@ -136,7 +122,14 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // the engine encodes no threshold of its own. The shared numerical
     // contract of A1/A2/A3 (kernel/vendor/include/ninfer/ops/gqa_attention.h)
     // keeps the layer's output unchanged in form.
-    const ninfer::PagedKVLayerView cache = cache_view(pool, seq, gqa_layer);
+    // The pool stores one K/V plane run per GQA layer and allocates one
+    // block-table row per sequence slot; `ignis_kv_layer_view`
+    // (kernel/include/ignis_seq_internal.h) builds the view from the pool's
+    // own KV format (GitHub #122) and is shared with the leaf's own append
+    // test, so the hq plane selection here is the one under test rather than
+    // a second copy of it.
+    const ninfer::PagedKVLayerView cache =
+        ignis_kv_layer_view(pool, seq, static_cast<std::int32_t>(gqa_layer));
     // A1 takes the batched cache view. The leaf is single-sequence: the
     // sequence's block-table row IS the complete [logical_pages, 1] table
     // matrix, and table row 0 selects it (the kv_table_rows buffer below).
@@ -350,8 +343,12 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // A1 batch selects lane b's own KV pages, which is what keeps the lanes'
     // caches isolated inside one call.
     ninfer::PagedKVBatchLayerView batch_cache;
-    batch_cache.k_pages      = pool->kv_pool.plane(2 * gqa_layer);
-    batch_cache.v_pages      = pool->kv_pool.plane(2 * gqa_layer + 1);
+    batch_cache.k_pages      = pool->kv_pool.plane(
+        ignis_kv_plane_index(pool->kv_format, static_cast<std::int32_t>(gqa_layer),
+                             IGNIS_KV_PLANE_K));
+    batch_cache.v_pages      = pool->kv_pool.plane(
+        ignis_kv_plane_index(pool->kv_format, static_cast<std::int32_t>(gqa_layer),
+                             IGNIS_KV_PLANE_V));
     batch_cache.block_tables = pool->kv_pool.block_tables();
     batch_cache.head_dim     = kHeadDim;
     batch_cache.num_kv_heads = kKvHeads;
@@ -420,6 +417,23 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
   }
 }
 
+// P4-04 (GitHub #122): the KV format is a load option, but only BF16 can
+// *serve* until the hq attention routes land (P4-05, GitHub #123). This
+// ticket's seam is deliberate -- the pool, its planes, the derived capacity
+// and the hq append path ship now so the state-transfer work (#124) is not
+// queued behind the routes -- so an hq forward pass is refused here, before
+// any device work, rather than dispatching the fused append-and-attend op
+// against a view whose attention route this engine has never qualified.
+bool gqa_format_can_serve(ignis_seq_pool *pool, const char *op) {
+  if (pool->kv_format == IGNIS_KV_FORMAT_BF16) {
+    return true;
+  }
+  set_error(std::string(op) +
+            ": this model is loaded with hq-e8-2b KV, whose attention routes are not wired yet "
+            "(GitHub #123); load with BF16 KV to serve tokens");
+  return false;
+}
+
 }  // namespace
 
 // P2-02 (GitHub #84): the validated body a chunk loop dispatches directly
@@ -442,6 +456,9 @@ int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
   }
   if (num_tokens == 0) {
     set_error("ignis_gqa_layer: num_tokens must be positive");
+    return -1;
+  }
+  if (!gqa_format_can_serve(pool, "ignis_gqa_layer")) {
     return -1;
   }
   if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
@@ -519,6 +536,9 @@ int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
   if (width == 0 || width > IGNIS_DECODE_MAX_BATCH) {
     set_error("ignis_gqa_layer_graph: width " + std::to_string(width) +
               " is not in 1..IGNIS_DECODE_MAX_BATCH");
+    return -1;
+  }
+  if (!gqa_format_can_serve(pool, "ignis_gqa_layer_graph")) {
     return -1;
   }
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);

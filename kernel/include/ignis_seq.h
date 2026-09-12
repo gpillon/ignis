@@ -50,17 +50,39 @@ struct ignis_seq_pool;
  * by ignis_seq_alloc, destroyed by ignis_seq_release. */
 struct ignis_seq;
 
-/* The geometry a sequence-state pool is built from. KV pages are two BF16
- * planes (K, V) of `[head_dim, kPagedKVPageSize, num_kv_heads]` each
- * (`core/paged_kv_cache.h`); the GDN pool is `gdn_num_layers` layers of
- * `[gdn_conv_channels]` conv taps (4-wide causal conv, the model's fixed
- * kernel width) and `gdn_value_heads` fp32 `[gdn_head_dim, gdn_head_dim]`
- * recurrent state matrices (mirrors ninfer::LinearAttentionStatePoolSpec;
- * the reference's GDN recurrence is square: value_head_dim == key_head_dim
- * == gdn_head_dim). */
+/* The KV cache storage format a pool stores its rows in (ADR 0022, GitHub
+ * #122). Fixed for the life of a model load: it decides the pool's planes,
+ * and so how many bytes one sequence-token costs and how many tokens a byte
+ * budget holds.
+ *
+ * Rust binding: `ignis_core::kv_format::KvFormat::abi_code` (keep 1:1). */
+enum ignis_kv_format {
+  /* Unquantized BF16 K/V rows: one plane per role per GQA layer, of
+   * `[head_dim, kPagedKVPageSize, num_kv_heads]`. 65,536 bytes per
+   * sequence-token at the 27B geometry. */
+  IGNIS_KV_FORMAT_BF16 = 0,
+  /* hq-e8-2b (`ops/kernel/hq_codec.cuh`): two U8 planes per role per GQA
+   * layer -- a `[kHqRowBudgetBytes=64, kPagedKVPageSize, num_kv_heads]` code
+   * plane and a `[kHqMetaBytes=8, ...]` metadata plane. Every (token, KV
+   * head) row occupies exactly those fixed budgets, so page addressing and
+   * capacity math are unchanged; 9,216 bytes per sequence-token, 7.11x
+   * denser than BF16. */
+  IGNIS_KV_FORMAT_HQ_E8_2B = 1
+};
+
+/* The geometry a sequence-state pool is built from. KV pages carry
+ * `kv_format`'s planes per GQA layer (see enum ignis_kv_format), addressed
+ * by `core/paged_kv_cache.h`'s page-major layout; the GDN pool is
+ * `gdn_num_layers` layers of `[gdn_conv_channels]` conv taps (4-wide causal
+ * conv, the model's fixed kernel width) and `gdn_value_heads` fp32
+ * `[gdn_head_dim, gdn_head_dim]` recurrent state matrices (mirrors
+ * ninfer::LinearAttentionStatePoolSpec; the reference's GDN recurrence is
+ * square: value_head_dim == key_head_dim == gdn_head_dim). */
 struct ignis_seq_pool_spec {
   uint32_t num_kv_heads;
   uint32_t head_dim;
+  /* One of enum ignis_kv_format. Rejected if it is neither. */
+  int32_t kv_format;
   /* Physical KV page count this pool holds -- the caller sizes this
    * (typically from ignis_paged_kv_page_budget against the VRAM left after
    * weights), not derived here. */
@@ -85,11 +107,23 @@ struct ignis_seq_pool_stats {
   uint32_t kv_page_group_count;
   uint32_t kv_entitled_pages;
   uint32_t kv_free_pages;
-  /* Bytes of one physical KV page across every plane (K + V). */
+  /* Bytes of one physical KV page across every plane of every GQA layer --
+   * K and V under BF16, their code and metadata planes under hq-e8-2b. */
   uint64_t kv_page_bytes;
   uint32_t logical_page_capacity;
   uint32_t slot_count;
   uint32_t free_slot_count;
+  /* The format the pool stores rows in (enum ignis_kv_format). */
+  int32_t kv_format;
+  /* Bytes one sequence-token costs across every GQA layer and both roles,
+   * derived from the planes the pool actually planned (kv_page_bytes /
+   * kPagedKVPageSize) -- not a per-format constant. */
+  uint64_t kv_bytes_per_token;
+  /* Resident sequence-tokens the whole pool holds: kv_page_group_count *
+   * kPagedKVPageSize. Derived from the byte budget the caller sized the
+   * pool with and the format in force, which is the number a load reports
+   * (GitHub #122). */
+  uint64_t kv_token_capacity;
 };
 
 struct ignis_seq_stats {

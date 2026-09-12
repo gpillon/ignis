@@ -18,7 +18,20 @@
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 
+#include "ops/kernel/hq_codec.cuh"
+
 #include <cuda_runtime.h>
+
+// `ignis_seq_internal.h` restates the codec's per-row byte budgets so that
+// header stays free of the codec's CUDA includes. This translation unit has
+// both, so it is where the restatement is checked: VENDOR.md's `verify`
+// catches an edited vendored file, never a constant copied out of one.
+static_assert(kIgnisHqCodeRowBytes == ninfer::ops::kHqRowBudgetBytes,
+              "kIgnisHqCodeRowBytes has drifted from the vendored kHqRowBudgetBytes");
+static_assert(kIgnisHqMetaRowBytes == ninfer::ops::kHqMetaBytes,
+              "kIgnisHqMetaRowBytes has drifted from the vendored kHqMetaBytes");
+static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
+              "kIgnisHqHeadDim has drifted from the vendored kHqHeadDim");
 
 #include <memory>
 #include <stdexcept>
@@ -34,6 +47,34 @@ void set_error(std::string message) {
 
 bool positive(uint32_t v) {
   return v > 0;
+}
+
+// One GQA layer's storage planes under `kv_format`, appended in the order
+// `ignis_kv_plane_index` addresses them (K, [K meta,] V, [V meta]).
+//
+// This is the only place that says what a KV format is made of. BF16 stores
+// the rows themselves; hq-e8-2b stores a fixed 64-byte code row plus an
+// 8-byte metadata row per (token, kv_head), which is why its planes are U8
+// with the codec's byte budgets as their leading extents rather than
+// head_dim. Both keep the paged-KV contract's fixed-bytes-per-token
+// property, so `plan_paged_kv_pool` sizes them identically in shape and the
+// capacity math below never branches on the format.
+void push_layer_planes(ninfer::PagedKVPoolSpec &spec, int32_t kv_format, uint32_t num_kv_heads,
+                       uint32_t head_dim) {
+  const auto heads = static_cast<std::int32_t>(num_kv_heads);
+  if (kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
+    spec.planes.push_back({ninfer::DType::U8, kIgnisHqCodeRowBytes, heads});
+    spec.planes.push_back({ninfer::DType::U8, kIgnisHqMetaRowBytes, heads});
+    spec.planes.push_back({ninfer::DType::U8, kIgnisHqCodeRowBytes, heads});
+    spec.planes.push_back({ninfer::DType::U8, kIgnisHqMetaRowBytes, heads});
+    return;
+  }
+  spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(head_dim), heads});
+  spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(head_dim), heads});
+}
+
+bool known_kv_format(int32_t kv_format) {
+  return kv_format == IGNIS_KV_FORMAT_BF16 || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
 }
 
 } // namespace
@@ -55,6 +96,20 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     set_error("ignis_seq_pool_create: every geometry field must be positive");
     return -1;
   }
+  if (!known_kv_format(spec->kv_format)) {
+    set_error("ignis_seq_pool_create: kv_format " + std::to_string(spec->kv_format) +
+              " is not an ignis_kv_format");
+    return -1;
+  }
+  // The codec's row budget is defined for a 256-dimension row only
+  // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
+  // append path cannot write.
+  if (spec->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B &&
+      spec->head_dim != static_cast<std::uint32_t>(kIgnisHqHeadDim)) {
+    set_error("ignis_seq_pool_create: hq-e8-2b KV requires head_dim " +
+              std::to_string(kIgnisHqHeadDim) + ", got " + std::to_string(spec->head_dim));
+    return -1;
+  }
 
   try {
     const auto logical_page_capacity = ninfer::pages_for_tokens(spec->max_context_tokens);
@@ -65,14 +120,13 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     kv_spec.logical_page_capacity = logical_page_capacity;
     kv_spec.table_rows            = static_cast<std::int32_t>(spec->slot_count);
     kv_spec.plane_order           = ninfer::PagedKVPlaneOrder::PageMajor;
-    // One K/V pair per full-attention layer. The GQA layer program selects its
-    // own pair, so a layer's K/V history never aliases another layer's pages.
-    kv_spec.planes.reserve(2 * kIgnisGqaLayerCount);
+    // One K/V plane run per full-attention layer. The GQA layer program
+    // selects its own run (`ignis_kv_plane_index`), so a layer's K/V history
+    // never aliases another layer's pages.
+    kv_spec.planes.reserve(static_cast<std::size_t>(ignis_kv_planes_per_layer(spec->kv_format)) *
+                           kIgnisGqaLayerCount);
     for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
-      kv_spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
-                                static_cast<std::int32_t>(spec->num_kv_heads)});
-      kv_spec.planes.push_back({ninfer::DType::BF16, static_cast<std::int32_t>(spec->head_dim),
-                                static_cast<std::int32_t>(spec->num_kv_heads)});
+      push_layer_planes(kv_spec, spec->kv_format, spec->num_kv_heads, spec->head_dim);
     }
     const ninfer::PagedKVPoolLayout kv_layout = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
     const std::size_t kv_bytes                = kv_builder.finish(256);
@@ -104,7 +158,10 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     auto pool = std::make_unique<ignis_seq_pool>(kv_bytes, kv_layout, gdn_bytes, gdn_layout,
                                                  sampling_counts_bytes,
                                                  static_cast<std::int32_t>(spec->vocab));
-    pool->kv_page_bytes = kv_page_bytes;
+    pool->kv_page_bytes   = kv_page_bytes;
+    pool->kv_format       = spec->kv_format;
+    pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
+    pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
       pool->free_slots.push_back(static_cast<std::int32_t>(i));
@@ -130,6 +187,16 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   out_stats->logical_page_capacity = pool->kv_pool.logical_page_capacity();
   out_stats->slot_count           = static_cast<std::uint32_t>(pool->kv_pool.table_row_count());
   out_stats->free_slot_count      = static_cast<std::uint32_t>(pool->free_slots.size());
+  out_stats->kv_format            = pool->kv_format;
+  // GitHub #122: both derived from the pool the leaf actually planned --
+  // `kv_page_bytes` came out of `plan_paged_kv_pool` over this format's
+  // planes, and the page size is the vendored `kPagedKVPageSize`. Nothing
+  // here is a per-format constant, so a format (or budget) change shows up
+  // as a different number rather than as a surprise under load.
+  out_stats->kv_bytes_per_token =
+      pool->kv_page_bytes / static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
+  out_stats->kv_token_capacity = static_cast<std::uint64_t>(pool->kv_pool.page_group_count()) *
+                                 static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
   return 0;
 }
 

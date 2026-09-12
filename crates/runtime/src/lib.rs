@@ -16,7 +16,12 @@ use ignis_core::{
 #[cfg(feature = "cuda")]
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
-pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel, KV_PAGE_TOKENS, kv_pool_pages};
+pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel};
+
+/// Tokens held by one physical KV page, in either format
+/// (`kPagedKVPageSize`). Re-exported from `ignis-core` so the server's
+/// scheduler accounting and the leaf name the same constant.
+pub use ignis_core::KV_PAGE_TOKENS;
 
 /// The default prefill chunk width, in tokens (spec
 /// `.scratch/runtime/specs/02-real-prefill.md`): the reference's own
@@ -38,27 +43,24 @@ pub const PREFILL_CHUNK_ALIGNMENT: u32 = 128;
 /// `02-real-prefill.md`, user story 22).
 pub const DEFAULT_MAX_CONTEXT: u32 = 32_768 + 8_192;
 
-/// The default paged-KV pool budget, in sequence-tokens: the *pool* the
-/// leaf builds, which every live sequence draws its pages from.
+/// The paged-KV pool's auto byte budget for a configured `max_context`
+/// under `format` (P4-04, GitHub #122): [`ignis_core::DEFAULT_KV_POOL_BYTES`]
+/// (4 GiB), raised if one configured context would not fit inside it.
 ///
 /// Deliberately not `slot_count * max_context`: reserving a full
 /// 40,960-token context for each of the eight decode lanes is ~20 GiB of
-/// BF16 paged KV at this model's geometry (16 GQA layers x 4 KV heads x
-/// 256 head_dim x K+V x 2 bytes = 64 KiB per sequence-token), which does
-/// not fit next to ~19 GB of weights. The pool is sized so one sequence
-/// can take the whole 32K cell and the other lanes still have a working
-/// budget; a request the free pool cannot cover is a scheduler admission
-/// decision, not a load failure.
-const DEFAULT_KV_POOL_TOKENS: u32 = 65_536;
-
-/// The paged-KV pool budget for a configured `max_context`: never smaller
-/// than it, so the pool can always serve one full sequence, floored at
-/// [`DEFAULT_KV_POOL_TOKENS`] otherwise. Not independently configurable —
-/// spec `02-real-prefill.md` names only the chunk width and the
-/// per-sequence cap as engine-shape flags — so this is a function of
-/// `max_context`, not a third default of its own.
-pub fn kv_pool_tokens_for(max_context: u32) -> u32 {
-    DEFAULT_KV_POOL_TOKENS.max(max_context)
+/// BF16 paged KV at this model's geometry, which does not fit next to
+/// ~19 GB of weights. The pool is sized so one sequence can take the whole
+/// 32K cell and the other lanes still have a working budget; a request the
+/// free pool cannot cover is a scheduler admission decision, not a load
+/// failure.
+///
+/// The budget is in bytes, and what it *buys* is derived from the format:
+/// 4 GiB is 65,536 resident BF16 tokens and 465,984 hq-e8-2b ones. That is
+/// why this replaced the former `kv_pool_tokens_for` — a token target is
+/// exactly the thing that cannot be format-independent.
+pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64 {
+    ignis_core::auto_kv_pool_bytes(format, ignis_core::KvGeometry::qwen38_27b(), max_context)
 }
 
 /// A failure returned by the step ABI.

@@ -188,6 +188,7 @@ fn capture_hq_kv_fixture_from_a_real_prefill() {
     let pool = SeqPool::create(
         &cfg,
         &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::Bf16,
             kv_page_group_count: MAX_CONTEXT / 64,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 1,

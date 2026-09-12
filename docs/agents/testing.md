@@ -197,9 +197,14 @@ cargo run -p ignis-bench -- g2 `
 
 `ignis-server` takes the engine shape the run needs as flags (each over its
 own env var, each validated before any loader work starts): `--prefill-chunk`
-(default 1024, a nonzero multiple of 128) and `--max-context` (default
-40960 — a 32K prompt plus an 8K generation budget). The paged-KV pool the
-leaf builds is derived from `--max-context`, not a flag of its own.
+(default 1024, a nonzero multiple of 128), `--max-context` (default
+40960 — a 32K prompt plus an 8K generation budget), `--kv-format` (`bf16`
+or `hq-e8-2b`, default `bf16` until the hq attention routes land) and
+`--kv-pool-bytes` (default auto: 4 GiB, raised if one `--max-context`
+sequence would not fit). The paged-KV pool is sized in **bytes**; the
+resident-token capacity that budget buys is derived from the format and
+logged at load as `ignis.runtime.kv_pool`, so a run's KV profile is read off
+that event rather than computed from a flag.
 
 ## Where tests live
 

@@ -36,6 +36,8 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 // to be kept in sync by hand across the crate boundary.
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
+pub use ignis_core::KvFormat;
+
 /// The fully-resolved config `main` needs to start the server — one field
 /// per env var, each independently resolved as flag → env → default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,13 +54,17 @@ pub struct Config {
     /// The maximum per-sequence context, in tokens (the largest prompt +
     /// generation budget a single request may reserve).
     pub max_context: u32,
-    /// The paged-KV pool budget, in sequence-tokens: not independently
-    /// configurable (spec `02-real-prefill.md` names only two engine-shape
-    /// flags — the chunk width and the per-sequence cap). Derived from
-    /// [`Config::max_context`] via [`ignis_runtime::kv_pool_tokens_for`],
-    /// which is never smaller than it — a pool the cap cannot fit inside
-    /// would admit a request the leaf can never allocate.
-    pub kv_pool_tokens: u32,
+    /// The KV storage format this load runs on (ADR 0022, GitHub #122),
+    /// fixed for the life of the load.
+    pub kv_format: KvFormat,
+    /// The paged-KV pool budget, in **bytes**. Never in tokens: what the
+    /// budget is worth in tokens is derived from [`Config::kv_format`] and
+    /// reported at load. When the operator names none, this is
+    /// [`ignis_runtime::auto_kv_pool_bytes`] for the resolved format and
+    /// context — never smaller than one full context, since a pool the
+    /// per-sequence cap cannot fit inside would admit a request the leaf
+    /// can never allocate.
+    pub kv_pool_bytes: u64,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
@@ -111,6 +117,8 @@ pub fn resolve(
     let mut reasoning_effort = None;
     let mut prefill_chunk = None;
     let mut max_context = None;
+    let mut kv_format = None;
+    let mut kv_pool_bytes = None;
     let mut request_timeout = None;
 
     let mut i = 0;
@@ -125,6 +133,8 @@ pub fn resolve(
             "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
+            "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
+            "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
@@ -158,7 +168,11 @@ pub fn resolve(
     // after a ~19 GB weight upload.
     let prefill_chunk = resolve_prefill_chunk(prefill_chunk, &env)?;
     let max_context = resolve_max_context(max_context, &env)?;
-    let kv_pool_tokens = ignis_runtime::kv_pool_tokens_for(max_context);
+    // The format is resolved before the budget, because what a budget is
+    // worth in tokens — and so what the auto default has to be — depends on
+    // it (GitHub #122).
+    let kv_format = resolve_kv_format(kv_format, &env)?;
+    let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
 
     Ok(ConfigOutcome::Config(Config {
@@ -170,7 +184,8 @@ pub fn resolve(
         reasoning_effort,
         prefill_chunk,
         max_context,
-        kv_pool_tokens,
+        kv_format,
+        kv_pool_bytes,
         request_timeout_secs,
     }))
 }
@@ -222,6 +237,75 @@ fn resolve_max_context(
     Ok(context)
 }
 
+/// `--kv-format` / `IGNIS_KV_FORMAT` / [`KvFormat::default`] (`bf16`).
+fn resolve_kv_format(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<KvFormat, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_FORMAT"))) else {
+        return Ok(KvFormat::default());
+    };
+    KvFormat::parse(&raw).map_err(|e| ConfigError(format!("`--kv-format`: {e}")))
+}
+
+/// A byte-count value (`--kv-pool-bytes`), with the size suffixes an
+/// operator actually types: a bare count, or one followed by `K`/`M`/`G`
+/// (case-insensitive, binary — `4G` is 4 GiB), optionally spelled `KiB`,
+/// `MiB`, `GiB` or `KB`/`MB`/`GB`. A pool budget is naturally a number of
+/// gibibytes, and making the operator write 4294967296 invites the typo
+/// that silently starts a server with a tenth of the pool it meant.
+fn parse_bytes(flag: &str, raw: &str) -> Result<u64, ConfigError> {
+    let text = raw.trim();
+    let bad = || ConfigError(format!("`{flag}` expects a byte count, got `{raw}`"));
+    let digits_end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, suffix) = text.split_at(digits_end);
+    if digits.is_empty() {
+        return Err(bad());
+    }
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return Err(bad()),
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .ok_or_else(bad)
+}
+
+/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES` / the auto default for the
+/// resolved format and context ([`ignis_runtime::auto_kv_pool_bytes`]).
+///
+/// An explicit budget is *not* raised to fit the context: if the operator
+/// names one too small, that is a usage error caught here, before any
+/// loader work — the auto default is what "big enough by construction"
+/// means, and silently overriding an explicit number would make the flag a
+/// suggestion.
+fn resolve_kv_pool_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+    format: KvFormat,
+    max_context: u32,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_POOL_BYTES"))) else {
+        return Ok(ignis_runtime::auto_kv_pool_bytes(format, max_context));
+    };
+    let bytes = parse_bytes("--kv-pool-bytes", &raw)?;
+    ignis_core::plan_kv_pool_for_context(
+        format,
+        ignis_core::KvGeometry::qwen38_27b(),
+        bytes,
+        max_context,
+    )
+    .map_err(|e| ConfigError(format!("`--kv-pool-bytes`: {e}")))?;
+    Ok(bytes)
+}
+
 /// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
 fn resolve_request_timeout_secs(
     flag: Option<String>,
@@ -260,6 +344,8 @@ fn version_text() -> String {
 }
 
 fn help_text() -> String {
+    let default_kv_format = KvFormat::default().as_str();
+    let default_kv_pool_gib = ignis_core::DEFAULT_KV_POOL_BYTES / (1024 * 1024 * 1024);
     format!(
         "ignis-server: the OpenAI-compatible HTTP entrypoint (localhost, no auth)\n\
          \n\
@@ -274,6 +360,8 @@ fn help_text() -> String {
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
+         \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
+         \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: auto, {default_kv_pool_gib} GiB; accepts a K/M/G suffix)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
@@ -321,7 +409,11 @@ mod tests {
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
-        assert_eq!(config.kv_pool_tokens, ignis_runtime::kv_pool_tokens_for(DEFAULT_MAX_CONTEXT));
+        assert_eq!(config.kv_format, KvFormat::Bf16);
+        assert_eq!(
+            config.kv_pool_bytes,
+            ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, DEFAULT_MAX_CONTEXT)
+        );
         assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
@@ -465,7 +557,12 @@ mod tests {
             config.max_context
         );
         // The pool the leaf builds must be able to hold one such sequence.
-        assert!(config.kv_pool_tokens >= config.max_context);
+        let plan = ignis_core::plan_kv_pool(
+            config.kv_format,
+            ignis_core::KvGeometry::qwen38_27b(),
+            config.kv_pool_bytes,
+        );
+        assert!(plan.token_capacity >= u64::from(config.max_context));
     }
 
     #[test]
@@ -522,16 +619,20 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_always_grows_to_hold_the_configured_cap() {
-        // The pool is not independently configurable (spec
-        // `02-real-prefill.md` names only `--prefill-chunk` and
-        // `--max-context`); a cap above the default pool raises the pool
-        // with it, automatically, so admission can never promise a context
-        // the pool cannot hold.
+    fn the_auto_pool_budget_always_grows_to_hold_the_configured_cap() {
+        // A cap above the default budget raises the budget with it,
+        // automatically, so admission can never promise a context the pool
+        // cannot hold. 200,000 BF16 tokens is well past the 4 GiB default.
         let a = args(&["--max-context", "200000"]);
         let config = expect_config(resolve(&a, no_env).expect("resolve"));
         assert_eq!(config.max_context, 200_000);
-        assert!(config.kv_pool_tokens >= 200_000);
+        assert!(config.kv_pool_bytes > ignis_core::DEFAULT_KV_POOL_BYTES);
+        let plan = ignis_core::plan_kv_pool(
+            config.kv_format,
+            ignis_core::KvGeometry::qwen38_27b(),
+            config.kv_pool_bytes,
+        );
+        assert!(plan.token_capacity >= 200_000);
     }
 
     #[test]
@@ -540,8 +641,105 @@ mod tests {
         else {
             panic!("expected Help");
         };
-        for flag in ["--prefill-chunk", "--max-context"] {
+        for flag in [
+            "--prefill-chunk",
+            "--max-context",
+            "--kv-format",
+            "--kv-pool-bytes",
+        ] {
             assert!(text.contains(flag), "help must document {flag}:\n{text}");
+        }
+        assert!(text.contains("hq-e8-2b"), "help must name both formats:\n{text}");
+    }
+
+    // ── the KV format and pool budget (GitHub #122) ──────────────────────
+
+    #[test]
+    fn the_kv_format_flag_wins_over_the_env_var_and_the_default() {
+        let env = env_map(&[("IGNIS_KV_FORMAT", "bf16")]);
+        let config = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), env).expect("resolve"));
+        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
+
+        let env = env_map(&[("IGNIS_KV_FORMAT", "hq-e8-2b")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
+    }
+
+    #[test]
+    fn an_unknown_kv_format_is_a_usage_error() {
+        let err = resolve(&args(&["--kv-format", "fp8"]), no_env).expect_err("unknown format");
+        assert!(err.0.contains("--kv-format") && err.0.contains("fp8"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_same_default_budget_buys_more_tokens_under_hq() {
+        // The format is a real option: one budget, two capacities. This is
+        // the whole reason the pool is described in bytes.
+        let geometry = ignis_core::KvGeometry::qwen38_27b();
+        let bf16 = expect_config(resolve(&[], no_env).expect("resolve"));
+        let hq = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), no_env).expect("resolve"));
+        assert_eq!(bf16.kv_pool_bytes, hq.kv_pool_bytes);
+        let bf16_capacity =
+            ignis_core::plan_kv_pool(bf16.kv_format, geometry, bf16.kv_pool_bytes).token_capacity;
+        let hq_capacity =
+            ignis_core::plan_kv_pool(hq.kv_format, geometry, hq.kv_pool_bytes).token_capacity;
+        assert!(hq_capacity > bf16_capacity * 7, "{hq_capacity} vs {bf16_capacity}");
+        // And it clears the standard target profile: 8 lanes x 40,960.
+        assert!(hq_capacity >= 8 * 40_960);
+    }
+
+    #[test]
+    fn an_explicit_pool_budget_overrides_the_auto_default() {
+        let config =
+            expect_config(resolve(&args(&["--kv-pool-bytes", "8G"]), no_env).expect("resolve"));
+        assert_eq!(config.kv_pool_bytes, 8 * 1024 * 1024 * 1024);
+
+        let env = env_map(&[("IGNIS_KV_POOL_BYTES", "6144MiB")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.kv_pool_bytes, 6144 * 1024 * 1024);
+
+        // A bare count is still a byte count.
+        let config = expect_config(
+            resolve(&args(&["--kv-pool-bytes", "4294967296"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.kv_pool_bytes, 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_pool_budget_too_small_for_the_context_is_refused_before_any_loader_work() {
+        // 1 MiB cannot hold a 40,960-token sequence in either format. The
+        // message has to name the budget, the format and the capacity it
+        // bought, so the operator can see which of the three to change.
+        let err =
+            resolve(&args(&["--kv-pool-bytes", "1M"]), no_env).expect_err("a budget this small");
+        assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0);
+        assert!(err.0.contains("bf16"), "{}", err.0);
+        assert!(err.0.contains("40960"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_budget_big_enough_only_under_hq_is_accepted_only_under_hq() {
+        // 512 MiB holds a 40,960-token sequence under hq (378 MB) and not
+        // under BF16 (2.5 GiB) — the format decides whether the load starts.
+        let too_small_for_bf16 = args(&["--kv-pool-bytes", "512M"]);
+        assert!(resolve(&too_small_for_bf16, no_env).is_err());
+
+        let under_hq = args(&["--kv-pool-bytes", "512M", "--kv-format", "hq-e8-2b"]);
+        let config = expect_config(resolve(&under_hq, no_env).expect("resolve"));
+        assert_eq!(config.kv_pool_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_malformed_pool_budget_is_a_usage_error() {
+        for raw in ["", "4 GiB please", "-1", "4TB", "G"] {
+            let a = args(&["--kv-pool-bytes", raw]);
+            match resolve(&a, no_env) {
+                // An empty value falls through to the auto default, the
+                // same as every other flag here (`non_empty`).
+                Ok(_) if raw.is_empty() => {}
+                Ok(_) => panic!("`{raw}` must not parse as a byte count"),
+                Err(err) => assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0),
+            }
         }
     }
 

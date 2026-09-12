@@ -19,6 +19,7 @@ use std::marker::PhantomData;
 use std::os::raw::c_void;
 
 use crate::compute::ModelConfig;
+use crate::kv_format::KvFormat;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
@@ -36,6 +37,9 @@ pub(crate) mod ffi {
     pub struct IgnisSeqPoolSpec {
         pub num_kv_heads: u32,
         pub head_dim: u32,
+        /// `enum ignis_kv_format` (GitHub #122): what the pool's planes
+        /// store, fixed for the life of the load.
+        pub kv_format: i32,
         pub kv_page_group_count: u32,
         pub max_context_tokens: u32,
         pub slot_count: u32,
@@ -60,6 +64,14 @@ pub(crate) mod ffi {
         pub logical_page_capacity: u32,
         pub slot_count: u32,
         pub free_slot_count: u32,
+        /// `enum ignis_kv_format` — the format the pool actually built
+        /// with, read back rather than assumed.
+        pub kv_format: i32,
+        /// Bytes one sequence-token costs in that format.
+        pub kv_bytes_per_token: u64,
+        /// Resident sequence-tokens the pool holds — the derived capacity
+        /// the byte budget bought (GitHub #122).
+        pub kv_token_capacity: u64,
     }
 
     /// 1:1 with `struct ignis_seq_stats`.
@@ -150,9 +162,13 @@ fn kv_capture_last_error() -> String {
 /// `ignis_seq_pool_create` needs beyond what [`ModelConfig`] already
 /// carries.
 pub struct SeqPoolBudget {
-    /// The physical KV page count this pool holds (typically from
-    /// [`ignis_artifact::paged_kv_page_budget`] against the VRAM left after
-    /// weights).
+    /// The KV storage format the pool's planes hold (ADR 0022, GitHub
+    /// #122). Fixed for the life of the load: it decides the planes, and so
+    /// how many tokens the page count below is worth.
+    pub kv_format: KvFormat,
+    /// The physical KV page count this pool holds — what a byte budget
+    /// bought under `kv_format` ([`crate::kv_format::plan_kv_pool`], whose
+    /// arithmetic is the leaf's own `ignis_paged_kv_page_budget`).
     pub kv_page_group_count: u32,
     /// The largest single sequence's KV reservation, in tokens.
     pub max_context_tokens: u32,
@@ -177,6 +193,7 @@ impl SeqPool {
         let spec = ffi::IgnisSeqPoolSpec {
             num_kv_heads: cfg.num_kv_heads as u32,
             head_dim: cfg.head_dim as u32,
+            kv_format: budget.kv_format.abi_code(),
             kv_page_group_count: budget.kv_page_group_count,
             max_context_tokens: budget.max_context_tokens,
             slot_count: budget.slot_count,
