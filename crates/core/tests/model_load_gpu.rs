@@ -76,7 +76,7 @@ fn real_nvfp4full_model_load_binds_every_text_scope_object() {
     // the chunk width, not on a busy GPU, and is exercised separately by
     // `an_unaffordable_prefill_chunk_fails_the_load_naming_the_shortfall`
     // below.)
-    let model = load_qwen38_27b(&reader, &artifact, &handles, 128, 128)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, 128, 128, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
     let stats = model.stats();
     // The 247 `*_input_scale_divisor` scalars (one per NVFP4 projection,
@@ -142,7 +142,7 @@ fn larger_prefill_chunk_reserves_more_program_vram() {
     // #83: prefill_chunk_tokens must not exceed max_context_tokens).
     const MAX_CONTEXT: u32 = 1024;
     let vram_for = |chunk: u32| -> u64 {
-        let model = load_qwen38_27b(&reader, &artifact, &handles, chunk, MAX_CONTEXT)
+        let model = load_qwen38_27b(&reader, &artifact, &handles, chunk, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
             .unwrap_or_else(|e| panic!("ignis_model_load (chunk={chunk}): {e}"));
         let pool = SeqPool::create(
             &ModelConfig::qwen38_27b(),
@@ -206,7 +206,7 @@ fn an_unaffordable_prefill_chunk_fails_the_load_naming_the_shortfall() {
     // GitHub #83: prefill_chunk_tokens must not exceed max_context_tokens) so
     // the load fails on the memory budget, not on that unrelated precondition.
     const HUGE_CHUNK: u32 = 8 * 1024 * 1024;
-    let err = match load_qwen38_27b(&reader, &artifact, &handles, HUGE_CHUNK, HUGE_CHUNK) {
+    let err = match load_qwen38_27b(&reader, &artifact, &handles, HUGE_CHUNK, HUGE_CHUNK, ignis_core::KvFormat::Bf16) {
         Ok(_) => panic!("an unaffordable chunk width must fail the load"),
         Err(e) => e,
     };

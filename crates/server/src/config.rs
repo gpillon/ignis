@@ -237,7 +237,9 @@ fn resolve_max_context(
     Ok(context)
 }
 
-/// `--kv-format` / `IGNIS_KV_FORMAT` / [`KvFormat::default`] (`bf16`).
+/// `--kv-format` / `IGNIS_KV_FORMAT` / [`KvFormat::default`]
+/// (`hq-e8-2b`, the serving default since GitHub #123; `bf16` is the
+/// retained oracle format an operator asks for by name).
 fn resolve_kv_format(
     flag: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
@@ -409,10 +411,10 @@ mod tests {
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
-        assert_eq!(config.kv_format, KvFormat::Bf16);
+        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
         assert_eq!(
             config.kv_pool_bytes,
-            ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, DEFAULT_MAX_CONTEXT)
+            ignis_runtime::auto_kv_pool_bytes(KvFormat::HqE8_2b, DEFAULT_MAX_CONTEXT)
         );
         assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
@@ -622,17 +624,26 @@ mod tests {
     fn the_auto_pool_budget_always_grows_to_hold_the_configured_cap() {
         // A cap above the default budget raises the budget with it,
         // automatically, so admission can never promise a context the pool
-        // cannot hold. 200,000 BF16 tokens is well past the 4 GiB default.
-        let a = args(&["--max-context", "200000"]);
-        let config = expect_config(resolve(&a, no_env).expect("resolve"));
-        assert_eq!(config.max_context, 200_000);
-        assert!(config.kv_pool_bytes > ignis_core::DEFAULT_KV_POOL_BYTES);
-        let plan = ignis_core::plan_kv_pool(
-            config.kv_format,
-            ignis_core::KvGeometry::qwen38_27b(),
-            config.kv_pool_bytes,
-        );
-        assert!(plan.token_capacity >= 200_000);
+        // cannot hold. The cap at which that happens is format-dependent --
+        // 4 GiB buys 65,536 BF16 tokens and 465,984 hq ones -- so each arm
+        // names a context past its own format's default capacity rather than
+        // one number that only stresses whichever format happens to be the
+        // default (GitHub #123 made that hq).
+        for (format, context) in [("bf16", 200_000u32), ("hq-e8-2b", 600_000)] {
+            let a = args(&["--kv-format", format, "--max-context", &context.to_string()]);
+            let config = expect_config(resolve(&a, no_env).expect("resolve"));
+            assert_eq!(config.max_context, context);
+            assert!(
+                config.kv_pool_bytes > ignis_core::DEFAULT_KV_POOL_BYTES,
+                "{format} at {context}: the budget did not grow past the default"
+            );
+            let plan = ignis_core::plan_kv_pool(
+                config.kv_format,
+                ignis_core::KvGeometry::qwen38_27b(),
+                config.kv_pool_bytes,
+            );
+            assert!(plan.token_capacity >= u64::from(context), "{format} at {context}");
+        }
     }
 
     #[test]
@@ -660,9 +671,11 @@ mod tests {
         let config = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), env).expect("resolve"));
         assert_eq!(config.kv_format, KvFormat::HqE8_2b);
 
-        let env = env_map(&[("IGNIS_KV_FORMAT", "hq-e8-2b")]);
+        // Both halves name the format the default is *not*, so neither can
+        // pass by agreeing with it (GitHub #123 made the default hq-e8-2b).
+        let env = env_map(&[("IGNIS_KV_FORMAT", "bf16")]);
         let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.kv_format, KvFormat::HqE8_2b);
+        assert_eq!(config.kv_format, KvFormat::Bf16);
     }
 
     #[test]
@@ -676,7 +689,7 @@ mod tests {
         // The format is a real option: one budget, two capacities. This is
         // the whole reason the pool is described in bytes.
         let geometry = ignis_core::KvGeometry::qwen38_27b();
-        let bf16 = expect_config(resolve(&[], no_env).expect("resolve"));
+        let bf16 = expect_config(resolve(&args(&["--kv-format", "bf16"]), no_env).expect("resolve"));
         let hq = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), no_env).expect("resolve"));
         assert_eq!(bf16.kv_pool_bytes, hq.kv_pool_bytes);
         let bf16_capacity =
@@ -709,19 +722,23 @@ mod tests {
     fn a_pool_budget_too_small_for_the_context_is_refused_before_any_loader_work() {
         // 1 MiB cannot hold a 40,960-token sequence in either format. The
         // message has to name the budget, the format and the capacity it
-        // bought, so the operator can see which of the three to change.
-        let err =
-            resolve(&args(&["--kv-pool-bytes", "1M"]), no_env).expect_err("a budget this small");
-        assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0);
-        assert!(err.0.contains("bf16"), "{}", err.0);
-        assert!(err.0.contains("40960"), "{}", err.0);
+        // bought, so the operator can see which of the three to change --
+        // and it names whichever format is actually in force, which is why
+        // both are asked here.
+        for format in ["bf16", "hq-e8-2b"] {
+            let err = resolve(&args(&["--kv-pool-bytes", "1M", "--kv-format", format]), no_env)
+                .expect_err("a budget this small");
+            assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0);
+            assert!(err.0.contains(format), "{}", err.0);
+            assert!(err.0.contains("40960"), "{}", err.0);
+        }
     }
 
     #[test]
     fn a_budget_big_enough_only_under_hq_is_accepted_only_under_hq() {
         // 512 MiB holds a 40,960-token sequence under hq (378 MB) and not
         // under BF16 (2.5 GiB) — the format decides whether the load starts.
-        let too_small_for_bf16 = args(&["--kv-pool-bytes", "512M"]);
+        let too_small_for_bf16 = args(&["--kv-pool-bytes", "512M", "--kv-format", "bf16"]);
         assert!(resolve(&too_small_for_bf16, no_env).is_err());
 
         let under_hq = args(&["--kv-pool-bytes", "512M", "--kv-format", "hq-e8-2b"]);

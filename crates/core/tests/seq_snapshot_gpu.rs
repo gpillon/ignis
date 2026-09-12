@@ -103,8 +103,15 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
-        .unwrap_or_else(|e| panic!("load model: {e}"));
+    let model = load_qwen38_27b(
+        &reader,
+        &artifact,
+        &handles,
+        MAX_CONTEXT,
+        MAX_CONTEXT,
+        ignis_core::KvFormat::Bf16,
+    )
+    .unwrap_or_else(|e| panic!("load model: {e}"));
     // Two slots and room for two full-context sequences plus a short one:
     // the restore target is allocated after the source is released, but the
     // mid-chunk sequence below lives alongside it.

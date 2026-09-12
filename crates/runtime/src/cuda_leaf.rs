@@ -77,8 +77,10 @@ impl Default for CudaLeafConfig {
             // builds a leaf directly (the GPU layer/program tests) rather
             // than through the server.
             max_context_tokens: crate::DEFAULT_MAX_CONTEXT,
-            // BF16 until the hq attention routes land (GitHub #123): a load
-            // that names no format must be one that can serve a token.
+            // hq-e8-2b since GitHub #123 wired its attention routes: the
+            // serving default ADR 0022 named, now that it can serve. A test
+            // that wants the oracle format says `KvFormat::Bf16` rather than
+            // inheriting it from here.
             kv_format: KvFormat::default(),
             kv_pool_bytes: crate::auto_kv_pool_bytes(
                 KvFormat::default(),
@@ -213,12 +215,16 @@ impl StepLeaf for CudaLeaf {
             .config
             .kv_pool_plan()
             .map_err(|e| leaf_error("kv pool plan", e.to_string()))?;
+        // The format reaches the load itself (P4-05, GitHub #123), not just
+        // the pool: the leaf sizes its attention workspace from it, and the
+        // GQA layers refuse a pool built in the other one.
         let model = model_load::load_qwen38_27b(
             &self.reader,
             &self.artifact,
             &self.handles,
             self.config.prefill_chunk_tokens,
             self.config.max_context_tokens,
+            self.config.kv_format,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
@@ -262,19 +268,12 @@ impl StepLeaf for CudaLeaf {
         // itself never returns Err for that reason; only a null model/pool
         // (impossible here) would.
         //
-        // Skipped outright under hq-e8-2b (GitHub #122): a decode round is
-        // an attention call, and the hq attention routes are GitHub #123 —
-        // so every width would fail capture and log its own refusal. One
-        // line saying the format is why beats eight saying it again.
-        if self.config.kv_format != KvFormat::Bf16 {
-            // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80).
-            tracing::warn!(
-                name: "ignis.runtime.decode_graph_capture_skipped",
-                kv_format = self.config.kv_format.as_str(),
-                "decode graph capture skipped: this KV format cannot serve a token yet (GitHub #123)"
-            );
-            return Ok(CudaModel { model, pool });
-        }
+        // Format-independent since P4-05 (GitHub #123): a capture set is one
+        // per process either way, and the hq codec keeps fixed bytes per row
+        // with a bounded, host-free escalation path, so the addresses a
+        // width's graph bakes in are as stable under hq as under BF16 (ADR
+        // 0022). #122's outright skip under hq is gone with the refusal it
+        // existed to avoid eight copies of.
         let capture = step::capture_decode_graphs(&model, &pool)
             .map_err(|e| leaf_error("decode graph capture", e))?;
         // Reported unconditionally (GitHub #102's acceptance: "startup cost
@@ -421,7 +420,8 @@ mod tests {
     fn the_pool_plan_reports_whole_pages_of_the_configured_format() {
         let config = CudaLeafConfig::default();
         let plan = config.kv_pool_plan().expect("the auto default always fits");
-        assert_eq!(plan.format, KvFormat::Bf16);
+        // hq-e8-2b since GitHub #123: the serving default ADR 0022 named.
+        assert_eq!(plan.format, KvFormat::HqE8_2b);
         assert_eq!(
             u64::from(plan.page_count) * u64::from(ignis_core::KV_PAGE_TOKENS),
             plan.token_capacity
@@ -446,26 +446,35 @@ mod tests {
     fn a_byte_budget_too_small_for_the_context_fails_the_load_naming_the_numbers() {
         // GitHub #122: the refusal happens in `load_model`, before the
         // weights go up — and the message has to name the budget, the
-        // format and the capacity it bought.
-        let config = CudaLeafConfig {
-            kv_pool_bytes: 1024 * 1024,
-            ..CudaLeafConfig::default()
-        };
-        let err = config.kv_pool_plan().expect_err("1 MiB holds no full context");
-        let message = err.to_string();
-        assert!(message.contains("1048576"), "{message}");
-        assert!(message.contains("bf16"), "{message}");
-        assert!(
-            message.contains(&crate::DEFAULT_MAX_CONTEXT.to_string()),
-            "{message}"
-        );
+        // format and the capacity it bought. Both formats are asked, because
+        // "the format" is whichever one is in force and the message is only
+        // useful if it names that one.
+        for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+            let config = CudaLeafConfig {
+                kv_format: format,
+                kv_pool_bytes: 1024 * 1024,
+                ..CudaLeafConfig::default()
+            };
+            let err = config.kv_pool_plan().expect_err("1 MiB holds no full context");
+            let message = err.to_string();
+            assert!(message.contains("1048576"), "{message}");
+            assert!(message.contains(format.as_str()), "{message}");
+            assert!(
+                message.contains(&crate::DEFAULT_MAX_CONTEXT.to_string()),
+                "{message}"
+            );
+        }
     }
 
     #[test]
     fn the_same_budget_buys_more_tokens_under_hq_than_under_bf16() {
         // The load option is a real option: nothing but the format changes
-        // between these two plans.
-        let bf16 = CudaLeafConfig::default();
+        // between these two plans. Both are named, so neither arm depends on
+        // which one `Default` currently is.
+        let bf16 = CudaLeafConfig {
+            kv_format: KvFormat::Bf16,
+            ..CudaLeafConfig::default()
+        };
         let hq = CudaLeafConfig {
             kv_format: KvFormat::HqE8_2b,
             ..CudaLeafConfig::default()

@@ -26,6 +26,7 @@ use ignis_artifact::{
 };
 
 use crate::compute::{LayerKind, ModelConfig};
+use crate::kv_format::KvFormat;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
@@ -94,6 +95,7 @@ pub(crate) mod ffi {
             topology: *const IgnisTopology,
             prefill_chunk_tokens: u32,
             max_context_tokens: u32,
+            kv_format: i32,
             out_model: *mut *mut IgnisModel,
         ) -> i32;
 
@@ -366,12 +368,23 @@ fn qwen38_27b_topology(layer_kinds_buf: &mut Vec<i32>) -> ffi::IgnisTopology {
 /// `max_context_tokens` the caller's [`crate::seq::SeqPool`] will be built
 /// with — it sizes the GQA attention workspace for the worst-case visible-key
 /// count.
+///
+/// `kv_format` must be the format of every [`crate::seq::SeqPool`] used with
+/// the returned handle (P4-05, GitHub #123). It is a load argument, not
+/// something the leaf reads off the pool, because the attention workspace is
+/// part of the scratch reservation and its size depends on the format: the
+/// hq-e8-2b prompt route materializes the envelope's visible history into two
+/// rotated-frame BF16 scratch planes that BF16's own prompt route has no
+/// counterpart for. A pool built in the other format is refused by the
+/// layer entry points rather than run against an arena sized for this one —
+/// the format is fixed for the life of a load (ADR 0022).
 pub fn load_qwen38_27b(
     reader: &Reader,
     artifact: &MaterializedArtifact,
     handles: &[ObjectHandle],
     prefill_chunk_tokens: u32,
     max_context_tokens: u32,
+    kv_format: KvFormat,
 ) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(reader, artifact, handles)?;
@@ -386,6 +399,7 @@ pub fn load_qwen38_27b(
             &topology,
             prefill_chunk_tokens,
             max_context_tokens,
+            kv_format.abi_code(),
             &mut handle,
         )
     };

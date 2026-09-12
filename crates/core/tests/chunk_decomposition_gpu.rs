@@ -202,7 +202,7 @@ fn prefill_chunk_and_traversal_sweeps() {
         // One model per width: the chunk width is fixed at load (it sizes the
         // leaf's scratch arena), so the sweep has to reload. The materialized
         // weights are shared -- only the arena is re-reserved.
-        let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT)
+        let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
             .unwrap_or_else(|e| panic!("ignis_model_load(chunk={width}): {e}"));
         let pool = SeqPool::create(&cfg, &budget)
             .unwrap_or_else(|e| panic!("seq pool create(chunk={width}): {e}"));
@@ -248,7 +248,7 @@ fn prefill_chunk_and_traversal_sweeps() {
     let mut baseline: Option<f64> = None;
     for &tokens in &spans {
         let width = u32::try_from(tokens).expect("span fits u32");
-        let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT)
+        let model = load_qwen38_27b(&reader, &artifact, &handles, width, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
             .unwrap_or_else(|e| panic!("ignis_model_load(chunk={width}): {e}"));
         let pool = SeqPool::create(&cfg, &budget)
             .unwrap_or_else(|e| panic!("seq pool create({tokens}): {e}"));

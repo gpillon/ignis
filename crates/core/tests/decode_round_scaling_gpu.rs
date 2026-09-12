@@ -137,7 +137,7 @@ fn a_wide_decode_round_costs_about_what_its_single_lane_round_costs() {
     // One model and one pool for both widths, so the two readings differ in
     // the round's width and nothing else -- and so both replay graphs
     // captured against the pool they actually run on.
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = new_pool(WIDE as u32).unwrap_or_else(|e| panic!("seq pool create: {e}"));
     let capture =

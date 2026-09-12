@@ -164,7 +164,7 @@ fn chunked_prefill_holds_its_span_split_width_and_determinism_properties() {
         const SPLIT_AT: usize = 700; // not a multiple of PREFILL_CHUNK
         assert_ne!(SPLIT_AT % PREFILL_CHUNK as usize, 0);
 
-        let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT)
+        let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
             .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
         let pool = new_pool(2).unwrap_or_else(|e| panic!("seq pool create: {e}"));
 
@@ -206,7 +206,7 @@ fn chunked_prefill_holds_its_span_split_width_and_determinism_properties() {
         const WIDE_CHUNK: u32 = 512;
         let mut results = Vec::with_capacity(2);
         for chunk in [NARROW_CHUNK, WIDE_CHUNK] {
-            let model = load_qwen38_27b(&reader, &artifact, &handles, chunk, MAX_CONTEXT)
+            let model = load_qwen38_27b(&reader, &artifact, &handles, chunk, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
                 .unwrap_or_else(|e| panic!("ignis_model_load(chunk={chunk}): {e}"));
             let pool = new_pool(1).unwrap_or_else(|e| panic!("seq pool create(chunk={chunk}): {e}"));
             match prefill_whole_then_decode(&model, &pool, &span, vocab) {
@@ -243,7 +243,7 @@ fn chunked_prefill_holds_its_span_split_width_and_determinism_properties() {
         );
         let mut runs = Vec::with_capacity(2);
         for _ in 0..2 {
-            let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT)
+            let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
                 .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
             let pool = new_pool(1).unwrap_or_else(|e| panic!("seq pool create: {e}"));
             match prefill_whole_then_decode(&model, &pool, &span, vocab) {

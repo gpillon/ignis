@@ -24,7 +24,14 @@ fn run_once(
     handles: &[ignis_artifact::ObjectHandle],
     prompt: &[i32],
 ) -> Result<Vec<i32>, String> {
-    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT)?;
+    let model = load_qwen38_27b(
+        reader,
+        artifact,
+        handles,
+        MAX_CONTEXT,
+        MAX_CONTEXT,
+        ignis_core::KvFormat::Bf16,
+    )?;
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {

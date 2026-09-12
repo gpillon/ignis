@@ -144,7 +144,7 @@ fn a4_route_agrees_with_a16_route_on_the_same_prompt() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
 
     let vocab = ModelConfig::qwen38_27b().vocab as usize;

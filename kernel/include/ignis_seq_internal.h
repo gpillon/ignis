@@ -83,7 +83,7 @@ enum ignis_kv_plane_role {
  * 2, and asking a BF16 pool for a metadata role is a caller bug: there is no
  * plane that could answer, so it asserts rather than handing back a
  * plausible wrong plane. Check the format first, the way
- * `ignis_kv_layer_view` below does. */
+ * `ignis_kv_fill_layer_planes` below does. */
 inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
                                         ignis_kv_plane_role role) {
   const bool wants_meta = role == IGNIS_KV_PLANE_K_META || role == IGNIS_KV_PLANE_V_META;
@@ -178,27 +178,57 @@ struct ignis_seq {
   std::uint64_t position = 0;
 };
 
-/* The single-sequence cache view one GQA layer's ops take, built from the
- * pool's own KV format (P4-04, GitHub #122).
+/* The cache element type a format's rows are declared as, and the
+ * quant_group that declaration has to carry (P4-05, GitHub #123).
  *
- * Lives here rather than in kernel/src/gqa_layer.cu so the one function that
- * decides which planes and which declared dtype an hq view carries is the
- * one under test (kernel/tests/test_kv_append_format.cu) -- a second copy in
- * the test would leave a bug in this one invisible.
+ * These two are what route the vendored `gqa_attention` family: its wrapper
+ * dispatches on `cache.dtype`, so declaring U8 with quant_group 32 IS the
+ * act of selecting the hq attention kernels over the BF16 ones. Stated once
+ * here, beside the plane mapping, so no call site can select the hq planes
+ * and the BF16 route (or the reverse) by editing only half of a view. */
+inline ninfer::DType ignis_kv_cache_dtype(std::int32_t kv_format) {
+  return kv_format == IGNIS_KV_FORMAT_HQ_E8_2B ? ninfer::DType::U8 : ninfer::DType::BF16;
+}
+
+inline std::int32_t ignis_kv_quant_group(std::int32_t kv_format) {
+  /* A BF16 cache must declare none at all; the hq wrapper requires 32. */
+  return kv_format == IGNIS_KV_FORMAT_HQ_E8_2B ? kIgnisHqQuantGroup : 0;
+}
+
+/* The operator-facing spelling of a format, for a message a human reads.
+ * The same two names `ignis_core::KvFormat::as_str`, the `--kv-format` flag
+ * and `CONTEXT.md` use -- a leaf error that printed the raw enum ordinal
+ * would make the reader translate it back. `"unknown"` covers a value the
+ * ABI rejected, which is the only way one gets this far. */
+inline const char *ignis_kv_format_name(std::int32_t kv_format) {
+  switch (kv_format) {
+  case IGNIS_KV_FORMAT_BF16:
+    return "bf16";
+  case IGNIS_KV_FORMAT_HQ_E8_2B:
+    return "hq-e8-2b";
+  default:
+    return "unknown";
+  }
+}
+
+/* Fills the plane set, dtype and quant_group `view` needs for one GQA
+ * layer's history under `pool`'s format. Shared by the single-sequence and
+ * the batched view builders below, which differ only in how they name the
+ * block table -- one sequence's row, or the pool-wide matrix.
  *
  * Under hq-e8-2b the value planes carry the codec's 64-byte code rows and
  * the `*_scale_pages` slots carry its 8-byte metadata rows (the slots the
- * vendored gqa_attention wrapper reads hq metadata from), with quant_group
- * 32, which that wrapper requires an hq view to declare. Page addressing is
+ * vendored gqa_attention wrapper reads hq metadata from). Page addressing is
  * the same `paged_kv_element_offset` in both formats; only a plane's leading
  * extent differs, which is what keeps capacity math format-independent.
  *
- * The view is non-owning: `seq`'s allocation keeps the mapping and pages
- * alive for as long as the caller uses it. The residual planes stay empty --
- * the hq residual window is not a feature this engine has opted into. */
-inline ninfer::PagedKVLayerView ignis_kv_layer_view(ignis_seq_pool *pool, ignis_seq *seq,
-                                                    std::int32_t gqa_layer) {
-  ninfer::PagedKVLayerView view;
+ * The residual planes stay empty in both. The hq residual window (the exact
+ * BF16 sink + recent rows `ninfer/ops/gqa_attention.h` describes) is a
+ * separate per-slot side store this engine has not opted into; every hq
+ * kernel guards it on a null pointer, so leaving it empty selects the
+ * codec-only path rather than reading uninitialized memory. */
+template <class View>
+inline void ignis_kv_fill_layer_planes(View &view, ignis_seq_pool *pool, std::int32_t gqa_layer) {
   view.k_pages =
       pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_K));
   view.v_pages =
@@ -208,14 +238,47 @@ inline ninfer::PagedKVLayerView ignis_kv_layer_view(ignis_seq_pool *pool, ignis_
         ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_K_META));
     view.v_scale_pages = pool->kv_pool.plane(
         ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_V_META));
-    view.dtype       = ninfer::DType::U8;
-    view.quant_group = kIgnisHqQuantGroup;
-  } else {
-    view.dtype = ninfer::DType::BF16;
   }
-  view.block_table  = seq->kv.block_table();
+  view.dtype        = ignis_kv_cache_dtype(pool->kv_format);
+  view.quant_group  = ignis_kv_quant_group(pool->kv_format);
   view.head_dim     = pool->kv_head_dim;
   view.num_kv_heads = pool->kv_num_kv_heads;
+}
+
+/* The single-sequence cache view, for the ops that take one: A2
+ * (`gqa_kv_append`) and A3 (`gqa_attention_cached`).
+ *
+ * No production caller today, and that is not an oversight. P2-04 (GitHub
+ * #86) replaced the layer's A2+A3 composition with the fused A1, which takes
+ * the *batched* view below, so the only callers left are the leaf's own
+ * append and route-agreement tests. It is kept because those tests must
+ * reach the plane mapping through the one function that decides it
+ * (kernel/tests/test_kv_append_format.cu,
+ * kernel/tests/test_hq_route_agreement.cu) -- each building its own view
+ * would leave a bug in the shared mapping invisible, which is the whole
+ * reason the mapping lives in this header.
+ *
+ * The view is non-owning: `seq`'s allocation keeps the mapping and pages
+ * alive for as long as the caller uses it. */
+inline ninfer::PagedKVLayerView ignis_kv_layer_view(ignis_seq_pool *pool, ignis_seq *seq,
+                                                    std::int32_t gqa_layer) {
+  ninfer::PagedKVLayerView view;
+  ignis_kv_fill_layer_planes(view, pool, gqa_layer);
+  view.block_table = seq->kv.block_table();
+  return view;
+}
+
+/* The batched counterpart (P4-05, GitHub #123): the same planes over the
+ * pool-wide block-table matrix, which is what a decode round's A1 call takes
+ * -- row `b` of it is lane `b`'s own page list, selected by the round's
+ * `kv_table_rows`. No `ignis_seq*`: every address here belongs to the pool
+ * for its lifetime, which is what lets a captured decode graph replay it
+ * (ADR 0019). */
+inline ninfer::PagedKVBatchLayerView ignis_kv_batch_layer_view(ignis_seq_pool *pool,
+                                                               std::int32_t gqa_layer) {
+  ninfer::PagedKVBatchLayerView view;
+  ignis_kv_fill_layer_planes(view, pool, gqa_layer);
+  view.block_tables = pool->kv_pool.block_tables();
   return view;
 }
 

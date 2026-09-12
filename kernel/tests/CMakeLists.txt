@@ -333,3 +333,30 @@ add_test(NAME ignis_kernel_kv_append_format_test COMMAND ignis_kernel_kv_append_
 add_executable(ignis_kernel_seq_snapshot_test test_seq_snapshot.cpp)
 target_link_libraries(ignis_kernel_seq_snapshot_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_snapshot_test COMMAND ignis_kernel_seq_snapshot_test)
+
+# P4-05 (GitHub #123): OURS, not vendored -- `ignis_model_load` refuses a KV
+# format it does not recognize, and lets a recognized one through to the
+# binding. Reachable only from a caller writing the flat C ABI directly (the
+# Rust binding's `KvFormat` is a two-variant enum), and host-only: the check
+# sits ahead of every device call the load makes, which the control arm pins.
+add_executable(ignis_kernel_model_load_kv_format_test test_model_load_kv_format.cpp)
+target_link_libraries(ignis_kernel_model_load_kv_format_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_model_load_kv_format_test
+         COMMAND ignis_kernel_model_load_kv_format_test)
+
+# P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
+# ignis's own BF16 route on identical keys and values (ADR 0022's in-house
+# acceptance for a lossy format). The same q/k/v/gate/positions go through A1
+# twice against two pools differing only in `kv_format`, on both routes the
+# GQA layer dispatches: the Prompt route at W=200 and every narrow width
+# 9..16 at B=1, and the SmallT route at W=1 for every exact batch width 1..8.
+# The tolerance is derived from the codec error ignis_hq_codec_kv_rows_test
+# measured on the same fixture, which is why both read that one file. Links
+# ignis_kernel for the pool ABI, the production view builders and the
+# engine's own attention-workspace sizing, and keeps the no-SKIP_RETURN_CODE
+# rule (ADR 0006).
+add_executable(ignis_kernel_hq_route_agreement_test test_hq_route_agreement.cu)
+target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_link_libraries(ignis_kernel_hq_route_agreement_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_route_agreement_test COMMAND ignis_kernel_hq_route_agreement_test)

@@ -110,7 +110,7 @@ fn device_side_sampling_holds_its_determinism_and_greedy_parity_properties() {
     let greedy = SamplingParams::greedy();
 
     // --- baseline: each sequence decoded alone, batch size 1 --------------
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = new_pool(1).unwrap_or_else(|e| panic!("seq pool create: {e}"));
     let alone_a = run_alone(&model, &pool, seed_a);
@@ -121,7 +121,7 @@ fn device_side_sampling_holds_its_determinism_and_greedy_parity_properties() {
     drop(model);
 
     // --- shared rounds: A, B and a greedy sequence together, in one order --
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = new_pool(3).unwrap_or_else(|e| panic!("seq pool create: {e}"));
     let mut seq_a = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc a: {e}"));
@@ -162,7 +162,7 @@ fn device_side_sampling_holds_its_determinism_and_greedy_parity_properties() {
     );
 
     // --- SamplingParams::greedy() is bit-identical to the plain greedy path
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("model load: {e}"));
     let pool = new_pool(1).unwrap_or_else(|e| panic!("seq pool create: {e}"));
     let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));

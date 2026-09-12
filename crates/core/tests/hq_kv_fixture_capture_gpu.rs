@@ -182,7 +182,7 @@ fn capture_hq_kv_fixture_from_a_real_prefill() {
         }
     };
 
-    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, MAX_CONTEXT, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("load model: {e}"));
     let cfg = ModelConfig::qwen38_27b();
     let pool = SeqPool::create(

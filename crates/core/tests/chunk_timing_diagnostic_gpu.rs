@@ -79,7 +79,7 @@ fn chunked_prefill_reports_its_per_chunk_wall_time() {
     };
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let span = token_span(&frontend, SPAN_TOKENS);
-    let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT)
+    let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
         .unwrap_or_else(|e| panic!("ignis_model_load(chunk={PREFILL_CHUNK}): {e}"));
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
