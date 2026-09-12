@@ -508,3 +508,185 @@ fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
         "a prefix-holding request (publisher or claimant) is never evicted"
     );
 }
+
+// ── ADR 0023 / GitHub #127: class-aware GPU-residency eviction ──────────
+
+/// Scenario 6 — among two device-resident, lane-less (`Prefilling`)
+/// candidates, the `Agent` one is evicted ahead of an older `Interactive`
+/// one (ADR 0023: class outranks LRU on the GPU-residency side, once
+/// eligibility and protection are settled — neither candidate holds a
+/// shared prefix or a lane). Before GitHub #127 this path was plain
+/// oldest-submitted, which would have picked the *older* (`Interactive`)
+/// candidate here instead.
+#[test]
+fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            max_in_flight: 11, // 8 fillers + interactive_a + agent_a2 + b
+            max_prefill_batch: 8,
+            // Exactly enough resident slots for the 8 lane-holding fillers
+            // plus both lane-less candidates — none left over for `b`.
+            resident_slot_capacity: 10,
+            host_capacity_bytes: 64,
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
+
+    // Eight fillers share one 16-token prefix, occupying every lane (and
+    // excluded from eviction by their shared-prefix claim, same as
+    // scenario 3).
+    for _ in 0..8 {
+        sched
+            .submit(
+                RequestInput {
+                    model: "qwen3.8-27b".into(),
+                    tokens: (1..=16).collect(),
+                    params: DecodeParams {
+                        max_tokens: Some(20),
+                        ..DecodeParams::default()
+                    },
+                },
+                RequestClass::Agent,
+            )
+            .unwrap();
+        sched.advance();
+    }
+
+    // `interactive_a`: submitted first (older), a unique short prompt —
+    // completes its one-chunk prefill, holds no lane, no shared prefix.
+    let interactive_a = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (1000..1004).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(8),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    sched.advance();
+
+    // `agent_a2`: submitted second (younger), same shape, `Agent` class.
+    let agent_a2 = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (2000..2004).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(8),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    sched.advance();
+
+    // `b`: the resident-slot budget (10) is now fully spent (8 fillers +
+    // `interactive_a` + `agent_a2`) — materializing it forces an eviction
+    // between the two lane-less candidates.
+    sched.submit(input(4), RequestClass::Agent).unwrap();
+    let ev_b = sched.advance();
+
+    assert!(
+        ev_b.iter().any(
+            |e| matches!(e, SchedEvent::Evicted { request, .. } if *request == agent_a2)
+        ),
+        "the Agent candidate is evicted despite being the younger one: class outranks LRU"
+    );
+    assert!(
+        !ev_b.iter().any(
+            |e| matches!(e, SchedEvent::Evicted { request, .. } if *request == interactive_a)
+        ),
+        "the older Interactive candidate is not evicted while a lower-class candidate remains"
+    );
+}
+
+/// Scenario 7 — the GPU side of ADR 0023's asymmetry, from a `Running`
+/// lane: a frozen donor is never a victim, even though its class (`Agent`)
+/// would otherwise make it the *preferred* victim by class alone
+/// (`retained_lane_is_better_victim`) — protection outranks class. AC:
+/// "a protected lane mid-stream is not evicted ahead of an unprotected one
+/// of a lower class." ADR 0023's own words: "a protected lane mid-stream
+/// is not a victim because its owner is an agent."
+#[test]
+fn a_protected_donor_lane_is_not_evicted_ahead_of_an_unprotected_lower_class_lane() {
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            max_in_flight: 16,
+            max_prefill_batch: 8,
+            resident_slot_capacity: 16, // lanes, not resident slots, are the constraint
+            host_capacity_bytes: 64, // host tier enabled: eviction can satisfy the head immediately
+            ..SchedulerConfig::default() // 4096-page pool: pages are never tight
+        },
+        Arc::new(MockCompute::new()),
+    );
+
+    // Seven Interactive fillers with a generous generation budget.
+    for i in 0..7u32 {
+        sched.submit(input(30 + i), RequestClass::Interactive).unwrap();
+    }
+    // One Agent filler with the *shortest* remaining work: by ADR 0004's
+    // donor selection (earliest-completion prefix), it is the protection's
+    // sole donor once a head blocks — despite `Agent` otherwise being the
+    // class-preferred victim.
+    let agent_donor = sched.submit(input(5), RequestClass::Agent).unwrap();
+    let ev1 = sched.advance(); // step 1: all eight fillers dealt onto the eight lanes
+
+    // The ninth request (the blocked head) opens a protection; the
+    // shortest-work incumbent (the Agent filler) freezes as the sole donor.
+    // With the host tier enabled, the blocked head is satisfied by eviction
+    // within this same `advance()` call, which also clears the protection
+    // — so it is read off the `Protected` event, not `sched.protection()`.
+    let head = sched.submit(input(8), RequestClass::Interactive).unwrap();
+    let ev2 = sched.advance();
+
+    let donors: Vec<u64> = ev2
+        .iter()
+        .find_map(|e| match e {
+            SchedEvent::Protected { donors, .. } => Some(donors.clone()),
+            _ => None,
+        })
+        .expect("a protection was opened for the blocked head");
+    assert_eq!(
+        donors,
+        vec![agent_donor],
+        "the Agent filler (shortest remaining work) is the sole frozen donor"
+    );
+
+    // The host tier is enabled and has room: the scheduler evicts a lane to
+    // admit the head immediately rather than waiting for a natural
+    // completion. The evicted lane must never be the protected donor —
+    // even though `Agent` alone would normally be the preferred victim.
+    let evicted: Vec<u64> = ev2
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::Evicted { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !evicted.is_empty(),
+        "an eviction frees the blocked head's lane"
+    );
+    assert!(
+        !evicted.contains(&agent_donor),
+        "the frozen Agent donor is never a victim, protection outranks class"
+    );
+
+    // Run to idle: everything (the fillers, the donor, the head, and the
+    // evicted request once restored) completes.
+    let mut events = ev1.into_iter().chain(ev2).collect::<Vec<_>>();
+    while !sched.is_idle() {
+        events.extend(sched.advance());
+    }
+    assert!(events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == head)));
+    assert!(events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == agent_donor)));
+    assert!(sched.is_idle());
+}

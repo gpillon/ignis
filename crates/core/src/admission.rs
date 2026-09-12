@@ -378,10 +378,12 @@ pub fn protected_head_safe_without_temporal(
 /// has exact reusable state on the lane; reserved lanes are never victims,
 /// all other retained state remains reclaimable.
 ///
-/// v1 ships this policy (and its unit tests) for ADR 0004 reference
-/// fidelity, but the concrete scheduler does **not** invoke it: retained
-/// lanes only exist once the KV-RAM host tier (core-06) can snapshot a
-/// lane to host RAM. The wiring lands with core-06.
+/// This is the GPU-residency half of ADR 0023's ordering: eligibility and
+/// protection first (`reserved_for_earlier_interactive` — a reserved lane
+/// is never a victim), then request class, then least-recently-used, lane
+/// id as the final tie-break. The concrete scheduler drives it for every
+/// `Running`-lane eviction; [`ResidentCandidate`] shares the same class
+/// ordering for the lane-less (`Prefilling`) half of GPU residency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedLaneCandidate {
     /// The lane holding the retained state.
@@ -411,17 +413,12 @@ pub fn retained_lane_is_better_victim(
     if candidate.reserved_for_earlier_interactive {
         return false;
     }
-    let priority = |owner: &RequestClass| match owner {
-        // v1 classes: Agent (the lower-priority class) is a better
-        // victim than Interactive; the reference's Classifier slot does
-        // not exist in v1's class set.
-        RequestClass::Agent => 1,
-        RequestClass::Interactive => 2,
-    };
-    let candidate_priority = priority(&candidate.owner);
-    let incumbent_priority = priority(&incumbent.owner);
-    if candidate_priority != incumbent_priority {
-        return candidate_priority < incumbent_priority;
+    // Class (ADR 0023's shared definition: [`RequestClass::eviction_rank`]):
+    // Agent ranks below Interactive, so it is the better victim.
+    let candidate_rank = candidate.owner.eviction_rank();
+    let incumbent_rank = incumbent.owner.eviction_rank();
+    if candidate_rank != incumbent_rank {
+        return candidate_rank < incumbent_rank;
     }
     if candidate.use_tick != incumbent.use_tick {
         return candidate.use_tick < incumbent.use_tick;
@@ -449,6 +446,57 @@ pub fn choose_retained_lane_victim(
         }
     }
     selected.map(|c| c.lane)
+}
+
+/// One candidate resident, lane-less (`Prefilling`) request's eviction
+/// value — the second GPU-residency call site ADR 0023 / GitHub #127
+/// unifies with [`RetainedLaneCandidate`]. A lane-less candidate has
+/// already had eligibility and protection settled by its caller's own
+/// filtering (device-resident, no shared-prefix claim — see
+/// `ConcreteScheduler::prefilling_eviction_candidate`), so only request
+/// class and LRU remain; a lane-less request has no `use_tick`, so
+/// oldest-submitted (`request_id` ascending — ids are monotonic and
+/// requests are never reordered) stands in for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentCandidate {
+    /// The candidate request's id.
+    pub request_id: RequestId,
+    /// The class owning the resident state (drives the victim priority:
+    /// Agent before Interactive, same ranking as [`RetainedLaneCandidate`]).
+    pub owner: RequestClass,
+}
+
+/// Lowest-value eligible resident, lane-less state: Agent before
+/// Interactive, oldest-submitted (request id) as the LRU proxy and final
+/// tie-break.
+#[must_use]
+pub fn resident_candidate_is_better_victim(
+    candidate: &ResidentCandidate,
+    incumbent: &ResidentCandidate,
+) -> bool {
+    let candidate_rank = candidate.owner.eviction_rank();
+    let incumbent_rank = incumbent.owner.eviction_rank();
+    if candidate_rank != incumbent_rank {
+        return candidate_rank < incumbent_rank;
+    }
+    candidate.request_id < incumbent.request_id
+}
+
+/// Pick the lowest-value eligible resident, lane-less request to evict:
+/// `None` when `candidates` is empty.
+#[must_use]
+pub fn choose_resident_candidate_victim(candidates: &[ResidentCandidate]) -> Option<RequestId> {
+    let mut selected: Option<&ResidentCandidate> = None;
+    for candidate in candidates {
+        match selected {
+            None => selected = Some(candidate),
+            Some(incumbent) if resident_candidate_is_better_victim(candidate, incumbent) => {
+                selected = Some(candidate);
+            }
+            _ => {}
+        }
+    }
+    selected.map(|c| c.request_id)
 }
 
 #[cfg(test)]
@@ -776,6 +824,39 @@ mod tests {
             choose_retained_lane_victim(&candidates),
             Some(3),
             "same class and tick: the lower lane id wins"
+        );
+    }
+
+    #[test]
+    fn resident_candidates_prefer_agents_then_oldest_submitted() {
+        // GitHub #127: the lane-less (`Prefilling`) half of GPU-residency
+        // eviction follows the same class ordering as retained lanes.
+        let candidates = [
+            ResidentCandidate { request_id: 1, owner: RequestClass::Interactive },
+            ResidentCandidate { request_id: 2, owner: RequestClass::Agent },
+            ResidentCandidate { request_id: 3, owner: RequestClass::Agent },
+        ];
+        assert_eq!(
+            choose_resident_candidate_victim(&candidates),
+            Some(2),
+            "an Agent candidate is a better victim than Interactive, oldest-submitted first"
+        );
+    }
+
+    #[test]
+    fn resident_candidates_default_to_submission_order_within_a_class() {
+        // ADR 0023 / GitHub #127's parity requirement: with every request
+        // the same class, the ordering collapses to plain oldest-submitted
+        // (today's pre-#127 behavior).
+        let candidates = [
+            ResidentCandidate { request_id: 5, owner: RequestClass::Interactive },
+            ResidentCandidate { request_id: 2, owner: RequestClass::Interactive },
+            ResidentCandidate { request_id: 9, owner: RequestClass::Interactive },
+        ];
+        assert_eq!(
+            choose_resident_candidate_victim(&candidates),
+            Some(2),
+            "same class: the oldest-submitted (smallest id) request is the victim"
         );
     }
 }
