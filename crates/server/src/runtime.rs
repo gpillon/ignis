@@ -38,6 +38,10 @@ pub struct EngineShape {
     /// [`ignis_runtime::auto_kv_pool_bytes`] for the resolved format and
     /// context when the operator names none).
     pub kv_pool_bytes: u64,
+    /// The KV-RAM host tier's budget, in bytes (`--kv-host-pool-bytes`,
+    /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
+    /// request snapshots, independent of the GPU-resident pool above.
+    pub host_pool_bytes: u64,
 }
 
 impl Default for EngineShape {
@@ -53,6 +57,7 @@ impl Default for EngineShape {
                 ignis_core::KvFormat::default(),
                 ignis_runtime::DEFAULT_MAX_CONTEXT,
             ),
+            host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
         }
     }
 }
@@ -64,6 +69,7 @@ impl From<&crate::config::Config> for EngineShape {
             max_context: config.max_context,
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
+            host_pool_bytes: config.host_pool_bytes,
         }
     }
 }
@@ -80,7 +86,7 @@ fn scheduler_config_for_shape(
         kv_page_tokens,
         max_sequence_tokens: shape.max_context,
         kv_capacity_pages: capacity_pages,
-        host_capacity_pages: capacity_pages,
+        host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
         ..SchedulerConfig::default()
     }
@@ -186,6 +192,7 @@ mod tests {
             max_context: 65_536,
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: 8 * 1024 * 1024 * 1024,
+            host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
@@ -199,6 +206,7 @@ mod tests {
         type Model = ();
         type Sequence = ();
         type Prefix = ();
+        type SnapshotBuf = Vec<u8>;
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -249,6 +257,28 @@ mod tests {
             _params: &[DecodeParams],
         ) -> Result<Vec<TokenId>, i32> {
             Ok(vec![7; sequences.len()])
+        }
+        fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
+            Ok(vec![0u8; bytes as usize])
+        }
+        fn snapshot_bytes(&self, _model: &Self::Model, _sequence: &Self::Sequence) -> Result<u64, i32> {
+            Ok(0)
+        }
+        fn snapshot_into(
+            &self,
+            _model: &Self::Model,
+            _sequence: &Self::Sequence,
+            _dst: &mut [u8],
+        ) -> Result<(), i32> {
+            Ok(())
+        }
+        fn restore_sequence(
+            &self,
+            _model: &Self::Model,
+            _sequence: &mut Self::Sequence,
+            _src: &[u8],
+        ) -> Result<(), i32> {
+            Ok(())
         }
     }
 

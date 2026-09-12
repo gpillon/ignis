@@ -59,14 +59,18 @@
 //!    zero) completes in that step — the pool can never grow past the
 //!    reservations (no OOM under the N=8 load, core-01).
 //!
-//! 4. **KV-RAM host tier** (core-06) — the overflow path: when a request
-//!    is blocked by the active set (all lanes / pages in use), the
-//!    scheduler evicts a retained lane (driven by
-//!    [`crate::admission::choose_retained_lane_victim`]) into the
-//!    host-RAM KV tier ([`crate::host::HostTier`]), freeing its lane +
-//!    pages so the blocked head can be dealt. The evicted request is
-//!    suspended (not done) and **restored** to a lane (instead of
-//!    re-prefilling) when a lane frees. The tier's two-tier eviction
+//! 4. **KV-RAM host tier** (core-06, real state since P4-07 GitHub #125) —
+//!    the overflow path: when a request is blocked by the active set (all
+//!    lanes / pages in use), the scheduler evicts a retained lane (driven
+//!    by [`crate::admission::choose_retained_lane_victim`]) by snapshotting
+//!    it to pinned host memory and releasing its KV pages, GDN slot and
+//!    conv taps ([`crate::scheduler::Compute::evict`]), recording the
+//!    snapshot in the host-RAM tier ([`crate::host::HostTier`]), bounded by
+//!    a **byte budget** (not a page or lane count — a snapshot's fixed GDN
+//!    floor is paid regardless of prompt length). The evicted request is
+//!    suspended (not done) and **restored** — the blob written back through
+//!    [`crate::scheduler::Compute::restore`], resuming generation without
+//!    re-prefilling — when a lane frees. The tier's two-tier eviction
 //!    (probation → protected) keeps evictions bounded; a snapshot whose
 //!    GDN position is mid-prefill is rejected (core-02's boundary).
 //!
@@ -108,6 +112,7 @@
 //! `tracing`'s own parent-child span graph. See the design doc for why.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
@@ -151,11 +156,12 @@ pub struct SchedulerConfig {
     /// resource dimension; production auto-sizes this from the pool,
     /// tests pass small values to drive contention).
     pub kv_capacity_pages: u32,
-    /// The KV-RAM host tier capacity in pages (core-06: the host-RAM
-    /// budget for evicted (suspended) request snapshots; production
-    /// auto-sizes this from host RAM, tests pass small values to drive
-    /// contention).
-    pub host_capacity_pages: u32,
+    /// The KV-RAM host tier capacity in bytes (core-06, P4-07 GitHub #125:
+    /// the host-RAM budget for evicted (suspended) request snapshots — a
+    /// byte budget, not a page or lane count, since a snapshot's fixed GDN
+    /// floor is paid regardless of prompt length; production exposes this
+    /// as an operator flag, tests pass small values to drive contention).
+    pub host_capacity_bytes: u64,
     /// The serving prefill chunk width, in tokens (P3-01, ADR 0018): the
     /// scheduler sends at most this many tokens of a request's remaining
     /// prompt per `advance()`, so a long prefill costs the decode lanes one
@@ -203,9 +209,11 @@ impl Default for SchedulerConfig {
             // of the admission machine is dormant unless the capacity is
             // tightened (or the pool is auto-sized smaller in production).
             kv_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
-            // Eight full sequences fit in host RAM by default: the
-            // host-tier overflow budget matches the KV pool (core-06).
-            host_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
+            // A generous default headroom for CPU tests (`MockCompute`'s
+            // `Compute::evict` reports a nominal 1-byte snapshot per
+            // request, GitHub #125) — production wires the operator's own
+            // byte flag rather than this default.
+            host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
         }
     }
@@ -238,7 +246,7 @@ pub struct ConcreteScheduler {
     // ── core-06: the KV-RAM host tier ──────────────────────────────────
     /// The host-RAM KV tier (core-06): holds evicted (suspended) request
     /// snapshots in two tiers (probation → protected); evictions are
-    /// bounded by `host_capacity_pages`.
+    /// bounded by `host_capacity_bytes`.
     host: HostTier,
     /// The scheduling tick (a per-advance counter; the LRU `use_tick` for
     /// retained-lane victim selection).
@@ -293,7 +301,7 @@ impl ConcreteScheduler {
             kv_used_pages: 0,
             protection: None,
             protection_epoch: 1,
-            host: HostTier::new(config.host_capacity_pages),
+            host: HostTier::new(config.host_capacity_bytes),
             tick: 0,
             prefix: PrefixCache::new(config.kv_page_tokens),
             config,
@@ -817,15 +825,17 @@ impl ConcreteScheduler {
         self.release_prefix_claim(prefix_entry);
     }
 
-    /// Make room in the host tier for `pages` pages (core-06): discard the
-    /// lowest-value entries (probation LRU) while the tier is over budget,
-    /// re-queueing each discarded request (its snapshot was lost — it
-    /// re-prefills from the start). Returns `true` when the tier can hold
-    /// `pages` (there is room, or it was made).
-    fn make_room_for(&mut self, pages: u32, events: &mut Vec<SchedEvent>) -> bool {
-        while self.host.used_pages() + pages > self.host.capacity_pages() {
+    /// Make room in the host tier for `bytes` (core-06, GitHub #125):
+    /// discard the lowest-value entries (probation LRU) while the tier is
+    /// over budget, re-queueing each discarded request (its snapshot was
+    /// lost — it re-prefills from the start) and freeing its pinned buffer
+    /// at the leaf (`Compute::discard_snapshot`). Returns `true` when the
+    /// tier can hold `bytes` (there is room, or it was made).
+    fn make_room_for(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
+        while self.host.used_bytes() + bytes > self.host.capacity_bytes() {
             match self.host.evict_one() {
                 Some(discarded) => {
+                    self.compute.discard_snapshot(discarded.request);
                     if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request)
                     {
                         self.requeue_request(idx, events);
@@ -838,10 +848,12 @@ impl ConcreteScheduler {
     }
 
     /// Try to admit a blocked head by evicting a retained lane to the host
-    /// tier (core-06): while the head does not fit, pick the lowest-value
-    /// non-donor running lane (`choose_retained_lane_victim`), make room in
-    /// the host tier (re-queueing any discarded snapshot), snapshot the
-    /// victim into the tier, and release its lane + pages. Returns `true`
+    /// tier (core-06, GitHub #125): while the head does not fit, pick the
+    /// lowest-value non-donor running lane (`choose_retained_lane_victim`),
+    /// query its real snapshot size, make room for that many bytes in the
+    /// host tier (re-queueing any discarded snapshot), snapshot the victim
+    /// to pinned host memory and release its KV pages, GDN slot and conv
+    /// taps (`Compute::evict`), then record the tier entry. Returns `true`
     /// once the head fits (the caller deals it), `false` when no evictable
     /// victim remains (the head is held — the backfill / donor wait path).
     fn try_evict_for_head(&mut self, head_idx: usize, events: &mut Vec<SchedEvent>) -> bool {
@@ -875,42 +887,79 @@ impl ConcreteScheduler {
                     v.gdn.clone(),
                 )
             };
+            // core-02: only a chunk-boundary-consistent sequence may be
+            // snapshotted. Every `Running`-state candidate is already past
+            // its last completed chunk / decode round (P3-01's durable
+            // prefill progress never reaches `Running` mid-chunk), so this
+            // is unreachable by construction rather than by timing — the
+            // same invariant the leaf's own `NOT_AT_BOUNDARY` refusal
+            // exists for.
+            if !v_gdn.is_valid_snapshot_point(v_gdn.position()) {
+                return false;
+            }
+            // Query the real snapshot size *before* moving or releasing
+            // anything (`Compute::snapshot_size` is a cheap, non-destructive
+            // query) so the host tier's byte budget can be checked (and
+            // made room for) before the victim's GPU sequence is touched —
+            // a tier that cannot make room leaves the victim running rather
+            // than releasing its GPU state for nothing.
+            let bytes = match self.compute.snapshot_size(v_id) {
+                Ok(bytes) => bytes,
+                Err(_) => return false, // refused (unreachable per the boundary note above)
+            };
             // Make room in the host tier (re-queueing any discarded
             // snapshot).
-            if !self.make_room_for(v_pages, events) {
+            if !self.make_room_for(bytes, events) {
                 return false; // the host tier cannot hold the snapshot
             }
+            // Snapshot to pinned host memory and release the GPU sequence
+            // (its KV pages, GDN slot and conv taps) — nothing else runs
+            // between the size query above and this call on this
+            // single-threaded scheduler, so `evict` cannot fail where
+            // `snapshot_size` just succeeded.
+            let started = Instant::now();
+            let Ok(bytes) = self.compute.evict(v_id) else {
+                return false;
+            };
+            let snapshot_micros = started.elapsed().as_micros() as u64;
             let entry = HostEntry {
                 request: v_id,
                 lane: victim_lane,
                 owner: v_class,
                 pages: v_pages,
+                bytes,
                 tokens: v_tokens,
                 remaining_work: v_work,
                 gdn: v_gdn,
                 tier: Tier::Probation,
                 use_tick: self.tick,
             };
-            // Capture the snapshot (rejects a mid-prefill GDN position,
-            // core-02).
-            if self.host.capture(entry).is_err() {
-                return false; // the snapshot is invalid (e.g. mid-prefill)
-            }
+            // Record the entry (`make_room_for` already guaranteed room for
+            // `bytes`, so this cannot fail on capacity; the GDN boundary
+            // was already checked above).
+            self.host
+                .capture(entry)
+                .expect("room was made for `bytes` and the boundary was already checked");
             // Evict the request (Running → Evicted; the lane is released).
             self.requests[v_idx].evict();
-            self.compute.release(v_id);
             self.free_lanes.push(victim_lane);
             self.kv_used_pages = self.kv_used_pages.saturating_sub(v_pages);
-            events.push(SchedEvent::Evicted { request: v_id });
+            events.push(SchedEvent::Evicted {
+                request: v_id,
+                snapshot_micros,
+            });
             // Loop: re-check whether the head now fits.
         }
     }
 
-    /// Restore evicted (suspended) requests to free lanes (core-06): a
-    /// restored request resumes from where it was evicted (no re-prefill),
-    /// taking priority over a fresh prefill. Restores as many evicted
-    /// requests as there are free lanes + page headroom, in the host
-    /// tier's victim order (the entries closest to being discarded).
+    /// Restore evicted (suspended) requests to free lanes (core-06,
+    /// GitHub #125): a restored request resumes from where it was evicted
+    /// (no re-prefill), taking priority over a fresh prefill. Restores as
+    /// many evicted requests as there are free lanes + page headroom, in
+    /// the host tier's victim order (the entries closest to being
+    /// discarded). A physical restore failure (a corrupt/foreign blob, or a
+    /// leaf-level error) discards the snapshot and re-prefills the request
+    /// instead — the same fallback the tier's own byte-budget discard uses.
     fn restore_pass(&mut self, events: &mut Vec<SchedEvent>) {
         loop {
             if self.free_lanes.is_empty() {
@@ -924,22 +973,48 @@ impl ConcreteScheduler {
             if self.kv_used_pages + victim.pages > self.capacity.kv_pages {
                 break; // no page headroom: leave it (retry next advance)
             }
-            let lane = self.free_lanes.pop().expect("checked non-empty above");
-            let snap = self
-                .host
-                .restore(victim.request)
-                .expect("the victim is a tier entry");
             let idx = self
                 .requests
                 .iter()
-                .position(|r| r.id == snap.request)
+                .position(|r| r.id == victim.request)
                 .expect("a host-tier snapshot always maps to a request");
-            self.requests[idx].restore_lane(lane);
-            self.kv_used_pages += snap.pages;
-            events.push(SchedEvent::Restored {
-                request: snap.request,
-                lane,
-            });
+            let context_tokens = ((self.requests[idx].input.tokens.len() as u64)
+                .saturating_add(
+                    self.requests[idx]
+                        .input
+                        .params
+                        .max_tokens
+                        .unwrap_or(self.config.max_sequence_tokens) as u64,
+                )
+                .min(u32::MAX as u64)) as u32;
+            let started = Instant::now();
+            match self.compute.restore(victim.request, context_tokens) {
+                Ok(()) => {
+                    let restore_micros = started.elapsed().as_micros() as u64;
+                    let lane = self.free_lanes.pop().expect("checked non-empty above");
+                    let snap = self
+                        .host
+                        .restore(victim.request)
+                        .expect("the victim is a tier entry");
+                    self.requests[idx].restore_lane(lane);
+                    self.kv_used_pages += snap.pages;
+                    events.push(SchedEvent::Restored {
+                        request: snap.request,
+                        lane,
+                        restore_micros,
+                    });
+                }
+                Err(_) => {
+                    // The blob could not be restored: drop it (never
+                    // promoted — it did not actually resume) and free
+                    // whatever the leaf still held for it, then re-prefill
+                    // from scratch.
+                    self.host.discard_request(victim.request);
+                    self.compute.discard_snapshot(victim.request);
+                    self.requeue_request(idx, events);
+                    // Loop: the freed lane stays free for the next victim.
+                }
+            }
         }
     }
 }

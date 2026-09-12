@@ -65,10 +65,23 @@ pub struct Config {
     /// per-sequence cap cannot fit inside would admit a request the leaf
     /// can never allocate.
     pub kv_pool_bytes: u64,
+    /// The KV-RAM host tier's budget, in bytes (P4-07, GitHub #125): pinned
+    /// host memory for evicted (suspended) request snapshots. `0` disables
+    /// the tier (admission refuses instead of evicting once the resident
+    /// lanes are full). A byte budget, not a page or lane count, because a
+    /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
+    /// length.
+    pub host_pool_bytes: u64,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
 }
+
+/// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES`'s default (P4-07,
+/// GitHub #125): comfortably holds several full-context snapshots (each
+/// ~528 MB per ADR 0024's estimate) without an operator having to reason
+/// about the format's per-snapshot cost just to start the server.
+pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// What [`resolve`] produced: a runnable config, or a request to print
 /// `--help`/`--version` text and exit before any loader/scheduler work runs.
@@ -119,6 +132,7 @@ pub fn resolve(
     let mut max_context = None;
     let mut kv_format = None;
     let mut kv_pool_bytes = None;
+    let mut host_pool_bytes = None;
     let mut request_timeout = None;
 
     let mut i = 0;
@@ -135,6 +149,7 @@ pub fn resolve(
             "--max-context" => max_context = Some(take_value(args, &mut i, flag)?),
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
+            "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
@@ -173,6 +188,7 @@ pub fn resolve(
     // it (GitHub #122).
     let kv_format = resolve_kv_format(kv_format, &env)?;
     let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
+    let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
 
     Ok(ConfigOutcome::Config(Config {
@@ -186,6 +202,7 @@ pub fn resolve(
         max_context,
         kv_format,
         kv_pool_bytes,
+        host_pool_bytes,
         request_timeout_secs,
     }))
 }
@@ -308,6 +325,20 @@ fn resolve_kv_pool_bytes(
     Ok(bytes)
 }
 
+/// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES` / [`DEFAULT_HOST_POOL_BYTES`]
+/// (P4-07, GitHub #125). `0` is a legal, explicit choice — it disables the
+/// host tier (admission refuses instead of evicting) — so it is accepted
+/// rather than treated as "unset" the way an empty string is.
+fn resolve_host_pool_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_HOST_POOL_BYTES"))) else {
+        return Ok(DEFAULT_HOST_POOL_BYTES);
+    };
+    parse_bytes("--kv-host-pool-bytes", &raw)
+}
+
 /// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
 fn resolve_request_timeout_secs(
     flag: Option<String>,
@@ -348,6 +379,7 @@ fn version_text() -> String {
 fn help_text() -> String {
     let default_kv_format = KvFormat::default().as_str();
     let default_kv_pool_gib = ignis_core::DEFAULT_KV_POOL_BYTES / (1024 * 1024 * 1024);
+    let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
     format!(
         "ignis-server: the OpenAI-compatible HTTP entrypoint (localhost, no auth)\n\
          \n\
@@ -364,6 +396,7 @@ fn help_text() -> String {
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: auto, {default_kv_pool_gib} GiB; accepts a K/M/G suffix)\n\
+         \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
@@ -416,6 +449,7 @@ mod tests {
             config.kv_pool_bytes,
             ignis_runtime::auto_kv_pool_bytes(KvFormat::HqE8_2b, DEFAULT_MAX_CONTEXT)
         );
+        assert_eq!(config.host_pool_bytes, DEFAULT_HOST_POOL_BYTES);
         assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
@@ -758,6 +792,56 @@ mod tests {
                 Err(err) => assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0),
             }
         }
+    }
+
+    // ── the KV-RAM host tier byte budget (P4-07, GitHub #125) ────────────
+
+    #[test]
+    fn an_explicit_host_pool_budget_overrides_the_default() {
+        let config = expect_config(
+            resolve(&args(&["--kv-host-pool-bytes", "512M"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.host_pool_bytes, 512 * 1024 * 1024);
+
+        let env = env_map(&[("IGNIS_KV_HOST_POOL_BYTES", "1G")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.host_pool_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_host_pool_budget_flag_wins_over_its_env_var() {
+        let env = env_map(&[("IGNIS_KV_HOST_POOL_BYTES", "1G")]);
+        let a = args(&["--kv-host-pool-bytes", "256M"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.host_pool_bytes, 256 * 1024 * 1024, "flag must win over env");
+    }
+
+    #[test]
+    fn a_zero_host_pool_budget_is_accepted_and_disables_the_tier() {
+        // Unlike an empty string (falls through to the default), `0` is an
+        // explicit, legal operator choice: no host tier at all.
+        let config =
+            expect_config(resolve(&args(&["--kv-host-pool-bytes", "0"]), no_env).expect("resolve"));
+        assert_eq!(config.host_pool_bytes, 0);
+    }
+
+    #[test]
+    fn a_malformed_host_pool_budget_is_a_usage_error() {
+        let err = resolve(&args(&["--kv-host-pool-bytes", "not-a-size"]), no_env)
+            .expect_err("must reject");
+        assert!(err.0.contains("--kv-host-pool-bytes"), "{}", err.0);
+    }
+
+    #[test]
+    fn help_lists_the_host_pool_budget_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(
+            text.contains("--kv-host-pool-bytes"),
+            "help must document --kv-host-pool-bytes:\n{text}"
+        );
     }
 
     // ── the request timeout (GitHub #95) ─────────────────────────────────

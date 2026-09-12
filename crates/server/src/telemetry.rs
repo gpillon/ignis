@@ -338,9 +338,21 @@ impl Telemetry {
         );
     }
 
-    /// A request was evicted to the host tier: bump the eviction counter.
-    pub fn on_evicted(&mut self, _id: RequestId) {
+    /// A request was evicted to the host tier: bump the eviction counter
+    /// and emit the `evicted` line (GitHub #125) — the snapshot's wall time
+    /// (`snapshot_micros`), so the tier's cost is attributable from the
+    /// request log alone, without a second run.
+    pub fn on_evicted(&mut self, id: RequestId, snapshot_micros: u64) {
         self.kv_evictions = self.kv_evictions.saturating_add(1);
+        self.emit_evicted(id, snapshot_micros);
+    }
+
+    /// A request was restored from the host tier onto a decode lane: emit
+    /// the `restored` line (GitHub #125) — the restore's wall time
+    /// (`restore_micros`), the other half of the tier's own cost
+    /// attribution alongside [`Telemetry::on_evicted`].
+    pub fn on_restored(&mut self, id: RequestId, restore_micros: u64) {
+        self.emit_restored(id, restore_micros);
     }
 
     /// A request's host-tier snapshot was discarded (core-06): it goes back
@@ -446,6 +458,31 @@ impl Telemetry {
             tok_s = throughput(1, ms),
             class = class.as_extension_str(),
             "first token"
+        );
+    }
+
+    /// Emit the `evicted` line (P4-07, GitHub #125): the KV-RAM host tier's
+    /// snapshot cost, attributable per request from the request log alone.
+    fn emit_evicted(&self, id: RequestId, snapshot_micros: u64) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.evicted",
+            request_id = id,
+            snapshot_micros,
+            "evicted to the host KV-RAM tier"
+        );
+    }
+
+    /// Emit the `restored` line (P4-07, GitHub #125): the host tier's
+    /// restore cost — the other half of [`Telemetry::emit_evicted`]'s
+    /// attribution.
+    fn emit_restored(&self, id: RequestId, restore_micros: u64) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.restored",
+            request_id = id,
+            restore_micros,
+            "restored from the host KV-RAM tier"
         );
     }
 
@@ -658,11 +695,39 @@ mod tests {
         let (mut telemetry, sink) = telemetry();
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.on_admitted(1, 0);
-        telemetry.on_evicted(1);
-        telemetry.on_evicted(1);
+        telemetry.on_evicted(1, 450);
+        telemetry.on_evicted(1, 450);
         telemetry.emit_interval();
         let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
         assert_eq!(v["kv_evictions"], 2, "each eviction bumps the counter");
+    }
+
+    /// P4-07 (GitHub #125): the host tier's snapshot/restore wall time is
+    /// recorded in the request log, so the tier's cost is attributable
+    /// without a second run.
+    #[test]
+    fn evicted_and_restored_report_the_tier_s_wall_time() {
+        let (mut telemetry, _sink) = telemetry();
+        let events = capture_request_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Agent);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_evicted(1, 45_000);
+            telemetry.on_restored(1, 44_500);
+        });
+        let event_names: Vec<&str> =
+            events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
+        assert!(event_names.contains(&"ignis.request.evicted"));
+        assert!(event_names.contains(&"ignis.request.restored"));
+        let evicted = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.evicted")
+            .unwrap();
+        assert_eq!(evicted["attributes"]["snapshot_micros"], 45_000);
+        let restored = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.restored")
+            .unwrap();
+        assert_eq!(restored["attributes"]["restore_micros"], 44_500);
     }
 
     #[test]

@@ -17,6 +17,13 @@
 // table (ignis_seq_sections.h) -- this file only moves bytes and decides
 // what to refuse.
 //
+// P4-07 (GitHub #125) adds the transfer's own host-side memory: a pinned
+// (page-locked) alloc/free pair the host KV-RAM tier calls to get the
+// region ignis_seq_snapshot writes into and ignis_seq_restore reads from --
+// plain cudaHostAlloc/cudaFreeHost, no pool of its own (unlike the vendored
+// arena.h staging allocator, this is a per-sequence-lifetime allocation, not
+// a churn-heavy scratch region worth pooling).
+//
 // Style follows model.cu: explicit pointers + sizes, int32 return codes (0
 // = ok, -1 = error, IGNIS_SEQ_ERR_NOT_AT_BOUNDARY / _BAD_SNAPSHOT for the
 // two refusals state transfer makes), no C++ types across the boundary.
@@ -687,6 +694,28 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_restore: ") + e.what());
     return -1;
+  }
+}
+
+extern "C" int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr) {
+  if (out_ptr == nullptr) {
+    set_error("ignis_host_pinned_alloc: null out_ptr");
+    return -1;
+  }
+  *out_ptr = nullptr;
+  void *ptr = nullptr;
+  const cudaError_t err = cudaHostAlloc(&ptr, static_cast<std::size_t>(bytes), cudaHostAllocDefault);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_host_pinned_alloc: cudaHostAlloc failed: ") + cudaGetErrorString(err));
+    return -1;
+  }
+  *out_ptr = ptr;
+  return 0;
+}
+
+extern "C" void ignis_host_pinned_free(void *ptr) {
+  if (ptr != nullptr) {
+    cudaFreeHost(ptr);
   }
 }
 

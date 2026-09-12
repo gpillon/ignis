@@ -110,7 +110,9 @@ pub trait Compute: Send + Sync {
     /// `max_tokens`) when that request finished this step instead.
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError>;
 
-    /// Release leaf-owned state for a request that completed or was evicted.
+    /// Release leaf-owned state for a request that completed or was
+    /// cancelled (never a request being evicted to the host tier — that
+    /// goes through [`Compute::evict`], which snapshots before releasing).
     /// CPU-only compute implementations need no lifecycle bookkeeping.
     fn release(&self, _request: RequestId) {}
 
@@ -120,6 +122,59 @@ pub trait Compute: Send + Sync {
     /// them has been released too, so this is a handle drop and not a free.
     /// CPU-only compute implementations hold no such handle.
     fn release_prefix(&self, _publisher: RequestId) {}
+
+    // ── core-06: the KV-RAM host tier (P4-07, GitHub #125, ADR 0024) ────
+    //
+    // The host tier itself (`crate::host::HostTier`) is pure CPU bookkeeping
+    // — tier membership, byte-budget accounting, LRU order — so it stays
+    // testable without a GPU (ADR 0006). The four methods below are where
+    // that bookkeeping meets real device state: production (`RuntimeCompute`)
+    // moves bytes through the kernel leaf's snapshot/restore ABI over pinned
+    // host memory; every CPU-only `Compute` (the mock, test stubs) keeps the
+    // safe zero-byte default, which preserves today's behavior exactly —
+    // those backends hold no real per-sequence device state for eviction to
+    // move in the first place.
+
+    /// Bytes a snapshot of `request` would need right now (ADR 0024): a
+    /// cheap query, no bytes moved and no leaf-owned state released — the
+    /// scheduler calls this *before* deciding whether the host tier's byte
+    /// budget can hold the snapshot, so a tier that cannot make room never
+    /// pays for (or discards) a snapshot it cannot use. `Err` while
+    /// `request` is mid-chunk (the leaf's `NOT_AT_BOUNDARY`) — unreachable
+    /// in production by construction (only a `Running`, chunk-complete
+    /// request is ever an eviction candidate), but still a `Result` rather
+    /// than an infallible query since the leaf's ABI is.
+    fn snapshot_size(&self, _request: RequestId) -> Result<u64, ComputeError> {
+        Ok(0)
+    }
+
+    /// Snapshot `request`'s device state into pinned host memory and
+    /// release its GPU-resident sequence — its KV pages, GDN slot and conv
+    /// taps (ADR 0024): the host tier's evict-to-tier transport. Returns
+    /// the snapshot's byte size (normally identical to
+    /// [`Compute::snapshot_size`]'s answer moments earlier — nothing else
+    /// runs between the two calls on this single-threaded scheduler). The
+    /// caller (the scheduler) times the call itself for the request log.
+    fn evict(&self, _request: RequestId) -> Result<u64, ComputeError> {
+        Ok(0)
+    }
+
+    /// Restore `request` from the snapshot [`Compute::evict`] took:
+    /// re-acquire a GPU sequence reserving `context_tokens` and write the
+    /// blob back into it. The request resumes decoding from exactly where
+    /// it was evicted — no re-prefill. `Err` (`BAD_SNAPSHOT` at the leaf, or
+    /// allocation failure) leaves the snapshot in place; the caller falls
+    /// back to discarding it and re-prefilling, the same fallback the
+    /// tier's own byte-budget discard uses.
+    fn restore(&self, _request: RequestId, _context_tokens: u32) -> Result<(), ComputeError> {
+        Ok(())
+    }
+
+    /// Discard `request`'s pending snapshot without restoring it (the host
+    /// tier's byte budget could not hold it, or a restore attempt failed):
+    /// frees the pinned buffer. The request re-prefills from scratch later.
+    /// A request with no pending snapshot is a no-op.
+    fn discard_snapshot(&self, _request: RequestId) {}
 }
 
 /// The engine's scheduling interface — what the server drives.

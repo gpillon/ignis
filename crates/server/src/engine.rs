@@ -347,7 +347,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         SchedEvent::Token { request, .. }
         | SchedEvent::Done { request, .. }
         | SchedEvent::Admitted { request, .. }
-        | SchedEvent::Evicted { request }
+        | SchedEvent::Evicted { request, .. }
         | SchedEvent::Restored { request, .. }
         | SchedEvent::Requeued { request }
         | SchedEvent::PrefixReused { request, .. }
@@ -374,7 +374,15 @@ async fn telemetry_task(
             TelemetryFact::Routed(event) => match event {
                 SchedEvent::Admitted { request, lane, .. } => telemetry.on_admitted(request, lane),
                 SchedEvent::Token { request, .. } => telemetry.on_token(request),
-                SchedEvent::Evicted { request } => telemetry.on_evicted(request),
+                SchedEvent::Evicted {
+                    request,
+                    snapshot_micros,
+                } => telemetry.on_evicted(request, snapshot_micros),
+                SchedEvent::Restored {
+                    request,
+                    restore_micros,
+                    ..
+                } => telemetry.on_restored(request, restore_micros),
                 SchedEvent::Requeued { request } => telemetry.on_requeued(request),
                 SchedEvent::Done {
                     request,

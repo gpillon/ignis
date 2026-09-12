@@ -29,6 +29,17 @@
 //! The tier honors the GDN boundary (core-02): a snapshot is only valid at a
 //! recorded checkpoint / frontier boundary, so [`HostTier::capture`] rejects
 //! a mid-prefill (non-boundary) GDN position.
+//!
+//! **The tier is bounded by a byte budget, not a page or lane count**
+//! (P4-07, GitHub #125, spec `04-reference-feature-floor.md`): a snapshot's
+//! floor is the GDN slot + conv taps + penalty row (a fixed ~145 MiB,
+//! regardless of prompt length) while its KV plane scales with pages, so a
+//! page count alone misprices a short sequence against a full-context one.
+//! [`HostEntry::bytes`] is what [`Compute::evict`](crate::scheduler::Compute::evict)
+//! actually wrote to pinned host memory; this module never allocates or
+//! moves those bytes itself — it only accounts for them, keeping the tier
+//! CPU-testable without a GPU (see the module-level note above on the
+//! `Compute` seam).
 
 use std::collections::HashSet;
 
@@ -61,9 +72,14 @@ pub struct HostEntry {
     /// The class owning the request (retained-lane victim priority: Agent
     /// before Interactive — see [`crate::admission`]).
     pub owner: RequestClass,
-    /// The main-pool KV pages the request holds (held in host RAM while
-    /// suspended; re-charged on the GPU pool at restore).
+    /// The main-pool KV pages the request holds (re-charged on the GPU pool
+    /// at restore — unrelated to this tier's own budget, which is bytes,
+    /// not pages).
     pub pages: u32,
+    /// The snapshot's real size in pinned host memory (P4-07, GitHub #125):
+    /// what [`Compute::evict`](crate::scheduler::Compute::evict) actually
+    /// wrote. This is the tier's own budget unit ([`HostTier::capacity_bytes`]).
+    pub bytes: u64,
     /// Tokens generated so far (the request resumes from here — no
     /// re-prefill).
     pub tokens: u32,
@@ -88,8 +104,8 @@ pub enum HostError {
     /// state is resumable only at a checkpoint / frontier boundary — a
     /// mid-prefill snapshot is invalid for GDN layers).
     InvalidSnapshotPoint,
-    /// The snapshot alone exceeds the tier's host-RAM capacity (it can never
-    /// be held, even alone).
+    /// The snapshot alone exceeds the tier's host-RAM byte budget (it can
+    /// never be held, even alone).
     Oversized,
 }
 
@@ -100,7 +116,7 @@ impl std::fmt::Display for HostError {
                 write!(f, "the snapshot's GDN position is not a resumable boundary")
             }
             HostError::Oversized => {
-                write!(f, "the snapshot alone exceeds the host tier's capacity")
+                write!(f, "the snapshot alone exceeds the host tier's byte budget")
             }
         }
     }
@@ -112,45 +128,47 @@ impl std::error::Error for HostError {}
 /// snapshots in two tiers (probation → protected), evicts probation entries
 /// first when full, and restores a snapshot to the GPU on request.
 pub struct HostTier {
-    /// The host-RAM budget in KV pages (the tier never holds more than this
-    /// many pages — entries are evicted to keep it bounded).
-    capacity_pages: u32,
+    /// The host-RAM budget in bytes (P4-07, GitHub #125): the tier never
+    /// holds more than this many bytes of snapshots — entries are evicted
+    /// to keep it bounded.
+    capacity_bytes: u64,
     /// Probation entries (LRU order: oldest capture at the front, evicted
     /// first).
     probation: Vec<HostEntry>,
     /// Protected entries (LRU order: oldest capture at the front, evicted
     /// after every probation entry).
     protected: Vec<HostEntry>,
-    /// The tier's current host-RAM usage (pages held by all entries).
-    used_pages: u32,
+    /// The tier's current host-RAM usage, in bytes (the sum of every held
+    /// entry's [`HostEntry::bytes`]).
+    used_bytes: u64,
     /// Requests proven worth retaining (restored at least once): their next
     /// capture lands directly in the protected tier.
     promoted: HashSet<RequestId>,
 }
 
 impl HostTier {
-    /// A host tier holding `capacity_pages` pages of host-RAM KV budget.
-    /// The tier never holds more than `capacity_pages` pages: entries are
-    /// evicted (probation first, then protected) to make room (bounded
-    /// eviction — the tier does not grow without bound).
-    pub fn new(capacity_pages: u32) -> Self {
+    /// A host tier holding `capacity_bytes` of host-RAM snapshot budget
+    /// (P4-07, GitHub #125). The tier never holds more than `capacity_bytes`
+    /// bytes: entries are evicted (probation first, then protected) to make
+    /// room (bounded eviction — the tier does not grow without bound).
+    pub fn new(capacity_bytes: u64) -> Self {
         Self {
-            capacity_pages,
+            capacity_bytes,
             probation: Vec::new(),
             protected: Vec::new(),
-            used_pages: 0,
+            used_bytes: 0,
             promoted: HashSet::new(),
         }
     }
 
-    /// The tier's host-RAM budget (pages).
-    pub fn capacity_pages(&self) -> u32 {
-        self.capacity_pages
+    /// The tier's host-RAM budget, in bytes.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
     }
 
-    /// The tier's current host-RAM usage (pages held by all entries).
-    pub fn used_pages(&self) -> u32 {
-        self.used_pages
+    /// The tier's current host-RAM usage, in bytes.
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes
     }
 
     /// The number of snapshots currently held (both tiers).
@@ -174,8 +192,8 @@ impl HostTier {
     /// Capture a lane's state into the tier (GPU → host). Fails with
     /// [`HostError::InvalidSnapshotPoint`] when the snapshot's GDN position
     /// is not a resumable boundary (core-02), and
-    /// [`HostError::Oversized`] when the snapshot alone exceeds the
-    /// capacity. On success the entry is placed in the **protected** tier
+    /// [`HostError::Oversized`] when the snapshot alone exceeds the byte
+    /// budget. On success the entry is placed in the **protected** tier
     /// when the request has been proven worth retaining (restored before),
     /// else in **probation**; entries are evicted (probation first) to make
     /// room, keeping the tier within its budget.
@@ -186,7 +204,7 @@ impl HostTier {
             return Err(HostError::InvalidSnapshotPoint);
         }
         // A snapshot that alone exceeds the tier can never be held.
-        if entry.pages > self.capacity_pages {
+        if entry.bytes > self.capacity_bytes {
             return Err(HostError::Oversized);
         }
         // A previously-restored request re-enters as protected (proven); a
@@ -198,21 +216,21 @@ impl HostTier {
         };
         // Make room: evict the lowest-value entries (probation LRU first)
         // until the new snapshot fits. An empty tier fits any snapshot ≤
-        // the capacity, so the loop always terminates with room available.
-        while self.used_pages + entry.pages > self.capacity_pages {
-            // Unreachable (an empty tier fits a snapshot ≤ capacity); guard
-            // against an infinite loop regardless.
+        // the budget, so the loop always terminates with room available.
+        while self.used_bytes + entry.bytes > self.capacity_bytes {
+            // Unreachable (an empty tier fits a snapshot ≤ the budget);
+            // guard against an infinite loop regardless.
             if self.evict_one().is_none() {
                 return Err(HostError::Oversized);
             }
         }
         entry.tier = tier;
-        let pages = entry.pages;
+        let bytes = entry.bytes;
         match tier {
             Tier::Protected => self.protected.push(entry),
             Tier::Probation => self.probation.push(entry),
         }
-        self.used_pages += pages;
+        self.used_bytes += bytes;
         Ok(())
     }
 
@@ -228,7 +246,7 @@ impl HostTier {
         } else {
             return None; // the tier is empty (nothing to evict)
         };
-        self.used_pages = self.used_pages.saturating_sub(entry.pages);
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
         Some(entry)
     }
 
@@ -245,18 +263,28 @@ impl HostTier {
         Some(entry)
     }
 
+    /// Discard a specific request's snapshot without promoting it (P4-07,
+    /// GitHub #125): the scheduler's fallback when a physical restore
+    /// attempt fails (a corrupt/foreign blob, or a leaf-level error) — the
+    /// snapshot is dropped from the tier exactly as [`HostTier::evict_one`]
+    /// would drop it, and the request falls back to re-prefilling. Returns
+    /// the discarded entry, or `None` when `request` is not in the tier.
+    pub fn discard_request(&mut self, request: RequestId) -> Option<HostEntry> {
+        self.remove(request)
+    }
+
     /// Remove a request's snapshot from whichever tier holds it, updating
     /// the usage accounting. Returns the removed entry, or `None` when the
     /// request is not in the tier.
     fn remove(&mut self, request: RequestId) -> Option<HostEntry> {
         if let Some(i) = self.probation.iter().position(|e| e.request == request) {
             let entry = self.probation.remove(i);
-            self.used_pages = self.used_pages.saturating_sub(entry.pages);
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
             return Some(entry);
         }
         if let Some(i) = self.protected.iter().position(|e| e.request == request) {
             let entry = self.protected.remove(i);
-            self.used_pages = self.used_pages.saturating_sub(entry.pages);
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
             return Some(entry);
         }
         None
@@ -284,12 +312,13 @@ mod tests {
         gdn
     }
 
-    fn entry(request: u64, pages: u32, gdn: GdnState, tick: u64) -> HostEntry {
+    fn entry(request: u64, bytes: u64, gdn: GdnState, tick: u64) -> HostEntry {
         HostEntry {
             request,
             lane: 0,
             owner: RequestClass::Agent,
-            pages,
+            pages: 1, // GPU-pool accounting, unrelated to this tier's byte budget
+            bytes,
             tokens: 0,
             remaining_work: 8,
             gdn,
@@ -307,7 +336,7 @@ mod tests {
         // Both are probation (never restored): the victim is the oldest
         // capture (LRU).
         assert_eq!(tier.victim().unwrap().request, 1);
-        assert_eq!(tier.used_pages(), 20);
+        assert_eq!(tier.used_bytes(), 20);
     }
 
     #[test]
@@ -335,21 +364,21 @@ mod tests {
 
     #[test]
     fn two_tier_eviction_probation_before_protected() {
-        // A 30-page tier with 20-page snapshots: only one fits at a time.
+        // A 30-byte tier with 20-byte snapshots: only one fits at a time.
         let mut tier = HostTier::new(30);
         tier.capture(entry(1, 20, gdn_boundary(0), 0)).unwrap(); // probation
         tier.capture(entry(2, 20, gdn_boundary(0), 1)).unwrap(); // evicts 1 (probation LRU)
         assert_eq!(
             tier.entry_count(),
             1,
-            "only one 20-page snapshot fits a 30-page tier"
+            "only one 20-byte snapshot fits a 30-byte tier"
         );
         assert_eq!(tier.victim().unwrap().request, 2);
         // Promote request 2 (restore, so its next capture is protected).
         tier.restore(2).unwrap();
         tier.capture(entry(2, 20, gdn_boundary(0), 2)).unwrap(); // protected (proven)
-        // A new probation 20-page snapshot cannot coexist with the
-        // protected 20-page snapshot (30 < 40): the protected entry is
+        // A new probation 20-byte snapshot cannot coexist with the
+        // protected 20-byte snapshot (30 < 40): the protected entry is
         // evicted as a last resort.
         tier.capture(entry(3, 20, gdn_boundary(0), 3)).unwrap();
         assert_eq!(tier.entry_count(), 1);
@@ -381,46 +410,35 @@ mod tests {
 
     #[test]
     fn usage_is_bounded_by_capacity() {
-        // A 40-page tier with 10-page snapshots: at most 4 fit. The tier
+        // A 40-byte tier with 10-byte snapshots: at most 4 fit. The tier
         // evicts (probation LRU) to stay within the budget — it never
-        // exceeds `capacity_pages`.
+        // exceeds `capacity_bytes`.
         let mut tier = HostTier::new(40);
         for i in 0..10u64 {
-            tier.capture(HostEntry {
-                request: i,
-                lane: 0,
-                owner: RequestClass::Agent,
-                pages: 10,
-                tokens: 0,
-                remaining_work: 8,
-                gdn: gdn_boundary(0),
-                tier: Tier::Probation,
-                use_tick: i,
-            })
-            .unwrap();
+            tier.capture(entry(i, 10, gdn_boundary(0), i)).unwrap();
             assert!(
-                tier.used_pages() <= tier.capacity_pages(),
-                "the tier must never exceed its capacity (used {} > {})",
-                tier.used_pages(),
-                tier.capacity_pages()
+                tier.used_bytes() <= tier.capacity_bytes(),
+                "the tier must never exceed its budget (used {} > {})",
+                tier.used_bytes(),
+                tier.capacity_bytes()
             );
         }
         assert_eq!(
-            tier.used_pages(),
+            tier.used_bytes(),
             40,
-            "the tier holds exactly its budget worth of pages"
+            "the tier holds exactly its budget worth of bytes"
         );
         assert_eq!(
             tier.entry_count(),
             4,
-            "only four 10-page snapshots fit a 40-page tier"
+            "only four 10-byte snapshots fit a 40-byte tier"
         );
     }
 
     #[test]
     fn an_oversized_snapshot_is_rejected() {
         let mut tier = HostTier::new(10);
-        // A 20-page snapshot exceeds the 10-page capacity: it can never be
+        // A 20-byte snapshot exceeds the 10-byte budget: it can never be
         // held.
         assert_eq!(
             tier.capture(entry(1, 20, gdn_boundary(0), 0)),
@@ -445,5 +463,23 @@ mod tests {
         );
         // Restoring a request not in the tier returns None.
         assert!(tier.restore(99).is_none());
+    }
+
+    #[test]
+    fn discard_request_removes_without_promoting() {
+        // P4-07, GitHub #125: the scheduler's fallback when a physical
+        // restore fails — the snapshot leaves the tier but the request is
+        // never marked "proven" (it did not actually resume).
+        let mut tier = HostTier::new(100);
+        tier.capture(entry(1, 10, gdn_boundary(0), 0)).unwrap();
+        let discarded = tier.discard_request(1).unwrap();
+        assert_eq!(discarded.request, 1);
+        assert!(!tier.contains(1));
+        assert_eq!(tier.used_bytes(), 0);
+        // Not promoted: a fresh capture lands back in probation.
+        tier.capture(entry(1, 10, gdn_boundary(0), 1)).unwrap();
+        assert_eq!(tier.victim().unwrap().tier, Tier::Probation);
+        // Discarding a request not in the tier returns None.
+        assert!(tier.discard_request(99).is_none());
     }
 }

@@ -10,9 +10,12 @@
 //! Each scenario keeps the KV page pool generous (the default 4096-page
 //! pool) so the *lane* dimension (8 resident lanes), not the page pool, is
 //! the constraint — that is what forces the overflow (evict-to-tier) path.
-//! `host_capacity_pages` is the knob that drives the tier's bounded
+//! `host_capacity_bytes` is the knob that drives the tier's bounded
 //! behavior: large (no discards, everything restores) vs small (the tier
 //! evicts to stay within budget, discarding the oldest snapshot).
+//! `MockCompute::evict` (GitHub #125) reports a nominal 1 byte per
+//! snapshot, so a byte budget here reads exactly like the old page-count
+//! one — an N-byte tier holds N snapshots.
 
 use std::sync::Arc;
 
@@ -34,16 +37,16 @@ fn input(max: u32) -> RequestInput {
 }
 
 /// A scheduler with a generous page pool (the lane dimension is the
-/// constraint) and a host tier of `host_pages` pages. `max_in_flight` is
+/// constraint) and a host tier of `host_bytes` bytes. `max_in_flight` is
 /// raised above the 8 resident lanes so the overflow (beyond-N) requests
 /// can be submitted (the host-tier overflow path, core-06).
-fn sched_with(host_pages: u32) -> ConcreteScheduler {
+fn sched_with(host_bytes: u64) -> ConcreteScheduler {
     let compute = Arc::new(MockCompute::new());
     let cfg = SchedulerConfig {
         model: "qwen3.8-27b".into(),
         max_in_flight: 16, // 8 resident lanes + the overflow beyond them
         max_prefill_batch: 8,
-        host_capacity_pages: host_pages,
+        host_capacity_bytes: host_bytes,
         ..SchedulerConfig::default() // 4096-page pool: pages are never tight
     };
     ConcreteScheduler::with_config(cfg, compute)
@@ -58,7 +61,7 @@ where
     events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::Evicted { request } if kind(e) => Some(*request),
+            SchedEvent::Evicted { request, .. } if kind(e) => Some(*request),
             SchedEvent::Restored { request, .. } if kind(e) => Some(*request),
             SchedEvent::Requeued { request } if kind(e) => Some(*request),
             _ => None,
@@ -101,7 +104,7 @@ fn evict_frees_a_blocked_head_and_restore_skips_reprefill() {
     );
     // The tier holds the evicted snapshot and stays within its budget.
     assert!(
-        sched.host_tier().used_pages() <= sched.host_tier().capacity_pages(),
+        sched.host_tier().used_bytes() <= sched.host_tier().capacity_bytes(),
         "the host tier never exceeds its budget"
     );
 
@@ -149,12 +152,12 @@ fn evict_frees_a_blocked_head_and_restore_skips_reprefill() {
 
 /// Scenario 2 — under N=8 + overflow load the evictions are **bounded**:
 /// with a small host-RAM budget the tier evicts its lowest-value (probation
-/// LRU) snapshot to make room, so it never exceeds `capacity_pages`; the
+/// LRU) snapshot to make room, so it never exceeds `capacity_bytes`; the
 /// discarded snapshot's request is re-queued (it re-prefills later), while
 /// the retained snapshots are still restored.
 #[test]
 fn evictions_are_bounded_under_overflow_load() {
-    // A 2-page tier holding 1-page snapshots: at most two fit, so a third
+    // A 2-byte tier holding 1-byte snapshots: at most two fit, so a third
     // capture must evict (discard) the oldest snapshot to stay bounded.
     let mut sched = sched_with(2);
 
@@ -178,14 +181,14 @@ fn evictions_are_bounded_under_overflow_load() {
         }
         // Boundedness invariant: the tier never holds more than its budget.
         assert!(
-            sched.host_tier().used_pages() <= sched.host_tier().capacity_pages(),
-            "the host tier must stay within its {}-page budget (holds {})",
-            sched.host_tier().capacity_pages(),
-            sched.host_tier().used_pages()
+            sched.host_tier().used_bytes() <= sched.host_tier().capacity_bytes(),
+            "the host tier must stay within its {}-byte budget (holds {})",
+            sched.host_tier().capacity_bytes(),
+            sched.host_tier().used_bytes()
         );
     }
 
-    // The tier filled (three 1-page captures into a 2-page tier), so at
+    // The tier filled (three 1-byte captures into a 2-byte tier), so at
     // least one snapshot was discarded and its request re-queued (it will
     // re-prefill) — that is the bounded behavior (the tier does not grow
     // without bound; it drops its lowest-value entry instead).

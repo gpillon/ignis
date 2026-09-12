@@ -44,7 +44,7 @@ fn small_pool() -> SchedulerConfig {
         // The core-05 scenarios exercise the admission machine in isolation:
         // the host tier is disabled (no overflow), so a blocked head waits
         // for its donors instead of being admitted via a lane eviction.
-        host_capacity_pages: 0,
+        host_capacity_bytes: 0,
         serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
     }
 }
@@ -224,7 +224,7 @@ fn lane_pressure_holds_head_and_backfills_until_a_lane_frees() {
         model: "qwen3.8-27b".into(),
         max_in_flight: 16,
         max_prefill_batch: 8,
-        host_capacity_pages: 0, // host tier disabled: lane pressure is the
+        host_capacity_bytes: 0, // host tier disabled: lane pressure is the
         // constraint (the head waits for a lane to free, core-05).
         ..SchedulerConfig::default() // 4096-page pool: pages are never tight
     };
@@ -351,7 +351,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             kv_page_tokens: 64,
             max_sequence_tokens: 1024,
             kv_capacity_pages: pool.block_count() as u32,
-            host_capacity_pages: 0,
+            host_capacity_bytes: 0,
             serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
         },
         compute.clone(),

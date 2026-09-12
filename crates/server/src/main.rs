@@ -202,6 +202,7 @@ async fn main() {
         max_context: _,
         kv_format: _,
         kv_pool_bytes: _,
+        host_pool_bytes: _,
         request_timeout_secs,
     } = config;
 

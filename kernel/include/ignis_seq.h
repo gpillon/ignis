@@ -397,6 +397,25 @@ void ignis_seq_prefix_release(struct ignis_seq_pool *pool, struct ignis_seq_pref
 int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
                                 struct ignis_seq_prefix_stats *out_stats);
 
+/* --- pinned host memory (P4-07, GitHub #125) ------------------------------
+ *
+ * The host tier's snapshot transport: a page-locked (`cudaHostAlloc`)
+ * region, which is what makes the D2H capture and H2D restore run at
+ * pinned PCIe rates rather than the pageable-memory path. Two calls, no
+ * options struct -- there is nothing to modulate, only a size to allocate
+ * and a pointer to free, the same shape as every other allocate/free pair
+ * in this ABI (`ignis_device_alloc` / `ignis_device_free`).
+ */
+
+/* Allocate `bytes` of pinned host memory; `out_ptr` receives the host
+ * pointer. Returns 0 on success, -1 on a null `out_ptr` or a CUDA
+ * allocation failure (see ignis_seq_last_error) -- most commonly the host's
+ * pinned-memory budget, not device VRAM. */
+int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr);
+
+/* Free a region returned by ignis_host_pinned_alloc. NULL is a no-op. */
+void ignis_host_pinned_free(void *ptr);
+
 /* The message from the most recent failing call on this thread
  * (thread-local; overwritten by the next call; empty string if none failed
  * yet). Never NULL. */
