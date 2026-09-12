@@ -306,7 +306,12 @@ When output names a domain concept, use the term as defined here.
   #137).
 - **Canary suite** — the fixed set of short, high-signal prompts used to detect
   divergences. Sanity is judged on everything the turn generated: a turn whose
-  budget ran out mid-thought produced sane tokens, not empty output.
+  budget ran out mid-thought produced sane tokens, not empty output. The
+  64-token budget stays that way under the serving default, so most canaries
+  are read on the thinking channel and the report says so
+  (`answer=thinking-only`). Checking the *answer* is the **canary oracle**'s
+  job, token by token with thinking off — the suite's own job is catching a
+  degenerate engine, which shows on either channel (GitHub #144).
 - **Canary oracle** — the recorded fixture the canary suite is checked against:
   the reference engine's greedy (exact-argmax) completions on those prompts for
   the same artifact, tokenized with the artifact's tokenizer.
