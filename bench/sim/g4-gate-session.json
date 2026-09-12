@@ -1,0 +1,87 @@
+{
+  "model": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "staggerSeconds": 2,
+  "requests": [
+    {
+      "name": "main",
+      "maxTokens": 16000,
+      "system": "You are the main coding agent working in the ignis repository (F:/ai/opencode/inference), a Rust + CUDA inference engine that is porting a reference C++/CUDA engine (ninfer) feature-for-feature under gated performance/correctness checks (ADRs in docs/adr/, gates in crates/bench). You have read_file, bash, edit_file, and spawn_subagent tools. You coordinate subagents for well-scoped subtasks instead of doing everything inline yourself. Always cite file paths and line numbers. Never guess at code you have not been shown in this conversation -- ask a subagent to read it first. Be thorough: give a complete, detailed report, not a summary.",
+      "files": [
+        ".scratch/runtime/specs/04-reference-feature-floor.md",
+        "docs/agents/testing.md",
+        "crates/bench/src/g4.rs"
+      ],
+      "task": "Task: this session is itself the live load for gate G4 (GitHub #128) -- you are being run right now, against the reference engine, to record the trace both engines will replay. Give me a complete readiness audit of the G4 gate machinery in the files above: every acceptance criterion in the spec, whether the g4 measurement instrument (needle retrieval cells, session id, trace hash) actually implements what the spec promises, and whether the GPU test profile runbook in testing.md is sufficient to certify a green kernel + Rust GPU profile in one run. Then spawn ten subagents in parallel with fully self-contained instructions (paste them the exact file content they need -- they cannot see this conversation) auditing: the pooled g4-gate verdict math, the KV format codec, sequence snapshot/restore, prefix reuse refcounting, tagged lanes over HTTP, the eviction priority ordering, the trace/record format, the canary suite, the model loader's hq-e8-2b wiring, and the CUDA leaf runtime. Be exhaustive about what each one should check."
+    },
+    {
+      "name": "sub01",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/bench/src/g4_gate.rs", "crates/bench/src/g4.rs"],
+      "task": "Task: read the pooled G4 verdict logic below in full. Walk through exactly how it pools >=2 launches per engine into one per-class and aggregate throughput ratio, how it enforces live/live (matching trace hash, matching session id) across all launches, and how the needle-retrieval floor is checked separately from the ratio cells. State, precisely, what would make check() refuse a verdict versus what would make it record a fail versus a pass, and list every field a launch record must carry for the pooling to be valid."
+    },
+    {
+      "name": "sub02",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/kv_format.rs"],
+      "task": "Task: read the KV format module below in full. Report every place hq-e8-2b's byte-per-token accounting is computed, how it derives token capacity from a byte budget, and how BF16 stays the correctness oracle format alongside it. Confirm whether anything in this file assumes a particular geometry (GQA head count, layer count) that the G4 gate's 27B model must match."
+    },
+    {
+      "name": "sub03",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/seq.rs"],
+      "task": "Task: read the sequence state module below in full. Report exactly how snapshot/restore/clone share the section-table machinery (ADR 0024), what the opaque blob's header validates, and what happens on a version/size mismatch. State whether a snapshot round-trip test could detect silent corruption versus only an explicit mismatch."
+    },
+    {
+      "name": "sub04",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/prefix.rs", "crates/core/src/host.rs"],
+      "task": "Task: read the prefix-reuse and host-tier eviction code below in full. Report exactly how a claimant sibling receives shared KV pages plus a device-to-device clone of mutable state, and how the one eviction priority (ADR 0023) differs between GPU residency (protection then class then LRU) and the host tier (class then probation/protected then LRU). Give a worked example of each ordering."
+    },
+    {
+      "name": "sub05",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/server/src/config.rs", "crates/server/src/main.rs"],
+      "task": "Task: read the server config and main below in full. Report the exact CLI flags for --kv-format, --max-context, --prefill-chunk, and --kv-pool-bytes, their defaults, and how the request class extension field reaches admission from HTTP. Confirm hq-e8-2b really is the compiled-in default per ADR 0022."
+    },
+    {
+      "name": "sub06",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/bench/src/trace.rs", "crates/bench/src/record.rs"],
+      "task": "Task: read the trace and capture-proxy format below in full. Report every field TraceLine carries, how class (main/sub) round-trips through JSON, and exactly how the capture proxy forwards SSE byte-for-byte without corrupting a multi-chunk tool_calls or reasoning_content delta. State what would prove that guarantee under load."
+    },
+    {
+      "name": "sub07",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/bench/src/canary.rs"],
+      "task": "Task: read the canary self-consistency suite below in full. Report exactly what 'sane output, greedy, fixed seed' means operationally here -- which prompts, which comparison, what counts as divergence -- and whether the suite already runs under hq-e8-2b or assumes BF16 anywhere."
+    },
+    {
+      "name": "sub08",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/core/src/model_load.rs"],
+      "task": "Task: read the model loader below in full. Report exactly how it wires hq-e8-2b at load time (flag, default, geometry checks), what it logs about the KV pool at load (token capacity, byte budget), and whether anything here differs between a BF16 load and an hq-e8-2b load beyond the format tag itself."
+    },
+    {
+      "name": "sub09",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": ["crates/runtime/src/cuda_leaf.rs", "crates/runtime/src/lib.rs"],
+      "task": "Task: read the CUDA leaf runtime below in full. Report exactly which entry points the G4 gate run exercises (decode graph capture widths 1..8, chunked prefill, snapshot/restore FFI if any), and flag anywhere a kernel error or busy-GPU condition could silently skip instead of hard-failing under IGNIS_GPU_PROFILE=1."
+    },
+    {
+      "name": "sub10",
+      "maxTokens": 12000,
+      "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
+      "files": [".scratch/ROADMAP.md", ".scratch/REVIEW-2026-09-05.md"],
+      "task": "Task: read the roadmap and review documents below (skim for the Phase 4 / G4 sections and the KV-format inequality note). Report exactly what §6 of the review currently says about G4, what the ROADMAP's G4 row currently says, and draft the replacement text each should carry once a live G4 verdict exists -- structured so it is easy to drop in verbatim."
+    }
+  ]
+}

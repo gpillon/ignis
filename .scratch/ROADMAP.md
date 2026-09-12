@@ -166,7 +166,7 @@ for prefix reuse). Ticket numbers go in this table when they are published.
 | P4-09 (#120) | Tagged lanes: the class as an ignis extension field, mapped to `RequestClass`, echoed in the request log and carried by the trace | — | Every request's class is attributable in the log; unknown maps to `Interactive` |
 | P4-10 (#126) | Device prefix reuse: leaf-owned page refcount and sharing, device-to-device clone of the mutable sections through the section machinery | P4-06 (#124) | A sibling claiming a prefix produces the same tokens as one that prefilled it; shared pages charged once |
 | P4-11 (#121) | Tool-call stream hardening and preserve-thinking against a real agent session | — | A recorded session's tool-call and thinking streams survive round-trip |
-| P4-12 (#128) | G4 gate run and verdict | all | **G4 GREEN** or a filed gap, never a waiver |
+| P4-12 (#128) | G4 gate run and verdict | all | **Run 2026-09-12: gaps filed (#137, #138, #139, #143, #144, #145), not a waiver.** Full verdict: `.scratch/REVIEW-2026-09-05.md` §6 Phase 4. Dogfood clean; GPU profile green but flaky across attempts (#145). Both engines measured over 2 launches each; the per-class throughput cell is unverified (#137: the bench client ignores `reasoning_content`), needle@128K fails identically on both engines (#138), and G3-under-hq has only one decidable launch pair (#139 blocks the reference's second), which misses C=1 by a hair and only tolerates ITL (#143). #65 stays open pending #137/#138/#139 and a follow-up two-launch-per-engine session with a fixed harness. |
 
 Frontier at start: **#117**, **#118**, **#119**, **#120**, **#121** in
 parallel (P4-01 and P4-09 are Rust only, no GPU; P4-02 needs the owner and the

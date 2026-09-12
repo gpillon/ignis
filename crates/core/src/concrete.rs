@@ -116,9 +116,9 @@ use std::time::Instant;
 
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
-    RetainedLaneCandidate, admission_resources_fit, choose_retained_lane_victim,
-    make_admission_protection, persistent_backfill_is_safe, protected_head_safe_without_temporal,
-    protection_frontier_distance,
+    ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
+    choose_resident_candidate_victim, choose_retained_lane_victim, make_admission_protection,
+    persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
 use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
@@ -891,31 +891,41 @@ impl ConcreteScheduler {
             .collect()
     }
 
-    /// The best (oldest-submitted) resident, lane-less `Prefilling`
-    /// request eligible for eviction (P4-07, GitHub #125): device-resident
-    /// (holds real KV pages, a GDN slot and conv taps) but holding no
-    /// decode lane at all — whether it is the sole half-prefilled request
-    /// still chunking, or a fully-prefilled one still queued for a lane
-    /// deal. Excludes a request holding (or holding open) a shared prefix,
-    /// for the same reason [`Self::retained_lane_candidates`] does, and
-    /// `exclude` (a request index this call must never pick — the blocked
-    /// head itself, when called from [`Self::try_evict_for_head`]: without
-    /// this, a `Prefilling`-complete head queued for a lane matches this
-    /// method's own filter and would be "evicted" to make room for itself).
+    /// The lowest-value resident, lane-less `Prefilling` request eligible
+    /// for eviction (P4-07, GitHub #125; class-aware priority per ADR
+    /// 0023, GitHub #127): device-resident (holds real KV pages, a GDN
+    /// slot and conv taps) but holding no decode lane at all — whether it
+    /// is the sole half-prefilled request still chunking, or a
+    /// fully-prefilled one still queued for a lane deal. Excludes a
+    /// request holding (or holding open) a shared prefix, for the same
+    /// reason [`Self::retained_lane_candidates`] does, and `exclude` (a
+    /// request index this call must never pick — the blocked head itself,
+    /// when called from [`Self::try_evict_for_head`]: without this, a
+    /// `Prefilling`-complete head queued for a lane matches this method's
+    /// own filter and would be "evicted" to make room for itself).
     ///
-    /// Oldest-submitted (vec order — ids are monotonic and requests are
-    /// never reordered) is a stopgap, not the class-aware priority ADR
-    /// 0023 defines for GPU residency; GitHub #127 unifies eviction
-    /// priority across the GPU and the host tier, and until then this
-    /// mirrors the Running-lane path's own pre-#127 simplicity. `None`
-    /// when no eligible candidate exists.
+    /// Ordering ([`choose_resident_candidate_victim`]): request class
+    /// (Agent before Interactive), then oldest-submitted (request id) as
+    /// the LRU proxy — a lane-less candidate has already had eligibility
+    /// and protection settled by this method's own filtering, so class and
+    /// LRU are all that remain (the GPU-residency half of ADR 0023's
+    /// ordering [`RetainedLaneCandidate`] shares). `None` when no eligible
+    /// candidate exists.
     fn prefilling_eviction_candidate(&self, exclude: Option<usize>) -> Option<usize> {
-        self.requests.iter().enumerate().position(|(i, r)| {
-            Some(i) != exclude
-                && r.state == RequestState::Prefilling
-                && r.resident
-                && r.prefix_entry.is_none()
-        })
+        let candidates: Vec<ResidentCandidate> = self
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| {
+                Some(*i) != exclude
+                    && r.state == RequestState::Prefilling
+                    && r.resident
+                    && r.prefix_entry.is_none()
+            })
+            .map(|(_, r)| ResidentCandidate { request_id: r.id, owner: r.class })
+            .collect();
+        let victim_id = choose_resident_candidate_victim(&candidates)?;
+        self.requests.iter().position(|r| r.id == victim_id)
     }
 
     /// Whether `r`'s lane is reserved for an earlier-queued interactive

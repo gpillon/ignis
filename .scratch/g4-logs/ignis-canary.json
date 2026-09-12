@@ -1,0 +1,33 @@
+[
+  {
+    "id": "rust-hello",
+    "sane": true,
+    "deterministic": true,
+    "first": "It defines a Rust `",
+    "second": "It defines a Rust `"
+  },
+  {
+    "id": "rust-sort",
+    "sane": false,
+    "sane_reason": "empty output",
+    "deterministic": true,
+    "first": "",
+    "second": ""
+  },
+  {
+    "id": "math-greedy",
+    "sane": false,
+    "sane_reason": "empty output",
+    "deterministic": true,
+    "first": "",
+    "second": ""
+  },
+  {
+    "id": "explain-reverse",
+    "sane": false,
+    "sane_reason": "empty output",
+    "deterministic": true,
+    "first": "",
+    "second": ""
+  }
+]

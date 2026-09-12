@@ -1,0 +1,43 @@
+{
+  "session": "g4-20260912T162610Z",
+  "ours_label": "ignis",
+  "reference_label": "ninfer",
+  "ours_engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "reference_engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "ours_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-pool auto(4GiB=465984 tok), max-context 262144, request-timeout 900",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-capacity 465984, max-context 262144",
+  "ours_date": "2026-09-12T18:37:55Z",
+  "reference_date": "2026-09-12T17:17:40Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 55.551705146362885,
+    "reference_tok_s": 57.02932610889454,
+    "ratio": 0.9740901556558776,
+    "passed": false
+  },
+  "c4": {
+    "ours_tok_s": 27.698885362908285,
+    "reference_tok_s": 10.234304508562511,
+    "ratio": 2.706474615811369,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 179.2876000000001,
+    "ours_p95_ms": 241.7902549999986,
+    "ours_p99_ms": 254.90753399999957,
+    "ours_max_ms": 278.32300000000396,
+    "reference_p50_ms": 159.55274999999824,
+    "reference_p95_ms": 234.74202500000393,
+    "reference_p99_ms": 255.02191400000214,
+    "reference_max_ms": 256.7890000000043,
+    "ratio": 1.030025428978874,
+    "passed": true,
+    "warning": "ITL p95 ratio 1.030 exceeds the reference's own p95 (tolerated up to 1.1, but not a clean pass — flagged for review)"
+  },
+  "notes": [
+    "G4 session g4-20260912T162610Z launch1 pair, GitHub #128"
+  ],
+  "passed": false
+}

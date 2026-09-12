@@ -161,6 +161,24 @@ impl RequestClass {
             RequestClass::Agent => "agent",
         }
     }
+
+    /// The class's rank in the **eviction** ordering (ADR 0023): lower ranks
+    /// first, so `Agent` (the backfill class — a better victim) is `0` and
+    /// `Interactive` is `1`. This is the single definition of "class" in
+    /// "request class" for both eviction levels
+    /// ([`crate::admission::retained_lane_is_better_victim`] on the GPU,
+    /// [`crate::host::HostTier`]'s discard ordering on the host tier) — it
+    /// is the *opposite* direction from the derived [`Ord`] on this type,
+    /// which orders `Interactive` first for lane-dealing *admission*
+    /// priority ([`crate::request::admit_candidates`]); the two orderings
+    /// answer different questions and are not interchangeable.
+    #[must_use]
+    pub fn eviction_rank(&self) -> u8 {
+        match self {
+            RequestClass::Agent => 0,
+            RequestClass::Interactive => 1,
+        }
+    }
 }
 
 /// The backfill class a request was admitted under by the admission state
