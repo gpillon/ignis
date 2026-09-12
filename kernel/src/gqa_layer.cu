@@ -489,7 +489,7 @@ int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
   const uint64_t start_position = seq->gqa_positions[gqa_layer];
   if (num_tokens > static_cast<uint64_t>(INT32_MAX) - start_position ||
-      start_position + num_tokens > seq->kv.mapped_token_capacity()) {
+      start_position + num_tokens > ignis_seq_token_capacity(*seq)) {
     set_error("ignis_gqa_layer: token positions exceed the sequence KV capacity");
     return -1;
   }

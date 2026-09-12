@@ -355,3 +355,154 @@ fn a_failed_prefill_retry_does_not_double_claim() {
     );
     let _ = (main, sub);
 }
+// ── P4-10 (GitHub #126): the leaf actually shares the pages ──────────────
+//
+// Before P4-10 the cache was two ledgers over the same pages: Rust counted
+// refcounts while the leaf independently materialized pages and bound rows,
+// and neither ever shared one. What makes the sharing real is what the
+// scheduler now puts on the prefill jobs — where the prefix is published,
+// and which prefix a claimant is allocated against — so that is what these
+// check, behind the `Compute` seam and with no GPU (ADR 0006).
+
+/// The prefill jobs the mock received, flattened, for the request `id`.
+fn jobs_of(compute: &MockCompute, id: u64) -> Vec<PrefillJob> {
+    compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter(|job| job.request == id)
+        .collect()
+}
+
+#[test]
+fn a_publishing_request_is_cut_at_the_page_boundary_it_publishes() {
+    // The mutable state a claimant clones is the state at the prefix's end,
+    // so the chunk that lands on the prefix has to stop there. A 40-token
+    // prompt shares its first 32 tokens (2 pages of 16), so its prefill is
+    // two chunks — 32 then 8 — and the publish rides on the first.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let main_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 40), 8), RequestClass::Agent)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs = jobs_of(&compute, main_id);
+    assert_eq!(
+        jobs.iter().map(|j| j.tokens.len()).collect::<Vec<_>>(),
+        vec![32, 8],
+        "the prompt is cut at the page boundary it publishes, then the tail"
+    );
+    assert_eq!(
+        jobs[0].publish_prefix_tokens,
+        Some(32),
+        "the chunk that lands on the prefix is the one that publishes it"
+    );
+    assert_eq!(
+        jobs[1].publish_prefix_tokens, None,
+        "the tail publishes nothing: the state has already moved past the prefix"
+    );
+    assert!(
+        jobs.iter().all(|j| j.shared_prefix.is_none()),
+        "the publisher claims nobody else's prefix"
+    );
+}
+
+#[test]
+fn a_claimant_is_allocated_against_the_publisher_s_prefix() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let main_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    sched.advance();
+    let sub_id = sched
+        .submit(
+            input("qwen3.8-27b", [tokens(1, 32), tokens(50, 8)].concat(), 8),
+            RequestClass::Agent,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs = jobs_of(&compute, sub_id);
+    let claim = jobs[0]
+        .shared_prefix
+        .expect("the claimant's first job names the prefix it was allocated against");
+    assert_eq!(
+        claim.publisher, main_id,
+        "the claim names the request whose prefill published the pages"
+    );
+    assert_eq!(claim.tokens, 32, "the claim covers the shared head");
+    assert_eq!(
+        jobs[0].start_position, claim.tokens,
+        "a claimant starts where the prefix ends, which is where its clone put it"
+    );
+    assert!(
+        jobs.iter().all(|j| j.publish_prefix_tokens.is_none()),
+        "a claimant never publishes: the head it would offer is the entry it holds"
+    );
+}
+
+#[test]
+fn a_full_prompt_match_carries_no_tail_to_prefill() {
+    // The claimant's prompt IS the cached prefix: the clone alone puts it
+    // where it needs to be, pending token included, so there is nothing left
+    // to warm. The job still exists — it is what allocates the sequence
+    // against the prefix.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let main_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    sched.advance();
+    let twin_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs = jobs_of(&compute, twin_id);
+    assert_eq!(jobs.len(), 1, "one job, and it warms nothing");
+    assert!(jobs[0].tokens.is_empty(), "a full-prompt match has no tail");
+    assert_eq!(
+        jobs[0].shared_prefix.map(|c| c.publisher),
+        Some(main_id),
+        "it is still allocated against the prefix — that is what the job is for"
+    );
+}
+
+#[test]
+fn the_backend_prefix_is_released_once_the_last_claimant_is_gone() {
+    // The scheduler's entry and the leaf's prefix are one object seen from
+    // two sides. When the entry drops, the backend's handle has to drop with
+    // it, or the leaf pins the shared pages for the life of the process.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let main_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    sched.advance();
+    sched
+        .submit(
+            input("qwen3.8-27b", [tokens(1, 32), tokens(50, 8)].concat(), 8),
+            RequestClass::Agent,
+        )
+        .unwrap();
+    // While both hold it, nothing is released.
+    sched.advance();
+    assert!(
+        compute.released_prefixes().is_empty(),
+        "a prefix two requests hold is not released"
+    );
+
+    run_to_idle(&mut sched);
+    assert_eq!(
+        compute.released_prefixes(),
+        vec![main_id],
+        "the last claimant's exit drops the backend's handle on the publisher's prefix"
+    );
+    assert_eq!(
+        sched.prefix_pinned_pages(),
+        0,
+        "and the pages stop being charged to the pool"
+    );
+}

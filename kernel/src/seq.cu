@@ -23,6 +23,7 @@
 
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
+#include "ignis_seq_prefix_internal.h"
 #include "ignis_seq_sections.h"
 
 #include "ops/kernel/hq_codec.cuh"
@@ -51,7 +52,7 @@ namespace {
 thread_local std::string g_last_error;
 
 void set_error(std::string message) {
-  g_last_error = std::move(message);
+  ignis_seq_set_last_error(std::move(message));
 }
 
 bool positive(uint32_t v) {
@@ -88,14 +89,21 @@ bool known_kv_format(int32_t kv_format) {
 
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
 
-// Whether `seq` was actually drawn from `pool`. Both transfer paths hand
-// the sequence and the pool to the vendored pools together, and the
-// vendored side's own mismatch check aborts the process (CUDA_CHECK /
-// std::invalid_argument out of a noexcept path), so the pairing is checked
-// here first and refused as a plain bad argument.
-bool seq_belongs_to(const ignis_seq_pool &pool, const ignis_seq &seq) {
-  return seq.kv.valid() && seq.kv.belongs_to(pool.kv_pool) && seq.slot >= 0 &&
-         seq.slot < pool.gdn_pool.slot_count();
+// Why `seq` cannot be moved as one blob, or nullptr if it can.
+//
+// A sequence that claims a shared prefix (P4-10, GitHub #126) does not own
+// its leading KV pages: they are the prefix's, refcounted and addressed by
+// every claimant's block-table row. A snapshot of it would either copy
+// another request's history into this request's blob, or leave a hole a
+// restore would read as zeroed attention -- so the transfer is refused
+// rather than approximated. Releasing the sequence drops the claim, and a
+// re-prefill is the way back on.
+const char *shared_prefix_refusal(const ignis_seq &seq) {
+  if (seq.prefix == nullptr) {
+    return nullptr;
+  }
+  return "the sequence claims a shared prefix, so its KV history is not all "
+         "its own; release it and re-prefill instead";
 }
 
 // The offset of `kind` in `sections`. The table always carries every kind
@@ -111,19 +119,6 @@ std::uint64_t section_offset(const std::vector<ignis_seq_section> &sections, int
                          ignis_seq_section_name(kind) + " section");
 }
 
-// The host-side scalars of IGNIS_SEQ_SECTION_PROGRESS.
-ignis_seq_progress_image progress_of(const ignis_seq &seq) {
-  ignis_seq_progress_image image{};
-  image.position      = seq.position;
-  image.pending_token = seq.pending_token;
-  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
-    image.gqa_positions[i] = seq.gqa_positions[i];
-  }
-  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
-    image.gdn_positions[i] = seq.gdn_positions[i];
-  }
-  return image;
-}
 
 // Zero the bytes of `dst` that no section's payload covers: the gap after
 // the header and records, and each section's alignment padding.
@@ -239,6 +234,13 @@ std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
 }
 
 } // namespace
+
+// Not in the anonymous namespace above: kernel/src/seq_prefix.cu writes this
+// same slot (declared in ignis_seq_internal.h), so the two translation units
+// share one `ignis_seq_last_error`.
+void ignis_seq_set_last_error(std::string message) {
+  g_last_error = std::move(message);
+}
 
 extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
                                           struct ignis_seq_pool **out_pool) {
@@ -425,7 +427,14 @@ extern "C" void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq 
     return;
   }
   const std::int32_t slot = seq->slot;
-  delete seq; // ~PagedKVAllocation: unbind the row, return the KV pages.
+  // P4-10 (GitHub #126): this sequence holds one reference to its shared
+  // prefix. Drop it before the handle goes, so the prefix's pages return to
+  // the pool exactly when the last holder -- claimant or publisher's handle
+  // -- lets go, and not a moment earlier.
+  ignis_seq_prefix_drop_reference(pool, seq->prefix);
+  seq->prefix       = nullptr;
+  seq->shared_pages = 0;
+  delete seq; // ~PagedKVAllocation: unbind the row, return the sequence's own KV pages.
   if (pool != nullptr && slot >= 0) {
     pool->free_slots.push_back(slot);
   }
@@ -435,10 +444,16 @@ extern "C" int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq
   if (seq == nullptr || out_stats == nullptr) {
     return -1;
   }
-  out_stats->slot             = seq->slot;
-  out_stats->page_entitlement = seq->kv.page_entitlement();
-  out_stats->mapped_pages     = seq->kv.mapped_page_count();
-  out_stats->token_capacity   = seq->kv.mapped_token_capacity();
+  out_stats->slot = seq->slot;
+  // P4-10 (GitHub #126): a sequence that claims a shared prefix owns only
+  // its tail, but its history -- and so its entitlement, its mapped pages
+  // and its capacity -- is the prefix's pages plus its own. Reporting the
+  // allocation alone would say a claimant has less context than it can
+  // actually address.
+  out_stats->page_entitlement = seq->shared_pages + seq->kv.page_entitlement();
+  out_stats->mapped_pages     = ignis_seq_logical_page_count(*seq);
+  out_stats->token_capacity   = ignis_seq_token_capacity(*seq);
+  out_stats->shared_pages     = seq->shared_pages;
   return 0;
 }
 
@@ -455,9 +470,13 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error("ignis_seq_snapshot_size: null argument");
     return -1;
   }
-  if (!seq_belongs_to(*pool, *seq)) {
+  if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
     return -1;
+  }
+  if (const char *refusal = shared_prefix_refusal(*seq)) {
+    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
+    return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
@@ -482,9 +501,13 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
     set_error("ignis_seq_snapshot: null argument");
     return -1;
   }
-  if (!seq_belongs_to(*pool, *seq)) {
+  if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
     return -1;
+  }
+  if (const char *refusal = shared_prefix_refusal(*seq)) {
+    set_error(std::string("ignis_seq_snapshot: ") + refusal);
+    return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
@@ -539,7 +562,7 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
                              "penalty counts");
         break;
       case IGNIS_SEQ_SECTION_PROGRESS: {
-        const ignis_seq_progress_image image = progress_of(*seq);
+        const ignis_seq_progress_image image = ignis_seq_progress_of(*seq);
         std::memcpy(at, &image, sizeof(image));
         break;
       }
@@ -572,9 +595,14 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
     set_error("ignis_seq_restore: null argument");
     return -1;
   }
-  if (!seq_belongs_to(*pool, *seq)) {
+  if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_restore: the sequence was not drawn from this pool");
     return -1;
+  }
+  if (const char *refusal = shared_prefix_refusal(*seq)) {
+    set_error(std::string("ignis_seq_restore: ") + refusal +
+              "; the target sequence is unchanged");
+    return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
   if (src_bytes < sizeof(ignis_seq_snapshot_header)) {
     set_error("ignis_seq_restore: " + std::to_string(src_bytes) +
@@ -654,14 +682,7 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
     // The progress scalars last, once the synchronize above has confirmed
     // every section actually landed -- the same ordering the chunk loop
     // uses for its own position advance (kernel/src/step.cu).
-    seq->position      = image.position;
-    seq->pending_token = image.pending_token;
-    for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
-      seq->gqa_positions[i] = image.gqa_positions[i];
-    }
-    for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
-      seq->gdn_positions[i] = image.gdn_positions[i];
-    }
+    ignis_seq_apply_progress(*seq, image);
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_restore: ") + e.what());

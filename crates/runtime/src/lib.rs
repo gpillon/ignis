@@ -113,6 +113,10 @@ pub trait StepLeaf: Send + Sync + 'static {
     type Model: Send + Sync + 'static;
     /// Opaque device-resident sequence handle.
     type Sequence: Send + 'static;
+    /// Opaque shared-prefix handle (P4-10, GitHub #126): leaf-owned KV pages
+    /// several sequences address, plus the mutable state each claimant
+    /// clones. Released when the scheduler's last claimant is gone.
+    type Prefix: Send + 'static;
 
     /// Load a model handle.
     fn load_model(&self) -> Result<Self::Model, i32>;
@@ -128,6 +132,29 @@ pub trait StepLeaf: Send + Sync + 'static {
     ) -> Result<Self::Sequence, i32>;
     /// Release a sequence allocation.
     fn release_sequence(&self, model: &Self::Model, sequence: Self::Sequence);
+    /// Allocate one sequence that **claims `prefix`** (P4-10, GitHub #126):
+    /// the prefix's KV pages are shared in place and its mutable state is
+    /// cloned device-to-device, so the sequence starts where the publisher
+    /// stood and prefills only its own tail. `context_tokens` is the whole
+    /// reservation, the prefix included.
+    fn allocate_sequence_shared(
+        &self,
+        model: &Self::Model,
+        context_tokens: u32,
+        prefix: &Self::Prefix,
+    ) -> Result<Self::Sequence, i32>;
+    /// Publish `sequence`'s first `prefix_tokens` tokens as a shared prefix.
+    /// Called at the chunk boundary that lands on `prefix_tokens`: the state
+    /// a claimant clones is the state at the prefix's end.
+    fn publish_prefix(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        prefix_tokens: u32,
+    ) -> Result<Self::Prefix, i32>;
+    /// Release the adapter's own handle on a prefix. Its pages return to the
+    /// pool once every sequence holding it has gone too.
+    fn release_prefix(&self, model: &Self::Model, prefix: Self::Prefix);
     /// Warm one sequence with a prefill span.
     fn prefill(
         &self,
@@ -198,6 +225,11 @@ pub struct RuntimeCompute<L: StepLeaf> {
     model: Arc<Model<L>>,
     eos: TokenId,
     sequences: Mutex<HashMap<RequestId, LiveSequence<L::Sequence>>>,
+    /// Shared prefixes (P4-10, GitHub #126), keyed by the request whose
+    /// prefill published each. Separate from `sequences` on purpose: a
+    /// prefix outlives its publisher, so its handle cannot hang off the
+    /// publisher's sequence.
+    prefixes: Mutex<HashMap<RequestId, L::Prefix>>,
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
@@ -208,6 +240,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             model,
             eos,
             sequences: Mutex::new(HashMap::new()),
+            prefixes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -216,35 +249,88 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         self.sequences.lock().unwrap().len()
     }
 
+    /// Number of shared prefixes this adapter holds a handle on (P4-10,
+    /// GitHub #126) — the CPU-stub observation point for prefix lifetime.
+    pub fn live_prefixes(&self) -> usize {
+        self.prefixes.lock().unwrap().len()
+    }
+
     fn release_sequence(&self, sequence: L::Sequence) {
         self.model
             .leaf
             .release_sequence(self.model.handle(), sequence);
+    }
+
+    fn release_prefix_handle(&self, prefix: L::Prefix) {
+        self.model.leaf.release_prefix(self.model.handle(), prefix);
     }
 }
 
 impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
         let mut sequences = self.sequences.lock().unwrap();
+        let mut prefixes = self.prefixes.lock().unwrap();
+        // Requests whose chunk lands on the prefix they publish. Collected
+        // here and published after every job has warmed, so a later job's
+        // failure cannot leave a published prefix behind with no sequence
+        // and no scheduler entry to release it. Deferring is safe because a
+        // job only ever touches its own sequence: nothing else in this batch
+        // can move the publisher's state off the boundary.
+        let mut to_publish: Vec<(RequestId, u32)> = Vec::new();
+        // Core retries a failed *batch*, not only the job that failed, so any
+        // failure below returns every sequence in the batch to zero state --
+        // otherwise the retry would prefill an already-warmed span twice.
+        macro_rules! unwind {
+            ($err:expr) => {{
+                let released: Vec<_> = jobs
+                    .iter()
+                    .filter_map(|job| sequences.remove(&job.request))
+                    .collect();
+                let unpublished: Vec<_> = jobs
+                    .iter()
+                    .filter(|job| job.publish_prefix_tokens.is_some())
+                    .filter_map(|job| prefixes.remove(&job.request))
+                    .collect();
+                drop(prefixes);
+                drop(sequences);
+                for sequence in released {
+                    self.release_sequence(sequence.handle);
+                }
+                for prefix in unpublished {
+                    self.release_prefix_handle(prefix);
+                }
+                return Err($err);
+            }};
+        }
         for job in jobs {
             if !sequences.contains_key(&job.request) {
-                let handle = match self
-                    .model
-                    .leaf
-                    .allocate_sequence(self.model.handle(), job.context_tokens)
-                {
+                // A claimant is allocated *against* the prefix: its leading
+                // KV pages are the publisher's own, shared in place, and its
+                // mutable state is cloned device-to-device (P4-10, GitHub
+                // #126). Allocating it normally and then prefilling from
+                // `start_position` would leave those leading pages zeroed —
+                // the sequence would attend over history it does not have.
+                let allocated = match &job.shared_prefix {
+                    Some(claim) => match prefixes.get(&claim.publisher) {
+                        Some(prefix) => self.model.leaf.allocate_sequence_shared(
+                            self.model.handle(),
+                            job.context_tokens,
+                            prefix,
+                        ),
+                        // The scheduler holds a claim on an entry this
+                        // adapter has no handle for. Nothing correct can be
+                        // built from that, and prefilling the tail alone
+                        // would answer from a hole, so it fails loudly.
+                        None => Err(-1),
+                    },
+                    None => self
+                        .model
+                        .leaf
+                        .allocate_sequence(self.model.handle(), job.context_tokens),
+                };
+                let handle = match allocated {
                     Ok(handle) => handle,
-                    Err(code) => {
-                        let released: Vec<_> = jobs
-                            .iter()
-                            .filter_map(|job| sequences.remove(&job.request))
-                            .collect();
-                        drop(sequences);
-                        for sequence in released {
-                            self.release_sequence(sequence.handle);
-                        }
-                        return Err(RuntimeError::Leaf(code).into());
-                    }
+                    Err(code) => unwind!(RuntimeError::Leaf(code).into()),
                 };
                 sequences.insert(
                     job.request,
@@ -257,25 +343,41 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             let sequence = sequences
                 .get_mut(&job.request)
                 .expect("sequence was inserted or already existed");
-            if let Err(code) = self.model.leaf.prefill(
-                self.model.handle(),
-                &mut sequence.handle,
-                &job.tokens,
-                job.start_position,
-                job.params,
-            ) {
-                // Core retries a failed *batch*, not only this job. Return
-                // every batch sequence to zero state so that retry does not
-                // prefill a successful earlier span twice.
-                let released: Vec<_> = jobs
-                    .iter()
-                    .filter_map(|job| sequences.remove(&job.request))
-                    .collect();
-                drop(sequences);
-                for sequence in released {
-                    self.release_sequence(sequence.handle);
+            // A full-prompt match carries no tail: the claim already put the
+            // sequence where its prompt ends, with the pending token the
+            // publisher computed, so there is nothing left to warm.
+            if !job.tokens.is_empty()
+                && let Err(code) = self.model.leaf.prefill(
+                    self.model.handle(),
+                    &mut sequence.handle,
+                    &job.tokens,
+                    job.start_position,
+                    job.params,
+                )
+            {
+                unwind!(RuntimeError::Leaf(code).into());
+            }
+            if let Some(prefix_tokens) = job.publish_prefix_tokens {
+                to_publish.push((job.request, prefix_tokens));
+            }
+        }
+        // The publisher stands exactly on its prefix now, and the next chunk
+        // it is dealt would move it off -- which is why the boundary is the
+        // scheduler's decision and the publish is the last thing this call
+        // does with the sequence.
+        for (request, prefix_tokens) in to_publish {
+            let sequence = sequences
+                .get_mut(&request)
+                .expect("the publishing request's sequence was built above");
+            match self
+                .model
+                .leaf
+                .publish_prefix(self.model.handle(), &mut sequence.handle, prefix_tokens)
+            {
+                Ok(prefix) => {
+                    prefixes.insert(request, prefix);
                 }
-                return Err(RuntimeError::Leaf(code).into());
+                Err(code) => unwind!(RuntimeError::Leaf(code).into()),
             }
         }
         Ok(())
@@ -381,6 +483,16 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             self.release_sequence(sequence.handle);
         }
     }
+
+    fn release_prefix(&self, publisher: RequestId) {
+        // Only this adapter's handle. The leaf's pages come back when every
+        // sequence still holding the prefix has been released too, which is
+        // what lets a publisher finish while its claimants keep serving.
+        let prefix = self.prefixes.lock().unwrap().remove(&publisher);
+        if let Some(prefix) = prefix {
+            self.release_prefix_handle(prefix);
+        }
+    }
 }
 
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
@@ -392,6 +504,16 @@ impl<L: StepLeaf> Drop for RuntimeCompute<L> {
         );
         for (_, sequence) in sequences {
             self.release_sequence(sequence.handle);
+        }
+        // Prefixes after sequences: a prefix's pages are released by its last
+        // holder, and a live sequence is one.
+        let prefixes = std::mem::take(
+            self.prefixes
+                .get_mut()
+                .expect("RuntimeCompute is not dropped while its prefix lock is held"),
+        );
+        for (_, prefix) in prefixes {
+            self.release_prefix_handle(prefix);
         }
     }
 }

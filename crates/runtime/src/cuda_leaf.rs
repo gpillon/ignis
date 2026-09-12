@@ -23,7 +23,7 @@
 
 use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
-use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
+use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, SeqPrefix};
 use ignis_core::step;
 use ignis_core::{
     DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, TokenId,
@@ -204,6 +204,7 @@ fn leaf_error(context: &str, message: String) -> i32 {
 impl StepLeaf for CudaLeaf {
     type Model = CudaModel;
     type Sequence = Seq<'static>;
+    type Prefix = SeqPrefix<'static>;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         // P4-04 (GitHub #122): plan the pool before the weights go up. A
@@ -345,6 +346,40 @@ impl StepLeaf for CudaLeaf {
 
     fn release_sequence(&self, _model: &Self::Model, _sequence: Self::Sequence) {
         // Drops here: `Seq::drop` calls `ignis_seq_release`.
+    }
+
+    fn allocate_sequence_shared(
+        &self,
+        model: &Self::Model,
+        context_tokens: u32,
+        prefix: &Self::Prefix,
+    ) -> Result<Self::Sequence, i32> {
+        let seq = model
+            .pool
+            .alloc_shared(context_tokens, prefix)
+            .map_err(|e| leaf_error("shared sequence alloc", e))?;
+        // Safety: as in `allocate_sequence` — `model.pool` outlives every
+        // sequence drawn from it.
+        Ok(unsafe { seq.into_static() })
+    }
+
+    fn publish_prefix(
+        &self,
+        _model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        prefix_tokens: u32,
+    ) -> Result<Self::Prefix, i32> {
+        // A prefix borrows the pool, not the sequence — so publishing from a
+        // `Seq<'static>` yields a `SeqPrefix<'static>` with no detaching
+        // needed, and the publisher stays usable for its own tail.
+        sequence
+            .publish_prefix(prefix_tokens)
+            .map_err(|e| leaf_error("prefix publish", e.to_string()))
+    }
+
+    fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {
+        // Drops here: `SeqPrefix::drop` calls `ignis_seq_prefix_release`,
+        // which is one holder fewer — not a free.
     }
 
     fn prefill(

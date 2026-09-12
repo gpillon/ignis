@@ -128,7 +128,18 @@ When output names a domain concept, use the term as defined here.
   device, and the mutable **state sections** are cloned device-to-device. It
   never round-trips through host RAM, and sharing pages alone would save
   nothing, since prefill must traverse every layer to produce the mutable
-  state (ADR 0024). Control plane since v1; it shares real pages from G4.
+  state (ADR 0024). Real since G4.
+- **Shared prefix** — the leaf-owned object prefix reuse is built on: the
+  physical KV pages of a prompt head plus a device image of the mutable state
+  at its end, held by a refcount. Every holder's block-table row addresses the
+  same pages, the pool is charged for them once, and they return when the last
+  holder releases. A sequence holding one cannot be snapshotted — its history
+  is not all its own — so it is released and re-prefilled rather than evicted.
+- **Publish point** — the chunk boundary a prefix is published at, always a
+  whole number of KV pages in. It is a scheduling decision, not a detail of
+  the publish call: what a claimant clones is the mutable state at the
+  prefix's *end*, so the publishing request's prefill is cut there, and a
+  prompt whose length is not a whole page pays one extra chunk for it.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving the host tier is request

@@ -58,6 +58,18 @@ a different transport over the same description.
 - The two parallel page ledgers end. The leaf owns physical pages and their
   refcounts; `KvPool`'s refcounts in Rust become admission accounting, not
   truth.
+- **A prefix is published at a page boundary, which makes it a scheduling
+  decision.** The mutable state a claimant clones is the state at the prefix's
+  *end*, so the publishing request's prefill has to stop exactly there. A
+  prompt whose length is not a whole number of KV pages therefore pays one
+  extra prefill chunk — its shareable head, then its remainder — in exchange
+  for every sibling skipping that head entirely (P4-10, GitHub #126).
+- **A sequence that holds a shared prefix cannot be snapshotted.** Its leading
+  pages belong to the prefix, so there is no whole-sequence blob to write: the
+  leaf refuses with its own code and the sequence is released and re-prefilled
+  rather than evicted to the host tier. The alternative — copying another
+  request's history into this request's blob — is the corruption the refusal
+  exists to prevent.
 - Clone, snapshot and restore share one description, so a new section is
   carried by all three or by none. A section added to only one of them is now a
   visible omission rather than a silent one.
@@ -81,3 +93,12 @@ a different transport over the same description.
     leaves the decision unchanged; the estimate above was made at PCIe 5.0
     rates. See
     [Sequence snapshot transfer cost](../findings/2026-09-12-sequence-snapshot-transfer-cost.md).
+  - **Measured (P4-10, GitHub #126):** the device-to-device clone is **0.33 ms**
+    for the 148 MiB of mutable state at this geometry, not 0.09 ms. The state
+    is strided per GDN layer in the pool and packed in the prefix's image, so
+    the copy runs at ~470 GB/s rather than at the card's flat-copy bandwidth.
+    It is still ~130x cheaper than the 45 ms one PCIe direction would cost and
+    four orders of magnitude cheaper than re-prefilling the head, so the
+    decision to clone on the device rather than route through the host tier
+    stands on a wider margin than the estimate claimed. See
+    [Device prefix clone cost](../findings/2026-09-12-device-prefix-clone-cost.md).

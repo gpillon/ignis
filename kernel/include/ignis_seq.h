@@ -31,6 +31,15 @@
  * and a format version -- the leaf's state-section table stays internal
  * (kernel/include/ignis_seq_sections.h).
  *
+ * Sibling sequences that share a prompt head share its **pages** rather than
+ * re-prefilling them (P4-10, GitHub #126, ADR 0024):
+ * `ignis_seq_prefix_publish` hands a sequence's leading pages to a leaf-owned
+ * refcount, and `ignis_seq_alloc_shared` gives a claimant those same physical
+ * pages plus a device-to-device clone of the mutable state. Neither direction
+ * crosses PCIe, which is what separates it from the snapshot path above -- and
+ * a sequence that holds a prefix cannot take that path at all
+ * (IGNIS_SEQ_ERR_SHARED_PREFIX).
+ *
  * Rust bindings: crates/core/src/seq.rs (keep 1:1).
  */
 #ifndef IGNIS_SEQ_H
@@ -62,6 +71,15 @@ extern "C" {
  * call. */
 #define IGNIS_SEQ_ERR_BAD_SNAPSHOT (-4)
 
+/* ignis_seq_snapshot / ignis_seq_restore only: the sequence holds a shared
+ * prefix (P4-10, GitHub #126), so its KV history is not all its own and
+ * there is no whole-sequence blob to write or to write back. The claim is
+ * released with the sequence; a caller that needs this sequence off the GPU
+ * releases it and re-prefills instead. Distinct from -1 because the call is
+ * well formed -- it is the sequence, not the arguments, that cannot be
+ * transferred. */
+#define IGNIS_SEQ_ERR_SHARED_PREFIX (-5)
+
 /* Opaque device-resident pool of sequence state (never dereferenced across
  * the boundary). Allocated by ignis_seq_pool_create, destroyed by
  * ignis_seq_pool_free. */
@@ -70,6 +88,13 @@ struct ignis_seq_pool;
 /* Opaque sequence handle: one slot's KV allocation + GDN state. Allocated
  * by ignis_seq_alloc, destroyed by ignis_seq_release. */
 struct ignis_seq;
+
+/* Opaque shared prefix: physical KV pages a leaf-owned refcount keeps alive,
+ * plus a device-resident image of the mutable state at the prefix's end
+ * (P4-10, GitHub #126, ADR 0024). Published from a live sequence by
+ * ignis_seq_prefix_publish, claimed by ignis_seq_alloc_shared, released by
+ * ignis_seq_prefix_release. */
+struct ignis_seq_prefix;
 
 /* The KV cache storage format a pool stores its rows in (ADR 0022, GitHub
  * #122). Fixed for the life of a model load: it decides the pool's planes,
@@ -149,9 +174,16 @@ struct ignis_seq_pool_stats {
 
 struct ignis_seq_stats {
   int32_t slot;
+  /* Pages, and tokens, of this sequence's whole history -- the shared
+   * prefix's pages included, since its block-table row addresses those too
+   * (P4-10, GitHub #126). */
   uint32_t page_entitlement;
   uint32_t mapped_pages;
   uint64_t token_capacity;
+  /* How many of `mapped_pages` belong to a shared prefix rather than to this
+   * sequence: 0 for a sequence that prefilled its own head. The pool is
+   * charged for these once, not once per claimant. */
+  uint32_t shared_pages;
 };
 
 /* Build the two device-resident pools from `spec`. Returns 0 and a handle
@@ -241,7 +273,11 @@ int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct 
  * refused with IGNIS_SEQ_ERR_NOT_AT_BOUNDARY rather than capturing state
  * that would restore into a subtly wrong sequence. Returns -1 on a null
  * argument, a sequence that is not `pool`'s, a `dst_bytes` below the
- * reported size, or a failed device copy. `seq` is never modified. */
+ * reported size, or a failed device copy. `seq` is never modified.
+ *
+ * A sequence that claims a shared prefix is refused with
+ * IGNIS_SEQ_ERR_SHARED_PREFIX: its leading pages belong to the prefix, so
+ * there is no whole-sequence blob to write (P4-10, GitHub #126). */
 int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                             void *dst, uint64_t dst_bytes);
 
@@ -257,10 +293,109 @@ int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis
  * `pool`'s own. A mismatch returns IGNIS_SEQ_ERR_BAD_SNAPSHOT. `seq` must
  * also hold at least as many mapped KV pages as the blob carries, which is
  * the one requirement on the target beyond matching geometry. Returns -1 on
- * a null argument, a sequence that is not `pool`'s, or a failed device
- * copy. */
+ * a null argument, a sequence that is not `pool`'s, or a failed device copy;
+ * IGNIS_SEQ_ERR_SHARED_PREFIX for a target that claims a shared prefix, whose
+ * leading pages are not its own to overwrite (P4-10, GitHub #126). */
 int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq, const void *src,
                            uint64_t src_bytes);
+
+/* --- device prefix reuse (P4-10, GitHub #126, ADR 0024) ------------------
+ *
+ * Two mechanisms, one description. **KV pages are read-only history**, so a
+ * shared prefix hands a second sequence the *same physical pages*: the leaf
+ * owns them and their refcount, both sequences' block-table rows address
+ * them, and they return to the pool when the last holder releases. **Mutable
+ * sections are cloned device-to-device** -- the GDN recurrent state, the
+ * conv taps and the penalty-count row -- through the same state-section
+ * table the snapshot path walks (kernel/include/ignis_seq_sections.h). No
+ * step of it crosses PCIe.
+ *
+ * Sharing pages *without* cloning the mutable sections would save nothing,
+ * because prefill has to traverse every layer to produce them. That is
+ * recorded here so it is not re-proposed as an optimization.
+ *
+ * On ADR 0016 (options structs, not new entry points): the rule is about
+ * per-call *modulation* of a step. These are lifetime operations on a new
+ * kind of leaf-owned object -- publish, claim, release -- in the same family
+ * as ignis_seq_alloc / ignis_seq_release, which is why they are entry points
+ * and not fields. A prefix carries no per-call knobs to put in a struct.
+ */
+
+struct ignis_seq_prefix_stats {
+  /* Tokens of history the prefix covers. Always a whole number of KV pages. */
+  uint32_t tokens;
+  /* Physical KV pages the prefix owns -- charged to the pool exactly once,
+   * however many sequences hold it. */
+  uint32_t pages;
+  /* Live holders: the caller's own handle counts as one, and every sequence
+   * allocated against it as one more. The pages return to the pool when this
+   * reaches zero. */
+  uint32_t refcount;
+  /* Device-resident bytes of the cloned (mutable) state image: the GDN
+   * recurrent state, the conv taps and the penalty-count row. Paid once per
+   * prefix, not per claimant. */
+  uint64_t clone_image_bytes;
+  /* Claims served (ignis_seq_alloc_shared calls that cloned from this
+   * prefix), and the wall time the most recent clone took, in microseconds
+   * -- the device-to-device cost ADR 0024 asks to be measured rather than
+   * assumed. 0 until the first claim. */
+  uint64_t clone_count;
+  double last_clone_micros;
+};
+
+/* Publish `seq`'s first `prefix_tokens` tokens of history as a shared prefix.
+ *
+ * `prefix_tokens` must be a whole number of KV pages and must be exactly
+ * where `seq` stands: the mutable state cloned to a claimant is the state at
+ * the prefix's end, and a sequence that has already run past it no longer
+ * has that state to give. So this is called at the chunk boundary that lands
+ * on the prefix, not at the end of a prompt.
+ *
+ * `seq` keeps serving: after the call its own row addresses the prefix's
+ * pages for the head and its own pages for everything it writes from here
+ * on, and it holds one reference to the prefix like any other claimant.
+ *
+ * Returns 0 and a handle in `*out_prefix`, which the caller releases with
+ * ignis_seq_prefix_release (that handle is one reference of its own, so the
+ * prefix outlives `seq`). Returns -1 (see ignis_seq_last_error) on a null
+ * argument, a sequence that is not `pool`'s, a `prefix_tokens` of zero, not
+ * page-aligned, or beyond what `seq` has written, a sequence that already
+ * holds a shared prefix, or an exhausted pool;
+ * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq` is mid-chunk or its frontier is
+ * not `prefix_tokens`. `seq` and the pool are unchanged on every failure. */
+int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct ignis_seq *seq,
+                                  uint32_t prefix_tokens,
+                                  struct ignis_seq_prefix **out_prefix);
+
+/* Allocate a sequence that claims `prefix`: its first `prefix_tokens` pages
+ * are the prefix's own physical pages (shared, not copied, not zeroed), the
+ * rest is a fresh zeroed reservation of its own, and its mutable state is a
+ * device-to-device clone of the prefix's.
+ *
+ * The returned sequence stands exactly where the publisher stood: same
+ * frontier, same pending token, same GDN state, same penalty counts. It
+ * prefills its own tail from `prefix_tokens` onwards and never writes a
+ * shared page -- the prefix is whole pages, so its first write lands on the
+ * first page it owns.
+ *
+ * `context_tokens` is the whole reservation, prefix included, and must leave
+ * room for at least one page of its own. Returns 0 and a handle in
+ * `*out_seq`; returns -1 (see ignis_seq_last_error, nothing allocated) on a
+ * null argument, a prefix that is not `pool`'s, a `context_tokens` that
+ * leaves no page of its own, or pool exhaustion (no free slot, or not enough
+ * free KV pages). */
+int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t context_tokens,
+                                struct ignis_seq_prefix *prefix, struct ignis_seq **out_seq);
+
+/* Release the caller's handle on `prefix`. The prefix itself lives while any
+ * sequence still holds it; its pages return to the pool when the last holder
+ * releases. A NULL `prefix` is a no-op. */
+void ignis_seq_prefix_release(struct ignis_seq_pool *pool, struct ignis_seq_prefix *prefix);
+
+/* A live prefix's size, holders and measured clone cost. Returns 0 on
+ * success, -1 on a null argument. */
+int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
+                                struct ignis_seq_prefix_stats *out_stats);
 
 /* The message from the most recent failing call on this thread
  * (thread-local; overwritten by the next call; empty string if none failed

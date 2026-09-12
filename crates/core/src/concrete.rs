@@ -27,15 +27,21 @@
 //!    one included — is recorded as a GDN resumable boundary
 //!    ([`crate::gdn::GdnState::checkpoint`]); a chunk call that errors
 //!    leaves the request's progress untouched, so the retry resends the
-//!    same (not-yet-applied) span. **Sibling prefix reuse** (core-07) runs
-//!    here too: before a *fresh* request's first chunk, it claims the
-//!    longest cached prefix of its prompt (skipping the redundant prefill —
-//!    its first job carries only the tail); once a request's *last* chunk
-//!    completes, it registers its now-warm prompt in the prefix cache for
-//!    siblings. The shared entry's pages are charged to the pool once (the
-//!    charge split), and the admission machine runs against the pool minus
-//!    the cache's pins (consistent accounting — the cache never
-//!    over-allocates).
+//!    same (not-yet-applied) span. **Sibling prefix reuse** (core-07,
+//!    device-backed since P4-10 / GitHub #126) runs here too: before a
+//!    *fresh* request's first chunk, it claims the longest cached prefix of
+//!    its prompt (skipping the redundant prefill — its first job carries
+//!    only the tail, and the backend allocates its sequence *against* the
+//!    leaf's prefix, sharing the pages in place and cloning the mutable
+//!    state device-to-device). A request with no claim publishes the whole
+//!    KV pages of its own prompt — and its prefill is **cut at that
+//!    boundary**, because the state a claimant clones is the state at the
+//!    prefix's end, so a chunk that overshot it would have moved that state
+//!    on. A prompt that is not a whole number of pages therefore pays one
+//!    extra chunk, and every sibling skips its whole head. The shared
+//!    entry's pages are charged to the pool once (the charge split), and the
+//!    admission machine runs against the pool minus the cache's pins
+//!    (consistent accounting — the cache never over-allocates).
 //! 2. **The admission state machine** (core-05) — lane assignment is
 //!    driven by the full fairness machinery (`admission.rs`, ported from
 //!    the reference stack per ADR 0004): *protection* (a blocked head
@@ -112,7 +118,9 @@ use crate::admission::{
 use crate::host::{HostEntry, HostTier, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
-use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
+use crate::scheduler::{
+    Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler, SharedPrefixClaim,
+};
 use crate::types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
@@ -342,9 +350,13 @@ impl ConcreteScheduler {
     }
 
     /// The shared sibling prefix `request` reuses (core-07), if any: the
-    /// cached entry's id + the leading prompt tokens it skips. The FFI /
-    /// kernel leaf uses this to bind the shared prefix's blocks read-only
-    /// into the request's block table (the kernel-abi channel; ADR 0001).
+    /// cached entry's id + the leading prompt tokens it skips.
+    ///
+    /// Observation only. What actually reaches the leaf is
+    /// [`PrefillJob::shared_prefix`](crate::scheduler::PrefillJob), carried
+    /// on the request's first job (P4-10, GitHub #126) — the backend cannot
+    /// ask the scheduler for it, because it needs it at the moment it builds
+    /// the sequence.
     pub fn shared_prefix_of(&self, request: RequestId) -> Option<(u64, u32)> {
         self.requests
             .iter()
@@ -380,10 +392,15 @@ impl ConcreteScheduler {
         let Some(entry) = entry else {
             return;
         };
-        let Some(freed) = self.prefix.release(entry) else {
+        let Some((freed, publisher)) = self.prefix.release(entry) else {
             return;
         };
         self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
+        // P4-10 (GitHub #126): the entry is gone from this cache, so the
+        // backend's own handle on the leaf's prefix goes too. The leaf's
+        // pages come back when its last *sequence* holder is released, which
+        // is why this is a handle drop and not a free.
+        self.compute.release_prefix(publisher);
     }
 
     /// The last hard compute error the most recent advance reported, if
@@ -960,13 +977,14 @@ impl Scheduler for ConcreteScheduler {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.requests.push(Request::new(
-            id,
-            class,
-            input,
-            resources,
-            effective_max as u64,
-        ));
+        // P4-10 (GitHub #126): the shareable head of this prompt, decided
+        // now rather than after its prefill. A prefix is published at the
+        // chunk boundary that lands on it, so the chunk decomposition has to
+        // know where that is before it cuts the first chunk.
+        let publish_tokens = self.prefix.publish_tokens(input.tokens.len());
+        let mut request = Request::new(id, class, input, resources, effective_max as u64);
+        request.publish_tokens = publish_tokens;
+        self.requests.push(request);
         Ok(id)
     }
 
@@ -1051,6 +1069,7 @@ impl Scheduler for ConcreteScheduler {
             if let Some(claim) = claimed {
                 let r = &mut self.requests[i];
                 r.prefix_entry = Some(claim.id);
+                r.prefix_publisher = Some(claim.publisher);
                 r.shared_prefix_tokens = claim.tokens;
                 r.prefill_progress = claim.tokens; // the shared head is already warm
                 r.gdn = claim.gdn; // core-02: resume at the shared boundary
@@ -1093,7 +1112,20 @@ impl Scheduler for ConcreteScheduler {
                 let r = &self.requests[i];
                 let start = r.prefill_progress;
                 let remaining = r.input.tokens.len() as u32 - start;
-                let take = remaining.min(self.config.serving_chunk_tokens);
+                let mut take = remaining.min(self.config.serving_chunk_tokens);
+                // P4-10 (GitHub #126): a request that will publish a prefix
+                // is cut at that boundary, even mid-prompt. The leaf hands a
+                // claimant the mutable state at the prefix's *end*, and a
+                // chunk that overshot it would have moved that state on — so
+                // the boundary is a scheduling decision, not a detail of the
+                // publish call. A request already holding a claim publishes
+                // nothing (the head it would offer is the entry it holds, and
+                // publishing it again would own the same pages twice), so its
+                // chunks are not cut for a boundary it will never use.
+                let publish_at = if r.prefix_entry.is_none() { r.publish_tokens } else { 0 };
+                if publish_at > start && take > publish_at - start {
+                    take = publish_at - start;
+                }
                 let tokens = r.input.tokens[start as usize..(start + take) as usize].to_vec();
                 // A stochastic prefill samples and updates the sequence's
                 // penalty-count row. Only the final chunk's successor is
@@ -1122,6 +1154,21 @@ impl Scheduler for ConcreteScheduler {
                         .min(u32::MAX as u64)) as u32,
                     start_position: start,
                     params,
+                    // Carried on the request's *first* job only — the one
+                    // that starts where the prefix ends. That is the job the
+                    // backend builds the sequence on, against the leaf's
+                    // prefix; every later chunk finds it already built.
+                    shared_prefix: r.prefix_publisher.filter(|_| start == r.shared_prefix_tokens).map(
+                        |publisher| SharedPrefixClaim {
+                            publisher,
+                            tokens: r.shared_prefix_tokens,
+                        },
+                    ),
+                    // `publish_at` is already 0 for a request holding a
+                    // claim, so this is exactly "the chunk that lands on the
+                    // boundary, for a request that has a boundary".
+                    publish_prefix_tokens: (publish_at > 0 && start + take == publish_at)
+                        .then_some(publish_at),
                 }
             })
             .collect();
@@ -1163,33 +1210,41 @@ impl Scheduler for ConcreteScheduler {
                             chunk_tokens: job.tokens.len() as u32,
                             prefilled_tokens: r.prefill_progress,
                         });
-                        if !r.prefill_complete() {
-                            // Not the last chunk: no registration yet
-                            // (that moves to the last chunk's completion),
-                            // and the request stays `Prefilling` —
-                            // incomplete, ineligible for a lane deal.
-                            continue;
-                        }
-                        // core-07 — registration: only a fresh request
-                        // (no shared head — it claimed nothing) caches
-                        // its now-warm prompt for siblings, and only once
-                        // its *last* chunk has landed. A claimant's head
-                        // is already the cached entry (registering its
-                        // full prompt would double-charge the shared
-                        // pages), and a same-batch duplicate's prompt is
-                        // already cached by the batch's first registrant
-                        // (register returns `None` — it keeps its own
-                        // charge, no re-registration). The entry's pages
-                        // are charged to the pool now (the charge split:
-                        // the registrant's own reservation keeps the
-                        // residual, the entry holds the shared pages).
-                        if self.requests[i].prefix_entry.is_none() {
-                            let registered = self
-                                .prefix
-                                .register(&self.requests[i].input.tokens, &self.requests[i].gdn);
+                        // core-07 — registration, at the boundary the
+                        // chunk was cut for (P4-10, GitHub #126): only a
+                        // fresh request (no shared head — it claimed
+                        // nothing) publishes its prompt head for siblings,
+                        // and only when its prefill stands exactly on that
+                        // head. That is when the leaf publishes too, because
+                        // what a claimant clones is the mutable state at the
+                        // prefix's end; registering at the end of the prompt
+                        // instead would cache pages whose state the
+                        // registrant had already run past.
+                        //
+                        // A claimant's head is already the cached entry
+                        // (registering its full prompt would double-charge
+                        // the shared pages), and a same-batch duplicate's
+                        // prompt is already cached by the batch's first
+                        // registrant (register returns `None` — it keeps its
+                        // own charge, no re-registration). The entry's pages
+                        // are charged to the pool now (the charge split: the
+                        // registrant's own reservation keeps the residual,
+                        // the entry holds the shared pages).
+                        let at_publish_boundary = self.requests[i].publish_tokens > 0
+                            && self.requests[i].prefix_entry.is_none()
+                            && self.requests[i].prefill_progress
+                                == self.requests[i].publish_tokens;
+                        if at_publish_boundary {
+                            let publisher = self.requests[i].id;
+                            let registered = self.prefix.register(
+                                publisher,
+                                &self.requests[i].input.tokens,
+                                &self.requests[i].gdn,
+                            );
                             if let Some((entry, pages)) = registered {
                                 let r = &mut self.requests[i];
                                 r.prefix_entry = Some(entry);
+                                r.prefix_publisher = Some(publisher);
                                 r.resources.kv_pages = r.resources.kv_pages.saturating_sub(pages);
                                 self.kv_used_pages = self.kv_used_pages.saturating_add(pages);
                             }

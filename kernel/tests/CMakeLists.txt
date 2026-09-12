@@ -360,3 +360,23 @@ target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
 target_link_libraries(ignis_kernel_hq_route_agreement_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_route_agreement_test COMMAND ignis_kernel_hq_route_agreement_test)
+
+# P4-10 (GitHub #126): OURS, not vendored -- device prefix reuse. It checks
+# the two halves ADR 0024 describes against the device itself: that a
+# claimant's block-table row addresses the *publisher's own physical pages*
+# for the head (and that the pool is charged for them once, not once per
+# claimant), and that its GDN slot, conv taps and penalty-count row come out
+# byte-identical to the publisher's state at the prefix's end. Both need
+# ignis_seq_internal.h / ignis_seq_prefix_internal.h to read a row and a slot
+# back, so neither can live in Rust.
+#
+# It also PRINTS the measured device-to-device clone cost at the real 27B
+# geometry under hq-e8-2b (the ticket's "measured rather than assumed"); the
+# numbers are recorded in
+# docs/findings/2026-09-12-device-prefix-clone-cost.md. That arm builds a
+# full-context pool plus two 144 MiB GDN slots, so it wants the card to
+# itself -- which ADR 0006 already requires of every test here. Same
+# no-SKIP_RETURN_CODE rule.
+add_executable(ignis_kernel_seq_prefix_test test_seq_prefix.cpp)
+target_link_libraries(ignis_kernel_seq_prefix_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_prefix_test COMMAND ignis_kernel_seq_prefix_test)
