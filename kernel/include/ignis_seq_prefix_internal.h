@@ -161,7 +161,7 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
    * `LinearAttentionStatePool::pack_slot_to_host` moves to host memory, run
    * device-to-device here. It matters: at the 27B geometry the GDN sections
    * are 96 layer-slots, and 96 separate copies of 3 MiB are launch-bound
-   * rather than bandwidth-bound (measured: 1.51 ms against 0.33 ms for the
+   * rather than bandwidth-bound (measured: 1.51 ms against ~0.25 ms for the
    * two 2D copies below -- see
    * docs/findings/2026-09-12-device-prefix-clone-cost.md).
    *
@@ -229,12 +229,13 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
   }
 }
 
-/* Drop one reference to `prefix`, destroying it (and returning its pages to
- * `pool`) when the last holder lets go. A null `prefix` is a no-op.
+/* Drop one reference to `prefix`, destroying it -- and returning its pages to
+ * the pool it was published from -- when the last holder lets go. A null
+ * `prefix` is a no-op.
  *
  * Defined in kernel/src/seq_prefix.cu and declared here because
  * ignis_seq_release has to call it: a released sequence is one holder fewer,
  * and nothing else in the leaf knows that. */
-void ignis_seq_prefix_drop_reference(ignis_seq_pool *pool, ignis_seq_prefix *prefix);
+void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix);
 
 #endif /* IGNIS_SEQ_PREFIX_INTERNAL_H */

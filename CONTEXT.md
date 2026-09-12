@@ -136,10 +136,11 @@ When output names a domain concept, use the term as defined here.
   holder releases. A sequence holding one cannot be snapshotted — its history
   is not all its own — so it is released and re-prefilled rather than evicted.
 - **Publish point** — the chunk boundary a prefix is published at, always a
-  whole number of KV pages in. It is a scheduling decision, not a detail of
-  the publish call: what a claimant clones is the mutable state at the
-  prefix's *end*, so the publishing request's prefill is cut there, and a
-  prompt whose length is not a whole page pays one extra chunk for it.
+  whole number of KV pages in, and 0 for a request that publishes nothing. It
+  is a scheduling decision, not a detail of the publish call: what a claimant
+  clones is the mutable state at the prefix's *end*, so the publishing
+  request's prefill is cut there, and a prompt whose length is not a whole
+  page pays one extra chunk for it.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving the host tier is request

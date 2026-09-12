@@ -250,6 +250,13 @@ impl PrefixCache {
 
     /// The cumulative `sibling_prefix_reused_tok` counter (telemetry,
     /// design §5): every prompt token skipped through a cached prefix.
+    ///
+    /// Cumulative skips, not net savings. A request that claims a prefix and
+    /// is later evicted and re-queued re-prefills that head from scratch
+    /// (`Request::requeue`), and this counter is not reduced: the skip
+    /// happened, and eviction is a separate event with its own cost. Read it
+    /// as "prefill the cache let requests avoid at the time", not as "prefill
+    /// this engine never performed".
     pub fn reused_tok(&self) -> u64 {
         self.reused_tok
     }
@@ -266,9 +273,9 @@ impl PrefixCache {
     /// not after: the leaf publishes a prefix at the chunk boundary that
     /// lands on it, because what a claimant clones is the mutable state at
     /// the prefix's end. So the chunk decomposition has to be told where that
-    /// boundary is, and this is where it comes from. 0 means "nothing
-    /// shareable" — a prompt shorter than one page.
-    pub fn publish_tokens(&self, prompt_tokens: usize) -> u32 {
+    /// **publish point** is, and this is where it comes from. 0 means
+    /// "nothing shareable" — a prompt shorter than one page.
+    pub fn shareable_head_tokens(&self, prompt_tokens: usize) -> u32 {
         ((prompt_tokens / self.page_tokens as usize) * self.page_tokens as usize) as u32
     }
 
@@ -445,11 +452,19 @@ mod tests {
     #[test]
     fn the_shareable_head_is_whole_pages_of_the_prompt() {
         // What the scheduler asks before it prefills, so the chunk that
-        // lands on the prefix can be cut at exactly that boundary.
+        // lands on the prefix can be cut at exactly the publish point.
         let cache = PrefixCache::new(16);
-        assert_eq!(cache.publish_tokens(40), 32, "2.5 pages share 2");
-        assert_eq!(cache.publish_tokens(64), 64, "an exact multiple shares all of it");
-        assert_eq!(cache.publish_tokens(15), 0, "a sub-page prompt shares nothing");
+        assert_eq!(cache.shareable_head_tokens(40), 32, "2.5 pages share 2");
+        assert_eq!(
+            cache.shareable_head_tokens(64),
+            64,
+            "an exact multiple shares all of it"
+        );
+        assert_eq!(
+            cache.shareable_head_tokens(15),
+            0,
+            "a sub-page prompt shares nothing"
+        );
     }
 
     #[test]

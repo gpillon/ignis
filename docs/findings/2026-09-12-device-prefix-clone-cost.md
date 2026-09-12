@@ -1,4 +1,4 @@
-# A prefix clone costs 0.33 ms on the device, and how the copy is shaped decides it
+# A prefix clone costs a quarter of a millisecond on the device, and how the copy is shaped decides it
 
 - Kind: experiment
 - Status: current
@@ -32,12 +32,14 @@ hq-e8-2b KV, publishes a 20,480-token prefix from one sequence, and times
 `ignis_seq_alloc_shared` claiming it. One untimed claim first, then the mean
 of three.
 
-RTX 5090, no other process holding the card.
+RTX 5090, no other process holding the card. The 2D row is five consecutive
+runs (each itself a mean of three claims); the per-layer row is one reading
+taken before the shape was changed.
 
 | copy shape | cloned bytes | clone | effective |
 | --- | ---: | ---: | ---: |
-| one copy per layer per section (96 copies) | 147.76 MiB | 1.513 ms | 102 GB/s |
-| one 2D copy per section (3 copies) | 147.76 MiB | 0.329 ms | 471 GB/s |
+| one copy per layer per section (96 copies) | 147.76 MiB | 1.51 ms | 102 GB/s |
+| one 2D copy per section (3 copies) | 147.76 MiB | 0.25 ms (0.24-0.32) | 620 GB/s |
 
 The cloned state is the mutable half of a sequence and nothing else: 144 MiB
 of GDN recurrent state (48 layers x 48 heads x 128x128 fp32), 2.81 MiB of conv
@@ -53,14 +55,16 @@ the whole difference.
 
 ## Finding
 
-**Observed.** The clone costs 0.33 ms for 147.76 MiB at the real geometry,
-3.6x ADR 0024's 0.09 ms estimate.
+**Observed.** The clone costs ~0.25 ms for 147.76 MiB at the real geometry,
+2.8x ADR 0024's 0.09 ms estimate. Four of five runs land within 5% of each
+other; the fifth came in at 0.32 ms, so treat ~0.3 ms as the slow end rather
+than as a different result.
 
 **Observed.** Issuing the same bytes as 96 per-layer copies instead of 3
-strided ones costs 4.6x. At 3 MiB per layer-slot the per-copy cost is ~16 us,
+strided ones costs 6x. At 3 MiB per layer-slot the per-copy cost is ~16 us,
 which is dispatch, not bandwidth.
 
-**Inference.** 471 GB/s is well under the card's flat-copy bandwidth, and the
+**Inference.** 620 GB/s is well under the card's flat-copy bandwidth, and the
 remaining gap is the strided source: the pool side of the copy reads 48 rows
 of 3 MiB at a layer stride rather than one contiguous 144 MiB run. Nothing
 here suggests a further shape would help much — the estimate's implied ~1.6
@@ -70,23 +74,28 @@ by construction, because the pool interleaves slots inside each layer.
 **The decision holds by a wider margin than the estimate claimed.** One PCIe
 direction for the same 148 MiB is ~12 ms on this host
 ([Sequence snapshot transfer cost](2026-09-12-sequence-snapshot-transfer-cost.md)),
-so routing prefix reuse through the pinned-memory tier would cost ~24 ms for
-the round trip against 0.33 ms on the card — 73x. Against the work it
-replaces, the margin is far larger still: re-prefilling this cell's
+so routing prefix reuse through the pinned-memory tier would cost ~12 ms one
+way and ~24 ms for the round trip, against 0.25 ms on the card — 48x and 96x.
+The leaf's own test enforces the weaker half of that as a check rather than a
+claim: a clone that came in under a third of one PCIe crossing cannot have
+taken that route, which is the acceptance criterion "no prefix-reuse path
+performs a host round-trip".
+Against the work it replaces, the margin is far larger still: re-prefilling
+this cell's
 20,480-token head is at least ~2.0 s at the measured chunk rate
 ([Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)), about
-6,000x the clone.
+8,000x the clone.
 
 ## Implications
 
-- **A claim is free at scheduling granularity.** 0.33 ms is a third of one
-  decode round's budget and four orders of magnitude under the prefill it
-  replaces, so admission has no reason to price a claim differently from a
-  plain allocation.
+- **A claim is free at scheduling granularity.** A quarter of a millisecond
+  is a fraction of one decode round's budget and four orders of magnitude
+  under the prefill it replaces, so admission has no reason to price a claim
+  differently from a plain allocation.
 - **The floor is the GDN slot, not the prefix.** A 64-token prefix and a
   40,960-token prefix cost the same clone, because the cloned half does not
   grow with the history. What grows with the prefix is the saving.
-- **Shape the copy, not the bytes.** The 4.6x between the two rows is the
+- **Shape the copy, not the bytes.** The 6x between the two rows is the
   only tuning knob found here, and it was worth taking. Any future state
   section large enough to matter should be moved the same way: one strided
   copy over the pool's layout, not one per layer.
@@ -96,9 +105,9 @@ replaces, the margin is far larger still: re-prefilling this cell's
 
 ## Limits and unknowns
 
-- One machine, one geometry, the mean of three claims after a warm-up claim.
-  Nothing here establishes variance across driver versions, and the figure was
-  taken with the card otherwise idle — a clone issued on the default stream
+- One machine, one geometry, five runs of three claims each after a warm-up
+  claim. Nothing here establishes variance across driver versions, and the
+  figures were taken with the card otherwise idle — a clone issued on the default stream
   while a decode round is in flight has not been measured.
 - The measurement times `ignis_seq_alloc_shared` end to end, so it includes
   the sequence's own page reservation and zeroing alongside the clone. Those

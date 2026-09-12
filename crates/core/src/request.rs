@@ -71,14 +71,15 @@ pub struct Request {
     /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
     /// full prefill, nothing skipped).
     pub shared_prefix_tokens: u32,
-    /// The prompt head this request will publish as a shared prefix once its
-    /// prefill reaches it (P4-10, GitHub #126): the whole KV pages of its
-    /// prompt, or 0 when there is nothing shareable (a sub-page prompt, or a
-    /// request that claimed someone else's prefix instead).
+    /// The whole KV pages of this request's own prompt — what it *could*
+    /// publish as a shared prefix (P4-10, GitHub #126), or 0 for a prompt
+    /// shorter than one page.
     ///
     /// Known before the first chunk, not after the last, because the chunk
     /// that lands on it has to stop there: the mutable state a claimant
-    /// clones is the state at the prefix's end.
+    /// clones is the state at the prefix's end. Read it through
+    /// [`Request::publish_point`], which also answers whether this request
+    /// publishes at all.
     pub publish_tokens: u32,
     /// Prompt tokens already sent to the compute backend during prefill
     /// (P3-01, ADR 0018): advances by at most the scheduler's serving chunk
@@ -163,6 +164,22 @@ impl Request {
         }
         self.state = next;
         true
+    }
+
+    /// The **publish point** (CONTEXT.md): the prefill position at which this
+    /// request publishes its prompt head as a shared prefix, or 0 for a
+    /// request that publishes nothing (P4-10, GitHub #126).
+    ///
+    /// A request holding a claim publishes nothing: the head it would offer
+    /// is the entry it is already holding, and publishing it again would own
+    /// the same pages twice. One function so that the chunk decomposition
+    /// (where to cut) and the registration (when to publish) cannot disagree
+    /// about it.
+    pub fn publish_point(&self) -> u32 {
+        if self.prefix_entry.is_some() {
+            return 0;
+        }
+        self.publish_tokens
     }
 
     /// Whether this request has finished prefill: every prompt token has

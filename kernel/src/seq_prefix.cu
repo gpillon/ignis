@@ -73,11 +73,6 @@ void publish_shared_row(ignis_seq_pool &pool, const ignis_seq &seq) {
   }
 }
 
-// The prefix's page count, from the allocation that owns them.
-std::uint32_t prefix_pages(const ignis_seq_prefix &prefix) {
-  return prefix.kv.mapped_page_count();
-}
-
 // Run `transfer` and return the wall time it took, in microseconds, with the
 // device work already complete. The synchronize is inside the measurement on
 // purpose: what a caller pays for a clone is the point at which the claimant
@@ -98,7 +93,7 @@ double timed_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix, ignis_seq 
 
 } // namespace
 
-void ignis_seq_prefix_drop_reference(ignis_seq_pool *pool, ignis_seq_prefix *prefix) {
+void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
   if (prefix == nullptr) {
     return;
   }
@@ -108,11 +103,11 @@ void ignis_seq_prefix_drop_reference(ignis_seq_pool *pool, ignis_seq_prefix *pre
   if (prefix->refcount != 0) {
     return;
   }
-  // The last holder let go. `~PagedKVAllocation` returns the shared pages and
-  // the entitlement to `pool` -- which is why a prefix's pages are charged to
-  // the pool once and released once, whatever the claimant count did in
-  // between.
-  (void)pool;
+  // The last holder let go. The prefix carries its own pool pointer inside
+  // `kv`, so `~PagedKVAllocation` returns the shared pages and the
+  // entitlement without being told where -- which is why a prefix's pages are
+  // charged to the pool once and released once, whatever the claimant count
+  // did in between.
   delete prefix;
 }
 
@@ -240,7 +235,7 @@ extern "C" int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t 
     return -1;
   }
   const std::uint32_t total  = ninfer::pages_for_tokens(context_tokens);
-  const std::uint32_t shared = prefix_pages(*prefix);
+  const std::uint32_t shared = prefix->kv.mapped_page_count();
   if (total <= shared) {
     ignis_seq_set_last_error(
         "ignis_seq_alloc_shared: a reservation of " + std::to_string(context_tokens) +
@@ -294,7 +289,16 @@ extern "C" int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t 
 
 extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,
                                           struct ignis_seq_prefix *prefix) {
-  ignis_seq_prefix_drop_reference(pool, prefix);
+  // `pool` is taken for the symmetry every other release in this ABI has, and
+  // it earns it here: a handle returned against one pool and released against
+  // another is a caller mistake that would otherwise free pages out of a pool
+  // that never lent them.
+  if (pool != nullptr && prefix != nullptr && !prefix->kv.belongs_to(pool->kv_pool)) {
+    ignis_seq_set_last_error("ignis_seq_prefix_release: the prefix was not published from this "
+                             "pool; nothing was released");
+    return;
+  }
+  ignis_seq_prefix_drop_reference(prefix);
 }
 
 extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,

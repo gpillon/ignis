@@ -506,3 +506,81 @@ fn the_backend_prefix_is_released_once_the_last_claimant_is_gone() {
         "and the pages stop being charged to the pool"
     );
 }
+
+#[test]
+fn two_identical_prompts_in_one_batch_leave_exactly_one_prefix_behind() {
+    // The case that leaks if the publish and the registration disagree: two
+    // requests with the same prompt, submitted before either has prefilled,
+    // both see an empty cache and neither can claim. Only one may publish —
+    // a second leaf prefix would hold its pages with no cache entry to
+    // release it and no sibling that could ever claim it.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let first = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    let second = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    sched.advance();
+
+    let published: Vec<u64> = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter(|job| job.publish_prefix_tokens.is_some())
+        .map(|job| job.request)
+        .collect();
+    assert_eq!(
+        published,
+        vec![first],
+        "the first candidate takes the head; the duplicate publishes nothing"
+    );
+    let _ = second;
+
+    run_to_idle(&mut sched);
+    assert_eq!(
+        compute.released_prefixes(),
+        vec![first],
+        "one prefix published, one released — nothing is left holding pages"
+    );
+    assert_eq!(sched.prefix_pinned_pages(), 0);
+}
+
+#[test]
+fn a_publish_the_cache_declines_is_released_immediately() {
+    // The leaf publishes before this cache decides whether to keep the
+    // entry, so a declined registration has to let the backend's handle go
+    // on the spot — nothing else ever would. Driven here through the one
+    // decline the scheduler can reach: a prompt whose page-aligned head is
+    // already registered by a live request.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone());
+    let main_id = sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    sched.advance();
+    assert!(compute.released_prefixes().is_empty());
+
+    // A second request with the same prompt, submitted after the first
+    // registered: it claims the live entry instead of publishing, so nothing
+    // new is published at all.
+    sched
+        .submit(input("qwen3.8-27b", tokens(1, 32), 8), RequestClass::Agent)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let publishes = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter(|job| job.publish_prefix_tokens.is_some())
+        .count();
+    assert_eq!(publishes, 1, "a claimant publishes nothing");
+    assert_eq!(
+        compute.released_prefixes(),
+        vec![main_id],
+        "and the one prefix is released once, by its last claimant"
+    );
+    assert_eq!(sched.prefix_pinned_pages(), 0);
+}

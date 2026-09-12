@@ -431,7 +431,7 @@ extern "C" void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq 
   // prefix. Drop it before the handle goes, so the prefix's pages return to
   // the pool exactly when the last holder -- claimant or publisher's handle
   // -- lets go, and not a moment earlier.
-  ignis_seq_prefix_drop_reference(pool, seq->prefix);
+  ignis_seq_prefix_drop_reference(seq->prefix);
   seq->prefix       = nullptr;
   seq->shared_pages = 0;
   delete seq; // ~PagedKVAllocation: unbind the row, return the sequence's own KV pages.

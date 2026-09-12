@@ -981,7 +981,7 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        let publish_tokens = self.prefix.publish_tokens(input.tokens.len());
+        let publish_tokens = self.prefix.shareable_head_tokens(input.tokens.len());
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         request.publish_tokens = publish_tokens;
         self.requests.push(request);
@@ -1102,27 +1102,47 @@ impl Scheduler for ConcreteScheduler {
         {
             batch.truncate(cut + 1);
         }
+        // P4-10 (GitHub #126) — one publisher per prompt head per batch.
+        //
+        // Two requests with the same prompt arriving before either has
+        // prefilled both see an empty cache, so neither can claim and both
+        // would publish. Only one of them could then register — and the
+        // loser's prefix would be a device image nothing ever claims,
+        // holding its pages for as long as its sequence lives. So the first
+        // candidate in the batch takes the head; the rest prefill it
+        // themselves this tick (there is nothing warm to claim yet) and a
+        // later sibling claims the one entry that did register.
+        let publish_points: Vec<u32> = {
+            let mut points: Vec<u32> = Vec::with_capacity(batch.len());
+            for (n, &i) in batch.iter().enumerate() {
+                let at = self.requests[i].publish_point();
+                let head = &self.requests[i].input.tokens[..at as usize];
+                let taken = batch[..n].iter().enumerate().any(|(m, &j)| {
+                    points[m] == at && self.requests[j].input.tokens[..at as usize] == *head
+                });
+                points.push(if at > 0 && taken { 0 } else { at });
+            }
+            points
+        };
         // Each job carries at most `serving_chunk_tokens` tokens starting
         // at the request's own prefill progress (0 for a fresh request
         // with no shared prefix, `shared_prefix_tokens` for a claimant,
         // or wherever an earlier chunk left off for a continuing request).
         let jobs: Vec<PrefillJob> = batch
             .iter()
-            .map(|&i| {
+            .enumerate()
+            .map(|(n, &i)| {
                 let r = &self.requests[i];
                 let start = r.prefill_progress;
                 let remaining = r.input.tokens.len() as u32 - start;
                 let mut take = remaining.min(self.config.serving_chunk_tokens);
                 // P4-10 (GitHub #126): a request that will publish a prefix
-                // is cut at that boundary, even mid-prompt. The leaf hands a
-                // claimant the mutable state at the prefix's *end*, and a
-                // chunk that overshot it would have moved that state on — so
-                // the boundary is a scheduling decision, not a detail of the
-                // publish call. A request already holding a claim publishes
-                // nothing (the head it would offer is the entry it holds, and
-                // publishing it again would own the same pages twice), so its
-                // chunks are not cut for a boundary it will never use.
-                let publish_at = if r.prefix_entry.is_none() { r.publish_tokens } else { 0 };
+                // is cut at its publish point, even mid-prompt. The leaf
+                // hands a claimant the mutable state at the prefix's *end*,
+                // and a chunk that overshot it would have moved that state
+                // on — so the point is a scheduling decision, not a detail of
+                // the publish call.
+                let publish_at = publish_points[n];
                 if publish_at > start && take > publish_at - start {
                     take = publish_at - start;
                 }
@@ -1164,9 +1184,9 @@ impl Scheduler for ConcreteScheduler {
                             tokens: r.shared_prefix_tokens,
                         },
                     ),
-                    // `publish_at` is already 0 for a request holding a
-                    // claim, so this is exactly "the chunk that lands on the
-                    // boundary, for a request that has a boundary".
+                    // 0 for a request that publishes nothing, so this is
+                    // exactly "the chunk that lands on the publish point,
+                    // for a request that has one".
                     publish_prefix_tokens: (publish_at > 0 && start + take == publish_at)
                         .then_some(publish_at),
                 }
@@ -1210,43 +1230,50 @@ impl Scheduler for ConcreteScheduler {
                             chunk_tokens: job.tokens.len() as u32,
                             prefilled_tokens: r.prefill_progress,
                         });
-                        // core-07 — registration, at the boundary the
-                        // chunk was cut for (P4-10, GitHub #126): only a
-                        // fresh request (no shared head — it claimed
-                        // nothing) publishes its prompt head for siblings,
-                        // and only when its prefill stands exactly on that
-                        // head. That is when the leaf publishes too, because
-                        // what a claimant clones is the mutable state at the
-                        // prefix's end; registering at the end of the prompt
-                        // instead would cache pages whose state the
-                        // registrant had already run past.
+                        // core-07 — registration, driven by the job that
+                        // actually published (P4-10, GitHub #126). The leaf
+                        // publishes at the chunk boundary the job named,
+                        // because what a claimant clones is the mutable
+                        // state at the prefix's *end*; registering at the
+                        // end of the prompt instead would cache pages whose
+                        // state the registrant had already run past.
                         //
-                        // A claimant's head is already the cached entry
-                        // (registering its full prompt would double-charge
-                        // the shared pages), and a same-batch duplicate's
-                        // prompt is already cached by the batch's first
-                        // registrant (register returns `None` — it keeps its
-                        // own charge, no re-registration). The entry's pages
-                        // are charged to the pool now (the charge split: the
-                        // registrant's own reservation keeps the residual,
-                        // the entry holds the shared pages).
-                        let at_publish_boundary = self.requests[i].publish_tokens > 0
-                            && self.requests[i].prefix_entry.is_none()
-                            && self.requests[i].prefill_progress
-                                == self.requests[i].publish_tokens;
-                        if at_publish_boundary {
+                        // Reading `job.publish_prefix_tokens` rather than
+                        // re-deriving the condition is what keeps the two
+                        // sides of one act from disagreeing — and it is why
+                        // the `None` arm below can be sure a leaf prefix
+                        // exists to let go of.
+                        //
+                        // The entry's pages are charged to the pool here (the
+                        // charge split: the publisher's own reservation keeps
+                        // the residual, the entry holds the shared pages).
+                        if job.publish_prefix_tokens.is_some() {
                             let publisher = self.requests[i].id;
                             let registered = self.prefix.register(
                                 publisher,
                                 &self.requests[i].input.tokens,
                                 &self.requests[i].gdn,
                             );
-                            if let Some((entry, pages)) = registered {
-                                let r = &mut self.requests[i];
-                                r.prefix_entry = Some(entry);
-                                r.prefix_publisher = Some(publisher);
-                                r.resources.kv_pages = r.resources.kv_pages.saturating_sub(pages);
-                                self.kv_used_pages = self.kv_used_pages.saturating_add(pages);
+                            match registered {
+                                Some((entry, pages)) => {
+                                    let r = &mut self.requests[i];
+                                    r.prefix_entry = Some(entry);
+                                    r.prefix_publisher = Some(publisher);
+                                    r.resources.kv_pages =
+                                        r.resources.kv_pages.saturating_sub(pages);
+                                    self.kv_used_pages = self.kv_used_pages.saturating_add(pages);
+                                }
+                                // The leaf published and this cache declined
+                                // — the head is already registered by
+                                // someone else, or the GDN position is not a
+                                // reusable boundary. Nothing will ever claim
+                                // that prefix, and no entry exists to release
+                                // it later, so the backend's handle is
+                                // dropped now. Its pages stay out of the pool
+                                // only until the publishing sequence itself
+                                // is released, which is the same lifetime
+                                // they would have had unshared.
+                                None => self.compute.release_prefix(publisher),
                             }
                         }
                     }

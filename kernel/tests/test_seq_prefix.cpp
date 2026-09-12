@@ -565,6 +565,18 @@ void report_clone_cost() {
   std::fflush(stdout);
 
   expect(mean_micros > 0.0, "cost: the clone is measured");
+  // And that it never left the card. This host runs the 5090 on a PCIe Gen 3
+  // x16 link measured at ~12 GB/s in either direction
+  // (docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md), so
+  // 147.76 MiB could not cross it in under ~12 ms one way, let alone make the
+  // round trip a restore-from-a-sibling's-snapshot would need. A clone that
+  // came in under a third of one crossing cannot have taken that route --
+  // which is the acceptance criterion "no prefix-reuse path performs a host
+  // round-trip", checked rather than asserted in a comment.
+  const double one_pcie_crossing_micros =
+      static_cast<double>(published.clone_image_bytes) / 12e9 * 1e6;
+  expect(mean_micros < one_pcie_crossing_micros / 3.0,
+         "cost: the clone is far too fast to have crossed PCIe");
   ignis_seq_release(pool, publisher);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);

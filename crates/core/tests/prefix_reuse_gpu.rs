@@ -206,22 +206,43 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
     let mut second = pool
         .alloc_shared(MAX_CONTEXT, &prefix)
         .unwrap_or_else(|e| panic!("second claim: {e}"));
+    // The claimant's own account of what it holds, which is what admission
+    // charges against: a tail of its own plus a shared head it is not billed
+    // for. Read off the leaf rather than assumed, so the two views are
+    // compared with each other instead of each with a literal.
+    let claimant = first.stats();
+    let shared = prefix.stats().pages;
+    assert_eq!(
+        claimant.shared_pages, shared,
+        "a claimant's shared pages are exactly the prefix's"
+    );
+    let tail = claimant.mapped_pages - claimant.shared_pages;
     assert_eq!(
         free_before_claims - pool.stats().kv_free_pages,
-        2 * (8 - 2),
+        2 * tail,
         "two claimants cost two tails: the shared head is charged to the pool once"
     );
-    // And the same arithmetic the admission machine runs: one charge for the
-    // prefix plus one tail per holder. `ConcreteScheduler` charges exactly
-    // `prefix.pages + sum(tails)` (crates/core/src/concrete.rs — the charge
-    // split at registration and at each claim), and this is that number read
-    // off the leaf's own pool, so the two views are checked against each
-    // other rather than each against itself.
-    let publisher_and_claimants = 3 * (8 - 2) + 2;
+    // And the same arithmetic the admission machine runs. `ConcreteScheduler`
+    // charges `prefix.pages + sum(tails)` for a published prefix and its
+    // holders (crates/core/src/concrete.rs — the charge split at registration
+    // and at each claim); this is that expression evaluated from the leaf's
+    // own numbers and compared against the leaf's own pool.
+    let holders = 3; // the publisher and its two claimants
     assert_eq!(
         free_at_rest - pool.stats().kv_free_pages,
-        8 + publisher_and_claimants,
-        "the leaf's pool spends one control sequence plus the prefix and three tails —          the admission machine's own charge for the same set"
+        claimant.mapped_pages + shared + holders * tail,
+        "the leaf's pool spends the unshared control sequence plus the prefix once          and one tail per holder — the admission machine's own charge for the same set"
+    );
+
+    // A claimant's history is not all its own, so it cannot be moved as one
+    // blob (P4-10 against P4-06). The right response is to release it and
+    // re-prefill, which is what the distinct code is for.
+    let refusal = first
+        .snapshot_bytes()
+        .expect_err("a sequence sharing a prefix has no whole-sequence snapshot");
+    assert!(
+        refusal.is_shared_prefix(),
+        "the sequence, not the call, is what cannot be transferred: {refusal}"
     );
 
     let claim_stats = prefix.stats();
@@ -279,11 +300,11 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn a_sequence_that_shares_a_prefix_refuses_to_be_snapshotted() {
-    // P4-10 against P4-06: a claimant's leading pages belong to the prefix,
-    // so there is no whole-sequence blob to write. The refusal is its own
-    // code, because the right response is to release and re-prefill rather
-    // than to retry or to treat it as a bad call.
+fn publishing_is_refused_unless_the_sequence_stands_on_the_prefix() {
+    // The precondition the whole mechanism rests on: what a claimant clones
+    // is the mutable state at the prefix's end, so a sequence standing
+    // anywhere else has nothing to give. Checked here at the binding level,
+    // where the failure is a typed error a scheduler branches on.
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;

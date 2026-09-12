@@ -71,9 +71,10 @@ extern "C" {
  * call. */
 #define IGNIS_SEQ_ERR_BAD_SNAPSHOT (-4)
 
-/* ignis_seq_snapshot / ignis_seq_restore only: the sequence holds a shared
- * prefix (P4-10, GitHub #126), so its KV history is not all its own and
- * there is no whole-sequence blob to write or to write back. The claim is
+/* The state-transfer calls (ignis_seq_snapshot_size, ignis_seq_snapshot,
+ * ignis_seq_restore): the sequence holds a shared prefix (P4-10, GitHub
+ * #126), so its KV history is not all its own and there is no
+ * whole-sequence blob to size, to write, or to write back. The claim is
  * released with the sequence; a caller that needs this sequence off the GPU
  * releases it and re-prefills instead. Distinct from -1 because the call is
  * well formed -- it is the sequence, not the arguments, that cannot be
@@ -253,8 +254,9 @@ uint32_t ignis_seq_snapshot_format_version(void);
  *
  * Returns 0 and the size in `*out_bytes`. Returns -1 on a null argument or
  * a sequence that is not `pool`'s (see ignis_seq_last_error);
- * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY if `seq` is mid-chunk, for the same reason
- * the snapshot itself is refused there. */
+ * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY if `seq` is mid-chunk, and
+ * IGNIS_SEQ_ERR_SHARED_PREFIX if it claims a shared prefix -- for the same
+ * reasons the snapshot itself is refused in each case. */
 int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                  uint64_t *out_bytes);
 
@@ -314,11 +316,9 @@ int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq, co
  * because prefill has to traverse every layer to produce them. That is
  * recorded here so it is not re-proposed as an optimization.
  *
- * On ADR 0016 (options structs, not new entry points): the rule is about
- * per-call *modulation* of a step. These are lifetime operations on a new
- * kind of leaf-owned object -- publish, claim, release -- in the same family
- * as ignis_seq_alloc / ignis_seq_release, which is why they are entry points
- * and not fields. A prefix carries no per-call knobs to put in a struct.
+ * These four are entry points rather than fields on an options struct, which
+ * ADR 0016 would otherwise ask for. The carve-out and its reasoning are
+ * recorded in ADR 0024 ("Lifetime calls are entry points"), not here.
  */
 
 struct ignis_seq_prefix_stats {
