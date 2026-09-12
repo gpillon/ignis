@@ -63,9 +63,24 @@ pub struct Request {
     /// claim pins the shared pages for the request's lifetime — released
     /// on completion or re-queue).
     pub prefix_entry: Option<PrefixId>,
+    /// The request that published the entry in [`Self::prefix_entry`]
+    /// (P4-10, GitHub #126). The compute backend keys the *leaf's* prefix —
+    /// which owns the physical pages — by its publisher, so a claim has to
+    /// carry that identity down with it.
+    pub prefix_publisher: Option<RequestId>,
     /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
     /// full prefill, nothing skipped).
     pub shared_prefix_tokens: u32,
+    /// The whole KV pages of this request's own prompt — what it *could*
+    /// publish as a shared prefix (P4-10, GitHub #126), or 0 for a prompt
+    /// shorter than one page.
+    ///
+    /// Known before the first chunk, not after the last, because the chunk
+    /// that lands on it has to stop there: the mutable state a claimant
+    /// clones is the state at the prefix's end. Read it through
+    /// [`Request::publish_point`], which also answers whether this request
+    /// publishes at all.
+    pub publish_tokens: u32,
     /// Prompt tokens already sent to the compute backend during prefill
     /// (P3-01, ADR 0018): advances by at most the scheduler's serving chunk
     /// width per `advance()`. `Prefilling` is durable and carries this as
@@ -107,7 +122,9 @@ impl Request {
             backfill_class: BackfillClass::None,
             gdn: GdnState::new(),
             prefix_entry: None,
+            prefix_publisher: None,
             shared_prefix_tokens: 0,
+            publish_tokens: 0,
             prefill_progress: 0,
             cancelled: false,
         }
@@ -147,6 +164,22 @@ impl Request {
         }
         self.state = next;
         true
+    }
+
+    /// The **publish point** (CONTEXT.md): the prefill position at which this
+    /// request publishes its prompt head as a shared prefix, or 0 for a
+    /// request that publishes nothing (P4-10, GitHub #126).
+    ///
+    /// A request holding a claim publishes nothing: the head it would offer
+    /// is the entry it is already holding, and publishing it again would own
+    /// the same pages twice. One function so that the chunk decomposition
+    /// (where to cut) and the registration (when to publish) cannot disagree
+    /// about it.
+    pub fn publish_point(&self) -> u32 {
+        if self.prefix_entry.is_some() {
+            return 0;
+        }
+        self.publish_tokens
     }
 
     /// Whether this request has finished prefill: every prompt token has
@@ -237,7 +270,12 @@ impl Request {
         // claim (released by the caller) is stale; a fresh prefill may
         // re-claim a live entry.
         self.prefix_entry = None;
+        self.prefix_publisher = None;
         self.shared_prefix_tokens = 0;
+        // `publish_tokens` is untouched: it is a property of the prompt, not
+        // of a run. With the claim gone the re-prefill is free to publish
+        // that head again (P4-10, GitHub #126) — the pages it had went back
+        // with the entry the caller released.
         // P3-01: the re-prefilled stream starts over at position 0 too —
         // whatever chunk progress it had before eviction is gone with the
         // KV it warmed.

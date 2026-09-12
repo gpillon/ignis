@@ -35,6 +35,11 @@ struct Inner {
     prefill_batches: Vec<Vec<PrefillJob>>,
     /// Every decode batch the mock received (batch shape for assertions).
     decode_batches: Vec<Vec<DecodeJob>>,
+    /// Shared prefixes the scheduler told the backend to let go of (P4-10,
+    /// GitHub #126), in order: the publishing request of each. The real
+    /// adapter drops its leaf handle here, so a test that never sees the
+    /// call is looking at a prefix the engine would have pinned forever.
+    prefixes_released: Vec<RequestId>,
 }
 
 /// A deterministic, recording [`Compute`] implementation for tests.
@@ -74,6 +79,12 @@ impl MockCompute {
         self.inner.lock().unwrap().decode_batches.clone()
     }
 
+    /// The publishers whose shared prefix the scheduler released (P4-10,
+    /// GitHub #126), in order.
+    pub fn released_prefixes(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().prefixes_released.clone()
+    }
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -105,6 +116,10 @@ impl Compute for MockCompute {
         }
         g.prefill_batches.push(jobs.to_vec());
         Ok(())
+    }
+
+    fn release_prefix(&self, publisher: RequestId) {
+        self.inner.lock().unwrap().prefixes_released.push(publisher);
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

@@ -290,6 +290,39 @@ inline const char *ignis_seq_snapshot_geometry_names(const ignis_seq_snapshot_ge
   return "an unnamed geometry field";
 }
 
+/* `seq`'s IGNIS_SEQ_SECTION_PROGRESS payload, and the same payload applied
+ * back to a sequence.
+ *
+ * Here rather than beside one consumer because all three read it: snapshot
+ * writes it into a blob, restore reads it back out of one, and a prefix
+ * clone hands it from a publisher to a claimant without a blob at all
+ * (P4-10, GitHub #126). One pair of functions is what keeps a scalar added
+ * to `ignis_seq_progress_image` from reaching two of them and not the
+ * third. */
+inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
+  ignis_seq_progress_image image{};
+  image.position      = seq.position;
+  image.pending_token = seq.pending_token;
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
+    image.gqa_positions[i] = seq.gqa_positions[i];
+  }
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
+    image.gdn_positions[i] = seq.gdn_positions[i];
+  }
+  return image;
+}
+
+inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_image &image) {
+  seq.position      = image.position;
+  seq.pending_token = image.pending_token;
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
+    seq.gqa_positions[i] = image.gqa_positions[i];
+  }
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
+    seq.gdn_positions[i] = image.gdn_positions[i];
+  }
+}
+
 /* The physical KV pages a snapshot of `seq` captures: the pages its written
  * history occupies, not its whole reservation. A sequence reserves its
  * entire context up front, so capturing the reservation would price a

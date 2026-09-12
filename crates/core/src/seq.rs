@@ -13,6 +13,13 @@
 //! blob is the leaf's alone — this side asks for a size, holds bytes it does
 //! not interpret, and hands them back.
 //!
+//! Sibling requests that share a prompt head share its **pages** rather than
+//! re-prefilling them (P4-10, GitHub #126): [`Seq::publish_prefix`] hands the
+//! leading pages to a leaf-owned refcount, and [`SeqPool::alloc_shared`]
+//! gives a claimant those same physical pages plus a device-to-device clone
+//! of the mutable state. Neither direction crosses PCIe, which is what
+//! separates it from the snapshot path above.
+//!
 //! `Seq<'a>` borrows the [`SeqPool`] it came from: the borrow checker
 //! rejects a pool drop while any sequence drawn from it is still alive,
 //! which the flat C ABI cannot enforce on its own (the leaf's pools are
@@ -37,6 +44,10 @@ pub(crate) mod ffi {
     /// Opaque sequence handle.
     #[repr(C)]
     pub struct IgnisSeq([u8; 1]);
+
+    /// Opaque shared-prefix handle (P4-10, GitHub #126).
+    #[repr(C)]
+    pub struct IgnisSeqPrefix([u8; 1]);
 
     /// 1:1 with `struct ignis_seq_pool_spec`.
     #[repr(C)]
@@ -88,6 +99,22 @@ pub(crate) mod ffi {
         pub page_entitlement: u32,
         pub mapped_pages: u32,
         pub token_capacity: u64,
+        /// How many of `mapped_pages` belong to a shared prefix rather than
+        /// to this sequence (GitHub #126): 0 for a sequence that prefilled
+        /// its own head.
+        pub shared_pages: u32,
+    }
+
+    /// 1:1 with `struct ignis_seq_prefix_stats`.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct IgnisSeqPrefixStats {
+        pub tokens: u32,
+        pub pages: u32,
+        pub refcount: u32,
+        pub clone_image_bytes: u64,
+        pub clone_count: u64,
+        pub last_clone_micros: f64,
     }
 
     unsafe extern "C" {
@@ -135,6 +162,27 @@ pub(crate) mod ffi {
             src_bytes: u64,
         ) -> i32;
 
+        pub fn ignis_seq_prefix_publish(
+            pool: *mut IgnisSeqPool,
+            seq: *mut IgnisSeq,
+            prefix_tokens: u32,
+            out_prefix: *mut *mut IgnisSeqPrefix,
+        ) -> i32;
+
+        pub fn ignis_seq_alloc_shared(
+            pool: *mut IgnisSeqPool,
+            context_tokens: u32,
+            prefix: *mut IgnisSeqPrefix,
+            out_seq: *mut *mut IgnisSeq,
+        ) -> i32;
+
+        pub fn ignis_seq_prefix_release(pool: *mut IgnisSeqPool, prefix: *mut IgnisSeqPrefix);
+
+        pub fn ignis_seq_prefix_stats(
+            prefix: *const IgnisSeqPrefix,
+            out_stats: *mut IgnisSeqPrefixStats,
+        ) -> i32;
+
         pub fn ignis_seq_last_error() -> *const c_char;
     }
 
@@ -164,7 +212,7 @@ pub(crate) mod ffi {
     }
 }
 
-pub use ffi::{IgnisSeqPoolStats, IgnisSeqStats};
+pub use ffi::{IgnisSeqPoolStats, IgnisSeqPrefixStats, IgnisSeqStats};
 
 /// `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` (`kernel/include/ignis_seq.h`): the
 /// leaf's return code for an entry point that is declared but not built
@@ -177,6 +225,12 @@ pub const NOT_IMPLEMENTED: i32 = -2;
 /// coherent to capture. The same call succeeds once the in-flight chunk
 /// completes, which is what an evicting scheduler waits for.
 pub const NOT_AT_BOUNDARY: i32 = -3;
+
+/// `IGNIS_SEQ_ERR_SHARED_PREFIX`: the sequence claims a shared prefix
+/// ([`SeqPrefix`]), so its KV history is not all its own and there is no
+/// whole-sequence blob to write or write back. Releasing the sequence drops
+/// the claim; the way off the GPU is a re-prefill, not a snapshot.
+pub const SHARED_PREFIX: i32 = -5;
 
 /// `IGNIS_SEQ_ERR_BAD_SNAPSHOT`: the blob is not one this leaf can restore
 /// (foreign buffer, stale format version, disagreeing size, or a geometry
@@ -216,6 +270,12 @@ impl SeqTransferError {
     /// The blob was refused: discard it and re-prefill.
     pub fn is_bad_snapshot(&self) -> bool {
         self.code == BAD_SNAPSHOT
+    }
+
+    /// The sequence claims a shared prefix, so it cannot be moved as one
+    /// blob: release it and re-prefill instead of evicting it.
+    pub fn is_shared_prefix(&self) -> bool {
+        self.code == SHARED_PREFIX
     }
 }
 
@@ -322,12 +382,102 @@ impl SeqPool {
         })
     }
 
+    /// Reserve a slot that **claims `prefix`** (P4-10, GitHub #126): its
+    /// leading pages are the prefix's own physical KV pages, shared rather
+    /// than copied, and its mutable state is a device-to-device clone of the
+    /// prefix's. The returned sequence stands exactly where the publisher
+    /// stood, so it prefills only its tail.
+    ///
+    /// `context_tokens` is the whole reservation, prefix included, and must
+    /// leave at least one page of its own to write into. `Err` (nothing
+    /// allocated) on a bad argument or exhaustion.
+    pub fn alloc_shared<'a>(
+        &'a self,
+        context_tokens: u32,
+        prefix: &SeqPrefix<'a>,
+    ) -> Result<Seq<'a>, String> {
+        let mut handle: *mut ffi::IgnisSeq = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::ignis_seq_alloc_shared(self.handle, context_tokens, prefix.handle, &mut handle)
+        };
+        if rc != 0 || handle.is_null() {
+            return Err(last_error());
+        }
+        Ok(Seq {
+            handle,
+            pool: self.handle,
+            _pool: PhantomData,
+        })
+    }
+
     /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never
     /// exposed outside this crate (mirrors the handle's C-ABI opacity).
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeqPool {
         self.handle
     }
 }
+
+/// A published shared prefix: physical KV pages a leaf-owned refcount keeps
+/// alive, plus the mutable state a claimant clones (P4-10, GitHub #126, ADR
+/// 0024).
+///
+/// The pages are charged to the pool **once**, however many sequences claim
+/// them, and come back when the last holder releases — this handle counts as
+/// one holder and every sequence allocated against it as one more, so a
+/// prefix outlives the request that published it. Dropping the handle
+/// releases only the handle's own reference.
+///
+/// Borrows its [`SeqPool`] for the same reason [`Seq`] does: the flat C ABI
+/// frees the pool regardless of what is still drawn from it.
+#[derive(Debug)]
+pub struct SeqPrefix<'a> {
+    handle: *mut ffi::IgnisSeqPrefix,
+    pool: *mut ffi::IgnisSeqPool,
+    _pool: PhantomData<&'a SeqPool>,
+}
+
+impl SeqPrefix<'_> {
+    /// The prefix's size, its live holders, and what its most recent clone
+    /// actually cost (ADR 0024 asks for the clone to be measured rather than
+    /// assumed).
+    pub fn stats(&self) -> IgnisSeqPrefixStats {
+        let mut stats = IgnisSeqPrefixStats::default();
+        let rc = unsafe { ffi::ignis_seq_prefix_stats(self.handle, &mut stats) };
+        assert_eq!(
+            rc, 0,
+            "ignis_seq_prefix_stats: null handle (unreachable — SeqPrefix always holds one)"
+        );
+        stats
+    }
+
+    /// Detach the compile-time borrow tying this prefix to its pool, exactly
+    /// as [`Seq::into_static`] does and for the same reason: a prefix
+    /// outlives the stack frame that published it.
+    ///
+    /// # Safety
+    /// The caller must keep the originating [`SeqPool`] alive (not dropped)
+    /// for as long as the returned handle exists or is dropped.
+    pub unsafe fn into_static(self) -> SeqPrefix<'static> {
+        let handle = self.handle;
+        let pool = self.pool;
+        std::mem::forget(self);
+        SeqPrefix {
+            handle,
+            pool,
+            _pool: PhantomData,
+        }
+    }
+}
+
+impl Drop for SeqPrefix<'_> {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_seq_prefix_release(self.pool, self.handle) };
+    }
+}
+
+// Moved into the scheduler adapter's `Mutex`-guarded prefix map, never
+// shared by reference across threads — the same contract `Seq` carries.
+unsafe impl Send for SeqPrefix<'_> {}
 
 impl Drop for SeqPool {
     fn drop(&mut self) {
@@ -344,7 +494,7 @@ pub struct Seq<'a> {
     _pool: PhantomData<&'a SeqPool>,
 }
 
-impl Seq<'_> {
+impl<'a> Seq<'a> {
     /// This sequence's slot, KV page entitlement/mapping and token
     /// capacity.
     pub fn stats(&self) -> IgnisSeqStats {
@@ -375,6 +525,11 @@ impl Seq<'_> {
 
     /// Write this sequence's whole device state into `dst` as an opaque
     /// blob, which must be at least [`Seq::snapshot_bytes`] long.
+    ///
+    /// A sequence that claims a shared prefix is refused with
+    /// [`SHARED_PREFIX`](SeqTransferError::is_shared_prefix): its leading
+    /// pages belong to the prefix, so there is no whole-sequence blob to
+    /// write.
     ///
     /// Synchronous: it returns with every byte already in `dst`. Pinned
     /// host memory is faster and is what the host tier uses (GitHub #125),
@@ -431,6 +586,43 @@ impl Seq<'_> {
         } else {
             Err(transfer_error(rc))
         }
+    }
+
+    /// Publish this sequence's first `prefix_tokens` tokens of history as a
+    /// shared prefix every sibling with the same prompt head can claim
+    /// (P4-10, GitHub #126, ADR 0024).
+    ///
+    /// `prefix_tokens` must be a whole number of KV pages **and must be
+    /// exactly where this sequence stands**: what a claimant receives is the
+    /// mutable state at the prefix's end, which a sequence that has run past
+    /// it no longer has. So this is called at the chunk boundary that lands
+    /// on the prefix, not at the end of a prompt.
+    ///
+    /// The sequence keeps serving and becomes a holder of its own prefix.
+    /// `Err` with [`NOT_AT_BOUNDARY`](SeqTransferError::is_not_at_boundary)
+    /// when it is mid-chunk or standing anywhere else; `-1` for a prefix that
+    /// is not whole pages, a sequence that already claims one, or a
+    /// reservation the prefix would consume entirely.
+    /// The returned prefix borrows the **pool**, not this sequence: it
+    /// outlives the request that published it (that is the point — a
+    /// claimant may arrive long after), and the publisher keeps serving
+    /// meanwhile.
+    pub fn publish_prefix(
+        &mut self,
+        prefix_tokens: u32,
+    ) -> Result<SeqPrefix<'a>, SeqTransferError> {
+        let mut handle: *mut ffi::IgnisSeqPrefix = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::ignis_seq_prefix_publish(self.pool, self.handle, prefix_tokens, &mut handle)
+        };
+        if rc != 0 || handle.is_null() {
+            return Err(transfer_error(if rc == 0 { -1 } else { rc }));
+        }
+        Ok(SeqPrefix {
+            handle,
+            pool: self.pool,
+            _pool: PhantomData,
+        })
     }
 
     /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never

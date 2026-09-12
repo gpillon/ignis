@@ -53,11 +53,44 @@ slot, the conv taps — are copied device-to-device through the same internal
 section machinery the snapshot path uses. The host tier's pinned-memory path is
 a different transport over the same description.
 
+**Lifetime calls are entry points** (amends ADR 0016 for this family). ADR 0016
+rules that the step ABI grows by fields on an options struct, never by new
+entry points, and that a call which plausibly needs per-call modulation takes
+an options pointer from its first version. That rule is about *steps* — a
+forward pass whose route, compute policy or sampling would otherwise multiply
+parameters and `_ex` variants. It does not reach the calls that create and
+destroy the objects a step runs against: `ignis_seq_pool_create`,
+`ignis_seq_alloc` and `ignis_seq_release` predate it and take no options
+struct, because there is nothing about an allocation to modulate per call.
+
+The state-transfer and prefix calls this ADR introduces are of that second
+kind. A snapshot size and a format version are queries with no knob; publish,
+claim and release are lifetime operations on a leaf-owned object. So they are
+entry points, and `ignis_seq_alloc_shared` is a second constructor rather than
+a flag on the first — a sequence that claims a prefix is built differently,
+not stepped differently.
+
+What ADR 0016 still governs, unchanged: a *snapshot control* — a policy, a
+stream, a partial extent — goes in an options struct when a phase needs one,
+and is not a fifth entry point.
+
 ## Consequences
 
 - The two parallel page ledgers end. The leaf owns physical pages and their
   refcounts; `KvPool`'s refcounts in Rust become admission accounting, not
   truth.
+- **A prefix is published at a page boundary, which makes it a scheduling
+  decision.** The mutable state a claimant clones is the state at the prefix's
+  *end*, so the publishing request's prefill has to stop exactly there. A
+  prompt whose length is not a whole number of KV pages therefore pays one
+  extra prefill chunk — its shareable head, then its remainder — in exchange
+  for every sibling skipping that head entirely (P4-10, GitHub #126).
+- **A sequence that holds a shared prefix cannot be snapshotted.** Its leading
+  pages belong to the prefix, so there is no whole-sequence blob to write: the
+  leaf refuses with its own code and the sequence is released and re-prefilled
+  rather than evicted to the host tier. The alternative — copying another
+  request's history into this request's blob — is the corruption the refusal
+  exists to prevent.
 - Clone, snapshot and restore share one description, so a new section is
   carried by all three or by none. A section added to only one of them is now a
   visible omission rather than a silent one.
@@ -81,3 +114,14 @@ a different transport over the same description.
     leaves the decision unchanged; the estimate above was made at PCIe 5.0
     rates. See
     [Sequence snapshot transfer cost](../findings/2026-09-12-sequence-snapshot-transfer-cost.md).
+  - **Measured (P4-10, GitHub #126):** the device-to-device clone is **~0.25 ms**
+    for the 148 MiB of mutable state at this geometry, not 0.09 ms. The state
+    is strided per GDN layer in the pool and packed in the prefix's image, so
+    the copy runs at ~620 GB/s rather than at the card's flat-copy bandwidth.
+    Against the same 148 MiB over PCIe — ~12 ms per direction at this host's
+    measured 12 GB/s — the clone is ~48x cheaper one way and ~96x cheaper than
+    the round trip a snapshot-and-restore would pay, and it is four orders of
+    magnitude cheaper than re-prefilling the head. The decision to clone on
+    the device rather than route through the host tier therefore stands on a
+    wider margin than the estimate claimed. See
+    [Device prefix clone cost](../findings/2026-09-12-device-prefix-clone-cost.md).

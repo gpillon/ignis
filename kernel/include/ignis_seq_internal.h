@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 /* The GDN causal-conv kernel width (mirrors kernel/src/model.cu's
@@ -148,7 +149,16 @@ struct ignis_seq_pool {
   }
 };
 
+/* The shared prefix a sequence may hold (P4-10, GitHub #126). Defined in
+ * ignis_seq_prefix_internal.h, which needs the state-section table and so
+ * includes this header -- a pointer is all `ignis_seq` needs. */
+struct ignis_seq_prefix;
+
 struct ignis_seq {
+  /* This sequence's OWN KV pages: the tail it writes itself. A sequence
+   * holding a shared prefix does not own its leading pages, so this
+   * allocation is not its whole history -- `ignis_seq_logical_page_count`
+   * below is, and the block-table row addresses both halves in order. */
   ninfer::PagedKVAllocation kv;
   // Also addresses this sequence's presence/frequency penalty-count row in
   // the pool's sampling_counts buffer (`pool->token_counts_for(slot)`,
@@ -176,7 +186,47 @@ struct ignis_seq {
   // above.  It pins span prefill's start_position contract even for GDN-only
   // prefixes.
   std::uint64_t position = 0;
+  // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
+  // One reference is held for as long as this handle lives; `shared_pages`
+  // restates its page count so every capacity question here can be answered
+  // without the prefix's own definition.
+  ignis_seq_prefix *prefix  = nullptr;
+  std::uint32_t shared_pages = 0;
 };
+
+/* Whether `seq` was actually drawn from `pool`.
+ *
+ * Every call that hands a sequence and a pool to the vendored pools together
+ * needs this first: the vendored side's own mismatch check aborts the
+ * process (CUDA_CHECK / std::invalid_argument out of a noexcept path), so
+ * the pairing is refused here as a plain bad argument instead. */
+inline bool ignis_seq_belongs_to(const ignis_seq_pool &pool, const ignis_seq &seq) {
+  return seq.kv.valid() && seq.kv.belongs_to(pool.kv_pool) && seq.slot >= 0 &&
+         seq.slot < pool.gdn_pool.slot_count();
+}
+
+/* The leaf's thread-local last-error slot -- the one `ignis_seq_last_error`
+ * reports. Defined in kernel/src/seq.cu and written by kernel/src/seq_prefix.cu
+ * too, so one error surface answers for every sequence entry point rather
+ * than one per translation unit. */
+void ignis_seq_set_last_error(std::string message);
+
+/* The pages of a sequence's history: the prefix's, which it shares, plus its
+ * own. **Not** `kv.mapped_page_count()`, which is only the half it owns --
+ * every capacity question (how many tokens fit, where the next one lands)
+ * is about this number, because the block-table row addresses both halves in
+ * order. */
+inline std::uint32_t ignis_seq_logical_page_count(const ignis_seq &seq) {
+  return seq.shared_pages + seq.kv.mapped_page_count();
+}
+
+/* Tokens the sequence's mapped history can hold, prefix included. The
+ * sibling of `ninfer::PagedKVAllocation::mapped_token_capacity` for a
+ * sequence that may not own all of its pages. */
+inline std::uint64_t ignis_seq_token_capacity(const ignis_seq &seq) {
+  return static_cast<std::uint64_t>(ignis_seq_logical_page_count(seq)) *
+         static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
+}
 
 /* The cache element type a format's rows are declared as, and the
  * quant_group that declaration has to carry (P4-05, GitHub #123).

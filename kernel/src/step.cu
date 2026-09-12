@@ -804,7 +804,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     set_error("ignis_program_prefill: start_position does not match the sequence frontier");
     return -1;
   }
-  if (num_tokens > seq->kv.mapped_token_capacity() - seq->position) {
+  if (num_tokens > ignis_seq_token_capacity(*seq) - seq->position) {
     set_error("ignis_program_prefill: span exceeds the sequence KV capacity");
     return -1;
   }
@@ -926,7 +926,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         set_error("ignis_program_decode: sequence is null or was not prefilled");
         return -1;
       }
-      if (seq->position >= seq->kv.mapped_token_capacity()) {
+      if (seq->position >= ignis_seq_token_capacity(*seq)) {
         set_error("ignis_program_decode: sequence reached its KV capacity");
         return -1;
       }

@@ -198,6 +198,7 @@ mod tests {
     impl StepLeaf for StubLeaf {
         type Model = ();
         type Sequence = ();
+        type Prefix = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -214,6 +215,23 @@ mod tests {
             Ok(())
         }
         fn release_sequence(&self, _model: &Self::Model, _sequence: Self::Sequence) {}
+        fn allocate_sequence_shared(
+            &self,
+            _model: &Self::Model,
+            _context_tokens: u32,
+            _prefix: &Self::Prefix,
+        ) -> Result<Self::Sequence, i32> {
+            Ok(())
+        }
+        fn publish_prefix(
+            &self,
+            _model: &Self::Model,
+            _sequence: &mut Self::Sequence,
+            _prefix_tokens: u32,
+        ) -> Result<Self::Prefix, i32> {
+            Ok(())
+        }
+        fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {}
         fn prefill(
             &self,
             _model: &Self::Model,

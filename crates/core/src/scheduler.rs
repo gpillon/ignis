@@ -16,6 +16,21 @@ use crate::types::{
     SchedEvent, SubmitError, TokenId,
 };
 
+/// The shared prefix a prefill job claims (P4-10, GitHub #126, ADR 0024):
+/// which request published it, and how many leading prompt tokens it covers.
+///
+/// The backend needs the publisher's identity rather than the scheduler's own
+/// entry id because the leaf's prefix is what actually owns the pages, and
+/// the publisher is the request whose prefill produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedPrefixClaim {
+    /// The request whose prefill published the prefix.
+    pub publisher: RequestId,
+    /// The leading prompt tokens the prefix covers — always a whole number
+    /// of KV pages, and always equal to this job's `start_position`.
+    pub tokens: u32,
+}
+
 /// One prefill job handed to the compute backend (batched prefill groups
 /// several of these into one GPU batch to saturate the GPU and cut burst TTFT).
 #[derive(Debug, Clone)]
@@ -39,6 +54,18 @@ pub struct PrefillJob {
     /// The request's generation parameters (carried so the backend can set
     /// up the decode state; prefill only warms the KV).
     pub params: DecodeParams,
+    /// The shared prefix this request claims (P4-10, GitHub #126), if any.
+    /// Set on the request's **first** job: the backend allocates its
+    /// sequence against the prefix, which shares the leading KV pages in
+    /// place and clones the mutable state device-to-device, so the sequence
+    /// begins at `start_position` with the publisher's state.
+    pub shared_prefix: Option<SharedPrefixClaim>,
+    /// Publish this request's first N tokens as a shared prefix once this
+    /// chunk lands (P4-10, GitHub #126). Set only on the chunk that ends
+    /// exactly at N: the mutable state a claimant clones is the state at the
+    /// prefix's end, so the publish happens at that boundary and nowhere
+    /// else.
+    pub publish_prefix_tokens: Option<u32>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -86,6 +113,13 @@ pub trait Compute: Send + Sync {
     /// Release leaf-owned state for a request that completed or was evicted.
     /// CPU-only compute implementations need no lifecycle bookkeeping.
     fn release(&self, _request: RequestId) {}
+
+    /// Release the backend's own handle on the shared prefix `publisher`
+    /// published (P4-10, GitHub #126), once the scheduler's last claimant has
+    /// gone. The leaf's pages return to the pool when every sequence holding
+    /// them has been released too, so this is a handle drop and not a free.
+    /// CPU-only compute implementations hold no such handle.
+    fn release_prefix(&self, _publisher: RequestId) {}
 }
 
 /// The engine's scheduling interface — what the server drives.
