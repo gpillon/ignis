@@ -1,0 +1,38 @@
+[
+  {
+    "id": "rust-hello",
+    "sane": true,
+    "deterministic": true,
+    "first": "It defines a Rust `",
+    "second": "It defines a Rust `",
+    "first_reasoning": "We need answer user's request: \"In one sentence, what does `fn main() { println!(\"hi\"); }` do?\" Need one sentence. Need likely Rust code. Explain: defines main function that prints hi to standard output. Keep one sentence. Ensure no extra.",
+    "second_reasoning": "We need answer user's request: \"In one sentence, what does `fn main() { println!(\"hi\"); }` do?\" Need one sentence. Need likely Rust code. Explain: defines main function that prints hi to standard output. Keep one sentence. Ensure no extra."
+  },
+  {
+    "id": "rust-sort",
+    "sane": true,
+    "deterministic": true,
+    "first": "",
+    "second": "",
+    "first_reasoning": "We need answer user's question: \"What does `let v = vec![3,1,2]; v.sort();` set `v` to, after the call?\" Likely Rust. Need explain v becomes [1,2,3]. Need maybe mention sort sorts in place ascending by default. Need final concise",
+    "second_reasoning": "We need answer user's question: \"What does `let v = vec![3,1,2]; v.sort();` set `v` to, after the call?\" Likely Rust. Need explain v becomes [1,2,3]. Need maybe mention sort sorts in place ascending by default. Need final concise"
+  },
+  {
+    "id": "math-greedy",
+    "sane": true,
+    "deterministic": true,
+    "first": "",
+    "second": "",
+    "first_reasoning": "We need answer user's simple request. Need compute step by step 2 * 3 + 4 and final number on last line. Need likely mention multiplication before addition: 2*3=6, 6+4=10. Final line just 10? User says final number on last line",
+    "second_reasoning": "We need answer user's simple request. Need compute step by step 2 * 3 + 4 and final number on last line. Need likely mention multiplication before addition: 2*3=6, 6+4=10. Final line just 10? User says final number on last line"
+  },
+  {
+    "id": "explain-reverse",
+    "sane": true,
+    "deterministic": true,
+    "first": "",
+    "second": "",
+    "first_reasoning": "We need answer user: \"Explain in one sentence what `x.reverse()` does to a `Vec<i32>` named `x`.\" Need final one sentence. Need be accurate Rust. Vec::reverse reverses elements in place. For Vec<i32> named x, x.reverse() reverses the",
+    "second_reasoning": "We need answer user: \"Explain in one sentence what `x.reverse()` does to a `Vec<i32>` named `x`.\" Need final one sentence. Need be accurate Rust. Vec::reverse reverses elements in place. For Vec<i32> named x, x.reverse() reverses the"
+  }
+]

@@ -1,0 +1,29 @@
+{
+  "label": "reference-137",
+  "metrics": [
+    {
+      "id": "main",
+      "class": "main",
+      "ttft_ms": 51.7921,
+      "n_tokens": 256,
+      "total_ms": 7442.0751,
+      "ok": true
+    },
+    {
+      "id": "s1",
+      "class": "sub",
+      "ttft_ms": 3623.0196,
+      "n_tokens": 240,
+      "total_ms": 7241.6355,
+      "ok": true
+    },
+    {
+      "id": "s2",
+      "class": "sub",
+      "ttft_ms": 6997.7076,
+      "n_tokens": 256,
+      "total_ms": 10709.9424,
+      "ok": true
+    }
+  ]
+}

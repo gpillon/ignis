@@ -75,6 +75,13 @@ struct Inner {
     /// for "the engine does not report the field" (the TTFT instrument's
     /// cold-prefix evidence — `ttft.rs`).
     cached_prompt_tokens: std::sync::atomic::AtomicI64,
+    /// When set, the mock generates on the **thinking** channel: every
+    /// token goes out as `delta.reasoning_content` (and
+    /// `message.reasoning_content` when non-streaming), a `tool_calls`
+    /// chunk follows, and the stream finishes on `"tool_calls"` — the shape
+    /// a real agentic turn takes with `enable_thinking` on, and the one
+    /// GitHub #137 found the client could not measure.
+    thinking: AtomicBool,
     /// Every prompt the mock has been sent, in arrival order (so a test
     /// can prove the samples were distinct on the wire).
     prompts: Mutex<Vec<String>>,
@@ -90,6 +97,7 @@ impl MockState {
             inner: Arc::new(Inner {
                 model: model.into(),
                 fail_503: AtomicBool::new(false),
+                thinking: AtomicBool::new(false),
                 in_flight: AtomicUsize::new(0),
                 peak_in_flight: AtomicUsize::new(0),
                 next_id: std::sync::atomic::AtomicU64::new(0),
@@ -109,6 +117,13 @@ impl MockState {
     /// engine's "cannot admit right now" shape).
     pub fn set_fail_503(&self, flag: bool) {
         self.inner.fail_503.store(flag, Ordering::Relaxed);
+    }
+
+    /// Generate on the thinking channel from now on: every token goes out
+    /// as `reasoning_content`, followed by a tool call — no `delta.content`
+    /// chunk at all (GitHub #137).
+    pub fn set_thinking(&self, flag: bool) {
+        self.inner.thinking.store(flag, Ordering::Relaxed);
     }
 
     /// The number of requests currently in flight.
@@ -278,6 +293,7 @@ async fn completions(
         c => Some(c as u32),
     };
     let n = req.max_tokens.unwrap_or(MAX_TOKENS).min(MAX_TOKENS);
+    let thinking = state.inner.thinking.load(Ordering::Relaxed);
     let model = req
         .model
         .clone()
@@ -297,7 +313,7 @@ async fn completions(
             .as_ref()
             .is_some_and(|o| o.include_usage)
             .then_some((prompt_tokens, cached));
-        let events = paced_chunks(&id, &model, created, n, usage);
+        let events = paced_chunks(&id, &model, created, n, usage, thinking);
         Sse::new(PacedSse::new(state.inner.clone(), n, guard, events)).into_response()
     } else {
         // Non-streaming: hold the request in flight for the "generation"
@@ -306,7 +322,7 @@ async fn completions(
         tokio::time::sleep(generation_time(n)).await;
         state.inner.completed.lock().unwrap().push(n);
         drop(guard);
-        Json(completion_json(&id, &model, created, &req, n)).into_response()
+        Json(completion_json(&id, &model, created, &req, n, thinking)).into_response()
     }
 }
 
@@ -341,9 +357,18 @@ fn completion_json(
     created: u64,
     req: &CompletionsRequest,
     n: u32,
+    thinking: bool,
 ) -> serde_json::Value {
     let prompt_tokens = prompt_token_count(req);
-    let content = (0..n).map(token_text).collect::<Vec<_>>().join(" ");
+    let text = (0..n).map(token_text).collect::<Vec<_>>().join(" ");
+    // A thinking turn whose budget ran out mid-thought: the whole generation
+    // is on `reasoning_content` and `content` is the empty string, exactly
+    // what the server sends (GitHub #137).
+    let message = if thinking {
+        serde_json::json!({ "role": "assistant", "content": "", "reasoning_content": text })
+    } else {
+        serde_json::json!({ "role": "assistant", "content": text })
+    };
     serde_json::json!({
         "id": id,
         "object": "chat.completion",
@@ -351,7 +376,7 @@ fn completion_json(
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "finish_reason": "stop",
         }],
         "usage": {
@@ -376,16 +401,60 @@ fn content_chunk(id: &str, model: &str, created: u64, content: &str) -> Event {
     )
 }
 
-/// The SSE final chunk (the server's finish chunk: an empty `delta`
-/// (serialized as `{}`) + `finish_reason: "stop"`).
-fn finish_chunk(id: &str, model: &str, created: u64) -> Event {
+/// One SSE thinking chunk (the server's `delta.reasoning_content` shape —
+/// the reasoning and content channels are never sent on the same chunk,
+/// GitHub #68).
+fn reasoning_chunk(id: &str, model: &str, created: u64, reasoning: &str) -> Event {
     Event::default().data(
         serde_json::to_string(&serde_json::json!({
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "", "reasoning_content": reasoning },
+                "finish_reason": null,
+            }],
+        }))
+        .expect("chunk serializes"),
+    )
+}
+
+/// One complete tool call as its own chunk (the server's `tool_call_chunk`
+/// shape): a delta carrying `tool_calls` and no text on either channel.
+fn tool_call_chunk(id: &str, model: &str, created: u64) -> Event {
+    Event::default().data(
+        serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "", "tool_calls": [{
+                    "index": 0,
+                    "id": "call_0",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}" },
+                }] },
+                "finish_reason": null,
+            }],
+        }))
+        .expect("chunk serializes"),
+    )
+}
+
+/// The SSE final chunk (the server's finish chunk: an empty `delta`
+/// (serialized as `{}`) + the engine's `finish_reason`).
+fn finish_chunk(id: &str, model: &str, created: u64, reason: &str) -> Event {
+    Event::default().data(
+        serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": reason }],
         }))
         .expect("chunk serializes"),
     )
@@ -429,22 +498,39 @@ fn usage_chunk(
     )
 }
 
-/// The SSE events for a request: a content chunk per token, the finish
+/// The SSE events for a request: a chunk per generated token, the finish
 /// chunk (empty delta + `finish_reason`), then the `[DONE]` marker. The
 /// stream (`PacedSse`) emits them at the mock decode cadence; the prefill wait
 /// happens in the handler, before the stream is built.
+///
+/// With `thinking` set, every token goes out on `reasoning_content` and a
+/// tool call closes the turn — a stream with no `delta.content` chunk in it
+/// at all (GitHub #137).
 fn paced_chunks(
     id: &str,
     model: &str,
     created: u64,
     n: u32,
     usage: Option<(u32, Option<u32>)>,
+    thinking: bool,
 ) -> VecDeque<Event> {
     let mut events = VecDeque::new();
     for i in 0..n {
-        events.push_back(content_chunk(id, model, created, &token_text(i)));
+        events.push_back(if thinking {
+            reasoning_chunk(id, model, created, &token_text(i))
+        } else {
+            content_chunk(id, model, created, &token_text(i))
+        });
     }
-    events.push_back(finish_chunk(id, model, created));
+    if thinking {
+        events.push_back(tool_call_chunk(id, model, created));
+    }
+    events.push_back(finish_chunk(
+        id,
+        model,
+        created,
+        if thinking { "tool_calls" } else { "stop" },
+    ));
     // The trailing usage chunk goes right before `[DONE]`, the way the
     // server sends it.
     if let Some((prompt_tokens, cached)) = usage {

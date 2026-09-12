@@ -379,6 +379,8 @@ mod tests {
             total_ms: 1.0,
             n_tokens: text.split_whitespace().count() as u32,
             output: text.to_string(),
+            reasoning_output: String::new(),
+            reasoning_tokens: Some(0),
             prompt_tokens: None,
             cached_prompt_tokens: None,
             token_times_ms: Vec::new(),

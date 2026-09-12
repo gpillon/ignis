@@ -1,0 +1,29 @@
+{
+  "label": "ignis-137-before",
+  "metrics": [
+    {
+      "id": "main",
+      "class": "main",
+      "ttft_ms": 4363.2778,
+      "n_tokens": 0,
+      "total_ms": 4363.2778,
+      "ok": true
+    },
+    {
+      "id": "s1",
+      "class": "sub",
+      "ttft_ms": 1808.5655000000002,
+      "n_tokens": 111,
+      "total_ms": 3635.0043,
+      "ok": true
+    },
+    {
+      "id": "s2",
+      "class": "sub",
+      "ttft_ms": 4276.7625,
+      "n_tokens": 0,
+      "total_ms": 4276.7625,
+      "ok": true
+    }
+  ]
+}

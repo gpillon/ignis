@@ -296,8 +296,17 @@ When output names a domain concept, use the term as defined here.
 - **GPU profile** — the explicit test profile for GPU work: it requires the
   5090 free and **fails**, never skips, when the GPU is busy or a kernel
   errors. A skip is not green for compute work.
+- **Generated token** — a token the engine decoded, on **either** channel: the
+  answer (`delta.content`) or the thinking trace
+  (`delta.reasoning_content`, on by default). Every throughput and latency
+  cell counts generated tokens, because both channels are the same decode
+  work; a correctness check reads the answer channel alone, because scratch
+  work is not an answer. Reading only the answer channel scored a
+  thinking-heavy agentic turn as a request that produced nothing (GitHub
+  #137).
 - **Canary suite** — the fixed set of short, high-signal prompts used to detect
-  divergences.
+  divergences. Sanity is judged on everything the turn generated: a turn whose
+  budget ran out mid-thought produced sane tokens, not empty output.
 - **Canary oracle** — the recorded fixture the canary suite is checked against:
   the reference engine's greedy (exact-argmax) completions on those prompts for
   the same artifact, tokenized with the artifact's tokenizer.
