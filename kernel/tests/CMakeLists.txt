@@ -314,15 +314,26 @@ target_compile_definitions(ignis_kernel_kv_append_format_test PRIVATE
 target_link_libraries(ignis_kernel_kv_append_format_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_kv_append_format_test COMMAND ignis_kernel_kv_append_format_test)
 
-# P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
-# ignis's own BF16 route on identical keys and values (ADR 0022's in-house
-# acceptance for a lossy format). The same q/k/v/gate/positions go through A1
-# twice against two pools differing only in `kv_format`, on both routes the
-# GQA layer dispatches: the Prompt route at W=200 B=1, and the SmallT route at
-# W=1 for every exact batch width 1..8. The tolerance is derived from the
-# codec error ignis_hq_codec_kv_rows_test measured on the same fixture, which
-# is why both read that one file. Links ignis_kernel for the pool ABI and the
-# production view builders, and keeps the no-SKIP_RETURN_CODE rule (ADR 0006).
+# P4-06 (GitHub #124): OURS, not vendored -- sequence state transfer. It
+# checks the leaf-internal state-section table against the blob a snapshot
+# actually writes, round-trips a dirtied sequence through release and
+# re-allocation, and drives every refusal (stale version, foreign buffer,
+# disagreeing size, edited layout, foreign geometry, too-small target,
+# mid-chunk source) past the guarantee that a refused restore leaves the
+# target untouched -- which needs ignis_seq_internal.h to set a sequence's
+# frontier and read its device state, so it cannot live in Rust.
+#
+# It also PRINTS the measured snapshot/restore cost at the real 27B
+# geometry for a short and a full-context sequence (the ticket's "measured
+# rather than assumed"); the numbers are recorded in
+# docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md. That arm
+# allocates a full-context KV pool plus a 144 MiB GDN slot and ~532 MB of
+# pinned host memory, so it wants the card to itself -- which ADR 0006
+# already requires of every test here. Same no-SKIP_RETURN_CODE rule.
+add_executable(ignis_kernel_seq_snapshot_test test_seq_snapshot.cpp)
+target_link_libraries(ignis_kernel_seq_snapshot_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_snapshot_test COMMAND ignis_kernel_seq_snapshot_test)
+
 # P4-05 (GitHub #123): OURS, not vendored -- `ignis_model_load` refuses a KV
 # format it does not recognize, and lets a recognized one through to the
 # binding. Reachable only from a caller writing the flat C ABI directly (the
@@ -333,6 +344,17 @@ target_link_libraries(ignis_kernel_model_load_kv_format_test PRIVATE ignis_kerne
 add_test(NAME ignis_kernel_model_load_kv_format_test
          COMMAND ignis_kernel_model_load_kv_format_test)
 
+# P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
+# ignis's own BF16 route on identical keys and values (ADR 0022's in-house
+# acceptance for a lossy format). The same q/k/v/gate/positions go through A1
+# twice against two pools differing only in `kv_format`, on both routes the
+# GQA layer dispatches: the Prompt route at W=200 and every narrow width
+# 9..16 at B=1, and the SmallT route at W=1 for every exact batch width 1..8.
+# The tolerance is derived from the codec error ignis_hq_codec_kv_rows_test
+# measured on the same fixture, which is why both read that one file. Links
+# ignis_kernel for the pool ABI, the production view builders and the
+# engine's own attention-workspace sizing, and keeps the no-SKIP_RETURN_CODE
+# rule (ADR 0006).
 add_executable(ignis_kernel_hq_route_agreement_test test_hq_route_agreement.cu)
 target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")

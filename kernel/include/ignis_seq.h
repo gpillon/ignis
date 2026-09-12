@@ -22,8 +22,14 @@
  * penalties) are zeroed before the handle is returned, so a released and
  * re-allocated sequence never observes another request's state.
  *
- * Snapshot / restore entry points are declared now (the KV-RAM host tier,
- * G4) but return `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` until then.
+ * A sequence can also leave the GPU and come back (P4-06, GitHub #124, ADR
+ * 0024): `ignis_seq_snapshot_size` reports what a whole-sequence snapshot
+ * costs as the sequence stands, `ignis_seq_snapshot` writes exactly that
+ * many bytes of an opaque self-describing blob into a caller-provided host
+ * region, and `ignis_seq_restore` validates the blob's own header before it
+ * writes any of it into a sequence. What crosses this boundary is a size
+ * and a format version -- the leaf's state-section table stays internal
+ * (kernel/include/ignis_seq_sections.h).
  *
  * Rust bindings: crates/core/src/seq.rs (keep 1:1).
  */
@@ -40,6 +46,21 @@ extern "C" {
  * returns -1 (see ignis_seq_last_error). A not-yet-implemented entry point
  * returns this instead. */
 #define IGNIS_SEQ_ERR_NOT_IMPLEMENTED (-2)
+
+/* ignis_seq_snapshot only: the sequence is mid-chunk, so its sections are
+ * not mutually consistent and there is nothing coherent to capture (ADR
+ * 0018 / 0024). Distinct from -1 because it is not a caller mistake about
+ * arguments -- the same call succeeds once the in-flight chunk completes,
+ * which is what an evicting scheduler waits for (GitHub #125). */
+#define IGNIS_SEQ_ERR_NOT_AT_BOUNDARY (-3)
+
+/* ignis_seq_restore only: the blob is not one this leaf can restore -- a
+ * foreign buffer, a stale format version, a size that disagrees with the
+ * blob's own header, or a geometry the target sequence does not match. The
+ * target sequence is left untouched. Distinct from -1 so a host tier can
+ * discard the blob and re-prefill rather than treat it as a bug in its own
+ * call. */
+#define IGNIS_SEQ_ERR_BAD_SNAPSHOT (-4)
 
 /* Opaque device-resident pool of sequence state (never dereferenced across
  * the boundary). Allocated by ignis_seq_pool_create, destroyed by
@@ -167,11 +188,79 @@ void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq *seq);
  * argument. */
 int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out_stats);
 
-/* Snapshot a sequence's device state to a caller-provided host region /
- * restore it from one (the KV-RAM host tier, G4). Not implemented yet:
- * always returns IGNIS_SEQ_ERR_NOT_IMPLEMENTED. */
-int32_t ignis_seq_snapshot(const struct ignis_seq *seq, void *dst, uint64_t dst_bytes);
-int32_t ignis_seq_restore(struct ignis_seq *seq, const void *src, uint64_t src_bytes);
+/* --- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
+ *
+ * On ADR 0016: it rules that "later phases add fields, not parameters and
+ * not entry points", and names G4's snapshot controls as an example. That
+ * rule is about per-call *modulation* -- a prefill route, a compute policy,
+ * sampling parameters -- which is what would otherwise multiply parameters
+ * or `_ex` entry points. These two additions are neither. The `pool` handle
+ * is the storage the call operates on, which every other sequence entry
+ * point here already takes (ignis_seq_alloc, ignis_seq_release,
+ * ignis_seq_pool_stats); and a size query and a version are queries with
+ * nothing to modulate, so an options struct would have no field to carry.
+ * Snapshot controls, when a phase needs one, still go in a struct. Nothing
+ * called either entry point before this change, so per ADR 0016 the Rust
+ * binding moves with it and no wrapper is kept.
+ */
+
+/* The snapshot blob format version this leaf writes and accepts. One of the
+ * two things state transfer exposes across this boundary; the other is the
+ * size below. A blob written under a different version is refused by
+ * ignis_seq_restore, never reinterpreted, so a caller that persists blobs
+ * across builds records this alongside them. */
+uint32_t ignis_seq_snapshot_format_version(void);
+
+/* Bytes ignis_seq_snapshot would write for `seq` as it stands now.
+ *
+ * A whole-sequence figure: its written KV history (not its whole
+ * reservation), its GDN recurrent state and conv taps, its penalty-count
+ * row and its progress scalars, plus the blob's own header. It therefore
+ * grows with the sequence, and a caller sizes its host region per snapshot
+ * rather than once per pool.
+ *
+ * Returns 0 and the size in `*out_bytes`. Returns -1 on a null argument or
+ * a sequence that is not `pool`'s (see ignis_seq_last_error);
+ * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY if `seq` is mid-chunk, for the same reason
+ * the snapshot itself is refused there. */
+int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
+                                 uint64_t *out_bytes);
+
+/* Write `seq`'s whole device state into `dst` as an opaque, self-describing
+ * blob of exactly the size ignis_seq_snapshot_size reports.
+ *
+ * The blob is opaque: its layout is the leaf's, it carries its own header,
+ * and the only valid thing to do with it is hand it back to
+ * ignis_seq_restore on a pool of the same geometry. `dst` is any host
+ * region of at least that many bytes (pinned memory is faster, and is what
+ * the host tier uses, GitHub #125); the call is synchronous -- it returns
+ * with every byte already in `dst`.
+ *
+ * A snapshot is taken only at a **chunk boundary**: mid-chunk the
+ * sequence's sections are not consistent with one another, so the call is
+ * refused with IGNIS_SEQ_ERR_NOT_AT_BOUNDARY rather than capturing state
+ * that would restore into a subtly wrong sequence. Returns -1 on a null
+ * argument, a sequence that is not `pool`'s, a `dst_bytes` below the
+ * reported size, or a failed device copy. `seq` is never modified. */
+int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
+                            void *dst, uint64_t dst_bytes);
+
+/* Restore a sequence from a blob ignis_seq_snapshot wrote.
+ *
+ * Whole-sequence, one call, no partial restore: GDN state cannot be
+ * recomputed without re-running the prefix a restore exists to avoid (ADR
+ * 0024). `src_bytes` must be exactly the blob's own recorded size.
+ *
+ * Every check runs before any byte is written, so a refused restore leaves
+ * `seq` exactly as it was: the magic, the format version, the recorded size,
+ * the section layout, and the geometry the blob was taken at, against
+ * `pool`'s own. A mismatch returns IGNIS_SEQ_ERR_BAD_SNAPSHOT. `seq` must
+ * also hold at least as many mapped KV pages as the blob carries, which is
+ * the one requirement on the target beyond matching geometry. Returns -1 on
+ * a null argument, a sequence that is not `pool`'s, or a failed device
+ * copy. */
+int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq, const void *src,
+                           uint64_t src_bytes);
 
 /* The message from the most recent failing call on this thread
  * (thread-local; overwritten by the next call; empty string if none failed

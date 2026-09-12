@@ -4,8 +4,14 @@
 //! and a GDN slot (recurrent state + conv taps) from its linear-attention
 //! state pool (`kernel/include/ignis_seq.h`). [`SeqPool`] builds both pools
 //! once; [`SeqPool::alloc`] draws a zeroed [`Seq`] from them and
-//! [`Drop`] returns it. Snapshot/restore are declared on [`Seq`] but return
-//! [`NOT_IMPLEMENTED`] until the KV-RAM host tier (G4).
+//! [`Drop`] returns it.
+//!
+//! A sequence can also leave the GPU and come back (P4-06, GitHub #124, ADR
+//! 0024): [`Seq::snapshot`] returns an opaque blob of the size
+//! [`Seq::snapshot_bytes`] reports, and [`Seq::restore`] validates that
+//! blob's own header before writing any of it back. The layout inside the
+//! blob is the leaf's alone — this side asks for a size, holds bytes it does
+//! not interpret, and hands them back.
 //!
 //! `Seq<'a>` borrows the [`SeqPool`] it came from: the borrow checker
 //! rejects a pool drop while any sequence drawn from it is still alive,
@@ -107,9 +113,27 @@ pub(crate) mod ffi {
 
         pub fn ignis_seq_stats(seq: *const IgnisSeq, out_stats: *mut IgnisSeqStats) -> i32;
 
-        pub fn ignis_seq_snapshot(seq: *const IgnisSeq, dst: *mut c_void, dst_bytes: u64) -> i32;
+        pub fn ignis_seq_snapshot_format_version() -> u32;
 
-        pub fn ignis_seq_restore(seq: *mut IgnisSeq, src: *const c_void, src_bytes: u64) -> i32;
+        pub fn ignis_seq_snapshot_size(
+            pool: *const IgnisSeqPool,
+            seq: *const IgnisSeq,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_snapshot(
+            pool: *const IgnisSeqPool,
+            seq: *const IgnisSeq,
+            dst: *mut c_void,
+            dst_bytes: u64,
+        ) -> i32;
+
+        pub fn ignis_seq_restore(
+            pool: *mut IgnisSeqPool,
+            seq: *mut IgnisSeq,
+            src: *const c_void,
+            src_bytes: u64,
+        ) -> i32;
 
         pub fn ignis_seq_last_error() -> *const c_char;
     }
@@ -143,9 +167,72 @@ pub(crate) mod ffi {
 pub use ffi::{IgnisSeqPoolStats, IgnisSeqStats};
 
 /// `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` (`kernel/include/ignis_seq.h`): the
-/// snapshot/restore entry points' return code until the KV-RAM host tier
-/// (G4).
+/// leaf's return code for an entry point that is declared but not built
+/// yet. No entry point returns it today — P4-06 (GitHub #124) implemented
+/// the last two that did.
 pub const NOT_IMPLEMENTED: i32 = -2;
+
+/// `IGNIS_SEQ_ERR_NOT_AT_BOUNDARY`: the sequence is mid-chunk, so its state
+/// sections are not consistent with one another and there is nothing
+/// coherent to capture. The same call succeeds once the in-flight chunk
+/// completes, which is what an evicting scheduler waits for.
+pub const NOT_AT_BOUNDARY: i32 = -3;
+
+/// `IGNIS_SEQ_ERR_BAD_SNAPSHOT`: the blob is not one this leaf can restore
+/// (foreign buffer, stale format version, disagreeing size, or a geometry
+/// the target does not match). The target sequence is left untouched, so
+/// the right response is to discard the blob and re-prefill.
+pub const BAD_SNAPSHOT: i32 = -4;
+
+/// The snapshot blob format version this leaf writes and accepts (ADR
+/// 0024). A caller that persists blobs beyond one process records this
+/// beside them: a blob written under a different version is refused, never
+/// reinterpreted.
+pub fn snapshot_format_version() -> u32 {
+    unsafe { ffi::ignis_seq_snapshot_format_version() }
+}
+
+/// A refused or failed state transfer: the leaf's return code plus the
+/// message it set.
+///
+/// The code is what a caller branches on — [`NOT_AT_BOUNDARY`] means "try
+/// again after this chunk", [`BAD_SNAPSHOT`] means "discard this blob" —
+/// while the message is what a log or a panic prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqTransferError {
+    /// The leaf's return code: `-1`, [`NOT_AT_BOUNDARY`] or
+    /// [`BAD_SNAPSHOT`].
+    pub code: i32,
+    /// `ignis_seq_last_error` at the moment of the failure.
+    pub message: String,
+}
+
+impl SeqTransferError {
+    /// The sequence was mid-chunk: retry once the chunk completes.
+    pub fn is_not_at_boundary(&self) -> bool {
+        self.code == NOT_AT_BOUNDARY
+    }
+
+    /// The blob was refused: discard it and re-prefill.
+    pub fn is_bad_snapshot(&self) -> bool {
+        self.code == BAD_SNAPSHOT
+    }
+}
+
+impl std::fmt::Display for SeqTransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (rc {})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for SeqTransferError {}
+
+fn transfer_error(code: i32) -> SeqTransferError {
+    SeqTransferError {
+        code,
+        message: last_error(),
+    }
+}
 
 fn last_error() -> String {
     let msg = unsafe { CStr::from_ptr(ffi::ignis_seq_last_error()) };
@@ -267,29 +354,82 @@ impl Seq<'_> {
         stats
     }
 
-    /// Not implemented until the KV-RAM host tier (G4): always
-    /// `Err(NOT_IMPLEMENTED)`.
-    pub fn snapshot(&self, dst: &mut [u8]) -> Result<(), i32> {
-        let rc = unsafe {
-            ffi::ignis_seq_snapshot(self.handle, dst.as_mut_ptr() as *mut c_void, dst.len() as u64)
-        };
+    /// Bytes a snapshot of this sequence costs **as it stands now** (ADR
+    /// 0024): its written KV history, its GDN recurrent state and conv
+    /// taps, its penalty-count row and its progress scalars, plus the
+    /// blob's own header.
+    ///
+    /// It grows with the sequence, so a host tier sizes its buffer per
+    /// snapshot rather than once per pool. `Err` with
+    /// [`NOT_AT_BOUNDARY`](SeqTransferError::is_not_at_boundary) while the
+    /// sequence is mid-chunk.
+    pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
+        let mut bytes: u64 = 0;
+        let rc = unsafe { ffi::ignis_seq_snapshot_size(self.pool, self.handle, &mut bytes) };
         if rc == 0 {
-            Ok(())
+            Ok(bytes)
         } else {
-            Err(rc)
+            Err(transfer_error(rc))
         }
     }
 
-    /// Not implemented until the KV-RAM host tier (G4): always
-    /// `Err(NOT_IMPLEMENTED)`.
-    pub fn restore(&mut self, src: &[u8]) -> Result<(), i32> {
+    /// Write this sequence's whole device state into `dst` as an opaque
+    /// blob, which must be at least [`Seq::snapshot_bytes`] long.
+    ///
+    /// Synchronous: it returns with every byte already in `dst`. Pinned
+    /// host memory is faster and is what the host tier uses (GitHub #125),
+    /// but any host slice works. A snapshot is taken only at a chunk
+    /// boundary — mid-chunk the call is refused with [`NOT_AT_BOUNDARY`]
+    /// rather than capturing state that would restore into a subtly wrong
+    /// sequence.
+    pub fn snapshot_into(&self, dst: &mut [u8]) -> Result<(), SeqTransferError> {
         let rc = unsafe {
-            ffi::ignis_seq_restore(self.handle, src.as_ptr() as *const c_void, src.len() as u64)
+            ffi::ignis_seq_snapshot(
+                self.pool,
+                self.handle,
+                dst.as_mut_ptr() as *mut c_void,
+                dst.len() as u64,
+            )
         };
         if rc == 0 {
             Ok(())
         } else {
-            Err(rc)
+            Err(transfer_error(rc))
+        }
+    }
+
+    /// [`Seq::snapshot_bytes`] then [`Seq::snapshot_into`] over a freshly
+    /// allocated buffer — the convenience shape for a test or a caller that
+    /// does not pool its host memory.
+    pub fn snapshot(&self) -> Result<Vec<u8>, SeqTransferError> {
+        let bytes = self.snapshot_bytes()?;
+        let mut blob = vec![0u8; bytes as usize];
+        self.snapshot_into(&mut blob)?;
+        Ok(blob)
+    }
+
+    /// Restore this sequence from a blob [`Seq::snapshot`] produced, whose
+    /// length must be exactly the blob's own recorded size.
+    ///
+    /// Whole-sequence, one call: partial restore is not offered, because
+    /// GDN state cannot be recomputed without re-running the prefix a
+    /// restore exists to avoid (ADR 0024). Every check runs before any byte
+    /// is written, so a refusal
+    /// ([`BAD_SNAPSHOT`](SeqTransferError::is_bad_snapshot)) leaves this
+    /// sequence exactly as it was.
+    pub fn restore(&mut self, src: &[u8]) -> Result<(), SeqTransferError> {
+        let rc = unsafe {
+            ffi::ignis_seq_restore(
+                self.pool,
+                self.handle,
+                src.as_ptr() as *const c_void,
+                src.len() as u64,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(transfer_error(rc))
         }
     }
 
