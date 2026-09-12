@@ -40,6 +40,15 @@ fn input(max: u32) -> RequestInput {
 /// constraint) and a host tier of `host_bytes` bytes. `max_in_flight` is
 /// raised above the 8 resident lanes so the overflow (beyond-N) requests
 /// can be submitted (the host-tier overflow path, core-06).
+/// Drive the scheduler to idle, collecting every event.
+fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
+    let mut events = Vec::new();
+    while !sched.is_idle() {
+        events.extend(sched.advance());
+    }
+    events
+}
+
 fn sched_with(host_bytes: u64) -> ConcreteScheduler {
     let compute = Arc::new(MockCompute::new());
     let cfg = SchedulerConfig {
@@ -224,4 +233,278 @@ fn evictions_are_bounded_under_overflow_load() {
         );
     }
     assert!(sched.is_idle());
+}
+
+// ── P4-07 (GitHub #125): half-prefilled eviction ────────────────────────
+
+/// Scenario 3 — a **half-prefilled** (`Prefilling`) request is
+/// device-resident (real KV pages, a GDN slot, conv taps) long before it
+/// ever holds a decode lane, and is therefore evictable — restoring it
+/// resumes without re-prefilling, and it does not oscillate host↔GPU once
+/// restored.
+///
+/// This drives the trigger that is actually reachable end-to-end: a
+/// `Prefilling`, prefill-*complete* request queued for a lane (blocked on
+/// lanes, not resident slots — `eight` fillers hold every lane) is a valid
+/// [`Self::prefilling_eviction_candidate`] once nothing else needs its
+/// slot; the *chunk-boundary* / mid-multi-chunk case (`prefill_progress`
+/// short of the whole prompt) is exercised directly at the data-model
+/// level instead — `host::tests::a_half_prefilled_entry_carries_its_resume_phase_and_progress`
+/// (the tier round-trips an arbitrary boundary unchanged) and
+/// `request::tests::a_prefilling_request_can_be_evicted_and_restored_to_prefilling`
+/// (the state machine) — because P3-01's own durable-prefill rule ("exactly
+/// one request may hold multi-tick prefill progress at a time") means the
+/// active continuer is *never* competing with anything else for Phase 1's
+/// admission-refusal path while it is still mid-chunk: nothing else is ever
+/// considered until it finishes or is cut by the chunk-width rule. Once
+/// `prefill_complete()` is true, though, it stops being "the" active
+/// continuer and becomes exactly like any other resident, lane-less
+/// candidate — which is the shape this test drives through the real
+/// `Compute` seam, host tier, and restore path together.
+#[test]
+fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            max_in_flight: 10, // 8 fillers + a + b
+            max_prefill_batch: 8,
+            // Exactly enough resident slots for the 8 lane-holding fillers
+            // plus `a` — none left over for `b`.
+            resident_slot_capacity: 9,
+            host_capacity_bytes: 64,
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
+
+    // Eight fillers share one 16-token prefix (a whole page): the first
+    // publishes it, the rest claim it — every one of them ends up holding
+    // `prefix_entry`, which is what excludes *all eight* from
+    // `Self::retained_lane_candidates` despite occupying every lane.
+    for _ in 0..8 {
+        sched
+            .submit(
+                RequestInput {
+                    model: "qwen3.8-27b".into(),
+                    tokens: (1..=16).collect(),
+                    params: DecodeParams {
+                        max_tokens: Some(20),
+                        ..DecodeParams::default()
+                    },
+                },
+                RequestClass::Agent,
+            )
+            .unwrap();
+        sched.advance();
+    }
+
+    // `a`: a short, unique (unshared) prompt. It materializes fine (the
+    // 9th resident slot is free) and completes its own one-chunk prefill,
+    // but every lane is already taken — it queues, `Prefilling` and
+    // complete, holding no lane and no prefix.
+    let a = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (1000..1004).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(8),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    let ev_a = sched.advance();
+    assert_eq!(
+        sched.prefill_progress(a),
+        Some(4),
+        "a's whole (unshared) 4-token prompt prefilled in one chunk"
+    );
+    assert_eq!(
+        sched.request_state(a),
+        Some(ignis_core::types::RequestState::Prefilling),
+        "complete, but still queued — every lane is taken"
+    );
+
+    // `b`: another short, unique prompt. The resident-slot budget (9) is
+    // now fully spent (8 fillers + `a`) — the only eligible victim for
+    // `b`'s own materialization is `a`: the fillers are excluded (shared
+    // prefix), and nothing else is resident.
+    let b = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (2000..2004).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(4),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    let ev_b = sched.advance();
+
+    let a_evicted_now = ev_b
+        .iter()
+        .filter(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a))
+        .count();
+    assert_eq!(
+        a_evicted_now, 1,
+        "the fully-prefilled, lane-less `a` is evicted to make room for `b`'s materialization"
+    );
+    assert_eq!(
+        sched.request_state(a),
+        Some(ignis_core::types::RequestState::Evicted),
+        "`a` is suspended, not discarded"
+    );
+
+    // Run to idle: as fillers complete and free lanes (and, eventually,
+    // resident slots), `a` is restored — never re-queued, so its prefill
+    // is never redone — and every request finishes.
+    let mut events = ev_a.into_iter().chain(ev_b).collect::<Vec<_>>();
+    while !sched.is_idle() {
+        events.extend(sched.advance());
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == a)),
+        "`a` is restored (not re-queued) once room exists again"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Requeued { request } if *request == a)),
+        "`a` is never re-queued — its completed prefill is never redone"
+    );
+    let a_evictions = events
+        .iter()
+        .filter(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a))
+        .count();
+    assert_eq!(
+        a_evictions, 1,
+        "anti-thrashing: `a` is evicted exactly once, never oscillates once restored"
+    );
+    assert!(events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == a)));
+    assert!(events.iter().any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == b)));
+    assert!(sched.is_idle());
+}
+
+/// Scenario 4 — anti-thrashing: with capacity to spare, the scheduler
+/// performs **no** evictions at all (P4-07, GitHub #125's acceptance
+/// criterion: eviction runs only on the admission-refusal path — a run
+/// with sufficient capacity performs none).
+#[test]
+fn sufficient_capacity_performs_no_evictions() {
+    let mut sched = sched_with(64);
+    for _ in 0..4 {
+        sched.submit(input(8), RequestClass::Agent).unwrap();
+    }
+    let events = run_to_idle(&mut sched);
+    assert!(
+        !events.iter().any(|e| matches!(e, SchedEvent::Evicted { .. })),
+        "four requests well within every budget trigger no eviction at all"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, SchedEvent::Done { .. }))
+            .count(),
+        4
+    );
+    assert!(sched.is_idle());
+}
+
+/// Scenario 5 — a request holding (or holding open) a shared prefix is
+/// never an eviction victim (P4-10, GitHub #126's `IGNIS_SEQ_ERR_SHARED_PREFIX`:
+/// its leading pages are not its own, so there is no whole-sequence blob to
+/// snapshot). With the resident-slot budget pinned to exactly the two
+/// prefix-sharing requests, a third candidate can never materialize — there
+/// is capacity pressure, but no eligible victim — so it stays queued
+/// indefinitely rather than the scheduler evicting a prefix holder anyway.
+#[test]
+fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "qwen3.8-27b".into(),
+            max_in_flight: 3,
+            max_prefill_batch: 8,
+            resident_slot_capacity: 2, // exactly enough for the two prefix-sharing requests
+            host_capacity_bytes: 64,
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
+
+    // `main`: a 16-token prompt (exactly one page — the whole prompt is
+    // shareable, so its own prefill is a single chunk with no publish-
+    // boundary cut) and a long generation budget, so it stays `Running`
+    // for the whole test.
+    let main = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (1..=16).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(50),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    sched.advance(); // main: one chunk, publishes the prefix, admitted
+
+    // `sub`: claims `main`'s shared 16-token head, prefills only its own
+    // 4-token tail.
+    let sub = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (1..=16).chain(100..104).collect(),
+                params: DecodeParams {
+                    max_tokens: Some(50),
+                    ..DecodeParams::default()
+                },
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    sched.advance(); // sub: claims the prefix, prefills the tail, admitted
+
+    assert_eq!(sched.prefix_pinned_pages(), 1, "the shared page is pinned once");
+    assert_eq!(
+        sched.request_state(main),
+        Some(ignis_core::types::RequestState::Running)
+    );
+    assert_eq!(
+        sched.request_state(sub),
+        Some(ignis_core::types::RequestState::Running)
+    );
+
+    // A third, unrelated candidate cannot materialize: the resident-slot
+    // budget (2) is spent by `main` and `sub`, and neither is an eligible
+    // victim (both hold the shared prefix) — it stays `Admitted`, queued,
+    // over several ticks, and neither `main` nor `sub` is ever evicted.
+    let third = sched.submit(input(4), RequestClass::Agent).unwrap();
+    let mut events = Vec::new();
+    for _ in 0..5 {
+        events.extend(sched.advance());
+    }
+
+    assert_eq!(
+        sched.request_state(third),
+        Some(ignis_core::types::RequestState::Admitted),
+        "the third candidate never materializes: no eligible victim exists"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            SchedEvent::Evicted { request, .. } if *request == main || *request == sub
+        )),
+        "a prefix-holding request (publisher or claimant) is never evicted"
+    );
 }

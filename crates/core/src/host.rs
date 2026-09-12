@@ -60,15 +60,44 @@ pub enum Tier {
     Protected,
 }
 
-/// A GPU-lane snapshot captured into the host tier: everything needed to
-/// **restore** the request without re-prefilling (its KV page reservation,
-/// its generation progress, and the GDN state at a valid boundary).
+/// Which lifecycle phase a snapshot resumes into (P4-07, GitHub #125): the
+/// two shapes [`Request::evict`](crate::request::Request::evict) /
+/// [`Request::evict_prefilling`](crate::request::Request::evict_prefilling)
+/// suspend, and the two
+/// [`Request::restore_lane`](crate::request::Request::restore_lane) /
+/// [`Request::restore_prefilling`](crate::request::Request::restore_prefilling)
+/// resume. A restricted two-variant discriminant rather than the general
+/// `RequestState` on purpose: a host-tier entry can only ever have been
+/// evicted from one of these two states, so this makes the other three
+/// states unrepresentable here instead of merely unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumePhase {
+    /// Evicted mid-prefill (half-prefilled, GitHub #125): held no decode
+    /// lane, and restores back into `Prefilling` — [`HostEntry::prefill_progress`]
+    /// is where it resumes chunking from, not from zero. It re-earns a
+    /// decode lane the normal way once prefill completes.
+    Prefilling,
+    /// Evicted from a decode lane: restores straight back onto one and
+    /// resumes generation with no re-prefill at all.
+    Running,
+}
+
+/// A GPU-resident snapshot captured into the host tier: everything needed
+/// to **restore** the request without re-prefilling (its KV page
+/// reservation, its generation and prefill progress, and the GDN state at
+/// a valid boundary).
 #[derive(Debug, Clone)]
 pub struct HostEntry {
     /// The suspended (evicted) request this snapshot belongs to.
     pub request: RequestId,
-    /// The decode lane it was evicted from (KV block mapping / telemetry).
-    pub lane: LaneId,
+    /// Which phase this snapshot resumes into (P4-07, GitHub #125): decides
+    /// whether restore hands the request a decode lane or puts it back into
+    /// `Prefilling` with no lane at all.
+    pub resume_phase: ResumePhase,
+    /// The decode lane it was evicted from (KV block mapping / telemetry),
+    /// or `None` for a half-prefilled ([`ResumePhase::Prefilling`]) entry,
+    /// which held no lane to begin with.
+    pub lane: Option<LaneId>,
     /// The class owning the request (retained-lane victim priority: Agent
     /// before Interactive — see [`crate::admission`]).
     pub owner: RequestClass,
@@ -83,6 +112,13 @@ pub struct HostEntry {
     /// Tokens generated so far (the request resumes from here — no
     /// re-prefill).
     pub tokens: u32,
+    /// Prompt tokens already sent to the compute backend at the moment of
+    /// eviction (P4-07, GitHub #125; mirrors
+    /// [`crate::request::Request::prefill_progress`]): a half-prefilled
+    /// request resumes chunking from here, not from zero. Meaningless (and
+    /// unused) for a [`ResumePhase::Running`] entry, whose prefill was
+    /// already complete when it was evicted.
+    pub prefill_progress: u32,
     /// Remaining service work (quanta; 1 quantum per decode token) — frozen
     /// while suspended.
     pub remaining_work: u64,
@@ -315,11 +351,13 @@ mod tests {
     fn entry(request: u64, bytes: u64, gdn: GdnState, tick: u64) -> HostEntry {
         HostEntry {
             request,
-            lane: 0,
+            resume_phase: ResumePhase::Running,
+            lane: Some(0),
             owner: RequestClass::Agent,
             pages: 1, // GPU-pool accounting, unrelated to this tier's byte budget
             bytes,
             tokens: 0,
+            prefill_progress: 0,
             remaining_work: 8,
             gdn,
             tier: Tier::Probation,
@@ -463,6 +501,28 @@ mod tests {
         );
         // Restoring a request not in the tier returns None.
         assert!(tier.restore(99).is_none());
+    }
+
+    #[test]
+    fn a_half_prefilled_entry_carries_its_resume_phase_and_progress() {
+        // P4-07, GitHub #125: a half-prefilled (Prefilling) eviction holds
+        // no lane and must resume chunking from its snapshotted progress,
+        // not from zero.
+        let mut tier = HostTier::new(100);
+        let half_prefilled = HostEntry {
+            resume_phase: ResumePhase::Prefilling,
+            lane: None,
+            prefill_progress: 384,
+            ..entry(1, 10, gdn_boundary(384), 0)
+        };
+        tier.capture(half_prefilled).unwrap();
+        let snap = tier.restore(1).unwrap();
+        assert_eq!(snap.resume_phase, ResumePhase::Prefilling);
+        assert_eq!(snap.lane, None);
+        assert_eq!(
+            snap.prefill_progress, 384,
+            "resumes from the snapshotted chunk boundary, not from zero"
+        );
     }
 
     #[test]

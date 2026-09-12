@@ -120,7 +120,7 @@ use crate::admission::{
     make_admission_protection, persistent_backfill_is_safe, protected_head_safe_without_temporal,
     protection_frontier_distance,
 };
-use crate::host::{HostEntry, HostTier, Tier};
+use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
@@ -156,6 +156,14 @@ pub struct SchedulerConfig {
     /// resource dimension; production auto-sizes this from the pool,
     /// tests pass small values to drive contention).
     pub kv_capacity_pages: u32,
+    /// The leaf's device-resident sequence-slot capacity (P4-07, GitHub
+    /// #125; `ignis_seq_pool_spec::slot_count` on the leaf side): a
+    /// **separate** resource dimension from decode lanes — a request
+    /// occupies a resident slot from its first prefill chunk (`Prefilling`,
+    /// before it ever holds a decode lane) until it completes, is
+    /// cancelled, or is evicted. Defaults to [`N_DECODE_LANES`], matching
+    /// the leaf's own default `slot_count`.
+    pub resident_slot_capacity: u32,
     /// The KV-RAM host tier capacity in bytes (core-06, P4-07 GitHub #125:
     /// the host-RAM budget for evicted (suspended) request snapshots — a
     /// byte budget, not a page or lane count, since a snapshot's fixed GDN
@@ -209,6 +217,7 @@ impl Default for SchedulerConfig {
             // of the admission machine is dormant unless the capacity is
             // tightened (or the pool is auto-sized smaller in production).
             kv_capacity_pages: (N_DECODE_LANES * (8192 / 16)) as u32,
+            resident_slot_capacity: N_DECODE_LANES as u32,
             // A generous default headroom for CPU tests (`MockCompute`'s
             // `Compute::evict` reports a nominal 1-byte snapshot per
             // request, GitHub #125) — production wires the operator's own
@@ -235,9 +244,19 @@ pub struct ConcreteScheduler {
     /// lanes, `kv_capacity_pages` main-pool pages (the speculative
     /// backend pool is 0 until DFlash2 / MTP, v1.2 / v1.3).
     capacity: AdmissionResources,
-    /// Main-pool pages reserved by running requests (over-reservation:
-    /// charged in full at deal, released at completion).
+    /// Main-pool pages reserved by device-resident requests (over-
+    /// reservation: charged in full at first materialization — P4-07,
+    /// GitHub #125 moved this off the decode-lane deal, since the leaf
+    /// reserves the pages the moment it materializes a sequence, at the
+    /// first prefill chunk, not when a decode lane is later assigned —
+    /// released when the sequence is released (completion, cancellation,
+    /// or eviction).
     kv_used_pages: u32,
+    /// Device-resident sequence slots in use (P4-07, GitHub #125): every
+    /// request currently materialized on the leaf (`Request::resident`),
+    /// `Prefilling` or `Running` alike. Charged/released in lockstep with
+    /// `kv_used_pages` — see [`Self::materialize`] / [`Self::unmaterialize`].
+    resident_slots_used: u32,
     /// The active protection (core-05): `None` while no head is blocked
     /// (or once the protected head has been dealt).
     protection: Option<AdmissionProtection>,
@@ -289,6 +308,10 @@ impl ConcreteScheduler {
             "the KV pool must hold at least one page"
         );
         assert!(
+            config.resident_slot_capacity > 0,
+            "the leaf must hold at least one resident sequence slot"
+        );
+        assert!(
             config.serving_chunk_tokens > 0,
             "the serving prefill chunk width must be non-zero"
         );
@@ -297,8 +320,10 @@ impl ConcreteScheduler {
                 lanes: N_DECODE_LANES as u32,
                 kv_pages: config.kv_capacity_pages,
                 backend_pages: 0,
+                resident_slots: config.resident_slot_capacity,
             },
             kv_used_pages: 0,
+            resident_slots_used: 0,
             protection: None,
             protection_epoch: 1,
             host: HostTier::new(config.host_capacity_bytes),
@@ -388,6 +413,7 @@ impl ConcreteScheduler {
                 .kv_pages
                 .saturating_sub(self.prefix.pinned_pages()),
             backend_pages: self.capacity.backend_pages,
+            resident_slots: self.capacity.resident_slots,
         }
     }
 
@@ -425,22 +451,107 @@ impl ConcreteScheduler {
 
     // ── core-05: the admission state machine ─────────────────────────────
 
-    /// Whether `r` can be dealt right now: the running set plus `r`
-    /// fits the capacity component-wise (a free lane *and* enough main-
-    /// pool pages — the resource dimension that makes protection
-    /// meaningful).
+    /// `r`'s resource need as far as the *lane-deal* machinery is
+    /// concerned: `kv_pages` and `resident_slots` zeroed out (P4-07, GitHub
+    /// #125). A `Prefilling`-complete request headed into this machinery
+    /// is, by construction, already device-resident — its whole KV/slot
+    /// reservation was charged once, at first materialization, and stays
+    /// charged (in `self.kv_used_pages` / `self.resident_slots_used`)
+    /// until it completes or is evicted; that invariant is what guarantees
+    /// those two dimensions never overflow capacity in the first place; see
+    /// [`Self::fits_for_materialization`]. Passing `r.resources` unchanged
+    /// into `admission.rs`'s protection/backfill arithmetic — which
+    /// recomputes its own totals from scratch over the active set rather
+    /// than reading the scheduler's running counters — would double-count
+    /// that already-settled charge and could reject (or, worse, silently
+    /// misjudge) a lane deal on dimensions that were never actually at
+    /// stake in it. Only the lane itself (and the still-dormant
+    /// speculative-backend reservation) is ever new here.
+    fn deal_only(r: &Request) -> AdmissionResources {
+        AdmissionResources {
+            lanes: r.resources.lanes,
+            kv_pages: 0,
+            backend_pages: r.resources.backend_pages,
+            resident_slots: 0,
+        }
+    }
+
+    /// Whether `r` can be dealt a decode lane right now (see
+    /// [`Self::deal_only`] for why only the lane is new here).
     fn fits(&self, r: &Request) -> bool {
         let running = AdmissionResources {
             lanes: N_DECODE_LANES as u32 - self.free_lanes.len() as u32,
             kv_pages: self.kv_used_pages,
             backend_pages: 0,
+            resident_slots: self.resident_slots_used,
         };
-        admission_resources_fit(&running.add(&r.resources), &self.capacity)
+        admission_resources_fit(&running.add(&Self::deal_only(r)), &self.capacity)
     }
 
-    /// Deal a lane to `idx` (a `Prefilling` request), charging the lane
-    /// and its full KV reservation. Returns `false` (deals nothing) when
-    /// no lane is free.
+    /// Whether `r` (still `Admitted`, not yet device-resident) can
+    /// materialize a leaf sequence right now: enough resident-slot and
+    /// main-pool headroom for its *whole* reservation (P4-07, GitHub #125).
+    /// This is the check the prefill-dispatch phase makes *before* sending
+    /// a fresh candidate's first chunk — the leaf reserves `r`'s KV pages
+    /// and a resident slot at that exact moment, so admission has to agree
+    /// beforehand or the two sides' views of capacity drift (a real
+    /// materialization failure would otherwise surface as a raw leaf
+    /// allocation error instead of an admission refusal the tier can act
+    /// on).
+    fn fits_for_materialization(&self, r: &Request) -> bool {
+        let materialized = AdmissionResources {
+            lanes: 0,
+            kv_pages: self.kv_used_pages,
+            backend_pages: 0,
+            resident_slots: self.resident_slots_used,
+        };
+        let additional = AdmissionResources {
+            lanes: 0,
+            kv_pages: r.resources.kv_pages,
+            backend_pages: 0,
+            resident_slots: 1,
+        };
+        admission_resources_fit(&materialized.add(&additional), &self.capacity)
+    }
+
+    /// Charge `r`'s resident-slot and KV-page reservation (P4-07, GitHub
+    /// #125): called exactly once per leaf materialization — a fresh
+    /// request's first successful chunk, or a continuing request's first
+    /// successful chunk *after* a prior chunk's failure released it (see
+    /// [`Self::unmaterialize`]) — mirroring `RuntimeCompute` holding a live
+    /// `LiveSequence` for it. A no-op if `r` is already materialized (never
+    /// double-charged).
+    fn materialize(&mut self, idx: usize) {
+        if self.requests[idx].resident {
+            return;
+        }
+        self.requests[idx].resident = true;
+        self.resident_slots_used += 1;
+        self.kv_used_pages += self.requests[idx].resources.kv_pages;
+    }
+
+    /// Release `r`'s resident-slot and KV-page charge (the inverse of
+    /// [`Self::materialize`]): completion, cancellation, eviction, or a
+    /// failed prefill batch unwinding every sequence it touched
+    /// (`RuntimeCompute::prefill_step`'s own documented behavior — a
+    /// failure releases every job's sequence, continuing ones included, not
+    /// only freshly-allocated ones). A no-op if `r` was never materialized.
+    fn unmaterialize(&mut self, idx: usize) {
+        if !self.requests[idx].resident {
+            return;
+        }
+        self.requests[idx].resident = false;
+        self.resident_slots_used = self.resident_slots_used.saturating_sub(1);
+        self.kv_used_pages = self
+            .kv_used_pages
+            .saturating_sub(self.requests[idx].resources.kv_pages);
+    }
+
+    /// Deal a lane to `idx` (a `Prefilling`, prefill-complete request).
+    /// Charges only the lane (P4-07, GitHub #125: `idx`'s KV pages and
+    /// resident slot were already charged at first materialization —
+    /// dealing a lane adds no new device state, only decode-round
+    /// eligibility). Returns `false` (deals nothing) when no lane is free.
     fn try_admit(
         &mut self,
         idx: usize,
@@ -465,15 +576,11 @@ impl ConcreteScheduler {
             self.free_lanes.push(lane);
             return false;
         }
-        let (kv_pages, backfill_epoch) = {
-            let epoch = if backfill == BackfillClass::None {
-                0
-            } else {
-                self.protection.as_ref().map(|p| p.epoch_id).unwrap_or(0)
-            };
-            (self.requests[idx].resources.kv_pages, epoch)
+        let backfill_epoch = if backfill == BackfillClass::None {
+            0
+        } else {
+            self.protection.as_ref().map(|p| p.epoch_id).unwrap_or(0)
         };
-        self.kv_used_pages += kv_pages; // over-reservation: charged at deal
         self.requests[idx].backfill_class = backfill;
         self.requests[idx].backfill_epoch = backfill_epoch;
         events.push(SchedEvent::Admitted {
@@ -494,7 +601,11 @@ impl ConcreteScheduler {
             .filter(|r| r.state == RequestState::Running && r.remaining_work > 0)
             .map(|r| ActiveAdmissionSnapshot {
                 request_id: r.id,
-                resources: r.resources,
+                // P4-07, GitHub #125: see `Self::deal_only` — a `Running`
+                // request's kv_pages/resident_slots are already-settled
+                // charges, not something this "what if" recomputation
+                // should weigh again.
+                resources: Self::deal_only(r),
                 remaining_work_quanta: r.remaining_work,
                 backfill_epoch: r.backfill_epoch,
                 backfill_class: r.backfill_class,
@@ -560,7 +671,7 @@ impl ConcreteScheduler {
                 let protection = match make_admission_protection(
                     self.protection_epoch,
                     self.requests[head].id,
-                    self.requests[head].resources,
+                    Self::deal_only(&self.requests[head]),
                     &active,
                     &available,
                 ) {
@@ -617,7 +728,7 @@ impl ConcreteScheduler {
                     if persistent_backfill_is_safe(
                         p,
                         &active,
-                        &self.requests[c].resources,
+                        &Self::deal_only(&self.requests[c]),
                         &self.available_capacity(),
                     ) {
                         self.try_admit(c, BackfillClass::Persistent, events);
@@ -644,16 +755,21 @@ impl ConcreteScheduler {
     /// suspend/resume primitive exists, so cancelling releases exactly what
     /// completing would).
     fn release_request(&mut self, idx: usize) -> (RequestId, u32) {
-        let (release_pages, lane, request_id, tokens, prefix_entry) = {
+        let (lane, request_id, tokens, prefix_entry) = {
             let r = &self.requests[idx];
-            (r.resources.kv_pages, r.lane, r.id, r.tokens, r.prefix_entry)
+            (r.lane, r.id, r.tokens, r.prefix_entry)
         };
         self.requests[idx].abort();
         self.compute.release(request_id);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
-            self.kv_used_pages = self.kv_used_pages.saturating_sub(release_pages);
         }
+        // P4-07, GitHub #125: the resident-slot + KV-page charge is gated
+        // on `resident`, not on holding a lane — a request cancelled while
+        // still `Prefilling` (materialized, no lane yet) still held real
+        // device state to release; one cancelled while still `Admitted`
+        // (never materialized) released nothing and charges nothing back.
+        self.unmaterialize(idx);
         // core-07: release the request's shared-prefix claim (its
         // completion frees its reference to the shared pages; the entry
         // drops — and its pages return to the pool — when the last
@@ -748,9 +864,13 @@ impl ConcreteScheduler {
 
     /// The retained-lane candidates for victim selection (core-06): every
     /// running request's lane, excluding the protection's donors (donors
-    /// are never evicted while the protection is open) and reserved lanes
-    /// (a lane whose shared prefix is claimed by an earlier-queued
-    /// interactive request — core-07).
+    /// are never evicted while the protection is open), reserved lanes (a
+    /// lane whose shared prefix is claimed by an earlier-queued interactive
+    /// request — core-07), and any request holding (or holding open) a
+    /// shared prefix at all (P4-10, GitHub #126): its sequence cannot be
+    /// snapshotted (`IGNIS_SEQ_ERR_SHARED_PREFIX`) since its leading pages
+    /// are not its own — excluded here, upstream of victim selection,
+    /// rather than picked and then failed at snapshot time.
     fn retained_lane_candidates(&self) -> Vec<RetainedLaneCandidate> {
         let donors: std::collections::HashSet<RequestId> = self
             .protection
@@ -761,6 +881,7 @@ impl ConcreteScheduler {
             .iter()
             .filter(|r| r.state == RequestState::Running)
             .filter(|r| !donors.contains(&r.id))
+            .filter(|r| r.prefix_entry.is_none())
             .map(|r| RetainedLaneCandidate {
                 lane: r.lane.expect("a running request holds a lane"),
                 owner: r.class,
@@ -768,6 +889,33 @@ impl ConcreteScheduler {
                 reserved_for_earlier_interactive: self.reserved_for_earlier_interactive(r),
             })
             .collect()
+    }
+
+    /// The best (oldest-submitted) resident, lane-less `Prefilling`
+    /// request eligible for eviction (P4-07, GitHub #125): device-resident
+    /// (holds real KV pages, a GDN slot and conv taps) but holding no
+    /// decode lane at all — whether it is the sole half-prefilled request
+    /// still chunking, or a fully-prefilled one still queued for a lane
+    /// deal. Excludes a request holding (or holding open) a shared prefix,
+    /// for the same reason [`Self::retained_lane_candidates`] does, and
+    /// `exclude` (a request index this call must never pick — the blocked
+    /// head itself, when called from [`Self::try_evict_for_head`]: without
+    /// this, a `Prefilling`-complete head queued for a lane matches this
+    /// method's own filter and would be "evicted" to make room for itself).
+    ///
+    /// Oldest-submitted (vec order — ids are monotonic and requests are
+    /// never reordered) is a stopgap, not the class-aware priority ADR
+    /// 0023 defines for GPU residency; GitHub #127 unifies eviction
+    /// priority across the GPU and the host tier, and until then this
+    /// mirrors the Running-lane path's own pre-#127 simplicity. `None`
+    /// when no eligible candidate exists.
+    fn prefilling_eviction_candidate(&self, exclude: Option<usize>) -> Option<usize> {
+        self.requests.iter().enumerate().position(|(i, r)| {
+            Some(i) != exclude
+                && r.state == RequestState::Prefilling
+                && r.resident
+                && r.prefix_entry.is_none()
+        })
     }
 
     /// Whether `r`'s lane is reserved for an earlier-queued interactive
@@ -831,7 +979,7 @@ impl ConcreteScheduler {
     /// lost — it re-prefills from the start) and freeing its pinned buffer
     /// at the leaf (`Compute::discard_snapshot`). Returns `true` when the
     /// tier can hold `bytes` (there is room, or it was made).
-    fn make_room_for(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
+    fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
         while self.host.used_bytes() + bytes > self.host.capacity_bytes() {
             match self.host.evict_one() {
                 Some(discarded) => {
@@ -847,26 +995,144 @@ impl ConcreteScheduler {
         true
     }
 
-    /// Try to admit a blocked head by evicting a retained lane to the host
-    /// tier (core-06, GitHub #125): while the head does not fit, pick the
-    /// lowest-value non-donor running lane (`choose_retained_lane_victim`),
-    /// query its real snapshot size, make room for that many bytes in the
-    /// host tier (re-queueing any discarded snapshot), snapshot the victim
-    /// to pinned host memory and release its KV pages, GDN slot and conv
-    /// taps (`Compute::evict`), then record the tier entry. Returns `true`
-    /// once the head fits (the caller deals it), `false` when no evictable
-    /// victim remains (the head is held — the backfill / donor wait path).
-    fn try_evict_for_head(&mut self, head_idx: usize, events: &mut Vec<SchedEvent>) -> bool {
-        loop {
-            if self.fits(&self.requests[head_idx]) {
-                return true;
+    /// Snapshot `v_idx` to the host tier and release its GPU-resident state
+    /// (P4-07, GitHub #125): query the real snapshot size, make room for it
+    /// in the host tier's byte budget, snapshot to pinned host memory and
+    /// release the sequence (`Compute::evict`), record the tier entry (its
+    /// resume phase / lane taken from `resume_phase` / `lane`), transition
+    /// the request (`Request::evict` for `Running`, `Request::evict_prefilling`
+    /// for `Prefilling`), free `lane` if any, and release the resident-slot
+    /// + KV-page charge (`Self::unmaterialize`). Returns `true` on success,
+    /// `false` on any refusal (an invalid GDN boundary — unreachable by
+    /// construction for either caller — a host-tier byte budget that
+    /// cannot be freed, or a leaf-level failure) — the caller leaves the
+    /// candidate exactly as it was.
+    fn snapshot_and_evict(
+        &mut self,
+        v_idx: usize,
+        resume_phase: ResumePhase,
+        lane: Option<LaneId>,
+        events: &mut Vec<SchedEvent>,
+    ) -> bool {
+        let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn) = {
+            let v = &self.requests[v_idx];
+            (
+                v.id,
+                v.class,
+                v.resources.kv_pages,
+                v.tokens,
+                v.prefill_progress,
+                v.remaining_work,
+                v.gdn.clone(),
+            )
+        };
+        // core-02: only a chunk-boundary-consistent sequence may be
+        // snapshotted. A `Running` candidate is always past its last
+        // completed decode round, and a `Prefilling` eviction candidate is
+        // only ever selected once `resident` (i.e. its first chunk already
+        // landed and checkpointed) — so this is unreachable by
+        // construction rather than by timing, the same invariant the
+        // leaf's own `NOT_AT_BOUNDARY` refusal exists for.
+        if !v_gdn.is_valid_snapshot_point(v_gdn.position()) {
+            return false;
+        }
+        // Query the real snapshot size *before* moving or releasing
+        // anything (`Compute::snapshot_size` is a cheap, non-destructive
+        // query) so the host tier's byte budget can be checked (and made
+        // room for) before the victim's GPU sequence is touched — a tier
+        // that cannot make room leaves the victim exactly as it was rather
+        // than releasing its GPU state for nothing.
+        let bytes = match self.compute.snapshot_size(v_id) {
+            Ok(bytes) => bytes,
+            Err(_) => return false, // refused (unreachable per the boundary note above)
+        };
+        // Make room in the host tier (re-queueing any discarded snapshot).
+        if !self.make_host_room_for_bytes(bytes, events) {
+            return false; // the host tier cannot hold the snapshot
+        }
+        // Snapshot to pinned host memory and release the GPU sequence (its
+        // KV pages, GDN slot and conv taps) — nothing else runs between the
+        // size query above and this call on this single-threaded scheduler,
+        // so `evict` cannot fail where `snapshot_size` just succeeded.
+        let started = Instant::now();
+        let Ok(bytes) = self.compute.evict(v_id) else {
+            return false;
+        };
+        let snapshot_micros = started.elapsed().as_micros() as u64;
+        let entry = HostEntry {
+            request: v_id,
+            resume_phase,
+            lane,
+            owner: v_class,
+            pages: v_pages,
+            bytes,
+            tokens: v_tokens,
+            prefill_progress: v_progress,
+            remaining_work: v_work,
+            gdn: v_gdn,
+            tier: Tier::Probation,
+            use_tick: self.tick,
+        };
+        // Record the entry (`make_host_room_for_bytes` already guaranteed
+        // room for `bytes`, so this cannot fail on capacity; the GDN
+        // boundary was already checked above).
+        self.host
+            .capture(entry)
+            .expect("room was made for `bytes` and the boundary was already checked");
+        match resume_phase {
+            ResumePhase::Running => {
+                self.requests[v_idx].evict();
             }
-            // No free lane / the head still does not fit: try to evict a
-            // retained lane (a running request other than the donors).
-            let candidates = self.retained_lane_candidates();
-            let Some(victim_lane) = choose_retained_lane_victim(&candidates) else {
-                return false; // no evictable victim (all reserved / none)
-            };
+            ResumePhase::Prefilling => {
+                self.requests[v_idx].evict_prefilling();
+            }
+        }
+        if let Some(lane) = lane {
+            self.free_lanes.push(lane);
+        }
+        // P4-07, GitHub #125: releases the resident-slot + KV-page charge —
+        // the leaf just released exactly that state above.
+        self.unmaterialize(v_idx);
+        // A `Prefilling`-phase eviction (GitHub #125) can target the
+        // *protected head itself* — a request that was blocked purely on
+        // lanes, with no eligible `Running` victim, falls through to
+        // `Self::prefilling_eviction_candidate`, which never selects the
+        // head being evaluated (`try_evict_for_head`'s own `exclude`), but
+        // *can* select a *different* half-prefilled request that happens
+        // to be the head of some other, still-open protection (e.g. a
+        // separate fresh candidate's own materialization gate evicting it).
+        // Mirrors `Self::release_request`'s own stale-protection clear:
+        // without this, the next blocked head would incorrectly reuse a
+        // protection frozen around a request that is no longer even
+        // queued.
+        if self.protection.as_ref().map(|p| p.head_request_id) == Some(v_id) {
+            self.protection = None;
+        }
+        events.push(SchedEvent::Evicted {
+            request: v_id,
+            snapshot_micros,
+        });
+        true
+    }
+
+    /// Evict the single lowest-value eligible victim (core-06, GitHub
+    /// #125): a retained decode lane first (ADR 0004's ported policy,
+    /// [`choose_retained_lane_victim`]), a resident lane-less half-prefilled
+    /// request otherwise ([`Self::prefilling_eviction_candidate`]).
+    /// `exclude` is a request index this call must never pick as its own
+    /// victim (a blocked head being evaluated for its own admission — see
+    /// [`Self::try_evict_for_head`]; `None` for a fresh candidate's own
+    /// materialization gate, which can never self-select since it is still
+    /// `Admitted`, never `Prefilling`, at that point). Returns `true` when
+    /// a victim was evicted, `false` when none remains eligible.
+    fn evict_one_victim(&mut self, exclude: Option<usize>, events: &mut Vec<SchedEvent>) -> bool {
+        // `exclude` (when set) is always `Prefilling` (the blocked head
+        // `try_evict_for_head` is evaluating), so it can never be a
+        // `Running`-lane candidate in the first place — nothing to guard
+        // here specifically; `Self::prefilling_eviction_candidate` is
+        // where excluding it actually matters.
+        let candidates = self.retained_lane_candidates();
+        if let Some(victim_lane) = choose_retained_lane_victim(&candidates) {
             let Some(v_idx) = self
                 .requests
                 .iter()
@@ -874,104 +1140,93 @@ impl ConcreteScheduler {
             else {
                 return false;
             };
-            // Copy the request's state (avoid a borrow conflict with the
-            // mutation below).
-            let (v_id, v_class, v_pages, v_tokens, v_work, v_gdn) = {
-                let v = &self.requests[v_idx];
-                (
-                    v.id,
-                    v.class,
-                    v.resources.kv_pages,
-                    v.tokens,
-                    v.remaining_work,
-                    v.gdn.clone(),
-                )
+            return self.snapshot_and_evict(v_idx, ResumePhase::Running, Some(victim_lane), events);
+        }
+        if let Some(v_idx) = self.prefilling_eviction_candidate(exclude) {
+            return self.snapshot_and_evict(v_idx, ResumePhase::Prefilling, None, events);
+        }
+        false
+    }
+
+    /// Make room for `needed` additional resources on top of what is
+    /// currently charged (P4-07, GitHub #125): evicts the lowest-value
+    /// eligible victim ([`Self::evict_one_victim`]), repeatedly, until
+    /// `needed` fits alongside current usage or no evictable victim
+    /// remains. This is the admission-refusal path a fresh candidate's
+    /// *materialization* drives too — not only a blocked, already-resident
+    /// head's lane deal (see [`Self::fits_for_materialization`]'s own
+    /// caller). The caller is never itself a valid victim at this point
+    /// (see [`Self::evict_one_victim`]'s own `exclude` doc), so this never
+    /// needs one.
+    fn make_room(&mut self, needed: &AdmissionResources, events: &mut Vec<SchedEvent>) -> bool {
+        loop {
+            let used = AdmissionResources {
+                lanes: N_DECODE_LANES as u32 - self.free_lanes.len() as u32,
+                kv_pages: self.kv_used_pages,
+                backend_pages: 0,
+                resident_slots: self.resident_slots_used,
             };
-            // core-02: only a chunk-boundary-consistent sequence may be
-            // snapshotted. Every `Running`-state candidate is already past
-            // its last completed chunk / decode round (P3-01's durable
-            // prefill progress never reaches `Running` mid-chunk), so this
-            // is unreachable by construction rather than by timing — the
-            // same invariant the leaf's own `NOT_AT_BOUNDARY` refusal
-            // exists for.
-            if !v_gdn.is_valid_snapshot_point(v_gdn.position()) {
+            if used.add(needed).fits(&self.capacity) {
+                return true;
+            }
+            if !self.evict_one_victim(None, events) {
                 return false;
             }
-            // Query the real snapshot size *before* moving or releasing
-            // anything (`Compute::snapshot_size` is a cheap, non-destructive
-            // query) so the host tier's byte budget can be checked (and
-            // made room for) before the victim's GPU sequence is touched —
-            // a tier that cannot make room leaves the victim running rather
-            // than releasing its GPU state for nothing.
-            let bytes = match self.compute.snapshot_size(v_id) {
-                Ok(bytes) => bytes,
-                Err(_) => return false, // refused (unreachable per the boundary note above)
-            };
-            // Make room in the host tier (re-queueing any discarded
-            // snapshot).
-            if !self.make_room_for(bytes, events) {
-                return false; // the host tier cannot hold the snapshot
+        }
+    }
+
+    /// Try to admit a blocked head by evicting retained state until it fits
+    /// (core-06, GitHub #125): the head is always already device-resident
+    /// (a `Prefilling`, prefill-complete request), so it needs only a
+    /// decode lane — [`Self::fits`] reflects that. Returns `true` once the
+    /// head fits (the caller deals it), `false` when no evictable victim
+    /// remains (the head is held — the backfill / donor wait path).
+    fn try_evict_for_head(&mut self, head_idx: usize, events: &mut Vec<SchedEvent>) -> bool {
+        loop {
+            if self.fits(&self.requests[head_idx]) {
+                return true;
             }
-            // Snapshot to pinned host memory and release the GPU sequence
-            // (its KV pages, GDN slot and conv taps) — nothing else runs
-            // between the size query above and this call on this
-            // single-threaded scheduler, so `evict` cannot fail where
-            // `snapshot_size` just succeeded.
-            let started = Instant::now();
-            let Ok(bytes) = self.compute.evict(v_id) else {
-                return false;
-            };
-            let snapshot_micros = started.elapsed().as_micros() as u64;
-            let entry = HostEntry {
-                request: v_id,
-                lane: victim_lane,
-                owner: v_class,
-                pages: v_pages,
-                bytes,
-                tokens: v_tokens,
-                remaining_work: v_work,
-                gdn: v_gdn,
-                tier: Tier::Probation,
-                use_tick: self.tick,
-            };
-            // Record the entry (`make_room_for` already guaranteed room for
-            // `bytes`, so this cannot fail on capacity; the GDN boundary
-            // was already checked above).
-            self.host
-                .capture(entry)
-                .expect("room was made for `bytes` and the boundary was already checked");
-            // Evict the request (Running → Evicted; the lane is released).
-            self.requests[v_idx].evict();
-            self.free_lanes.push(victim_lane);
-            self.kv_used_pages = self.kv_used_pages.saturating_sub(v_pages);
-            events.push(SchedEvent::Evicted {
-                request: v_id,
-                snapshot_micros,
-            });
+            // `head_idx` is itself `Prefilling` (queued for a lane) and so
+            // matches `prefilling_eviction_candidate`'s own filter —
+            // excluded here so the head is never evicted to make room for
+            // itself.
+            if !self.evict_one_victim(Some(head_idx), events) {
+                return false; // no evictable victim (all reserved / none)
+            }
             // Loop: re-check whether the head now fits.
         }
     }
 
-    /// Restore evicted (suspended) requests to free lanes (core-06,
-    /// GitHub #125): a restored request resumes from where it was evicted
-    /// (no re-prefill), taking priority over a fresh prefill. Restores as
-    /// many evicted requests as there are free lanes + page headroom, in
-    /// the host tier's victim order (the entries closest to being
-    /// discarded). A physical restore failure (a corrupt/foreign blob, or a
-    /// leaf-level error) discards the snapshot and re-prefills the request
-    /// instead — the same fallback the tier's own byte-budget discard uses.
+    /// Restore evicted (suspended) requests (core-06, GitHub #125): a
+    /// restored request resumes from where it was evicted (no re-prefill),
+    /// taking priority over a fresh prefill. A [`ResumePhase::Running`]
+    /// entry needs a free decode lane; a [`ResumePhase::Prefilling`]
+    /// (half-prefilled) entry needs none — it resumes chunking from
+    /// [`crate::host::HostEntry::prefill_progress`] and re-earns a lane the
+    /// normal way once its prefill completes. Either way, restoring
+    /// re-materializes the request's resident-slot + KV-page charge
+    /// (`Self::materialize`) before anything else, mirroring exactly what
+    /// eviction released. Restores as many evicted requests as there is
+    /// room for, in the host tier's victim order (the entries closest to
+    /// being discarded). A physical restore failure (a corrupt/foreign
+    /// blob, or a leaf-level error) discards the snapshot and re-prefills
+    /// the request instead — the same fallback the tier's own byte-budget
+    /// discard uses.
     fn restore_pass(&mut self, events: &mut Vec<SchedEvent>) {
         loop {
-            if self.free_lanes.is_empty() {
-                break;
-            }
             let victim = match self.host.victim() {
                 Some(v) => v.clone(),
                 None => break, // no evicted request to restore
             };
-            // The restored request's pages must fit the GPU pool.
-            if self.kv_used_pages + victim.pages > self.capacity.kv_pages {
-                break; // no page headroom: leave it (retry next advance)
+            if victim.resume_phase == ResumePhase::Running && self.free_lanes.is_empty() {
+                break; // no lane: leave it (retry next advance)
+            }
+            // The restored request's resident slot + pages must fit the
+            // GPU pool either way.
+            if self.resident_slots_used + 1 > self.capacity.resident_slots
+                || self.kv_used_pages + victim.pages > self.capacity.kv_pages
+            {
+                break; // no room: leave it (retry next advance)
             }
             let idx = self
                 .requests
@@ -991,15 +1246,29 @@ impl ConcreteScheduler {
             match self.compute.restore(victim.request, context_tokens) {
                 Ok(()) => {
                     let restore_micros = started.elapsed().as_micros() as u64;
-                    let lane = self.free_lanes.pop().expect("checked non-empty above");
-                    let snap = self
-                        .host
+                    self.host
                         .restore(victim.request)
                         .expect("the victim is a tier entry");
-                    self.requests[idx].restore_lane(lane);
-                    self.kv_used_pages += snap.pages;
+                    // P4-07, GitHub #125: re-charges resident_slots +
+                    // kv_pages — the leaf just re-materialized exactly that
+                    // state above.
+                    self.materialize(idx);
+                    let lane = match victim.resume_phase {
+                        ResumePhase::Running => {
+                            let lane = self.free_lanes.pop().expect("checked non-empty above");
+                            self.requests[idx].restore_lane(lane);
+                            Some(lane)
+                        }
+                        ResumePhase::Prefilling => {
+                            // Resume chunking from the snapshotted boundary,
+                            // not from zero.
+                            self.requests[idx].prefill_progress = victim.prefill_progress;
+                            self.requests[idx].restore_prefilling();
+                            None
+                        }
+                    };
                     events.push(SchedEvent::Restored {
-                        request: snap.request,
+                        request: victim.request,
                         lane,
                         restore_micros,
                     });
@@ -1012,7 +1281,7 @@ impl ConcreteScheduler {
                     self.host.discard_request(victim.request);
                     self.compute.discard_snapshot(victim.request);
                     self.requeue_request(idx, events);
-                    // Loop: the freed lane stays free for the next victim.
+                    // Loop: try the next victim.
                 }
             }
         }
@@ -1046,6 +1315,7 @@ impl Scheduler for ConcreteScheduler {
             lanes: 1,
             kv_pages,
             backend_pages: 0,
+            resident_slots: 1,
         };
         if !admission_resources_fit(&resources, &self.capacity) {
             return Err(SubmitError::Oversized);
@@ -1101,7 +1371,7 @@ impl Scheduler for ConcreteScheduler {
             .requests
             .iter()
             .position(|r| r.state == RequestState::Prefilling && !r.prefill_complete());
-        let mut batch: Vec<usize> = match active {
+        let batch: Vec<usize> = match active {
             Some(idx) => vec![idx],
             None => {
                 let mut b: Vec<usize> = self
@@ -1113,70 +1383,115 @@ impl Scheduler for ConcreteScheduler {
                     .collect();
                 b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
                 b.truncate(self.config.max_prefill_batch);
-                b
+
+                // core-07 — sibling prefix claim: a *fresh* candidate
+                // claims the longest cached prefix of its prompt (skipping
+                // the redundant prefill — its first job carries only the
+                // tail, and its own reservation shrinks to the tail + max:
+                // the shared entry's pages are charged to the pool once,
+                // for every claimant). Runs *before* the P4-07 gating loop
+                // below, which must see this reduced reservation — not the
+                // unclaimed one — or it would charge (and evict for) pages
+                // the claimant was never actually going to reserve.
+                for &i in &b {
+                    // A request that already holds a claim (from a prior
+                    // advance, whose prefill failed and is retried) keeps
+                    // it: re-claiming would double-count the entry's
+                    // refcount and the `sibling_prefix_reused_tok` counter,
+                    // and pin the entry forever (the release happens once,
+                    // at completion).
+                    if self.requests[i].prefix_entry.is_some() {
+                        continue;
+                    }
+                    let claimed = self.prefix.claim(&self.requests[i].input.tokens);
+                    if let Some(claim) = claimed {
+                        let r = &mut self.requests[i];
+                        r.prefix_entry = Some(claim.id);
+                        r.prefix_publisher = Some(claim.publisher);
+                        r.shared_prefix_tokens = claim.tokens;
+                        r.prefill_progress = claim.tokens; // the shared head is already warm
+                        r.gdn = claim.gdn; // core-02: resume at the shared boundary
+                        // Shrink the claimant's own reservation by the
+                        // shared prefix's pages (the entry now owns them —
+                        // charged once, for every claimant). `ceil((prompt
+                        // + max) / pt) - shared_pages` equals `ceil((tail +
+                        // max) / pt)`: the shared head is page-aligned, so
+                        // subtracting its whole pages is exact.
+                        r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
+                        events.push(SchedEvent::PrefixReused {
+                            request: r.id,
+                            tokens: claim.tokens,
+                        });
+                    }
+                }
+
+                // A fresh batch (no active carry-over) may still pack
+                // several requests into this one call, but only while each
+                // finishes within its own single chunk (P3-01: nothing
+                // beyond this call may leave more than one request
+                // `Prefilling` and incomplete). The moment one candidate's
+                // remaining span exceeds the chunk width, it is included
+                // (it becomes this tick's chunk) and the batch stops there
+                // — whatever queued behind it waits for its turn. Also
+                // before the gating loop, for the same reason the claim
+                // loop is: a candidate cut here is never materialized this
+                // tick at all.
+                if let Some(cut) = b.iter().position(|&i| {
+                    let r = &self.requests[i];
+                    (r.input.tokens.len() as u32 - r.prefill_progress)
+                        > self.config.serving_chunk_tokens
+                }) {
+                    b.truncate(cut + 1);
+                }
+
+                // P4-07 (GitHub #125): a fresh candidate materializes a
+                // real device-resident sequence (KV pages, GDN slot, conv
+                // taps) the moment its first chunk lands — admission has to
+                // agree there is room *before* that happens, evicting on
+                // this same admission-refusal path if not, rather than
+                // letting a real leaf allocation fail (which would surface
+                // page pressure as a raw kernel error instead of a
+                // refusal the tier can act on). `b` is final by now (the
+                // claim and the over-wide-chunk cut above already ran), so
+                // every candidate's `resources.kv_pages` is exactly what it
+                // will actually reserve.
+                //
+                // `Self::materialize` runs *inside* this loop, immediately
+                // once a candidate is confirmed to fit or room was made for
+                // it — not deferred to the per-job success loop below. Two
+                // fresh candidates batched together both read
+                // `fits_for_materialization` against the *same* counters if
+                // neither has actually charged yet; charging eagerly here is
+                // what makes the second one see the first one's charge
+                // (`RuntimeCompute::prefill_step`'s own per-job allocation
+                // order is exactly this sequential — a real leaf never
+                // reserves both without noticing the first). The later
+                // per-job call stays as a no-op safety net (idempotent) for
+                // the one path that skips this loop entirely: a continuing
+                // (already-`Prefilling`) request re-materializing after an
+                // earlier chunk's failure unmaterialized it.
+                let mut admitted = Vec::with_capacity(b.len());
+                for i in b {
+                    if !self.fits_for_materialization(&self.requests[i]) {
+                        let needed = AdmissionResources {
+                            lanes: 0,
+                            kv_pages: self.requests[i].resources.kv_pages,
+                            backend_pages: 0,
+                            resident_slots: 1,
+                        };
+                        if !self.make_room(&needed, &mut events) {
+                            // No room, and none could be made: stop the
+                            // batch here — `i` (and anything sorted after
+                            // it) waits for a later tick.
+                            break;
+                        }
+                    }
+                    self.materialize(i);
+                    admitted.push(i);
+                }
+                admitted
             }
         };
-        // core-07 — sibling prefix claim: a *fresh* candidate (not yet
-        // sent a single chunk) claims the longest cached prefix of its
-        // prompt (skipping the redundant prefill — its first job carries
-        // only the tail, and its own reservation shrinks to the tail +
-        // max: the shared entry's pages are charged to the pool once, for
-        // every claimant). The claim is established before the prefill
-        // call (the shared prefix is already warm in the pool); a failed
-        // prefill is retried next advance with the same claim. A
-        // continuing (already `Prefilling`) candidate never re-claims —
-        // it started from position 0 without one, and a claim mid-way
-        // through its own chunks cannot retroactively skip what it has
-        // already sent.
-        for &i in &batch {
-            if self.requests[i].state != RequestState::Admitted {
-                continue;
-            }
-            // A request that already holds a claim (from a prior advance,
-            // whose prefill failed and is retried) keeps it: re-claiming
-            // would double-count the entry's refcount and the
-            // `sibling_prefix_reused_tok` counter, and pin the entry
-            // forever (the release happens once, at completion).
-            if self.requests[i].prefix_entry.is_some() {
-                continue;
-            }
-            let claimed = self.prefix.claim(&self.requests[i].input.tokens);
-            if let Some(claim) = claimed {
-                let r = &mut self.requests[i];
-                r.prefix_entry = Some(claim.id);
-                r.prefix_publisher = Some(claim.publisher);
-                r.shared_prefix_tokens = claim.tokens;
-                r.prefill_progress = claim.tokens; // the shared head is already warm
-                r.gdn = claim.gdn; // core-02: resume at the shared boundary
-                // Shrink the claimant's own reservation by the shared
-                // prefix's pages (the entry now owns them — charged once,
-                // for every claimant). `ceil((prompt + max) / pt) -
-                // shared_pages` equals `ceil((tail + max) / pt)`: the
-                // shared head is page-aligned, so subtracting its whole
-                // pages is exact.
-                r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
-                events.push(SchedEvent::PrefixReused {
-                    request: r.id,
-                    tokens: claim.tokens,
-                });
-            }
-        }
-        // A fresh batch (no active carry-over) may still pack several
-        // requests into this one call, but only while each finishes
-        // within its own single chunk (P3-01: nothing beyond this call may
-        // leave more than one request `Prefilling` and incomplete). The
-        // moment one candidate's remaining span exceeds the chunk width,
-        // it is included (it becomes this tick's chunk) and the batch
-        // stops there — whatever queued behind it waits for its turn.
-        if active.is_none()
-            && let Some(cut) = batch.iter().position(|&i| {
-                let r = &self.requests[i];
-                (r.input.tokens.len() as u32 - r.prefill_progress)
-                    > self.config.serving_chunk_tokens
-            })
-        {
-            batch.truncate(cut + 1);
-        }
         // P4-10 (GitHub #126) — one publisher per prompt head per batch.
         //
         // Two requests with the same prompt arriving before either has
@@ -1285,6 +1600,12 @@ impl Scheduler for ConcreteScheduler {
                             start_position = job.start_position,
                         )
                         .entered();
+                        // P4-07, GitHub #125: charges resident_slots +
+                        // kv_pages exactly once per materialization — a
+                        // no-op if `i` is already resident (every chunk
+                        // after its first, or a restored-to-Prefilling
+                        // request continuing from its snapshot boundary).
+                        self.materialize(i);
                         let r = &mut self.requests[i];
                         if r.state == RequestState::Admitted {
                             r.advance(RequestState::Prefilling);
@@ -1319,9 +1640,16 @@ impl Scheduler for ConcreteScheduler {
                         // the `None` arm below can be sure a leaf prefix
                         // exists to let go of.
                         //
-                        // The entry's pages are charged to the pool here (the
-                        // charge split: the publisher's own reservation keeps
-                        // the residual, the entry holds the shared pages).
+                        // The entry's pages are *not* separately charged
+                        // here (P4-07, GitHub #125 changed this): the
+                        // publisher's materialization already charged its
+                        // *whole* reservation, entry pages included, before
+                        // this ever ran (`Self::materialize`, above). This
+                        // is bookkeeping only — the charge split, so the
+                        // publisher's later release subtracts just its
+                        // residual, and the entry's own release
+                        // (`Self::release_prefix_claim`) subtracts the
+                        // rest when its last claimant is gone.
                         if job.publish_prefix_tokens.is_some() {
                             let publisher = self.requests[i].id;
                             let registered = self.prefix.register(
@@ -1336,7 +1664,6 @@ impl Scheduler for ConcreteScheduler {
                                     r.prefix_publisher = Some(publisher);
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
-                                    self.kv_used_pages = self.kv_used_pages.saturating_add(pages);
                                 }
                                 // The leaf published and this cache declined
                                 // — the head is already registered by
@@ -1360,6 +1687,20 @@ impl Scheduler for ConcreteScheduler {
                     // on the next advance with the *same* span — not a
                     // span already applied; the fault is surfaced through
                     // `last_error`.
+                    //
+                    // P4-07, GitHub #125: `RuntimeCompute::prefill_step`'s
+                    // own documented failure behavior releases *every* job's
+                    // sequence on any error in the batch, continuing ones
+                    // included, not only freshly-allocated ones — so every
+                    // request in this batch un-charges its resident-slot +
+                    // KV-page reservation here (a no-op for one that was
+                    // never materialized, e.g. a fresh candidate whose very
+                    // first `allocate_sequence` is what failed). The next
+                    // successful chunk re-materializes and re-charges it
+                    // (`Self::materialize`, above).
+                    for &i in &batch {
+                        self.unmaterialize(i);
+                    }
                     self.last_error = Some(e);
                     return events;
                 }
