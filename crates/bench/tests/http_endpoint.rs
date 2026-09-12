@@ -97,6 +97,74 @@ fn http_endpoint_non_streaming_has_no_decode_phase() {
 }
 
 #[test]
+fn http_endpoint_measures_a_turn_that_generates_only_on_the_thinking_channel() {
+    // GitHub #137: a realistic agentic turn with `enable_thinking` on
+    // streams its tokens as `delta.reasoning_content` and closes on a tool
+    // call — not one `delta.content` chunk in the whole stream. Reading only
+    // the content channel reported `n_tokens = 0` and `ttft_ms = total_ms`,
+    // which is how a G4 per-class cell came back as 0.0 tok/s against an
+    // engine that was decoding normally.
+    let engine = MockEngine::start();
+    engine.state.set_thinking(true);
+    let ep = HttpEndpoint::new(engine.url());
+    let out = ep
+        .complete(&request("t1", "list the files", 8, true))
+        .expect("the streaming completion");
+    assert_eq!(out.n_tokens, 8, "the thinking tokens are generated tokens");
+    assert_eq!(out.reasoning_tokens, Some(8), "and they are reported as such");
+    assert!(out.output.is_empty(), "the mock sent no content chunk");
+    assert!(out.reasoning_output.contains("tok-7"), "the thinking text flows through");
+    // ttft is the first thinking token (after the mock's 20 ms prefill), and
+    // the decode phase that follows is measurable — the two properties the
+    // gate's ttft and tok/s cells are built on.
+    assert!(out.ttft_ms >= 15.0, "ttft {} ms should be at least the prefill", out.ttft_ms);
+    assert!(
+        out.ttft_ms < out.total_ms,
+        "ttft {} ms must not be the 'nothing to measure' fallback at total {} ms",
+        out.ttft_ms,
+        out.total_ms
+    );
+    assert!(metrics(&out).tok_s() > 0.0, "a decode speed must be measured");
+}
+
+#[test]
+fn http_endpoint_reads_the_thinking_channel_of_a_non_streaming_turn() {
+    let engine = MockEngine::start();
+    engine.state.set_thinking(true);
+    let ep = HttpEndpoint::new(engine.url());
+    let out = ep
+        .complete(&request("t2", "compute", 6, false))
+        .expect("the non-streaming completion");
+    // The engine's own `completion_tokens` already counts the thinking
+    // tokens; a single JSON body reports no per-channel split.
+    assert_eq!(out.n_tokens, 6);
+    assert_eq!(out.reasoning_tokens, None, "a JSON body carries no channel split");
+    assert!(out.output.is_empty(), "the answer channel is empty");
+    assert!(out.reasoning_output.contains("tok-5"), "the thinking text is read back");
+}
+
+#[test]
+fn the_canary_suite_passes_against_a_thinking_enabled_engine() {
+    // GitHub #137 / #144: the whole suite read `sane=false ... empty output`
+    // against a server started with its own default (`enable_thinking`
+    // true), and passed only when the server was restarted with thinking
+    // off. Judging a canary on everything the turn generated removes the
+    // need for that workaround.
+    let engine = MockEngine::start();
+    engine.state.set_thinking(true);
+    let ep = HttpEndpoint::new(engine.url());
+    let results = ignis_bench::canary::run_canaries(&ep);
+    assert_eq!(results.len(), ignis_bench::canary::CANARIES.len());
+    for r in &results {
+        assert!(r.sane, "canary {} unsane: {:?}", r.id, r.sane_reason);
+        assert!(r.deterministic, "canary {} not deterministic", r.id);
+        assert!(r.first.is_empty(), "the mock's turn never reached the answer");
+        assert!(!r.first_reasoning.is_empty(), "but it did think, and that is reported");
+    }
+    assert!(ignis_bench::canary::suite_consistent(&results));
+}
+
+#[test]
 fn http_endpoint_surfaces_engine_errors() {
     let engine = MockEngine::start();
     engine.state.set_fail_503(true); // the server's `engine_full` 503 shape

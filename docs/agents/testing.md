@@ -153,7 +153,9 @@ Re-record it (needs the GPU and the reference stack, ADR 0006 — stop
 ```powershell
 # 1. Start the reference engine on the same artifact, greedy, thinking off
 #    (thinking on burns the whole token budget on the reasoning channel,
-#    leaving no content tokens to compare).
+#    leaving no content tokens to compare). This is specific to the oracle,
+#    which diffs answer tokens; `canary`, `ttft`, `g3` and `g4` read both
+#    channels and need no such flag (GitHub #137).
 F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe `
   F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer `
   --model-id qwen3.8-27b-nvfp4full-v2 --host 127.0.0.1 --port 8080 `

@@ -75,14 +75,37 @@ pub enum FinishReason {
 /// The raw outcome of a single request completion.
 #[derive(Debug, Clone)]
 pub struct Outcome {
-    /// Time to first token (ms).
+    /// Time to first token (ms). The first generated token of *either*
+    /// channel — a turn that thinks before it answers spent its prefill
+    /// exactly once (GitHub #137).
     pub ttft_ms: f64,
     /// Wall-clock duration of the whole request (ms).
     pub total_ms: f64,
-    /// Number of tokens generated.
+    /// Number of tokens generated, **both channels together** — the thinking
+    /// channel is decode work like any other, and a throughput cell that
+    /// dropped it would read zero for a turn that answers entirely inside
+    /// `<think>` (GitHub #137). [`Outcome::reasoning_tokens`] carries the
+    /// split for a caller that wants the two rates apart.
     pub n_tokens: u32,
-    /// The full generated text.
+    /// The generated text of the **content** channel. Correctness checks
+    /// (the oracle comparison, needle retrieval) read this and only this:
+    /// scratch work is not an answer.
     pub output: String,
+    /// The generated text of the **reasoning** channel
+    /// (`delta.reasoning_content` / `message.reasoning_content`), empty when
+    /// the turn did not think or thinking was disabled.
+    pub reasoning_output: String,
+    /// How many of [`Outcome::n_tokens`] carried text on the reasoning
+    /// channel. It is a count of tokens, not a partition of them: a chunk
+    /// that somehow carried both channels at once counts once in each, so
+    /// `n_tokens - reasoning_tokens` is a lower bound on the answer tokens
+    /// rather than their exact number. The server never sends such a chunk
+    /// (GitHub #68).
+    ///
+    /// `None` means this transport cannot tell the channels apart: a
+    /// non-streaming response reports one `completion_tokens` figure and no
+    /// per-channel split, which is not the same as a reported zero.
+    pub reasoning_tokens: Option<u32>,
     /// `usage.prompt_tokens` as the engine reported it, when it reported
     /// any (a streaming response reports it only with
     /// [`Request::include_usage`]).
@@ -92,12 +115,13 @@ pub struct Outcome {
     /// the engine does not report the field at all, which is not the same
     /// as a reported zero; see [`Outcome::computed_prefill_tokens`].
     pub cached_prompt_tokens: Option<u32>,
-    /// The arrival time of every content token, in ms since the request was
+    /// The arrival time of every generated token, in ms since the request was
     /// sent (streaming only; empty for a non-streaming response). This is
     /// what the G3 inter-token-latency cell reads: a decode lane's inter-
     /// token intervals are the consecutive differences of this series
     /// ([`crate::g3`]), sampled continuously rather than reduced to a
-    /// single ttft/total pair.
+    /// single ttft/total pair. Both channels land here, in arrival order —
+    /// the decode cadence is the decode cadence whatever the token says.
     pub token_times_ms: Vec<f64>,
     /// Why the stream ended, when this transport could tell (GitHub #114).
     /// `None` for a response that named no reason and was not cancelled,
@@ -127,7 +151,7 @@ pub trait Endpoint: Send + Sync {
     /// string on failure (the driver records a failed request, not a panic).
     fn complete(&self, req: &Request) -> Result<Outcome, String>;
 
-    /// Complete a request while reporting each content-token arrival, with
+    /// Complete a request while reporting each generated-token arrival, with
     /// no way to stop early. A convenience wrapper over
     /// [`Endpoint::complete_observed_while`] — override *that* method, not
     /// this one, so a streaming transport's observers run as chunks arrive
@@ -231,6 +255,9 @@ impl MockEndpoint {
             total_ms: ttft + decode_ms,
             n_tokens: n,
             output: format!("[{}]", req.id),
+            // The mock never thinks: every token it generates is content.
+            reasoning_output: String::new(),
+            reasoning_tokens: Some(0),
             // The mock has no tokenizer: it reports the prompt's whitespace
             // word count as its prompt tokens, all of them computed.
             prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
@@ -429,6 +456,8 @@ impl HttpEndpoint {
             total_ms,
             prompt_tokens: usage.prompt_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
+            // The engine's own `completion_tokens` already counts every token
+            // it generated, thinking included — nothing to add here.
             n_tokens: value
                 .pointer("/usage/completion_tokens")
                 .and_then(|v| v.as_u64())
@@ -438,6 +467,14 @@ impl HttpEndpoint {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            reasoning_output: value
+                .pointer("/choices/0/message/reasoning_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            // A single JSON body reports one token figure and no per-channel
+            // split (GitHub #137): unknown, not zero.
+            reasoning_tokens: None,
             // No per-token timing on a non-streaming response.
             token_times_ms: Vec::new(),
             finish_reason,
@@ -445,9 +482,11 @@ impl HttpEndpoint {
     }
 
     /// The streaming half: the SSE `chat.completion.chunk` framing — a
-    /// content chunk per token (a token's delta), a finish chunk (an empty
-    /// delta + `finish_reason`), a terminal `[DONE]` marker. ttft is the
-    /// first content chunk; the token count is the non-empty deltas.
+    /// chunk per generated token (a token's delta), a finish chunk (an empty
+    /// delta + `finish_reason`), a terminal `[DONE]` marker.
+    ///
+    /// Delegates to [`read_sse_stream`], which is the same reader over any
+    /// `BufRead` — a recorded stream in a test, the live response here.
     fn read_sse(
         &self,
         resp: Response,
@@ -455,92 +494,133 @@ impl HttpEndpoint {
         observer: &mut dyn FnMut(f64) -> bool,
     ) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let reader = std::io::BufReader::new(resp);
-        let mut n_tokens: u32 = 0;
-        let mut output = String::new();
-        let mut first_token_ms: Option<f64> = None;
-        let mut prompt_tokens: Option<u32> = None;
-        let mut cached_prompt_tokens: Option<u32> = None;
-        let mut token_times_ms: Vec<f64> = Vec::new();
-        // GitHub #114. `engine_finish` is read from every chunk rather than
-        // only the terminal one: the OpenAI shape puts it on a trailing
-        // chunk with an empty delta, but an engine that hangs it off the
-        // last content chunk is equally readable this way, last write
-        // winning. `cancelled` records that *this* client ended the stream,
-        // in which case the engine never got to name a reason at all.
-        let mut engine_finish: Option<String> = None;
-        let mut cancelled = false;
-        for line in reader.lines() {
-            let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
-            // The SSE framing: `data: <payload>` lines (empty lines
-            // separate the events — skipped).
-            let Some(data) = line.trim().strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data.is_empty() {
-                continue;
-            }
-            if data == "[DONE]" {
-                break;
-            }
-            let chunk = serde_json::from_str::<serde_json::Value>(data)
-                .map_err(|e| format!("POST {url}: bad SSE chunk {data}: {e}"))?;
-            // `choices[0].delta.content` (an empty delta = the finish
-            // chunk, not a token).
-            // The trailing usage chunk (`stream_options.include_usage`):
-            // empty `choices`, populated `usage`. It arrives last, so
-            // reading it here costs nothing and keeps one parse of the
-            // stream.
-            let usage = Usage::from_response(&chunk);
-            if let Some(prompt) = usage.prompt_tokens {
-                prompt_tokens = Some(prompt);
-                cached_prompt_tokens = usage.cached_prompt_tokens;
-            }
-            if let Some(reason) = chunk
-                .pointer("/choices/0/finish_reason")
-                .and_then(|v| v.as_str())
-            {
-                engine_finish = Some(reason.to_string());
-            }
-            let delta = chunk
-                .pointer("/choices/0/delta/content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !delta.is_empty() {
-                let now_ms = ms_since(start);
-                if first_token_ms.is_none() {
-                    first_token_ms = Some(now_ms);
-                }
-                token_times_ms.push(now_ms);
-                output.push_str(delta);
-                n_tokens += 1;
-                if !observer(now_ms) {
-                    cancelled = true;
-                    break;
-                }
-            }
-        }
-        let total_ms = ms_since(start);
-        // No content chunk: nothing to measure (ttft = total, tok_s = 0).
-        let ttft_ms = first_token_ms.unwrap_or(total_ms);
-        Ok(Outcome {
-            ttft_ms,
-            total_ms,
-            n_tokens,
-            output,
-            prompt_tokens,
-            cached_prompt_tokens,
-            token_times_ms,
-            // Cancellation wins: it is why the stream ended here, and any
-            // reason the engine had was never sent.
-            finish_reason: if cancelled {
-                Some(FinishReason::Cancelled)
-            } else {
-                engine_finish.map(FinishReason::Engine)
-            },
-        })
+        read_sse_stream(std::io::BufReader::new(resp), &url, start, observer)
     }
+}
+
+/// Read one SSE `chat.completion.chunk` stream into an [`Outcome`].
+///
+/// A token arrives on one of two channels: `delta.content` (the answer) or
+/// `delta.reasoning_content` (the thinking channel both engines stream by
+/// default). **Both are generated tokens** and both are counted, timed and
+/// observed here — reading only `content` made a thinking-heavy agentic turn
+/// look like a request that produced nothing at all, which is how the G4
+/// per-class cell and the canary came to report `n_tokens = 0` and
+/// `ttft_ms = total_ms` against streams that were perfectly well formed
+/// (GitHub #137). The two texts stay apart on the `Outcome` so a correctness
+/// check still reads the answer alone.
+///
+/// A `delta.tool_calls` chunk is deliberately *not* counted: ignis emits one
+/// complete call per chunk while the reference streams its arguments in
+/// fragments, so counting them would compare two different framings rather
+/// than two decode rates. Such a chunk carries no text on either channel, so
+/// it is simply passed over.
+///
+/// `url` names the endpoint in the error messages; `start` is the instant the
+/// request was sent, which every reported time is relative to.
+pub fn read_sse_stream<R: BufRead>(
+    reader: R,
+    url: &str,
+    start: Instant,
+    observer: &mut dyn FnMut(f64) -> bool,
+) -> Result<Outcome, String> {
+    let mut n_tokens: u32 = 0;
+    let mut reasoning_tokens: u32 = 0;
+    let mut output = String::new();
+    let mut reasoning_output = String::new();
+    let mut first_token_ms: Option<f64> = None;
+    let mut prompt_tokens: Option<u32> = None;
+    let mut cached_prompt_tokens: Option<u32> = None;
+    let mut token_times_ms: Vec<f64> = Vec::new();
+    // GitHub #114. `engine_finish` is read from every chunk rather than
+    // only the terminal one: the OpenAI shape puts it on a trailing
+    // chunk with an empty delta, but an engine that hangs it off the
+    // last content chunk is equally readable this way, last write
+    // winning. `cancelled` records that *this* client ended the stream,
+    // in which case the engine never got to name a reason at all.
+    let mut engine_finish: Option<String> = None;
+    let mut cancelled = false;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
+        // The SSE framing: `data: <payload>` lines (empty lines
+        // separate the events — skipped).
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk = serde_json::from_str::<serde_json::Value>(data)
+            .map_err(|e| format!("POST {url}: bad SSE chunk {data}: {e}"))?;
+        // The trailing usage chunk (`stream_options.include_usage`):
+        // empty `choices`, populated `usage`. It arrives last, so
+        // reading it here costs nothing and keeps one parse of the
+        // stream.
+        let usage = Usage::from_response(&chunk);
+        if let Some(prompt) = usage.prompt_tokens {
+            prompt_tokens = Some(prompt);
+            cached_prompt_tokens = usage.cached_prompt_tokens;
+        }
+        if let Some(reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+        {
+            engine_finish = Some(reason.to_string());
+        }
+        // The token's text and the channel it came on. An empty delta is
+        // the finish chunk, not a token; a `tool_calls`-only delta is a
+        // chunk this reader passes over (see the doc comment).
+        let text_at = |pointer| chunk.pointer(pointer).and_then(|v| v.as_str()).unwrap_or("");
+        let content = text_at("/choices/0/delta/content");
+        let reasoning = text_at("/choices/0/delta/reasoning_content");
+        if content.is_empty() && reasoning.is_empty() {
+            continue;
+        }
+        let now_ms = ms_since(start);
+        if first_token_ms.is_none() {
+            first_token_ms = Some(now_ms);
+        }
+        token_times_ms.push(now_ms);
+        output.push_str(content);
+        reasoning_output.push_str(reasoning);
+        n_tokens += 1;
+        // A chunk carrying both channels at once is one token on the
+        // reasoning side of the ledger; the server never sends one
+        // (GitHub #68) and an engine that did would still be counted once.
+        if !reasoning.is_empty() {
+            reasoning_tokens += 1;
+        }
+        if !observer(now_ms) {
+            cancelled = true;
+            break;
+        }
+    }
+    let total_ms = ms_since(start);
+    // No token chunk on either channel: nothing to measure (ttft = total,
+    // tok_s = 0).
+    let ttft_ms = first_token_ms.unwrap_or(total_ms);
+    Ok(Outcome {
+        ttft_ms,
+        total_ms,
+        n_tokens,
+        output,
+        reasoning_output,
+        reasoning_tokens: Some(reasoning_tokens),
+        prompt_tokens,
+        cached_prompt_tokens,
+        token_times_ms,
+        // Cancellation wins: it is why the stream ended here, and any
+        // reason the engine had was never sent.
+        finish_reason: if cancelled {
+            Some(FinishReason::Cancelled)
+        } else {
+            engine_finish.map(FinishReason::Engine)
+        },
+    })
 }
 
 /// Elapsed milliseconds since `start` (the timing unit of an `Outcome`).
@@ -787,6 +867,8 @@ mod tests {
             total_ms: total,
             n_tokens: n,
             output: "x".repeat(n as usize),
+            reasoning_output: String::new(),
+            reasoning_tokens: Some(0),
             prompt_tokens: None,
             cached_prompt_tokens: None,
             token_times_ms: Vec::new(),
@@ -878,5 +960,128 @@ mod tests {
             ok: true,
         };
         assert_eq!(m.tok_s(), 0.0);
+    }
+
+    // ── the SSE reader, against recorded streams (GitHub #137) ───────────
+
+    /// One `data:` line of a `chat.completion.chunk` carrying `delta`.
+    fn sse_chunk(delta: serde_json::Value) -> String {
+        let chunk = serde_json::json!({
+            "id": "cmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+        });
+        format!("data: {chunk}\n\n")
+    }
+
+    /// Read a recorded SSE stream the way the live transport reads the wire.
+    fn read_recorded(stream: &str) -> Outcome {
+        read_sse_stream(
+            std::io::Cursor::new(stream.to_string()),
+            "http://recorded/v1/chat/completions",
+            Instant::now(),
+            &mut |_| true,
+        )
+        .expect("the recorded stream parses")
+    }
+
+    /// The shape the G4 dogfood actually recorded: a long thinking trace, a
+    /// tool call, a clean finish — and not one `delta.content` chunk.
+    fn thinking_then_tool_call_stream(n_reasoning: u32) -> String {
+        let mut sse = String::new();
+        for i in 0..n_reasoning {
+            sse.push_str(&sse_chunk(
+                serde_json::json!({ "reasoning_content": format!("think-{i} ") }),
+            ));
+        }
+        sse.push_str(&sse_chunk(serde_json::json!({
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_0",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}" },
+            }],
+        })));
+        let finish = serde_json::json!({
+            "id": "cmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+        });
+        sse.push_str(&format!("data: {finish}\n\ndata: [DONE]\n\n"));
+        sse
+    }
+
+    #[test]
+    fn a_turn_that_answers_entirely_in_the_thinking_channel_is_still_measured() {
+        // GitHub #137: this exact stream (100% `reasoning_content` + a
+        // `tool_calls` delta) used to read back as `n_tokens = 0` and
+        // `ttft_ms = total_ms`, which turned a G4 per-class throughput cell
+        // into a fiction.
+        let out = read_recorded(&thinking_then_tool_call_stream(12));
+        assert_eq!(out.n_tokens, 12, "every thinking token is a generated token");
+        assert_eq!(out.reasoning_tokens, Some(12), "all of them on the reasoning channel");
+        assert_eq!(
+            out.token_times_ms.len(),
+            12,
+            "the decode cadence is sampled on the thinking channel too"
+        );
+        assert_eq!(
+            out.ttft_ms,
+            out.token_times_ms[0],
+            "ttft is the first generated token, not the 'nothing to measure' fallback"
+        );
+        assert!(
+            out.ttft_ms <= out.total_ms,
+            "ttft {} ms cannot outlast the request ({} ms)",
+            out.ttft_ms,
+            out.total_ms
+        );
+        // The answer channel stays empty: scratch work is not an answer.
+        assert!(out.output.is_empty(), "no content token was sent");
+        assert!(out.reasoning_output.contains("think-11"), "the thinking text is kept");
+        assert_eq!(
+            out.finish_reason,
+            Some(FinishReason::Engine("tool_calls".into())),
+            "the engine's own reason survives the tool-call chunk"
+        );
+    }
+
+    #[test]
+    fn the_two_channels_are_counted_together_and_reported_apart() {
+        let sse = format!(
+            "{}{}{}data: [DONE]\n\n",
+            sse_chunk(serde_json::json!({ "reasoning_content": "let me think " })),
+            sse_chunk(serde_json::json!({ "reasoning_content": "about it " })),
+            sse_chunk(serde_json::json!({ "content": "42" })),
+        );
+        let out = read_recorded(&sse);
+        assert_eq!(out.n_tokens, 3, "throughput counts every token the engine decoded");
+        assert_eq!(out.reasoning_tokens, Some(2), "the split stays readable");
+        assert_eq!(out.output, "42", "the answer alone is what a correctness check reads");
+        assert_eq!(out.reasoning_output, "let me think about it ");
+    }
+
+    #[test]
+    fn an_observer_can_stop_a_stream_on_a_thinking_token() {
+        // The G3 decode lanes stop their own stream at the measurement
+        // boundary. A lane that thinks must be stoppable the same way.
+        let sse = thinking_then_tool_call_stream(50);
+        let mut seen = 0u32;
+        let out = read_sse_stream(
+            std::io::Cursor::new(sse),
+            "http://recorded/v1/chat/completions",
+            Instant::now(),
+            &mut |_| {
+                seen += 1;
+                seen < 5
+            },
+        )
+        .expect("the recorded stream parses");
+        assert_eq!(out.n_tokens, 5, "the reader stopped where the observer said");
+        assert_eq!(out.finish_reason, Some(FinishReason::Cancelled));
     }
 }
