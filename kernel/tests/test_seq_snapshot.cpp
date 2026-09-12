@@ -91,16 +91,26 @@ void fill_device(void *dst, std::size_t bytes, std::uint32_t seed) {
   CUDA_CHECK(cudaMemcpy(dst, host.data(), bytes, cudaMemcpyHostToDevice));
 }
 
-// Give `seq` a history: a program frontier every GQA layer agrees with (a
-// completed chunk boundary), a pending token, and a known pattern in every
-// section of its device state.
-void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
-                  std::uint32_t seed) {
-  seq.position      = tokens;
-  seq.pending_token = static_cast<std::int32_t>(1000 + seed);
+// Put `seq` at a completed chunk boundary `tokens` in: the program frontier
+// and every layer's own, GDN included (a GDN layer's state is updated in
+// place, so its counter is the only thing that can say it has consumed the
+// same tokens the KV pages have).
+void set_frontier(ignis_seq &seq, std::uint64_t tokens) {
+  seq.position = tokens;
   for (std::uint32_t &frontier : seq.gqa_positions) {
     frontier = static_cast<std::uint32_t>(tokens);
   }
+  for (std::uint32_t &frontier : seq.gdn_positions) {
+    frontier = static_cast<std::uint32_t>(tokens);
+  }
+}
+
+// Give `seq` a history: a chunk boundary `tokens` in, a pending token, and a
+// known pattern in every section of its device state.
+void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
+                  std::uint32_t seed) {
+  set_frontier(seq, tokens);
+  seq.pending_token = static_cast<std::int32_t>(1000 + seed);
 
   std::uint32_t salt = seed;
   for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
@@ -202,7 +212,7 @@ void check_section_table() {
   expect(pages == 2, "table: 100 tokens over 64-token pages is 2 pages");
 
   const std::vector<ignis_seq_section> sections = ignis_seq_section_table(*pool, pages);
-  expect(sections.size() == 5, "table: five state sections");
+  expect(sections.size() == kIgnisSeqSectionCount, "table: every state section is listed");
 
   const std::int32_t want_kind[] = {IGNIS_SEQ_SECTION_KV_PAGES, IGNIS_SEQ_SECTION_GDN_CONV,
                                     IGNIS_SEQ_SECTION_GDN_RECURRENT,
@@ -276,11 +286,21 @@ void check_section_table() {
         "table: the progress section carries the pending token");
   expect(progress.gqa_positions[0] == 100,
         "table: the progress section carries every GQA frontier");
+  expect(progress.gdn_positions[kIgnisGdnLayerCount - 1] == 100,
+        "table: the progress section carries every GDN frontier");
 
   // A destination one byte short is refused rather than truncated.
   std::vector<unsigned char> tight(static_cast<std::size_t>(reported) - 1);
   expect_rc(ignis_seq_snapshot(pool, seq, tight.data(), tight.size()), -1,
            "table: a destination below the reported size is refused");
+
+  // The blob is the same bytes whatever was in the destination before: a
+  // host tier reuses its pinned regions, and the gaps between sections are
+  // part of the blob's extent.
+  std::vector<unsigned char> dirty(static_cast<std::size_t>(reported), 0xEE);
+  expect_rc(ignis_seq_snapshot(pool, seq, dirty.data(), dirty.size()), 0,
+           "table: snapshot into a used buffer");
+  expect(dirty == blob, "table: a snapshot into a dirty buffer is byte-identical to a clean one");
 
   ignis_seq_release(pool, seq);
   ignis_seq_pool_free(pool);
@@ -288,14 +308,15 @@ void check_section_table() {
 
 // ---- 2. the round trip -----------------------------------------------------
 
-void check_round_trip() {
-  const ignis_seq_pool_spec spec = small_spec();
-  ignis_seq_pool *pool           = nullptr;
+void check_round_trip(const ignis_seq_pool_spec &spec, std::uint32_t context_tokens,
+                      std::uint64_t history_tokens, const char *label) {
+  std::printf("round trip (%s)\n", label);
+  ignis_seq_pool *pool = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "round trip: pool create");
 
   ignis_seq *source = nullptr;
-  expect_rc(ignis_seq_alloc(pool, 128, &source), 0, "round trip: alloc source");
-  give_history(*pool, *source, 100, 0xA5u);
+  expect_rc(ignis_seq_alloc(pool, context_tokens, &source), 0, "round trip: alloc source");
+  give_history(*pool, *source, history_tokens, 0xA5u);
   const std::vector<unsigned char> blob = snapshot_of(*pool, *source, "round trip: snapshot");
   const std::int32_t pending            = source->pending_token;
 
@@ -305,16 +326,21 @@ void check_round_trip() {
   ignis_seq_release(pool, source);
 
   ignis_seq *target = nullptr;
-  expect_rc(ignis_seq_alloc(pool, 128, &target), 0, "round trip: alloc target");
+  expect_rc(ignis_seq_alloc(pool, context_tokens, &target), 0, "round trip: alloc target");
   expect(target->position == 0 && target->pending_token == -1,
         "round trip: a fresh sequence starts at zero");
 
   expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size()), 0,
            "round trip: restore");
-  expect(target->position == 100, "round trip: the frontier is restored");
+  expect(target->position == history_tokens, "round trip: the frontier is restored");
   expect(target->pending_token == pending, "round trip: the pending token is restored");
   for (std::uint32_t frontier : target->gqa_positions) {
-    expect(frontier == 100, "round trip: every GQA frontier is restored");
+    expect(static_cast<std::uint64_t>(frontier) == history_tokens,
+          "round trip: every GQA frontier is restored");
+  }
+  for (std::uint32_t frontier : target->gdn_positions) {
+    expect(static_cast<std::uint64_t>(frontier) == history_tokens,
+          "round trip: every GDN frontier is restored");
   }
 
   // The strongest statement available at this level: the restored sequence
@@ -456,15 +482,31 @@ void check_refusals() {
   // size query refuses it too -- a caller cannot even price a snapshot it
   // would not be allowed to take.
   {
-    source->gqa_positions[0] += 1;
-    std::uint64_t bytes = 0;
-    expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
-             "refusals: sizing a mid-chunk sequence");
-    expect(bytes == 0, "refusals: a refused size query reports nothing");
     std::vector<unsigned char> scratch(blob.size());
+    std::uint64_t bytes = 0;
+
+    source->gqa_positions[0] += 1;
+    expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
+             "refusals: sizing a sequence mid-chunk at a GQA layer");
+    expect(bytes == 0, "refusals: a refused size query reports nothing");
     expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size()),
-             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refusals: snapshotting a mid-chunk sequence");
+             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
+             "refusals: snapshotting a sequence mid-chunk at a GQA layer");
     source->gqa_positions[0] -= 1;
+
+    // The same, one GDN layer in. Layers 0..2 are GDN, so this is the state
+    // a chunk is in before it reaches its first GQA layer at all -- and a
+    // GDN layer leaves no trace in the KV pages, so without its own counter
+    // this would look like a boundary and capture GDN state running ahead of
+    // the KV history.
+    source->gdn_positions[0] += 1;
+    expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
+             "refusals: sizing a sequence mid-chunk at a GDN layer");
+    expect_rc(ignis_seq_snapshot(pool, source, scratch.data(), scratch.size()),
+             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
+             "refusals: snapshotting a sequence mid-chunk at a GDN layer");
+    source->gdn_positions[0] -= 1;
+
     expect_rc(ignis_seq_snapshot_size(pool, source, &bytes), 0,
              "refusals: the same sequence at the boundary again");
   }
@@ -491,10 +533,7 @@ void check_both_formats() {
     expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "formats: pool create");
     ignis_seq *seq = nullptr;
     expect_rc(ignis_seq_alloc(pool, context, &seq), 0, "formats: alloc");
-    seq->position = context;
-    for (std::uint32_t &frontier : seq->gqa_positions) {
-      frontier = context;
-    }
+    set_frontier(*seq, context);
 
     struct ignis_seq_pool_stats stats{};
     expect_rc(ignis_seq_pool_stats(pool, &stats), 0, "formats: pool stats");
@@ -547,10 +586,7 @@ void report_transfer_cost(std::uint32_t context_tokens, const char *label) {
   }
   ignis_seq *seq = nullptr;
   expect_rc(ignis_seq_alloc(pool, context_tokens, &seq), 0, "cost: alloc");
-  seq->position = context_tokens;
-  for (std::uint32_t &frontier : seq->gqa_positions) {
-    frontier = context_tokens;
-  }
+  set_frontier(*seq, context_tokens);
 
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), 0, "cost: snapshot size");
@@ -612,7 +648,13 @@ int main() {
   }
 
   check_section_table();
-  check_round_trip();
+  // Twice: the small BF16 geometry, and the real 27B geometry under
+  // hq-e8-2b, whose KV pages are four planes per layer of fixed-budget code
+  // and metadata rows rather than two of raw values. A round trip that packs
+  // and unpacks one correctly says nothing about the other.
+  check_round_trip(small_spec(), 128, 100, "bf16, small geometry");
+  check_round_trip(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2), 256, 200,
+                   "hq-e8-2b, 27B geometry");
   check_refusals();
   check_both_formats();
   // 128 tokens is the "short sequence" the spec prices at the snapshot's

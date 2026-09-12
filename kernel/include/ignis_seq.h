@@ -188,12 +188,27 @@ void ignis_seq_release(struct ignis_seq_pool *pool, struct ignis_seq *seq);
  * argument. */
 int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq_stats *out_stats);
 
-/* The snapshot blob format version this leaf writes and accepts (P4-06,
- * GitHub #124, ADR 0024). One of the two things state transfer exposes
- * across this boundary; the other is the size below. A blob written under a
- * different version is refused by ignis_seq_restore, never reinterpreted,
- * so a caller that persists blobs across builds records this alongside
- * them. */
+/* --- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
+ *
+ * On ADR 0016: it rules that "later phases add fields, not parameters and
+ * not entry points", and names G4's snapshot controls as an example. That
+ * rule is about per-call *modulation* -- a prefill route, a compute policy,
+ * sampling parameters -- which is what would otherwise multiply parameters
+ * or `_ex` entry points. These two additions are neither. The `pool` handle
+ * is the storage the call operates on, which every other sequence entry
+ * point here already takes (ignis_seq_alloc, ignis_seq_release,
+ * ignis_seq_pool_stats); and a size query and a version are queries with
+ * nothing to modulate, so an options struct would have no field to carry.
+ * Snapshot controls, when a phase needs one, still go in a struct. Nothing
+ * called either entry point before this change, so per ADR 0016 the Rust
+ * binding moves with it and no wrapper is kept.
+ */
+
+/* The snapshot blob format version this leaf writes and accepts. One of the
+ * two things state transfer exposes across this boundary; the other is the
+ * size below. A blob written under a different version is refused by
+ * ignis_seq_restore, never reinterpreted, so a caller that persists blobs
+ * across builds records this alongside them. */
 uint32_t ignis_seq_snapshot_format_version(void);
 
 /* Bytes ignis_seq_snapshot would write for `seq` as it stands now.

@@ -32,8 +32,10 @@
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 /* The snapshot blob format this leaf writes and accepts. Bump it whenever
@@ -103,6 +105,11 @@ struct ignis_seq_section {
   std::uint64_t bytes;
 };
 
+/* How many rows `ignis_seq_section_table` returns. Named so a caller can
+ * reserve for it and a test can assert against it, and so that adding a
+ * section is one edit in one place rather than a literal to chase. */
+inline constexpr std::size_t kIgnisSeqSectionCount = 5;
+
 /* The progress scalars, as the IGNIS_SEQ_SECTION_PROGRESS payload. Fixed
  * width and explicitly padded: it is written to a host buffer that another
  * process-lifetime may read back, so its size is pinned below rather than
@@ -112,20 +119,49 @@ struct ignis_seq_progress_image {
   std::int32_t pending_token;
   std::int32_t reserved;
   std::uint32_t gqa_positions[kIgnisGqaLayerCount];
+  std::uint32_t gdn_positions[kIgnisGdnLayerCount];
 };
-static_assert(sizeof(ignis_seq_progress_image) == 16 + 4 * kIgnisGqaLayerCount,
+static_assert(sizeof(ignis_seq_progress_image) ==
+                  16 + 4 * (kIgnisGqaLayerCount + kIgnisGdnLayerCount),
               "ignis_seq_progress_image has gained padding; bump "
               "kIgnisSeqSnapshotFormatVersion and restate the size");
 
-/* The blob's own header: identity, the geometry a restore must agree with,
- * and the shape of the record array that follows it.
+/* The pool geometry a blob was taken at, and which a restore's target pool
+ * must match.
  *
- * Everything a restore validates before it touches the target sequence is
- * here. The geometry block is deliberately the pool's *planned* sizes and
- * not only its spec fields: `kv_page_bytes`, `gdn_conv_slot_bytes` and
- * `gdn_recurrent_slot_bytes` come out of what the pools actually planned, so
- * a vendored layout change that leaves every spec field equal still reads as
- * a mismatch. */
+ * One struct rather than loose header fields so that the geometry is built
+ * once and compared *whole*: a field added here is carried into the blob and
+ * into the comparison by the same edit, where two field-by-field lists would
+ * let a new field be written and never checked.
+ *
+ * Deliberately the pools' *planned* sizes and not only their spec fields:
+ * `kv_page_bytes`, `gdn_conv_slot_bytes` and `gdn_recurrent_slot_bytes` come
+ * out of what the pools actually planned, so a vendored layout change that
+ * leaves every spec field equal still reads as a mismatch. */
+struct ignis_seq_snapshot_geometry {
+  std::int32_t kv_format;
+  std::uint32_t kv_num_kv_heads;
+  std::uint32_t kv_head_dim;
+  std::uint32_t kv_page_size;
+  std::uint32_t kv_plane_count;
+  std::uint32_t gqa_layer_count;
+  std::uint64_t kv_page_bytes;
+  std::uint32_t gdn_num_layers;
+  std::uint32_t gdn_conv_channels;
+  std::uint32_t gdn_conv_width;
+  std::uint32_t gdn_value_heads;
+  std::uint32_t gdn_head_dim;
+  std::uint32_t vocab;
+  std::uint64_t gdn_conv_slot_bytes;
+  std::uint64_t gdn_recurrent_slot_bytes;
+};
+static_assert(sizeof(ignis_seq_snapshot_geometry) == 72,
+              "the snapshot geometry layout changed; bump kIgnisSeqSnapshotFormatVersion, "
+              "restate the size, and add the new field to ignis_seq_snapshot_geometry_names");
+
+/* The blob's own header: identity, the geometry a restore must agree with,
+ * and the shape of the record array that follows it. Everything a restore
+ * validates before it touches the target sequence is here. */
 struct ignis_seq_snapshot_header {
   std::uint64_t magic;
   std::uint32_t format_version;
@@ -134,30 +170,15 @@ struct ignis_seq_snapshot_header {
   std::uint32_t section_count;
   std::uint64_t total_bytes;
 
-  /* --- geometry the target pool must match ------------------------------ */
-  std::int32_t kv_format;
-  std::uint32_t kv_num_kv_heads;
-  std::uint32_t kv_head_dim;
-  std::uint32_t kv_page_size;
-  std::uint32_t kv_plane_count;
-  /* Explicit, so the struct has no implicit padding to reason about: the
-   * checksum below runs over the raw bytes of this header. */
-  std::uint32_t reserved0;
-  std::uint64_t kv_page_bytes;
-  std::uint32_t gqa_layer_count;
-  std::uint32_t gdn_num_layers;
-  std::uint32_t gdn_conv_channels;
-  std::uint32_t gdn_conv_width;
-  std::uint32_t gdn_value_heads;
-  std::uint32_t gdn_head_dim;
-  std::uint64_t gdn_conv_slot_bytes;
-  std::uint64_t gdn_recurrent_slot_bytes;
-  std::uint32_t vocab;
+  struct ignis_seq_snapshot_geometry geometry;
 
   /* --- what this particular blob holds ---------------------------------- */
   /* Physical KV pages captured: `pages_for_tokens(position)`, the history
    * the sequence has actually written, not its whole reservation. */
   std::uint32_t kv_page_count;
+  /* Explicit, so the struct has no implicit padding to reason about: the
+   * checksum below runs over the raw bytes of this header. */
+  std::uint32_t reserved0;
 
   /* FNV-1a 64 over this header with the field itself zeroed. Cheap, and
    * enough to refuse a buffer that is neither a snapshot nor empty. */
@@ -185,23 +206,88 @@ inline std::uint64_t ignis_seq_fnv1a(const void *data, std::size_t bytes) {
   return hash;
 }
 
-/* A sequence is at a chunk boundary when every GQA layer's KV frontier has
- * caught up with the program frontier (ADR 0018).
+/* A sequence is at a chunk boundary when **every** layer's frontier -- all
+ * 16 GQA and all 48 GDN -- has caught up with the program frontier (ADR
+ * 0018).
  *
- * `kernel/src/step.cu` advances both only after the chunk's single
+ * `kernel/src/step.cu` advances all of them only after the chunk's single
  * `cudaStreamSynchronize` has confirmed the whole chunk's device work, so
- * the two agreeing is exactly the "completed chunk" the G3 session
- * established the sections are mutually consistent at. They disagree while a
- * caller drives the per-layer GQA entry point itself
- * (`ignis_gqa_layer_step`), which is the mid-chunk state a snapshot must
- * refuse rather than capture. */
+ * their agreeing is exactly the "completed chunk" the G3 session established
+ * the sections are mutually consistent at. They disagree while a caller
+ * drives a per-layer entry point itself (`ignis_gqa_layer_step`,
+ * `ignis_gdn_layer_step`), which is the mid-chunk state a snapshot must
+ * refuse rather than capture.
+ *
+ * Both arrays, not just the GQA one: a GDN layer's conv taps and recurrent
+ * state are updated in place, so a sequence stepped one GDN layer at a time
+ * has GDN state ahead of its KV with nothing about the KV pages to show it.
+ * That is the quietest version of the inconsistency, not the absent one. */
 inline bool ignis_seq_at_chunk_boundary(const ignis_seq &seq) {
   for (std::uint32_t frontier : seq.gqa_positions) {
     if (static_cast<std::uint64_t>(frontier) != seq.position) {
       return false;
     }
   }
+  for (std::uint32_t frontier : seq.gdn_positions) {
+    if (static_cast<std::uint64_t>(frontier) != seq.position) {
+      return false;
+    }
+  }
   return true;
+}
+
+/* The geometry of the pool `pool`'s sequences live in. */
+inline ignis_seq_snapshot_geometry ignis_seq_snapshot_geometry_of(const ignis_seq_pool &pool) {
+  const ninfer::LinearAttentionStatePoolSpec &gdn = pool.gdn_pool.spec;
+  ignis_seq_snapshot_geometry geometry{};
+  geometry.kv_format       = pool.kv_format;
+  geometry.kv_num_kv_heads = static_cast<std::uint32_t>(pool.kv_num_kv_heads);
+  geometry.kv_head_dim     = static_cast<std::uint32_t>(pool.kv_head_dim);
+  geometry.kv_page_size    = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+  geometry.kv_plane_count  = static_cast<std::uint32_t>(pool.kv_pool.plane_count());
+  geometry.gqa_layer_count = static_cast<std::uint32_t>(kIgnisGqaLayerCount);
+  geometry.kv_page_bytes   = pool.kv_page_bytes;
+  geometry.gdn_num_layers  = gdn.layers;
+  geometry.gdn_conv_channels        = static_cast<std::uint32_t>(gdn.conv_channels);
+  geometry.gdn_conv_width           = static_cast<std::uint32_t>(gdn.conv_width);
+  geometry.gdn_value_heads          = static_cast<std::uint32_t>(gdn.value_heads);
+  geometry.gdn_head_dim             = static_cast<std::uint32_t>(gdn.value_head_dim);
+  geometry.vocab                    = static_cast<std::uint32_t>(pool.vocab);
+  geometry.gdn_conv_slot_bytes      = pool.gdn_pool.conv_slot_bytes();
+  geometry.gdn_recurrent_slot_bytes = pool.gdn_pool.recurrent_slot_bytes();
+  return geometry;
+}
+
+/* The name of the first field in which `blob` and `target` differ, or
+ * nullptr if they are identical.
+ *
+ * Equality is decided by one `memcmp` over the whole struct, so no field can
+ * escape the check by being missing from the list below -- the list only
+ * makes the message name the field. A field added to the struct and not to
+ * the list is still refused, and says so. */
+inline const char *ignis_seq_snapshot_geometry_names(const ignis_seq_snapshot_geometry &blob,
+                                                     const ignis_seq_snapshot_geometry &target) {
+  if (std::memcmp(&blob, &target, sizeof(blob)) == 0) {
+    return nullptr;
+  }
+  if (blob.kv_format != target.kv_format) return "kv_format";
+  if (blob.kv_num_kv_heads != target.kv_num_kv_heads) return "num_kv_heads";
+  if (blob.kv_head_dim != target.kv_head_dim) return "head_dim";
+  if (blob.kv_page_size != target.kv_page_size) return "kv page size";
+  if (blob.kv_plane_count != target.kv_plane_count) return "kv plane count";
+  if (blob.gqa_layer_count != target.gqa_layer_count) return "gqa layer count";
+  if (blob.kv_page_bytes != target.kv_page_bytes) return "kv page bytes";
+  if (blob.gdn_num_layers != target.gdn_num_layers) return "gdn layer count";
+  if (blob.gdn_conv_channels != target.gdn_conv_channels) return "gdn conv channels";
+  if (blob.gdn_conv_width != target.gdn_conv_width) return "gdn conv width";
+  if (blob.gdn_value_heads != target.gdn_value_heads) return "gdn value heads";
+  if (blob.gdn_head_dim != target.gdn_head_dim) return "gdn head dim";
+  if (blob.vocab != target.vocab) return "vocab";
+  if (blob.gdn_conv_slot_bytes != target.gdn_conv_slot_bytes) return "gdn conv slot bytes";
+  if (blob.gdn_recurrent_slot_bytes != target.gdn_recurrent_slot_bytes) {
+    return "gdn recurrent slot bytes";
+  }
+  return "an unnamed geometry field";
 }
 
 /* The physical KV pages a snapshot of `seq` captures: the pages its written
@@ -237,7 +323,7 @@ inline std::uint32_t ignis_seq_snapshot_page_count(const ignis_seq &seq) {
 inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_pool &pool,
                                                               std::uint32_t kv_page_count) {
   std::vector<ignis_seq_section> sections;
-  sections.reserve(5);
+  sections.reserve(kIgnisSeqSectionCount);
   const auto push = [&sections](ignis_seq_section_kind kind, ignis_seq_section_transfer transfer,
                                 std::uint64_t bytes) {
     sections.push_back({static_cast<std::int32_t>(kind), static_cast<std::int32_t>(transfer), 0,
@@ -257,6 +343,8 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   push(IGNIS_SEQ_SECTION_PENALTY_COUNTS, IGNIS_SEQ_SECTION_CLONE,
        static_cast<std::uint64_t>(pool.vocab) * sizeof(std::int32_t));
   push(IGNIS_SEQ_SECTION_PROGRESS, IGNIS_SEQ_SECTION_CLONE, sizeof(ignis_seq_progress_image));
+  assert(sections.size() == kIgnisSeqSectionCount &&
+         "kIgnisSeqSectionCount has drifted from the table above");
 
   std::uint64_t cursor = ignis_seq_align_up(
       sizeof(ignis_seq_snapshot_header) + sections.size() * sizeof(ignis_seq_section),
@@ -269,15 +357,17 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
 }
 
 /* Bytes a blob of `sections` occupies: the end of the last section's
- * payload, tail padding included, so the reported size and the written size
- * are the same number by construction. */
+ * payload, its tail padding included, so the reported size and the written
+ * size are the same number by construction. `ignis_seq_section_table`
+ * assigns offsets in order, so the last section ends last. */
 inline std::uint64_t ignis_seq_snapshot_bytes(const std::vector<ignis_seq_section> &sections) {
-  std::uint64_t total = sizeof(ignis_seq_snapshot_header) +
-                        sections.size() * sizeof(ignis_seq_section);
-  for (const ignis_seq_section &section : sections) {
-    total = ignis_seq_align_up(section.offset + section.bytes, kIgnisSeqSectionAlign);
+  const std::uint64_t records_end = sizeof(ignis_seq_snapshot_header) +
+                                    sections.size() * sizeof(ignis_seq_section);
+  if (sections.empty()) {
+    return ignis_seq_align_up(records_end, kIgnisSeqSectionAlign);
   }
-  return total;
+  const ignis_seq_section &last = sections.back();
+  return ignis_seq_align_up(last.offset + last.bytes, kIgnisSeqSectionAlign);
 }
 
 /* A section's name, for the messages a refusal sets. */
@@ -311,24 +401,8 @@ ignis_seq_snapshot_header_for(const ignis_seq_pool &pool, std::uint32_t kv_page_
   header.section_count        = static_cast<std::uint32_t>(sections.size());
   header.total_bytes          = ignis_seq_snapshot_bytes(sections);
 
-  header.kv_format       = pool.kv_format;
-  header.kv_num_kv_heads = static_cast<std::uint32_t>(pool.kv_num_kv_heads);
-  header.kv_head_dim     = static_cast<std::uint32_t>(pool.kv_head_dim);
-  header.kv_page_size    = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
-  header.kv_plane_count  = static_cast<std::uint32_t>(pool.kv_pool.plane_count());
-  header.kv_page_bytes   = pool.kv_page_bytes;
-  header.gqa_layer_count = static_cast<std::uint32_t>(kIgnisGqaLayerCount);
-
-  const ninfer::LinearAttentionStatePoolSpec &gdn = pool.gdn_pool.spec;
-  header.gdn_num_layers           = gdn.layers;
-  header.gdn_conv_channels        = static_cast<std::uint32_t>(gdn.conv_channels);
-  header.gdn_conv_width           = static_cast<std::uint32_t>(gdn.conv_width);
-  header.gdn_value_heads          = static_cast<std::uint32_t>(gdn.value_heads);
-  header.gdn_head_dim             = static_cast<std::uint32_t>(gdn.value_head_dim);
-  header.gdn_conv_slot_bytes      = pool.gdn_pool.conv_slot_bytes();
-  header.gdn_recurrent_slot_bytes = pool.gdn_pool.recurrent_slot_bytes();
-  header.vocab                    = static_cast<std::uint32_t>(pool.vocab);
-  header.kv_page_count            = kv_page_count;
+  header.geometry      = ignis_seq_snapshot_geometry_of(pool);
+  header.kv_page_count = kv_page_count;
 
   header.header_checksum = 0;
   header.header_checksum = ignis_seq_fnv1a(&header, sizeof(header));

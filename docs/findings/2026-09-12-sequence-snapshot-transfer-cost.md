@@ -32,12 +32,18 @@ under hq-e8-2b KV, gives one sequence a frontier, and times
 the transport the host tier will use. One untimed pass first, then the mean
 of three.
 
-Run of 2026-09-12, RTX 5090, no other process holding the card:
+Three consecutive runs of 2026-09-12, RTX 5090, no other process holding the
+card. Means of the three (each itself the mean of three reps):
 
 | sequence | blob | snapshot | restore | effective |
 | --- | ---: | ---: | ---: | ---: |
-| 128 tokens ("short") | 148.89 MiB | 15.49 ms | 14.36 ms | 10.1 / 10.9 GB/s |
-| 40,960 tokens ("full context") | 507.76 MiB | 52.05 ms | 49.99 ms | 10.2 / 10.7 GB/s |
+| 128 tokens ("short") | 148.89 MiB | 13.7 ms | 12.6 ms | 11.4 / 12.4 GB/s |
+| 40,960 tokens ("full context") | 507.76 MiB | 44.6 ms | 41.6 ms | 11.9 / 12.8 GB/s |
+
+Spread across the three runs is under 5%. One earlier reading on the same
+machine came in at 52.1 / 50.0 ms for the full-context cell (10.2 GB/s), so
+treat ~10 GB/s as the slow end of what this host does rather than as a
+different result.
 
 The blob sizes match the spec's own model of what a sequence is made of. The
 short sequence is the floor: 144 MiB of GDN recurrent state, 2.81 MiB of conv
@@ -58,45 +64,45 @@ of theoretical payload bandwidth.
 
 ## Finding
 
-**Observed.** Snapshot and restore both run at 10–11 GB/s regardless of blob
-size, and the two directions cost the same within noise. A full-context
-snapshot is ~52 ms per direction, not ~21 ms.
+**Observed.** Snapshot and restore both run at 11–13 GB/s regardless of blob
+size, with restore consistently a few percent faster than snapshot. A
+full-context snapshot is ~45 ms per direction, not ~21 ms.
 
 **Observed.** The card is on a Gen 3 x16 link because the host board caps it
 there, not because the GPU cannot do better.
 
-**Inference.** The transfer is link-bound, not pattern-bound. 10.2 GB/s is
-65% of the Gen 3 x16 theoretical maximum, which is the ordinary efficiency of
-a pinned host-to-device copy, and the rate is flat from 149 MiB to 508 MiB —
-the signature of a saturated link rather than of per-copy overhead. The KV
-section is moved as one copy per (plane, page), 40,960 of them at full
-context, and even that does not move the rate, which is further evidence the
-link is the limit.
+**Inference.** The transfer is link-bound, not pattern-bound. 12 GB/s is 76%
+of the Gen 3 x16 theoretical maximum, the ordinary efficiency of a pinned
+copy, and the rate is flat from 149 MiB to 508 MiB — the signature of a
+saturated link rather than of per-copy overhead. The KV section is moved as
+one copy per (plane, page), 40,960 of them at full context, and even that does
+not move the rate, which is further evidence the link is the limit.
 
 **Inference.** ADR 0024's 21 ms is an estimate at PCIe 5.0 rates. It is right
-about the mechanism and optimistic by 2.4x about this machine.
+about the mechanism and optimistic by roughly 2x about this machine.
 
 **The tier's justification survives.** Against the measured prefill rate of
 0.0974 ms/token at a 1,024-token chunk width
 ([Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)), 40,960
 tokens is at least ~4.0 s of re-prefill, and more in practice because
-attention cost grows with the prefix. A 50 ms restore is therefore 80–90x
-cheaper than the work it replaces. That is the low edge of ADR 0024's "two
-orders of magnitude" rather than the ~220x the 21 ms figure implied, and the
-decision does not turn on the difference.
+attention cost grows with the prefix. A 42 ms restore is therefore around
+100x cheaper than the work it replaces. That is the low edge of ADR 0024's
+"two orders of magnitude" rather than the ~220x the 21 ms figure implied, and
+the decision does not turn on the difference.
 
 ## Implications
 
-- **Eviction budgeting (#125) should use ~100 ms, not ~42 ms**, for a
-  full-context round trip on this host. An eviction that frees a lane pays
-  one direction now and the other when the request resumes.
+- **Eviction budgeting (#125) should use ~90 ms, not ~42 ms**, for a
+  full-context round trip on this host, and should tolerate ~100 ms at the
+  slow end. An eviction that frees a lane pays one direction now and the
+  other when the request resumes.
 - **The floor dominates a short sequence.** A 128-token sequence costs 149
-  MiB and 15 ms because the 144 MiB GDN slot is paid whatever the prompt
+  MiB and 14 ms because the 144 MiB GDN slot is paid whatever the prompt
   length. This is why the host tier is bounded by a byte budget rather than a
   lane count: 3.4 short sequences cost what one full-context sequence costs,
   and a lane count would price them identically.
 - **The KV format changes only the KV part.** A BF16 full-context snapshot
-  would carry 360 MiB x 7.11 of KV instead, a 2.6 GiB blob, so roughly 280 ms
+  would carry 360 MiB x 7.11 of KV instead, a 2.6 GiB blob, so roughly 240 ms
   per direction. hq-e8-2b is what makes a full-context sequence transferable
   at all on this link.
 - **A faster host would change the number, not the conclusion.** On a Gen 5
@@ -104,9 +110,10 @@ decision does not turn on the difference.
 
 ## Limits and unknowns
 
-- One machine, one run of three reps per cell. The numbers are stable within
-  the run and the rate is flat across a 3.4x size range, but nothing here
-  establishes run-to-run variance across reboots or driver versions.
+- One machine, three runs of three reps per cell. The rate is flat across a
+  3.4x size range and stable within 5% across those runs, but one earlier
+  reading was 17% slower, and nothing here establishes variance across
+  reboots or driver versions.
 - The measurement uses a sequence whose device state was written directly
   rather than produced by a forward pass. Transfer cost does not depend on
   the content of the bytes, but this does not exercise any interaction

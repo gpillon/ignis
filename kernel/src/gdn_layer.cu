@@ -461,24 +461,21 @@ int32_t ignis_gdn_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
     set_error("ignis_gdn_layer: layer " + std::to_string(layer) + " is not a GDN layer");
     return -1;
   }
-  // This GDN layer's position among GDN layers only (0..47): the Qwen 3.8
-  // topology's GQA layers sit at index 3, 7, 11, ... (every 4th, validated
-  // by `ignis_gqa_layer_step`'s own check), so the count of GQA layers at
-  // or before `layer` is `(layer + 1) / 4` -- subtracting it out of the
-  // absolute index gives the GDN-relative one the state pool is sized and
-  // addressed by (GitHub #55), mirroring `ignis_gqa_layer_step`'s
-  // `gqa_layer = (layer - 3) / 4` for its own (16-count) pool.
-  const uint32_t gdn_layer = layer - (layer + 1) / 4;
+  // This GDN layer's position among GDN layers only (0..47) -- the index the
+  // state pool is sized and addressed by (GitHub #55), the counterpart of
+  // `ignis_gqa_relative_layer`, and the same index `seq->gdn_positions`
+  // counts in (kernel/src/layer_internal.h).
+  const uint32_t gdn_layer = ignis_gdn_relative_layer(layer);
   return run_gdn_layer(model, pool, seq->slot, layer, gdn_layer, const_cast<void *>(in_residual),
                        out_residual, num_tokens, mode);
 }
 
 // P2-03 (GitHub #85): `ignis_gdn_layer_step`'s synchronous contract (body +
-// one stream synchronization; no position advance -- the GDN layer's state
-// is updated in place by the enqueued work) with a non-default
-// compute-policy mode -- the program's per-token route (kernel/src/step.cu)
-// threads ADR 0016's `compute_policy` override through it. The flat C ABI
-// entry point below is this same contract with `kEngineDefault`.
+// one stream synchronization + the deferred `gdn_positions` advance) with a
+// non-default compute-policy mode -- the program's per-token route
+// (kernel/src/step.cu) threads ADR 0016's `compute_policy` override through
+// it. The flat C ABI entry point below is this same contract with
+// `kEngineDefault`.
 int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                   uint32_t layer, const void *in_residual, void *out_residual,
                                   uint64_t num_tokens, LinearPolicyMode mode) {
@@ -498,6 +495,15 @@ int32_t ignis_gdn_layer_step_mode(ignis_model *model, ignis_seq_pool *pool, igni
               cudaGetErrorString(error));
     return -1;
   }
+  // P4-06 (GitHub #124): the layer's state was updated in place by the work
+  // the synchronize above just confirmed, so this counter -- which exists
+  // only to say how far this layer has consumed the sequence -- advances
+  // here and nowhere earlier. Without it a sequence stepped one GDN layer
+  // at a time would look consistent to `ignis_seq_at_chunk_boundary` while
+  // its GDN state ran ahead of its KV, which is exactly the mid-chunk
+  // inconsistency a snapshot must refuse rather than capture.
+  seq->gdn_positions[ignis_gdn_relative_layer(layer)] +=
+      static_cast<std::uint32_t>(num_tokens);
   return 0;
 }
 
@@ -521,7 +527,7 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
               " is not in 1..IGNIS_DECODE_MAX_BATCH");
     return -1;
   }
-  const uint32_t gdn_layer = layer - (layer + 1) / 4;
+  const uint32_t gdn_layer = ignis_gdn_relative_layer(layer);
   return run_gdn_layer_graph(model, pool, layer, width, const_cast<void *>(in_residual), out_residual,
                              gdn_layer, mode);
 }

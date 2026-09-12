@@ -183,12 +183,17 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
     restored
         .restore(&blob)
         .unwrap_or_else(|e| panic!("restore: {e}"));
+    // Byte-identity at the real geometry, before a single token is decoded.
+    // The token comparison below is the claim that matters, but it runs
+    // greedy, so a section that only sampling reads — the penalty-count row
+    // — could go missing without changing a token. This catches that, and
+    // catches it at the model's real 248,320-entry vocabulary.
     assert_eq!(
         restored
-            .snapshot_bytes()
-            .unwrap_or_else(|e| panic!("restored snapshot size: {e}")),
-        blob.len() as u64,
-        "the restored sequence costs what the source cost"
+            .snapshot()
+            .unwrap_or_else(|e| panic!("re-snapshot: {e}")),
+        blob,
+        "a restored sequence snapshots to the same bytes as its source"
     );
 
     let tail = decode_n(&model, &pool, &mut restored, GENERATED, "restored tail");

@@ -119,7 +119,34 @@ ignis_seq_progress_image progress_of(const ignis_seq &seq) {
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     image.gqa_positions[i] = seq.gqa_positions[i];
   }
+  for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
+    image.gdn_positions[i] = seq.gdn_positions[i];
+  }
   return image;
+}
+
+// Zero the bytes of `dst` that no section's payload covers: the gap after
+// the header and records, and each section's alignment padding.
+//
+// Only a few hundred bytes in total, but they are part of the blob's extent,
+// so a blob written into a reused buffer would otherwise carry whatever the
+// previous occupant left in its gaps. Two snapshots of the same sequence
+// have to be the same bytes -- the leaf's own round-trip test says so by
+// comparing them -- and that has to be true of a recycled host region as
+// much as of a fresh one.
+void zero_blob_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
+                    std::uint64_t total_bytes) {
+  std::uint64_t cursor = sizeof(ignis_seq_snapshot_header) +
+                         sections.size() * sizeof(ignis_seq_section);
+  for (const ignis_seq_section &section : sections) {
+    if (section.offset > cursor) {
+      std::memset(base + cursor, 0, static_cast<std::size_t>(section.offset - cursor));
+    }
+    cursor = section.offset + section.bytes;
+  }
+  if (total_bytes > cursor) {
+    std::memset(base + cursor, 0, static_cast<std::size_t>(total_bytes - cursor));
+  }
 }
 
 // One host<->device copy on the default stream, as a checked error rather
@@ -171,48 +198,12 @@ std::string snapshot_refusal(const ignis_seq_pool &pool, const ignis_seq &seq,
     return mismatch("size", header.total_bytes, src_bytes);
   }
 
-  if (header.kv_format != pool.kv_format) {
-    return mismatch("kv_format", static_cast<std::uint64_t>(header.kv_format),
-                    static_cast<std::uint64_t>(pool.kv_format));
-  }
-  if (header.kv_num_kv_heads != static_cast<std::uint32_t>(pool.kv_num_kv_heads)) {
-    return mismatch("num_kv_heads", header.kv_num_kv_heads,
-                    static_cast<std::uint64_t>(pool.kv_num_kv_heads));
-  }
-  if (header.kv_head_dim != static_cast<std::uint32_t>(pool.kv_head_dim)) {
-    return mismatch("head_dim", header.kv_head_dim, static_cast<std::uint64_t>(pool.kv_head_dim));
-  }
-  if (header.kv_page_size != static_cast<std::uint32_t>(ninfer::kPagedKVPageSize)) {
-    return mismatch("kv page size", header.kv_page_size,
-                    static_cast<std::uint64_t>(ninfer::kPagedKVPageSize));
-  }
-  if (header.kv_plane_count != static_cast<std::uint32_t>(pool.kv_pool.plane_count())) {
-    return mismatch("kv plane count", header.kv_plane_count, pool.kv_pool.plane_count());
-  }
-  if (header.kv_page_bytes != pool.kv_page_bytes) {
-    return mismatch("kv page bytes", header.kv_page_bytes, pool.kv_page_bytes);
-  }
-  if (header.gqa_layer_count != static_cast<std::uint32_t>(kIgnisGqaLayerCount)) {
-    return mismatch("gqa layer count", header.gqa_layer_count,
-                    static_cast<std::uint64_t>(kIgnisGqaLayerCount));
-  }
-
-  const ninfer::LinearAttentionStatePoolSpec &gdn = pool.gdn_pool.spec;
-  if (header.gdn_num_layers != gdn.layers) {
-    return mismatch("gdn layers", header.gdn_num_layers, gdn.layers);
-  }
-  if (header.gdn_conv_channels != static_cast<std::uint32_t>(gdn.conv_channels) ||
-      header.gdn_conv_width != static_cast<std::uint32_t>(gdn.conv_width) ||
-      header.gdn_conv_slot_bytes != pool.gdn_pool.conv_slot_bytes()) {
-    return "snapshot GDN conv geometry does not match this pool's";
-  }
-  if (header.gdn_value_heads != static_cast<std::uint32_t>(gdn.value_heads) ||
-      header.gdn_head_dim != static_cast<std::uint32_t>(gdn.value_head_dim) ||
-      header.gdn_recurrent_slot_bytes != pool.gdn_pool.recurrent_slot_bytes()) {
-    return "snapshot GDN recurrent geometry does not match this pool's";
-  }
-  if (header.vocab != static_cast<std::uint32_t>(pool.vocab)) {
-    return mismatch("vocab", header.vocab, static_cast<std::uint64_t>(pool.vocab));
+  // The geometry as one struct, compared whole: `memcmp` decides, and the
+  // field names only improve the message, so a geometry field added to the
+  // blob is checked here whether or not anyone remembered to name it.
+  const ignis_seq_snapshot_geometry target = ignis_seq_snapshot_geometry_of(pool);
+  if (const char *field = ignis_seq_snapshot_geometry_names(header.geometry, target)) {
+    return std::string("snapshot ") + field + " does not match this pool's";
   }
 
   // The one requirement on the target beyond matching geometry: it must
@@ -522,6 +513,7 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
     std::memcpy(base, &header, sizeof(header));
     std::memcpy(base + sizeof(header), sections.data(),
                 sections.size() * sizeof(ignis_seq_section));
+    zero_blob_gaps(base, sections, header.total_bytes);
     const std::uint64_t recurrent_at = section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT);
 
     for (const ignis_seq_section &section : sections) {
@@ -597,9 +589,13 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
   ignis_seq_snapshot_header header{};
   std::memcpy(&header, base, sizeof(header));
 
+  // Read the records only if the header's own account of them fits inside
+  // the buffer the caller actually passed -- that bound comes from
+  // `src_bytes`, a real allocation, so a header claiming a preposterous
+  // section count allocates nothing here. Left empty otherwise, which
+  // `snapshot_refusal` then refuses by count.
   std::vector<ignis_seq_section> records;
-  if (header.section_record_bytes == sizeof(ignis_seq_section) && header.section_count != 0 &&
-      header.section_count <= 64) {
+  if (header.section_record_bytes == sizeof(ignis_seq_section) && header.section_count != 0) {
     const std::uint64_t records_end =
         sizeof(ignis_seq_snapshot_header) +
         static_cast<std::uint64_t>(header.section_count) * sizeof(ignis_seq_section);
@@ -662,6 +658,9 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
     seq->pending_token = image.pending_token;
     for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
       seq->gqa_positions[i] = image.gqa_positions[i];
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
+      seq->gdn_positions[i] = image.gdn_positions[i];
     }
     return 0;
   } catch (const std::exception &e) {

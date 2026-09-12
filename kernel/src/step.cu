@@ -682,14 +682,19 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         out_logits[v] = bf16_to_f32(host_logits_bits[static_cast<std::size_t>(v)]);
       }
     }
-    // Only advance every GQA layer's position counter once the synchronize
-    // above confirms the whole chunk's device work actually completed
-    // (mirrors `ignis_gqa_layer_step`'s own ordering) -- GDN has no
-    // separate counter to advance, its state was already updated in place
-    // by the enqueued work.
+    // Only advance every layer's position counter once the synchronize above
+    // confirms the whole chunk's device work actually completed (mirrors
+    // `ignis_gqa_layer_step`'s and `ignis_gdn_layer_step`'s own ordering).
+    // Both kinds, because both are state a snapshot has to find consistent:
+    // a GDN layer's own state is updated in place by the enqueued work, but
+    // its counter is what lets `ignis_seq_at_chunk_boundary` say so (P4-06,
+    // GitHub #124).
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       if (model->layers[layer].kind == IGNIS_LAYER_GQA) {
         seq->gqa_positions[ignis_gqa_relative_layer(layer)] +=
+            static_cast<std::uint32_t>(num_tokens);
+      } else {
+        seq->gdn_positions[ignis_gdn_relative_layer(layer)] +=
             static_cast<std::uint32_t>(num_tokens);
       }
     }
@@ -1044,9 +1049,14 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       // bodies' KV-capacity check, so a decode round must keep it truthful.
       // Before #111 the graph path left it behind by one per round, so a
       // round that fell back to eager after a replay read a stale position.
+      // The GDN counters advance here for the same reason the chunk loop
+      // advances them (P4-06, GitHub #124): nothing reads them on the
+      // forward pass, but a snapshot's chunk-boundary check does.
       for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
         if (model->layers[layer].kind == IGNIS_LAYER_GQA) {
           ++sequences[i]->gqa_positions[ignis_gqa_relative_layer(layer)];
+        } else {
+          ++sequences[i]->gdn_positions[ignis_gdn_relative_layer(layer)];
         }
       }
     }

@@ -214,7 +214,7 @@ int main() {
   expect(slot_is_zero(*pool, spec.gdn_num_layers, d_stats.slot),
         "re-allocated sequence's GDN slot is zero");
 
-  // Snapshot / restore live in their own test (kernel/tests/test_seq_snapshot.cu,
+  // Snapshot / restore live in their own test (kernel/tests/test_seq_snapshot.cpp,
   // P4-06 / GitHub #124): they need a dirtied sequence and a second one to
   // restore into, which is more setup than this file's alloc/release
   // accounting.
