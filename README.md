@@ -14,11 +14,15 @@ Without an artifact, or without `--features cuda`, it falls back to the
 deterministic CPU-only mock (`MockCompute`, ADR 0006) for protocol and loop
 work.
 
-**Next milestone: the G1 gate run** — record the verdict (canary agreement
-≥ 95% vs. the recorded oracle fixture, the f64 layer checks, reproducibility
-across loads) and close out gate G1. The 99% performance gate (ADR 0007) sits
-behind G4. The full phase/gate plan is `.scratch/ROADMAP.md`; the review that
-reset it is `.scratch/REVIEW-2026-09-05.md`.
+**Gate history:** G1 GREEN (2026-09-07, 97.1% teacher-forced canary
+agreement), G2 GREEN (2026-09-09, TTFT ratios 0.878/0.851 on the 8K/32K
+cells), G3 closed 2026-09-10 with one open gap (#110, the ITL p95 cell).
+**Next milestone: the G4 gate run** (master #65, the reference feature
+floor) — hq-e8-2b KV as a load option, snapshot/restore + KV-RAM host tier,
+device prefix reuse, unified eviction, tagged lanes; verdict is the 99%
+performance gate (ADR 0007) on the recorded "1 main + N subagents" load.
+The full phase/gate plan is `.scratch/ROADMAP.md`; the review that reset it
+is `.scratch/REVIEW-2026-09-05.md`.
 
 ---
 
@@ -53,10 +57,10 @@ Rust core (crates/core)
   │              + full admission state machine (protection / backfill class /
   │              temporal credit / frontier distance)
   ├── Paged KV page accounting + block tables (device pages reported by the leaf)
-  ├── KV-RAM host tier (probation / protected eviction) + prefix reuse *(planned: G4)*
+  ├── KV-RAM host tier (probation / protected eviction) + prefix reuse *(in progress: G4)*
   ├── Artifact loader (.ninfer reader + binder + materializer + device views)
-  ├── Telemetry (JSONL events + interval lines)
-  └── crates/runtime: safe wrapper over the step ABI *(planned: G1)*
+  ├── Telemetry (JSONL interval lines; request lifecycle as structured logs)
+  └── crates/runtime: safe wrapper over the step ABI *(shipped: G1)*
         │
 Step-level C ABI (device-resident, opaque handles — ADR 0009)
   model load · sequence alloc/release/snapshot · prefill(span, pos)
@@ -66,18 +70,24 @@ Kernel leaf (kernel/, C++/CUDA static lib — CMake + nvcc, SM120a)
   ├── program: device arena, streams, the 64-layer op sequence,
   │            sequence state (KV pages, fp32 GDN slots, conv taps)
   └── vendored ops (verbatim from the reference, ADR 0010)
-      ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T; W4A4 + TMA at G2)
-      ├── GQA attention (bf16 paged decode + prefill; i8/hq at G4)
-      ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked at G2)
+      ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T; W4A4 + TMA since G2)
+      ├── GQA attention (bf16 paged decode + prefill; i8/hq in progress at G4)
+      ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked since G2)
       ├── norms / embedding / sampling
-      └── per-width decode CUDA graphs *(planned: G3)*
+      └── per-width decode CUDA graphs *(shipped: G3, widths 1..8)*
 ```
 
 **The model lifecycle is decoupled from the server lifecycle** (hot-reload-ready
 by construction): the KV pool, CUDA graphs, and scheduler state are regenerable
-per model. The target context envelope is 262k (the KV pool auto-sized from free
-VRAM); the target max concurrency is N=8 (resident lanes with host-tier overflow,
-sized for a ~10-subagent concurrent workload).
+per model. The per-sequence context defaults to 40960 tokens (a 32K prompt
+plus an 8K generation, `--max-context`), the model's 262k envelope being the
+ceiling; the paged KV pool is sized by a **byte** budget (`--kv-pool-bytes`,
+4 GiB by default, raised if one full context would not fit) rather than from
+free VRAM — auto-sizing it from the leaf's real free-VRAM headroom is
+deferred work. What that budget is worth in tokens is derived from the KV
+format in force (`--kv-format`): 65536 sequence-tokens under BF16, 7.11x that
+under hq-e8-2b, reported at load. The target max concurrency is N=8 (resident
+lanes with host-tier overflow, sized for a ~10-subagent concurrent workload).
 
 ## Repo layout
 
@@ -86,11 +96,15 @@ ignis/
 ├── crates/
 │   ├── core/        # scheduler, paged KV accounting, request state machine, host tier
 │   ├── artifact/    # .ninfer reader (reader / binder / materializer)
+│   ├── runtime/     # safe step-ABI wrapper (CudaLeaf, decode graphs)
 │   ├── server/      # HTTP + OpenAI schemas + telemetry
-│   └── bench/       # trace-replay harness + canary-suite runner
+│   ├── logging/     # structured logging (tracing layers, hotpath lint, trace context)
+│   ├── bench/       # trace-replay harness + gate/canary runner
+│   └── vendor/      # ADR 0010 vendoring tool (manifest, hashes, patch records)
 ├── kernel/          # C++/CUDA leaf: program + vendored ops (CMake + nvcc) + build.ps1
-├── bench/traces/    # recorded load traces (JSONL)
-├── docs/            # adr/, design/, agents/
+├── bench/traces/    # recorded load traces (JSONL; only the *.meta.json ship)
+├── scripts/         # gpu-preflight / gpu-profile / vendor-ninfer (PowerShell)
+├── docs/            # adr/, design/, agents/, findings/
 ├── CONTEXT.md       # glossary (domain vocabulary only)
 └── AGENTS.md        # agent conventions (issue tracker, testing)
 ```
@@ -196,8 +210,10 @@ evolve as the engine matures.
 
 > **Real completions on the GPU.** Built with `--features cuda` and a
 > verified `IGNIS_ARTIFACT`, the server loads the ~19 GB of weights into
-> VRAM, builds a modest fixed-size KV pool (8 sequences × 4096 tokens —
-> auto-sizing it from whatever VRAM the weights leave behind is later
+> VRAM, builds a paged KV pool from a 4 GiB byte budget across 8 decode
+> slots — 65536 sequence-tokens under the default BF16 KV format, each
+> sequence capped at the 40960-token default context; auto-sizing the budget
+> from the leaf's real free-VRAM headroom is later
 > work, `ignis_runtime::CudaLeafConfig`), and drives the real 64-layer
 > program for every request: streaming and non-streaming chat completions
 > stop at the model's own EOS token (`finish_reason: "stop"`) or at
@@ -222,6 +238,11 @@ full, always-current table.
 | `IGNIS_TELEMETRY` | `--telemetry <path>` | `-t` | — (stdout) | The telemetry JSONL sink path (a file). |
 | `IGNIS_ENABLE_THINKING` | `--enable-thinking <true\|false>` | — | `true` | The server-wide default for `enable_thinking`. |
 | `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |
+| `IGNIS_PREFILL_CHUNK` | `--prefill-chunk <tokens>` | — | `1024` | The prefill chunk width (a nonzero multiple of 128); the program's prefill scratch is reserved for it at load. |
+| `IGNIS_MAX_CONTEXT` | `--max-context <tokens>` | — | `40960` | The max per-sequence context (prompt + generation); the KV pool must be able to hold one of them. |
+| `IGNIS_KV_FORMAT` | `--kv-format <fmt>` | — | `bf16` | The KV cache format for this load: `bf16` or `hq-e8-2b` (ADR 0022). Decides what a pool byte budget is worth in tokens. |
+| `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | auto (4 GiB) | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context` fails the load by name. |
+| `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | — | `--help` | `-h` | — | Print the flag table and exit. |
 | — | `--version` | `-V` | — | Print the crate version and exit. |
 
@@ -302,15 +323,19 @@ cargo run -p ignis-bench -- canary --endpoint http://127.0.0.1:8000
 
 ## Telemetry
 
-JSONL — one line per event and one line per interval. Useful for watching
-scheduler behavior (admissions, evictions, throughput) while load runs:
+JSONL — one interval line per tick. Useful for watching scheduler behavior
+(queue depth, evictions, throughput) while load runs:
 
 ```jsonl
-{"kind":"interval","t":123,"waiting":2,"prefilling":1,"running":3,"kv_used_pct":62,"kv_evictions":0}
-{"kind":"request","id":"r-042","event":"ttft","ms":226}
-{"kind":"request","id":"r-042","event":"done","n":512,"tok_s":41.2}
-{"kind":"evict","tier":"ram","reason":"capacity"}
+{"kind":"interval","t":123,"waiting":2,"prefilling":0,"running":3,"kv_used_pct":0,"kv_evictions":1}
 ```
+
+Two caveats: `prefilling` and `kv_used_pct` report 0 until the scheduler
+exposes its live stats in `ignis-core` (the `kv_evictions` counter is real
+today); and the per-request lifecycle (`admitted` / `ttft` / `done`) is no
+longer JSONL — since GitHub #79 it is emitted as `ignis.request.*`
+structured-log events (the JSON/pretty layers of `ignis-logging`), with the
+request id doubling as the OTel trace id (ADR 0012).
 
 ---
 
