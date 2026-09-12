@@ -231,10 +231,18 @@ fn cmd_canary(args: &[String]) -> ExitCode {
     let consistent = canary::suite_consistent(&results);
     for r in &results {
         println!(
-            "canary {:<12} sane={} deterministic={}{}",
+            "canary {:<12} sane={} deterministic={} answer={}{}",
             r.id,
             r.sane,
             r.deterministic,
+            // GitHub #144: an empty answer because the turn was still
+            // thinking is a budget fact, and the report says so rather than
+            // leaving it to be inferred from an empty field.
+            if r.thinking_only() {
+                "thinking-only"
+            } else {
+                "reached"
+            },
             if r.consistent() { "" } else { "  <-- DIVERGENT" },
         );
         // An unsane canary carries the sanity reason (the divergence report

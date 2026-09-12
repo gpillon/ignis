@@ -48,6 +48,28 @@ pub const CANARIES: &[Canary] = &[
     },
 ];
 
+/// The output budget of every canary request.
+///
+/// It stays **64 under the serving default** (thinking on), which for most of
+/// these prompts is spent entirely on the reasoning channel — the turn thinks
+/// and never reaches an answer (GitHub #144). That is deliberate, not an
+/// oversight left in place:
+///
+/// - The canary's job (ADR 0007) is to catch a *degenerate engine* — empty,
+///   NUL-ridden or stuck-repeating generation — and that shows on either
+///   channel. 64 tokens of reasoning prove it as well as 64 tokens of answer,
+///   and [`CanaryResult::thinking_only`] says which was read.
+/// - Checking the **answer** is the canary oracle's job, and it already does
+///   it properly: teacher-forced, token by token, against a recorded fixture,
+///   with thinking off on purpose so there are answer tokens to compare
+///   (`crate::oracle`, ADR 0014). A bigger budget here would duplicate that
+///   badly — prose sanity instead of token agreement.
+/// - Every raise costs every canary run, and the suite is run at every gate.
+///
+/// Raise it only with an answer to "what does this catch that the oracle
+/// does not?".
+pub const CANARY_MAX_TOKENS: u32 = 64;
+
 /// The result of running one canary (sent twice for the determinism check).
 ///
 /// Serializable: the canary results *are* the divergence report, which is
@@ -83,6 +105,18 @@ impl CanaryResult {
     /// Overall self-consistency verdict: sane **and** deterministic.
     pub fn consistent(&self) -> bool {
         self.sane && self.deterministic
+    }
+
+    /// The turn thought and never reached an answer: the whole
+    /// [`CANARY_MAX_TOKENS`] budget went to the reasoning channel.
+    ///
+    /// This is what the report says instead of leaving a reader to infer it
+    /// from an empty `first` (GitHub #144). An empty answer *because the
+    /// engine was still thinking* is a budget fact; an empty answer with
+    /// nothing on either channel is a broken engine, and `sane` is false for
+    /// that one.
+    pub fn thinking_only(&self) -> bool {
+        self.first.trim().is_empty() && !self.first_reasoning.trim().is_empty()
     }
 }
 
@@ -205,7 +239,7 @@ pub fn run_canaries(ep: &dyn Endpoint) -> Vec<CanaryResult> {
                 id: format!("canary-{}", c.id),
                 class: RequestClass::Sub,
                 prompt: c.prompt.to_string(),
-                max_tokens: 64,
+                max_tokens: CANARY_MAX_TOKENS,
                 stream: false,
                 include_usage: false,
                 enable_thinking: None,
@@ -365,6 +399,39 @@ mod tests {
         );
         assert!(r.sane);
         assert!(!r.deterministic, "the reasoning diverged");
+    }
+
+    #[test]
+    fn a_thinking_only_turn_is_told_apart_from_a_dead_one() {
+        // GitHub #144. Both have an empty answer; only one of them is a
+        // finding. The report must not make a reader diff two empty strings
+        // to tell which.
+        let thinking = evaluate_channels(
+            "rust-sort",
+            Generation { content: "", reasoning: "the vector sorts in place, so " },
+            Generation { content: "", reasoning: "the vector sorts in place, so " },
+        );
+        assert!(thinking.thinking_only(), "the budget went to the thinking channel");
+        assert!(thinking.sane, "which is a budget fact, not a broken engine");
+
+        let dead = evaluate("dead", "", "");
+        assert!(!dead.thinking_only(), "nothing was generated on either channel");
+        assert!(!dead.sane);
+
+        let answered = evaluate_channels(
+            "math-greedy",
+            Generation { content: "10", reasoning: "2*3=6, +4 " },
+            Generation { content: "10", reasoning: "2*3=6, +4 " },
+        );
+        assert!(!answered.thinking_only(), "this turn reached its answer");
+    }
+
+    #[test]
+    fn the_canary_budget_is_the_named_one() {
+        // The budget is a decision with a rationale on it (GitHub #144), not
+        // a literal to be nudged: a change here should fail this test and
+        // send the author to read why 64.
+        assert_eq!(CANARY_MAX_TOKENS, 64);
     }
 
     #[test]
