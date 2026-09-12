@@ -45,41 +45,6 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &weight, ninfer::DType dtype,
   return ninfer::Tensor(const_cast<void *>(weight.qdata), dtype, shape);
 }
 
-// The pool stores one K/V plane run per GQA layer (`ignis_kv_plane_index`)
-// and allocates one block-table row per sequence slot. This view is
-// non-owning: the sequence's allocation keeps the mapping and pages alive
-// for the full call.
-//
-// GitHub #122: the view's planes and declared dtype follow the pool's own
-// format. Under hq-e8-2b the value planes carry the codec's 64-byte code
-// rows and the `*_scale_pages` slots carry its 8-byte metadata rows -- the
-// slots the vendored wrapper reads hq metadata from -- with quant_group 32,
-// which the wrapper requires an hq view to declare. Page addressing is the
-// same `paged_kv_element_offset` in both formats; only the plane's leading
-// extent differs, which is what makes the capacity math format-independent.
-ninfer::PagedKVLayerView cache_view(ignis_seq_pool *pool, ignis_seq *seq, uint32_t gqa_layer) {
-  const auto layer = static_cast<std::int32_t>(gqa_layer);
-  ninfer::PagedKVLayerView view;
-  view.k_pages =
-      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, layer, IGNIS_KV_PLANE_K));
-  view.v_pages =
-      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, layer, IGNIS_KV_PLANE_V));
-  if (pool->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
-    view.k_scale_pages =
-        pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, layer, IGNIS_KV_PLANE_K_META));
-    view.v_scale_pages =
-        pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, layer, IGNIS_KV_PLANE_V_META));
-    view.dtype       = ninfer::DType::U8;
-    view.quant_group = kIgnisHqQuantGroup;
-  } else {
-    view.dtype = ninfer::DType::BF16;
-  }
-  view.block_table = seq->kv.block_table();
-  view.head_dim = 256;
-  view.num_kv_heads = 4;
-  return view;
-}
-
 int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       uint32_t layer, void *in_residual, void *out_residual,
                       uint32_t gqa_layer, uint64_t num_tokens, LinearPolicyMode mode) {
@@ -157,7 +122,14 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // the engine encodes no threshold of its own. The shared numerical
     // contract of A1/A2/A3 (kernel/vendor/include/ninfer/ops/gqa_attention.h)
     // keeps the layer's output unchanged in form.
-    const ninfer::PagedKVLayerView cache = cache_view(pool, seq, gqa_layer);
+    // The pool stores one K/V plane run per GQA layer and allocates one
+    // block-table row per sequence slot; `ignis_kv_layer_view`
+    // (kernel/include/ignis_seq_internal.h) builds the view from the pool's
+    // own KV format (GitHub #122) and is shared with the leaf's own append
+    // test, so the hq plane selection here is the one under test rather than
+    // a second copy of it.
+    const ninfer::PagedKVLayerView cache =
+        ignis_kv_layer_view(pool, seq, static_cast<std::int32_t>(gqa_layer));
     // A1 takes the batched cache view. The leaf is single-sequence: the
     // sequence's block-table row IS the complete [logical_pages, 1] table
     // matrix, and table row 0 selects it (the kv_table_rows buffer below).

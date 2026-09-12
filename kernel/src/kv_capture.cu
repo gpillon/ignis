@@ -59,9 +59,21 @@ extern "C" int32_t ignis_kv_capture_rows(const struct ignis_seq_pool *pool,
     return -1;
   }
 
-  // Plane index mirrors ignis_seq_pool_create's own layout: two planes per
-  // GQA layer (K then V), page-major.
-  const std::size_t plane_index = static_cast<std::size_t>(2 * gqa_layer_ordinal + role);
+  // This seam reads BF16 value rows, which only a BF16 pool holds: an hq
+  // pool's planes are the codec's code and metadata bytes, and the row
+  // shape below does not describe them. Refused by name here rather than
+  // left to the `dtype != BF16` check further down, which would report a
+  // plane-level surprise instead of the actual cause (GitHub #122).
+  if (pool->kv_format != IGNIS_KV_FORMAT_BF16) {
+    set_error("ignis_kv_capture_rows: this pool stores KV in format " +
+             std::to_string(pool->kv_format) +
+             ", which holds no BF16 value rows -- this seam reads BF16 rows only");
+    return -1;
+  }
+  // Plane index comes from the pool's own layout helper
+  // (kernel/include/ignis_seq_internal.h), never re-derived here.
+  const std::size_t plane_index = ignis_kv_plane_index(
+      pool->kv_format, gqa_layer_ordinal, role == 0 ? IGNIS_KV_PLANE_K : IGNIS_KV_PLANE_V);
   const std::size_t plane_count = pool->kv_pool.plane_count();
   if (plane_index >= plane_count) {
     set_error("ignis_kv_capture_rows: plane_index " + std::to_string(plane_index) +

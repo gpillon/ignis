@@ -264,31 +264,6 @@ struct DeviceBytes {
   DeviceBytes &operator=(const DeviceBytes &) = delete;
 };
 
-// The cache view kernel/src/gqa_layer.cu builds for this layer, for whichever
-// format the pool holds -- rebuilt here rather than shared, because that one
-// is file-local to the layer and a test is not a reason to widen it.
-ninfer::PagedKVLayerView layer_view(ignis_seq_pool *pool, ignis_seq *seq) {
-  ninfer::PagedKVLayerView cache;
-  cache.k_pages =
-      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, kGqaOrdinal, IGNIS_KV_PLANE_K));
-  cache.v_pages =
-      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, kGqaOrdinal, IGNIS_KV_PLANE_V));
-  if (pool->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
-    cache.k_scale_pages = pool->kv_pool.plane(
-        ignis_kv_plane_index(pool->kv_format, kGqaOrdinal, IGNIS_KV_PLANE_K_META));
-    cache.v_scale_pages = pool->kv_pool.plane(
-        ignis_kv_plane_index(pool->kv_format, kGqaOrdinal, IGNIS_KV_PLANE_V_META));
-    cache.dtype       = ninfer::DType::U8;
-    cache.quant_group = kIgnisHqQuantGroup;
-  } else {
-    cache.dtype = ninfer::DType::BF16;
-  }
-  cache.block_table  = seq->kv.block_table();
-  cache.head_dim     = kHeadDim;
-  cache.num_kv_heads = kKvHeads;
-  return cache;
-}
-
 } // namespace
 
 int main() {
@@ -352,7 +327,11 @@ int main() {
          "bf16: the sequence under test is mapped to a non-zero physical page (the decoy holds "
          "the first page group)");
 
-    ninfer::ops::gqa_kv_append(k, v, positions, layer_view(pool, seq), /*stream=*/nullptr);
+    // The production view builder (kernel/include/ignis_seq_internal.h),
+    // not a copy of it: a wrong plane or a missing quant_group there has to
+    // turn this test red.
+    ninfer::ops::gqa_kv_append(k, v, positions, ignis_kv_layer_view(pool, seq, kGqaOrdinal),
+                               /*stream=*/nullptr);
     CUDA_FATAL(cudaStreamSynchronize(nullptr));
 
     const ninfer::Tensor &k_plane =
@@ -404,7 +383,11 @@ int main() {
     ignis_seq *seq = nullptr;
     expect_rc(ignis_seq_alloc(pool, kMaxContext, &seq), 0, "hq alloc");
 
-    ninfer::ops::gqa_kv_append(k, v, positions, layer_view(pool, seq), /*stream=*/nullptr);
+    // The production view builder (kernel/include/ignis_seq_internal.h),
+    // not a copy of it: a wrong plane or a missing quant_group there has to
+    // turn this test red.
+    ninfer::ops::gqa_kv_append(k, v, positions, ignis_kv_layer_view(pool, seq, kGqaOrdinal),
+                               /*stream=*/nullptr);
     CUDA_FATAL(cudaStreamSynchronize(nullptr));
 
     const ninfer::Tensor &code_plane =

@@ -18,7 +18,20 @@
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 
+#include "ops/kernel/hq_codec.cuh"
+
 #include <cuda_runtime.h>
+
+// `ignis_seq_internal.h` restates the codec's per-row byte budgets so that
+// header stays free of the codec's CUDA includes. This translation unit has
+// both, so it is where the restatement is checked: VENDOR.md's `verify`
+// catches an edited vendored file, never a constant copied out of one.
+static_assert(kIgnisHqCodeRowBytes == ninfer::ops::kHqRowBudgetBytes,
+              "kIgnisHqCodeRowBytes has drifted from the vendored kHqRowBudgetBytes");
+static_assert(kIgnisHqMetaRowBytes == ninfer::ops::kHqMetaBytes,
+              "kIgnisHqMetaRowBytes has drifted from the vendored kHqMetaBytes");
+static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
+              "kIgnisHqHeadDim has drifted from the vendored kHqHeadDim");
 
 #include <memory>
 #include <stdexcept>
@@ -91,9 +104,10 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
   // The codec's row budget is defined for a 256-dimension row only
   // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
   // append path cannot write.
-  if (spec->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B && spec->head_dim != 256) {
-    set_error("ignis_seq_pool_create: hq-e8-2b KV requires head_dim 256, got " +
-              std::to_string(spec->head_dim));
+  if (spec->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B &&
+      spec->head_dim != static_cast<std::uint32_t>(kIgnisHqHeadDim)) {
+    set_error("ignis_seq_pool_create: hq-e8-2b KV requires head_dim " +
+              std::to_string(kIgnisHqHeadDim) + ", got " + std::to_string(spec->head_dim));
     return -1;
   }
 
@@ -144,8 +158,10 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     auto pool = std::make_unique<ignis_seq_pool>(kv_bytes, kv_layout, gdn_bytes, gdn_layout,
                                                  sampling_counts_bytes,
                                                  static_cast<std::int32_t>(spec->vocab));
-    pool->kv_page_bytes = kv_page_bytes;
-    pool->kv_format     = spec->kv_format;
+    pool->kv_page_bytes   = kv_page_bytes;
+    pool->kv_format       = spec->kv_format;
+    pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
+    pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
       pool->free_slots.push_back(static_cast<std::int32_t>(i));

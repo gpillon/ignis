@@ -107,7 +107,8 @@ struct ignis_seq_pool_stats {
   uint32_t kv_page_group_count;
   uint32_t kv_entitled_pages;
   uint32_t kv_free_pages;
-  /* Bytes of one physical KV page across every plane (K + V). */
+  /* Bytes of one physical KV page across every plane of every GQA layer --
+   * K and V under BF16, their code and metadata planes under hq-e8-2b. */
   uint64_t kv_page_bytes;
   uint32_t logical_page_capacity;
   uint32_t slot_count;

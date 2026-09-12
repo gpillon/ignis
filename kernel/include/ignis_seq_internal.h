@@ -17,6 +17,7 @@
 #include "core/paged_kv_cache.h"
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -44,6 +45,7 @@ inline constexpr int32_t kIgnisGqaLayerCount = 16;
  * gqa_attention wrapper requires an hq cache view to declare. */
 inline constexpr int32_t kIgnisHqCodeRowBytes = 64;
 inline constexpr int32_t kIgnisHqMetaRowBytes = 8;
+inline constexpr int32_t kIgnisHqHeadDim      = 256;
 inline constexpr int32_t kIgnisHqQuantGroup   = 32;
 
 /* Planes one GQA layer's K/V history occupies, per format: BF16 stores one
@@ -72,11 +74,15 @@ enum ignis_kv_plane_role {
 /* The pool plane index of one GQA layer's `role` plane.
  *
  * BF16 has no metadata planes at all, so its V plane sits at offset 1, not
- * 2; a BF16 caller asking for a metadata role gets its own role's value
- * plane back, which is a caller bug (check the format first, as
- * kernel/src/gqa_layer.cu's `cache_view` does) and never a metadata row. */
-inline constexpr std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
-                                                  ignis_kv_plane_role role) {
+ * 2, and asking a BF16 pool for a metadata role is a caller bug: there is no
+ * plane that could answer, so it asserts rather than handing back a
+ * plausible wrong plane. Check the format first, the way
+ * `ignis_kv_layer_view` below does. */
+inline std::size_t ignis_kv_plane_index(int32_t kv_format, int32_t gqa_layer,
+                                        ignis_kv_plane_role role) {
+  const bool wants_meta = role == IGNIS_KV_PLANE_K_META || role == IGNIS_KV_PLANE_V_META;
+  assert((!wants_meta || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) &&
+         "a BF16 KV pool has no metadata planes");
   const bool is_v      = role == IGNIS_KV_PLANE_V || role == IGNIS_KV_PLANE_V_META;
   const int32_t within = kv_format == IGNIS_KV_FORMAT_HQ_E8_2B ? static_cast<int32_t>(role)
                                                                : (is_v ? 1 : 0);
@@ -94,6 +100,11 @@ struct ignis_seq_pool {
   /* One of enum ignis_kv_format: what every plane above stores, fixed for
    * the life of this pool (ADR 0022). */
   std::int32_t kv_format = IGNIS_KV_FORMAT_BF16;
+  /* The head geometry the pool was built with. Kept because it cannot be
+   * read back off the planes under every format: an hq code plane's leading
+   * extent is the codec's row budget, not head_dim. */
+  std::int32_t kv_head_dim     = 0;
+  std::int32_t kv_num_kv_heads = 0;
   std::vector<std::int32_t> free_slots;
 
   // P3-03 (GitHub #99): one int32 occurrence count per vocab entry, per slot
@@ -144,5 +155,46 @@ struct ignis_seq {
   // prefixes.
   std::uint64_t position = 0;
 };
+
+/* The single-sequence cache view one GQA layer's ops take, built from the
+ * pool's own KV format (P4-04, GitHub #122).
+ *
+ * Lives here rather than in kernel/src/gqa_layer.cu so the one function that
+ * decides which planes and which declared dtype an hq view carries is the
+ * one under test (kernel/tests/test_kv_append_format.cu) -- a second copy in
+ * the test would leave a bug in this one invisible.
+ *
+ * Under hq-e8-2b the value planes carry the codec's 64-byte code rows and
+ * the `*_scale_pages` slots carry its 8-byte metadata rows (the slots the
+ * vendored gqa_attention wrapper reads hq metadata from), with quant_group
+ * 32, which that wrapper requires an hq view to declare. Page addressing is
+ * the same `paged_kv_element_offset` in both formats; only a plane's leading
+ * extent differs, which is what keeps capacity math format-independent.
+ *
+ * The view is non-owning: `seq`'s allocation keeps the mapping and pages
+ * alive for as long as the caller uses it. The residual planes stay empty --
+ * the hq residual window is not a feature this engine has opted into. */
+inline ninfer::PagedKVLayerView ignis_kv_layer_view(ignis_seq_pool *pool, ignis_seq *seq,
+                                                    std::int32_t gqa_layer) {
+  ninfer::PagedKVLayerView view;
+  view.k_pages =
+      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_K));
+  view.v_pages =
+      pool->kv_pool.plane(ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_V));
+  if (pool->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
+    view.k_scale_pages = pool->kv_pool.plane(
+        ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_K_META));
+    view.v_scale_pages = pool->kv_pool.plane(
+        ignis_kv_plane_index(pool->kv_format, gqa_layer, IGNIS_KV_PLANE_V_META));
+    view.dtype       = ninfer::DType::U8;
+    view.quant_group = kIgnisHqQuantGroup;
+  } else {
+    view.dtype = ninfer::DType::BF16;
+  }
+  view.block_table  = seq->kv.block_table();
+  view.head_dim     = pool->kv_head_dim;
+  view.num_kv_heads = pool->kv_num_kv_heads;
+  return view;
+}
 
 #endif /* IGNIS_SEQ_INTERNAL_H */
