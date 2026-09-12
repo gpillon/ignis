@@ -1,0 +1,23 @@
+{
+  "model": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "stream": true,
+  "max_tokens": 4000,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file from the repository",
+        "parameters": {
+          "type": "object",
+          "properties": {"path": {"type": "string"}},
+          "required": ["path"]
+        }
+      }
+    }
+  ],
+  "messages": [
+    {"role": "system", "content": "You are a coding agent working in the ignis repository. You have a read_file tool. Use it when you need file content before answering."},
+    {"role": "user", "content": "I need to know exactly what the g4-gate refuses a verdict for. Use the read_file tool to read crates/bench/src/g4_gate.rs, then summarize the refusal conditions in a short list."}
+  ]
+}

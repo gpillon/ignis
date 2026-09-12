@@ -1,0 +1,30 @@
+[
+  {
+    "id": "rust-hello",
+    "sane": true,
+    "deterministic": true,
+    "first": "It defines the entry point of a Rust program that prints the string \"hi\" to the standard output.",
+    "second": "It defines the entry point of a Rust program that prints the string \"hi\" to the standard output."
+  },
+  {
+    "id": "rust-sort",
+    "sane": true,
+    "deterministic": true,
+    "first": "After the call, `v` is set to `[1, 2, 3]`.\n\n**Explanation:**\n- `vec![3, 1, 2]` creates a vector with elements in that order.\n- `v.sort()` sorts the vector **in place** in ascending order.",
+    "second": "After the call, `v` is set to `[1, 2, 3]`.\n\n**Explanation:**\n- `vec![3, 1, 2]` creates a vector with elements in that order.\n- `v.sort()` sorts the vector **in place** in ascending order."
+  },
+  {
+    "id": "math-greedy",
+    "sane": true,
+    "deterministic": true,
+    "first": "To compute the expression $2 \\times 3 + 4$, we follow the standard order of operations (PEMDAS/BODMAS), which dictates that multiplication must be performed before addition.\n\n**Step 1: Perform the multiplication**\n$$2 \\times 3 = 6$$\n\n**Step ",
+    "second": "To compute the expression $2 \\times 3 + 4$, we follow the standard order of operations (PEMDAS/BODMAS), which dictates that multiplication must be performed before addition.\n\n**Step 1: Perform the multiplication**\n$$2 \\times 3 = 6$$\n\n**Step "
+  },
+  {
+    "id": "explain-reverse",
+    "sane": true,
+    "deterministic": true,
+    "first": "The method `x.reverse()` reverses the order of the elements in the vector `x` in place, so that the first element becomes the last and the last becomes the first.",
+    "second": "The method `x.reverse()` reverses the order of the elements in the vector `x` in place, so that the first element becomes the last and the last becomes the first."
+  }
+]

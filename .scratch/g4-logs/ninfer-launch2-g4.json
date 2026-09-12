@@ -1,0 +1,116 @@
+{
+  "session": "g4-20260912T162610Z",
+  "trace_sha256": "51d44a789e99223748493f06c707a9aaa2594cb555576c15135eadd9fd531b7b",
+  "label": "ninfer",
+  "endpoint": "http://127.0.0.1:8080",
+  "engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-capacity 465984, max-context 262144",
+  "date": "2026-09-12T17:27:57Z",
+  "run": {
+    "label": "ninfer",
+    "metrics": [
+      {
+        "id": "req-001",
+        "class": "main",
+        "ttft_ms": 520602.55170000007,
+        "n_tokens": 0,
+        "total_ms": 520602.55170000007,
+        "ok": true
+      },
+      {
+        "id": "req-002",
+        "class": "sub",
+        "ttft_ms": 443493.11929999996,
+        "n_tokens": 0,
+        "total_ms": 443493.11929999996,
+        "ok": true
+      },
+      {
+        "id": "req-003",
+        "class": "sub",
+        "ttft_ms": 441396.1617,
+        "n_tokens": 0,
+        "total_ms": 441396.1617,
+        "ok": true
+      },
+      {
+        "id": "req-004",
+        "class": "sub",
+        "ttft_ms": 16289.8252,
+        "n_tokens": 23,
+        "total_ms": 18408.0111,
+        "ok": true
+      },
+      {
+        "id": "req-005",
+        "class": "sub",
+        "ttft_ms": 437162.38920000003,
+        "n_tokens": 0,
+        "total_ms": 437162.38920000003,
+        "ok": true
+      },
+      {
+        "id": "req-006",
+        "class": "sub",
+        "ttft_ms": 435059.9643,
+        "n_tokens": 0,
+        "total_ms": 435059.9643,
+        "ok": true
+      },
+      {
+        "id": "req-007",
+        "class": "sub",
+        "ttft_ms": 432954.08170000004,
+        "n_tokens": 0,
+        "total_ms": 432954.08170000004,
+        "ok": true
+      },
+      {
+        "id": "req-008",
+        "class": "sub",
+        "ttft_ms": 45191.2391,
+        "n_tokens": 23,
+        "total_ms": 59505.44,
+        "ok": true
+      },
+      {
+        "id": "req-009",
+        "class": "sub",
+        "ttft_ms": 0.0,
+        "n_tokens": 0,
+        "total_ms": 0.0,
+        "ok": false
+      },
+      {
+        "id": "req-010",
+        "class": "sub",
+        "ttft_ms": 10403.8947,
+        "n_tokens": 91,
+        "total_ms": 16135.031600000002,
+        "ok": true
+      },
+      {
+        "id": "req-011",
+        "class": "sub",
+        "ttft_ms": 8944.618999999999,
+        "n_tokens": 119,
+        "total_ms": 15991.3364,
+        "ok": true
+      }
+    ]
+  },
+  "needles": [
+    {
+      "context_tokens": 65536,
+      "secret": "432896",
+      "retrieved": true
+    },
+    {
+      "context_tokens": 131072,
+      "secret": "765792",
+      "retrieved": false,
+      "error": "the request failed: POST http://127.0.0.1:8080/v1/chat/completions: read SSE: error decoding response body"
+    }
+  ]
+}
