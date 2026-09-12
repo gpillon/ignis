@@ -1,0 +1,89 @@
+{
+  "session": "g4-20260912T162610Z",
+  "trace_sha256": "51d44a789e99223748493f06c707a9aaa2594cb555576c15135eadd9fd531b7b",
+  "ours_label": "ignis",
+  "reference_label": "ninfer",
+  "ours_launches": 2,
+  "reference_launches": 2,
+  "threshold": 0.99,
+  "per_class": [
+    {
+      "label": "main",
+      "ours_pooled_tok_s": 0.0,
+      "reference_pooled_tok_s": 4.593989417194097,
+      "ratio": 0.0,
+      "passed": false,
+      "ours_launch_tok_s": [
+        0.0,
+        0.0
+      ],
+      "reference_launch_tok_s": [
+        4.593989417194097,
+        0.0
+      ],
+      "ours_across_launch_spread_pct": 0.0,
+      "reference_across_launch_spread_pct": 100.0,
+      "ours_within_launch_spread_pct": 0.0,
+      "reference_within_launch_spread_pct": 0.0,
+      "spread_flagged": true
+    },
+    {
+      "label": "sub",
+      "ours_pooled_tok_s": 16.20337677028606,
+      "reference_pooled_tok_s": 11.394996228422904,
+      "ratio": 1.4219729823051155,
+      "passed": true,
+      "ours_launch_tok_s": [
+        13.03497687522934,
+        21.383000567637552
+      ],
+      "reference_launch_tok_s": [
+        15.697095980308418,
+        8.627111263384949
+      ],
+      "ours_across_launch_spread_pct": 24.254835154871472,
+      "reference_across_launch_spread_pct": 29.06563262717034,
+      "ours_within_launch_spread_pct": 126.24790675747737,
+      "reference_within_launch_spread_pct": 149.55212875788726,
+      "spread_flagged": false
+    }
+  ],
+  "aggregate": {
+    "label": "aggregate",
+    "ours_pooled_tok_s": 16.20337677028606,
+    "reference_pooled_tok_s": 10.350806756514325,
+    "ratio": 1.5654216286173437,
+    "passed": true,
+    "ours_launch_tok_s": [
+      13.03497687522934,
+      21.383000567637552
+    ],
+    "reference_launch_tok_s": [
+      12.181678956301965,
+      8.627111263384949
+    ],
+    "ours_across_launch_spread_pct": 24.254835154871472,
+    "reference_across_launch_spread_pct": 17.082048765882067,
+    "ours_within_launch_spread_pct": 136.13371131615108,
+    "reference_within_launch_spread_pct": 160.00757212587553,
+    "spread_flagged": false
+  },
+  "needles": [
+    {
+      "context_tokens": 65536,
+      "ours_retrieved": true,
+      "reference_retrieved": true,
+      "passed": true
+    },
+    {
+      "context_tokens": 131072,
+      "ours_retrieved": false,
+      "reference_retrieved": false,
+      "passed": false
+    }
+  ],
+  "notes": [
+    "G4 gate run, session g4-20260912T162610Z, GitHub #128"
+  ],
+  "passed": false
+}
