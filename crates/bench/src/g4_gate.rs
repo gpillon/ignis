@@ -274,6 +274,21 @@ fn within_launch_spread_pct(record: &Record, class: Option<RequestClass>) -> f64
     coefficient_of_variation(&values)
 }
 
+/// Every request of `class` across `records` that failed or generated
+/// nothing, as `"<id> (launch <n>)"` (GitHub #147).
+fn unmeasured_requests(records: &[Record], class: Option<RequestClass>) -> Vec<String> {
+    records
+        .iter()
+        .enumerate()
+        .flat_map(|(i, r)| {
+            class_metrics(r, class)
+                .into_iter()
+                .filter(|m| !m.is_measurement())
+                .map(move |m| format!("{} (launch {})", m.id, i + 1))
+        })
+        .collect()
+}
+
 /// Build one cell's pooled verdict (a class, or the aggregate).
 fn pooled_cell(
     label: &str,
@@ -281,6 +296,24 @@ fn pooled_cell(
     reference: &[Record],
     class: Option<RequestClass>,
 ) -> Result<CellVerdict, Refusal> {
+    // GitHub #147: a request that failed or generated nothing contributes
+    // wall time and no tokens, so a cell holding one reads as a slow engine —
+    // with a single `main` request, as 0.000 tok/s. That is not a
+    // measurement to rank, on either side, and both sides are named.
+    let unmeasured: Vec<String> = [ours, reference]
+        .into_iter()
+        .filter_map(|side| {
+            let ids = unmeasured_requests(side, class);
+            (!ids.is_empty()).then(|| format!("{}'s records: {}", side[0].label, ids.join(", ")))
+        })
+        .collect();
+    if !unmeasured.is_empty() {
+        return Err(Refusal(format!(
+            "the `{label}` cell holds requests that failed or generated no tokens — {} — a cell \
+             computed from them is not a measurement",
+            unmeasured.join("; ")
+        )));
+    }
     let ours_pooled = pooled_stats(ours, class).ok_or_else(|| {
         Refusal(format!(
             "the `{label}` cell has no requests in {}'s records — nothing to compare",
@@ -298,6 +331,15 @@ fn pooled_cell(
             "the reference's `{label}` cell has a pooled aggregate of {} tok/s: a ratio against \
              it would be meaningless",
             reference_pooled.tok_s
+        )));
+    }
+    // A cell of single-token requests generated something but decoded
+    // nothing: ranking its 0.0 tok/s would be the #147 failure again.
+    if ours_pooled.tok_s <= 0.0 {
+        return Err(Refusal(format!(
+            "{}'s `{label}` cell has a pooled aggregate of {} tok/s (no decode phase): ranking \
+             it would be meaningless",
+            ours[0].label, ours_pooled.tok_s
         )));
     }
     let ratio = ours_pooled.tok_s / reference_pooled.tok_s;
@@ -597,6 +639,92 @@ mod tests {
         let ours = vec![mk("ignis"), mk("ignis")];
         let reference = vec![mk("reference"), mk("reference")];
         let refusal = check(&ours, &reference).expect_err("must refuse");
+        assert!(refusal.0.contains("meaningless"), "{refusal}");
+    }
+
+    #[test]
+    fn a_cell_holding_a_request_that_generated_nothing_is_refused_not_ranked() {
+        // GitHub #147: the trace's single `main` request came back with zero
+        // tokens and `ok: true` (a record written before the harness refused
+        // that), so the cell read 0.000 tok/s and was ranked as a FAIL.
+        let mut ours = vec![
+            record("ignis", "S1", "abc", 100.0, true),
+            record("ignis", "S1", "abc", 100.0, true),
+        ];
+        let reference = vec![
+            record("reference", "S1", "abc", 100.0, true),
+            record("reference", "S1", "abc", 100.0, true),
+        ];
+        let main = ours[1].run.metrics.iter_mut().find(|m| m.class == RequestClass::Main).unwrap();
+        main.n_tokens = 0;
+        main.ttft_ms = 451_653.7;
+        main.total_ms = 451_653.7;
+        let refusal = check(&ours, &reference).expect_err("must refuse");
+        for expected in ["`main`", "ignis", "launch 2", "not a measurement"] {
+            assert!(refusal.0.contains(expected), "must mention {expected}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_failed_request_on_the_reference_side_is_refused_and_named() {
+        let ours = vec![
+            record("ignis", "S1", "abc", 100.0, true),
+            record("ignis", "S1", "abc", 100.0, true),
+        ];
+        let mut reference = vec![
+            record("reference", "S1", "abc", 100.0, true),
+            record("reference", "S1", "abc", 100.0, true),
+        ];
+        let sub = reference[0].run.metrics.iter_mut().find(|m| m.class == RequestClass::Sub).unwrap();
+        sub.ok = false;
+        let refusal = check(&ours, &reference).expect_err("must refuse");
+        for expected in ["`sub`", "reference", "launch 1", "not a measurement"] {
+            assert!(refusal.0.contains(expected), "must mention {expected}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn unmeasured_requests_on_both_sides_are_all_named() {
+        // The #128 records had an empty `main` on both engines; naming only
+        // the first side would hide the reference's.
+        let mut ours = vec![
+            record("ignis", "S1", "abc", 100.0, true),
+            record("ignis", "S1", "abc", 100.0, true),
+        ];
+        let mut reference = vec![
+            record("reference", "S1", "abc", 100.0, true),
+            record("reference", "S1", "abc", 100.0, true),
+        ];
+        for m in ours[0].run.metrics.iter_mut().chain(reference[1].run.metrics.iter_mut()) {
+            if m.class == RequestClass::Main {
+                m.n_tokens = 0;
+            }
+        }
+        let refusal = check(&ours, &reference).expect_err("must refuse");
+        for expected in ["ignis", "main (launch 1)", "reference", "main (launch 2)"] {
+            assert!(refusal.0.contains(expected), "must mention {expected}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_zero_tok_s_cell_on_our_side_is_refused_rather_than_ranked() {
+        // One token is a generated token but no decoded one: our cell would
+        // read 0.000 tok/s exactly as an empty request did (GitHub #147).
+        let mut ours = vec![
+            record("ignis", "S1", "abc", 100.0, true),
+            record("ignis", "S1", "abc", 100.0, true),
+        ];
+        let reference = vec![
+            record("reference", "S1", "abc", 100.0, true),
+            record("reference", "S1", "abc", 100.0, true),
+        ];
+        for r in &mut ours {
+            let main = r.run.metrics.iter_mut().find(|m| m.class == RequestClass::Main).unwrap();
+            main.n_tokens = 1;
+            main.total_ms = main.ttft_ms;
+        }
+        let refusal = check(&ours, &reference).expect_err("must refuse");
+        assert!(refusal.0.contains("ignis") && refusal.0.contains("`main`"), "{refusal}");
         assert!(refusal.0.contains("meaningless"), "{refusal}");
     }
 
