@@ -336,6 +336,15 @@ When output names a domain concept, use the term as defined here.
   from the first content token, so no prefix cache or host KV tier on
   either engine can serve it; the engine's own computed-prefill-token count
   must equal the prompt length or the sample is void.
+- **ITL measurement window** — the stretch of a G3 ITL cell in which *every*
+  decode lane was alive: it opens at the last lane's first token and closes at
+  the first lane's end, and only the prefill windows closing inside it are
+  pooled against. A lane the harness cancelled ends at the cancellation, since
+  it was generating until then; a lane the engine ended — its own EOS, the
+  safety cap — ends at its last token. The window is what keeps a pooled
+  interval honest (all four lanes decoding beside it) without making the leg
+  hostage to which of the three terminators fired first
+  ([ITL lane terminator race](docs/findings/2026-09-13-itl-lane-terminator-race.md)).
 - **Live/live gate** — how G2 is judged: ignis and the reference measured on
   the same TTFT cells in the same session on the same machine, and the
   ratio ignis/reference must be ≤ 1.5. A committed reference record exists

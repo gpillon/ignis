@@ -137,7 +137,7 @@ oracle.
 42. As the engine owner, I want each cell's fixture stated as reserved `context_tokens`, so that a fixture is sized against what `ignis_seq_alloc` actually takes from the pool.
 43. As the engine owner, I want the ITL cell to repeat its cold prefill ten times, so that the percentile it reports has a distribution behind it.
 44. As the engine owner, I want those ten prefillers to be sequential, each released before the next is allocated, so that the cell measures one active prefill and not a concurrency this phase does not have.
-45. As the engine owner, I want the four decode lanes to stay alive across the whole series, so that their inter-token latency is sampled continuously rather than restarted.
+45. As the engine owner, I want the four decode lanes held open for as much of the series as the engine will keep them, and never restarted mid-cell, so that their inter-token latency is sampled continuously rather than stitched together across requests (the lanes are asked to outlive the whole series; how much of it they actually cover is story 53's concern).
 46. As the engine owner, I want p50, p95, p99 and max all recorded even though p95 decides, so that a later reader can see the shape and not only the verdict.
 47. As the engine owner, I want each generation cap derived from the measured window, so that reserved pages are not wasted on tokens no cell will generate.
 48. As the engine owner, I want the gate to state that N=8 at long context is unreachable with BF16 KV, so that nobody reads G3's concurrency as a promise G4 has not yet delivered.
@@ -145,6 +145,7 @@ oracle.
 50. As the engine owner, I want any correctness regression found at G3 filed as its own ticket, so that no gap is waived to make a gate pass.
 51. As a coding-agent user, I want my tokens to keep arriving while another agent's session starts up, so that one long prompt does not freeze the others.
 52. As a coding-agent user, I want my sampling settings honoured regardless of who else is being served in the same round, so that reproducibility is mine and not the batch's.
+53. As the engine owner, I want the ITL cell to pool only the stretch of the series in which every decode lane was alive, and to report how much of the series that was, so that a lane the engine ends early costs me distribution rather than the whole leg (GitHub #139).
 
 ## Implementation Decisions
 
@@ -240,8 +241,10 @@ per engine is not a valid G3 reading.
 The ITL cell runs **ten sequential cold prefillers**: each 32,768-token
 prefiller is allocated, prefilled, and released before the next is
 allocated, every prompt cold and distinct under ADR 0015's rule, while the
-four decode lanes stay alive across the whole series. The lanes' inter-token
-intervals are sampled for the entire series; p50, p95, p99 and max are all
+four decode lanes are held open beside it. The lanes' inter-token intervals
+are sampled across the measurement window -- the stretch in which all four
+were alive, which is the whole series when the engine keeps them that long
+and less when it does not (see below); p50, p95, p99 and max are all
 recorded and p95 decides. The original 512-token estimate was falsified by
 the live reference: lanes exhausted it after 15-19 seconds while the ten
 prefillers lasted about 62 seconds. The instrument cancels every lane once
@@ -255,10 +258,39 @@ Cancellation is the intended terminator but not a guaranteed one: an
 endpoint that honors neither ignis `ignore_eos` nor `logit_bias` still stops
 at its own EOS, and a fast enough engine reaches the safety cap first. The
 measurement does not depend on which of the three ends a lane. What it
-depends on is the guard that refuses any lane ending before the final
-prefill window closed, so every pooled interval comes from a series that had
-all four lanes alive throughout. A run in which a leg's lanes end on the cap
-is a run whose cap is load-bearing rather than spare.
+depends on is that every pooled interval comes from a stretch of the series
+that had all four lanes alive.
+
+**The cell measures the window its lanes shared, and says how much of the
+series that covered (#139).** The **measurement window** opens at the last
+lane's first token and closes at the first lane's end; only prefillers whose
+request-start -> first-token window closes inside it are pooled against, and
+only intervals lying inside it are pooled at all. A lane the harness
+cancelled was generating up to that moment, so its end is the cancellation,
+not its last observed token; only a lane the *engine* ended -- on its own
+EOS, on the cap -- ends where its last token arrived.
+
+The earlier rule refused any lane that ended before the final prefill window
+closed. That refused legs for reasons carrying no information about either
+engine: the reference honors neither suppression knob, so its lanes stop at
+their own EOS wherever the content puts it, and the cap arm of the same race
+tightens as an engine gets *faster* -- against ignis, precisely as ignis
+approaches what this gate exists to measure. The three refused reference legs
+of #139 covered 6, 7 and 8 of their 10 prefill windows, and the p95 they
+already carried sat within 0.7% of the leg that was accepted.
+
+What the shortened window costs is distribution, not validity, so the record
+carries the window and its coverage and the gate refuses only below
+`ITL_MIN_COVERED_PREFILLERS` (2) -- a percentile over one prefill window is
+an anecdote, which is what the ten prefillers of story 43 exist to prevent. A
+leg covering fewer than all ten is warned about by name, on both the record
+and the verdict, and a verdict whose two sides pooled different amounts of
+the series says so rather than correcting for it. A run in which a leg's
+lanes end on the cap is still a run whose cap is load-bearing rather than
+spare. The evidence behind this rule -- the three refused reference legs
+recomputed against the shared span, and the reference's handling of both
+suppression knobs read off its own source -- is
+[ITL lane terminator race](../../../docs/findings/2026-09-13-itl-lane-terminator-race.md).
 
 **The safety cap is 4,032, the largest the pool admits (#114).** #104's
 first estimate of 512 was falsified above; 3,072 replaced it and was itself

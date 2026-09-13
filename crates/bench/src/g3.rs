@@ -59,8 +59,14 @@ pub const C4_CONCURRENCY: usize = 4;
 /// had its length decided by the fixture rather than by what it is
 /// measuring. #110's reference leg ended that way, clearing the final
 /// prefill window by only 3.4 to 7.0 s out of a 101 s run, so a reference
-/// some 7% faster would have exhausted the cap first and had its lane
-/// refused (GitHub #114).
+/// some 7% faster would have exhausted the cap first (GitHub #114).
+///
+/// Since #139 that is a *shorter* measurement, not a refused one: the cell
+/// measures the span all lanes shared and reports how much of the
+/// prefiller series it covered ([`ItlCell::window_warning`]). The cap
+/// being load-bearing therefore costs distribution rather than the leg —
+/// which matters because the engine this gate exists to make faster is the
+/// one that hits the cap first.
 ///
 /// 4,032 is the largest cap the pool admits, so it is the most runway this
 /// fixture can buy. Admission reserves `ceil((prompt + token budget) / 64)`
@@ -86,6 +92,20 @@ pub const ITL_DECODE_MAX_TOKENS: u32 = 4_032;
 pub const ITL_DECODE_LANES: usize = 4;
 const ITL_DECODE_INSTRUCTION: &str =
     "Produce at least 4032 tokens. Do not stop, conclude, or emit EOS earlier.";
+
+/// The fewest prefill windows the measurement window may cover before the
+/// ITL cell reports an anecdote rather than a distribution (GitHub #139).
+///
+/// The window is bounded by the *shortest-lived* decode lane, and three
+/// different things can end one: the harness cancelling it at the end of
+/// the prefiller series (what the fixture intends), the engine's own EOS
+/// when the endpoint honours neither `ignore_eos` nor a `logit_bias`
+/// exclusion, or [`ITL_DECODE_MAX_TOKENS`] when the engine is fast enough
+/// to exhaust it first. The cell measures whatever span all four lanes
+/// shared, so none of the three voids it — but spec 03 asks for ten
+/// prefillers so the percentile has a distribution behind it, and a window
+/// covering one has none at all.
+pub const ITL_MIN_COVERED_PREFILLERS: usize = 2;
 
 /// The ITL cell's prefillers: prompt 32,768, cap 64, run ten times,
 /// sequentially, each released before the next is allocated.
@@ -406,6 +426,15 @@ pub struct DecodeLaneTrace {
     pub error: Option<String>,
 }
 
+impl DecodeLaneTrace {
+    /// When this lane's last content token arrived, on the cell's shared
+    /// monotonic timeline. A lane with no tokens never decoded, so this is
+    /// its own request start.
+    pub fn end_ms(&self) -> f64 {
+        self.started_ms + self.token_times_ms.last().copied().unwrap_or(0.0)
+    }
+}
+
 /// The ITL cell: the ten sequential prefillers, the four continuous decode
 /// lanes, and the pooled inter-token-interval percentiles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -418,8 +447,38 @@ pub struct ItlCell {
     pub decode_lanes: usize,
     pub prefillers: Vec<PrefillerSample>,
     pub lanes: Vec<DecodeLaneTrace>,
-    /// Every decode lane's inter-token intervals that overlap a prefiller's
-    /// request-start -> first-token window, pooled across the series.
+    /// The **measurement window**: the span of the cell's shared monotonic
+    /// timeline in which every decode lane was alive. It opens at the last
+    /// lane's first token and closes with the first lane to end, so a lane
+    /// the engine ended early — at its own EOS, or on the safety cap —
+    /// shortens the window instead of voiding the cell (GitHub #139).
+    ///
+    /// Where a lane *ends* depends on who ended it. One the harness
+    /// cancelled was generating up to the cancellation, so that is its end;
+    /// only a lane the engine stopped ends at its last observed token.
+    /// Otherwise the window's close would be a race between a lane's final
+    /// SSE chunk and the harness's own store, which is a property of
+    /// neither engine.
+    ///
+    /// The opening is guaranteed rather than merely measured: the harness
+    /// does not send the first prefiller until every lane has produced a
+    /// token, so `window_start_ms` always precedes the series. It is
+    /// recorded so a reader can see it instead of trusting it.
+    #[serde(default)]
+    pub window_start_ms: f64,
+    /// Where the measurement window closed (see
+    /// [`ItlCell::window_start_ms`]).
+    #[serde(default)]
+    pub window_end_ms: f64,
+    /// How many prefillers reached their first token inside the
+    /// measurement window. Only those are pooled against, so this — not
+    /// [`ItlCell::prefill_count`] — is the size of the distribution behind
+    /// the percentiles.
+    #[serde(default)]
+    pub prefillers_covered: usize,
+    /// Every decode lane's inter-token intervals that lie inside the
+    /// measurement window and overlap a covered prefiller's request-start
+    /// -> first-token window, pooled across the series.
     pub intervals_ms: Vec<f64>,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
@@ -431,8 +490,10 @@ pub struct ItlCell {
 
 impl ItlCell {
     /// True when every prefiller was provably cold, every decode lane
-    /// completed, and the cell has intervals to report — the property a
-    /// gate verdict may be computed over.
+    /// completed, the measurement window covered enough of the series to
+    /// be a distribution ([`ITL_MIN_COVERED_PREFILLERS`]), and the cell has
+    /// intervals to report — the property a gate verdict may be computed
+    /// over.
     pub fn all_cold(&self) -> bool {
         self.error.is_none()
             && !self.prefillers.is_empty()
@@ -442,7 +503,14 @@ impl ItlCell {
                 .all(|p| !p.void && p.first_token_ms > p.started_ms)
             && !self.lanes.is_empty()
             && self.lanes.iter().all(|l| l.error.is_none())
+            && self.covers_enough()
             && !self.intervals_ms.is_empty()
+    }
+
+    /// Whether the measurement window covered enough of the prefiller
+    /// series to stand behind a percentile ([`ITL_MIN_COVERED_PREFILLERS`]).
+    pub fn covers_enough(&self) -> bool {
+        self.prefillers_covered >= ITL_MIN_COVERED_PREFILLERS
     }
 
     /// The prefillers that are not provably cold, with their reasons.
@@ -451,18 +519,65 @@ impl ItlCell {
     }
 
     /// The lanes the fixture's safety cap ended rather than the measurement
-    /// boundary (GitHub #114). Not an error: such a run can still be valid,
-    /// because the pooling guard only requires every lane to outlive the
-    /// final prefill window. It does mean the cap is load-bearing rather
-    /// than spare, so a slightly faster engine would fail this cell for a
-    /// fixture reason -- which is worth saying out loud rather than leaving
-    /// to a reader who notices a token count equal to the cap.
+    /// boundary (GitHub #114). Not an error: the cell measures the span
+    /// every lane shared, so a capped lane shortens the measurement window
+    /// rather than contaminating it. It does mean the cap was
+    /// load-bearing for this leg, which is worth saying out loud rather
+    /// than leaving to a reader who notices a token count equal to the cap.
     pub fn lanes_on_cap(&self) -> Vec<&DecodeLaneTrace> {
         self.lanes.iter().filter(|lane| lane.finish.is_cap()).collect()
     }
 
-    /// A one-line warning when the cap decided any lane's length, or `None`
-    /// when the measurement boundary closed them all.
+    /// The lane that closed the measurement window early — the first one
+    /// the *engine* ended, and therefore the one that decided how much of
+    /// the prefiller series this cell could measure.
+    ///
+    /// `None` when the harness closed every lane itself, which is the case
+    /// in which nothing closed the window early: a cancelled lane was
+    /// generating until the boundary, so it bounds nothing.
+    pub fn window_closed_by(&self) -> Option<&DecodeLaneTrace> {
+        self.lanes
+            .iter()
+            .filter(|lane| {
+                lane.error.is_none()
+                    && !lane.token_times_ms.is_empty()
+                    && lane.finish != LaneFinish::Window
+            })
+            .min_by(|a, b| a.end_ms().total_cmp(&b.end_ms()))
+    }
+
+    /// A one-line warning when the measurement window covered less than the
+    /// whole prefiller series, naming the lane that closed it and how that
+    /// lane ended. `None` when every prefiller was covered.
+    ///
+    /// Not an error — [`ItlCell::all_cold`] still holds down to
+    /// [`ITL_MIN_COVERED_PREFILLERS`]. What it costs is distribution: the
+    /// percentiles stand on the prefill windows actually covered, not on
+    /// spec 03's ten.
+    pub fn window_warning(&self) -> Option<String> {
+        if self.prefillers.is_empty() || self.prefillers_covered >= self.prefillers.len() {
+            return None;
+        }
+        let closed_by = self.window_closed_by();
+        Some(format!(
+            "the measurement window covered {} of {} prefill window(s): lane {} ended first, on \
+             {} -- the pooled percentiles have that much of the series behind them, not all of it",
+            self.prefillers_covered,
+            self.prefillers.len(),
+            closed_by.map_or("(none)", |lane| lane.id.as_str()),
+            closed_by.map_or("an unrecorded reason", |lane| lane.finish.describe()),
+        ))
+    }
+
+    /// A one-line warning when the safety cap ended any lane (GitHub #114),
+    /// or `None` when no lane reached it.
+    ///
+    /// Independent of [`ItlCell::window_warning`], and needed beside it: a
+    /// lane that exhausts the cap *after* the last prefill window closed
+    /// costs this leg no coverage at all and would otherwise go unsaid --
+    /// which is #110's exact shape, and the reason #114 asked for it. The
+    /// cap being load-bearing is a fact about how close this fixture came
+    /// to deciding the cell's length itself, whatever the coverage was.
     pub fn cap_warning(&self) -> Option<String> {
         let on_cap = self.lanes_on_cap();
         if on_cap.is_empty() {
@@ -470,12 +585,20 @@ impl ItlCell {
         }
         let names: Vec<&str> = on_cap.iter().map(|lane| lane.id.as_str()).collect();
         Some(format!(
-            "{} of {} decode lane(s) ended on the {}-token safety cap rather than at the              measurement boundary ({}) -- the cap is load-bearing for this leg, so an engine              fast enough to exhaust it before the final prefill window closes would fail this              cell for a fixture reason",
+            "{} of {} decode lane(s) ended on the {}-token safety cap rather than at the \
+             measurement boundary ({}) -- the cap is load-bearing for this leg, not spare",
             on_cap.len(),
             self.lanes.len(),
             self.decode_max_tokens,
             names.join(", "),
         ))
+    }
+
+    /// Everything about this cell a reader has to be told rather than left
+    /// to infer: how much of the series the window covered, and whether the
+    /// fixture's own cap ended a lane. Either, both, or neither.
+    pub fn warnings(&self) -> Vec<String> {
+        [self.window_warning(), self.cap_warning()].into_iter().flatten().collect()
     }
 
     fn failed(cfg: &ItlConfig, error: String) -> Self {
@@ -488,6 +611,9 @@ impl ItlCell {
             decode_lanes: cfg.decode_lanes,
             prefillers: Vec::new(),
             lanes: Vec::new(),
+            window_start_ms: 0.0,
+            window_end_ms: 0.0,
+            prefillers_covered: 0,
             intervals_ms: Vec::new(),
             p50_ms: None,
             p95_ms: None,
@@ -617,7 +743,7 @@ fn measure_itl_with(
     let (lane_ready_tx, lane_ready_rx) = std::sync::mpsc::channel();
     let lanes_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let eos_tokens = std::sync::Arc::new(eos_tokens);
-    let (mut lanes, prefillers) = std::thread::scope(|scope| {
+    let (lanes, prefillers, cancelled_at_ms) = std::thread::scope(|scope| {
         // The decode lanes: one streaming request each, held open until the
         // sequential prefiller series ends, then cancelled.
         //
@@ -626,9 +752,10 @@ fn measure_itl_with(
         // that long, which needs the endpoint to have honoured the EOS
         // suppression; an engine that honours neither `ignore_eos` nor
         // `logit_bias` stops at its own EOS instead, and one that is fast
-        // enough reaches `decode_max_tokens` first. Either way the pooled
-        // intervals stay honest, because the guard below refuses any lane
-        // that ended before the final prefill window closed.
+        // enough reaches `decode_max_tokens` first. Whichever of the three
+        // ends the shortest lane, the pooled intervals stay honest: the
+        // measurement window below is the span every lane shared, and
+        // nothing outside it is pooled.
         let lane_handles: Vec<_> = decode_set
             .prompts
             .iter()
@@ -718,42 +845,89 @@ fn measure_itl_with(
 
         // End all lane streams together at the actual measurement boundary.
         lanes_running.store(false, std::sync::atomic::Ordering::Release);
+        let cancelled_at_ms = epoch.elapsed().as_secs_f64() * 1_000.0;
 
         let lanes: Vec<DecodeLaneTrace> = lane_handles
             .into_iter()
             .map(|h| h.join().expect("a decode-lane thread panicked"))
             .collect();
-        (lanes, prefillers)
+        (lanes, prefillers, cancelled_at_ms)
     });
 
-    // Pool only intervals overlapping a prefiller's request-start -> first-
-    // token window. Shift each lane's request-relative SSE timestamps onto
-    // the shared monotonic timeline before testing the intersection.
-    let last_prefill_end = prefillers.iter().map(|p| p.first_token_ms).max_by(f64::total_cmp);
+    // The measurement window: the span in which *every* lane was producing
+    // tokens. Cancellation at the end of the series is the terminator the
+    // fixture intends, but never a guaranteed one — a lane the endpoint
+    // stopped at its own EOS, or one the safety cap ended, closes the
+    // window earlier (GitHub #139). Measuring inside the window keeps
+    // exactly the property the cell claims, and keeps it whichever of the
+    // three ended the shortest lane: every pooled interval was measured
+    // with all `decode_lanes` lanes decoding at once. A lane that failed on
+    // the wire decoded no span at all, so it leaves no window to measure
+    // in.
+    //
+    // A lane the *harness* closed was alive and generating right up to
+    // that moment: its last token is merely the last one that arrived
+    // before the stream was dropped, not where the lane stopped. So a
+    // cancelled lane's span ends at the cancellation, and only a lane the
+    // engine ended — on its own EOS, on the cap — ends at its last token.
+    // Without that distinction the window's close would be a race between
+    // a lane's final token and the harness's store, which is not a
+    // property of anything being measured.
+    let spans: Option<Vec<(f64, f64)>> = lanes
+        .iter()
+        .map(|lane| {
+            if lane.error.is_some() {
+                return None;
+            }
+            let first = lane.token_times_ms.first()?;
+            let end = if lane.finish == LaneFinish::Window {
+                cancelled_at_ms
+            } else {
+                lane.end_ms()
+            };
+            Some((lane.started_ms + first, end))
+        })
+        .collect();
+    let (window_start_ms, window_end_ms) = match spans {
+        Some(spans) if !spans.is_empty() => (
+            spans.iter().map(|span| span.0).fold(f64::NEG_INFINITY, f64::max),
+            spans.iter().map(|span| span.1).fold(f64::INFINITY, f64::min),
+        ),
+        _ => (0.0, 0.0),
+    };
+
+    // The prefill windows that closed inside it. Their *opening* needs no
+    // test: the harness holds the first prefiller until every lane has
+    // produced a token, so the series begins after `window_start_ms` by
+    // construction.
+    let covered: Vec<(f64, f64)> = prefillers
+        .iter()
+        .filter(|prefill| prefill.first_token_ms <= window_end_ms)
+        .map(|prefill| (prefill.started_ms, prefill.first_token_ms))
+        .collect();
+    let prefillers_covered = covered.len();
+
+    // Pool only intervals that lie inside the measurement window and
+    // overlap one of those prefill windows. Shift each lane's
+    // request-relative SSE timestamps onto the shared monotonic timeline
+    // before testing either.
     let mut intervals_ms: Vec<f64> = Vec::new();
-    for lane in &mut lanes {
-        if lane.error.is_some() {
-            continue;
+    if window_end_ms > window_start_ms {
+        for lane in &lanes {
+            intervals_ms.extend(lane.token_times_ms.windows(2).filter_map(|pair| {
+                let interval_start = lane.started_ms + pair[0];
+                let interval_end = lane.started_ms + pair[1];
+                if interval_start < window_start_ms || interval_end > window_end_ms {
+                    return None;
+                }
+                covered
+                    .iter()
+                    .any(|(prefill_start, prefill_first_token)| {
+                        interval_start < *prefill_first_token && interval_end > *prefill_start
+                    })
+                    .then_some(pair[1] - pair[0])
+            }));
         }
-        let last_lane_token = lane.token_times_ms.last().map(|time| lane.started_ms + time);
-        if last_prefill_end.is_some_and(|end| last_lane_token.is_none_or(|last| last < end)) {
-            lane.error = Some(format!(
-                "decode lane ended at {:.3} ms before the final prefill window ended at {:.3} ms",
-                last_lane_token.unwrap_or(lane.started_ms),
-                last_prefill_end.unwrap_or_default()
-            ));
-            continue;
-        }
-        intervals_ms.extend(lane.token_times_ms.windows(2).filter_map(|window| {
-            let interval_start = lane.started_ms + window[0];
-            let interval_end = lane.started_ms + window[1];
-            prefillers
-                .iter()
-                .any(|prefill| {
-                    interval_start < prefill.first_token_ms && interval_end > prefill.started_ms
-                })
-                .then_some(window[1] - window[0])
-        }));
     }
     let mut sorted = intervals_ms.clone();
     sorted.sort_by(f64::total_cmp);
@@ -777,6 +951,9 @@ fn measure_itl_with(
         decode_lanes: cfg.decode_lanes,
         prefillers,
         lanes,
+        window_start_ms,
+        window_end_ms,
+        prefillers_covered,
         intervals_ms,
         p50_ms,
         p95_ms,
@@ -880,6 +1057,16 @@ impl Record {
                     self.itl.prefillers.len(),
                     if void == 0 { String::new() } else { format!(", {void} VOID") },
                 ));
+                // GitHub #139: the span every lane shared, and how much of
+                // the series it covered -- the size of the distribution the
+                // percentiles above stand on.
+                out.push_str(&format!(
+                    "       window {:.3} -> {:.3} ms  covering {} of {} prefill window(s)\n",
+                    self.itl.window_start_ms,
+                    self.itl.window_end_ms,
+                    self.itl.prefillers_covered,
+                    self.itl.prefillers.len(),
+                ));
                 // GitHub #114: how each lane ended, always -- a reader
                 // should never have to infer it from a token count.
                 for lane in &self.itl.lanes {
@@ -891,7 +1078,7 @@ impl Record {
                         lane.finish.describe(),
                     ));
                 }
-                if let Some(warning) = self.itl.cap_warning() {
+                for warning in self.itl.warnings() {
                     out.push_str(&format!("  ITL  WARNING: {warning}
 "));
                 }
@@ -1174,7 +1361,6 @@ mod tests {
 
     #[test]
     fn itl_runs_prefillers_sequentially_and_pools_only_overlapping_intervals() {
-        let ep = MockEndpoint::new();
         let template = MockTemplate::new();
         let cfg = ItlConfig {
             prefill_prompt_tokens: 40,
@@ -1184,83 +1370,261 @@ mod tests {
             decode_max_tokens: 6,
             decode_lanes: 2,
         };
+        // Paced against the series rather than against the scheduler: the
+        // cell's timeline spans two kinds of request, so a fixture whose
+        // canned token times bear no relation to when the harness actually
+        // sent anything cannot say which intervals overlap (GitHub #146).
+        let ep = PacedSeries::until_cancelled(cfg.decode_lanes, cfg.prefill_count, 2);
         let cell = measure_itl(&ep, &template, &cfg);
         assert!(cell.error.is_none(), "{:?}", cell.error);
         assert_eq!(cell.prefillers.len(), 3);
         assert_eq!(cell.lanes.len(), 2);
         assert!(cell.all_cold(), "void prefillers: {:?}", cell.void_prefillers());
+        let measured: usize =
+            cell.lanes.iter().map(|lane| lane.token_times_ms.len().saturating_sub(1)).sum();
         assert!(
-            cell.intervals_ms.len() < 10,
-            "intervals outside the prefill windows must be excluded"
+            cell.intervals_ms.len() < measured,
+            "intervals outside the prefill windows must be excluded: pooled {} of {measured}",
+            cell.intervals_ms.len()
         );
         assert!(cell.p50_ms.is_some() && cell.p95_ms.is_some() && cell.p99_ms.is_some());
         let expected_max = cell.intervals_ms.iter().cloned().fold(f64::MIN, f64::max);
         assert_eq!(cell.max_ms, Some(expected_max));
     }
 
-    #[test]
-    fn itl_decode_lanes_are_stopped_after_the_final_prefill_window() {
-        // A lane that never stops on its own. If cancellation failed to
-        // reach it, it runs to this ceiling instead of blocking forever —
-        // which is why the assertions below check *both* ends: past the
-        // fixture's token cap, and short of the ceiling.
-        const NEVER_CANCELLED: u32 = 100_000;
+    /// How far apart [`PacedSeries`] spaces a lane's tokens (see its emit
+    /// loop for why a fixture needs real spacing at all).
+    const TOKEN_PACE: std::time::Duration = std::time::Duration::from_millis(2);
 
-        struct UntilCancelled;
+    /// A fixture whose decode lanes are paced by the prefiller series
+    /// rather than by the OS scheduler (GitHub #146).
+    ///
+    /// Each lane may emit `tokens_per_prefill` tokens before the series
+    /// starts, and `tokens_per_prefill` more for each prefiller that has
+    /// begun; each prefiller returns only once every lane has emitted its
+    /// allowance (or stopped itself at its own `lane_caps` entry). Which
+    /// terminator ends a lane is therefore decided by those two numbers,
+    /// never by how the machine happened to schedule the lane threads —
+    /// which is the whole point of #146: the previous fixtures emitted
+    /// their canned tokens with no pacing at all, so a loaded machine could
+    /// close a lane at the measurement boundary where an idle one let it
+    /// reach the cap.
+    struct PacedSeries {
+        state: std::sync::Mutex<PacedState>,
+        ready: std::sync::Condvar,
+        tokens_per_prefill: u32,
+        /// Per lane: the tokens after which it stops itself and reports
+        /// `"length"` (the engine reaching the safety cap), or `None` for a
+        /// lane that only ever ends when the harness cancels it. Lanes may
+        /// differ, which is the shape #139 found live — one lane spent well
+        /// before the others.
+        lane_caps: Vec<Option<u32>>,
+        prefill_count: usize,
+    }
 
-        impl Endpoint for UntilCancelled {
-            fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
-                if req.id.starts_with("itl-decode") {
-                    return Err("decode lane must use the cancellable streaming path".into());
-                }
-                Ok(crate::client::Outcome {
-                    ttft_ms: 1.0,
-                    total_ms: 1.0,
-                    n_tokens: 1,
-                    output: String::new(),
-                    reasoning_output: String::new(),
-                    reasoning_tokens: Some(0),
-                    prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
-                    cached_prompt_tokens: None,
-                    token_times_ms: vec![1.0],
-                    finish_reason: Some(crate::client::FinishReason::Engine("length".into())),
-                })
-            }
+    struct PacedState {
+        /// Prefillers begun so far — what the lanes' allowance is measured
+        /// in.
+        round: usize,
+        /// Tokens emitted so far, per lane index.
+        emitted: Vec<u32>,
+        /// Every prefiller has been served: the lanes may now run freely
+        /// until the harness closes them.
+        series_over: bool,
+    }
 
-            fn complete_observed_while(
-                &self,
-                _req: &Request,
-                observer: &mut dyn FnMut(f64) -> bool,
-                _suppress_eos: &[u32],
-            ) -> Result<crate::client::Outcome, String> {
-                let mut token_times_ms = Vec::new();
-                let mut cancelled = false;
-                for tick in 1..=NEVER_CANCELLED {
-                    let time_ms = tick as f64;
-                    token_times_ms.push(time_ms);
-                    if !observer(time_ms) {
-                        cancelled = true;
-                        break;
-                    }
-                    std::thread::yield_now();
-                }
-                Ok(crate::client::Outcome {
-                    ttft_ms: 1.0,
-                    total_ms: *token_times_ms.last().unwrap(),
-                    n_tokens: token_times_ms.len() as u32,
-                    output: String::new(),
-                    reasoning_output: String::new(),
-                    reasoning_tokens: Some(0),
-                    prompt_tokens: None,
-                    cached_prompt_tokens: None,
-                    token_times_ms,
-                    // This lane ran until the harness closed it, which is
-                    // what the fixture intends (GitHub #114).
-                    finish_reason: cancelled.then_some(crate::client::FinishReason::Cancelled),
-                })
+    impl PacedSeries {
+        /// A lane that runs until the harness cancels it — the terminator
+        /// the fixture intends.
+        fn until_cancelled(lanes: usize, prefill_count: usize, tokens_per_prefill: u32) -> Self {
+            Self::new(prefill_count, tokens_per_prefill, vec![None; lanes])
+        }
+
+        /// A lane that stops itself after `cap` tokens, the way an engine
+        /// fast enough to exhaust [`ITL_DECODE_MAX_TOKENS`] does.
+        fn capped_at(
+            lanes: usize,
+            prefill_count: usize,
+            tokens_per_prefill: u32,
+            cap: u32,
+        ) -> Self {
+            Self::new(prefill_count, tokens_per_prefill, vec![Some(cap); lanes])
+        }
+
+        /// Lanes spent at different points in the series — one stops well
+        /// before the others, so the window it closes provably leaves the
+        /// survivors' later intervals outside it.
+        fn capped_per_lane(prefill_count: usize, tokens_per_prefill: u32, caps: &[u32]) -> Self {
+            Self::new(
+                prefill_count,
+                tokens_per_prefill,
+                caps.iter().map(|cap| Some(*cap)).collect(),
+            )
+        }
+
+        fn new(
+            prefill_count: usize,
+            tokens_per_prefill: u32,
+            lane_caps: Vec<Option<u32>>,
+        ) -> Self {
+            Self {
+                state: std::sync::Mutex::new(PacedState {
+                    round: 0,
+                    emitted: vec![0; lane_caps.len()],
+                    series_over: false,
+                }),
+                ready: std::sync::Condvar::new(),
+                tokens_per_prefill,
+                lane_caps,
+                prefill_count,
             }
         }
 
+        /// The tokens lane `index` must have emitted before the prefiller of
+        /// round `round` may return — never more than that lane's own cap
+        /// will ever produce, which would deadlock the series.
+        fn target(&self, round: usize, index: usize) -> u32 {
+            let owed = (round as u32 + 1) * self.tokens_per_prefill;
+            self.lane_caps[index].map_or(owed, |cap| owed.min(cap))
+        }
+    }
+
+    impl Endpoint for PacedSeries {
+        fn complete(&self, req: &Request) -> Result<crate::client::Outcome, String> {
+            if !req.id.starts_with("itl-prefill") {
+                return Err(format!("this fixture only serves prefillers here, got `{}`", req.id));
+            }
+            let start = std::time::Instant::now();
+            let round = {
+                let mut state = self.state.lock().unwrap();
+                state.round += 1;
+                self.ready.notify_all();
+                state.round
+            };
+            {
+                let mut state = self.state.lock().unwrap();
+                while state
+                    .emitted
+                    .iter()
+                    .enumerate()
+                    .any(|(index, &emitted)| emitted < self.target(round, index))
+                {
+                    state = self.ready.wait(state).unwrap();
+                }
+                if round == self.prefill_count {
+                    state.series_over = true;
+                    self.ready.notify_all();
+                }
+            }
+            // A prefiller that has nothing left to wait for still costs
+            // something: in production this is a 32,768-token prefill. A
+            // zero-width request-start -> first-token window is not a
+            // window at all, and the cell rightly refuses one.
+            std::thread::sleep(TOKEN_PACE);
+            let ttft_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            Ok(crate::client::Outcome {
+                ttft_ms,
+                total_ms: ttft_ms,
+                n_tokens: 1,
+                output: String::new(),
+                reasoning_output: String::new(),
+                reasoning_tokens: Some(0),
+                prompt_tokens: Some(req.prompt.split_whitespace().count() as u32),
+                cached_prompt_tokens: None,
+                token_times_ms: vec![ttft_ms],
+                finish_reason: Some(crate::client::FinishReason::Engine("length".into())),
+            })
+        }
+
+        fn complete_observed_while(
+            &self,
+            req: &Request,
+            observer: &mut dyn FnMut(f64) -> bool,
+            _suppress_eos: &[u32],
+        ) -> Result<crate::client::Outcome, String> {
+            // A lane that never stops on its own. If cancellation failed to
+            // reach it, it runs to this ceiling instead of blocking
+            // forever — which is why the tests below check both ends.
+            const NEVER_CANCELLED: usize = 100_000;
+
+            let index: usize = req
+                .id
+                .rsplit('-')
+                .next()
+                .and_then(|tail| tail.parse().ok())
+                .ok_or_else(|| format!("not a decode-lane id: `{}`", req.id))?;
+            let start = std::time::Instant::now();
+            let mut token_times_ms: Vec<f64> = Vec::new();
+            let mut cancelled = false;
+            while token_times_ms.len() < NEVER_CANCELLED {
+                // Wait for the allowance this lane is owed. Once the series
+                // is over there is nothing left to pace against, so the
+                // lane runs free until the harness closes it.
+                {
+                    let mut state = self.state.lock().unwrap();
+                    loop {
+                        let allowance = (state.round as u32 + 1) * self.tokens_per_prefill;
+                        if state.series_over || state.emitted[index] < allowance {
+                            break;
+                        }
+                        state = self.ready.wait(state).unwrap();
+                    }
+                }
+                // Real spacing between tokens. Both halves of this cell's
+                // timeline are assembled from two clocks -- the harness
+                // stamps a request's start, the endpoint times the tokens
+                // within it -- so events microseconds apart cannot be
+                // ordered against each other under load. Production tokens
+                // are tens of milliseconds apart and the question never
+                // arises; a fixture has to buy the same margin.
+                std::thread::sleep(TOKEN_PACE);
+                let time_ms = start.elapsed().as_secs_f64() * 1_000.0;
+                token_times_ms.push(time_ms);
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.emitted[index] += 1;
+                    self.ready.notify_all();
+                }
+                // The cap is the *engine* stopping, so it is decided
+                // before the client is asked for more: a lane whose cap
+                // falls on the same round the harness cancels must still
+                // record `Cap`, or the fixture has handed #146's coin flip
+                // back to the scheduler.
+                if self.lane_caps[index].is_some_and(|cap| token_times_ms.len() as u32 >= cap) {
+                    break;
+                }
+                if !observer(time_ms) {
+                    cancelled = true;
+                    break;
+                }
+            }
+            Ok(crate::client::Outcome {
+                ttft_ms: token_times_ms.first().copied().unwrap_or(0.0),
+                total_ms: token_times_ms.last().copied().unwrap_or(0.0),
+                n_tokens: token_times_ms.len() as u32,
+                output: String::new(),
+                reasoning_output: String::new(),
+                reasoning_tokens: Some(0),
+                prompt_tokens: None,
+                cached_prompt_tokens: None,
+                token_times_ms,
+                finish_reason: Some(if cancelled {
+                    crate::client::FinishReason::Cancelled
+                } else {
+                    // The lane stopped itself at the cap (GitHub #114).
+                    crate::client::FinishReason::Engine("length".into())
+                }),
+            })
+        }
+    }
+
+    /// GitHub #146: the lanes outlive the series by the fixture's own
+    /// arithmetic — two tokens before the first prefiller and two more per
+    /// prefiller after it — so `Window` is what ends them on an idle
+    /// machine and on a loaded one alike.
+    #[test]
+    fn itl_decode_lanes_are_stopped_after_the_final_prefill_window() {
+        const NEVER_CANCELLED: u32 = 100_000;
         let cfg = ItlConfig {
             prefill_prompt_tokens: 40,
             prefill_max_tokens: 1,
@@ -1269,12 +1633,15 @@ mod tests {
             decode_max_tokens: 2,
             decode_lanes: 2,
         };
-        let cell = measure_itl(&UntilCancelled, &MockTemplate::new(), &cfg);
+        let ep = PacedSeries::until_cancelled(cfg.decode_lanes, cfg.prefill_count, 2);
+        let cell = measure_itl(&ep, &MockTemplate::new(), &cfg);
+
         assert!(cell.error.is_none(), "{:?}", cell.error);
         assert!(cell.lanes.iter().all(|lane| lane.error.is_none()), "{:?}", cell.lanes);
         assert!(
             cell.lanes.iter().all(|lane| lane.n_tokens > cfg.decode_max_tokens),
-            "the measured window, not the fixture's old token cap, must end each lane"
+            "the measured window, not the fixture's old token cap, must end each lane: {:?}",
+            cell.lanes.iter().map(|lane| lane.n_tokens).collect::<Vec<_>>()
         );
         assert!(
             cell.lanes.iter().all(|lane| lane.n_tokens < NEVER_CANCELLED),
@@ -1285,33 +1652,226 @@ mod tests {
         assert!(
             cell.lanes.iter().all(|lane| lane.finish == LaneFinish::Window),
             "the boundary closed every lane, so every lane must record it: {:?}",
-            cell.lanes.iter().map(|l| l.finish).collect::<Vec<_>>()
+            cell.lanes.iter().map(|lane| lane.finish).collect::<Vec<_>>()
         );
         assert!(cell.lanes_on_cap().is_empty());
-        assert_eq!(cell.cap_warning(), None, "no lane ended on the cap, so there is nothing to warn about");
+        // GitHub #139: lanes that outlived the series cover all of it.
+        assert_eq!(cell.prefillers_covered, cfg.prefill_count);
+        assert_eq!(cell.window_warning(), None, "the window covered the whole series");
+        assert!(cell.all_cold(), "void: {:?}", cell.void_prefillers());
     }
 
-    /// GitHub #114. The mock generates exactly `max_tokens` and reports
-    /// `"length"` for it, which is precisely the shape the cap warning
-    /// exists to catch: the lanes end because the fixture said so, not
-    /// because the measurement did.
+    /// GitHub #146 + #139. The lanes stop themselves at the cap partway
+    /// through the series — deterministically, because the cap is reached
+    /// on the fixture's own token allowance rather than on a race. That
+    /// shortens the measurement window instead of voiding the cell
+    /// (GitHub #139), and the record says by how much.
     #[test]
-    fn lanes_that_end_on_the_cap_are_named_in_a_warning() {
-        let ep = MockEndpoint::new();
+    fn lanes_that_end_on_the_cap_shorten_the_window_and_are_named_in_a_warning() {
+        const LANE_CAP: u32 = 10;
         let cfg = ItlConfig {
             prefill_prompt_tokens: 40,
-            prefill_max_tokens: 4,
-            prefill_count: 2,
+            prefill_max_tokens: 1,
+            prefill_count: 6,
             decode_prompt_tokens: 24,
-            decode_max_tokens: 4,
+            decode_max_tokens: LANE_CAP,
             decode_lanes: 2,
         };
+        let ep = PacedSeries::capped_at(cfg.decode_lanes, cfg.prefill_count, 2, LANE_CAP);
         let cell = measure_itl(&ep, &MockTemplate::new(), &cfg);
+
+        assert!(cell.error.is_none(), "{:?}", cell.error);
         assert_eq!(cell.lanes_on_cap().len(), 2, "{:?}", cell.lanes);
-        let warning = cell.cap_warning().expect("a leg whose lanes end on the cap must warn");
-        assert!(warning.contains("itl-decode-0"), "the warning names the lanes: {warning}");
-        assert!(warning.contains("itl-decode-1"), "the warning names the lanes: {warning}");
-        assert!(warning.contains('4'), "the warning states the cap: {warning}");
+        assert!(cell.lanes.iter().all(|lane| lane.n_tokens == LANE_CAP), "{:?}", cell.lanes);
+        // Two tokens before the series and two per prefiller: the lanes are
+        // spent partway through, so some prefill windows closed inside the
+        // measurement window and the rest did not. How many is a property
+        // of the run rather than of the contract — what the contract says
+        // is that the window shortened and the cell survived it.
+        assert!(
+            cell.prefillers_covered < cfg.prefill_count,
+            "the spent lanes must shorten the window: covered {} of {}",
+            cell.prefillers_covered,
+            cfg.prefill_count
+        );
+        assert!(
+            cell.prefillers_covered >= ITL_MIN_COVERED_PREFILLERS,
+            "the lanes outlived enough of the series to keep the cell: covered {}",
+            cell.prefillers_covered
+        );
+        assert!(
+            cell.window_end_ms > cell.window_start_ms,
+            "the lanes shared a span: {} -> {}",
+            cell.window_start_ms,
+            cell.window_end_ms
+        );
+        // A shorter measurement, not a refused one (GitHub #139).
+        assert!(
+            cell.all_cold(),
+            "void: {:?}; window {} -> {}; covered {}; intervals {}; lanes {:?}; prefillers {:?}",
+            cell.void_prefillers(),
+            cell.window_start_ms,
+            cell.window_end_ms,
+            cell.prefillers_covered,
+            cell.intervals_ms.len(),
+            cell.lanes
+                .iter()
+                .map(|lane| (
+                    lane.started_ms,
+                    lane.token_times_ms.first().copied(),
+                    lane.token_times_ms.last().copied()
+                ))
+                .collect::<Vec<_>>(),
+            cell.prefillers
+                .iter()
+                .map(|p| (p.started_ms, p.first_token_ms))
+                .collect::<Vec<_>>(),
+        );
+        let warning = cell.window_warning().expect("a shortened window must warn");
+        assert!(
+            warning.contains(&format!(
+                "{} of {}",
+                cell.prefillers_covered, cfg.prefill_count
+            )),
+            "the warning states the coverage: {warning}"
+        );
+        assert!(warning.contains("itl-decode-"), "the warning names the lane: {warning}");
+        assert!(warning.contains("safety cap"), "the warning says how it ended: {warning}");
+    }
+
+    /// GitHub #139: a window too short to cover
+    /// [`ITL_MIN_COVERED_PREFILLERS`] prefill windows is an anecdote rather
+    /// than a distribution, so the cell refuses it instead of reporting a
+    /// percentile over one prefill.
+    #[test]
+    fn a_window_covering_too_little_of_the_series_is_not_all_cold() {
+        const LANE_CAP: u32 = 2;
+        let cfg = ItlConfig {
+            prefill_prompt_tokens: 40,
+            prefill_max_tokens: 1,
+            prefill_count: 4,
+            decode_prompt_tokens: 24,
+            decode_max_tokens: LANE_CAP,
+            decode_lanes: 2,
+        };
+        let ep = PacedSeries::capped_at(cfg.decode_lanes, cfg.prefill_count, 2, LANE_CAP);
+        let cell = measure_itl(&ep, &MockTemplate::new(), &cfg);
+
+        // The lanes spend their whole budget on the allowance they get
+        // before the first prefiller is even sent, so the measurement
+        // window closes before the series has a distribution in it.
+        assert!(
+            cell.prefillers_covered < ITL_MIN_COVERED_PREFILLERS,
+            "covered {} of {}",
+            cell.prefillers_covered,
+            cfg.prefill_count
+        );
+        assert!(!cell.all_cold(), "a window this short cannot decide a gate");
+        assert!(cell.window_warning().is_some());
+    }
+
+    /// GitHub #139: an interval measured after the shortest lane died had
+    /// fewer lanes decoding beside it than the cell claims, so it stays out
+    /// of the pool even when it overlaps a prefill window.
+    #[test]
+    fn intervals_outside_the_shared_window_are_not_pooled() {
+        let cfg = ItlConfig {
+            prefill_prompt_tokens: 40,
+            prefill_max_tokens: 1,
+            prefill_count: 8,
+            decode_prompt_tokens: 24,
+            decode_max_tokens: 14,
+            decode_lanes: 2,
+        };
+        // Lane 0 is spent four tokens before lane 1, the way #139's lane-0
+        // was spent well before the rest. Lane 1's last four intervals are
+        // therefore measured with only one lane decoding — outside the
+        // window by construction, so this test cannot pass vacuously.
+        let ep = PacedSeries::capped_per_lane(cfg.prefill_count, 2, &[10, 14]);
+        let cell = measure_itl(&ep, &MockTemplate::new(), &cfg);
+
+        assert_eq!(cell.lanes[0].n_tokens, 10, "{:?}", cell.lanes);
+        assert_eq!(cell.lanes[1].n_tokens, 14, "{:?}", cell.lanes);
+        assert!(!cell.intervals_ms.is_empty(), "the covered windows pooled something");
+
+        let mut inside = 0usize;
+        let mut outside = 0usize;
+        for lane in &cell.lanes {
+            for pair in lane.token_times_ms.windows(2) {
+                let within = lane.started_ms + pair[0] >= cell.window_start_ms
+                    && lane.started_ms + pair[1] <= cell.window_end_ms;
+                if within {
+                    inside += 1;
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        assert!(
+            outside > 0,
+            "lane 1 outlived lane 0, so some of its intervals must fall outside the window"
+        );
+        assert!(
+            cell.intervals_ms.len() <= inside,
+            "pooled {} intervals but only {inside} lie inside the shared window",
+            cell.intervals_ms.len()
+        );
+    }
+
+    /// GitHub #114 + #139. A lane that exhausts the safety cap *after* the
+    /// last prefill window closed costs the leg no coverage, so the window
+    /// warning rightly stays silent — and the cap warning must not, or the
+    /// very fact #114 exists to surface goes unsaid on #110's own shape.
+    #[test]
+    fn a_cap_that_cost_no_coverage_is_still_warned_about() {
+        let lane = |id: &str, finish: LaneFinish| DecodeLaneTrace {
+            id: id.to_string(),
+            started_ms: 0.0,
+            n_tokens: 2,
+            token_times_ms: vec![1.0, 900.0],
+            finish,
+            error: None,
+        };
+        let cell = ItlCell {
+            prefill_prompt_tokens: 32_768,
+            prefill_max_tokens: 64,
+            prefill_count: 2,
+            decode_prompt_tokens: 4_096,
+            decode_max_tokens: ITL_DECODE_MAX_TOKENS,
+            decode_lanes: 2,
+            prefillers: (0..2)
+                .map(|index| PrefillerSample {
+                    index,
+                    started_ms: index as f64 * 100.0,
+                    first_token_ms: index as f64 * 100.0 + 90.0,
+                    ttft_ms: 90.0,
+                    computed_prefill_tokens: Some(32_768),
+                    void: false,
+                    void_reason: None,
+                })
+                .collect(),
+            lanes: vec![lane("itl-decode-0", LaneFinish::Cap), lane("itl-decode-1", LaneFinish::Window)],
+            window_start_ms: 1.0,
+            window_end_ms: 900.0,
+            prefillers_covered: 2,
+            intervals_ms: vec![5.0, 6.0],
+            p50_ms: Some(5.5),
+            p95_ms: Some(6.0),
+            p99_ms: Some(6.0),
+            max_ms: Some(6.0),
+            error: None,
+        };
+
+        assert!(cell.all_cold(), "full coverage: the cap cost this leg nothing");
+        assert_eq!(cell.window_warning(), None, "nothing was lost, so nothing to say about coverage");
+        let warning = cell.cap_warning().expect("a load-bearing cap must still be named");
+        assert!(warning.contains("itl-decode-0"), "the warning names the lane: {warning}");
+        assert!(
+            warning.contains(&ITL_DECODE_MAX_TOKENS.to_string()),
+            "the warning states the cap: {warning}"
+        );
+        assert!(!warning.contains("itl-decode-1"), "only the capped lane: {warning}");
+        assert_eq!(cell.warnings(), vec![warning], "the reader gets exactly this one");
     }
 
     /// GitHub #114: every transport outcome the instrument can see maps to
@@ -1529,7 +2089,6 @@ mod tests {
 
     #[test]
     fn an_itl_cell_measures_cold_samples_from_a_corpus() {
-        let ep = MockEndpoint::new();
         let template = CorpusMock { header: 0, footer: 0 };
         let bank = corpus_bank();
         let cfg = ItlConfig {
@@ -1540,6 +2099,7 @@ mod tests {
             decode_max_tokens: 4,
             decode_lanes: 2,
         };
+        let ep = PacedSeries::until_cancelled(cfg.decode_lanes, cfg.prefill_count, 2);
         let cell = measure_itl_from_corpus(&ep, &template, &cfg, &bank);
         assert!(cell.error.is_none(), "{:?}", cell.error);
         assert!(cell.all_cold(), "void prefillers: {:?}", cell.void_prefillers());
