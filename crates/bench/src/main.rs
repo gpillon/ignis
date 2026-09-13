@@ -61,6 +61,27 @@
 //!       when the launches are not live/live (different sessions, different
 //!       trace hashes, a missing cell) or fewer than two launches are given
 //!       per side.
+//!   `g5      --endpoint <url> --artifact <artifact.ninfer> [--label ignis]
+//!             [--profile P] [--session S] [--committed-tokens 512]
+//!             [--corpus <bank.ids>] [--out <record.json>]`
+//!       The G5 measurement instrument (P5-07, ADR 0015/0021): g3's C=1
+//!       throughput cell (and its committed-token counter) at three prompt
+//!       depths (24K/98K/196K). Writes one *launch* of one engine's record.
+//!   `g5-gate --ours <launch1.json> --ours <launch2.json> [...]
+//!             --ref <launch1.json> --ref <launch2.json> [...]
+//!             [--note <text>] [--out <verdict.json>]`
+//!       The pooled G5 verdict over at least two launches per engine
+//!       (ADR 0021): one committed-tok/s ratio per depth against 99%,
+//!       reusing `g4-gate`'s pooling rule. Refuses a verdict when the
+//!       launches are not live/live or fewer than two launches are given
+//!       per side.
+//!   `g5-equivalence --spec-on <url> --spec-off <url> --artifact <artifact.ninfer>
+//!             [--max-tokens 64] [--out <report.json>]`
+//!       The phase 5 correctness oracle (P5-07): the canary suite run
+//!       greedy against a speculation-on and a speculation-off endpoint (or
+//!       the same endpoint restarted between runs), compared token-for-token
+//!       for exact equality. Exits non-zero on the first divergence, naming
+//!       the canary and the position.
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
@@ -74,7 +95,8 @@ use std::sync::Arc;
 use ignis_bench::{
     canary::{self, CanaryResult},
     client::{replay, Endpoint, HttpEndpoint, ReplayConfig},
-    g2, g3, g3_gate, g4, g4_gate,
+    equivalence,
+    g2, g3, g3_gate, g4, g4_gate, g5, g5_gate,
     gate::GateReport,
     metrics::Run,
     oracle::{self, Fixture},
@@ -100,6 +122,9 @@ fn main() -> ExitCode {
         Some("g3-gate") => cmd_g3_gate(&args[1..]),
         Some("g4") => cmd_g4(&args[1..]),
         Some("g4-gate") => cmd_g4_gate(&args[1..]),
+        Some("g5") => cmd_g5(&args[1..]),
+        Some("g5-gate") => cmd_g5_gate(&args[1..]),
+        Some("g5-equivalence") => cmd_g5_equivalence(&args[1..]),
         _ => {
             print_usage();
             ExitCode::FAILURE
@@ -128,6 +153,12 @@ fn print_usage() {
                  [--profile <text>] [--session <id>] [--conc N] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g4-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
                       [--note <text>] [--out <verdict.json>]
+  ignis-bench g5 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
+                 [--session <id>] [--committed-tokens 512] [--corpus <bank.ids>] [--out <record.json>]
+  ignis-bench g5-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
+                      [--note <text>] [--out <verdict.json>]
+  ignis-bench g5-equivalence --spec-on <url> --spec-off <url> --artifact <artifact.ninfer>
+                      [--max-tokens 64] [--out <report.json>]
 
 environment:
   {timeout_env}=<seconds>   the per-request deadline every subcommand drives an engine with
@@ -1046,6 +1077,236 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
             verdict.threshold
         );
         ExitCode::FAILURE
+    }
+}
+
+/// `g5` (P5-07, GitHub #151): g3's C=1 throughput cell (and its
+/// committed-token counter), measured at three prompt depths (24K/98K/196K)
+/// against one OpenAI-compatible endpoint. The record it writes is one
+/// *launch* of one engine; `g5-gate` pools at least two of them per engine
+/// (ADR 0021) into a per-depth verdict.
+fn cmd_g5(args: &[String]) -> ExitCode {
+    let (endpoint, artifact) = match (require(args, "endpoint"), require(args, "artifact")) {
+        (Ok(e), Ok(a)) => (e, a),
+        (e, a) => {
+            for err in [e.err(), a.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
+    let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
+    // Live/live (ADR 0015): the *same* session id must be passed to every
+    // launch of both engines.
+    let session = opt(args, "session").unwrap_or_else(new_session_id);
+    let committed_tokens =
+        opt(args, "committed-tokens").and_then(|v| v.parse::<u32>().ok()).unwrap_or(g5::COMMITTED_TOKENS);
+    let out = opt(args, "out");
+    let corpus = opt(args, "corpus").map(PathBuf::from);
+    if let Some(path) = &corpus {
+        // Fail before any request is sent: a missing corpus file would
+        // otherwise fail every depth cell with a late error.
+        if !path.is_file() {
+            eprintln!("error: --corpus file not found: {path:?}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "corpus mode: prompts are cut from {path:?} (detokenized windows, no filler growth — \
+             needed at the 24K-196K depth scale)"
+        );
+    }
+
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ep = endpoint_for(&endpoint);
+    let engine = match ep.list_models() {
+        Ok(models) if !models.is_empty() => {
+            eprintln!("engine {endpoint}: {}", models.join(", "));
+            models[0].clone()
+        }
+        Ok(_) => {
+            eprintln!("error: engine {endpoint} reports no loaded model");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!("g5 session {session}: committed tok/s @24K/98K/196K against {label}");
+
+    let cfg = g5::G5Config { label, profile, artifact, session, committed_tokens, corpus };
+    let record = g5::measure(&ep, &frontend, engine, endpoint, &cfg);
+    print!("{}", record.render());
+
+    if let Some(path) = &out {
+        if let Err(e) = record.write(Path::new(path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    if record.all_cold() {
+        eprintln!("all depth cells cold; pass --session {} to the other engine's run", cfg.session);
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "error: at least one depth cell did not produce a full set of cold/complete samples — \
+             this record cannot decide the gate"
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `g5-gate` (P5-07, GitHub #151): the pooled G5 verdict over at least two
+/// launches per engine (ADR 0021), one ratio per depth. Refuses outright —
+/// rather than reporting a failure — when the launches do not support a
+/// live/live comparison (different sessions, a missing depth cell) or fewer
+/// than two launches are given per side.
+fn cmd_g5_gate(args: &[String]) -> ExitCode {
+    let ours_paths = repeated_opt(args, "ours");
+    let ref_paths = repeated_opt(args, "ref");
+    if ours_paths.is_empty() || ref_paths.is_empty() {
+        eprintln!("--ours and --ref must each be passed at least once (repeat the flag per launch)");
+        print_usage();
+        return ExitCode::FAILURE;
+    }
+    let load = |paths: &[String]| -> Result<Vec<g5::Record>, String> {
+        paths.iter().map(|p| g5::Record::read(Path::new(p))).collect()
+    };
+    let ours = match load(&ours_paths) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reference = match load(&ref_paths) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut verdict = match g5_gate::check(&ours, &reference) {
+        Ok(v) => v,
+        Err(refusal) => {
+            eprintln!("G5 gate check REFUSED: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    verdict.notes.extend(repeated_opt(args, "note"));
+    print!("{}", verdict.render());
+    if let Some(path) = opt(args, "out") {
+        if let Err(e) = verdict.write(Path::new(&path)) {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    if verdict.passed {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "G5 gate FAILED (ADR 0021: pooled committed tok/s ratio >= {} at every depth)",
+            verdict.threshold
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// `g5-equivalence` (P5-07, GitHub #151): the phase 5 correctness oracle —
+/// the canary suite run greedy against a speculation-on and a
+/// speculation-off endpoint (or the same endpoint restarted between runs),
+/// compared token-for-token for exact equality. Exits non-zero on the first
+/// divergence, naming the canary and the position.
+fn cmd_g5_equivalence(args: &[String]) -> ExitCode {
+    let (spec_on_url, spec_off_url, artifact) = match (
+        require(args, "spec-on"),
+        require(args, "spec-off"),
+        require(args, "artifact"),
+    ) {
+        (Ok(a), Ok(b), Ok(art)) => (a, b, art),
+        (a, b, art) => {
+            for err in [a.err(), b.err(), art.err()].into_iter().flatten() {
+                eprintln!("{err}");
+            }
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let max_tokens = opt(args, "max-tokens")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(equivalence::EQUIVALENCE_MAX_TOKENS);
+    let out = opt(args, "out");
+
+    let frontend = match open_frontend(&artifact) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec_on = endpoint_for(&spec_on_url);
+    if let Err(e) = spec_on.list_models() {
+        eprintln!("error: spec-on endpoint {spec_on_url}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let spec_off = endpoint_for(&spec_off_url);
+    if let Err(e) = spec_off.list_models() {
+        eprintln!("error: spec-off endpoint {spec_off_url}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let results =
+        match equivalence::compare_endpoints(&spec_on, &spec_off, frontend.tokenizer(), max_tokens) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    for r in &results {
+        println!(
+            "canary {:<16} {}{}",
+            r.id,
+            if r.equivalent() { "EQUIVALENT" } else { "DIVERGENT" },
+            match r.first_divergence {
+                Some(pos) => format!("  first divergence @ {pos}"),
+                None => String::new(),
+            }
+        );
+    }
+    if let Some(path) = &out {
+        let json = match serde_json::to_string_pretty(&results) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: serialize the equivalence report: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::write(path, json) {
+            eprintln!("error: write {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {path}");
+    }
+    match equivalence::first_failure(&results) {
+        None => {
+            eprintln!("all canaries equivalent: greedy spec-on == spec-off");
+            ExitCode::SUCCESS
+        }
+        Some((id, pos)) => {
+            eprintln!("error: canary {id} diverged at position {pos}: speculation changed greedy output");
+            ExitCode::FAILURE
+        }
     }
 }
 
