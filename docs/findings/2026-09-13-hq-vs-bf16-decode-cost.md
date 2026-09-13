@@ -1,4 +1,4 @@
-# hq-e8-2b costs decode speed against BF16, and the card is neither throttled nor bandwidth-bound
+# The hq-e8-2b decode penalty is the format's, not ignis's — but ignis moves far less memory than the reference doing the same work
 
 - Kind: experiment
 - Status: current
@@ -12,8 +12,9 @@
 
 During a G3 smoke run the RTX 5090 sat at high reported utilization but low
 temperature, which the project owner read as poor utilization. Is the card
-actually limited by anything, and does the hq-e8-2b KV format cost decode speed
-against BF16?
+actually limited by anything; does the hq-e8-2b KV format cost decode speed
+against BF16; and is the ~300 W the card draws what this model costs on this
+hardware or what ignis's own decode loop costs?
 
 ## Evidence
 
@@ -33,13 +34,34 @@ The first two differ only in KV pool geometry; the last two differ only in KV
 format. Every run covered 10 of 10 prefill windows with all four lanes ending at
 the measurement boundary.
 
-GPU telemetry over each run's ITL cell (~75-85 s of the ~170 s run):
+The same A/B was then run against the reference engine (`ninfer-serve`, same
+artifact, same corpus, same bench binary, `--kv-capacity 65536 --max-context
+40960 --max-concurrency 8 --prefill-chunk 1024`), giving a 2x2 over engine and
+format at one matched KV capacity:
+
+| engine / format | C=1 tok/s | C=4 tok/s | ITL p50 | ITL p95 | covered |
+|---|---:|---:|---:|---:|---:|
+| ignis hq-e8-2b | 54.2 | 27.0 | 183.49 | 248.16 | 10/10 |
+| ignis BF16 | 61.2 | 40.1 | 164.70 | 214.73 | 10/10 |
+| ninfer hq-e8-2b | 55.2 | 10.0 | 167.25 | 243.10 | 6/10 |
+| ninfer BF16 | 61.4 | 33.7 | 148.26 | 211.39 | 8/10 |
+
+Both reference runs ended lane 0 at **exactly 2,856 tokens on its own EOS**,
+the same count `ninfer-launch2-g3.json` recorded on 2026-09-12 — identical
+across the two KV formats, so the stop is a property of that lane's prompt
+alone. Both produced verdict-ready records under the measurement window of
+[ITL lane terminator race](2026-09-13-itl-lane-terminator-race.md); under the
+guard it replaced, both would have been refused.
+
+GPU telemetry over each run's ITL cell (~75-95 s of the ~170-230 s run):
 
 | run | util | mem-util | power (mean / max) | SM clock | temp |
 |---|---:|---:|---:|---:|---:|
-| hq-e8-2b, 7,281 pages | 87% | 22% | 284.9 W / 355.3 W | 1,996 MHz | 49 °C |
-| hq-e8-2b, 1,024 pages | 96% | 25% | 306.1 W / 354.7 W | 1,996 MHz | 49 °C |
-| BF16, 1,024 pages | 87% | 27% | 300.5 W / 361.3 W | 1,995 MHz | 49 °C |
+| ignis hq-e8-2b, 7,281 pages | 87% | 22% | 284.9 W / 355.3 W | 1,996 MHz | 49 °C |
+| ignis hq-e8-2b, 1,024 pages | 96% | 25% | 306.1 W / 354.7 W | 1,996 MHz | 51 °C |
+| ignis BF16, 1,024 pages | 87% | 27% | 300.5 W / 361.3 W | 1,995 MHz | 49 °C |
+| ninfer hq-e8-2b | 98% | 37% | 290.2 W / 357.8 W | 1,996 MHz | 53 °C |
+| ninfer BF16 | 98% | 44% | 306.2 W / 367.2 W | 1,996 MHz | 53 °C |
 | idle, no model loaded | 14% | 1% | 67.8 W | 2,010 MHz | 37 °C |
 
 The card's nominal boost is 2,010 MHz and its board limit ~575 W.
@@ -76,10 +98,38 @@ synchronization rather than in either compute or bandwidth. The low temperature
 is a consequence of that, not an independent symptom.
 
 **Inference — hq trades SM cycles for footprint, and on this card the trade is
-losing.** At matched geometry hq keeps the SMs busier than BF16 (96% against
-87%) while moving *less* memory (25% against 27%) and producing *fewer* tokens.
-Occupancy that does not become output is the signature of the dequantization and
-attention-route work hq adds.
+losing.** At matched geometry hq keeps the SMs busier than BF16 while moving
+*less* memory and producing *fewer* tokens, on both engines. Occupancy that does
+not become output is the signature of the dequantization and attention-route
+work hq adds.
+
+**Observed — the reference pays almost exactly the same hq penalty.** Going from
+hq to BF16 is worth +12.9% on C=1 for ignis and +11.2% for ninfer; -10.2% and
+-11.4% on ITL p50; -13.5% and -13.0% on p95.
+
+**Inference.** Two independently written engines paying the same toll within a
+percentage point means the cost belongs to the format, not to either
+implementation. Optimizing ignis's hq route can at best reach ninfer's hq route;
+it cannot recover the 12-13%, which is what dequantizing a KV entry per
+attention op costs on this hardware.
+
+**Observed — ignis moves far less memory than the reference doing the same
+work.** At matched geometry and near-identical power, `utilization.memory` is
+25% for ignis against 37% for ninfer under hq, and 27% against 44% under BF16 —
+while ninfer decodes more tokens in the same window.
+
+**Inference.** This is the part that *is* ignis's. The ~300 W is not simply what
+the model costs on this card: the reference draws the same watts and turns more
+of them into memory traffic and output. Where ignis's non-memory time goes
+remains unmeasured, but the gap is now attributable rather than ambient.
+
+**Observed — ignis is much faster than the reference at concurrency 4, in both
+formats.** C=4 is 27.0 against 10.0 under hq (2.7x) and 40.1 against 33.7 under
+BF16 (+19%); ninfer's hq figure of 10.0 reproduces the 10.2 its
+`ninfer-launch1-g3.json` recorded on 2026-09-12, so it is not a bad draw. C=1 is
+parity (54.2 against 55.2 under hq, 61.2 against 61.4 under BF16), and ITL p95
+favours the reference slightly in both formats (ratio 1.021 under hq, 1.016
+under BF16 — inside the G3 gate's tolerated band but not a clean pass).
 
 **Observed — the ITL cell is the most reproducible of the three.** Across the two
 hq runs its p50 and p95 agree to 0.05%, where C=1 and C=4 move 6% between the
@@ -95,10 +145,16 @@ same pair.
 - hq-e8-2b is not replaceable by BF16: at a 4 GiB budget BF16 holds 65,536
   tokens in total, which does not fit one G4 needle cell at 128K, let alone N=8
   concurrency (see [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md)).
-  The finding is that hq's decode path is worth optimizing, not that the format
-  is wrong.
+  Nor is the format the problem: both engines pay its 12-13% alike.
+- The actionable gap is the memory one. Ignis draws the reference's power and
+  moves two thirds to three fifths of the reference's memory traffic on the same
+  cells, which points at the decode loop's own structure — launches, latency,
+  synchronization — rather than at the KV format or the hardware.
 - Roughly half the board's power envelope is unused at every configuration
-  measured, so the headroom for that optimization is real rather than notional.
+  measured, so the headroom for that work is real rather than notional.
+- At concurrency 4 ignis is already well ahead of the reference under hq, which
+  is the engine's serving default. The G3 cells where it is behind are C=1
+  (parity) and ITL p95 (1.6-2.1% behind).
 - A G3 gate leg should not be run on a cold machine, and a leg whose C=1 sits
   well under its own recent history should be repeated before it is pooled.
 
@@ -117,12 +173,19 @@ same pair.
 - Nothing here is live/live: no reference-engine run shares these sessions, so
   none of these numbers can decide a gate (ADR 0015).
 - Only the 27B NVFP4 artifact on one RTX 5090 was measured.
+- None of these runs is live/live: each engine measured in its own session, so
+  no G3 verdict can be computed from them and none of the engine-to-engine
+  numbers above may decide a gate (ADR 0015, ADR 0021).
+- The reference's ITL percentiles stand on 6 and 8 covered prefill windows
+  against ignis's 10, because its lane 0 stops at its own EOS. The comparison is
+  therefore between percentiles pooled over different amounts of the series.
 
 ## Follow-ups
 
 - Profile one decode round under Nsight Compute to convert the occupancy /
   bandwidth split into a named cost.
 - Repeat the matched A/B once per configuration to put an error bar on C=4.
-- Sample the same telemetry during a `ninfer-serve` run on the same cells: the
-  reference is the only available answer to "is 300 W what this model costs on
-  this card, or is it what our decode loop costs".
+- Answered: the reference draws the same power at 1.4-1.6x the memory
+  utilization, so the idle memory subsystem is ignis's, not the hardware's.
+- Profile ignis's decode round against ninfer's for launch count and
+  synchronization points, which is where the memory gap most likely lives.
