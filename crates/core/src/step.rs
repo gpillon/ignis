@@ -710,6 +710,12 @@ pub fn decode_program_verify(
             sequences.len()
         ));
     }
+    if window == 0 {
+        return Err(
+            "decode_program_verify: window 0 is today's round, not a verify round -- use decode_program_batch_sampled"
+                .to_string(),
+        );
+    }
     let width = window as usize;
     for (index, lane) in lanes.iter().enumerate() {
         if lane.drafts.len() > width {
@@ -746,7 +752,7 @@ pub fn decode_program_verify(
     let options = ffi::IgnisDecodeOptions {
         size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
         speculative_window: window,
-        drafts: if width == 0 { std::ptr::null() } else { drafts.as_ptr() },
+        drafts: drafts.as_ptr(),
         draft_counts: draft_counts.as_ptr(),
         out_committed_counts: committed.as_mut_ptr(),
     };

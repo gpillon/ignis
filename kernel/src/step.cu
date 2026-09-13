@@ -1093,39 +1093,6 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       selectors[i] = c - 1;
     }
 
-    // The penalty rows: at temperature > 0 the accept kernel counted every
-    // licensed token -- the accepted drafts and the correction/bonus token --
-    // in the lane's occurrence counts. A cut run keeps only
-    // `licensed[0..c)` (its drafts plus the new pending token); the tokens
-    // past it were never emitted, so their counts come back off, or the row
-    // a snapshot or a prefix clone carries would run ahead of the text.
-    // Greedy lanes count nothing (the kernel's own contract), so there is
-    // nothing to undo for them.
-    for (uint64_t i = 0; i < batch_size; ++i) {
-      if (!(configs[i].temperature > 0.0f) || configs[i].token_counts == nullptr) {
-        continue;
-      }
-      const std::int32_t produced = accepted[i] + 1;
-      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
-      for (std::int32_t j = committed[i]; j < produced; ++j) {
-        std::int32_t *count = configs[i].token_counts + lane_licensed[j];
-        std::int32_t value = 0;
-        err = cudaMemcpyAsync(&value, count, sizeof(value), cudaMemcpyDeviceToHost, model->stream);
-        if (err == cudaSuccess) {
-          err = cudaStreamSynchronize(model->stream);
-        }
-        if (err == cudaSuccess) {
-          value = value > 0 ? value - 1 : 0;
-          err = cudaMemcpyAsync(count, &value, sizeof(value), cudaMemcpyHostToDevice, model->stream);
-        }
-        if (err != cudaSuccess) {
-          set_error(std::string("ignis_program_decode: penalty count rollback failed: ") +
-                    cudaGetErrorString(err));
-          return -1;
-        }
-      }
-    }
-
     // The fold: every GDN layer's slot and conv taps rebuilt from the
     // committed prefix of this round's records, in one vendored call over
     // every lane. A zero-length commit is that op's own strict no-op; this
@@ -1152,6 +1119,58 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       set_error(std::string("ignis_program_decode: cudaStreamSynchronize(fold) failed: ") +
                 cudaGetErrorString(err));
       return -1;
+    }
+
+    // The penalty rows: at temperature > 0 the accept kernel counted every
+    // licensed token -- the accepted drafts and the correction/bonus token --
+    // in the lane's occurrence counts. A cut run keeps only
+    // `licensed[0..c)` (its drafts plus the new pending token); the tokens
+    // past it were never emitted, so their counts come back off, or the row
+    // a snapshot or a prefix clone carries would run ahead of the text.
+    // Greedy lanes count nothing (the kernel's own contract). Done after the
+    // fold is confirmed, as the last device step before the commit, and in
+    // one read, one adjustment and one write for every such count.
+    std::vector<std::int32_t *> rollback;
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      if (!(configs[i].temperature > 0.0f) || configs[i].token_counts == nullptr) {
+        continue;
+      }
+      const std::int32_t produced = accepted[i] + 1;
+      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
+      for (std::int32_t j = committed[i]; j < produced; ++j) {
+        rollback.push_back(configs[i].token_counts + lane_licensed[j]);
+      }
+    }
+    if (!rollback.empty()) {
+      std::vector<std::int32_t> counts(rollback.size(), 0);
+      for (std::size_t r = 0; r < rollback.size() && err == cudaSuccess; ++r) {
+        err = cudaMemcpyAsync(&counts[r], rollback[r], sizeof(std::int32_t),
+                              cudaMemcpyDeviceToHost, model->stream);
+      }
+      if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(model->stream);
+      }
+      // A token licensed twice in one run has two entries reading the same
+      // count; each entry takes one occurrence off the value read.
+      for (std::size_t r = 0; r < rollback.size(); ++r) {
+        std::int32_t taken = 0;
+        for (std::size_t q = 0; q <= r; ++q) {
+          taken += rollback[q] == rollback[r] ? 1 : 0;
+        }
+        counts[r] = counts[r] > taken ? counts[r] - taken : 0;
+      }
+      for (std::size_t r = 0; r < rollback.size() && err == cudaSuccess; ++r) {
+        err = cudaMemcpyAsync(rollback[r], &counts[r], sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice, model->stream);
+      }
+      if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(model->stream);
+      }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: penalty count rollback failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
 
     // Only now, with the fold confirmed on the device, does any lane's
