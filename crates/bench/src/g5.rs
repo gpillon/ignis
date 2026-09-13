@@ -56,14 +56,6 @@ pub const DEPTHS: [u32; 3] = [DEPTH_24K, DEPTH_98K, DEPTH_196K];
 /// committed tokens").
 pub const COMMITTED_TOKENS: u32 = 512;
 
-/// One depth's C=1 throughput cell — g3's own cell type and counter, just
-/// measured at this phase's depth instead of G3's fixed 8,192.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DepthCell {
-    pub depth_tokens: u32,
-    pub cell: ThroughputCell,
-}
-
 /// A failed cell (corpus load error, or an unreachable fixture) — built
 /// directly from [`ThroughputCell`]'s public fields rather than a new
 /// constructor, since every field it needs is already `pub`.
@@ -99,20 +91,22 @@ pub struct Record {
     pub profile: String,
     /// When the record was made (UTC, RFC 3339 seconds).
     pub date: String,
-    /// One cell per depth measured, in [`DEPTHS`] order.
-    pub cells: Vec<DepthCell>,
+    /// One cell per depth measured, in [`DEPTHS`] order. Each cell's own
+    /// [`ThroughputCell::prompt_tokens`] *is* the depth it was measured at
+    /// — no separate depth field to keep in sync with it.
+    pub cells: Vec<ThroughputCell>,
 }
 
 impl Record {
     /// This record's cell at `depth_tokens`, if measured.
     pub fn cell_at(&self, depth_tokens: u32) -> Option<&ThroughputCell> {
-        self.cells.iter().find(|c| c.depth_tokens == depth_tokens).map(|c| &c.cell)
+        self.cells.iter().find(|c| c.prompt_tokens == depth_tokens)
     }
 
     /// True when every depth cell produced a full set of cold, complete
     /// samples — the property a gate verdict may be computed over.
     pub fn all_cold(&self) -> bool {
-        !self.cells.is_empty() && self.cells.iter().all(|c| c.cell.all_cold())
+        !self.cells.is_empty() && self.cells.iter().all(|c| c.all_cold())
     }
 
     /// Serialize to pretty JSON (the on-disk record format).
@@ -145,18 +139,14 @@ impl Record {
             self.session, self.label, self.engine, self.profile
         ));
         out.push_str(&format!("  endpoint={}  artifact={}  date={}\n", self.endpoint, self.artifact, self.date));
-        for depth_cell in &self.cells {
-            let cell = &depth_cell.cell;
+        for cell in &self.cells {
             match &cell.error {
-                Some(err) => out.push_str(&format!(
-                    "  {:>4}K FAILED: {err}\n",
-                    depth_cell.depth_tokens / 1024,
-                )),
+                Some(err) => out.push_str(&format!("  {:>4}K FAILED: {err}\n", cell.prompt_tokens / 1024)),
                 None => {
                     let bad = cell.bad_samples().len();
                     out.push_str(&format!(
                         "  {:>4}K  {:>9.1} tok/s  over {} sequence(s){}\n",
-                        depth_cell.depth_tokens / 1024,
+                        cell.prompt_tokens / 1024,
                         cell.aggregate_tok_s,
                         cell.samples.len(),
                         if bad == 0 { "  (all cold)".to_string() } else { format!("  ({bad} BAD)") },
@@ -221,20 +211,17 @@ pub fn measure(
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
     let cells = DEPTHS
         .iter()
-        .map(|&depth| {
-            let cell = match &corpus {
-                Some(Ok(ids)) => measure_throughput_cell_from_corpus(
-                    ep,
-                    template,
-                    depth,
-                    cfg.committed_tokens,
-                    C1_CONCURRENCY,
-                    ids,
-                ),
-                Some(Err(error)) => failed_cell(depth, cfg.committed_tokens, error.clone()),
-                None => measure_throughput_cell(ep, template, depth, cfg.committed_tokens, C1_CONCURRENCY),
-            };
-            DepthCell { depth_tokens: depth, cell }
+        .map(|&depth| match &corpus {
+            Some(Ok(ids)) => measure_throughput_cell_from_corpus(
+                ep,
+                template,
+                depth,
+                cfg.committed_tokens,
+                C1_CONCURRENCY,
+                ids,
+            ),
+            Some(Err(error)) => failed_cell(depth, cfg.committed_tokens, error.clone()),
+            None => measure_throughput_cell(ep, template, depth, cfg.committed_tokens, C1_CONCURRENCY),
         })
         .collect();
     Record {
@@ -302,6 +289,36 @@ mod tests {
         }
     }
 
+    /// The bank the corpus tests cut from — mirrors `g3.rs`'s / `g4.rs`'s
+    /// own `corpus_bank()`, sized past the largest depth ([`DEPTH_196K`]).
+    /// The real `DEPTHS` (up to 200,704) go through the corpus path in
+    /// every test below, never the filler word-growth generator: this
+    /// module's own doc comment already names that path as "impractical at
+    /// this scale" (O(n²) re-encoding). Unlike `g4::build_haystack_from_corpus`
+    /// (which wraps a short bank around itself for its own needle cell),
+    /// `g3`'s underlying `land_corpus_window` (`ttft.rs`) caps a window at
+    /// the corpus's own length — a bank shorter than the largest depth
+    /// cannot land it at all, one id per token being the mock template's
+    /// exact ratio.
+    fn corpus_bank() -> Vec<u32> {
+        (0..(DEPTH_196K as usize + 1_000)).map(|i| ((i * 37) % 900) as u32 + 100).collect()
+    }
+
+    /// Write `bank` as a `--corpus` file in a process- and call-unique temp
+    /// directory (mirrors `ttft.rs`'s own corpus-file test). Returns the
+    /// directory (for cleanup) and the file path.
+    fn write_corpus_file(bank: &[u32]) -> (PathBuf, PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ignis-bench-g5-corpus-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("corpus.ids");
+        let text = bank.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+        std::fs::write(&path, text).expect("write corpus");
+        (dir, path)
+    }
+
     #[test]
     fn depths_are_the_spec_05_table_in_1024_multiples() {
         assert_eq!(DEPTH_24K, 24_576);
@@ -319,19 +336,20 @@ mod tests {
     #[test]
     fn each_depth_cell_uses_the_committed_token_counter() {
         let ep = DeterministicEndpoint { ttft_ms: 40.0, interval_ms: 8.0 };
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
         let cfg = G5Config {
             label: "ignis".into(),
             profile: "test-profile".into(),
             artifact: "mock.ninfer".into(),
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
-            corpus: None,
+            corpus: Some(corpus),
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
+        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(record.cells.len(), 3);
-        for depth_cell in &record.cells {
-            let cell = &depth_cell.cell;
-            assert!(cell.all_cold(), "{depth_cell:?}");
+        for cell in &record.cells {
+            assert!(cell.all_cold(), "{cell:?}");
             assert_eq!(cell.samples.len(), 1, "C=1: one sequence per depth");
             let sample = &cell.samples[0];
             assert_eq!(sample.n_tokens, COMMITTED_TOKENS);
@@ -341,7 +359,7 @@ mod tests {
             assert!(
                 (cell.aggregate_tok_s - expected_tok_s).abs() < 1e-6,
                 "depth {}: got {}, expected {}",
-                depth_cell.depth_tokens,
+                cell.prompt_tokens,
                 cell.aggregate_tok_s,
                 expected_tok_s,
             );
@@ -361,22 +379,24 @@ mod tests {
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
         assert_eq!(record.cells.len(), 3);
-        assert!(record.cells.iter().all(|c| c.cell.error.is_some()));
+        assert!(record.cells.iter().all(|c| c.error.is_some()));
         assert!(!record.all_cold());
     }
 
     #[test]
     fn cell_at_finds_the_matching_depth() {
         let ep = DeterministicEndpoint { ttft_ms: 40.0, interval_ms: 8.0 };
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
         let cfg = G5Config {
             label: "ignis".into(),
             profile: "test-profile".into(),
             artifact: "mock.ninfer".into(),
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
-            corpus: None,
+            corpus: Some(corpus),
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
+        std::fs::remove_dir_all(&dir).ok();
         assert!(record.cell_at(DEPTH_98K).is_some());
         assert!(record.cell_at(999).is_none());
     }
@@ -384,15 +404,17 @@ mod tests {
     #[test]
     fn a_record_round_trips_through_json_and_renders() {
         let ep = DeterministicEndpoint { ttft_ms: 40.0, interval_ms: 8.0 };
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
         let cfg = G5Config {
             label: "ignis".into(),
             profile: "test-profile".into(),
             artifact: "mock.ninfer".into(),
             session: "S1".into(),
             committed_tokens: COMMITTED_TOKENS,
-            corpus: None,
+            corpus: Some(corpus),
         };
         let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg);
+        std::fs::remove_dir_all(&dir).ok();
         let json = record.to_json().expect("serialize");
         assert_eq!(Record::from_json(&json).expect("parse"), record);
         let text = record.render();

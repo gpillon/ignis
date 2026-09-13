@@ -86,6 +86,9 @@ pub fn compare_endpoints(
         .map(|c| {
             let req = |suffix: &str| Request {
                 id: format!("equiv-{}-{suffix}", c.id),
+                // `Sub` only because `Request` needs some class and nothing
+                // here ever feeds `class_stats` — matches `oracle::record`'s
+                // own canary requests.
                 class: RequestClass::Sub,
                 prompt: c.prompt.to_string(),
                 max_tokens,

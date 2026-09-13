@@ -350,7 +350,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     // depth present on one launch only is a missing cell.
     let mut depths: Vec<u32> = all
         .iter()
-        .flat_map(|r| r.cells.iter().map(|c| c.depth_tokens))
+        .flat_map(|r| r.cells.iter().map(|c| c.prompt_tokens))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -395,7 +395,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
 mod tests {
     use super::*;
     use crate::g3::{ThroughputCell, ThroughputSample};
-    use crate::g5::{DepthCell, DEPTHS, DEPTH_196K, DEPTH_24K, DEPTH_98K};
+    use crate::g5::{DEPTHS, DEPTH_196K, DEPTH_24K, DEPTH_98K};
 
     fn sample(id: &str, ttft: f64, n: u32, total: f64) -> ThroughputSample {
         ThroughputSample {
@@ -433,10 +433,7 @@ mod tests {
             artifact: "qwen3.8-27b.ninfer".into(),
             profile: format!("{label}-profile"),
             date: "2026-09-13T12:00:00Z".into(),
-            cells: tok_s_by_depth
-                .iter()
-                .map(|&(depth, tok_s)| DepthCell { depth_tokens: depth, cell: cell(depth, tok_s) })
-                .collect(),
+            cells: tok_s_by_depth.iter().map(|&(depth, tok_s)| cell(depth, tok_s)).collect(),
         }
     }
 
@@ -503,9 +500,9 @@ mod tests {
     fn a_cell_holding_a_sample_that_generated_nothing_is_refused_not_ranked() {
         let mut ours = vec![full("ignis", "S1", 140.0), full("ignis", "S1", 140.0)];
         let reference = vec![full("reference", "S1", 140.0), full("reference", "S1", 140.0)];
-        let bad = ours[1].cells.iter_mut().find(|c| c.depth_tokens == DEPTH_98K).unwrap();
-        bad.cell.samples[0].n_tokens = 0;
-        bad.cell.samples[0].ok = true;
+        let bad = ours[1].cells.iter_mut().find(|c| c.prompt_tokens == DEPTH_98K).unwrap();
+        bad.samples[0].n_tokens = 0;
+        bad.samples[0].ok = true;
         let refusal = check(&ours, &reference).expect_err("must refuse");
         assert!(refusal.0.contains("98K"), "{refusal}");
         assert!(refusal.0.contains("launch 2"), "{refusal}");
@@ -516,9 +513,9 @@ mod tests {
     fn a_zero_tok_s_reference_cell_is_refused_rather_than_a_meaningless_ratio() {
         let mk = |label: &str| {
             let mut r = full(label, "S1", 100.0);
-            for dc in &mut r.cells {
-                dc.cell.samples[0].total_ms = dc.cell.samples[0].ttft_ms; // no decode phase
-                dc.cell.aggregate_tok_s = 0.0;
+            for cell in &mut r.cells {
+                cell.samples[0].total_ms = cell.samples[0].ttft_ms; // no decode phase
+                cell.aggregate_tok_s = 0.0;
             }
             r
         };
