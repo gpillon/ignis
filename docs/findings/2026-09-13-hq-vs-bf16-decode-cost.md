@@ -180,6 +180,13 @@ same pair.
   against ignis's 10, because its lane 0 stops at its own EOS. The comparison is
   therefore between percentiles pooled over different amounts of the series.
 
+## Reproducing
+
+The runbook, with the matched-capacity rule and the two pitfalls that cost this
+session a run each, is
+[`docs/agents/testing.md`](../agents/testing.md) — "The KV-format A/B". Reduce a
+telemetry capture with `scripts/gpu-telemetry-summary.py`.
+
 ## Follow-ups
 
 - Profile one decode round under Nsight Compute to convert the occupancy /

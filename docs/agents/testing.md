@@ -245,6 +245,88 @@ runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
 
+## The KV-format A/B: 2x2 over engine and format (GitHub #139)
+
+What it answers: how much the hq-e8-2b KV format costs against BF16, whether
+that cost is ours or the format's, and what the card is actually doing while it
+is paid. The result of the 2026-09-13 run is
+[`docs/findings/2026-09-13-hq-vs-bf16-decode-cost.md`](../findings/2026-09-13-hq-vs-bf16-decode-cost.md);
+this is how to redo it.
+
+**The one rule that makes it a comparison.** Give every leg the *same KV token
+capacity*. A BF16 token costs 65,536 bytes against hq-e8-2b's 9,216 (7.11x, see
+[hq-e8-2b KV capacity](../findings/2026-09-11-hq-e8-2b-kv-capacity.md)), so the
+same byte budget buys 7.11x more pages under hq and a "just change the format"
+run confounds the format with its page count. 65,536 tokens is the value to
+pick: it is 1,024 pages, the geometry spec 03's ITL table and #114's cap
+arithmetic assume, and the ITL fixture's peak of 65,344 tokens fits it with 192
+to spare. Under hq that means asking for the smaller pool explicitly
+(`--kv-pool-bytes 576M`), because its default 4 GiB buys 465,984 tokens.
+
+For the record: shrinking the hq pool from 7,281 pages to 1,024 moved ITL p50 by
+0.04% and p95 by 0.05%, so the page count is not itself a performance term —
+but that is a measured result, not an assumption to skip the matching on.
+
+Needs the GPU exclusively (ADR 0006) and `ninfer-serve` stopped for the ignis
+legs. Four runs, ~4 minutes each.
+
+```powershell
+$Artifact = "F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer"
+$Corpus   = "F:\ai\q38\ninfer\bench\fixtures\bench_corpus.ids"
+cargo build --release -p ignis-server -p ignis-bench --features cuda
+
+# Per leg: start the telemetry sampler, start the engine, run the cell, stop both.
+# Stop the sampler as soon as ignis-bench exits -- see the pitfall below.
+nvidia-smi --format=csv,noheader -l 1 `
+  --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem,temperature.gpu `
+  > .scratch/gpu-<leg>.csv
+
+# ignis, hq-e8-2b / BF16 (--kv-format bf16, and drop --kv-pool-bytes: BF16's
+# 4 GiB default already lands on 65,536 tokens)
+.\target\x86_64-pc-windows-msvc\release\ignis-server.exe --artifact $Artifact `
+  --bind 127.0.0.1:8000 --kv-format hq-e8-2b --max-context 40960 `
+  --kv-pool-bytes 576M --prefill-chunk 1024 --request-timeout 900
+
+# the reference, same two formats
+F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe $Artifact `
+  --host 127.0.0.1 --port 8080 --kv-dtype hq-e8-2b --max-context 40960 `
+  --kv-capacity 65536 --max-concurrency 8 --prefill-chunk 1024
+
+# the cell, once per leg (port 8000 for ignis, 8080 for the reference)
+.\target\x86_64-pc-windows-msvc\release\ignis-bench.exe g3 `
+  --endpoint http://127.0.0.1:8000 --artifact $Artifact --corpus $Corpus `
+  --label ignis --profile "hq-e8-2b KV, 1024 chunk, max-context 40960, 65536-token pool" `
+  --session "kvab-<leg>-$(Get-Date -Format yyyyMMddTHHmmssZ)" `
+  --out .scratch/g3-<leg>.json
+```
+
+Each engine logs the capacity it resolved — `ignis.runtime.kv_pool`'s
+`page_count`, and ninfer's `KV capacity explicit resolved=... tokens pages=...`.
+Check both say 1,024 pages / 65,536 tokens before believing the leg.
+
+Then reduce each capture over the ITL cell, which is the last cell a `g3` run
+measures and whose length the record itself states
+(`window_end_ms - window_start_ms`):
+
+```powershell
+python scripts/gpu-telemetry-summary.py .scratch/gpu-<leg>.csv --label "<leg> ITL" --last 90
+```
+
+**Pitfall: a sampler left running past the cell dilutes the window.** Idle
+samples pull the means down hard — the same hq leg reads 96% util / 306 W over
+its ITL cell and 83% / 274 W if eleven seconds of idle tail are included. Stop
+the sampler when the bench exits, or pass `--from`/`--to` instead of `--last`.
+
+**Pitfall: a cold machine is not a measurement.** The first `g3` run of a
+session came in 14% under the records committed the day before and converged on
+them over four runs (C=1 46.6 -> 51.3 -> 51.0 -> 54.2 against 55.6). Discard the
+first leg, or run one throwaway before the matrix.
+
+**This is not live/live and cannot decide a gate.** Each leg is its own session,
+so `g3-gate` will refuse to build a verdict from these records, by design (ADR
+0015, ADR 0021). The A/B answers a question about *where time goes*; a verdict
+needs both engines measured back to back under one `--session`.
+
 ## The harness's own request deadline (GitHub #138)
 
 Every `ignis-bench` subcommand drives its endpoint through one
