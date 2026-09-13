@@ -54,14 +54,27 @@
 //! trace it replayed; `g4_gate` pools at least two independent process
 //! launches per engine into one verdict — the per-class / aggregate pooled
 //! throughput ratio, and the needle floor, never folded into a ratio.
+//!
+//! The G5 measurement instrument (`g5` + `g5_gate`, P5-07) is the phase-5
+//! gate tooling (ADR 0015, ADR 0021): `g5` reuses `g3`'s C=1 throughput
+//! cell (and its committed-token counter) at three prompt depths — 24K /
+//! 98K / 196K — instead of a new instrument; `g5_gate` pools at least two
+//! independent process launches per engine into one ratio per depth,
+//! reusing `g4_gate`'s pooling rule. `equivalence` is the same phase's
+//! correctness oracle: the canary suite run against a spec-on and a
+//! spec-off endpoint, compared token-for-token for exact equality (not a
+//! tolerance floor like `oracle` — any divergence is the bug).
 
 pub mod canary;
 pub mod client;
+pub mod equivalence;
 pub mod g2;
 pub mod g3;
 pub mod g3_gate;
 pub mod g4;
 pub mod g4_gate;
+pub mod g5;
+pub mod g5_gate;
 pub mod gate;
 pub mod metrics;
 pub mod oracle;
