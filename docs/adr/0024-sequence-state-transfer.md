@@ -100,6 +100,20 @@ and is not a fifth entry point.
 - A blob does not survive a version change. That is the intent — a snapshot
   taken before a layout change is unusable and must be rejected, not
   reinterpreted.
+- **Per-sequence state lives where these calls can reach it: in the pool.**
+  Snapshot, restore and clone take a pool and a sequence, never a model, so a
+  section must be addressable from those two alone. The DFlash2 drafter's
+  window and rewrite checkpoint (P5-03, GitHub #152) therefore moved from the
+  model load, where P5-02 had reserved them per decode lane, into the sequence
+  pool, one lane per slot. The pool is built for a speculative backend, and
+  the program entry points refuse a model loaded for a different one. Spec 05's
+  "Model load" paragraph predates this.
+- **A GPU test may read the blob layout; a production consumer may not.** The
+  layout stays out of the ABI. A test that must inspect what snapshot carried
+  (`crates/core/tests/dflash2_window_gpu.rs`) spells out the layout for one
+  format version and asserts that version first, so a layout change fails the
+  test instead of being misread. The alternative is a feature-gated readback
+  seam, and the GPU profile does not build it, so such a test would never run.
 - Sharing pages without cloning the mutable sections saves nothing, because
   prefill must traverse every layer to produce them. This is recorded so it is
   not re-proposed as an optimization.
