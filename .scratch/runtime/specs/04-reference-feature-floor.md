@@ -212,9 +212,36 @@ least two launches per engine (ADR 0021).
 | cell | measurement | verdict |
 |---|---|---|
 | per class (`main`, `sub`) | trace replay: TTFT and tok/s per class | pooled ratio ≥ 0.99 against the live reference |
-| C=1, C=4, ITL p95 | the G3 cells re-run with hq on both engines | the G3 thresholds, retiring the recorded KV inequality |
+| C=1, C=4, ITL p95 | the G3 cells re-run with hq on both engines | **a regression band, not a threshold**: every ratio reported, the cell fails only below 0.90 (throughput) or above 1.10 (ITL p95) — see below |
 | needle retrieval @ 64K / 128K | correctness floor under hq, not a ratio | the planted fact is retrieved |
 | canary self-consistency | greedy, fixed seed, sane output | exit 0 |
+
+**Why the G3 cells are a band here and not a threshold (GitHub #143, #139).**
+This cell exists to retire the recorded KV-format inequality — the note that has
+sat beside the G2 and G3 verdicts since the two engines were first compared
+across different KV formats. Retiring it needs hq measured on *both* sides. It
+does not need ignis to win by a percent.
+
+Read at G3's 0.99 threshold it does not measure that, because the threshold sits
+inside the cell's own noise. C=1 came in at 1.054 and 0.975 on two live/live
+pairs measured ten minutes apart on one tree and one card (2026-09-13,
+`.scratch/g3-live-verdict.json` and `.scratch/g3-partial-verdict.json`), and
+ADR 0021 already records 5-17% between launches of one binary. A 0.99 floor
+tolerates 1%. A cell whose run-to-run spread is roughly eight times its
+threshold's margin decides which launch was drawn, not which engine is faster —
+which is how #143 came to block a phase on a ratio of 0.974.
+
+So at G4 this cell reports every ratio and fails only outside a band wide enough
+that the failure means something: **below 0.90 on C=1 or C=4, above 1.10 on ITL
+p95**. That catches an hq route that costs real performance and ignores the few
+percent that a later optimization phase is for. The G3 thresholds are unchanged
+and remain G3's own verdict; `ignis-bench g3-gate`'s PASS/FAIL is therefore *not*
+this cell's verdict at G4, and its exit code should not be read as one. Whoever
+runs the gate reads the ratios it prints against the band above.
+
+A cell that lands inside the band but away from parity is recorded as a finding,
+not waived: the point is to stop spending gate runs on it, not to stop knowing
+it.
 
 **Method.** One GPU-exclusive session. Both engines launched twice,
 independently — stopped and restarted, not a second bench invocation against a
