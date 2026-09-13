@@ -200,14 +200,113 @@ pub fn text_scope_27b() -> Vec<InventoryEntry> {
 /// handles, so a caller can zip them with the inventory's names / formats
 /// when building the model-load descriptors.
 pub fn bind_text_scope_27b(reader: &Reader) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
+    bind_model_scope_27b(reader, None)
+}
+
+// ---------------------------------------------------------------------------
+// The DFlash2 drafter module (P5-02, GitHub #150)
+// ---------------------------------------------------------------------------
+
+/// A drafter module the v2 artifact carries beside the text scope, bound
+/// only when a load selects speculation (spec 05: engine residency, chosen at
+/// load). Without one the binder leaves the module's objects unconsumed,
+/// exactly as before it existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftModule {
+    /// The 66 `dflash2/*` objects (the reference's
+    /// `docs/maintainer/qwen3.8-27b-artifact.md` §15).
+    Dflash2,
+}
+
+/// The drafter's layer count (§15.1: five sliding-attention layers).
+pub const DFLASH2_LAYERS: usize = 5;
+
+const SH_DF_FEATURES: [u64; 2] = [5120, 25600]; // hidden x (5 target taps x hidden)
+const SH_DF_QKV: [u64; 2] = [6144, 5120]; // concat(q 32x128, k 8x128, v 8x128)
+const SH_DF_HEAD_NORM: [u64; 1] = [128]; // the drafter's q/k-norm width
+const SH_DF_ATTN_OUT: [u64; 2] = [5120, 4096];
+const SH_DF_CONV_BASE: [u64; 3] = [2, 2, 5120]; // the two-tap dynamic conv's base kernel
+const SH_DF_CONV_PROJ: [u64; 2] = [1280, 5120]; // 320 groups x 2 taps x 2
+const SH_DF_SELECTOR_HIDDEN: [u64; 2] = [256, 5120]; // the selector's rank-256 projection
+const SH_DF_CODEBOOK: [u64; 2] = [248320, 256]; // the per-token predecessor/successor codebooks
+
+/// The 66 DFlash2 module objects, in the artifact's directory order (two
+/// globals, five layer groups of twelve, four closing globals). Matrices are
+/// weight-only NVFP4 — the drafter runs A16, so unlike the text scope no
+/// `*_input_scale_divisor` object pairs with them — and norms and conv base
+/// kernels are BF16 (34 NVFP4 + 32 BF16). The `tests/real_artifact`
+/// cross-check pins this table against the container (ADR 0002).
+pub fn dflash2_scope_27b() -> Vec<InventoryEntry> {
+    let nvfp4 = (NumericFormat::Nvfp4, StorageLayout::BlockScaleK16M128x4V1);
+    let bf16 = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
+    let mut entries = Vec::with_capacity(66);
+    let mut push = |name: &str, (format, layout): (NumericFormat, StorageLayout), shape: &'static [u64]| {
+        entries.push(mk(name, format, layout, shape));
+    };
+    push("dflash2/feature_projection", nvfp4, &SH_DF_FEATURES);
+    push("dflash2/context_norm", bf16, &SH_HIDDEN);
+    for l in 0..DFLASH2_LAYERS {
+        let name = |suffix: &str| format!("dflash2/layers/{l}/{suffix}");
+        push(&name("input_norm"), bf16, &SH_HIDDEN);
+        push(&name("attention/query_key_value"), nvfp4, &SH_DF_QKV);
+        push(&name("attention/query_norm"), bf16, &SH_DF_HEAD_NORM);
+        push(&name("attention/key_norm"), bf16, &SH_DF_HEAD_NORM);
+        push(&name("attention/output"), nvfp4, &SH_DF_ATTN_OUT);
+        push(&name("attention/conv_base"), bf16, &SH_DF_CONV_BASE);
+        push(&name("attention/conv_proj"), nvfp4, &SH_DF_CONV_PROJ);
+        push(&name("post_attention_norm"), bf16, &SH_HIDDEN);
+        push(&name("mlp/gate_up"), nvfp4, &SH_MLP_GATE_UP);
+        push(&name("mlp/down"), nvfp4, &SH_MLP_DOWN);
+        push(&name("mlp/conv_base"), bf16, &SH_DF_CONV_BASE);
+        push(&name("mlp/conv_proj"), nvfp4, &SH_DF_CONV_PROJ);
+    }
+    push("dflash2/final_norm", bf16, &SH_HIDDEN);
+    push("dflash2/selector/hidden", nvfp4, &SH_DF_SELECTOR_HIDDEN);
+    push("dflash2/selector/predecessor", nvfp4, &SH_DF_CODEBOOK);
+    push("dflash2/selector/successor", nvfp4, &SH_DF_CODEBOOK);
+    entries
+}
+
+/// Every object a load binds: the text scope, then the drafter module when
+/// one is selected. The text entries are [`text_scope_27b`] unchanged and
+/// first, so a drafter-bearing plan places every text tensor at the offset a
+/// text-only plan does.
+pub fn model_scope_27b(draft: Option<DraftModule>) -> Vec<InventoryEntry> {
+    let mut entries = text_scope_27b();
+    match draft {
+        None => {}
+        Some(DraftModule::Dflash2) => entries.extend(dflash2_scope_27b()),
+    }
+    entries
+}
+
+/// [`bind_text_scope_27b`], plus the drafter module's objects when `draft`
+/// names one (P5-02, GitHub #150). A missing or mis-shaped drafter object is
+/// a load failure naming it, the same contract as the text scope's. Returns
+/// the handles in [`model_scope_27b`] order.
+pub fn bind_model_scope_27b(
+    reader: &Reader,
+    draft: Option<DraftModule>,
+) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
+    let entries = model_scope_27b(draft);
     let mut binder = Binder::new(reader);
-    let mut handles = Vec::with_capacity(906);
-    for entry in text_scope_27b() {
+    let mut handles = Vec::with_capacity(entries.len());
+    bind_entries(&mut binder, &entries, &mut handles)?;
+    Ok((binder.plan(), handles))
+}
+
+/// Require and place each entry on the device, in order.
+fn bind_entries(
+    binder: &mut Binder,
+    entries: &[InventoryEntry],
+    handles: &mut Vec<ObjectHandle>,
+) -> Result<()> {
+    for entry in entries {
         let handle = binder.require_tensor(entry.name, entry.format, entry.layout, entry.shape)?;
         binder.materialize_on_device(handle)?;
         handles.push(handle);
     }
-    Ok((binder.plan(), handles))
+    Ok(())
 }
 
 /// Build an entry, leaking the (templated) name into a `'static` string
@@ -365,5 +464,83 @@ mod tests {
             .to_string();
         assert!(err.contains("does not match target contract"), "{err}");
         assert!(err.contains("text/token_embedding"), "{err}");
+    }
+
+    // -- the DFlash2 drafter module (P5-02, GitHub #150) ---------------------
+
+    #[test]
+    fn dflash2_scope_is_the_66_module_objects() {
+        let entries = dflash2_scope_27b();
+        assert_eq!(entries.len(), 66);
+        let nvfp4 = entries.iter().filter(|e| e.format == NumericFormat::Nvfp4).count();
+        let bf16 = entries.iter().filter(|e| e.format == NumericFormat::Bf16).count();
+        assert_eq!((nvfp4, bf16), (34, 32), "the reference's 34 NVFP4 + 32 BF16");
+        let mut names = std::collections::BTreeSet::new();
+        for e in &entries {
+            assert!(e.name.starts_with("dflash2/"), "{}", e.name);
+            assert!(names.insert(e.name), "duplicate {}", e.name);
+            let size = tensor_encoded_size(e.layout, e.format, e.shape)
+                .unwrap_or_else(|err| panic!("{} fails the geometry check: {err}", e.name));
+            assert!(size > 0);
+            // Weight-only: the drafter runs A16, no divisor object pairs up.
+            assert!(!e.name.ends_with("input_scale_divisor"), "{}", e.name);
+        }
+    }
+
+    #[test]
+    fn without_a_draft_module_the_scope_is_todays_text_scope() {
+        assert_eq!(model_scope_27b(None), text_scope_27b());
+    }
+
+    #[test]
+    fn with_dflash2_the_scope_appends_the_module_and_leaves_the_text_scope_alone() {
+        let text = text_scope_27b();
+        let scope = model_scope_27b(Some(DraftModule::Dflash2));
+        assert_eq!(scope.len(), text.len() + 66);
+        assert_eq!(&scope[..text.len()], text.as_slice(), "text entries unchanged and first");
+        assert_eq!(&scope[text.len()..], dflash2_scope_27b().as_slice());
+    }
+
+    /// `bind_entries` over the drafter table, on a fixture carrying the
+    /// module's first object (or not): the drafter's refusals are the text
+    /// scope's, naming the object.
+    fn bind_dflash2_error(objects: Vec<crate::fixture::FixtureObject>, payload: &[u8], tag: &str) -> String {
+        let artifact = crate::fixture::write_fixture(&objects, payload, tag).expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+        let mut binder = Binder::new(&reader);
+        let mut handles = Vec::new();
+        bind_entries(&mut binder, &dflash2_scope_27b(), &mut handles)
+            .expect_err("the drafter module is not in this fixture as the model needs it")
+            .to_string()
+    }
+
+    #[test]
+    fn a_missing_dflash2_object_is_a_load_failure_naming_it() {
+        let objects = vec![crate::fixture::FixtureObject::Resource {
+            name: "frontend/tokenizer.json",
+            encoding: "raw-bytes-v1",
+            offset: 0,
+            bytes: 4,
+        }];
+        let err = bind_dflash2_error(objects, &[0u8; 4], "dflash2-missing");
+        assert!(err.contains("is missing"), "{err}");
+        assert!(err.contains("dflash2/feature_projection"), "{err}");
+    }
+
+    #[test]
+    fn a_mis_shaped_dflash2_object_is_a_load_failure_naming_it() {
+        // Present under the right name, stored BF16 [4, 8] instead of the
+        // model's NVFP4 [5120, 25600].
+        let objects = vec![crate::fixture::FixtureObject::Tensor {
+            name: "dflash2/feature_projection",
+            shape: vec![4, 8],
+            format: "BF16",
+            layout: "contiguous-le-v1",
+            offset: 0,
+            bytes: 64,
+        }];
+        let err = bind_dflash2_error(objects, &[0u8; 64], "dflash2-mis-shaped");
+        assert!(err.contains("does not match target contract"), "{err}");
+        assert!(err.contains("dflash2/feature_projection"), "{err}");
     }
 }

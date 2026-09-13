@@ -37,6 +37,7 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
 pub use ignis_core::KvFormat;
+pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 
 /// The fully-resolved config `main` needs to start the server — one field
 /// per env var, each independently resolved as flag → env → default.
@@ -72,6 +73,9 @@ pub struct Config {
     /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
     /// length.
     pub host_pool_bytes: u64,
+    /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
+    /// GitHub #150). `None` loads nothing of the drafter.
+    pub speculation: Option<Speculation>,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
@@ -134,6 +138,8 @@ pub fn resolve(
     let mut kv_pool_bytes = None;
     let mut host_pool_bytes = None;
     let mut request_timeout = None;
+    let mut spec = None;
+    let mut draft_tokens = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -151,6 +157,8 @@ pub fn resolve(
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
+            "--spec" => spec = Some(take_value(args, &mut i, flag)?),
+            "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
         i += 1;
@@ -190,6 +198,7 @@ pub fn resolve(
     let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
+    let speculation = resolve_speculation(spec, draft_tokens, &env)?;
 
     Ok(ConfigOutcome::Config(Config {
         model,
@@ -203,8 +212,44 @@ pub fn resolve(
         kv_format,
         kv_pool_bytes,
         host_pool_bytes,
+        speculation,
         request_timeout_secs,
     }))
+}
+
+/// `--spec` / `IGNIS_SPEC` and `--draft-tokens` / `IGNIS_DRAFT_TOKENS`
+/// (P5-02, GitHub #150). Absent `--spec` means off, and then a draft window
+/// has nothing to size, so naming one alone is refused rather than ignored.
+/// With `--spec`, the window is required — there is no default window to
+/// guess — and anything outside `1..MAX_DRAFT_TOKENS` is refused naming the
+/// range.
+fn resolve_speculation(
+    spec: Option<String>,
+    draft_tokens: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Speculation>, ConfigError> {
+    let spec = non_empty(spec.or_else(|| env("IGNIS_SPEC")));
+    let draft_tokens = non_empty(draft_tokens.or_else(|| env("IGNIS_DRAFT_TOKENS")));
+    let Some(spec) = spec else {
+        return match draft_tokens {
+            Some(raw) => Err(ConfigError(format!(
+                "`--draft-tokens {raw}` requires `--spec` (speculation is off without it)"
+            ))),
+            None => Ok(None),
+        };
+    };
+    let backend =
+        SpeculativeBackend::parse(&spec).map_err(|e| ConfigError(format!("`--spec`: {e}")))?;
+    let Some(raw) = draft_tokens else {
+        return Err(ConfigError(format!(
+            "`--spec {}` requires `--draft-tokens N` (N in 1..{MAX_DRAFT_TOKENS})",
+            backend.as_str()
+        )));
+    };
+    let out_of_range =
+        || ConfigError(format!("`--draft-tokens` must be in 1..{MAX_DRAFT_TOKENS}, got `{raw}`"));
+    let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
+    Speculation::new(backend, n).map(Some).map_err(|_| out_of_range())
 }
 
 /// Parse a `u32` count for `flag`, naming the flag, `unit`, and the
@@ -398,6 +443,8 @@ fn help_text() -> String {
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: auto, {default_kv_pool_gib} GiB; accepts a K/M/G suffix)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
+         \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
+         \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
          \n\
@@ -450,6 +497,7 @@ mod tests {
             ignis_runtime::auto_kv_pool_bytes(KvFormat::HqE8_2b, DEFAULT_MAX_CONTEXT)
         );
         assert_eq!(config.host_pool_bytes, DEFAULT_HOST_POOL_BYTES);
+        assert_eq!(config.speculation, None);
         assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
     }
 
@@ -895,5 +943,71 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--request-timeout"), "help must document --request-timeout:\n{text}");
+    }
+
+    // ── speculation as a load option (P5-02, GitHub #150) ────────────────
+
+    #[test]
+    fn spec_dflash2_with_a_window_in_range_parses() {
+        for n in 1..=7u32 {
+            let a = args(&["--spec", "dflash2", "--draft-tokens", &n.to_string()]);
+            let config = expect_config(resolve(&a, no_env).expect("resolve"));
+            assert_eq!(
+                config.speculation,
+                Some(Speculation::new(SpeculativeBackend::Dflash2, n).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_window_outside_1_to_7_is_refused_naming_the_range() {
+        for raw in ["0", "8", "15", "-1", "seven"] {
+            let a = args(&["--spec", "dflash2", "--draft-tokens", raw]);
+            let err = resolve(&a, no_env).expect_err("out of range");
+            assert!(err.0.contains("--draft-tokens"), "{}", err.0);
+            assert!(err.0.contains("1..7"), "{}", err.0);
+            assert!(err.0.contains(raw), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn an_unknown_speculative_backend_is_refused_naming_dflash2() {
+        let a = args(&["--spec", "mtp", "--draft-tokens", "3"]);
+        let err = resolve(&a, no_env).expect_err("unknown backend");
+        assert!(err.0.contains("--spec") && err.0.contains("mtp"), "{}", err.0);
+        assert!(err.0.contains("dflash2"), "{}", err.0);
+    }
+
+    #[test]
+    fn spec_without_a_draft_window_is_refused() {
+        let err = resolve(&args(&["--spec", "dflash2"]), no_env).expect_err("no window");
+        assert!(err.0.contains("--draft-tokens") && err.0.contains("1..7"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_draft_window_without_spec_is_refused_rather_than_ignored() {
+        let err = resolve(&args(&["--draft-tokens", "7"]), no_env).expect_err("no backend");
+        assert!(err.0.contains("--spec"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_speculation_env_vars_apply_and_the_flags_win_over_them() {
+        let env = env_map(&[("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "3")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(3));
+
+        let env = env_map(&[("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "3")]);
+        let config =
+            expect_config(resolve(&args(&["--draft-tokens", "7"]), env).expect("resolve"));
+        assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7), "flag must win over env");
+    }
+
+    #[test]
+    fn help_lists_the_speculation_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--spec") && text.contains("--draft-tokens"), "{text}");
     }
 }

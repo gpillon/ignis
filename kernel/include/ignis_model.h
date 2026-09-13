@@ -108,6 +108,29 @@ struct ignis_topology {
 /* Opaque loaded-model handle. Never dereferenced across the boundary. */
 struct ignis_model;
 
+/* The speculative backend a load selects (P5-02, GitHub #150, spec 05).
+ * Speculation is engine residency, fixed for the life of the load. */
+enum ignis_speculative_backend {
+  IGNIS_SPECULATIVE_NONE = 0,
+  /* The 5-layer sliding-window DFlash2 drafter: binds the 66 `dflash2/*`
+   * objects and allocates the drafter's per-lane window pool. */
+  IGNIS_SPECULATIVE_DFLASH2 = 1,
+};
+
+/* The widest DFlash2 draft window a load accepts. */
+#define IGNIS_DFLASH2_MAX_DRAFT_TOKENS 7
+
+/* Load options (ADR 0016: `size` first, `sizeof` the struct the caller
+ * compiled against; a NULL pointer means the production defaults -- no
+ * speculation). */
+struct ignis_model_load_options {
+  uint32_t size;
+  int32_t speculative_backend; /* enum ignis_speculative_backend */
+  /* The draft window: 1..IGNIS_DFLASH2_MAX_DRAFT_TOKENS under DFLASH2, 0
+   * with no backend. */
+  uint32_t draft_tokens;
+};
+
 struct ignis_model_stats {
   uint64_t vram_bytes;        /* sum of every bound tensor's payload bytes */
   uint64_t bound_tensor_count;
@@ -141,16 +164,25 @@ struct ignis_model_stats {
  * A pool whose format differs from this argument is refused by the layer
  * entry points rather than run against an arena sized for the other format.
  *
+ * `options` (NULL = no speculation) selects a speculative backend and its
+ * draft window (P5-02, GitHub #150). Under IGNIS_SPECULATIVE_DFLASH2 the
+ * `dflash2/*` tensors must be among `tensors` -- without the option they are
+ * extra bound tensors like any other -- and the load allocates the drafter's
+ * window pool (BF16, 5 layers x 2048 x 8 KV heads x 128 x K+V per lane, twice
+ * with the rewrite checkpoint, for IGNIS_DECODE_MAX_BATCH lanes), which
+ * `ignis_program_stats` reports.
+ *
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate
  * name, a missing or extra bound tensor, a tensor whose shape does not
  * match the one `topology` implies, an invalid `prefill_chunk_tokens` /
- * `max_context_tokens` / `kv_format`, or a chunk width whose scratch
- * reservation does not fit the device's free memory -- a load is
+ * `max_context_tokens` / `kv_format` / `options`, or a chunk width whose
+ * scratch reservation does not fit the device's free memory -- a load is
  * all-or-nothing. */
 int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                           const struct ignis_topology *topology, uint32_t prefill_chunk_tokens,
                           uint32_t max_context_tokens, int32_t kv_format,
+                          const struct ignis_model_load_options *options,
                           struct ignis_model **out_model);
 
 /* Statistics of a loaded model. Returns 0 on success, -1 on a null
