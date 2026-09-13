@@ -186,6 +186,17 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/qk_norm_rope.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gqa_attention.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/kv_cache_append_prefix.cpp
+  # P5-01 (GitHub #149): the speculative-round accept kernel and
+  # verify-input preparation (speculative_round), the DFlash2 draft
+  # kernels (dflash2_draft: dynamic conv, selector lattice, top-k,
+  # selector walk, predecessors), and their wrappers. The cyclic KV
+  # window (cyclic_kv_cache) was already vendored by P1-16/#52.
+  # Nothing is wired into a round yet — these compile and their
+  # reference op tests run under CTest.
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/speculative_round.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/speculative_round.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/dflash2_draft.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/dflash2_draft.cpp
   # P1-13 (GitHub #49): the fused MLP gate_up projection with the SiLU-mul
   # epilogue, NVFP4 arm only. The large-T W4A4/TMA sources compile here but
   # are verified only at G2, same as P1-09's own W4A4/TMA route.
