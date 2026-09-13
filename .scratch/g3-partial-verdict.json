@@ -1,0 +1,45 @@
+{
+  "session": "g3-live-partial-20260913T102623Z",
+  "ours_label": "ignis",
+  "reference_label": "reference",
+  "ours_engine": "qwen3.8-27b-nvfp4full-hq-40k",
+  "reference_engine": "qwen3.8-27b-nvfp4full-hq-40k",
+  "ours_profile": "hq-e8-2b KV, 1024 chunk, 65536-token pool, max-context 40960",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, 65536-token capacity, max-context 40960",
+  "ours_date": "2026-09-13T10:29:22Z",
+  "reference_date": "2026-09-13T10:33:23Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 51.18595418418363,
+    "reference_tok_s": 52.510344537873934,
+    "ratio": 0.9747784866897024,
+    "passed": false
+  },
+  "c4": {
+    "ours_tok_s": 24.90815733201254,
+    "reference_tok_s": 11.202876988433646,
+    "ratio": 2.223371492673609,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 193.03369999999995,
+    "ours_p95_ms": 263.4956000000011,
+    "ours_p99_ms": 276.4078000000027,
+    "ours_max_ms": 280.97439999999915,
+    "reference_p50_ms": 172.63939999998547,
+    "reference_p95_ms": 256.88170000000827,
+    "reference_p99_ms": 277.1967119999934,
+    "reference_max_ms": 282.6840000000084,
+    "ours_prefillers_covered": 10,
+    "reference_prefillers_covered": 8,
+    "ratio": 1.0257468710304884,
+    "passed": true,
+    "warning": "ITL p95 ratio 1.026 exceeds the reference's own p95 (tolerated up to 1.1, but not a clean pass — flagged for review); the reference's measurement window covered 8 of 10 prefill window(s); the two sides pooled over different amounts of the series (10 vs 8 prefill window(s)), so the ratio is noisier on the shorter side"
+  },
+  "notes": [
+    "matched 65,536-token KV capacity on both engines; the reference's lane 0 stops at its own EOS, so its percentiles pool over 8 of 10 prefill windows"
+  ],
+  "passed": false
+}

@@ -79,6 +79,14 @@ pub struct ItlVerdict {
     pub reference_p95_ms: f64,
     pub reference_p99_ms: f64,
     pub reference_max_ms: f64,
+    /// How many prefill windows each side's measurement window covered
+    /// (GitHub #139). The percentiles above stand on these, not on spec
+    /// 03's ten, so a reader can see how much distribution decided the
+    /// ratio — and whether the two sides measured comparable amounts of it.
+    #[serde(default)]
+    pub ours_prefillers_covered: usize,
+    #[serde(default)]
+    pub reference_prefillers_covered: usize,
     /// `ours_p95 / reference_p95`.
     pub ratio: f64,
     /// `ratio <= `[`ITL_RATIO_FAIL_THRESHOLD`].
@@ -166,6 +174,10 @@ impl Verdict {
             self.itl.ratio,
             if self.itl.passed { "PASS" } else { "FAIL" },
         ));
+        out.push_str(&format!(
+            "       pooled over {}/{} prefill window(s) (ours/reference)\n",
+            self.itl.ours_prefillers_covered, self.itl.reference_prefillers_covered,
+        ));
         if let Some(warning) = &self.itl.warning {
             out.push_str(&format!("  ITL WARNING: {warning}\n"));
         }
@@ -244,6 +256,25 @@ pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
                 "the {label} record's ITL cell has a decode lane that failed mid-series"
             )));
         }
+        // GitHub #139: the window is the span every lane shared, so a lane
+        // ended early by its own EOS or by the safety cap shortens it
+        // rather than voiding the cell -- but a window covering fewer than
+        // this many prefill windows is an anecdote, not the distribution
+        // spec 03's ten prefillers exist to provide. A record written
+        // before this field existed reports zero and lands here, which is
+        // the intended outcome: it was measured under the old guard and is
+        // not comparable.
+        if !itl.covers_enough() {
+            return Err(Refusal(format!(
+                "the {label} record's ITL measurement window covered {} of {} prefill window(s), \
+                 fewer than the {} a pooled percentile needs — re-record it (a record written \
+                 before the measurement window existed reports zero here: it was measured under \
+                 the guard this replaced and is not comparable either)",
+                itl.prefillers_covered,
+                itl.prefillers.len(),
+                crate::g3::ITL_MIN_COVERED_PREFILLERS,
+            )));
+        }
         if itl.p95_ms.is_none() {
             return Err(Refusal(format!(
                 "the {label} record's ITL cell has no p95 (no intervals were sampled)"
@@ -307,12 +338,34 @@ fn itl_verdict(ours: &crate::g3::ItlCell, reference: &crate::g3::ItlCell) -> Res
         )));
     }
     let ratio = ours_p95 / ref_p95;
-    let warning = (ratio > ITL_RATIO_PASS_THRESHOLD && ratio <= ITL_RATIO_FAIL_THRESHOLD).then(|| {
-        format!(
+    let mut warnings: Vec<String> = Vec::new();
+    if ratio > ITL_RATIO_PASS_THRESHOLD && ratio <= ITL_RATIO_FAIL_THRESHOLD {
+        warnings.push(format!(
             "ITL p95 ratio {ratio:.3} exceeds the reference's own p95 (tolerated up to \
              {ITL_RATIO_FAIL_THRESHOLD}, but not a clean pass — flagged for review)"
-        )
-    });
+        ));
+    }
+    // GitHub #139: a side whose measurement window closed early still
+    // measured C=4 throughout, but over less of the series. Both the
+    // shortfall and any imbalance between the two sides are the reader's to
+    // weigh, so neither is corrected for — they are said.
+    for (label, cell) in [("ours", ours), ("the reference", reference)] {
+        if cell.prefillers_covered < cell.prefillers.len() {
+            warnings.push(format!(
+                "{label}'s measurement window covered {} of {} prefill window(s)",
+                cell.prefillers_covered,
+                cell.prefillers.len(),
+            ));
+        }
+    }
+    if ours.prefillers_covered != reference.prefillers_covered {
+        warnings.push(format!(
+            "the two sides pooled over different amounts of the series ({} vs {} prefill \
+             window(s)), so the ratio is noisier on the shorter side",
+            ours.prefillers_covered, reference.prefillers_covered,
+        ));
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     Ok(ItlVerdict {
         ours_p50_ms: ours.p50_ms.unwrap_or(0.0),
         ours_p95_ms: ours_p95,
@@ -322,6 +375,8 @@ fn itl_verdict(ours: &crate::g3::ItlCell, reference: &crate::g3::ItlCell) -> Res
         reference_p95_ms: ref_p95,
         reference_p99_ms: reference.p99_ms.unwrap_or(0.0),
         reference_max_ms: reference.max_ms.unwrap_or(0.0),
+        ours_prefillers_covered: ours.prefillers_covered,
+        reference_prefillers_covered: reference.prefillers_covered,
         ratio,
         passed: ratio <= ITL_RATIO_FAIL_THRESHOLD,
         warning,
@@ -379,6 +434,9 @@ mod tests {
                     void_reason: None,
                 })
                 .collect(),
+            window_start_ms: 0.0,
+            window_end_ms: 10_000.0,
+            prefillers_covered: 10,
             lanes: vec![DecodeLaneTrace {
                 id: "lane-0".into(),
                 started_ms: 0.0,
@@ -548,5 +606,86 @@ mod tests {
         for expected in ["S1", "ignis-engine", "reference-engine", "C=1", "C=4", "ITL", "PASS", "N=8"] {
             assert!(text.contains(expected), "render must mention {expected}:\n{text}");
         }
+        // GitHub #139: how much of the series each side pooled over is part
+        // of reading the ratio, so it is rendered rather than left in the
+        // records.
+        assert!(
+            text.contains("pooled over 10/10 prefill window(s)"),
+            "render must state each side's coverage:\n{text}"
+        );
+    }
+
+    /// GitHub #139: a shortened measurement window is a shorter reading, not
+    /// a refused one — the verdict still computes, and carries what it
+    /// stands on.
+    #[test]
+    fn a_partly_covered_window_still_decides_the_gate_and_says_so() {
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.0);
+        let mut reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        reference.itl.prefillers_covered = 6;
+
+        let verdict = check(&ours, &reference).expect("a shortened window still decides");
+        assert_eq!(verdict.itl.ours_prefillers_covered, 10);
+        assert_eq!(verdict.itl.reference_prefillers_covered, 6);
+        assert!(verdict.itl.passed);
+        let warning = verdict.itl.warning.expect("partial coverage must be flagged");
+        assert!(
+            warning.contains("the reference's measurement window covered 6 of 10"),
+            "the shortfall is named on the side it happened: {warning}"
+        );
+        assert!(
+            warning.contains("10 vs 6"),
+            "the imbalance between the two sides is stated, not corrected for: {warning}"
+        );
+    }
+
+    /// GitHub #139: the coverage warning is additive — a ratio in the
+    /// tolerated band and a short window are two separate things to know,
+    /// and neither may swallow the other.
+    #[test]
+    fn a_tolerated_ratio_and_a_short_window_are_both_reported() {
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.5);
+        let mut reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        reference.itl.prefillers_covered = 7;
+
+        let verdict = check(&ours, &reference).expect("a verdict");
+        assert!(verdict.itl.passed, "1.0625 is inside the tolerated band");
+        let warning = verdict.itl.warning.expect("both facts must be flagged");
+        assert!(warning.contains("ITL p95 ratio"), "{warning}");
+        assert!(warning.contains("covered 7 of 10"), "{warning}");
+    }
+
+    /// GitHub #139: below [`crate::g3::ITL_MIN_COVERED_PREFILLERS`] there is
+    /// no distribution left to compare, so the gate refuses rather than
+    /// ranking two anecdotes.
+    #[test]
+    fn a_window_covering_too_little_of_the_series_is_refused() {
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.0);
+        let mut reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        reference.itl.prefillers_covered = 1;
+
+        let refusal = check(&ours, &reference).expect_err("must refuse");
+        assert!(refusal.0.contains("reference"), "the refusal names the side: {refusal}");
+        assert!(refusal.0.contains("covered 1 of 10"), "{refusal}");
+        assert!(refusal.0.contains("re-record"), "{refusal}");
+    }
+
+    /// GitHub #139: a record written before the measurement window existed
+    /// deserializes with a zero coverage, which is not a near miss — it was
+    /// measured under the guard this replaced and is not comparable.
+    #[test]
+    fn a_record_from_before_the_measurement_window_is_refused() {
+        let ours = record("ignis", "S1", 100.0, 380.0, 8.0);
+        let reference = record("reference", "S1", 100.0, 380.0, 8.0);
+        let mut json = serde_json::to_value(&reference).expect("serialize");
+        let itl = json.get_mut("itl").expect("itl").as_object_mut().expect("object");
+        for field in ["window_start_ms", "window_end_ms", "prefillers_covered"] {
+            itl.remove(field).expect("the field is written today");
+        }
+        let old: Record = serde_json::from_value(json).expect("an older record still parses");
+        assert_eq!(old.itl.prefillers_covered, 0);
+
+        let refusal = check(&ours, &old).expect_err("must refuse");
+        assert!(refusal.0.contains("covered 0 of 10"), "{refusal}");
     }
 }
