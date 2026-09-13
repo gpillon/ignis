@@ -11,7 +11,7 @@
 //! that line: 65,536 tokens answered at 15.0 s, 131,072 tokens cancelled at
 //! 30.85 s having generated nothing.
 //!
-//! `crates/bench/tests/long_ttft.rs` holds the transport's own regression
+//! `crates/bench/tests/request_deadline.rs` holds the transport's own regression
 //! test (in-process, no GPU). This file is the other half: the cell itself,
 //! at its real length, against the real engine — the run that proves the
 //! floor is measurable again rather than merely that the client no longer
