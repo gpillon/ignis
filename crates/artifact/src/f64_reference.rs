@@ -196,6 +196,47 @@ pub fn evaluate_layer(reader: &Reader, layer: usize, input: &LayerInput) -> Resu
     }
 }
 
+/// One stored `[rows, cols]` matrix applied to `input` (`cols` values in,
+/// `rows` out), decoded and accumulated exactly as the layer oracle applies
+/// its own weights (BF16, FP32, NVFP4 or W8G32 payloads, FP64 sums).
+///
+/// Public for oracles of what the text layers feed rather than what they
+/// are: the DFlash2 drafter's context append (P5-03, GitHub #152) projects the
+/// target's features through the same decode.
+pub fn matrix_product(
+    reader: &Reader,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    input: &[f64],
+) -> Result<Vec<f64>> {
+    Matrix::load(reader, name, rows, cols)?.product(input)
+}
+
+/// Row `row` of a stored `[rows, cols]` matrix, decoded to f64 — an
+/// embedding lookup, for `text/token_embedding`.
+pub fn matrix_row(
+    reader: &Reader,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    row: usize,
+) -> Result<Vec<f64>> {
+    let matrix = Matrix::load(reader, name, rows, cols)?;
+    (0..cols).map(|col| matrix.at(row, col)).collect()
+}
+
+/// A stored `[len]` vector weight (a norm's gain), decoded to f64.
+pub fn vector_weight(reader: &Reader, name: &str, len: usize) -> Result<Vec<f64>> {
+    vector(&Matrix::load_vector(reader, name, len)?)
+}
+
+/// RMSNorm over one row as the layer oracle evaluates it (epsilon 1e-6);
+/// `unit_offset` selects the `1 + weight` gain the text layers use.
+pub fn rms_norm(input: &[f64], weight: &[f64], unit_offset: bool) -> Result<Vec<f64>> {
+    norm(input, weight, unit_offset)
+}
+
 struct Matrix<'a> {
     rows: usize,
     cols: usize,
@@ -814,6 +855,55 @@ mod tests {
         assert_eq!(LayerFixture::read_from(&path).unwrap(), fixture);
         std::fs::remove_file(path).unwrap();
     }
+    #[test]
+    fn the_public_weight_accessors_decode_what_the_oracle_decodes() {
+        // BF16 [2, 3] = [[1, 2, 0.5], [-1, 0, 2]] at offset 0, and BF16 [3]
+        // = [1, 0.5, 2] at offset 256 (objects are 256-byte aligned).
+        let words: [u16; 9] = [
+            0x3f80, 0x4000, 0x3f00, 0xbf80, 0x0000, 0x4000, 0x3f80, 0x3f00, 0x4000,
+        ];
+        let mut payload = vec![0u8; 512];
+        for (i, word) in words.iter().enumerate() {
+            let at = if i < 6 { i * 2 } else { 256 + (i - 6) * 2 };
+            payload[at..at + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        let objects = vec![
+            crate::fixture::FixtureObject::Tensor {
+                name: "test/matrix",
+                shape: vec![2, 3],
+                format: "BF16",
+                layout: "contiguous-le-v1",
+                offset: 0,
+                bytes: 12,
+            },
+            crate::fixture::FixtureObject::Tensor {
+                name: "test/vector",
+                shape: vec![3],
+                format: "BF16",
+                layout: "contiguous-le-v1",
+                offset: 256,
+                bytes: 6,
+            },
+        ];
+        let artifact = crate::fixture::write_fixture(&objects, &payload, "f64-public-accessors")
+            .expect("write fixture");
+        let reader = Reader::open(&artifact.path).expect("open fixture");
+
+        assert_eq!(matrix_row(&reader, "test/matrix", 2, 3, 1).unwrap(), vec![-1., 0., 2.]);
+        assert_eq!(
+            matrix_product(&reader, "test/matrix", 2, 3, &[1., 1., 2.]).unwrap(),
+            vec![4., 3.]
+        );
+        let gain = vector_weight(&reader, "test/vector", 3).unwrap();
+        assert_eq!(gain, vec![1., 0.5, 2.]);
+        let inv = 1.0 / (25.0 / 3.0 + EPS).sqrt();
+        assert_eq!(rms_norm(&[3., 4., 0.], &gain, false).unwrap(), vec![3. * inv, 2. * inv, 0.]);
+        assert!(
+            matrix_product(&reader, "test/matrix", 3, 2, &[1., 1.]).is_err(),
+            "a shape the stored tensor does not have is refused"
+        );
+    }
+
     #[test]
     fn gdn_unit_vector_is_normalized_with_epsilon() {
         let v = unit(&[3., 4.]);

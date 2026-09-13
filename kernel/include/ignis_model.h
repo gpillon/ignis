@@ -113,7 +113,8 @@ struct ignis_model;
 enum ignis_speculative_backend {
   IGNIS_SPECULATIVE_NONE = 0,
   /* The 5-layer sliding-window DFlash2 drafter: binds the 66 `dflash2/*`
-   * objects and allocates the drafter's per-lane window pool. */
+   * objects; a sequence pool built with it carries the drafter's window per
+   * slot (ignis_seq_pool_spec::speculative_backend). */
   IGNIS_SPECULATIVE_DFLASH2 = 1,
 };
 
@@ -167,10 +168,12 @@ struct ignis_model_stats {
  * `options` (NULL = no speculation) selects a speculative backend and its
  * draft window (P5-02, GitHub #150). Under IGNIS_SPECULATIVE_DFLASH2 the
  * `dflash2/*` tensors must be among `tensors` -- without the option they are
- * extra bound tensors like any other -- and the load allocates the drafter's
- * window pool (BF16, 5 layers x 2048 x 8 KV heads x 128 x K+V per lane, twice
- * with the rewrite checkpoint, for IGNIS_DECODE_MAX_BATCH lanes), which
- * `ignis_program_stats` reports.
+ * extra bound tensors like any other -- and the prefill scratch grows by the
+ * drafter's context append over a chunk (the feature taps and their
+ * projection). The drafter's window and checkpoint are per-sequence state,
+ * so they live in the sequence pool (`ignis_seq_pool_spec::speculative_backend`,
+ * P5-03, GitHub #152), which must be built with the same backend; both are
+ * reported by `ignis_program_stats`.
  *
  * Returns 0 and a handle in `*out_model` on success. Returns -1 (no model
  * produced; see ignis_model_last_error) on a null argument, a duplicate

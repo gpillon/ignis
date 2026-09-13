@@ -202,6 +202,14 @@ fn validate_prefill_config(prefill_chunk_tokens: u32, max_context_tokens: u32) -
     Ok(())
 }
 
+/// The input divisor a weight-only NVFP4 descriptor carries. Nothing reads it
+/// as a divisor (the drafter runs A16), but the vendored NVFP4 weight
+/// validation requires every weight's input divisor to be finite and
+/// positive whatever the route, so 0 fails the first dispatch ("invalid NVFP4
+/// weight", P5-03, GitHub #152). 1.0 is the reference's own value for these
+/// weights (`targets/qwen3_6_27b/impl/load/bindings.cpp`, `dflash2_matrix`).
+pub(crate) const WEIGHT_ONLY_NVFP4_INPUT_DIVISOR: f32 = 1.0;
+
 /// A bound tensor does not cross the ABI if it is a
 /// `*_input_scale_divisor` scalar (the W4A4 path that reads them is
 /// P2-03, GitHub #85) -- its presence and shape are already validated by
@@ -212,8 +220,8 @@ fn crosses_the_abi(name: &str) -> bool {
 
 /// An NVFP4 weight with no paired `*_input_scale_divisor` object: the DFlash2
 /// drafter's matrices are weight-only (it runs A16; the reference's
-/// `qwen3.8-27b-artifact.md` §15.1), so its descriptors carry an input
-/// divisor of 0 — no W4A4 path reads one.
+/// `qwen3.8-27b-artifact.md` §15.1), so its descriptors carry
+/// [`WEIGHT_ONLY_NVFP4_INPUT_DIVISOR`] — no W4A4 path reads it.
 fn is_weight_only_nvfp4(name: &str) -> bool {
     name.starts_with("dflash2/")
 }
@@ -296,7 +304,10 @@ fn build_bound_tensors(
         let (weight_scale_divisor, input_scale_divisor) = if entry.format == NumericFormat::Nvfp4
             && is_weight_only_nvfp4(entry.name)
         {
-            (read_weight_divisor(reader, entry.name, entry.shape)?, 0.0)
+            (
+                read_weight_divisor(reader, entry.name, entry.shape)?,
+                WEIGHT_ONLY_NVFP4_INPUT_DIVISOR,
+            )
         } else if entry.format == NumericFormat::Nvfp4 {
             // The paired `<name>/..._projection/input_scale_divisor` object
             // (present for every NVFP4 projection) is generated immediately
@@ -435,9 +446,12 @@ pub fn load_qwen38_27b(
 ///
 /// With `Some`, `handles` must be the handles
 /// [`ignis_artifact::bind_model_scope_27b`] returned for [`draft_module`] of
-/// the same option; the leaf binds the drafter's weights from them and
-/// allocates its per-lane window pool, both reported by
-/// [`crate::step::program_stats`]. With `None` the options pointer crosses as
+/// the same option; the leaf binds the drafter's weights from them and sizes
+/// the prefill scratch for its context append. The drafter's per-sequence
+/// window lives in the pool, which must be built with
+/// [`crate::seq::SeqPool::create_with_speculation`] for the same backend
+/// (P5-03, GitHub #152); both are reported by [`crate::step::program_stats`].
+/// With `None` the options pointer crosses as
 /// NULL (ADR 0016: production defaults) and the load is exactly today's.
 pub fn load_qwen38_27b_with_speculation(
     reader: &Reader,
@@ -550,6 +564,15 @@ mod tests {
         ));
         assert!(crosses_the_abi("text/layers/3/attention/query_key_gate_value"));
         assert!(crosses_the_abi("text/token_embedding"));
+    }
+
+    #[test]
+    fn a_weight_only_nvfp4_input_divisor_passes_the_vendored_weight_validation() {
+        // nvfp4_format.cpp refuses a non-finite or non-positive input divisor
+        // on every route, A16 included.
+        assert!(WEIGHT_ONLY_NVFP4_INPUT_DIVISOR.is_finite());
+        assert!(WEIGHT_ONLY_NVFP4_INPUT_DIVISOR > 0.0);
+        assert_eq!(WEIGHT_ONLY_NVFP4_INPUT_DIVISOR, 1.0, "the reference's value");
     }
 
     #[test]

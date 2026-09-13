@@ -68,6 +68,10 @@ pub(crate) mod ffi {
         /// slot's presence/frequency penalty count buffer (one int32 per
         /// vocab entry).
         pub vocab: u32,
+        /// `enum ignis_speculative_backend` (P5-03, GitHub #152): 0 for a
+        /// pool without a drafter; under DFlash2 every slot also owns the
+        /// drafter's window and its checkpoint (80 MiB).
+        pub speculative_backend: i32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -347,6 +351,20 @@ impl SeqPool {
     /// Build the pool from a model's GDN geometry and a caller-sized
     /// budget (P1-19).
     pub fn create(cfg: &ModelConfig, budget: &SeqPoolBudget) -> Result<Self, String> {
+        Self::create_with_speculation(cfg, budget, None)
+    }
+
+    /// [`SeqPool::create`] for a load with speculation (P5-03, GitHub #152):
+    /// with `Some`, every slot also owns that backend's per-sequence drafter
+    /// state — for DFlash2 its window and rewrite checkpoint — which
+    /// snapshot, restore and prefix clone carry like the GDN slot. The
+    /// backend must be the one the model was loaded with; the leaf refuses a
+    /// prefill or decode that pairs them otherwise.
+    pub fn create_with_speculation(
+        cfg: &ModelConfig,
+        budget: &SeqPoolBudget,
+        speculative_backend: Option<crate::SpeculativeBackend>,
+    ) -> Result<Self, String> {
         let spec = ffi::IgnisSeqPoolSpec {
             num_kv_heads: cfg.num_kv_heads as u32,
             head_dim: cfg.head_dim as u32,
@@ -359,6 +377,7 @@ impl SeqPool {
             gdn_value_heads: cfg.gdn_value_heads as u32,
             gdn_head_dim: cfg.gdn_head_dim as u32,
             vocab: cfg.vocab as u32,
+            speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
         };
         let mut handle: *mut ffi::IgnisSeqPool = std::ptr::null_mut();
         let rc = unsafe { ffi::ignis_seq_pool_create(&spec, &mut handle) };

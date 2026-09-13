@@ -148,6 +148,16 @@ struct ignis_seq_pool_spec {
    * presence/frequency penalty count buffer (one int32 per vocab entry).
    * Must match the model the pool's sequences are stepped with. */
   uint32_t vocab;
+  /* One of enum ignis_speculative_backend (ignis_model.h; 0 = none). Under
+   * IGNIS_SPECULATIVE_DFLASH2 every slot also owns the DFlash2 drafter's
+   * per-sequence state (P5-03, GitHub #152): its sliding BF16 K/V window
+   * (5 layers x 2048 x 8 KV heads x 128 x K+V = 40 MiB) and that window's
+   * rewrite checkpoint (40 MiB more), zeroed at ignis_seq_alloc. Both are
+   * state sections like the GDN slot, so snapshot, restore and the prefix
+   * clone carry them, and a blob taken on a pool with the drafter is
+   * refused by one without it and vice versa. Must match the speculative
+   * backend of the model the pool's sequences are stepped with. */
+  int32_t speculative_backend;
 };
 
 struct ignis_seq_pool_stats {
@@ -187,9 +197,11 @@ struct ignis_seq_stats {
   uint32_t shared_pages;
 };
 
-/* Build the two device-resident pools from `spec`. Returns 0 and a handle
- * in `*out_pool` on success. Returns -1 (see ignis_seq_last_error) on a
- * null argument or a non-positive geometry field. */
+/* Build the two device-resident pools from `spec` (and, under a speculative
+ * backend, the drafter's window and checkpoint for every slot). Returns 0
+ * and a handle in `*out_pool` on success. Returns -1 (see
+ * ignis_seq_last_error) on a null argument, a non-positive geometry field,
+ * or an unknown speculative backend. */
 int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
                                struct ignis_seq_pool **out_pool);
 
