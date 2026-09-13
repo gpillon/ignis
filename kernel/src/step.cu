@@ -1099,6 +1099,11 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
       model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
       model->decode_graph_slots->bytes;
+  // P5-02 (GitHub #150): the drafter's window pool, present only under a
+  // speculative load -- its weights are already in `model->vram_bytes`.
+  if (model->dflash2_window != nullptr) {
+    out_stats->vram_bytes += model->dflash2_window->bytes + model->dflash2_checkpoint->bytes;
+  }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;

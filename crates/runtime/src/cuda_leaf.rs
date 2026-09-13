@@ -63,6 +63,11 @@ pub struct CudaLeafConfig {
     /// #84: prefill traverses a span one chunk at a time, synchronizing
     /// once per chunk, not once per token.
     pub prefill_chunk_tokens: u32,
+    /// Speculative decoding, fixed for the life of the model handle (P5-02,
+    /// GitHub #150). With it, the leaf binds the drafter's weights — which
+    /// `handles` must then carry (`ignis_artifact::bind_model_scope_27b`) —
+    /// and allocates its window pool; `None` is today's load.
+    pub speculation: Option<ignis_core::Speculation>,
 }
 
 impl Default for CudaLeafConfig {
@@ -88,6 +93,7 @@ impl Default for CudaLeafConfig {
             ),
             slot_count: N_DECODE_LANES as u32,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
+            speculation: None,
         }
     }
 }
@@ -220,13 +226,14 @@ impl StepLeaf for CudaLeaf {
         // The format reaches the load itself (P4-05, GitHub #123), not just
         // the pool: the leaf sizes its attention workspace from it, and the
         // GQA layers refuse a pool built in the other one.
-        let model = model_load::load_qwen38_27b(
+        let model = model_load::load_qwen38_27b_with_speculation(
             &self.reader,
             &self.artifact,
             &self.handles,
             self.config.prefill_chunk_tokens,
             self.config.max_context_tokens,
             self.config.kv_format,
+            self.config.speculation,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();

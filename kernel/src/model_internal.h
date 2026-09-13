@@ -47,6 +47,36 @@ struct GdnLayerWeights {
   ninfer::Weight mlp_down;
 };
 
+// P5-02 (GitHub #150): the DFlash2 drafter's weights, bound only under
+// IGNIS_SPECULATIVE_DFLASH2. Each attention and MLP block carries its own
+// two-tap dynamic conv (a base kernel and its projection).
+struct Dflash2LayerWeights {
+  ninfer::Weight input_norm;
+  ninfer::Weight query_key_value;
+  ninfer::Weight query_norm;
+  ninfer::Weight key_norm;
+  ninfer::Weight output;
+  ninfer::Weight attention_conv_base;
+  ninfer::Weight attention_conv_proj;
+  ninfer::Weight post_attention_norm;
+  ninfer::Weight mlp_gate_up;
+  ninfer::Weight mlp_down;
+  ninfer::Weight mlp_conv_base;
+  ninfer::Weight mlp_conv_proj;
+};
+
+inline constexpr std::size_t kDflash2Layers = 5;
+
+struct Dflash2Weights {
+  ninfer::Weight feature_projection;
+  ninfer::Weight context_norm;
+  std::array<Dflash2LayerWeights, kDflash2Layers> layers{};
+  ninfer::Weight final_norm;
+  ninfer::Weight selector_hidden;
+  ninfer::Weight selector_predecessor;
+  ninfer::Weight selector_successor;
+};
+
 struct LayerWeights {
   ignis_layer_kind kind = IGNIS_LAYER_GDN;
   GqaLayerWeights gqa{};
@@ -152,4 +182,17 @@ struct ignis_model {
   // graph, 0 if it ran the eager loop (`ignis_program_stats`'s
   // `graph_launches`).
   uint64_t last_step_graph_launches = 0;
+
+  // P5-02 (GitHub #150): speculation, chosen at load. Under
+  // IGNIS_SPECULATIVE_DFLASH2, `dflash2` is bound and the drafter's window
+  // pool is allocated: one BF16 K+V window per lane in `dflash2_window` and
+  // its rewrite checkpoint in `dflash2_checkpoint`, each
+  // `IGNIS_DECODE_MAX_BATCH` lanes wide. Both stay null without the option,
+  // so the VRAM report does not move. The ticket that runs the drafter lays
+  // its own structure over these reservations.
+  int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
+  uint32_t draft_tokens = 0;
+  Dflash2Weights dflash2{};
+  std::unique_ptr<ninfer::DeviceBuffer> dflash2_window;
+  std::unique_ptr<ninfer::DeviceBuffer> dflash2_checkpoint;
 };

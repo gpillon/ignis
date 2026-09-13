@@ -349,6 +349,18 @@ target_link_libraries(ignis_kernel_model_load_kv_format_test PRIVATE ignis_kerne
 add_test(NAME ignis_kernel_model_load_kv_format_test
          COMMAND ignis_kernel_model_load_kv_format_test)
 
+# P5-02 (GitHub #150): OURS, not vendored -- `ignis_model_load`'s speculation
+# option: the options struct is refused by name before binding, and under
+# DFLASH2 each of the 66 `dflash2/*` tensors is required, named when missing or
+# mis-shaped, and an extra without the option. Host-only: every arm fails at
+# binding, ahead of the load's device calls.
+add_executable(ignis_kernel_model_load_speculative_options_test
+               test_model_load_speculative_options.cpp)
+target_link_libraries(ignis_kernel_model_load_speculative_options_test
+                      PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_model_load_speculative_options_test
+         COMMAND ignis_kernel_model_load_speculative_options_test)
+
 # P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
 # ignis's own BF16 route on identical keys and values (ADR 0022's in-house
 # acceptance for a lossy format). The same q/k/v/gate/positions go through A1

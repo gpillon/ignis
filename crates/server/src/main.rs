@@ -130,6 +130,10 @@ fn cuda_scheduler(
                 max_context = shape.max_context,
                 kv_format = shape.kv_format.as_str(),
                 kv_pool_bytes = shape.kv_pool_bytes,
+                speculation = %shape.speculation.map_or_else(
+                    || "off".to_owned(),
+                    |s| format!("{} draft_tokens={}", s.backend().as_str(), s.draft_tokens())
+                ),
                 "model loaded on the GPU"
             );
             Box::new(scheduler)
@@ -199,6 +203,7 @@ async fn main() {
         kv_format: _,
         kv_pool_bytes: _,
         host_pool_bytes: _,
+        speculation: _,
         request_timeout_secs,
     } = config;
 

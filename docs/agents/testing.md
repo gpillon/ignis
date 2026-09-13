@@ -261,6 +261,13 @@ resident-token capacity that budget buys is derived from the format and
 logged at load as `ignis.runtime.kv_pool`, so a run's KV profile is read off
 that event rather than computed from a flag.
 
+Speculation is a load option too (GitHub #150): `--spec dflash2
+--draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
+`dflash2/*` objects and reserves its window pool (8 lanes x 80 MiB);
+`ignis.model.loaded` records it as `speculation`. Absent, the load, its plan
+and its VRAM report are exactly what they were before the option existed.
+`crates/core/tests/speculative_load_gpu.rs` pins the VRAM delta.
+
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`

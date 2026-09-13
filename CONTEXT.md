@@ -228,6 +228,13 @@ When output names a domain concept, use the term as defined here.
   are ~20 GiB of BF16 KV against ~3.02 GB of hq (**KV format**).
 - **DFlash2** — the 5-layer sliding-window (2048) speculative-decoding drafter
   (hidden 5120, draft tokens 1..7, native acceptance 3.4–3.7 tokens/round).
+  Selected at load (`--spec dflash2 --draft-tokens N`); without it none of the
+  66 `dflash2/*` objects is bound.
+- **Draft window** — the number of tokens the drafter proposes per round
+  (`--draft-tokens`, 1..7), fixed for the life of a load. Not to be confused
+  with the drafter's own 2048-token sliding **drafter window**, whose per-lane
+  BF16 K+V pool (40 MiB, twice with its rewrite checkpoint) the load reserves
+  for every decode lane.
 - **MTP** — the model's native multi-token-prediction heads (draft window 3,
   adaptive verification width).
 - **Vision** — multimodal (image/video) input.

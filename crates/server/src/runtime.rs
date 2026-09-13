@@ -42,6 +42,9 @@ pub struct EngineShape {
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
+    /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
+    /// `None` binds nothing of the drafter.
+    pub speculation: Option<ignis_core::Speculation>,
 }
 
 impl Default for EngineShape {
@@ -58,6 +61,7 @@ impl Default for EngineShape {
                 ignis_runtime::DEFAULT_MAX_CONTEXT,
             ),
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            speculation: None,
         }
     }
 }
@@ -70,6 +74,7 @@ impl From<&crate::config::Config> for EngineShape {
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
             host_pool_bytes: config.host_pool_bytes,
+            speculation: config.speculation,
         }
     }
 }
@@ -106,12 +111,16 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
-    use ignis_artifact::{CudaDevice, Reader, bind_text_scope_27b, materialize};
+    use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b, materialize};
     use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
+    // P5-02 (GitHub #150): the drafter's objects are bound and uploaded only
+    // when the operator asked for speculation; otherwise the plan is the text
+    // scope's alone, as before.
+    let draft = ignis_core::model_load::draft_module(shape.speculation);
     let (plan, handles) =
-        bind_text_scope_27b(&reader).map_err(|e| format!("bind text scope: {e}"))?;
+        bind_model_scope_27b(&reader, draft).map_err(|e| format!("bind model scope: {e}"))?;
     let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
@@ -121,6 +130,7 @@ pub fn cuda_scheduler(
         kv_format: shape.kv_format,
         kv_pool_bytes: shape.kv_pool_bytes,
         prefill_chunk_tokens: shape.prefill_chunk,
+        speculation: shape.speculation,
         ..CudaLeafConfig::default()
     };
 
@@ -193,6 +203,7 @@ mod tests {
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: 8 * 1024 * 1024 * 1024,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            speculation: None,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
