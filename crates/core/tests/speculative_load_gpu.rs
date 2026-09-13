@@ -86,17 +86,26 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
         (stats.vram_bytes, model.stats().bound_tensor_count)
     };
 
+    // P5-04 (GitHub #153): any load with a draft window also carries the
+    // verify substrate (its staging, ReplaySSM records, accept scratch and a
+    // decode scratch sized for k+1 columns per lane). A verify-only load at
+    // the same window carries exactly that and no drafter, so the drafter's
+    // own cost is the difference between the two -- still to the byte.
+    let verify_only = Speculation::new(SpeculativeBackend::VerifyOnly, 7).unwrap();
     let (plain_vram, plain_bound) = load(&handles[..text_len], None);
     let (spec_vram, spec_bound) = load(&handles, Some(spec));
-    // Asked again after the speculative load, so nothing it allocated leaks
-    // into the plain load's figure.
+    let (verify_vram, verify_bound) = load(&handles[..text_len], Some(verify_only));
+    // Asked again after the speculative loads, so nothing they allocated
+    // leaks into the plain load's figure.
     let (plain_again, _) = load(&handles[..text_len], None);
 
     assert_eq!(plain_again, plain_vram, "a load without the option reports today's figure");
     assert_eq!(spec_bound, plain_bound + 66, "every dflash2 object crosses the ABI");
+    assert_eq!(verify_bound, plain_bound, "a verify-only load binds no drafter object");
+    assert!(verify_vram > plain_vram, "a draft window reserves the verify substrate");
     assert_eq!(spec.window_pool_bytes(), 8 * 80 * 1024 * 1024);
     assert_eq!(
-        spec_vram - plain_vram,
+        spec_vram - verify_vram,
         drafter_weight_bytes + spec.window_pool_bytes(),
         "the drafter adds its weights and 8 lanes x 80 MiB of window pool, nothing else"
     );

@@ -185,6 +185,11 @@ struct ignis_seq_stats {
    * sequence: 0 for a sequence that prefilled its own head. The pool is
    * charged for these once, not once per claimant. */
   uint32_t shared_pages;
+  /* The program-wide frontier: tokens the sequence has consumed, prompt and
+   * every committed token included (P5-04, GitHub #153: what a verify
+   * round's stop-aware commit is measured against -- it equals the emitted
+   * length, never runs past it). */
+  uint64_t position;
 };
 
 /* Build the two device-resident pools from `spec`. Returns 0 and a handle

@@ -103,6 +103,9 @@ pub(crate) mod ffi {
         /// to this sequence (GitHub #126): 0 for a sequence that prefilled
         /// its own head.
         pub shared_pages: u32,
+        /// The program-wide frontier (P5-04, GitHub #153): tokens consumed,
+        /// prompt and every committed token included.
+        pub position: u64,
     }
 
     /// 1:1 with `struct ignis_seq_prefix_stats`.

@@ -235,6 +235,30 @@ When output names a domain concept, use the term as defined here.
   with the drafter's own 2048-token sliding **drafter window**, whose per-lane
   BF16 K+V pool (40 MiB, twice with its rewrite checkpoint) the load reserves
   for every decode lane.
+- **Verify round** — the speculative form of the **decode round** (P5-04): each
+  lane contributes `k+1` columns — its anchor (the pending successor) followed
+  by the drafts, the tail padded with the anchor — and the 64 layers traverse
+  the batch's columns once, the GQA layers appending every valid column and
+  the GDN layers recording instead of advancing. Selected per call through
+  the decode options at the load's draft window, never padded to it; window 0
+  is today's round. Widths stay exact: one **verify graph** per batch width
+  1..8 at the window.
+- **Extent** — the draft columns a lane actually verifies in a round:
+  `min(k, proposed, remaining budget − 1, remaining context − 1)`. Extent 0 is
+  a fallback step inside the same round, one committed token.
+- **Committed run** — the tokens a verify round emits for a lane: the anchor
+  plus the accepted drafts, cut at the first stop id inclusive (1..k+1). The
+  KV frontier, the GDN slot and the pending token move by exactly the run, so
+  a sequence never stands past the text it emitted.
+- **ReplaySSM record and fold** — how the GDN layers speculate without
+  advancing: the verify traversal records each column's conv input, key,
+  value and gates (the **records**), and after accept the **fold** replays
+  the committed prefix of each lane's records into its recurrent slot and
+  conv taps in one vendored call. A rejected draft's transition is recorded
+  and never folded — that is the whole rollback.
+- **Drafter** — whatever fills a verify round's proposal seam: **DFlash2**
+  once it is wired into the round, a fake drafter in the substrate's own
+  tests (`verify-only` load: the verify substrate with nothing bound).
 - **MTP** — the model's native multi-token-prediction heads (draft window 3,
   adaptive verification width).
 - **Vision** — multimodal (image/video) input.

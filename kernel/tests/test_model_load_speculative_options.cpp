@@ -167,18 +167,25 @@ int main() {
     const std::string m = load_error({}, &bad);
     check(contains(m, "options.size"), "an unrecognized options size is refused: " + m);
   }
-  for (const int32_t backend : {-1, 2, 9}) {
+  for (const int32_t backend : {-1, 3, 9}) {
     ignis_model_load_options bad = dflash2(7);
     bad.speculative_backend = backend;
     const std::string m = load_error({}, &bad);
     check(contains(m, "speculative_backend") && contains(m, std::to_string(backend)),
           "backend " + std::to_string(backend) + " is refused by name: " + m);
   }
-  for (const uint32_t window : {0u, 8u, 15u}) {
-    const ignis_model_load_options bad = dflash2(window);
-    const std::string m = load_error({}, &bad);
-    check(contains(m, "draft_tokens") && contains(m, "1..7") && contains(m, std::to_string(window)),
-          "window " + std::to_string(window) + " is refused naming the range: " + m);
+  // P5-04 (GitHub #153): the verify-only backend takes the same window rule
+  // as DFLASH2 -- the verify graphs are captured at it.
+  for (const int32_t backend : {static_cast<int32_t>(IGNIS_SPECULATIVE_DFLASH2),
+                                static_cast<int32_t>(IGNIS_SPECULATIVE_VERIFY_ONLY)}) {
+    for (const uint32_t window : {0u, 8u, 15u}) {
+      ignis_model_load_options bad = dflash2(window);
+      bad.speculative_backend = backend;
+      const std::string m = load_error({}, &bad);
+      check(contains(m, "draft_tokens") && contains(m, "1..7") && contains(m, std::to_string(window)),
+            "backend " + std::to_string(backend) + " window " + std::to_string(window) +
+                " is refused naming the range: " + m);
+    }
   }
   {
     ignis_model_load_options bad{};
@@ -225,6 +232,16 @@ int main() {
     const std::string m = load_error(concat(text, drafter), nullptr);
     check(contains(m, "extra bound tensor: dflash2/feature_projection"),
           "without the option the drafter's tensors are extras: " + m);
+  }
+  {
+    // P5-04 (GitHub #153): VERIFY_ONLY binds no drafter either -- the
+    // verify substrate needs the text scope alone -- so the same tensors are
+    // extras under it too.
+    ignis_model_load_options verify_only = dflash2(7);
+    verify_only.speculative_backend = IGNIS_SPECULATIVE_VERIFY_ONLY;
+    const std::string m = load_error(concat(text, drafter), &verify_only);
+    check(contains(m, "extra bound tensor: dflash2/feature_projection"),
+          "under VERIFY_ONLY the drafter's tensors are extras: " + m);
   }
 
   if (g_failed != 0) {

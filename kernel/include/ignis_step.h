@@ -72,7 +72,17 @@ extern "C" {
  * position key the counter-based RNG draw, independent of which other
  * sequences share the round or their arrival order. `min_p` is not
  * exposed at this ABI (disabled) -- not one of this ticket's six
- * parameters. */
+ * parameters.
+ *
+ * P5-04 (GitHub #153) appends the verify round's per-lane inputs (ADR 0016:
+ * a field append and a size bump, never a parameter). Both are read only by
+ * a decode call whose `ignis_decode_options::speculative_window` is nonzero;
+ * every other entry point ignores them. `remaining_tokens` is the lane's
+ * remaining generation budget in tokens, counting the anchor this round
+ * emits -- the round proposes at most `remaining_tokens - 1` drafts -- and 0
+ * means no budget. `stop_ids` (caller-owned, `stop_id_count` entries, valid
+ * for the call) cut the committed run at the first stop id inclusive: the
+ * sequence's state never runs past the text the caller emits. */
 struct ignis_sampling_params {
   uint32_t size;    /* sizeof(struct ignis_sampling_params) */
   int32_t greedy;   /* nonzero: argmax, ignoring every field below */
@@ -82,6 +92,9 @@ struct ignis_sampling_params {
   float presence_penalty;
   float frequency_penalty;
   uint64_t seed;
+  uint32_t remaining_tokens; /* P5-04: this lane's budget, anchor included; 0 = none */
+  uint32_t stop_id_count;    /* P5-04: entries in `stop_ids` (0: no stop id) */
+  const int32_t *stop_ids;   /* P5-04: caller-owned; NULL when the count is 0 */
 };
 
 /* The largest `batch_size` `ignis_program_decode` accepts: the decode
@@ -175,6 +188,10 @@ struct ignis_program_stats {
   uint64_t kernel_count;
   uint64_t graph_launches;
   uint32_t decode_graph_ready_mask;
+  /* P5-04 (GitHub #153): bit (w-1) set when a *verify* graph for exact batch
+   * width w is captured at the load's draft window. Always 0 on a load with
+   * no window. */
+  uint32_t verify_graph_ready_mask;
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..IGNIS_DECODE_MAX_BATCH
@@ -190,7 +207,14 @@ struct ignis_program_stats {
  * call (every width's capture, sequentially) so the startup cost is
  * measured and reported, not assumed. Returns 0 unless `model` or `pool` is
  * null (in which case no width is attempted and `*out_ready_mask` is left
- * unset). */
+ * unset).
+ *
+ * P5-04 (GitHub #153): on a load with a draft window this call also
+ * captures one *verify* graph per exact width at that window, after the
+ * decode graphs; a verify capture failure degrades that width to the eager
+ * verify traversal, never refuses service, and is reported through
+ * `ignis_program_stats::verify_graph_ready_mask` (the `*out_ready_mask` here
+ * stays the decode graphs' own). */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 
@@ -232,6 +256,38 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
                               const struct ignis_prefill_options *options,
                               float *out_logits);
 
+/* Per-call options for ignis_program_decode (ADR 0016; P5-04, GitHub #153,
+ * spec 05). `size` must be `sizeof(struct ignis_decode_options)`; a NULL
+ * pointer means the production defaults -- today's round, one token per
+ * lane.
+ *
+ * `speculative_window == 0` is today's round. `speculative_window == k` runs
+ * the verify round: it must equal the window the model was loaded with
+ * (`ignis_model_load_options::draft_tokens`, the one the verify graphs were
+ * captured at) -- any other value is rejected naming both, never padded.
+ *
+ * The drafts come through `drafts`, an internal seam this ticket fills from
+ * a test's fake drafter and P5-05 fills from the DFlash2 drafter: host
+ * `[batch_size][speculative_window]`, row-major, lane i's proposals in
+ * order; `draft_counts[i]` (NULL: `speculative_window` for every lane) says
+ * how many of lane i's entries are proposals. A NULL `drafts` proposes
+ * nothing, so every lane runs at extent 0 -- a fallback step inside the same
+ * round, one committed token, exactly what the round emits today.
+ *
+ * `out_committed_counts` (`batch_size` entries, required) receives how many
+ * tokens lane i committed this round, 1..k+1; `out_token_ids` is then
+ * `[batch_size][speculative_window + 1]` and lane i's committed run is its
+ * first `out_committed_counts[i]` entries: the anchor (the successor the
+ * prior round made ready) followed by the accepted drafts, cut at the first
+ * stop id inclusive. */
+struct ignis_decode_options {
+  uint32_t size;               /* sizeof(struct ignis_decode_options) */
+  uint32_t speculative_window; /* 0: today's round; k: the verify round at the load's window */
+  const int32_t *drafts;       /* [batch_size][speculative_window], or NULL */
+  const uint32_t *draft_counts; /* [batch_size], or NULL (every lane proposes the window) */
+  int32_t *out_committed_counts; /* [batch_size]; required when speculative_window > 0 */
+};
+
 /* Complete one decode round for a batch of sequence handles.  Each output is
  * the successor made ready by prefill/the prior round; that token is
  * consumed before return to make the next successor ready.
@@ -241,11 +297,28 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
  * sharing this round may carry independent temperatures, seeds and penalty
  * histories. `batch_size` must not exceed `IGNIS_DECODE_MAX_BATCH`. Returns
  * -1 (see ignis_step_last_error) on a null argument, an oversized batch, or
- * an unrecognized `sampling[i].size`. */
+ * an unrecognized `sampling[i].size`.
+ *
+ * `options` (P5-04, GitHub #153; NULL = today's round) selects the verify
+ * round -- see `struct ignis_decode_options`. With a window of k, lane i's
+ * extent is `min(k, draft_counts[i], remaining_tokens - 1, remaining
+ * context - 1)` draft columns beyond the anchor; the 64 layers traverse the
+ * batch's `k+1` columns per lane once, with the GDN layers recording
+ * ReplaySSM transitions instead of advancing and the GQA layers appending
+ * every valid column; the vendored accept kernel (greedy, or the
+ * distribution-preserving branch at temperature > 0, with its stateless RNG
+ * keyed by seed, position and purpose) licenses the accepted prefix plus
+ * one correction or bonus token; the run is cut at the first stop id; the
+ * KV frontier moves to the committed length, the ReplaySSM fold rebuilds
+ * each lane's GDN slot and conv taps from its committed records, and the
+ * accepted final hidden state is kept for the drafter (P5-05). The round is
+ * atomic as before: no lane's state advances unless the whole round
+ * succeeds. With NULL options the width-1 path is today's, unchanged. */
 int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *pool,
                              struct ignis_seq *const *sequences, uint64_t batch_size,
                              const struct ignis_sampling_params *sampling,
-                             int32_t *out_token_ids);
+                             int32_t *out_token_ids,
+                             const struct ignis_decode_options *options);
 
 /* Read program counters and allocated device footprint. */
 int32_t ignis_program_stats(const struct ignis_model *model,

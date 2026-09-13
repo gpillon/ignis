@@ -37,6 +37,26 @@ mod ffi {
         pub presence_penalty: f32,
         pub frequency_penalty: f32,
         pub seed: u64,
+        /// P5-04 (GitHub #153): read only by the verify round. The lane's
+        /// remaining budget in tokens, this round's anchor included; 0 = none.
+        pub remaining_tokens: u32,
+        /// P5-04: entries in `stop_ids`; 0 with a null pointer means none.
+        pub stop_id_count: u32,
+        /// P5-04: caller-owned, valid for the call.
+        pub stop_ids: *const i32,
+    }
+
+    /// 1:1 with `struct ignis_decode_options` (ADR 0016; P5-04, GitHub
+    /// #153). `size` must be `sizeof(struct ignis_decode_options)`; a null
+    /// options pointer is today's round.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IgnisDecodeOptions {
+        pub size: u32,
+        pub speculative_window: u32,
+        pub drafts: *const i32,
+        pub draft_counts: *const u32,
+        pub out_committed_counts: *mut i32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -75,6 +95,9 @@ mod ffi {
         /// P3-05 (GitHub #102): bit (w-1) set when a decode graph for exact
         /// width w (1..IGNIS_DECODE_MAX_BATCH) is captured and replayable.
         pub decode_graph_ready_mask: u32,
+        /// P5-04 (GitHub #153): the same for the verify graphs at the load's
+        /// draft window; 0 on a load without one.
+        pub verify_graph_ready_mask: u32,
     }
 
     unsafe extern "C" {
@@ -120,6 +143,7 @@ mod ffi {
             batch_size: u64,
             sampling: *const IgnisSamplingParams,
             out_token_ids: *mut i32,
+            options: *const IgnisDecodeOptions,
         ) -> i32;
 
         pub fn ignis_program_stats(
@@ -150,6 +174,9 @@ const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams {
     presence_penalty: 0.0,
     frequency_penalty: 0.0,
     seed: 0,
+    remaining_tokens: 0,
+    stop_id_count: 0,
+    stop_ids: std::ptr::null(),
 };
 
 /// A sequence's real sampling parameters for one program-layer call (P3-03,
@@ -194,6 +221,39 @@ impl SamplingParams {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             seed: self.seed,
+            remaining_tokens: 0,
+            stop_id_count: 0,
+            stop_ids: std::ptr::null(),
+        }
+    }
+}
+
+/// One lane's inputs to a verify round (P5-04, GitHub #153): its sampling
+/// settings, its remaining generation budget, its stop ids and the drafts
+/// proposed for it -- the internal seam a fake drafter fills in tests and
+/// the DFlash2 drafter fills from P5-05 on.
+///
+/// `remaining_tokens` counts the anchor this round emits, so the round
+/// proposes at most `remaining_tokens - 1` drafts; 0 means no budget.
+/// `drafts` holds at most the load's window; an empty slice proposes nothing
+/// and the lane runs at extent 0, one committed token. The committed run is
+/// cut at the first id in `stop_ids`, inclusive.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyLane<'a> {
+    pub sampling: SamplingParams,
+    pub remaining_tokens: u32,
+    pub stop_ids: &'a [i32],
+    pub drafts: &'a [i32],
+}
+
+impl<'a> VerifyLane<'a> {
+    /// A greedy lane with no budget, no stop ids and these drafts.
+    pub fn greedy(drafts: &'a [i32]) -> Self {
+        VerifyLane {
+            sampling: SamplingParams::greedy(),
+            remaining_tokens: 0,
+            stop_ids: &[],
+            drafts,
         }
     }
 }
@@ -213,6 +273,10 @@ pub struct ProgramStats {
     /// (1..=8) is captured and replayable (P3-05, GitHub #102) -- see
     /// [`capture_decode_graphs`].
     pub decode_graph_ready_mask: u32,
+    /// The same for the verify graphs at the load's draft window (P5-04,
+    /// GitHub #153): captured by [`capture_decode_graphs`] on a load with a
+    /// window, 0 without one.
+    pub verify_graph_ready_mask: u32,
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -571,6 +635,7 @@ pub fn decode_program_batch(
             handles.len() as u64,
             params.as_ptr(),
             tokens.as_mut_ptr(),
+            std::ptr::null(),
         )
     };
     if rc != 0 {
@@ -608,12 +673,105 @@ pub fn decode_program_batch_sampled(
             handles.len() as u64,
             params.as_ptr(),
             tokens.as_mut_ptr(),
+            std::ptr::null(),
         )
     };
     if rc != 0 {
         return Err(last_error());
     }
     Ok(tokens)
+}
+
+/// One verify round over `sequences` at the load's draft `window` (P5-04,
+/// GitHub #153, spec 05): every lane's anchor and drafts are verified in one
+/// traversal, the vendored accept kernel licenses the accepted prefix, the
+/// leaf cuts each run at the lane's first stop id and commits it -- KV
+/// frontier, GDN slot and conv taps (the ReplaySSM fold), pending token.
+/// Returns, per lane in order, the committed run: the anchor followed by the
+/// accepted drafts (1..=window+1 tokens, fewer after a cut). A lane whose
+/// budget or context leaves no room for drafts, or whose `drafts` is empty,
+/// runs at extent 0 and commits its anchor alone -- today's round.
+///
+/// `window` must be the window the model was loaded with
+/// ([`crate::Speculation::draft_tokens`]); the leaf rejects any other, naming
+/// both. `lanes.len()` must equal `sequences.len()` and each lane's `drafts`
+/// must not exceed `window`.
+pub fn decode_program_verify(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+) -> Result<Vec<Vec<i32>>, String> {
+    if lanes.len() != sequences.len() {
+        return Err(format!(
+            "decode_program_verify: {} lanes for {} sequences",
+            lanes.len(),
+            sequences.len()
+        ));
+    }
+    let width = window as usize;
+    for (index, lane) in lanes.iter().enumerate() {
+        if lane.drafts.len() > width {
+            return Err(format!(
+                "decode_program_verify: lane {index} proposes {} drafts for a window of {window}",
+                lane.drafts.len()
+            ));
+        }
+    }
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    let params: Vec<ffi::IgnisSamplingParams> = lanes
+        .iter()
+        .map(|lane| ffi::IgnisSamplingParams {
+            remaining_tokens: lane.remaining_tokens,
+            stop_id_count: lane.stop_ids.len() as u32,
+            stop_ids: if lane.stop_ids.is_empty() {
+                std::ptr::null()
+            } else {
+                lane.stop_ids.as_ptr()
+            },
+            ..lane.sampling.to_ffi()
+        })
+        .collect();
+    // Row-major `[batch][window]`, each lane's proposals first, the rest
+    // unread past its count.
+    let mut drafts = vec![0i32; handles.len() * width];
+    let mut draft_counts = vec![0u32; handles.len()];
+    for (index, lane) in lanes.iter().enumerate() {
+        drafts[index * width..index * width + lane.drafts.len()].copy_from_slice(lane.drafts);
+        draft_counts[index] = lane.drafts.len() as u32;
+    }
+    let mut tokens = vec![-1i32; handles.len() * (width + 1)];
+    let mut committed = vec![0i32; handles.len()];
+    let options = ffi::IgnisDecodeOptions {
+        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
+        speculative_window: window,
+        drafts: if width == 0 { std::ptr::null() } else { drafts.as_ptr() },
+        draft_counts: draft_counts.as_ptr(),
+        out_committed_counts: committed.as_mut_ptr(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+            &options,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(committed
+        .iter()
+        .enumerate()
+        .map(|(index, &count)| {
+            let start = index * (width + 1);
+            tokens[start..start + count as usize].to_vec()
+        })
+        .collect())
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.
@@ -629,5 +787,6 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         kernel_count: stats.kernel_count,
         graph_launches: stats.graph_launches,
         decode_graph_ready_mask: stats.decode_graph_ready_mask,
+        verify_graph_ready_mask: stats.verify_graph_ready_mask,
     })
 }

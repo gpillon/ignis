@@ -461,6 +461,7 @@ extern "C" int32_t ignis_seq_stats(const struct ignis_seq *seq, struct ignis_seq
   out_stats->mapped_pages     = ignis_seq_logical_page_count(*seq);
   out_stats->token_capacity   = ignis_seq_token_capacity(*seq);
   out_stats->shared_pages     = seq->shared_pages;
+  out_stats->position         = seq->position;
   return 0;
 }
 

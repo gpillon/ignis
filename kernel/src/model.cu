@@ -26,6 +26,8 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 
+#include "core/gdn_replay_records.h"
+#include "core/layout.h"
 #include "core/weight.h"
 
 #include "ninfer/ops/attn_input_proj.h"
@@ -37,6 +39,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
@@ -499,20 +502,24 @@ std::size_t gdn_layer_scratch_bytes(const ignis_topology &topology, const GdnLay
 // here so P2-02's chunk loop needs no new allocation), plus the final-norm /
 // output-head / argmax stage. Prefill feeds only the span's last position to
 // the output head (GitHub #72), a decode round feeds one column per lane, so
-// that stage is sized by `batch` rather than by the whole column count.
+// that stage is sized by `batch` rather than by the whole column count --
+// except for the verify round (P5-04, GitHub #153, `head_every_column`),
+// which norms every one of its `k+1` columns per lane before the output
+// head (its logits and argmax land in model-owned buffers, not here).
 std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int32_t chunk,
-                                        std::int32_t batch) {
+                                        std::int32_t batch, bool head_every_column) {
   const auto hidden = static_cast<std::int32_t>(topology.hidden);
   const auto vocab = static_cast<std::int32_t>(topology.vocab);
   const std::int32_t columns = chunk * batch;
+  const std::int32_t head_columns = head_every_column ? columns : batch;
 
   std::size_t bytes = 0;
   bytes += i32_bytes(columns);
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns); // left
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns); // right
-  bytes += bf16_bytes(static_cast<int64_t>(hidden) * batch);   // normalized
-  bytes += bf16_bytes(static_cast<int64_t>(vocab) * batch);    // logits
-  bytes += i32_bytes(1);                                       // argmax_out
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);      // left
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * columns);      // right
+  bytes += bf16_bytes(static_cast<int64_t>(hidden) * head_columns); // normalized
+  bytes += bf16_bytes(static_cast<int64_t>(vocab) * batch);         // logits
+  bytes += i32_bytes(1);                                            // argmax_out
   return bytes;
 }
 
@@ -522,7 +529,8 @@ std::size_t program_outer_scratch_bytes(const ignis_topology &topology, std::int
 // ever live alongside the outer scope's).
 std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_topology &topology,
                                           std::int32_t chunk, uint32_t max_context_tokens,
-                                          ninfer::DType cache_dtype, std::int32_t batch) {
+                                          ninfer::DType cache_dtype, std::int32_t batch,
+                                          bool head_every_column = false) {
   std::size_t layer_peak = 0;
   for (const auto &layer : model.layers) {
     const std::size_t layer_bytes = layer.kind == IGNIS_LAYER_GQA
@@ -530,7 +538,85 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
         : gdn_layer_scratch_bytes(topology, layer.gdn, chunk, batch);
     layer_peak = std::max(layer_peak, layer_bytes);
   }
-  return program_outer_scratch_bytes(topology, chunk, batch) + layer_peak;
+  return program_outer_scratch_bytes(topology, chunk, batch, head_every_column) + layer_peak;
+}
+
+// ---------------------------------------------------------------------------
+// P5-04 (GitHub #153): the verify round's substrate (model_internal.h's
+// `IgnisVerifyRound`) at window `k`, for `IGNIS_DECODE_MAX_BATCH` lanes. The
+// ReplaySSM record geometry is the model's GDN geometry -- the layer count
+// from the topology's kinds, the head counts from the state widths -- and
+// the vendored planner (`plan_gdn_replay_records`) lays the four planes out;
+// the fold only admits its registered all-layer geometries, so a wrong
+// count here fails at the first round, by name, not silently.
+std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology,
+                                                     uint32_t window) {
+  auto verify = std::make_unique<IgnisVerifyRound>();
+  verify->window = window;
+  const auto k = static_cast<std::int32_t>(window);
+  const std::int32_t columns = k + 1;
+  const std::int32_t lanes = IGNIS_DECODE_MAX_BATCH;
+  const auto hidden = static_cast<std::size_t>(topology.hidden);
+  const auto vocab = static_cast<std::int32_t>(topology.vocab);
+
+  const auto i32 = [](std::int64_t n) {
+    return std::make_unique<ninfer::DeviceBuffer>(static_cast<std::size_t>(n) * sizeof(int32_t));
+  };
+  const auto bf16 = [](std::size_t n) {
+    return std::make_unique<ninfer::DeviceBuffer>(n * sizeof(std::uint16_t));
+  };
+  verify->anchors = i32(lanes);
+  verify->drafts = i32(static_cast<std::int64_t>(k) * lanes);
+  verify->base_positions = i32(lanes);
+  verify->extents = i32(lanes);
+  verify->valid_columns = i32(lanes);
+  verify->lengths = i32(lanes);
+  verify->verify_ids = i32(static_cast<std::int64_t>(columns) * lanes);
+  verify->positions = i32(static_cast<std::int64_t>(columns) * lanes);
+  verify->target_tokens = i32(static_cast<std::int64_t>(columns) * lanes);
+  verify->logits = bf16(static_cast<std::size_t>(vocab) * columns * lanes);
+  verify->hidden = bf16(hidden * columns * lanes);
+  verify->licensed_tokens = i32(static_cast<std::int64_t>(columns) * lanes);
+  verify->licensed_counts = i32(lanes);
+  verify->accepted = i32(lanes);
+  verify->selectors = i32(lanes);
+  verify->selected_hidden = bf16(hidden * lanes);
+  // The staging a capture reads before any round refreshed it must still be
+  // a legal input (a valid extent, a real slot): zero is one.
+  for (auto *buffer : {verify->anchors.get(), verify->drafts.get(), verify->base_positions.get(),
+                       verify->extents.get(), verify->valid_columns.get(), verify->lengths.get()}) {
+    buffer->fill(0);
+  }
+
+  std::int32_t gdn_layers = 0;
+  for (uint32_t i = 0; i < topology.num_layers; ++i) {
+    if (static_cast<ignis_layer_kind>(topology.layer_kinds[i]) == IGNIS_LAYER_GDN) {
+      ++gdn_layers;
+    }
+  }
+  ninfer::GdnReplayRecordSpec spec{};
+  spec.layers = gdn_layers;
+  spec.record_capacity = lanes;
+  spec.width = columns;
+  spec.conv_channels =
+      static_cast<std::int32_t>(topology.gdn_q_width + topology.gdn_state_cols + topology.gdn_state_rows);
+  spec.qk_heads = static_cast<std::int32_t>(topology.gdn_q_width / kGdnHeadDim);
+  spec.value_heads = static_cast<std::int32_t>(topology.gdn_state_rows / kGdnHeadDim);
+  spec.key_dim = static_cast<std::int32_t>(kGdnHeadDim);
+  spec.value_dim = static_cast<std::int32_t>(kGdnHeadDim);
+  ninfer::LayoutBuilder builder;
+  verify->records_layout = ninfer::plan_gdn_replay_records(builder, spec);
+  const std::size_t record_bytes = builder.finish(kArenaAlign, "GDN replay records");
+  verify->records_backing = std::make_unique<ninfer::DeviceBuffer>(record_bytes);
+  verify->records = ninfer::GdnReplayRecords(
+      ninfer::DeviceSpan{verify->records_backing->p, verify->records_backing->bytes},
+      verify->records_layout);
+
+  const std::size_t accept_bytes = ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+      vocab, k, k, 1, lanes);
+  verify->accept_workspace =
+      std::make_unique<ninfer::DeviceArena>(std::max<std::size_t>(accept_bytes, kArenaAlign));
+  return verify;
 }
 
 } // namespace
@@ -605,7 +691,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     draft_tokens = options->draft_tokens;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
-      speculative_backend != IGNIS_SPECULATIVE_DFLASH2) {
+      speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
+      speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
     set_error("ignis_model_load: speculative_backend " + std::to_string(speculative_backend) +
               " is not an ignis_speculative_backend");
     return -1;
@@ -615,7 +702,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
               " needs a speculative_backend");
     return -1;
   }
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 &&
+  // P5-04 (GitHub #153): VERIFY_ONLY takes the same window rule -- the
+  // verify graphs are captured at it, and the round is refused at any other.
+  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
       (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
     set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
               " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
@@ -768,10 +857,18 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // every width 1..IGNIS_DECODE_MAX_BATCH shares this one reservation.
   // Capture itself (`ignis_decode_graph_capture`) happens later, once the
   // sequence pool exists.
+  //
+  // P5-04 (GitHub #153): a load with a draft window sizes the same arena for
+  // the verify round instead -- `k+1` columns per lane, the head over every
+  // column -- which bounds today's one-column round too, so both rounds
+  // share it.
   try {
+    const bool windowed = draft_tokens > 0;
+    const auto round_columns = static_cast<std::int32_t>(windowed ? draft_tokens + 1 : 1);
     const std::size_t decode_graph_scratch_bytes =
-        compute_program_scratch_bytes(*model, *topology, /*chunk=*/1, max_context_tokens,
-                                      cache_dtype, /*batch=*/IGNIS_DECODE_MAX_BATCH);
+        compute_program_scratch_bytes(*model, *topology, /*chunk=*/round_columns, max_context_tokens,
+                                      cache_dtype, /*batch=*/IGNIS_DECODE_MAX_BATCH,
+                                      /*head_every_column=*/windowed);
     model->decode_graph_scratch =
         std::make_unique<ninfer::DeviceArena>(decode_graph_scratch_bytes);
     model->decode_graph_token_ids =
@@ -801,6 +898,19 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     }
   }
 
+  // P5-04 (GitHub #153): the verify round's substrate, for either windowed
+  // backend.
+  if (draft_tokens > 0) {
+    try {
+      model->verify = build_verify_round(*topology, draft_tokens);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: verify round allocation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+  }
+
   *out_model = model.release();
   return 0;
 }
@@ -823,6 +933,14 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
       if (exec != nullptr) {
         cudaGraphExecDestroy(exec);
         exec = nullptr;
+      }
+    }
+    if (model->verify != nullptr) {
+      for (auto &exec : model->verify->graph_exec) {
+        if (exec != nullptr) {
+          cudaGraphExecDestroy(exec);
+          exec = nullptr;
+        }
       }
     }
     if (model->stream != nullptr) {

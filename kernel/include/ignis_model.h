@@ -115,6 +115,13 @@ enum ignis_speculative_backend {
   /* The 5-layer sliding-window DFlash2 drafter: binds the 66 `dflash2/*`
    * objects and allocates the drafter's per-lane window pool. */
   IGNIS_SPECULATIVE_DFLASH2 = 1,
+  /* The verify substrate alone (P5-04, GitHub #153): the verify round, its
+   * ReplaySSM records and its graphs at the load's window, with no drafter
+   * bound and no window pool. The drafts come through
+   * `ignis_decode_options::drafts` -- the internal seam a test's fake
+   * drafter fills, and what proves accept, rollback and fold before the real
+   * drafter is wired in (P5-05). Not an operator-facing backend. */
+  IGNIS_SPECULATIVE_VERIFY_ONLY = 2,
 };
 
 /* The widest DFlash2 draft window a load accepts. */
@@ -126,8 +133,10 @@ enum ignis_speculative_backend {
 struct ignis_model_load_options {
   uint32_t size;
   int32_t speculative_backend; /* enum ignis_speculative_backend */
-  /* The draft window: 1..IGNIS_DFLASH2_MAX_DRAFT_TOKENS under DFLASH2, 0
-   * with no backend. */
+  /* The draft window: 1..IGNIS_DFLASH2_MAX_DRAFT_TOKENS under DFLASH2 and
+   * VERIFY_ONLY, 0 with no backend. Fixed for the life of the load: it is
+   * the window the verify graphs are captured at, and the only
+   * `speculative_window` `ignis_program_decode` accepts besides 0. */
   uint32_t draft_tokens;
 };
 

@@ -18,9 +18,11 @@
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -34,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -888,12 +891,294 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
 // 1.07x). The round is atomic: no sequence's `pending_token`/`position`
 // advances unless the traversal and the batched sample both succeed, so a
 // mid-round failure never leaves one lane's state ahead of another's.
+namespace {
+
+// P5-04 (GitHub #153): advances every per-layer frontier of `seq` by
+// `tokens` once a round's device work is confirmed complete -- the same
+// bookkeeping the decode round does at one token (see the comment there),
+// at a committed run's length.
+void advance_frontiers(const ignis_model *model, ignis_seq *seq, std::uint32_t tokens) {
+  seq->position += tokens;
+  for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+    if (model->layers[layer].kind == IGNIS_LAYER_GQA) {
+      seq->gqa_positions[ignis_gqa_relative_layer(layer)] += tokens;
+    } else {
+      seq->gdn_positions[ignis_gdn_relative_layer(layer)] += tokens;
+    }
+  }
+}
+
+// P5-04 (GitHub #153): one verify round over `batch_size` lanes at the
+// load's window `k` (spec 05, "The verify round"). The device-side pass is
+// `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu), replayed from
+// the width's verify graph when one is ready and enqueued directly
+// otherwise; this function stages its inputs, reads its outputs back, and
+// does the host-side half of the commit -- the cut at the first stop id,
+// the frontier advance, the ReplaySSM fold and the accepted-hidden
+// selection.
+//
+// Per lane i, with `p` its frontier and `a` the anchor (its pending token):
+//   extent   = min(k, draft_counts[i], remaining_tokens - 1, capacity - p - 1)
+//   columns  = [a, d_1 .. d_extent, a, ...] at positions p, p+1, .., p+extent
+//   accept   -> `n` accepted drafts (n <= extent), licensed = [d_1..d_n, t*]
+//               where t* is the correction/bonus token
+//   run      = [a, d_1 .. d_n], cut at the first stop id inclusive -> c tokens
+//   commit   = the first c columns: KV frontier p -> p + c (the columns'
+//              K/V were appended in place at p..p+c-1 and the rest are
+//              overwritten by the next round), fold records[0..c) into the
+//              GDN slot and conv taps, pending <- licensed[c-1] (the
+//              successor of the run's last token: a draft the target agreed
+//              with, or t*)
+// so a lane whose run was cut stands exactly where a per-token decode of the
+// same text would, and one whose run was not stands with t* pending -- what
+// today's round leaves after one token, at every token of the run. The round
+// is atomic: no lane's state moves unless every step succeeded.
+int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
+                         ignis_seq *const *sequences, uint64_t batch_size,
+                         const ignis_sampling_params *sampling, const ignis_decode_options &options,
+                         int32_t *out_token_ids) {
+  IgnisVerifyRound &verify = *model->verify;
+  const std::uint32_t k = verify.window;
+  const std::uint32_t lane_columns = k + 1;
+  const auto batch = static_cast<std::int32_t>(batch_size);
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+
+  std::vector<std::int32_t> anchors(batch_size, 0);
+  std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch_size, 0);
+  std::vector<std::int32_t> base_positions(batch_size, 0);
+  std::vector<std::int32_t> extents(batch_size, 0);
+  std::vector<std::int32_t> valid_columns(batch_size, 1);
+  std::vector<std::int32_t> slots(batch_size, 0);
+  std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
+  try {
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      ignis_seq *seq = sequences[i];
+      if (seq == nullptr || seq->pending_token < 0) {
+        set_error("ignis_program_decode: sequence is null or was not prefilled");
+        return -1;
+      }
+      const uint64_t capacity = ignis_seq_token_capacity(*seq);
+      if (seq->position >= capacity) {
+        set_error("ignis_program_decode: sequence reached its KV capacity");
+        return -1;
+      }
+      // The lane's extent: never more drafts than proposed, than its budget
+      // leaves after the anchor, or than its context leaves after the
+      // anchor. 0 is the fallback step inside this same round.
+      uint64_t extent = k;
+      if (options.drafts == nullptr) {
+        extent = 0;
+      } else if (options.draft_counts != nullptr) {
+        extent = std::min<uint64_t>(extent, options.draft_counts[i]);
+      }
+      if (sampling[i].remaining_tokens != 0) {
+        extent = std::min<uint64_t>(extent, sampling[i].remaining_tokens - 1);
+      }
+      extent = std::min<uint64_t>(extent, capacity - seq->position - 1);
+      if (sampling[i].stop_id_count != 0 && sampling[i].stop_ids == nullptr) {
+        set_error("ignis_program_decode: stop_ids is null with a nonzero stop_id_count at index " +
+                  std::to_string(i));
+        return -1;
+      }
+      anchors[i] = seq->pending_token;
+      base_positions[i] = static_cast<std::int32_t>(seq->position);
+      extents[i] = static_cast<std::int32_t>(extent);
+      valid_columns[i] = static_cast<std::int32_t>(extent + 1);
+      slots[i] = seq->slot;
+      configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
+      for (uint64_t j = 0; j < extent; ++j) {
+        drafts[i * k + j] = options.drafts[i * k + j];
+      }
+    }
+
+    const auto stage = [&](ninfer::DeviceBuffer &buffer, const void *host, std::size_t bytes,
+                           const char *what) -> bool {
+      const cudaError_t err =
+          cudaMemcpyAsync(buffer.p, host, bytes, cudaMemcpyHostToDevice, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(") + what + ") failed: " +
+                  cudaGetErrorString(err));
+        return false;
+      }
+      return true;
+    };
+    const std::size_t lane_bytes = batch_size * sizeof(std::int32_t);
+    if (!stage(*verify.anchors, anchors.data(), lane_bytes, "verify anchors") ||
+        !stage(*verify.drafts, drafts.data(), drafts.size() * sizeof(std::int32_t), "verify drafts") ||
+        !stage(*verify.base_positions, base_positions.data(), lane_bytes, "verify base positions") ||
+        !stage(*verify.extents, extents.data(), lane_bytes, "verify extents") ||
+        !stage(*verify.valid_columns, valid_columns.data(), lane_bytes, "verify valid columns") ||
+        // The accept RNG's position base is the lane's frontier, the same
+        // logical position today's sampler keys its draw by.
+        !stage(*verify.lengths, base_positions.data(), lane_bytes, "verify lengths") ||
+        !stage(*model->decode_graph_slots, slots.data(), lane_bytes, "verify slots") ||
+        !stage(*model->sampling_decode_configs, configs.data(),
+               batch_size * sizeof(ninfer::ops::SamplingConfig), "verify sampling configs")) {
+      return -1;
+    }
+
+    const bool use_graph = verify.graph_ready[batch_size - 1];
+    if (use_graph) {
+      const cudaError_t err = cudaGraphLaunch(verify.graph_exec[batch_size - 1], model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaGraphLaunch(verify) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    } else if (ignis_verify_graph_run_batch(model, pool, static_cast<uint32_t>(batch_size),
+                                            LinearPolicyMode::kEngineDefault) != 0) {
+      set_error(std::string("ignis_program_decode: ") + ignis_decode_graph_last_error());
+      return -1;
+    }
+
+    std::vector<std::int32_t> licensed(static_cast<std::size_t>(lane_columns) * batch_size, 0);
+    std::vector<std::int32_t> accepted(batch_size, 0);
+    cudaError_t err = cudaMemcpyAsync(licensed.data(), verify.licensed_tokens->p,
+                                      licensed.size() * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost, model->stream);
+    if (err == cudaSuccess) {
+      err = cudaMemcpyAsync(accepted.data(), verify.accepted->p, lane_bytes,
+                            cudaMemcpyDeviceToHost, model->stream);
+    }
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaMemcpyAsync(accept results) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+    err = cudaStreamSynchronize(model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaStreamSynchronize(verify) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    // The host half of the commit: the run, its cut, the fold rows.
+    std::vector<std::int32_t> committed(batch_size, 0);
+    std::vector<std::int32_t> next_pending(batch_size, -1);
+    std::vector<ninfer::ops::GdnReplayFoldRow> fold_rows(batch_size);
+    std::vector<std::int32_t> selectors(batch_size, 0);
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      const std::int32_t n = accepted[i];
+      if (n < 0 || n > extents[i]) {
+        set_error("ignis_program_decode: the accept kernel reported " + std::to_string(n) +
+                  " accepted drafts for an extent of " + std::to_string(extents[i]));
+        return -1;
+      }
+      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
+      // run[j]: j == 0 the anchor, else licensed[j-1] (= the j-th draft,
+      // accepted); run length n + 1 before the cut.
+      const auto run_at = [&](std::int32_t j) {
+        return j == 0 ? anchors[i] : lane_licensed[j - 1];
+      };
+      std::int32_t c = n + 1;
+      for (std::int32_t j = 0; j < n + 1; ++j) {
+        bool stop = false;
+        for (uint32_t s = 0; s < sampling[i].stop_id_count && !stop; ++s) {
+          stop = sampling[i].stop_ids[s] == run_at(j);
+        }
+        if (stop) {
+          c = j + 1;
+          break;
+        }
+      }
+      committed[i] = c;
+      // The successor of the run's last token: the draft after it when the
+      // target agreed with that draft, else the correction/bonus token.
+      next_pending[i] = lane_licensed[c - 1];
+      for (std::int32_t j = 0; j < c; ++j) {
+        out_token_ids[i * lane_columns + j] = run_at(j);
+      }
+      fold_rows[i] = ninfer::ops::GdnReplayFoldRow{.linear_state_slot = slots[i],
+                                                   .commit_columns = c};
+      selectors[i] = c - 1;
+    }
+
+    // The penalty rows: at temperature > 0 the accept kernel counted every
+    // licensed token -- the accepted drafts and the correction/bonus token --
+    // in the lane's occurrence counts. A cut run keeps only
+    // `licensed[0..c)` (its drafts plus the new pending token); the tokens
+    // past it were never emitted, so their counts come back off, or the row
+    // a snapshot or a prefix clone carries would run ahead of the text.
+    // Greedy lanes count nothing (the kernel's own contract), so there is
+    // nothing to undo for them.
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      if (!(configs[i].temperature > 0.0f) || configs[i].token_counts == nullptr) {
+        continue;
+      }
+      const std::int32_t produced = accepted[i] + 1;
+      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
+      for (std::int32_t j = committed[i]; j < produced; ++j) {
+        std::int32_t *count = configs[i].token_counts + lane_licensed[j];
+        std::int32_t value = 0;
+        err = cudaMemcpyAsync(&value, count, sizeof(value), cudaMemcpyDeviceToHost, model->stream);
+        if (err == cudaSuccess) {
+          err = cudaStreamSynchronize(model->stream);
+        }
+        if (err == cudaSuccess) {
+          value = value > 0 ? value - 1 : 0;
+          err = cudaMemcpyAsync(count, &value, sizeof(value), cudaMemcpyHostToDevice, model->stream);
+        }
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_decode: penalty count rollback failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
+    }
+
+    // The fold: every GDN layer's slot and conv taps rebuilt from the
+    // committed prefix of this round's records, in one vendored call over
+    // every lane. A zero-length commit is that op's own strict no-op; this
+    // round never asks for one (c >= 1), the anchor is always committed.
+    ninfer::ops::gdn_replay_fold(verify.records, pool->gdn_pool.all_layers_view(),
+                                 std::span<const ninfer::ops::GdnReplayFoldRow>(fold_rows.data(),
+                                                                                batch_size),
+                                 model->stream);
+
+    // The accepted hidden state per lane (the run's last column's final
+    // residual), kept for the drafter's continuation input (P5-05).
+    if (!stage(*verify.selectors, selectors.data(), lane_bytes, "verify selectors")) {
+      return -1;
+    }
+    const ninfer::Tensor hidden_columns(verify.hidden->p, ninfer::DType::BF16,
+                                        {hidden, static_cast<std::int32_t>(lane_columns), batch, 1});
+    const ninfer::Tensor selector_tensor(verify.selectors->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor selected(verify.selected_hidden->p, ninfer::DType::BF16, {hidden, batch, 1, 1});
+    ninfer::ops::speculative_select_accepted_hidden(hidden_columns, selector_tensor, selected,
+                                                    model->stream);
+
+    err = cudaStreamSynchronize(model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program_decode: cudaStreamSynchronize(fold) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    // Only now, with the fold confirmed on the device, does any lane's
+    // state move (the decode round's own ordering).
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      sequences[i]->pending_token = next_pending[i];
+      advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
+      options.out_committed_counts[i] = committed[i];
+    }
+    model->last_step_kernel_count = model->layers.size();
+    model->last_step_graph_launches = use_graph ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_program_decode: ") + e.what());
+    return -1;
+  }
+  return 0;
+}
+
+} // namespace
+
 extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                                           struct ignis_seq_pool *pool,
                                           struct ignis_seq *const *sequences,
                                           uint64_t batch_size,
                                           const struct ignis_sampling_params *sampling,
-                                          int32_t *out_token_ids) {
+                                          int32_t *out_token_ids,
+                                          const struct ignis_decode_options *options) {
   if (model == nullptr || pool == nullptr || sequences == nullptr || sampling == nullptr ||
       out_token_ids == nullptr || batch_size == 0) {
     set_error("ignis_program_decode: null argument or empty batch");
@@ -909,6 +1194,38 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       set_error("ignis_program_decode: unrecognized ignis_sampling_params size " +
                 std::to_string(sampling[i].size) + " at index " + std::to_string(i));
       return -1;
+    }
+  }
+  // P5-04 (GitHub #153, ADR 0016): NULL means today's round; a window must
+  // be the load's own, never padded to it.
+  if (options != nullptr) {
+    if (options->size != sizeof(struct ignis_decode_options)) {
+      set_error("ignis_program_decode: unrecognized ignis_decode_options size " +
+                std::to_string(options->size));
+      return -1;
+    }
+    if (options->speculative_window != 0) {
+      const uint32_t loaded = model->verify == nullptr ? 0 : model->verify->window;
+      if (options->speculative_window != loaded) {
+        set_error("ignis_program_decode: speculative_window " +
+                  std::to_string(options->speculative_window) + " is not the window this model was loaded with (" +
+                  std::to_string(loaded) + ")");
+        return -1;
+      }
+      if (options->out_committed_counts == nullptr) {
+        set_error("ignis_program_decode: out_committed_counts is null for a verify round");
+        return -1;
+      }
+      const auto began = std::chrono::steady_clock::now();
+      const int32_t rc =
+          run_verify_round(model, pool, sequences, batch_size, sampling, *options, out_token_ids);
+      if (rc != 0) {
+        return rc;
+      }
+      model->last_step_micros = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - began).count());
+      return 0;
     }
   }
 
@@ -1104,15 +1421,26 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->dflash2_window != nullptr) {
     out_stats->vram_bytes += model->dflash2_window->bytes + model->dflash2_checkpoint->bytes;
   }
+  // P5-04 (GitHub #153): the verify substrate's own buffers, records and
+  // accept scratch, present only under a draft window (its traversal scratch
+  // is `decode_graph_scratch` above, sized for it at load).
+  if (model->verify != nullptr) {
+    out_stats->vram_bytes += model->verify->device_bytes();
+  }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;
   uint32_t ready_mask = 0;
+  uint32_t verify_ready_mask = 0;
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
     if (model->decode_graph_ready[width - 1]) {
       ready_mask |= (1u << (width - 1));
     }
+    if (model->verify != nullptr && model->verify->graph_ready[width - 1]) {
+      verify_ready_mask |= (1u << (width - 1));
+    }
   }
   out_stats->decode_graph_ready_mask = ready_mask;
+  out_stats->verify_graph_ready_mask = verify_ready_mask;
   return 0;
 }

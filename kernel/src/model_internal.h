@@ -10,6 +10,7 @@
 #include "ignis_step.h"
 
 #include "core/arena.h"
+#include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -81,6 +82,75 @@ struct LayerWeights {
   ignis_layer_kind kind = IGNIS_LAYER_GDN;
   GqaLayerWeights gqa{};
   GdnLayerWeights gdn{};
+};
+
+// P5-04 (GitHub #153): the verify round's substrate, built at load when the
+// options fixed a draft window (`draft_tokens > 0`, under DFLASH2 or
+// VERIFY_ONLY) and absent otherwise, so a load without a window reserves
+// nothing here.
+//
+// Everything below is a stable device address the verify graphs bake in
+// (ADR 0019 / 0020): the round refreshes the *_staging buffers in place by
+// one H2D copy each before a replay, the traversal writes the rest. `B` is
+// `IGNIS_DECODE_MAX_BATCH`; `k` is the window; a `[k+1, B]` matrix is
+// contiguous with column `b`'s `k+1` entries adjacent, which is both the
+// vendored `speculative_*` ops' `[K+1,B]` and the traversal's lane-major
+// column order (lane b's columns are `b*(k+1) .. b*(k+1)+k`).
+struct IgnisVerifyRound {
+  uint32_t window = 0; // k
+
+  // Host-refreshed per round.
+  std::unique_ptr<ninfer::DeviceBuffer> anchors;        // I32 [B]: each lane's pending token
+  std::unique_ptr<ninfer::DeviceBuffer> drafts;         // I32 [k, B]: the proposals
+  std::unique_ptr<ninfer::DeviceBuffer> base_positions; // I32 [B]: each lane's frontier
+  std::unique_ptr<ninfer::DeviceBuffer> extents;        // I32 [B]: draft columns this round
+  std::unique_ptr<ninfer::DeviceBuffer> valid_columns;  // I32 [B]: extent + 1
+  std::unique_ptr<ninfer::DeviceBuffer> lengths;        // I32 [B]: the accept RNG's position base
+
+  // Written by the traversal (device-only).
+  std::unique_ptr<ninfer::DeviceBuffer> verify_ids;      // I32 [k+1, B]
+  std::unique_ptr<ninfer::DeviceBuffer> positions;       // I32 [k+1, B]: base + min(j, extent)
+  std::unique_ptr<ninfer::DeviceBuffer> target_tokens;   // I32 [k+1, B]: argmax per column
+  std::unique_ptr<ninfer::DeviceBuffer> logits;          // BF16 [vocab, k+1, B]
+  std::unique_ptr<ninfer::DeviceBuffer> hidden;          // BF16 [hidden, k+1, B]: final residual
+  std::unique_ptr<ninfer::DeviceBuffer> licensed_tokens; // I32 [k+1, B]: accept output
+  std::unique_ptr<ninfer::DeviceBuffer> licensed_counts; // I32 [B]
+  std::unique_ptr<ninfer::DeviceBuffer> accepted;        // I32 [B]
+  std::unique_ptr<ninfer::DeviceBuffer> selectors;       // I32 [B]: committed - 1
+  std::unique_ptr<ninfer::DeviceBuffer> selected_hidden; // BF16 [hidden, B]: for the drafter
+
+  // The ReplaySSM records every GDN layer writes for every lane's `k+1`
+  // columns (conv input, key, value, {g, beta}), folded into each lane's
+  // slot after accept. Record row b is lane b.
+  std::unique_ptr<ninfer::DeviceBuffer> records_backing;
+  ninfer::GdnReplayRecordLayout records_layout;
+  ninfer::GdnReplayRecords records;
+
+  // The accept kernel's own transient scratch (its partial-top-k route at
+  // temperature > 0), sized once for `k` drafts across `B` lanes.
+  std::unique_ptr<ninfer::DeviceArena> accept_workspace;
+
+  // One verify graph per exact width, captured by
+  // `ignis_decode_graph_capture` after the decode graphs.
+  std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> graph_exec{};
+  std::array<bool, IGNIS_DECODE_MAX_BATCH> graph_ready{};
+
+  std::size_t device_bytes() const {
+    std::size_t bytes = 0;
+    for (const auto *buffer :
+         {anchors.get(), drafts.get(), base_positions.get(), extents.get(), valid_columns.get(),
+          lengths.get(), verify_ids.get(), positions.get(), target_tokens.get(), logits.get(),
+          hidden.get(), licensed_tokens.get(), licensed_counts.get(), accepted.get(),
+          selectors.get(), selected_hidden.get(), records_backing.get()}) {
+      if (buffer != nullptr) {
+        bytes += buffer->bytes;
+      }
+    }
+    if (accept_workspace != nullptr) {
+      bytes += accept_workspace->capacity();
+    }
+    return bytes;
+  }
 };
 
 // The opaque loaded-model handle (never dereferenced across the boundary).
@@ -195,4 +265,9 @@ struct ignis_model {
   Dflash2Weights dflash2{};
   std::unique_ptr<ninfer::DeviceBuffer> dflash2_window;
   std::unique_ptr<ninfer::DeviceBuffer> dflash2_checkpoint;
+
+  // P5-04 (GitHub #153): the verify round's substrate, present exactly when
+  // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,
+  // which a windowed load sizes for `k+1` columns per lane instead of one.
+  std::unique_ptr<IgnisVerifyRound> verify;
 };

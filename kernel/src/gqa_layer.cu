@@ -261,19 +261,30 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 // replay or direct eager execution (this round's real content, refreshed by
 // the caller) -- see the declaration in layer_internal.h and ADR 0019 for
 // the full argument.
-int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
-                            uint32_t width, void *in_residual, void *out_residual,
-                            uint32_t gqa_layer, LinearPolicyMode mode) {
+//
+// P5-04 (GitHub #153) generalizes the body from one token per lane to
+// `lane_tokens` columns per lane: the verify round traverses every lane's
+// `k+1` verify columns (anchor + drafts, the tail padded with the anchor)
+// as a [.., lane_tokens, batch] batch. `positions` is then the round's
+// staged I32 [lane_tokens, batch] matrix (`base + min(j, extent)` per
+// column) and `valid_columns` its I32 [batch] extents (extent + 1), so A1
+// appends and attends exactly a lane's valid prefix and writes zero for the
+// padded tail -- the masked form of A1's own contract. The decode round is
+// the `lane_tokens == 1` case with the dense (empty) mask, unchanged.
+int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                            uint32_t width, std::int32_t lane_tokens, const void *positions_ptr,
+                            const void *valid_columns_ptr, void *in_residual, void *out_residual,
+                            uint32_t gqa_layer, LinearPolicyMode mode, const char *op) {
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
   constexpr std::int32_t kRotaryDim = 64;
   constexpr float kRopeTheta = 10'000'000.0F;
-  // A decode round is exactly one token per lane: the batch's rows are the
-  // lanes (`batch` below), and every row's width is one.
-  constexpr std::int32_t kLaneTokens = 1;
 
+  // The batch's rows are the lanes; every row carries `lane_tokens`
+  // columns, lane-major, so the activations are `columns` wide.
   const auto batch = static_cast<std::int32_t>(width);
+  const std::int32_t columns = lane_tokens * batch;
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto q_width = kHeadDim * kQHeads;
   const auto kv_width = kHeadDim * kKvHeads;
@@ -285,25 +296,25 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
   ninfer::DeviceArena::Scope scope = model->decode_graph_scratch->scope();
   try {
     ninfer::Tensor normalized =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
     ninfer::Tensor query =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, columns, 1, 1});
     ninfer::Tensor key =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor gate =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, columns, 1, 1});
     ninfer::Tensor value =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor rotated_query =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, columns, 1, 1});
     ninfer::Tensor rotated_key =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor attention =
-        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, batch, 1, 1});
-    ninfer::Tensor post = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, batch, 1, 1});
-    ninfer::Tensor fused = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {ffn, batch, 1, 1});
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {q_width, columns, 1, 1});
+    ninfer::Tensor post = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::Tensor fused = model->decode_graph_scratch->alloc(ninfer::DType::BF16, {ffn, columns, 1, 1});
 
-    const ninfer::Tensor input(in_residual, ninfer::DType::BF16, {hidden, batch, 1, 1});
+    const ninfer::Tensor input(in_residual, ninfer::DType::BF16, {hidden, columns, 1, 1});
     const ninfer::Tensor input_norm =
         weight_tensor(weights.input_norm, ninfer::DType::BF16, {hidden, 1, 1, 1});
     ninfer::ops::rmsnorm(input, input_norm, model->rms_norm_eps, /*unit_offset=*/true,
@@ -313,21 +324,26 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                  value, ignis_policy_for(weights.query_key_gate_value.qtype, mode),
                                  *model->decode_graph_scratch, stream);
 
-    // Graph-safe positions (ADR 0019): the round's staged per-lane absolute
+    // Graph-safe positions (ADR 0019): the round's staged absolute
     // positions, read from device memory at replay -- `fill_i32_positions`'s
     // host-scalar `start` would freeze this round's positions into the graph
     // forever. The lanes' positions are unrelated to one another, so this is
     // read as-is rather than derived from a base; it is the same contiguous
-    // I32 [width] buffer both `qk_norm_rope` (positions [T], read per token)
-    // and `gqa_attention` (positions [W,B] with W=1) want, and both only
-    // read it.
-    // Two shapes over the same buffer, again because the ops name the batch
-    // differently: `qk_norm_rope` wants a flat I32 [T], A1 wants I32 [W,B]
-    // with W=1.
-    const ninfer::Tensor positions(model->sampling_decode_positions->p, ninfer::DType::I32,
-                                   {batch, 1, 1, 1});
-    const ninfer::Tensor positions_rows(model->sampling_decode_positions->p, ninfer::DType::I32,
-                                        {kLaneTokens, batch, 1, 1});
+    // I32 [lane_tokens, batch] buffer both `qk_norm_rope` (positions [T],
+    // read per column) and `gqa_attention` (positions [W,B]) want, and both
+    // only read it. Two shapes over the same buffer, because the ops name
+    // the batch differently.
+    const ninfer::Tensor positions(const_cast<void *>(positions_ptr), ninfer::DType::I32,
+                                   {columns, 1, 1, 1});
+    const ninfer::Tensor positions_rows(const_cast<void *>(positions_ptr), ninfer::DType::I32,
+                                        {lane_tokens, batch, 1, 1});
+    // The masked form (P5-04): each lane's valid prefix, or the dense form
+    // (an empty tensor) for the decode round.
+    const ninfer::Tensor valid_columns =
+        valid_columns_ptr == nullptr
+            ? ninfer::Tensor{}
+            : ninfer::Tensor(const_cast<void *>(valid_columns_ptr), ninfer::DType::I32,
+                             {batch, 1, 1, 1});
 
     const ninfer::Tensor q_norm =
         weight_tensor(weights.query_norm, ninfer::DType::BF16, {kHeadDim, 1, 1, 1});
@@ -337,18 +353,18 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
         ninfer::ops::rope_linear_frequencies(kRopeTheta, kRotaryDim);
     // Two views of the same contiguous storage, because the two ops name
     // the batch differently: `qk_norm_rope` takes flat `[256,Hq|Hkv,T]` and
-    // reads one position per column, so the round's lanes are simply its T;
-    // A1 below takes `[256,Hq|Hkv,W,B]` and needs the lanes on the batch
-    // axis with W=1. The element order is identical either way -- one token
-    // per lane, lane-major -- so this is a reshape, not a copy.
-    ninfer::Tensor query_tokens = query.view({kHeadDim, kQHeads, batch, 1});
-    ninfer::Tensor key_tokens = key.view({kHeadDim, kKvHeads, batch, 1});
-    ninfer::Tensor rotated_query_tokens = rotated_query.view({kHeadDim, kQHeads, batch, 1});
-    ninfer::Tensor rotated_key_tokens = rotated_key.view({kHeadDim, kKvHeads, batch, 1});
+    // reads one position per column, so the round's columns are simply its
+    // T; A1 below takes `[256,Hq|Hkv,W,B]` and needs the lanes on the batch
+    // axis. The element order is identical either way -- lane-major, a
+    // lane's columns adjacent -- so this is a reshape, not a copy.
+    ninfer::Tensor query_tokens = query.view({kHeadDim, kQHeads, columns, 1});
+    ninfer::Tensor key_tokens = key.view({kHeadDim, kKvHeads, columns, 1});
+    ninfer::Tensor rotated_query_tokens = rotated_query.view({kHeadDim, kQHeads, columns, 1});
+    ninfer::Tensor rotated_key_tokens = rotated_key.view({kHeadDim, kKvHeads, columns, 1});
     ninfer::ops::qk_norm_rope(query_tokens, key_tokens, q_norm, k_norm, model->rms_norm_eps,
                               positions, rope, rotated_query_tokens, rotated_key_tokens, stream);
-    ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, kLaneTokens, batch});
-    ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, kLaneTokens, batch});
+    ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, lane_tokens, batch});
+    ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, lane_tokens, batch});
 
     // ADR 0019: the pool-wide block-table matrix (every physical slot, a
     // fixed address independent of round composition) with `kv_table_rows`
@@ -365,7 +381,7 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
         ignis_kv_batch_layer_view(pool, static_cast<std::int32_t>(gqa_layer));
     const ninfer::Tensor kv_table_rows(model->decode_graph_slots->p, ninfer::DType::I32,
                                        {batch, 1, 1, 1});
-    ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, kLaneTokens, batch});
+    ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, lane_tokens, batch});
     // A fixed, conservative envelope (ADR 0019): `max_visible_keys` is a
     // host launch-resource promise for workspace sizing and kernel-route
     // selection, not the causal mask (the mask comes from `positions`
@@ -380,32 +396,33 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // The cache's own declared dtype, as on the eager path: at one token per
     // lane both formats resolve to the small-T route, but the reservation
     // `ignis_model_load` made for `decode_graph_scratch` was made under this
-    // format and the query has to be asked the same way (GitHub #123).
+    // format and the query has to be asked the same way (GitHub #123). At
+    // the verify width the resolver's own chunking decides the route -- one
+    // hq width-8 tile, or BF16's two passes of six -- not this layer.
     const std::size_t attention_workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
-        kQHeads, batch_cache.dtype, envelope, batch, kLaneTokens, kLaneTokens);
+        kQHeads, batch_cache.dtype, envelope, batch, lane_tokens, lane_tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
         model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
     cudaError_t error = cudaMemsetAsync(attention_workspace_storage.data, 0,
                                         attention_workspace_storage.bytes, stream);
     if (error != cudaSuccess) {
-      set_error(std::string("ignis_gqa_layer_graph: cudaMemsetAsync(attention workspace) failed: ") +
+      set_error(std::string(op) + ": cudaMemsetAsync(attention workspace) failed: " +
                 cudaGetErrorString(error));
       return -1;
     }
     ninfer::DeviceArena attention_workspace(attention_workspace_storage);
-    ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, kLaneTokens, batch});
+    ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, lane_tokens, batch});
     ninfer::ops::gqa_attention(
-        rotated_query_heads, rotated_key_heads, value_heads, positions_rows,
-        /*valid_columns=*/ninfer::Tensor{}, kv_table_rows,
-        gate.view({kHeadDim, kQHeads, kLaneTokens, batch}), attention_scale, batch_cache, envelope,
-        attention_workspace, attention_heads, stream);
+        rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
+        kv_table_rows, gate.view({kHeadDim, kQHeads, lane_tokens, batch}), attention_scale,
+        batch_cache, envelope, attention_workspace, attention_heads, stream);
 
-    ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, batch, 1, 1});
+    ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, columns, 1, 1});
     error = cudaMemcpyAsync(out_residual, in_residual,
-                            static_cast<std::size_t>(hidden) * batch * sizeof(uint16_t),
+                            static_cast<std::size_t>(hidden) * columns * sizeof(uint16_t),
                             cudaMemcpyDeviceToDevice, stream);
     if (error != cudaSuccess) {
-      set_error(std::string("ignis_gqa_layer_graph: cudaMemcpyAsync(residual) failed: ") +
+      set_error(std::string(op) + ": cudaMemcpyAsync(residual) failed: " +
                 cudaGetErrorString(error));
       return -1;
     }
@@ -419,16 +436,26 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                          stream);
     ninfer::ops::linear_swiglu(
         post, weights.mlp_gate_up, fused,
-        ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, batch),
+        ignis_linear_swiglu_policy_for(weights.mlp_gate_up.qtype, mode, columns),
         *model->decode_graph_scratch, stream);
     ninfer::ops::linear_add(fused, weights.mlp_down, residual,
                             ignis_policy_for(weights.mlp_down.qtype, mode), *model->decode_graph_scratch,
                             stream);
     return 0;
   } catch (const std::exception &error) {
-    set_error(std::string("ignis_gqa_layer_graph: ") + error.what());
+    set_error(std::string(op) + ": " + error.what());
     return -1;
   }
+}
+
+// The decode round's shape of the body above: one token per lane, positions
+// from `sampling_decode_positions`, the dense mask.
+int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                            uint32_t width, void *in_residual, void *out_residual,
+                            uint32_t gqa_layer, LinearPolicyMode mode) {
+  return run_gqa_layer_batch(model, pool, layer, width, /*lane_tokens=*/1,
+                             model->sampling_decode_positions->p, /*valid_columns_ptr=*/nullptr,
+                             in_residual, out_residual, gqa_layer, mode, "ignis_gqa_layer_graph");
 }
 
 // P4-05 (GitHub #123): both formats serve, and which routes a layer takes is
@@ -561,6 +588,42 @@ int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
   return run_gqa_layer_graph(model, pool, layer, width, const_cast<void *>(in_residual), out_residual,
                              gqa_layer, mode);
+}
+
+// P5-04 (GitHub #153): the verify round's GQA body -- `width` lanes at the
+// load's `k+1` verify columns each, positions and valid extents from the
+// verify substrate's staging (model_internal.h `IgnisVerifyRound`), dispatched
+// once per GQA layer per round by `ignis_verify_graph_run_batch`
+// (kernel/src/decode_graph.cu) under capture, replay or eager alike.
+int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
+                                        uint32_t width, const void *in_residual, void *out_residual,
+                                        LinearPolicyMode mode) {
+  if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
+    set_error("ignis_gqa_layer_verify: null argument");
+    return -1;
+  }
+  if (model->verify == nullptr) {
+    set_error("ignis_gqa_layer_verify: the model was loaded without a draft window");
+    return -1;
+  }
+  if (layer >= model->layers.size() || model->layers[layer].kind != IGNIS_LAYER_GQA) {
+    set_error("ignis_gqa_layer_verify: layer " + std::to_string(layer) + " is not a GQA layer");
+    return -1;
+  }
+  if (width == 0 || width > IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_gqa_layer_verify: width " + std::to_string(width) +
+              " is not in 1..IGNIS_DECODE_MAX_BATCH");
+    return -1;
+  }
+  if (!gqa_format_matches_load(model, pool, "ignis_gqa_layer_verify")) {
+    return -1;
+  }
+  const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
+  const IgnisVerifyRound &verify = *model->verify;
+  return run_gqa_layer_batch(model, pool, layer, width, static_cast<std::int32_t>(verify.window + 1),
+                             verify.positions->p, verify.valid_columns->p,
+                             const_cast<void *>(in_residual), out_residual, gqa_layer, mode,
+                             "ignis_gqa_layer_verify");
 }
 
 extern "C" int32_t ignis_gqa_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

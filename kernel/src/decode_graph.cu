@@ -19,16 +19,19 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
@@ -122,7 +125,163 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
   }
 }
 
+// P5-04 (GitHub #153): the verify round's device-side pass at batch `width`
+// (layer_internal.h). Column order is lane-major: lane b's `k+1` columns are
+// contiguous, which is both what the vendored `speculative_*` ops mean by a
+// `[K+1,B]` matrix and how the verify layer bodies view the residual, so no
+// column shuffle exists anywhere in the round.
+//
+// The accept kernel reads the round's sampling configs from
+// `sampling_decode_configs` (per lane, as the decode round stages them) and
+// keys its stateless RNG by `lengths` (each lane's frontier) and the
+// speculative purposes, so a lane's draws depend on its own seed and
+// position alone -- G3's isolation property, kept by construction.
+int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
+                                     LinearPolicyMode mode) {
+  if (model == nullptr || pool == nullptr) {
+    set_error("ignis_verify_graph: null argument");
+    return -1;
+  }
+  if (model->verify == nullptr) {
+    set_error("ignis_verify_graph: the model was loaded without a draft window");
+    return -1;
+  }
+  if (width == 0 || width > IGNIS_DECODE_MAX_BATCH) {
+    set_error("ignis_verify_graph: width " + std::to_string(width) +
+              " is not in 1..IGNIS_DECODE_MAX_BATCH");
+    return -1;
+  }
+  IgnisVerifyRound &verify = *model->verify;
+  const auto k = static_cast<std::int32_t>(verify.window);
+  const std::int32_t lane_columns = k + 1;
+  const auto batch = static_cast<std::int32_t>(width);
+  const std::int32_t columns = lane_columns * batch;
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  const auto vocab = static_cast<std::int32_t>(model->vocab);
+  ninfer::DeviceArena::Scope scope = model->decode_graph_scratch->scope();
+  try {
+    // Column 0 of every lane is its anchor, columns 1..extent its drafts,
+    // the tail the anchor again; positions `base + min(j, extent)`.
+    const ninfer::Tensor anchors(verify.anchors->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    const ninfer::Tensor drafts(verify.drafts->p, ninfer::DType::I32, {k, batch, 1, 1});
+    const ninfer::Tensor base_positions(verify.base_positions->p, ninfer::DType::I32,
+                                        {batch, 1, 1, 1});
+    const ninfer::Tensor extents(verify.extents->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor verify_ids(verify.verify_ids->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
+    ninfer::Tensor positions(verify.positions->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
+    ninfer::ops::speculative_prepare_verify_inputs(anchors, drafts, base_positions, extents,
+                                                   verify_ids, positions, model->stream);
+
+    const ninfer::Tensor ids(verify.verify_ids->p, ninfer::DType::I32, {columns, 1, 1, 1});
+    ninfer::Tensor left =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::Tensor right =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
+
+    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
+          ? ignis_gqa_layer_run_body_verify(model, pool, layer, width, left.data, right.data, mode)
+          : ignis_gdn_layer_run_body_verify(model, pool, layer, width, left.data, right.data, mode);
+      if (rc != 0) {
+        const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
+            ? ignis_gqa_layer_last_error()
+            : ignis_gdn_layer_last_error();
+        set_error("ignis_verify_graph: width " + std::to_string(width) + " layer " +
+                  std::to_string(layer) + " failed: " + detail);
+        return -1;
+      }
+      std::swap(left, right);
+    }
+
+    // The final residual of every column, kept past the round for the
+    // accepted-hidden selection (the drafter's continuation input, P5-05).
+    cudaError_t err = cudaMemcpyAsync(verify.hidden->p, left.data,
+                                      static_cast<std::size_t>(hidden) * columns * sizeof(uint16_t),
+                                      cudaMemcpyDeviceToDevice, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_verify_graph: cudaMemcpyAsync(hidden) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+
+    const ninfer::Tensor norm_weight(const_cast<void *>(model->final_norm.qdata), ninfer::DType::BF16,
+                                     {hidden, 1, 1, 1});
+    ninfer::Tensor normalized =
+        model->decode_graph_scratch->alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
+    ninfer::ops::rmsnorm(left, norm_weight, model->rms_norm_eps, /*unit_offset=*/true, normalized,
+                         model->stream);
+    ninfer::Tensor logits(verify.logits->p, ninfer::DType::BF16, {vocab, columns, 1, 1});
+    ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
+    ninfer::Tensor target_tokens(verify.target_tokens->p, ninfer::DType::I32, {columns, 1, 1, 1});
+    ninfer::ops::argmax(logits, target_tokens, vocab, model->stream);
+
+    // The vendored accept: the greedy branch keeps the longest draft prefix
+    // the target argmax agrees with and takes the target argmax at the
+    // divergence; the sampling branch (temperature > 0) is the
+    // distribution-preserving rule over the same columns. Its outputs are
+    // read back by the caller after the round.
+    const ninfer::Tensor targets_rows(verify.target_tokens->p, ninfer::DType::I32,
+                                      {lane_columns, batch, 1, 1});
+    const ninfer::Tensor logits_rows(verify.logits->p, ninfer::DType::BF16,
+                                     {vocab, lane_columns, batch, 1});
+    ninfer::Tensor lengths(verify.lengths->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor anchors_out(verify.anchors->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor licensed_tokens(verify.licensed_tokens->p, ninfer::DType::I32,
+                                   {lane_columns, batch, 1, 1});
+    ninfer::Tensor licensed_counts(verify.licensed_counts->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::Tensor accepted(verify.accepted->p, ninfer::DType::I32, {batch, 1, 1, 1});
+    ninfer::DeviceArena::Scope accept_scope = verify.accept_workspace->scope();
+    ninfer::ops::speculative_accept_greedy_drafts(
+        targets_rows, logits_rows, drafts, extents, lengths, anchors_out, licensed_tokens,
+        licensed_counts, accepted, vocab,
+        static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
+        *verify.accept_workspace, model->stream);
+    return 0;
+  } catch (const std::exception &e) {
+    set_error("ignis_verify_graph: width " + std::to_string(width) + ": " + e.what());
+    return -1;
+  }
+}
+
 namespace {
+
+// P5-04 (GitHub #153): records one width-W verify graph -- exactly
+// `ignis_verify_graph_run_batch`, captured once. Same failure handling as
+// the decode capture below.
+int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, uint32_t width,
+                                   cudaGraphExec_t *out_exec) {
+  *out_exec = nullptr;
+  cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_verify_graph_capture: cudaStreamBeginCapture failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  const bool ok =
+      ignis_verify_graph_run_batch(model, pool, width, LinearPolicyMode::kEngineDefault) == 0;
+  cudaGraph_t graph = nullptr;
+  const cudaError_t end_err = cudaStreamEndCapture(model->stream, &graph);
+  if (end_err != cudaSuccess) {
+    set_error(std::string("ignis_verify_graph_capture: cudaStreamEndCapture failed: ") +
+              cudaGetErrorString(end_err));
+    return -1;
+  }
+  if (!ok) {
+    cudaGraphDestroy(graph);
+    return -1;
+  }
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
+  cudaGraphDestroy(graph);
+  if (inst_err != cudaSuccess) {
+    set_error(std::string("ignis_verify_graph_capture: cudaGraphInstantiate failed: ") +
+              cudaGetErrorString(inst_err));
+    return -1;
+  }
+  *out_exec = exec;
+  return 0;
+}
 
 // Records one width-W graph: one W-wide model traversal
 // (`ignis_decode_graph_run_batch` above) followed by one batched
@@ -219,6 +378,21 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
       // rather than aborting.
       model->decode_graph_exec[width - 1] = nullptr;
       model->decode_graph_ready[width - 1] = false;
+    }
+  }
+  // P5-04 (GitHub #153): the verify graphs, one per exact width at the
+  // load's window, under the same never-refuse-service rule -- a width whose
+  // verify capture failed runs the verify traversal eagerly.
+  if (model->verify != nullptr) {
+    for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
+      cudaGraphExec_t exec = nullptr;
+      if (capture_verify_graph_width(model, pool, width, &exec) == 0) {
+        model->verify->graph_exec[width - 1] = exec;
+        model->verify->graph_ready[width - 1] = true;
+      } else {
+        model->verify->graph_exec[width - 1] = nullptr;
+        model->verify->graph_ready[width - 1] = false;
+      }
     }
   }
   if (out_capture_micros != nullptr) {

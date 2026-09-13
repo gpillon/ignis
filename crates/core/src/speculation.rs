@@ -29,6 +29,12 @@ pub const DFLASH2_WINDOW_LANES: u64 = crate::N_DECODE_LANES as u64;
 pub enum SpeculativeBackend {
     /// The 5-layer sliding-window DFlash2 drafter (`CONTEXT.md`).
     Dflash2,
+    /// The verify substrate alone (P5-04, GitHub #153): the verify round,
+    /// its ReplaySSM records and its graphs at the window, with no drafter
+    /// bound. The drafts come per call through
+    /// [`crate::step::decode_program_verify`] -- the seam a test's fake
+    /// drafter fills. Not an operator spelling: [`Self::parse`] refuses it.
+    VerifyOnly,
 }
 
 impl SpeculativeBackend {
@@ -44,6 +50,7 @@ impl SpeculativeBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Dflash2 => "dflash2",
+            Self::VerifyOnly => "verify-only",
         }
     }
 
@@ -52,6 +59,7 @@ impl SpeculativeBackend {
     pub fn abi_code(&self) -> i32 {
         match self {
             Self::Dflash2 => 1,
+            Self::VerifyOnly => 2,
         }
     }
 }
@@ -89,9 +97,11 @@ impl Speculation {
     /// The device bytes the drafter's window pool takes: BF16, layers ×
     /// window × KV heads × head width × (K + V) per lane — 40 MiB — twice
     /// with the rewrite checkpoint, for every decode lane. Independent of the
-    /// draft window.
+    /// draft window. Zero for [`SpeculativeBackend::VerifyOnly`], which binds
+    /// no drafter.
     pub fn window_pool_bytes(&self) -> u64 {
         match self.backend {
+            SpeculativeBackend::VerifyOnly => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = 2;
                 let per_lane = DFLASH2_LAYERS
@@ -131,10 +141,22 @@ mod tests {
     #[test]
     fn only_dflash2_parses() {
         assert_eq!(SpeculativeBackend::parse("dflash2"), Ok(SpeculativeBackend::Dflash2));
-        for bad in ["mtp", "dflash", "DFLASH2", ""] {
+        // The verify-only backend is an internal seam (P5-04, GitHub #153),
+        // never an operator spelling.
+        for bad in ["mtp", "dflash", "DFLASH2", "", "verify-only"] {
             let err = SpeculativeBackend::parse(bad).expect_err("not a backend");
             assert!(err.contains("dflash2"), "{err}");
         }
+    }
+
+    #[test]
+    fn verify_only_takes_the_same_window_rule_and_no_window_pool() {
+        let spec = Speculation::new(SpeculativeBackend::VerifyOnly, 7).expect("in range");
+        assert_eq!(spec.draft_tokens(), 7);
+        assert_eq!(spec.backend().abi_code(), 2);
+        assert_eq!(spec.window_pool_bytes(), 0, "no drafter, no window pool");
+        let err = Speculation::new(SpeculativeBackend::VerifyOnly, 8).expect_err("out of range");
+        assert!(err.contains("1..7"), "{err}");
     }
 
     #[test]

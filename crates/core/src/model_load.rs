@@ -223,8 +223,11 @@ fn is_weight_only_nvfp4(name: &str) -> bool {
 /// this load, so the handles and the descriptors cannot name different
 /// scopes.
 pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
-    speculation.map(|s| match s.backend() {
-        SpeculativeBackend::Dflash2 => DraftModule::Dflash2,
+    speculation.and_then(|s| match s.backend() {
+        SpeculativeBackend::Dflash2 => Some(DraftModule::Dflash2),
+        // The verify substrate binds no drafter (P5-04, GitHub #153): the
+        // text scope alone.
+        SpeculativeBackend::VerifyOnly => None,
     })
 }
 
