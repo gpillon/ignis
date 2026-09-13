@@ -31,11 +31,21 @@ pub struct RequestMetrics {
     pub n_tokens: u32,
     /// Wall-clock duration of the whole request (ms).
     pub total_ms: f64,
-    /// Whether the request completed normally (false on a mid-stream error).
+    /// Whether the request completed normally *and* generated at least one
+    /// token (false on an error, and on a response that delivered nothing —
+    /// GitHub #147).
     pub ok: bool,
 }
 
 impl RequestMetrics {
+    /// Whether this request is something a throughput cell may be computed
+    /// from: it completed and generated at least one token. Checked on the
+    /// token count too, not just `ok`, because records written before GitHub
+    /// #147 carry `ok: true` on streams that delivered nothing.
+    pub fn is_measurement(&self) -> bool {
+        self.ok && self.n_tokens > 0
+    }
+
     /// Decode-phase throughput in tokens/second:
     /// `(n_tokens - 1) / ((total_ms - ttft_ms) / 1000)`.
     ///
@@ -198,6 +208,21 @@ mod tests {
         // ttft == total (no measurable decode phase).
         let req = m("r", RequestClass::Main, 500.0, 64, 500.0);
         assert_eq!(req.tok_s(), 0.0);
+    }
+
+    #[test]
+    fn only_a_completed_request_that_generated_tokens_is_a_measurement() {
+        assert!(m("r", RequestClass::Main, 200.0, 10, 1000.0).is_measurement());
+        let mut failed = m("r", RequestClass::Main, 0.0, 0, 0.0);
+        failed.ok = false;
+        assert!(!failed.is_measurement(), "a failed request");
+        // GitHub #147: records written before the harness refused them carry
+        // `ok: true` on a stream that delivered nothing — still not a
+        // measurement when read back.
+        assert!(
+            !m("r", RequestClass::Main, 451_653.7, 0, 451_653.7).is_measurement(),
+            "zero tokens, whatever `ok` says"
+        );
     }
 
     #[test]

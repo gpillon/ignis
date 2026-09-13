@@ -833,7 +833,10 @@ pub fn replay(ep: Arc<dyn Endpoint>, trace: &Trace, cfg: &ReplayConfig) -> Vec<R
                         ttft_ms: o.ttft_ms,
                         n_tokens: o.n_tokens,
                         total_ms: o.total_ms,
-                        ok: true,
+                        // GitHub #147: a response that delivered no token on
+                        // either channel did not complete a measurement, even
+                        // on a 200. Its timing is kept for the record.
+                        ok: o.n_tokens > 0,
                     },
                     Err(_e) => RequestMetrics {
                         id: req.id,
@@ -1107,6 +1110,28 @@ mod tests {
         let results = replay(ep, &trace, &cfg);
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|m| !m.ok && m.n_tokens == 0));
+    }
+
+    #[test]
+    fn a_response_that_generated_no_tokens_is_not_recorded_as_ok() {
+        // GitHub #147: a 200 response whose stream carried no token on either
+        // channel (`ttft_ms == total_ms`, `n_tokens == 0`) used to read back
+        // as `ok: true`, and the G4 `main` cell ranked it as 0.000 tok/s.
+        let trace = Trace::from_jsonl(&trace_jsonl()).expect("valid trace");
+        let ep = Arc::new(MockEndpoint::new(vec![
+            outcome(451_653.7, 451_653.7, 0),
+            outcome(100.0, 1000.0, 64),
+            outcome(100.0, 1000.0, 64),
+        ]));
+        let cfg = ReplayConfig {
+            max_concurrency: 1,
+            time_scale: 0.0,
+        };
+        let results = replay(ep, &trace, &cfg);
+        let empty = results.iter().find(|m| m.n_tokens == 0).expect("the empty response");
+        assert!(!empty.ok, "{empty:?}");
+        assert_eq!(empty.total_ms, 451_653.7, "the wall time it cost is kept");
+        assert_eq!(results.iter().filter(|m| m.ok).count(), 2);
     }
 
     #[test]
