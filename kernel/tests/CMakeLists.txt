@@ -55,6 +55,11 @@ set(ignis_vendored_op_tests
   rope
   qk_norm_rope
   sampling
+  speculative_round
+  dflash2_dynamic_conv
+  dflash2_selector_predecessors
+  dflash2_selector_scores
+  dflash2_topk_walk
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)

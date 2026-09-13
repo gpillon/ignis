@@ -1,7 +1,7 @@
 {
   "reference": {
     "repo": "gpillon/ninfer",
-    "branch": "feat/dflash2-local",
+    "branch": "gpillon/coding",
     "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
     "default_path": "F:/ai/q38/ninfer"
   },
@@ -22,6 +22,26 @@
     {
       "path": "include/ninfer/ops/causal_conv1d_silu.h",
       "sha256": "6815cec1e6e5a67aba25630b2ed0eafc90f7036394e94a16e132637feb741a34"
+    },
+    {
+      "path": "include/ninfer/ops/dflash2_dynamic_conv.h",
+      "sha256": "3f0a974665ae40a33442f8cebfe9df6fdd99fe1ea2aa64ee370e641a89cd87d1"
+    },
+    {
+      "path": "include/ninfer/ops/dflash2_selector_predecessors.h",
+      "sha256": "a830383439b6b02b986b6de348f78799b04173f3852af9ea453a4866f314272c"
+    },
+    {
+      "path": "include/ninfer/ops/dflash2_selector_scores.h",
+      "sha256": "1feaadc9f620b636b50724e7c9665e9e7d2694517bc988005b55341c96badcde"
+    },
+    {
+      "path": "include/ninfer/ops/dflash2_selector_walk.h",
+      "sha256": "c1c6c1b1068d3030087ba5f5be9e48c36e72050c401d31f3e850727f3d7f0a6e"
+    },
+    {
+      "path": "include/ninfer/ops/dflash2_topk.h",
+      "sha256": "ac97913cccdf6faba5cc2fc4ffbb3558b56f715595aedd0fa9e9986c94a7e4ef"
     },
     {
       "path": "include/ninfer/ops/embedding.h",
@@ -98,6 +118,10 @@
     {
       "path": "include/ninfer/ops/sampling.h",
       "sha256": "ea8255a4b4e87df2fe815ae62353a4006667701663989f2ba658a2db368b8154"
+    },
+    {
+      "path": "include/ninfer/ops/speculative_round.h",
+      "sha256": "ca407c0578f358ee187b02370f75dd5ae66af2117c5b0310bb029ff3c9933531"
     },
     {
       "path": "include/ninfer/ops/sigmoid_mul.h",
@@ -372,6 +396,10 @@
       "sha256": "6ee83c24c7712595446a0e7fbe822fbb89550f7768578550b7834ccfc9a82fd8"
     },
     {
+      "path": "src/ops/kernel/dflash2_draft.cuh",
+      "sha256": "80f0978bcbe7767274068df32585a13e7336290d616b1a47357f6d77726a6435"
+    },
+    {
       "path": "src/ops/kernel/embed_gather.cuh",
       "sha256": "041e27ca7dad3cd329a163ca3e9b36a1020b6487637d3833dbc53fb941087a7c"
     },
@@ -460,6 +488,10 @@
       "sha256": "99864fcc72fa117895c82abadd30b4856227c1f87f9e57e5c6732c31535ae90d"
     },
     {
+      "path": "src/ops/kernel/speculative_round.cuh",
+      "sha256": "3cef808d138d4f86e43db3bad78d921b64d6f6491c7061e2e5a724574a7f2bb4"
+    },
+    {
       "path": "src/ops/kernel/sigmoid_gate_mul.cuh",
       "sha256": "d9aad5219f7c471b00f468d2c0e1c0aa7615dda783110028311aa69056a8e217"
     },
@@ -482,6 +514,14 @@
     {
       "path": "src/ops/launcher/causal_conv1d.h",
       "sha256": "4e0d8a3a365d4e2aa7aabf8bcabf863c19d1c568d14b9768c246014a92ce1b5b"
+    },
+    {
+      "path": "src/ops/launcher/dflash2_draft.cu",
+      "sha256": "e0b12162c4a5f481615517e6ed5861ec0f59182ada2b1aef9f0a104b995361a4"
+    },
+    {
+      "path": "src/ops/launcher/dflash2_draft.h",
+      "sha256": "57577ebabae8f3a0f7c7bcc94002be36bf1c3412cb208a23d020ab6faa09fca9"
     },
     {
       "path": "src/ops/launcher/embed_gather.cu",
@@ -614,6 +654,14 @@
     {
       "path": "src/ops/launcher/sampling.h",
       "sha256": "91a3cea2f8a09492b8649620b0959c658f428934995674edc7dcd1d638a07b5b"
+    },
+    {
+      "path": "src/ops/launcher/speculative_round.cu",
+      "sha256": "e193699472715489f76e277b42e6779d333e3537bb7e581449e5de11764515d9"
+    },
+    {
+      "path": "src/ops/launcher/speculative_round.h",
+      "sha256": "49fe63255e368618c05846b34e01ffdd708b6d37e5f55524912a739f08ab65e0"
     },
     {
       "path": "src/ops/launcher/sigmoid_gate_mul.cu",
@@ -976,6 +1024,10 @@
       "sha256": "a5e5621c8b4c2479e1b65c07c35ee6e500e2a7f747b763129c5a7bbac7f3e669"
     },
     {
+      "path": "src/ops/wrapper/dflash2_draft.cpp",
+      "sha256": "7bff6c05d99f50e288830e2ddf5633581f04aeae2ef9218777764aa46fe82b24"
+    },
+    {
       "path": "src/ops/wrapper/embedding.cpp",
       "sha256": "58d3638f0e25207ed917a4388260390336707de455bcbf37488e13bcabd58060"
     },
@@ -1022,6 +1074,10 @@
     {
       "path": "src/ops/wrapper/sampling.cpp",
       "sha256": "986e0d0002b660c3c85988ab065db2420519d9fb0877ffaf53a8679837f69fdc"
+    },
+    {
+      "path": "src/ops/wrapper/speculative_round.cpp",
+      "sha256": "593ac08a6a9bd23b82cd7837afb56e1465f11dfd21ea3d3fa8583f7c1930520e"
     },
     {
       "path": "src/ops/wrapper/sigmoid_mul.cpp",
@@ -1129,6 +1185,22 @@
       "sha256": "94e000c93d4343e991a1da8b13e37a417bb9696ba24c34ce582c91d07ff00d93"
     },
     {
+      "path": "tests/ops/test_dflash2_dynamic_conv.cpp",
+      "sha256": "2a6d0480e9eb2d72ece52bfda4419aea975f055b32d878afe533d7f523c7ec6a"
+    },
+    {
+      "path": "tests/ops/test_dflash2_selector_predecessors.cpp",
+      "sha256": "382fa77db801210edfefc76abd24c7e4946aecfe91a859981896aebf4254df53"
+    },
+    {
+      "path": "tests/ops/test_dflash2_selector_scores.cpp",
+      "sha256": "8692fa3b8174e3e09ded67ebfd8b1fdb7661b31602497ac74168213b35a2edce"
+    },
+    {
+      "path": "tests/ops/test_dflash2_topk_walk.cpp",
+      "sha256": "d4544fcd919e090eba345028411d454e1b30e4515933a5fad17128869328bc62"
+    },
+    {
       "path": "tests/ops/test_embedding.cpp",
       "sha256": "a262a90b83b3ec9e5cda1ee889231eb30bf84264dc20d04ab441d04dca2dd44c"
     },
@@ -1201,6 +1273,10 @@
     {
       "path": "tests/ops/test_sampling.cpp",
       "sha256": "828a073bb70195921341fc3d43e5c1dd1a4b945718323fdb7627a7fb6da5d086"
+    },
+    {
+      "path": "tests/ops/test_speculative_round.cpp",
+      "sha256": "c599dbc5f9cc349b11847988ef2ec24910a8475a55cc03f7b3640e93f520a530"
     },
     {
       "path": "tests/ops/test_sigmoid_mul.cpp",
