@@ -1,21 +1,24 @@
 {
-  "trace_sha256": "51d44a789e99223748493f06c707a9aaa2594cb555576c15135eadd9fd531b7b",
+  "trace_sha256": "00fd08b810c44ed6ec1a422e4a0c476af786bccdc0219e733d346bd5a0c4ab01",
   "requests": 11,
-  "class_split": { "main": 1, "sub": 10 },
-  "arrival_span_ms": 36517,
+  "class_split": {
+    "main": 1,
+    "sub": 10
+  },
+  "arrival_span_ms": 21152,
   "prompt_length_chars": {
-    "min": 11071,
+    "min": 21228,
     "p50": 54602,
-    "p90": 72686,
-    "max": 75305,
+    "p90": 81605,
+    "max": 82859,
     "unit": "utf-8 bytes of the raw JSON request body (the 'prompt' field), not tokens"
   },
   "recorded_against": {
     "repo": "gpillon/ninfer",
     "commit": "a00648cb828457986cf5b4b4f712b4cbcd7af0d1",
-    "preset": "qwen3.8-27b-nvfp4full-ram-hq-e8-2b-262k",
+    "preset": "flags, not a preset: --kv-dtype hq-e8-2b --prefill-chunk 1024 --max-context 262144 --max-concurrency 8 --kv-capacity 465984 (resolved 465,984 tokens / 7,281 pages)",
     "model_id": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k"
   },
   "recorded_via": "bench/sim/simulate-session.ps1 -> ignis-bench record --class first-is-main",
-  "note": "GitHub #128 (G4 gate run, 2026-09-12, session g4-20260912T162610Z). 1 main + 10 subagents auditing the G4 gate machinery itself (bench/sim/g4-gate-session.json), each request real current-repository files pasted as context (11KB-75KB per request, max_tokens 16000 main / 12000 sub) with tool definitions. Requests launched 2s apart, genuinely overlapping in flight (all 11 in flight together by t=24s); wall clock to last completion ~13m16s (19:27:12-19:40:52 local) against the single global prefill lane. All 11 requests returned status=200. No tool-call or thinking-stream damage observed on direct SSE inspection of a separate dogfood request against ignis-server (.scratch/g4-logs/dogfood-raw-sse.txt): clean reasoning_content stream, a well-formed tool_calls delta, finish_reason=tool_calls, terminal [DONE]. This trace supersedes the one #118 recorded (GitHub #118's own trace file was never committed and is no longer present on this machine; its meta is preserved in git history) -- the g4-load-trace.jsonl path is reused for the same purpose, a fresh recording every gate-run session per ADR 0015/0021 (the reference's *run* is measured live in the same session, never read from a committed file, and the trace itself is regenerated alongside it). The trace file itself is not committed (real working content); only this shape summary is."
+  "note": "GitHub #65 (G4 gate run 2, 2026-09-13, session g4-20260913T163557Z). The gate's second run: the first (#128, session g4-20260912T162610Z) filed six harness gaps and was recorded as a verdict-with-gaps rather than a pass; #137, #138, #139, #143, #144, #145, #146 and #147 are all closed and merged, and this trace was recorded fresh against a reference launched from the same argv the gate legs use. 1 main + 10 subagents auditing the G4 gate machinery itself (bench/sim/g4-gate-session.json), each request real current-repository files pasted as context (21KB-83KB per request, max_tokens 16000 main / 12000 sub) with tool definitions. Requests launched 2s apart and genuinely overlapping: all 11 in flight by t=21s, wall clock to last completion 12m18s (18:37:34-18:49:52 local). All 11 returned status=200 and the reference's log carried no error, warn or panic line across the whole recording. Supersedes the trace #128 recorded at this same path -- per ADR 0015 / ADR 0021 the trace is regenerated alongside the reference's own live run every gate-run session, never read from a committed file. The trace file itself is not committed (real working content); only this shape summary is."
 }
