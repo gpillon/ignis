@@ -49,12 +49,25 @@ ignis-server in the G4 profile: hq-e8-2b, max-context 262,144, auto 4 GiB pool,
 | the whole 11-request trace, `--conc 8` | 3,135 ms | 15,613 | 467,511 ms | true |
 
 Every sub request of the whole-trace replay also reported tokens (202 to
-11,156). Raw output: `.scratch/g4-147-logs/` in the #147 worktree.
+11,156).
+
+The same whole-trace replay against **ninfer** (same `ignis-bench`, ninfer-serve
+in the #128 argv: hq-e8-2b, `--kv-capacity 465984`, `--max-concurrency 8`,
+`--prefill-chunk 1024`, max-context 262,144):
+
+| run | `req-001` ttft | n_tokens | total | ok |
+|---|---:|---:|---:|---|
+| the whole 11-request trace, `--conc 8` | 3,092 ms | 16,000 | 536,098 ms | true |
+
+Five of its sub requests stopped at 11,984-12,000 of their 12,000 budget in
+448-458 s — the shape of the zero-token ninfer rows in the #128 records
+(400-443 s). Raw output: `.scratch/g4-147-logs/` in the #147 worktree.
 
 ## Finding
 
-Observed: under the G4 load `req-001` generates ~16,000 tokens on ignis, and the
-current reader counts them, so the `main` cell is a measurement.
+Observed: under the G4 load `req-001` generates 15,613 counted tokens on ignis
+and 16,000 on ninfer, and the current reader counts them, so the `main` cell is
+a measurement on both engines.
 
 Observed: the 0.000 in the G4 verdict came from records written by an
 `ignis-bench` built before #137; the zero-token rows on both engines are
