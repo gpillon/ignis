@@ -111,13 +111,6 @@ impl Server {
         self
     }
 
-    /// Route the server's telemetry through `sink` (the §5 JSONL sink — a
-    /// file or stdout in production, an in-memory sink in tests).
-    pub fn with_telemetry(mut self, sink: std::sync::Arc<dyn ignis_logging::LineSink>) -> Self {
-        self.engine = self.engine.with_telemetry(sink);
-        self
-    }
-
     /// The axum app (build once, share across a listener; the state the
     /// router serves is an `Arc` of this server).
     pub fn app(&self) -> Router {

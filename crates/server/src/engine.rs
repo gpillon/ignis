@@ -20,8 +20,9 @@
 //! - **Telemetry** — the model thread only ever pushes lightweight facts
 //!   (a routed event, a submission notice, a per-step tick) onto an
 //!   unbounded channel; a separate async task owns the [`Telemetry`] value
-//!   and does all the sink I/O and counter math off the model thread, then
-//!   publishes the computed counters into a wait-free [`ArcSwap`] snapshot.
+//!   and does all the counter math and event emission off the model thread,
+//!   then publishes the computed counters into a wait-free [`ArcSwap`]
+//!   snapshot.
 
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
@@ -33,7 +34,6 @@ use ignis_core::{
     FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, Scheduler, SubmitError,
     TokenId,
 };
-use ignis_logging::{LineSink, NullSink};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -69,19 +69,17 @@ enum Command {
 }
 
 /// A message on the telemetry consumer's inbox. The model thread only ever
-/// sends the first three variants — lightweight facts, never sink I/O,
-/// never counter math (mirroring the call sites [`Telemetry`] has: a
-/// submission, a routed event, a per-step tick). `SetSink`/`SetStats` are a
+/// sends the first three variants — lightweight facts, never event
+/// emission, never counter math (mirroring the call sites [`Telemetry`]
+/// has: a submission, a routed event, a per-step tick). `SetStats` is a
 /// different kind of message on the same channel: an async-side
 /// reconfiguration request the model thread never sends, used by
-/// [`Engine::with_telemetry`] / [`Engine::with_stats`] to reach the
-/// already-running consumer without ever sharing a lock with the model
-/// thread.
+/// [`Engine::with_stats`] to reach the already-running consumer without
+/// ever sharing a lock with the model thread.
 enum TelemetryFact {
     Submitted(RequestId, u32, RequestClass),
     Routed(SchedEvent),
     Tick,
-    SetSink(Arc<dyn LineSink>),
     SetStats(Arc<dyn IntervalStatsProvider>),
 }
 
@@ -112,27 +110,22 @@ impl Clone for Engine {
 }
 
 impl Engine {
-    /// Wrap a concrete scheduler in a server engine (telemetry off — a no-op
-    /// sink, so no JSONL is written; use [`Engine::with_sinks`] to enable it).
+    /// Wrap a concrete scheduler in a server engine on the wall clock.
     /// Spawns the model thread immediately (server startup, for the
     /// process's whole life).
     pub fn new(scheduler: Box<dyn Scheduler>) -> Self {
-        Self::with_sinks(scheduler, Arc::new(NullSink), Arc::new(SystemClock))
+        Self::with_clock(scheduler, Arc::new(SystemClock))
     }
 
-    /// Wrap a concrete scheduler in a server engine whose telemetry writes
-    /// through `sink`, with `clock` supplying the request-line `ms` /
-    /// `tok_s` (a fixed clock keeps tests deterministic — ADR 0006). Spawns
-    /// the model thread and the async telemetry consumer immediately.
-    pub fn with_sinks(
-        scheduler: Box<dyn Scheduler>,
-        sink: Arc<dyn LineSink>,
-        clock: Arc<dyn TelemetryClock>,
-    ) -> Self {
-        Self::with_sinks_and_driver(scheduler, sink, clock).0
+    /// Wrap a concrete scheduler in a server engine whose telemetry reads
+    /// `clock` for the request events' `duration_ms` / `tok_s` (a fixed
+    /// clock keeps tests deterministic — ADR 0006). Spawns the model thread
+    /// and the async telemetry consumer immediately.
+    pub fn with_clock(scheduler: Box<dyn Scheduler>, clock: Arc<dyn TelemetryClock>) -> Self {
+        Self::with_clock_and_driver(scheduler, clock).0
     }
 
-    /// Same as [`Engine::with_sinks`], but also returns the model thread's
+    /// Same as [`Engine::with_clock`], but also returns the model thread's
     /// [`std::thread::JoinHandle`] (GitHub #71). Production (`main.rs`)
     /// never needs it — the process exits with the thread still running.
     /// A caller that needs the scheduler's GPU-resident state (weights, KV
@@ -143,9 +136,8 @@ impl Engine {
     /// until the model thread has actually exited and dropped the
     /// `Scheduler` it owned, so the next caller never races the GPU
     /// teardown of the previous one.
-    pub fn with_sinks_and_driver(
+    pub fn with_clock_and_driver(
         scheduler: Box<dyn Scheduler>,
-        sink: Arc<dyn LineSink>,
         clock: Arc<dyn TelemetryClock>,
     ) -> (Self, std::thread::JoinHandle<()>) {
         let model_id = scheduler.model_id().to_string();
@@ -162,8 +154,8 @@ impl Engine {
             .expect("spawning the model thread must not fail");
 
         // The telemetry consumer: an async task that owns `Telemetry` and
-        // does all sink I/O / counter math off the model thread.
-        let telemetry = Telemetry::new(sink, clock);
+        // does all counter math / event emission off the model thread.
+        let telemetry = Telemetry::new(clock);
         tokio::spawn(telemetry_task(telemetry, facts_rx, Arc::clone(&counters)));
 
         (
@@ -175,15 +167,6 @@ impl Engine {
             },
             driver,
         )
-    }
-
-    /// Route the engine's telemetry through `sink` (keeping the existing
-    /// clock and any live counter source). Reconfigures the already-running
-    /// telemetry consumer through the facts channel — never touches the
-    /// model thread.
-    pub fn with_telemetry(self, sink: Arc<dyn LineSink>) -> Self {
-        let _ = self.facts.send(TelemetryFact::SetSink(sink));
-        self
     }
 
     /// Use `provider` as the live counter source for the interval line (the
@@ -358,7 +341,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
 
 /// The async telemetry consumer (GitHub #69): owns `Telemetry` and drains
 /// the facts channel, calling the exact same methods the old inline driver
-/// called — all sink I/O and counter math happens here, off the model
+/// called — all event emission and counter math happens here, off the model
 /// thread. After each tick, publishes the computed counters into `counters`
 /// (the wait-free `ArcSwap` snapshot).
 async fn telemetry_task(
@@ -400,7 +383,6 @@ async fn telemetry_task(
                 let snapshot = telemetry.emit_interval();
                 counters.store(Arc::new(snapshot));
             }
-            TelemetryFact::SetSink(sink) => telemetry.set_sink(sink),
             TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
         }
     }

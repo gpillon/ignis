@@ -17,12 +17,10 @@
 //! `Metadata::name()`, nothing here invents or rewrites it.
 //!
 //! Named `logging`, not `telemetry`: `ignis_server::telemetry` already owns
-//! that name for an unrelated, pre-existing concern (the scheduler
-//! interval-counter JSONL stream behind `IGNIS_TELEMETRY`/`--telemetry`,
-//! GitHub #77). The two event models do not merge here — GitHub #108 only
-//! moved telemetry's line-writing sink onto [`sink::LineSink`]/
-//! [`sink::FileSink`]/[`sink::NullSink`] (see `sink.rs`'s module doc);
-//! telemetry's facts, counters, and JSONL shape stay its own.
+//! that name for the asynchronous consumer that tracks request and scheduler
+//! state. It has no output format of its own — its request lifecycle and
+//! interval counters are ordinary events here (`ignis.request.*`, GitHub #79;
+//! `ignis.scheduler.interval`, ADR 0025).
 //!
 //! [`init`] is the one production entrypoint: resolves [`config::LogConfig`]
 //! from `IGNIS_LOG_FORMAT`/`IGNIS_LOG_LEVEL` (`auto` format picks pretty on

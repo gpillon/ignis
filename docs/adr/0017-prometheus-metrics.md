@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-09-08, owner decision).
+Accepted (2026-09-08, owner decision). The "Existing JSONL interval telemetry
+remains compatible" consequence is superseded by ADR 0025; the projection
+still reads the telemetry consumer, never rendered log output.
 
 ## Context
 

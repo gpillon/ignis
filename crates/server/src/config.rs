@@ -45,7 +45,6 @@ pub struct Config {
     pub model: String,
     pub bind: String,
     pub artifact: Option<PathBuf>,
-    pub telemetry: Option<PathBuf>,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The prefill chunk width, in tokens (a nonzero multiple of
@@ -125,7 +124,6 @@ pub fn resolve(
     let mut model = None;
     let mut bind = None;
     let mut artifact = None;
-    let mut telemetry = None;
     let mut enable_thinking = None;
     let mut reasoning_effort = None;
     let mut prefill_chunk = None;
@@ -142,7 +140,6 @@ pub fn resolve(
             "--model" | "-m" => model = Some(take_value(args, &mut i, flag)?),
             "--bind" | "-b" => bind = Some(take_value(args, &mut i, flag)?),
             "--artifact" | "-a" => artifact = Some(take_value(args, &mut i, flag)?),
-            "--telemetry" | "-t" => telemetry = Some(take_value(args, &mut i, flag)?),
             "--enable-thinking" => enable_thinking = Some(take_value(args, &mut i, flag)?),
             "--reasoning-effort" => reasoning_effort = Some(take_value(args, &mut i, flag)?),
             "--prefill-chunk" => prefill_chunk = Some(take_value(args, &mut i, flag)?),
@@ -163,7 +160,6 @@ pub fn resolve(
         .or_else(|| env("IGNIS_BIND"))
         .unwrap_or_else(|| DEFAULT_BIND.to_owned());
     let artifact = non_empty(artifact.or_else(|| env("IGNIS_ARTIFACT"))).map(PathBuf::from);
-    let telemetry = non_empty(telemetry.or_else(|| env("IGNIS_TELEMETRY"))).map(PathBuf::from);
 
     let enable_thinking_raw = enable_thinking
         .or_else(|| env("IGNIS_ENABLE_THINKING"))
@@ -195,7 +191,6 @@ pub fn resolve(
         model,
         bind,
         artifact,
-        telemetry,
         enable_thinking,
         reasoning_effort,
         prefill_chunk,
@@ -389,7 +384,6 @@ fn help_text() -> String {
          \x20   -m, --model <id>              env: IGNIS_MODEL         (default: {DEFAULT_MODEL})\n\
          \x20   -b, --bind <addr>             env: IGNIS_BIND          (default: {DEFAULT_BIND})\n\
          \x20   -a, --artifact <path>         env: IGNIS_ARTIFACT      (default: unset — placeholder template)\n\
-         \x20   -t, --telemetry <path>        env: IGNIS_TELEMETRY     (default: unset — stdout)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
@@ -439,7 +433,6 @@ mod tests {
         assert_eq!(config.model, DEFAULT_MODEL);
         assert_eq!(config.bind, DEFAULT_BIND);
         assert_eq!(config.artifact, None);
-        assert_eq!(config.telemetry, None);
         assert!(config.enable_thinking);
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
@@ -459,7 +452,6 @@ mod tests {
             ("IGNIS_MODEL", "custom-model"),
             ("IGNIS_BIND", "0.0.0.0:9000"),
             ("IGNIS_ARTIFACT", "/path/to.ninfer"),
-            ("IGNIS_TELEMETRY", "/tmp/telemetry.jsonl"),
             ("IGNIS_ENABLE_THINKING", "false"),
             ("IGNIS_REASONING_EFFORT", "low"),
         ]);
@@ -467,7 +459,6 @@ mod tests {
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.bind, "0.0.0.0:9000");
         assert_eq!(config.artifact, Some(PathBuf::from("/path/to.ninfer")));
-        assert_eq!(config.telemetry, Some(PathBuf::from("/tmp/telemetry.jsonl")));
         assert!(!config.enable_thinking);
         assert_eq!(config.reasoning_effort, Some(ReasoningEffort::Low));
     }
@@ -478,7 +469,6 @@ mod tests {
             "--model", "flag-model",
             "--bind", "0.0.0.0:1234",
             "--artifact", "/flag/artifact.ninfer",
-            "--telemetry", "/flag/telemetry.jsonl",
             "--enable-thinking", "false",
             "--reasoning-effort", "high",
         ]);
@@ -486,19 +476,41 @@ mod tests {
         assert_eq!(config.model, "flag-model");
         assert_eq!(config.bind, "0.0.0.0:1234");
         assert_eq!(config.artifact, Some(PathBuf::from("/flag/artifact.ninfer")));
-        assert_eq!(config.telemetry, Some(PathBuf::from("/flag/telemetry.jsonl")));
         assert!(!config.enable_thinking);
         assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]
     fn short_aliases_behave_like_their_long_form() {
-        let a = args(&["-m", "m", "-b", "b", "-a", "a", "-t", "t"]);
+        let a = args(&["-m", "m", "-b", "b", "-a", "a"]);
         let config = expect_config(resolve(&a, no_env).expect("resolve"));
         assert_eq!(config.model, "m");
         assert_eq!(config.bind, "b");
         assert_eq!(config.artifact, Some(PathBuf::from("a")));
-        assert_eq!(config.telemetry, Some(PathBuf::from("t")));
+    }
+
+    #[test]
+    fn the_retired_telemetry_sink_flag_is_refused_and_its_env_var_ignored() {
+        // ADR 0025: the interval counters are a log event now, so there is
+        // no separate sink to point anywhere. A leftover `--telemetry` in a
+        // launch script must fail loudly rather than be silently dropped.
+        for flag in ["--telemetry", "-t"] {
+            let err = resolve(&args(&[flag, "/tmp/telemetry.jsonl"]), no_env)
+                .expect_err("a retired flag must be rejected");
+            assert!(err.0.contains(flag), "{err}");
+        }
+        let env = env_map(&[("IGNIS_TELEMETRY", "/tmp/telemetry.jsonl")]);
+        assert_eq!(
+            resolve(&[], env).expect("resolve"),
+            resolve(&[], no_env).expect("resolve"),
+            "IGNIS_TELEMETRY no longer changes the resolved config"
+        );
+
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(!text.contains("telemetry"), "help must not document it:\n{text}");
     }
 
     #[test]

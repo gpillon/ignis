@@ -16,7 +16,6 @@ use std::time::Duration;
 
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::gpu_profile;
-use ignis_logging::NullSink;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{cuda_scheduler, EngineShape};
 use ignis_server::telemetry::SystemClock;
@@ -90,7 +89,7 @@ impl LiveServer {
                 unreachable!();
             }
         };
-        // `Engine::with_sinks_and_driver` spawns its telemetry task with
+        // `Engine::with_clock_and_driver` spawns its telemetry task with
         // `tokio::spawn`, which needs a live reactor — build the runtime
         // and enter it before touching the engine (a `#[tokio::test]` gets
         // this for free; a plain `#[test]` has to do it explicitly).
@@ -101,11 +100,8 @@ impl LiveServer {
             .expect("serve runtime");
         let _guard = runtime.enter();
 
-        let (engine, driver) = Engine::with_sinks_and_driver(
-            Box::new(scheduler),
-            Arc::new(NullSink),
-            Arc::new(SystemClock),
-        );
+        let (engine, driver) =
+            Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
         let app = Server::with_artifact_template(engine, frontend)
             .with_request_timeout(request_timeout)
             .app();
