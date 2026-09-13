@@ -251,16 +251,13 @@ When output names a domain concept, use the term as defined here.
 - **`logging` crate** — owns `tracing_subscriber` setup, the JSON/pretty
   `Layer`s, and log-format/log-level config resolution; every other crate
   depends on it only for macros/init, never the reverse. Distinct from the
-  pre-existing **server telemetry** (`crates/server/src/telemetry.rs`,
-  design §5): the scheduler interval-counter/request-lifecycle JSONL stream
-  behind `IGNIS_TELEMETRY`/`--telemetry`. Interval counters are metrics-shaped
-  and stay out of the logging system's scope; the request-lifecycle line
-  (`admitted`/`ttft`/`done`) migrates onto canonical `ignis.request.*` events.
-  The two event models never merge — but since GitHub #108, telemetry's
-  sink *implementation* (line-writing only: `StdoutSink`/`FileSink`/
-  `MemorySink`/`NullSink`) is `ignis_logging::sink`'s, not a duplicate of
-  its own; the interval line's facts, counters, and JSONL shape stay
-  telemetry's alone.
+  **server telemetry** (`crates/server/src/telemetry.rs`, design §5): the
+  asynchronous consumer that tracks per-request state and the scheduler
+  interval counters. It owns no output of its own: the request lifecycle is
+  the `ignis.request.*` events (GitHub #79), and the interval counters are the
+  DEBUG event `ignis.scheduler.interval`, emitted when they change (ADR 0025).
+  Metrics are a separate projection of the same consumer's state (ADR 0017),
+  never parsed back out of the log.
 - **Logging queue** — the handoff decoupling event *creation* (a `tracing`
   call site, potentially on the prefill/decode path) from physical I/O
   (potentially slow: a full disk, a stalled pipe). Two channels, two

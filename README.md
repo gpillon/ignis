@@ -238,7 +238,6 @@ full, always-current table.
 | `IGNIS_ARTIFACT` | `--artifact <path>` | `-a` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). **Unset → the built-in placeholder template**, whose rendered content is not natural text. A configured artifact is verified (checksum clean) or the server refuses to start. |
 | `IGNIS_MODEL` | `--model <id>` | `-m` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name). |
 | `IGNIS_BIND` | `--bind <addr>` | `-b` | `127.0.0.1:8000` | The bind address (localhost only, no auth). |
-| `IGNIS_TELEMETRY` | `--telemetry <path>` | `-t` | — (stdout) | The telemetry JSONL sink path (a file). |
 | `IGNIS_ENABLE_THINKING` | `--enable-thinking <true\|false>` | — | `true` | The server-wide default for `enable_thinking`. |
 | `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |
 | `IGNIS_PREFILL_CHUNK` | `--prefill-chunk <tokens>` | — | `1024` | The prefill chunk width (a nonzero multiple of 128); the program's prefill scratch is reserved for it at load. |
@@ -326,19 +325,21 @@ cargo run -p ignis-bench -- canary --endpoint http://127.0.0.1:8000
 
 ## Telemetry
 
-JSONL — one interval line per tick. Useful for watching scheduler behavior
-(queue depth, evictions, throughput) while load runs:
+Everything goes through the one structured log on stdout, in the format
+`IGNIS_LOG_FORMAT` picks (pretty on a terminal, JSON otherwise). The request
+lifecycle is the `ignis.request.*` events (`admitted` / `ttft` / `done`,
+GitHub #79), with the request id doubling as the OTel trace id (ADR 0012).
 
-```jsonl
-{"kind":"interval","t":123,"waiting":2,"prefilling":0,"running":3,"kv_used_pct":0,"kv_evictions":1}
+The scheduler counters are the DEBUG event `ignis.scheduler.interval`,
+emitted whenever `waiting`, `running` or `kv_evictions` change (ADR 0025).
+To watch them while load runs, start the server with `IGNIS_LOG_LEVEL=debug`:
+
+```text
+2026-09-13T10:00:00.000Z DEBUG ignis.scheduler.interval - scheduler counters changed {tick=123, waiting=2, running=3, kv_evictions=1}
 ```
 
-Two caveats: `prefilling` and `kv_used_pct` report 0 until the scheduler
-exposes its live stats in `ignis-core` (the `kv_evictions` counter is real
-today); and the per-request lifecycle (`admitted` / `ttft` / `done`) is no
-longer JSONL — since GitHub #79 it is emitted as `ignis.request.*`
-structured-log events (the JSON/pretty layers of `ignis-logging`), with the
-request id doubling as the OTel trace id (ADR 0012).
+`prefilling` and KV occupancy are not reported until the scheduler exposes
+them as real values in `ignis-core`.
 
 ---
 

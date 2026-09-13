@@ -1,30 +1,17 @@
-//! v1 telemetry (server-02, GitHub #15, design §5): a **JSONL** sink — one
-//! compact JSON object per line — carrying the scheduler's live counters:
+//! v1 telemetry (server-02, GitHub #15, design §5): the server's
+//! request-lifecycle and scheduler-counter observability, emitted as
+//! canonical `ignis-logging` events — it has no output format of its own:
 //!
-//! - the **interval** line — the live scheduler counters, one per scheduler
-//!   step / driver tick:
-//!   `{"kind":"interval","t":3,"waiting":2,"prefilling":1,"running":3,"kv_used_pct":62,"kv_evictions":0}`
+//! - the request lifecycle — `ignis.request.admitted`/`ttft`/`done`/
+//!   `evicted`/`restored` (GitHub #79, #125);
+//! - the scheduler counters — `ignis.scheduler.interval` at DEBUG, emitted
+//!   when `waiting` / `running` / `kv_evictions` change (ADR 0025). Until
+//!   ADR 0025 these were a `{"kind":"interval",...}` JSONL line written
+//!   straight to stdout on every step, past the operator's log format.
 //!
-//! The per-request lifecycle events (`admitted` / `ttft` / `done`) used to be
-//! a second JSONL record kind (`kind:"request"`) on this same sink; GitHub
-//! #79 migrated them onto the canonical structured-logging system
-//! (`ignis-logging`) as `ignis.request.admitted`/`ttft`/`done` tracing
-//! events instead — request lifecycle observability lives in the one
-//! canonical system now. This sink only carries the interval line (metrics,
-//! not logs, GitHub #77 — untouched by that migration).
-//!
-//! The sink is injectable (tests capture lines in memory; production targets
-//! stdout or a file) — since GitHub #108, through `ignis_logging::LineSink`
-//! and its `StdoutSink`/`FileSink`/`MemorySink`/`NullSink` impls, rather
-//! than a duplicate trait of this module's own (the two had carried
-//! identical `fn write_line(&str)` shapes since #78; only the sink
-//! plumbing is shared — the interval line's facts/counters/shape, and the
-//! logging crate's own event model, stay independent, per ADR 0011/0017).
-//! Since GitHub #69, all of this module's work (sink I/O, counter math)
-//! runs on an async task off the model thread — the thread that owns the
-//! `Scheduler` never calls into `Telemetry` at all, so a slow sink can
-//! never add latency to a decode step, no matter how long a write takes or
-//! how it is implemented.
+//! Since GitHub #69, all of this module's work (counter math, event
+//! emission) runs on an async task off the model thread — the thread that
+//! owns the `Scheduler` never calls into `Telemetry` at all.
 //!
 //! **Live counters (blocker for the coordinator).** The core [`Scheduler`]
 //! trait — the public API the server drives (`Box<dyn Scheduler>`) — does not
@@ -32,20 +19,19 @@
 //! `kv_used_pct` / `kv_evictions`). `ConcreteScheduler` only exposes raw
 //! pieces (`kv_used_pages`, `host_tier`, …), none of which are on the
 //! `Scheduler` trait, so a trait object cannot reach them. This module
-//! therefore fills the interval line from an injectable
+//! therefore reads the counters from an injectable
 //! [`IntervalStatsProvider`]; the default is an **event-derived** estimator
 //! (it counts `running` / `waiting` / `kv_evictions` from the routed
 //! [`SchedEvent`]s) and reports `prefilling` / `kv_used_pct` as 0 until core
-//! exposes a `Scheduler::stats(&self)` accessor. That accessor is the missing
-//! seam this module is built to close.
+//! exposes a `Scheduler::stats(&self)` accessor — which is why those two
+//! never reach the interval event. That accessor is the missing seam this
+//! module is built to close.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId};
-use ignis_logging::LineSink;
 use serde::Serialize;
-use serde_json;
 
 use crate::api::finish_reason_str;
 
@@ -117,28 +103,6 @@ pub trait IntervalStatsProvider: Send + Sync {
     fn counters(&self) -> IntervalCounters;
 }
 
-// ── the records (one compact JSON object per line) ──────────────────────────
-
-/// The interval line (design §5): the live counters, one per scheduler step.
-#[derive(Debug, Serialize)]
-struct IntervalLine {
-    /// The record kind (the JSONL discriminator; always `"interval"`).
-    kind: &'static str,
-    /// The tick number (a per-step counter; the §5 `t` field).
-    t: u64,
-    /// Queued requests (submitted, not yet dealt a lane).
-    waiting: u32,
-    /// Mid-prefill requests — 0 until core exposes it.
-    prefilling: u32,
-    /// Requests on a decode lane.
-    running: u32,
-    /// Main-pool KV occupancy, percent — 0 until core exposes it.
-    kv_used_pct: u32,
-    /// Cumulative evictions to the host tier.
-    kv_evictions: u64,
-}
-
-
 // ── the telemetry state ─────────────────────────────────────────────────────
 
 /// Per-request telemetry state (just enough for the request lines + the
@@ -178,14 +142,17 @@ struct RequestTelemetry {
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
-/// request JSONL lines through the injected sink.
+/// request events.
 pub struct Telemetry {
-    sink: Arc<dyn LineSink>,
     clock: Arc<dyn TelemetryClock>,
     /// A live counter source (the §5 blocker seam); `None` → event-derived.
     stats: Option<Arc<dyn IntervalStatsProvider>>,
-    /// The tick number (per-step counter; the §5 `t` field).
+    /// The tick number (per-step counter; the interval event's `tick`).
     tick: u64,
+    /// The `(waiting, running, kv_evictions)` the last interval event
+    /// carried; `None` before the first tick (ADR 0025: unchanged counters
+    /// are not logged again).
+    last_logged: Option<(u32, u32, u64)>,
     /// Cumulative evictions to the host KV-RAM tier.
     kv_evictions: u64,
     /// In-flight request telemetry (id → state); removed on completion.
@@ -193,14 +160,14 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    /// Telemetry over `sink` (lines go here) and `clock` (`ms` / `tok_s`).
-    /// No live counter source is set, so the interval line is event-derived.
-    pub fn new(sink: Arc<dyn LineSink>, clock: Arc<dyn TelemetryClock>) -> Self {
+    /// Telemetry over `clock` (`ms` / `tok_s`). No live counter source is
+    /// set, so the interval counters are event-derived.
+    pub fn new(clock: Arc<dyn TelemetryClock>) -> Self {
         Self {
-            sink,
             clock,
             stats: None,
             tick: 0,
+            last_logged: None,
             kv_evictions: 0,
             requests: HashMap::new(),
         }
@@ -209,11 +176,6 @@ impl Telemetry {
     /// Use `stats` as the live counter source (overrides the estimator).
     pub fn with_stats(&mut self, stats: std::sync::Arc<dyn IntervalStatsProvider>) {
         self.stats = Some(stats);
-    }
-
-    /// Point the sink at `sink` (the clock and any stats source are kept).
-    pub fn set_sink(&mut self, sink: Arc<dyn LineSink>) {
-        self.sink = sink;
     }
 
     /// A request was submitted: anchor its `ms` timeline and record its
@@ -395,23 +357,30 @@ impl Telemetry {
         }
     }
 
-    /// Emit the interval line (called once per scheduler step / driver
-    /// tick), returning the counters it computed (GitHub #69: the async
-    /// telemetry consumer republishes this into the wait-free `ArcSwap`
-    /// snapshot without recomputing it).
+    /// Called once per scheduler step / driver tick: returns the counters it
+    /// computed (GitHub #69: the async telemetry consumer republishes them
+    /// into the wait-free `ArcSwap` snapshot every tick, without
+    /// recomputing), and emits the `ignis.scheduler.interval` DEBUG event
+    /// only when the authoritative counters differ from the last one logged
+    /// (ADR 0025). A decode run holds them constant for thousands of steps;
+    /// one event per step would crowd every other DEBUG event out of the
+    /// logging queue's drop-oldest buffer. `prefilling` / `kv_used_pct` are
+    /// placeholder zeros (see the module doc), so they are not attributes.
     pub fn emit_interval(&mut self) -> IntervalCounters {
         self.tick = self.tick.saturating_add(1);
         let counters = self.counters();
-        let line = IntervalLine {
-            kind: "interval",
-            t: self.tick,
-            waiting: counters.waiting,
-            prefilling: counters.prefilling,
-            running: counters.running,
-            kv_used_pct: counters.kv_used_pct,
-            kv_evictions: counters.kv_evictions,
-        };
-        self.sink.write_line(&to_line(&line));
+        let logged = (counters.waiting, counters.running, counters.kv_evictions);
+        if self.last_logged != Some(logged) {
+            self.last_logged = Some(logged);
+            tracing::debug!(
+                name: "ignis.scheduler.interval",
+                tick = self.tick,
+                waiting = counters.waiting,
+                running = counters.running,
+                kv_evictions = counters.kv_evictions,
+                "scheduler counters changed"
+            );
+        }
         counters
     }
 
@@ -547,17 +516,10 @@ fn throughput(n: u32, ms: u64) -> f64 {
     }
 }
 
-/// Serialize a record to one compact JSON object (a single JSONL line).
-fn to_line(record: &impl Serialize) -> String {
-    serde_json::to_string(record).expect("a telemetry record always serializes")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    use ignis_logging::{FileSink, MemorySink};
 
     /// A provider that reports a fixed, known set of counters.
     struct FixedStats(IntervalCounters);
@@ -567,34 +529,71 @@ mod tests {
         }
     }
 
-    fn telemetry() -> (Telemetry, Arc<MemorySink>) {
-        let sink = Arc::new(MemorySink::new());
-        let telemetry = Telemetry::new(sink.clone(), Arc::new(FixedClock::new(0)));
-        (telemetry, sink)
+    fn telemetry() -> Telemetry {
+        Telemetry::new(Arc::new(FixedClock::new(0)))
+    }
+
+    /// The `ignis.scheduler.interval` events (ADR 0025) among `events`.
+    fn intervals(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e["event_name"] == "ignis.scheduler.interval")
+            .collect()
     }
 
     #[test]
-    fn an_interval_line_has_the_section5_shape() {
-        let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1, 3, RequestClass::Interactive);
-        telemetry.on_admitted(1, 0); // now an `ignis.request.admitted` tracing event, not a sink line
-        telemetry.emit_interval(); // emits the interval line
-        let lines = sink.lines();
-        assert_eq!(lines.len(), 1, "only the interval line goes through `LineSink` now");
-        let last: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(last["kind"], "interval");
-        assert_eq!(last["t"], 1, "the first interval is tick 1");
-        assert_eq!(last["running"], 1, "the admitted request is on a lane");
-        assert_eq!(last["waiting"], 0, "no queued request");
-        assert_eq!(last["prefilling"], 0);
-        assert_eq!(last["kv_used_pct"], 0);
-        assert_eq!(last["kv_evictions"], 0);
+    fn an_interval_event_carries_the_authoritative_counters_at_debug() {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_admitted(1, 0);
+            telemetry.emit_interval();
+        });
+        let intervals = intervals(&events);
+        assert_eq!(intervals.len(), 1, "one tick, one interval event: {events:?}");
+        let interval = intervals[0];
+        assert_eq!(interval["severity_text"], "DEBUG");
+        let attributes = &interval["attributes"];
+        assert_eq!(attributes["tick"], 1, "the first interval is tick 1");
+        assert_eq!(attributes["running"], 1, "the admitted request is on a lane");
+        assert_eq!(attributes["waiting"], 0, "no queued request");
+        assert_eq!(attributes["kv_evictions"], 0);
+        // Placeholder zeros are not facts (ADR 0025, after ADR 0017).
+        assert!(attributes.get("prefilling").is_none(), "{interval}");
+        assert!(attributes.get("kv_used_pct").is_none(), "{interval}");
     }
 
-    /// Captures the `ignis.request.*` events a block of code emits through
-    /// `tracing`, via `ignis-logging`'s own `JsonLayer`/`MemorySink` (GitHub
-    /// #79's canonical replacement for the old `RequestLine` JSONL shape).
-    fn capture_request_events(f: impl FnOnce()) -> Vec<serde_json::Value> {
+    #[test]
+    fn unchanged_counters_are_not_logged_again_but_are_still_returned() {
+        let mut telemetry = telemetry();
+        let mut returned = Vec::new();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_admitted(1, 0);
+            // Three steps of a steady decode: one change, then nothing new.
+            for _ in 0..3 {
+                returned.push(telemetry.emit_interval());
+            }
+            telemetry.on_done(1, 3, FinishReason::Stop);
+            returned.push(telemetry.emit_interval());
+        });
+        let intervals = intervals(&events);
+        let ticks: Vec<u64> = intervals
+            .iter()
+            .map(|e| e["attributes"]["tick"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ticks, vec![1, 4], "only ticks whose counters changed are logged");
+        assert_eq!(intervals[1]["attributes"]["running"], 0, "the request finished");
+        // The snapshot the consumer republishes every tick is unaffected.
+        let running: Vec<u32> = returned.iter().map(|c| c.running).collect();
+        assert_eq!(running, vec![1, 1, 1, 0]);
+    }
+
+    /// Captures every event a block of code emits through `tracing` — the
+    /// `ignis.request.*` lifecycle (GitHub #79) and `ignis.scheduler.interval`
+    /// (ADR 0025) — via `ignis-logging`'s own `JsonLayer`/`MemorySink`, with
+    /// no level filter.
+    fn capture_events(f: impl FnOnce()) -> Vec<serde_json::Value> {
         use tracing_subscriber::layer::SubscriberExt;
 
         let log_sink = std::sync::Arc::new(ignis_logging::MemorySink::new());
@@ -610,8 +609,8 @@ mod tests {
 
     #[test]
     fn request_events_carry_the_lifecycle_names_and_attributes() {
-        let (mut telemetry, _sink) = telemetry();
-        let events = capture_request_events(|| {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
             telemetry.note_submit(7, 10, RequestClass::Interactive);
             telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
@@ -637,8 +636,8 @@ mod tests {
 
     #[test]
     fn a_fixed_clock_keeps_request_events_deterministic() {
-        let (mut telemetry, _sink) = telemetry();
-        let events = capture_request_events(|| {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
             telemetry.on_done(1, 3, FinishReason::Stop);
@@ -651,7 +650,6 @@ mod tests {
 
     #[test]
     fn a_step_clock_reports_the_elapsed_span_on_request_events() {
-        let sink = Arc::new(MemorySink::new());
         // A clock that advances 100 ms per read: submit at 100, done at 200.
         // An `AtomicU32` (not a `Cell`) so the clock stays `Sync` for the
         // `TelemetryClock` bound.
@@ -665,10 +663,10 @@ mod tests {
             }
         }
         let mut telemetry =
-            Telemetry::new(sink.clone(), Arc::new(StepClock {
+            Telemetry::new(Arc::new(StepClock {
                 reads: std::sync::atomic::AtomicU32::new(0),
             }));
-        let events = capture_request_events(|| {
+        let events = capture_events(|| {
             telemetry.note_submit(1, 5, RequestClass::Interactive); // read #1 → 100 ms
             telemetry.on_done(1, 5, FinishReason::Length); // read #2 → 200 ms, so ms = 100
         });
@@ -680,26 +678,30 @@ mod tests {
 
     #[test]
     fn event_derived_counters_split_waiting_and_running() {
-        let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1, 3, RequestClass::Interactive); // queued (not yet admitted)
-        telemetry.note_submit(2, 3, RequestClass::Interactive); // queued
-        telemetry.on_admitted(2, 0); // dealt a lane
-        telemetry.emit_interval();
-        let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
-        assert_eq!(v["waiting"], 1, "request 1 is still queued");
-        assert_eq!(v["running"], 1, "request 2 is on a lane");
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive); // queued (not yet admitted)
+            telemetry.note_submit(2, 3, RequestClass::Interactive); // queued
+            telemetry.on_admitted(2, 0); // dealt a lane
+            telemetry.emit_interval();
+        });
+        let v = intervals(&events).last().copied().expect("an interval event");
+        assert_eq!(v["attributes"]["waiting"], 1, "request 1 is still queued");
+        assert_eq!(v["attributes"]["running"], 1, "request 2 is on a lane");
     }
 
     #[test]
     fn evictions_bump_the_counter() {
-        let (mut telemetry, sink) = telemetry();
-        telemetry.note_submit(1, 3, RequestClass::Interactive);
-        telemetry.on_admitted(1, 0);
-        telemetry.on_evicted(1, 450);
-        telemetry.on_evicted(1, 450);
-        telemetry.emit_interval();
-        let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
-        assert_eq!(v["kv_evictions"], 2, "each eviction bumps the counter");
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_evicted(1, 450);
+            telemetry.on_evicted(1, 450);
+            telemetry.emit_interval();
+        });
+        let v = intervals(&events).last().copied().expect("an interval event");
+        assert_eq!(v["attributes"]["kv_evictions"], 2, "each eviction bumps the counter");
     }
 
     /// P4-07 (GitHub #125): the host tier's snapshot/restore wall time is
@@ -707,8 +709,8 @@ mod tests {
     /// without a second run.
     #[test]
     fn evicted_and_restored_report_the_tier_s_wall_time() {
-        let (mut telemetry, _sink) = telemetry();
-        let events = capture_request_events(|| {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Agent);
             telemetry.on_admitted(1, 0);
             telemetry.on_evicted(1, 45_000);
@@ -732,8 +734,8 @@ mod tests {
 
     #[test]
     fn admitted_reports_the_prefill_phase_summary() {
-        let (mut telemetry, _sink) = telemetry();
-        let events = capture_request_events(|| {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive); // a 300-token prompt
             telemetry.on_prefill_chunk(1, 128); // chunk 1: 128/300
             telemetry.on_prefill_chunk(1, 256); // chunk 2: 256/300
@@ -754,8 +756,8 @@ mod tests {
         // comment). Without a reset, the eventual `admitted` line would sum
         // the discarded first attempt's chunks onto the second attempt's —
         // exactly the misattribution P3-06's request log exists to prevent.
-        let (mut telemetry, _sink) = telemetry();
-        let events = capture_request_events(|| {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive);
             telemetry.on_prefill_chunk(1, 128); // 1st attempt: 1 chunk, then evicted/discarded
             telemetry.on_requeued(1); // re-queued: the summary resets
@@ -776,7 +778,6 @@ mod tests {
 
     #[test]
     fn done_reports_the_per_lane_inter_token_latency_summary() {
-        let sink = Arc::new(MemorySink::new());
         // A clock that advances 10 ms per read, so every generated token is
         // exactly 10 ms apart — a deterministic, known ITL distribution.
         struct StepClock(std::sync::atomic::AtomicU32);
@@ -785,11 +786,9 @@ mod tests {
                 (self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u64 + 1) * 10
             }
         }
-        let mut telemetry = Telemetry::new(
-            sink,
-            Arc::new(StepClock(std::sync::atomic::AtomicU32::new(0))),
-        );
-        let events = capture_request_events(|| {
+        let mut telemetry =
+            Telemetry::new(Arc::new(StepClock(std::sync::atomic::AtomicU32::new(0))));
+        let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
             telemetry.on_token(1); // ttft — no ITL sample yet
@@ -812,7 +811,6 @@ mod tests {
     /// position in the one recorded stream (no re-run needed).
     #[test]
     fn a_failing_itl_cell_is_attributable_from_one_recorded_stream() {
-        let sink = Arc::new(MemorySink::new());
         struct ScriptClock(std::sync::atomic::AtomicUsize, Vec<u64>);
         impl TelemetryClock for ScriptClock {
             fn now_ms(&self) -> u64 {
@@ -829,8 +827,8 @@ mod tests {
             std::sync::atomic::AtomicUsize::new(0),
             vec![0, 5, 10, 20, 25, 220, 230, 220],
         );
-        let mut telemetry = Telemetry::new(sink, Arc::new(clock));
-        let events = capture_request_events(|| {
+        let mut telemetry = Telemetry::new(Arc::new(clock));
+        let events = capture_events(|| {
             telemetry.note_submit(1, 4, RequestClass::Interactive); // t=0
             telemetry.on_admitted(1, 0); // t=5, lane 0
             telemetry.on_token(1); // t=10, ttft
@@ -871,11 +869,7 @@ mod tests {
 
     #[test]
     fn a_live_provider_overrides_the_estimator() {
-        let sink = Arc::new(MemorySink::new());
-        let mut telemetry = Telemetry::new(
-            sink.clone(),
-            Arc::new(FixedClock::new(0)),
-        );
+        let mut telemetry = telemetry();
         telemetry.with_stats(Arc::new(FixedStats(IntervalCounters {
             waiting: 3,
             prefilling: 2,
@@ -883,42 +877,16 @@ mod tests {
             kv_used_pct: 62,
             kv_evictions: 9,
         })));
-        telemetry.emit_interval();
-        let v: serde_json::Value = serde_json::from_str(sink.lines().last().unwrap()).unwrap();
+        let mut returned = IntervalCounters::default();
+        let events = capture_events(|| returned = telemetry.emit_interval());
+        let v = intervals(&events).last().copied().expect("an interval event");
         // The provider's counters win over the (empty) event-derived set.
-        assert_eq!(v["waiting"], 3);
-        assert_eq!(v["prefilling"], 2);
-        assert_eq!(v["running"], 5);
-        assert_eq!(v["kv_used_pct"], 62);
-        assert_eq!(v["kv_evictions"], 9);
-    }
-
-    #[test]
-    fn the_memory_sink_records_lines_in_order() {
-        let sink = Arc::new(MemorySink::new());
-        sink.write_line("a");
-        sink.write_line("b");
-        assert_eq!(sink.lines(), vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn a_file_sink_appends_jsonl_lines() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("ignis-telemetry-test-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        {
-            let sink = Arc::new(FileSink::open(&path).unwrap());
-            let mut telemetry = Telemetry::new(sink.clone(), Arc::new(FixedClock::new(0)));
-            telemetry.note_submit(1, 3, RequestClass::Interactive);
-            telemetry.on_admitted(1, 0);
-            telemetry.emit_interval();
-        }
-        let content = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        // `on_admitted` now emits through `tracing`, not `LineSink` — only
-        // the interval line lands in the file (GitHub #79).
-        assert_eq!(lines.len(), 1, "the interval line");
-        assert!(lines.iter().all(|l| l.starts_with('{') && l.ends_with('}')));
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(v["attributes"]["waiting"], 3);
+        assert_eq!(v["attributes"]["running"], 5);
+        assert_eq!(v["attributes"]["kv_evictions"], 9);
+        // The snapshot carries the provider's whole set, placeholders
+        // included; only the log event leaves them out.
+        assert_eq!(returned.prefilling, 2);
+        assert_eq!(returned.kv_used_pct, 62);
     }
 }

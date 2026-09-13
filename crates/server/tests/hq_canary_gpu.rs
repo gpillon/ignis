@@ -38,7 +38,6 @@ use ignis_artifact::{FrontendSet, Reader};
 use ignis_bench::canary::{CANARIES, evaluate};
 use ignis_core::KvFormat;
 use ignis_core::gpu_profile;
-use ignis_logging::NullSink;
 use ignis_server::Server;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{EngineShape, cuda_scheduler};
@@ -102,11 +101,7 @@ fn harness() -> Option<Harness> {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let (engine, driver) = Engine::with_sinks_and_driver(
-        Box::new(scheduler),
-        Arc::new(NullSink),
-        Arc::new(SystemClock),
-    );
+    let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
     let server = Server::with_artifact_template(engine, frontend)
         .with_request_timeout(Duration::from_secs(120));
     Some(Harness {

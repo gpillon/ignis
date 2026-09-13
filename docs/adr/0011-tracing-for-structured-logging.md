@@ -3,7 +3,9 @@
 ## Status
 
 Accepted (2026-09-07, grilling session on `.scratch/Ignis Structured Logging
-Specification.md`).
+Specification.md`). The interval-counter boundary below is superseded by ADR
+0025: the counters are now the DEBUG event `ignis.scheduler.interval`, and
+the `IGNIS_TELEMETRY`/`--telemetry` sink is gone.
 
 ## Context
 

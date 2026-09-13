@@ -33,8 +33,6 @@
 //!   path (server-03): its sidecar must be present and its checksum report
 //!   clean, or the server refuses to start (no silent fallback to the
 //!   placeholder).
-//! - `IGNIS_TELEMETRY` / `--telemetry`, `-t` — the telemetry JSONL sink path
-//!   (server-02, design §5): one compact line per event; unset = stdout.
 //! - `IGNIS_ENABLE_THINKING` / `--enable-thinking` — the server-wide default
 //!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
 //!   An unparseable value, or a `false` the loaded template cannot honour,
@@ -62,7 +60,6 @@ use ignis_core::{
     mock::MockCompute,
     Compute, ConcreteScheduler, Scheduler, SchedulerConfig,
 };
-use ignis_logging::{FileSink, LineSink, StdoutSink};
 use ignis_server::{
     config::{self, Config, ConfigOutcome},
     engine::Engine,
@@ -199,7 +196,6 @@ async fn main() {
         model,
         bind,
         artifact,
-        telemetry,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         prefill_chunk: _,
@@ -210,32 +206,6 @@ async fn main() {
         speculation: _,
         request_timeout_secs,
     } = config;
-
-    // The telemetry sink (server-02, design §5): a JSONL file named by
-    // `--telemetry`/`IGNIS_TELEMETRY`, or stdout by default. One compact
-    // line per event.
-    let telemetry_sink: Arc<dyn LineSink> = match &telemetry {
-        None => Arc::new(StdoutSink),
-        Some(path) => match FileSink::open(path) {
-            Ok(file) => {
-                tracing::info!(
-                    name: "ignis.telemetry.sink_selected",
-                    path = %path.display(),
-                    "telemetry sink selected"
-                );
-                Arc::new(file)
-            }
-            Err(err) => {
-                tracing::warn!(
-                    name: "ignis.telemetry.sink_failed",
-                    path = %path.display(),
-                    error = %err,
-                    "falling back to stdout"
-                );
-                Arc::new(StdoutSink)
-            }
-        },
-    };
 
     let server = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
@@ -288,14 +258,14 @@ async fn main() {
             mock_scheduler(&model)
         };
 
-        let engine = Engine::with_sinks(scheduler, telemetry_sink, Arc::new(SystemClock));
+        let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
         Server::with_artifact_template(engine, frontend)
     } else {
         tracing::warn!(
             name: "ignis.model.placeholder_template",
             "no artifact (set --artifact/IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute"
         );
-        let engine = Engine::with_sinks(mock_scheduler(&model), telemetry_sink, Arc::new(SystemClock));
+        let engine = Engine::with_clock(mock_scheduler(&model), Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     }
     .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64));

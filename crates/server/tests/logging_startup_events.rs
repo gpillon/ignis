@@ -5,7 +5,7 @@
 //! severity-based stream split — that split is for one-shot commands like
 //! `vendor-ninfer`), so these events land on stdout, not stderr.
 //!
-//! Coverage: 7 of the 14 migrated `main.rs` sites are exercised here —
+//! Coverage: 5 of the 12 migrated `main.rs` sites are exercised here —
 //! every one reachable without a real `.ninfer` artifact fixture or a
 //! `--features cuda` build. The other 7 are not testable from this
 //! CPU-only file:
@@ -192,39 +192,16 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
 }
 
 #[test]
-fn a_valid_telemetry_path_emits_a_sink_selected_event() {
-    let path = std::env::temp_dir().join(format!(
-        "ignis-logging-test-telemetry-{}.jsonl",
-        std::process::id()
-    ));
-    let records = run_until(
-        &["--telemetry", path.to_str().unwrap()],
-        &[],
-        &["ignis.telemetry.sink_selected"],
-    );
-    let record = find(&records, "ignis.telemetry.sink_selected");
-    assert_eq!(record["severity_text"], "INFO");
-    assert_eq!(record["attributes"]["path"], path.display().to_string());
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn an_unopenable_telemetry_path_emits_a_sink_failed_event_and_falls_back() {
-    // A parent directory that does not exist: `FileSink::open` cannot
-    // create the intermediate directory, so the open fails.
-    let path = std::env::temp_dir()
-        .join("ignis-logging-test-no-such-dir")
-        .join("telemetry.jsonl");
-    let records = run_until(
-        &["--telemetry", path.to_str().unwrap()],
-        &[],
-        &["ignis.telemetry.sink_failed"],
-    );
-    let record = find(&records, "ignis.telemetry.sink_failed");
-    assert_eq!(record["severity_text"], "WARN");
-    assert_eq!(record["attributes"]["path"], path.display().to_string());
+fn the_retired_telemetry_flag_refuses_to_start() {
+    // ADR 0025 removed the separate telemetry sink: a launch script still
+    // passing `--telemetry` must fail by name, not start with its interval
+    // counters silently gone somewhere else.
+    let path = std::env::temp_dir().join("ignis-logging-test-telemetry.jsonl");
+    let record = run(&["--telemetry", path.to_str().unwrap()]);
+    assert_eq!(record["event_name"], "ignis.config.invalid");
+    assert_eq!(record["severity_text"], "ERROR");
     assert!(
-        record["attributes"]["error"].as_str().is_some(),
-        "the open error should appear as a typed attribute: {record}"
+        record["attributes"]["error"].as_str().unwrap().contains("--telemetry"),
+        "the retired flag should be named: {record}"
     );
 }

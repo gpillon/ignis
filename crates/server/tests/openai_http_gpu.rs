@@ -19,7 +19,6 @@ use tower::ServiceExt;
 
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::gpu_profile;
-use ignis_logging::NullSink;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{cuda_scheduler, EngineShape};
 use ignis_server::telemetry::SystemClock;
@@ -92,8 +91,7 @@ fn harness() -> Option<Harness> {
             unreachable!();
         }
     };
-    let (engine, driver) =
-        Engine::with_sinks_and_driver(Box::new(scheduler), Arc::new(NullSink), Arc::new(SystemClock));
+    let (engine, driver) = Engine::with_clock_and_driver(Box::new(scheduler), Arc::new(SystemClock));
     let server = Server::with_artifact_template(engine, frontend)
         .with_request_timeout(Duration::from_secs(120));
     Some(Harness { app: Some(server.app()), driver: Some(driver) })

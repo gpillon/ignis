@@ -1,15 +1,5 @@
 //! The line sink each layer writes rendered records through — injectable so
 //! tests capture output in memory instead of going through real stdout.
-//!
-//! `ignis_server::telemetry`'s `kind:"interval"` JSONL stream (GitHub #77)
-//! is a separate concern from this crate's event model (ADR 0011/0017: the
-//! scheduler interval counters stay metrics-shaped, not a `tracing::Event`,
-//! and the future Prometheus projection reads the telemetry consumer
-//! directly, never rendered log lines) — but GitHub #108 moved its sink
-//! *implementation* onto [`LineSink`]/[`FileSink`]/[`NullSink`] here, since
-//! the two had been carrying identical `fn write_line(&str)` shapes since
-//! #78. Only the line-writing plumbing is shared; the two event streams
-//! never merge.
 
 use std::sync::Mutex;
 
@@ -77,9 +67,7 @@ impl LineSink for MemorySink {
     }
 }
 
-/// A no-op sink: every line is discarded. The default for a consumer that
-/// tracks state but has nowhere configured to write (e.g. telemetry with no
-/// `--telemetry` sink selected and metrics disabled).
+/// A no-op sink: every line is discarded.
 pub struct NullSink;
 
 impl LineSink for NullSink {
