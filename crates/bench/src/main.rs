@@ -127,7 +127,15 @@ fn print_usage() {
   ignis-bench g4 --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl> [--label ignis]
                  [--profile <text>] [--session <id>] [--conc N] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g4-gate --ours <launch.json> [--ours <launch2.json> ...] --ref <launch.json> [--ref <launch2.json> ...]
-                      [--note <text>] [--out <verdict.json>]"
+                      [--note <text>] [--out <verdict.json>]
+
+environment:
+  {timeout_env}=<seconds>   the per-request deadline every subcommand drives an engine with
+                            (default {timeout_default} s; 0 removes it). A measurement request
+                            that outlives it is reported as the client's own timeout, not as an
+                            engine failure.",
+        timeout_env = ignis_bench::client::REQUEST_TIMEOUT_ENV,
+        timeout_default = ignis_bench::client::DEFAULT_REQUEST_TIMEOUT.as_secs(),
     );
 }
 
@@ -149,6 +157,27 @@ fn opt(args: &[String], key: &str) -> Option<String> {
 
 fn require(args: &[String], key: &str) -> Result<String, String> {
     opt(args, key).ok_or_else(|| format!("--{key} is required"))
+}
+
+/// Build the endpoint for a subcommand and **say what deadline it drives
+/// with** (GitHub #138).
+///
+/// The deadline that made the G4 needle cell unmeasurable was invisible:
+/// nothing configured it, nothing printed it, and nothing in the run record
+/// named it, so four launches across two engines read its symptom as an
+/// engine fault. A run that prints the number it is using cannot cost
+/// anyone that again.
+fn endpoint_for(base_url: &str) -> HttpEndpoint {
+    let ep = HttpEndpoint::new(base_url);
+    match ep.request_timeout() {
+        Some(deadline) => eprintln!(
+            "request deadline: {} s per request ({}=0 removes it)",
+            deadline.as_secs(),
+            ignis_bench::client::REQUEST_TIMEOUT_ENV
+        ),
+        None => eprintln!("request deadline: none (waiting as long as the engine takes)"),
+    }
+    ep
 }
 
 fn cmd_replay(args: &[String]) -> ExitCode {
@@ -174,7 +203,7 @@ fn cmd_replay(args: &[String]) -> ExitCode {
         }
     };
 
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     // Pre-flight: the engine must be reachable and have a model loaded — a
     // clean error beats N failed requests in the run file.
     match ep.list_models() {
@@ -216,7 +245,7 @@ fn cmd_canary(args: &[String]) -> ExitCode {
         }
     };
     let out = opt(args, "out");
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     // Pre-flight: the engine must be reachable and have a model loaded — a
     // clean error beats a full canary run that fails on every request.
     match ep.list_models() {
@@ -439,7 +468,7 @@ fn cmd_record(args: &[String]) -> ExitCode {
     };
     // Pre-flight: the target engine must be reachable and have a model
     // loaded — a clean error beats a proxy that 502s on every request.
-    let probe = HttpEndpoint::new(&target);
+    let probe = endpoint_for(&target);
     match probe.list_models() {
         Ok(models) => eprintln!("target {target}: {}", models.join(", ")),
         Err(e) => {
@@ -577,7 +606,7 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     let engine = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -729,7 +758,7 @@ fn cmd_g3(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     let engine = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -912,7 +941,7 @@ fn cmd_g4(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     let engine = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -1081,7 +1110,7 @@ fn cmd_oracle_record(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ep = HttpEndpoint::new(&endpoint);
+    let ep = endpoint_for(&endpoint);
     let model = match ep.list_models() {
         Ok(models) if !models.is_empty() => {
             eprintln!("engine {endpoint}: {}", models.join(", "));
@@ -1170,7 +1199,7 @@ fn cmd_oracle_compare(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let ep = HttpEndpoint::new(&endpoint);
+        let ep = endpoint_for(&endpoint);
         if let Err(e) = ep.list_models() {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;

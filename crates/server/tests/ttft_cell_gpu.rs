@@ -22,19 +22,14 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::Path;
-use std::sync::Arc;
+mod support;
+
 use std::time::Duration;
 
-use ignis_artifact::{FrontendSet, Reader};
 use ignis_bench::client::HttpEndpoint;
 use ignis_bench::ttft::{self, CellSpec, TtftConfig};
-use ignis_core::gpu_profile;
-use ignis_logging::NullSink;
-use ignis_server::engine::Engine;
-use ignis_server::runtime::{cuda_scheduler, EngineShape};
-use ignis_server::telemetry::SystemClock;
-use ignis_server::Server;
+use ignis_server::runtime::EngineShape;
+use support::live_server::LiveServer;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MODEL: &str = "qwen3.8-27b";
@@ -48,94 +43,15 @@ const CELL_TOKENS: u32 = 1_024;
 /// here — coldness is — so two samples plus the warmup is enough.
 const CELL_SAMPLES: usize = 2;
 
-/// A live server: the production router over the real GPU-backed
-/// scheduler, served on a random localhost port.
-///
-/// The teardown order matters for the same reason it does in
-/// `openai_http_gpu.rs` (GitHub #71): the model thread owns the
-/// scheduler's GPU-resident state and only frees it when it exits, so the
-/// serve runtime is dropped first (disconnecting every `Engine` clone) and
-/// the driver thread is joined afterwards.
-struct LiveServer {
-    url: String,
-    frontend: FrontendSet,
-    runtime: Option<tokio::runtime::Runtime>,
-    driver: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for LiveServer {
-    fn drop(&mut self) {
-        drop(self.runtime.take());
-        if let Some(driver) = self.driver.take() {
-            let _ = driver.join();
-        }
-    }
-}
+/// The server's own request deadline for this run: generous, so the cell
+/// measures the engine rather than a timeout.
+const SERVER_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Start the live server, or `None` when the GPU profile says to skip.
+/// The harness itself (and its GPU-safe teardown) lives in
+/// `support::live_server`, shared with the other GPU-profile tests.
 fn live_server() -> Option<LiveServer> {
-    let path = Path::new(ARTIFACT);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
-        return None;
-    }
-    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
-    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    let eos = frontend
-        .eos_token_id()
-        .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
-    // A second frontend set: one is consumed by the server's template
-    // provider, the other is the instrument's own tokenizer + chat
-    // template. Both come from the same artifact, which is the point —
-    // the cell's claimed length is measured against the engine's own.
-    let instrument_frontend =
-        FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-
-    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, EngineShape::default()) {
-        Ok(scheduler) => scheduler,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
-                return None;
-            }
-            unreachable!();
-        }
-    };
-    // `Engine::with_sinks_and_driver` spawns its telemetry task with
-    // `tokio::spawn`, which needs a live reactor -- build the runtime
-    // first and enter it before touching the engine (`openai_http_gpu.rs`
-    // gets this for free from `#[tokio::test]`; this file's `#[test]`
-    // harness has to enter its own runtime explicitly).
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("serve runtime");
-    let _guard = runtime.enter();
-
-    let (engine, driver) = Engine::with_sinks_and_driver(
-        Box::new(scheduler),
-        Arc::new(NullSink),
-        Arc::new(SystemClock),
-    );
-    let app = Server::with_artifact_template(engine, frontend)
-        .with_request_timeout(Duration::from_secs(600))
-        .app();
-
-    let url = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a local port");
-        let port = listener.local_addr().expect("local addr").port();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        format!("http://127.0.0.1:{port}")
-    });
-    Some(LiveServer {
-        url,
-        frontend: instrument_frontend,
-        runtime: Some(runtime),
-        driver: Some(driver),
-    })
+    LiveServer::start(ARTIFACT, MODEL, EngineShape::default(), SERVER_TIMEOUT)
 }
 
 #[test]
