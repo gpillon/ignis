@@ -31,8 +31,9 @@ nothing else on the card, GPU at 2,355 MiB idle baseline before the first:
 | 2 | `-SkipKernelBuild` | 0 | 623.6 s | 39 passed, 0 failed |
 | 3 | `-SkipKernelBuild` | 0 | 582.8 s | 39 passed, 0 failed |
 
-Zero failures, zero panics, zero skips across all three. Logs:
-`.scratch/issue-145/gpu-profile-a{1,2,3}.log`.
+Zero failures, zero panics, zero skips across all three. Per-run extract:
+`.scratch/issue-145/summary.txt` (the full logs sit beside it as
+`gpu-profile-a{1,2,3}.log`, uncommitted — `*.log` is gitignored).
 
 Both tests #145 saw die ran and passed in every attempt. In particular
 `prefill_chunk_and_traversal_sweeps` completes its whole width sweep including
