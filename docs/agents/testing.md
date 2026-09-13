@@ -245,6 +245,30 @@ runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
 
+## The harness's own request deadline (GitHub #138)
+
+Every `ignis-bench` subcommand drives its endpoint through one
+`HttpEndpoint`, which sets an **explicit** per-request deadline: 1800 s by
+default, and `IGNIS_BENCH_REQUEST_TIMEOUT=<seconds>` overrides it (`0`
+removes it entirely). Each run prints the deadline it is using on stderr
+before its first request.
+
+This is not a knob a normal run needs — it exists because the *implicit*
+one cost a gate session. `reqwest::blocking::Client::new()` carries an
+undeclared 30-second total timeout that covers reading the response body,
+so a streamed measurement request lives entirely inside it. The G4 needle
+cell at 131,072 tokens (~30 s of prefill on this hardware) died on it
+against **both** engines, every attempt, reporting `read SSE: error
+decoding response body` — which reads like an engine fault and was chased
+as one across four launches. The 65,536-token cell, at ~15 s, passed every
+time.
+
+Two consequences for anyone measuring here: the deadline is now the
+harness's own declared number rather than a library default, and a request
+that does hit it says so by name instead of surfacing as a decode error.
+Raise it (or set `0`) for a cell whose legitimate wall time could approach
+half an hour; never lower it to "make a run finish".
+
 ## Where tests live
 
 - Unit tests: `#[cfg(test)]` modules, in the file they test.

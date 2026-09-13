@@ -286,6 +286,92 @@ impl Endpoint for MockEndpoint {
     }
 }
 
+/// The per-request deadline the harness gives an engine by default.
+///
+/// This exists because `reqwest::blocking::Client::new()` does **not** mean
+/// "no deadline": the blocking builder defaults `timeout` to **30 seconds**,
+/// and that deadline covers reading the response body, not just connecting.
+/// A measurement request whose prefill outlives it dies mid-stream with
+/// `read SSE: error decoding response body` while the engine is still
+/// computing perfectly normally — which is how the G4 needle cell at 131,072
+/// tokens came back as a deterministic failure against *both* engines while
+/// the 65,536-token cell (a prefill that fits inside 30 s) passed every time
+/// (GitHub #138).
+///
+/// The value is deliberately far above any legitimate measurement request:
+/// the 128K needle cell answers in ~60 s on this hardware, and a G3 ITL
+/// lane streams thousands of tokens after its own prefill. It is a backstop
+/// against a wedged engine, not a pacing knob — [`REQUEST_TIMEOUT_ENV`]
+/// raises or removes it for a run that needs to.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The connect-phase deadline: a dead endpoint must fail on reaching the
+/// engine rather than sit out [`DEFAULT_REQUEST_TIMEOUT`]. It is the 30 s
+/// the transport already had for the whole request, kept for the one phase
+/// that never legitimately takes minutes — so no endpoint that used to be
+/// reachable becomes unreachable here; the deadline only stops applying to
+/// the part of the request that does the work.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overrides [`DEFAULT_REQUEST_TIMEOUT`] for a run, in **seconds**. `0`
+/// removes the deadline entirely (the harness then waits as long as the
+/// engine takes). An unparseable value falls back to the default rather
+/// than failing the run — with a line on stderr, since a silently ignored
+/// timeout is exactly the class of bug this constant exists for.
+pub const REQUEST_TIMEOUT_ENV: &str = "IGNIS_BENCH_REQUEST_TIMEOUT";
+
+/// Read [`REQUEST_TIMEOUT_ENV`]'s value into a client deadline: `None` is
+/// "no deadline", which both an absent variable and a `0` can *not* mean at
+/// once — an absent variable takes [`DEFAULT_REQUEST_TIMEOUT`], `0` removes
+/// the deadline.
+fn timeout_from_env(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(DEFAULT_REQUEST_TIMEOUT);
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => {
+            eprintln!(
+                "warning: {REQUEST_TIMEOUT_ENV}={raw} is not a whole number of seconds; \
+                 using the default ({} s)",
+                DEFAULT_REQUEST_TIMEOUT.as_secs()
+            );
+            Some(DEFAULT_REQUEST_TIMEOUT)
+        }
+    }
+}
+
+/// Whether this I/O error is the client giving up on its own deadline
+/// rather than the connection actually breaking.
+///
+/// It cannot be read off the error's kind: reqwest hands a body-read
+/// timeout up as `io::ErrorKind::Other` wrapping a `reqwest::Error`, which
+/// reads back as the same opaque `error decoding response body` a real
+/// transport fault gives. That indistinguishability is half of what made
+/// GitHub #138 cost four launches against two engines — so the wrapped
+/// error is unwrapped and asked directly.
+fn is_client_deadline(err: &std::io::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> =
+        err.get_ref().map(|e| e as &(dyn std::error::Error + 'static));
+    while let Some(e) = source {
+        if e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout) {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// What to say when the harness's own deadline, not the engine, ended a
+/// request: name the deadline and how to move it (GitHub #138).
+fn deadline_elapsed(url: &str, phase: &str) -> String {
+    format!(
+        "POST {url}: {phase}: the client's own request deadline elapsed while the engine was \
+         still responding — raise it with {REQUEST_TIMEOUT_ENV}=<seconds> (0 removes it)"
+    )
+}
+
 /// The real HTTP transport: drives the running engine (the `ignis-server`'s
 /// OpenAI-compatible API) and measures the per-request timing.
 ///
@@ -294,6 +380,10 @@ impl Endpoint for MockEndpoint {
 /// (a readiness probe). One `reqwest::blocking::Client` is shared across the
 /// driver's worker threads (`Client` is cheap to share), so
 /// `HttpEndpoint` is `Send + Sync` and fits the `Endpoint` seam as-is.
+///
+/// Every client this type builds sets its deadline **explicitly** (see
+/// [`DEFAULT_REQUEST_TIMEOUT`]): the transport of a measurement harness must
+/// never be the thing that decides how long a request is allowed to take.
 #[derive(Debug, Clone)]
 pub struct HttpEndpoint {
     /// The engine's base URL (e.g. `http://127.0.0.1:8080`).
@@ -301,14 +391,40 @@ pub struct HttpEndpoint {
     /// The shared HTTP client (cheap to share across the driver's worker
     /// threads).
     client: Client,
+    /// The deadline `client` was built with (`None`: no deadline) — kept so
+    /// a caller can report what the run is actually configured for.
+    request_timeout: Option<Duration>,
 }
 
 impl HttpEndpoint {
+    /// An endpoint with the default deadline, or [`REQUEST_TIMEOUT_ENV`]'s
+    /// when the environment sets one.
     pub fn new(base_url: impl Into<String>) -> Self {
+        let raw = std::env::var(REQUEST_TIMEOUT_ENV).ok();
+        Self::with_timeout(base_url, timeout_from_env(raw.as_deref()))
+    }
+
+    /// An endpoint with an explicit per-request deadline (`None`: none at
+    /// all). The timeout covers the whole request *including reading the
+    /// response body*, which for a streamed measurement request is its
+    /// entire life — prefill, decode and all.
+    pub fn with_timeout(base_url: impl Into<String>, request_timeout: Option<Duration>) -> Self {
+        let client = Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .expect("the bench HTTP client builds");
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client,
+            request_timeout,
         }
+    }
+
+    /// The per-request deadline this endpoint drives the engine with
+    /// (`None`: none at all).
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// `GET /v1/models` — a readiness probe: the loaded model id(s)
@@ -422,7 +538,13 @@ impl Endpoint for HttpEndpoint {
             .post(&url)
             .json(&body)
             .send()
-            .map_err(|e| format!("POST {url} failed: {e}"))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    deadline_elapsed(&url, "send")
+                } else {
+                    format!("POST {url} failed: {e}")
+                }
+            })?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().unwrap_or_default();
@@ -442,9 +564,13 @@ impl HttpEndpoint {
     /// metrics model reports tok_s = 0 for a non-streaming request).
     fn read_json(&self, resp: Response, start: Instant) -> Result<Outcome, String> {
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let value: serde_json::Value =
-            resp.json()
-                .map_err(|e| format!("POST {url}: parse: {e}"))?;
+        let value: serde_json::Value = resp.json().map_err(|e| {
+            if e.is_timeout() {
+                deadline_elapsed(&url, "parse")
+            } else {
+                format!("POST {url}: parse: {e}")
+            }
+        })?;
         let total_ms = ms_since(start);
         let usage = Usage::from_response(&value);
         let finish_reason = value
@@ -541,7 +667,13 @@ pub fn read_sse_stream<R: BufRead>(
     let mut engine_finish: Option<String> = None;
     let mut cancelled = false;
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("POST {url}: read SSE: {e}"))?;
+        let line = line.map_err(|e| {
+            if is_client_deadline(&e) {
+                deadline_elapsed(url, "read SSE")
+            } else {
+                format!("POST {url}: read SSE: {e}")
+            }
+        })?;
         // The SSE framing: `data: <payload>` lines (empty lines
         // separate the events — skipped).
         let Some(data) = line.trim().strip_prefix("data:") else {
@@ -828,6 +960,44 @@ mod tests {
         // Replay traffic never asks for it.
         let plain = Request { include_usage: false, ..base };
         assert!(request_body(&plain).get("stream_options").is_none());
+    }
+
+    #[test]
+    fn the_transport_never_takes_reqwests_own_deadline() {
+        // GitHub #138: `Client::new()`'s default is 30 s, covering the body
+        // read — the G4 needle cell at 131,072 tokens died on it while the
+        // engine was still prefilling. Whatever this default is, it must be
+        // far enough above a real measurement request not to be one.
+        assert!(
+            DEFAULT_REQUEST_TIMEOUT >= Duration::from_secs(10 * 60),
+            "{DEFAULT_REQUEST_TIMEOUT:?} is close enough to a real request to cut one"
+        );
+    }
+
+    #[test]
+    fn the_run_can_raise_or_remove_the_deadline() {
+        assert_eq!(
+            timeout_from_env(None),
+            Some(DEFAULT_REQUEST_TIMEOUT),
+            "an unset variable takes the default"
+        );
+        assert_eq!(timeout_from_env(Some("")), Some(DEFAULT_REQUEST_TIMEOUT));
+        assert_eq!(timeout_from_env(Some("  ")), Some(DEFAULT_REQUEST_TIMEOUT));
+        assert_eq!(
+            timeout_from_env(Some(" 900 ")),
+            Some(Duration::from_secs(900)),
+            "a whole number of seconds is the deadline"
+        );
+        assert_eq!(
+            timeout_from_env(Some("0")),
+            None,
+            "0 removes the deadline — the harness waits as long as the engine takes"
+        );
+        assert_eq!(
+            timeout_from_env(Some("15m")),
+            Some(DEFAULT_REQUEST_TIMEOUT),
+            "an unparseable value falls back to the default rather than to no deadline"
+        );
     }
 
     #[test]

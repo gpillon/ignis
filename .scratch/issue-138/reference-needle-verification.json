@@ -1,0 +1,35 @@
+{
+  "session": "issue-138-verify",
+  "trace_sha256": "f38fee5dd6106fe060b0a637a5579ac6748d5a9c6175457332a4970394cfce3d",
+  "label": "reference",
+  "endpoint": "http://127.0.0.1:8080",
+  "engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "issue-138 verification: needle cells only",
+  "date": "2026-09-13T00:22:59Z",
+  "run": {
+    "label": "reference",
+    "metrics": [
+      {
+        "id": "probe",
+        "class": "main",
+        "ttft_ms": 48.4568,
+        "n_tokens": 1,
+        "total_ms": 66.91669999999999,
+        "ok": true
+      }
+    ]
+  },
+  "needles": [
+    {
+      "context_tokens": 65536,
+      "secret": "432896",
+      "retrieved": true
+    },
+    {
+      "context_tokens": 131072,
+      "secret": "765792",
+      "retrieved": true
+    }
+  ]
+}

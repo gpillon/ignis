@@ -3,6 +3,16 @@
 //! itself a test binary (it lives under a subdirectory of `tests/`, so
 //! cargo does not compile it as one).
 
+// Each test binary includes the whole module and uses a subset of it, so
+// "never used" here means "not used by *this* binary" rather than not used.
+#![allow(dead_code)]
+
+/// The live GPU-backed server the `#[ignore]`d GPU-profile tests measure
+/// through. Behind the feature gate so the CPU-only binaries that include
+/// this module never compile it.
+#[cfg(feature = "cuda")]
+pub mod live_server;
+
 use std::sync::Arc;
 
 use ignis_core::TokenId;
