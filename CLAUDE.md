@@ -31,7 +31,11 @@ See `docs/agents/domain.md`.
 ### Testing
 
 Every code change ships with a test, and the task is not complete until
-`cargo test` passes workspace-wide. See `docs/agents/testing.md`.
+`cargo test` passes workspace-wide. Before launching **anything** on the GPU
+(the profile, a bench run, a gate leg, one `--ignored` test), always check
+that no other test, bench or agent session is already using the card — in
+any worktree. The 5090 fits one run at a time and the loser dies with no
+diagnostic. See `docs/agents/testing.md`.
 
 ### Worktrees
 

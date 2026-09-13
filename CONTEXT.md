@@ -295,7 +295,11 @@ When output names a domain concept, use the term as defined here.
   reference feature floor, G5 speculative decoding (`.scratch/ROADMAP.md`).
 - **GPU profile** — the explicit test profile for GPU work: it requires the
   5090 free and **fails**, never skips, when the GPU is busy or a kernel
-  errors. A skip is not green for compute work.
+  errors. A skip is not green for compute work. *Free* means **one process on
+  the card**: no ninfer, and no other test run, bench leg or agent session
+  already using it — in any worktree, since the worktrees are separate and the
+  card is not. A single run peaks near 26 of the card's 32 GiB, so a second
+  one does not fit; the loser dies with no diagnostic (GitHub #145).
 - **Generated token** — a token the engine decoded, on **either** channel: the
   answer (`delta.content`) or the thinking trace
   (`delta.reasoning_content`, on by default). Every throughput and latency

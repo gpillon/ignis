@@ -119,9 +119,33 @@ same order whatever the split, pinned by a unit test that compares schedules
 bit-for-bit and by `layer_reference_real` still matching the committed
 fixtures, which were recorded by the scalar path.
 
+**"Free" means one process on the card, not just "ninfer is stopped."** The
+preflight inspects the GPU once, before the run starts; nothing stops a
+second GPU-touching process from entering while the sweep is under way. One
+clean profile run peaks at **26.1 GiB of the 5090's 32.6 GiB** (measured
+2026-09-13, sampled every 15s across two consecutive runs), so the headroom
+left for anything else is about 6 GiB — less than one more artifact load. A
+test binary that loses that race dies the way GitHub #145 recorded it: an
+abrupt process exit, `exit code: 1`, no panic text and nothing printed
+despite `--nocapture`, and the same test passing immediately when re-run
+alone. Two unrelated tests died that way in one session, which is what a
+contended card looks like from inside a test log — there is no diagnostic
+that says so.
+
+So before launching **any** GPU work — the profile, a bench run, a gate
+leg, a single `--ignored` test — check that nobody has already launched
+some. That includes another agent session in another worktree: the
+worktrees are separate, the card is not. `nvidia-smi` (or
+`scripts/gpu-preflight.ps1`) plus `tasklist` for stray `*_gpu-*.exe`,
+`ignis-server`, `ignis-bench` and `ninfer*` processes answers it in one
+step.
+
 Runbook:
 
 ```powershell
+# 0. Check nobody else is already running GPU work -- another agent session
+#    in another worktree counts. nvidia-smi for held memory, tasklist for
+#    stray *_gpu-*.exe / ignis-server / ignis-bench / ninfer processes.
 # 1. Stop ninfer (frees the VRAM the GPU profile needs).
 # 2. Preflight + profile in one step: refuses to proceed while the GPU is
 #    held (and names the offending process); on a free GPU, runs the leaf's
