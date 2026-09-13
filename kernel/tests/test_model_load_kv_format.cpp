@@ -66,7 +66,8 @@ std::string load_error_for(int32_t kv_format) {
   ignis_model *model = nullptr;
   const int32_t rc   = ignis_model_load(tensors, /*count=*/0, &topology,
                                         /*prefill_chunk_tokens=*/128,
-                                        /*max_context_tokens=*/128, kv_format, &model);
+                                        /*max_context_tokens=*/128, kv_format,
+                                        /*options=*/nullptr, &model);
   if (rc == 0 || model != nullptr) {
     std::fprintf(stderr, "FATAL: a load with no bound tensors must not succeed\n");
     if (model != nullptr) { ignis_model_free(model); }

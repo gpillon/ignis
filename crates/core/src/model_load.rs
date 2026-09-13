@@ -22,11 +22,13 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
 use ignis_artifact::{
-    text_scope_27b, MaterializedArtifact, NumericFormat, ObjectHandle, Reader, StorageLayout,
+    model_scope_27b, DraftModule, MaterializedArtifact, NumericFormat, ObjectHandle, Reader,
+    StorageLayout,
 };
 
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
+use crate::speculation::{SpeculativeBackend, Speculation};
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
@@ -80,6 +82,14 @@ pub(crate) mod ffi {
         pub rms_norm_eps: f32,
     }
 
+    /// 1:1 with `struct ignis_model_load_options` (ADR 0016: `size` first).
+    #[repr(C)]
+    pub struct IgnisModelLoadOptions {
+        pub size: u32,
+        pub speculative_backend: i32,
+        pub draft_tokens: u32,
+    }
+
     /// 1:1 with `struct ignis_model_stats`.
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
@@ -96,6 +106,7 @@ pub(crate) mod ffi {
             prefill_chunk_tokens: u32,
             max_context_tokens: u32,
             kv_format: i32,
+            options: *const IgnisModelLoadOptions,
             out_model: *mut *mut IgnisModel,
         ) -> i32;
 
@@ -199,6 +210,24 @@ fn crosses_the_abi(name: &str) -> bool {
     !name.ends_with("/input_scale_divisor")
 }
 
+/// An NVFP4 weight with no paired `*_input_scale_divisor` object: the DFlash2
+/// drafter's matrices are weight-only (it runs A16; the reference's
+/// `qwen3.8-27b-artifact.md` §15.1), so its descriptors carry an input
+/// divisor of 0 — no W4A4 path reads one.
+fn is_weight_only_nvfp4(name: &str) -> bool {
+    name.starts_with("dflash2/")
+}
+
+/// The artifact module a speculation option binds beside the text scope
+/// (P5-02, GitHub #150). One mapping, shared by the server's binder call and
+/// this load, so the handles and the descriptors cannot name different
+/// scopes.
+pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
+    speculation.map(|s| match s.backend() {
+        SpeculativeBackend::Dflash2 => DraftModule::Dflash2,
+    })
+}
+
 /// Read the NVFP4 blockscale layout's trailing FP32 weight divisor
 /// directly from the container (host-side, via the mapping -- the same
 /// bytes the device upload copied, ADR 0002).
@@ -234,9 +263,9 @@ fn read_input_scale_divisor(reader: &Reader, name: &str) -> Result<f32, String> 
     Ok(f32::from_le_bytes(bytes))
 }
 
-/// Build the bound-tensor descriptors for every text-scope tensor
-/// [`ignis_artifact::bind_text_scope_27b`] placed on the device, in [`text_scope_27b`]
-/// order.
+/// Build the bound-tensor descriptors for every tensor
+/// [`ignis_artifact::bind_model_scope_27b`] placed on the device for `draft`,
+/// in [`model_scope_27b`] order.
 ///
 /// Returns the descriptors alongside the [`CString`] names they point
 /// into: the caller must keep both alive across the `ignis_model_load`
@@ -245,11 +274,12 @@ fn build_bound_tensors(
     reader: &Reader,
     artifact: &MaterializedArtifact,
     handles: &[ObjectHandle],
+    draft: Option<DraftModule>,
 ) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
-    let entries = text_scope_27b();
+    let entries = model_scope_27b(draft);
     if entries.len() != handles.len() {
         return Err(format!(
-            "text-scope handle count ({}) does not match the inventory ({})",
+            "model-scope handle count ({}) does not match the inventory ({}, drafter: {draft:?})",
             handles.len(),
             entries.len()
         ));
@@ -263,7 +293,11 @@ fn build_bound_tensors(
         }
         let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
 
-        let (weight_scale_divisor, input_scale_divisor) = if entry.format == NumericFormat::Nvfp4 {
+        let (weight_scale_divisor, input_scale_divisor) = if entry.format == NumericFormat::Nvfp4
+            && is_weight_only_nvfp4(entry.name)
+        {
+            (read_weight_divisor(reader, entry.name, entry.shape)?, 0.0)
+        } else if entry.format == NumericFormat::Nvfp4 {
             // The paired `<name>/..._projection/input_scale_divisor` object
             // (present for every NVFP4 projection) is generated immediately
             // after its weight in `text_scope_27b`'s per-layer templates
@@ -386,10 +420,44 @@ pub fn load_qwen38_27b(
     max_context_tokens: u32,
     kv_format: KvFormat,
 ) -> Result<Model, String> {
+    load_qwen38_27b_with_speculation(
+        reader,
+        artifact,
+        handles,
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        None,
+    )
+}
+
+/// [`load_qwen38_27b`] with speculation chosen at load (P5-02, GitHub #150).
+///
+/// With `Some`, `handles` must be the handles
+/// [`ignis_artifact::bind_model_scope_27b`] returned for [`draft_module`] of
+/// the same option; the leaf binds the drafter's weights from them and
+/// allocates its per-lane window pool, both reported by
+/// [`crate::step::program_stats`]. With `None` the options pointer crosses as
+/// NULL (ADR 0016: production defaults) and the load is exactly today's.
+pub fn load_qwen38_27b_with_speculation(
+    reader: &Reader,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    speculation: Option<Speculation>,
+) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
-    let (_names, tensors) = build_bound_tensors(reader, artifact, handles)?;
+    let (_names, tensors) =
+        build_bound_tensors(reader, artifact, handles, draft_module(speculation))?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let options = speculation.map(|s| ffi::IgnisModelLoadOptions {
+        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+        speculative_backend: s.backend().abi_code(),
+        draft_tokens: s.draft_tokens(),
+    });
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -400,6 +468,9 @@ pub fn load_qwen38_27b(
             prefill_chunk_tokens,
             max_context_tokens,
             kv_format.abi_code(),
+            options
+                .as_ref()
+                .map_or(std::ptr::null(), |o| o as *const ffi::IgnisModelLoadOptions),
             &mut handle,
         )
     };
@@ -479,6 +550,20 @@ mod tests {
         ));
         assert!(crosses_the_abi("text/layers/3/attention/query_key_gate_value"));
         assert!(crosses_the_abi("text/token_embedding"));
+    }
+
+    #[test]
+    fn only_the_drafter_carries_weight_only_nvfp4() {
+        assert!(is_weight_only_nvfp4("dflash2/layers/0/mlp/gate_up"));
+        assert!(is_weight_only_nvfp4("dflash2/selector/successor"));
+        assert!(!is_weight_only_nvfp4("text/layers/3/mlp/gate_up"));
+    }
+
+    #[test]
+    fn a_speculation_option_selects_its_draft_module_and_none_selects_nothing() {
+        assert_eq!(draft_module(None), None);
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        assert_eq!(draft_module(Some(spec)), Some(DraftModule::Dflash2));
     }
 
     #[test]

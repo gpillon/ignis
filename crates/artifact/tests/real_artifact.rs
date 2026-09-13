@@ -12,7 +12,8 @@
 use std::path::Path;
 
 use ignis_artifact::{
-    materialize, text_scope_27b, Binder, CpuDevice, MaterializationPlan, NumericFormat, Object,
+    bind_model_scope_27b, bind_text_scope_27b, dflash2_scope_27b, materialize, text_scope_27b,
+    Binder, CpuDevice, DraftModule, MaterializationPlan, NumericFormat, Object,
     OUT_OF_SCOPE_TEXT_NAMES, Reader, StorageLayout,
 };
 #[cfg(feature = "cuda")]
@@ -176,6 +177,88 @@ fn real_nvfp4full_text_scope_inventory_matches() {
             "{a_name}: the shape (the container's authority, ADR 0002)"
         );
     }
+}
+
+/// The DFlash2 module table (`inventory::dflash2_scope_27b`, P5-02, GitHub
+/// #150) matches the container's `dflash2/*` objects: the same 66 names,
+/// formats, layouts and shapes. Tier 1.
+#[test]
+fn real_nvfp4full_dflash2_inventory_matches() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+    let mut actual: Vec<(String, NumericFormat, StorageLayout, Vec<u64>)> = reader
+        .objects()
+        .iter()
+        .filter_map(|o| match o {
+            Object::Tensor(t) if t.name.starts_with("dflash2/") => {
+                Some((t.name.clone(), t.format, t.layout, t.shape.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    actual.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected: Vec<(String, NumericFormat, StorageLayout, Vec<u64>)> = dflash2_scope_27b()
+        .iter()
+        .map(|e| (e.name.to_string(), e.format, e.layout, e.shape.to_vec()))
+        .collect();
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(expected, actual, "the dflash2 module table is the container's (ADR 0002)");
+}
+
+/// With the drafter selected, the plan consumes every `dflash2/*` object and
+/// changes nothing about the text scope's placements; without it, the plan is
+/// exactly `bind_text_scope_27b`'s (P5-02, GitHub #150). Tier 1: binding
+/// plans placements, it reads no payload.
+#[test]
+fn real_nvfp4full_dflash2_plan_extends_the_text_plan() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+    // Today's binding spelled out here, independently of the code under test
+    // (which `bind_text_scope_27b` now delegates to): require + place every
+    // text-scope entry in inventory order.
+    let mut binder = Binder::new(&reader);
+    let mut text_handles = Vec::new();
+    for e in text_scope_27b() {
+        let handle = binder
+            .require_tensor(e.name, e.format, e.layout, e.shape)
+            .unwrap_or_else(|err| panic!("{}: {err}", e.name));
+        binder.materialize_on_device(handle).expect("place");
+        text_handles.push(handle);
+    }
+    let text_plan = binder.plan();
+    assert_eq!(text_plan.object_count, 906);
+
+    let (off_plan, off_handles) = bind_model_scope_27b(&reader, None).expect("bind, no drafter");
+    assert_eq!(off_plan, text_plan, "no drafter: byte-identical to today's plan");
+    assert_eq!(off_handles, text_handles);
+    let (wrapper_plan, _) = bind_text_scope_27b(&reader).expect("bind text scope");
+    assert_eq!(wrapper_plan, text_plan);
+
+    let (plan, handles) =
+        bind_model_scope_27b(&reader, Some(DraftModule::Dflash2)).expect("bind with dflash2");
+    assert_eq!(plan.object_count, text_plan.object_count + 66);
+    assert_eq!(&handles[..text_handles.len()], text_handles.as_slice());
+    assert_eq!(
+        &plan.device_objects[..text_plan.device_objects.len()],
+        text_plan.device_objects.as_slice(),
+        "every text placement keeps its offset"
+    );
+    let drafter_names: std::collections::BTreeSet<&str> = plan.device_objects
+        [text_plan.device_objects.len()..]
+        .iter()
+        .map(|p| reader.objects()[p.handle.index].name())
+        .collect();
+    let every_dflash2: std::collections::BTreeSet<&str> = reader
+        .objects()
+        .iter()
+        .map(|o| o.name())
+        .filter(|n| n.starts_with("dflash2/"))
+        .collect();
+    assert_eq!(drafter_names, every_dflash2, "every dflash2/* object, and nothing else");
 }
 
 /// Full `CpuDevice` materialization of the whole artifact. Gated: it

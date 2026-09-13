@@ -271,6 +271,68 @@ bool bind_gdn_layer(ModelBinder &binder, const std::string &prefix, const Geomet
 }
 
 // ---------------------------------------------------------------------------
+// P5-02 (GitHub #150): the DFlash2 drafter's weights (the reference's
+// `docs/maintainer/qwen3.8-27b-artifact.md` §15). Its hidden and MLP widths
+// are the target's; the rest are the module's own constants.
+constexpr int64_t kDflash2FeatureTaps = 5;   // target layers 5, 19, 33, 47, 61
+constexpr int64_t kDflash2QueryHeads = 32;
+constexpr int64_t kDflash2KvHeads = 8;
+constexpr int64_t kDflash2HeadDim = 128;
+constexpr int64_t kDflash2ConvTaps = 2;
+constexpr int64_t kDflash2ConvProjRows = 1280; // 320 groups x 2 taps x 2
+constexpr int64_t kDflash2SelectorRank = 256;
+constexpr int64_t kDflash2WindowTokens = 2048;
+
+bool bind_dflash2_layer(ModelBinder &binder, const std::string &prefix, const Geometry &g,
+                        Dflash2LayerWeights &w) {
+  const int64_t q_width = kDflash2QueryHeads * kDflash2HeadDim;
+  const int64_t kv_width = kDflash2KvHeads * kDflash2HeadDim;
+  const std::initializer_list<int64_t> conv_base{kDflash2ConvTaps, kDflash2ConvTaps, g.hidden};
+  return binder.bind(prefix + "input_norm", {g.hidden}, w.input_norm) &&
+         binder.bind(prefix + "attention/query_key_value", {q_width + 2 * kv_width, g.hidden},
+                     w.query_key_value) &&
+         binder.bind(prefix + "attention/query_norm", {kDflash2HeadDim}, w.query_norm) &&
+         binder.bind(prefix + "attention/key_norm", {kDflash2HeadDim}, w.key_norm) &&
+         binder.bind(prefix + "attention/output", {g.hidden, q_width}, w.output) &&
+         binder.bind(prefix + "attention/conv_base", conv_base, w.attention_conv_base) &&
+         binder.bind(prefix + "attention/conv_proj", {kDflash2ConvProjRows, g.hidden},
+                     w.attention_conv_proj) &&
+         binder.bind(prefix + "post_attention_norm", {g.hidden}, w.post_attention_norm) &&
+         binder.bind(prefix + "mlp/gate_up", {2 * g.ffn_intermediate, g.hidden}, w.mlp_gate_up) &&
+         binder.bind(prefix + "mlp/down", {g.hidden, g.ffn_intermediate}, w.mlp_down) &&
+         binder.bind(prefix + "mlp/conv_base", conv_base, w.mlp_conv_base) &&
+         binder.bind(prefix + "mlp/conv_proj", {kDflash2ConvProjRows, g.hidden}, w.mlp_conv_proj);
+}
+
+bool bind_dflash2(ModelBinder &binder, const Geometry &g, Dflash2Weights &w) {
+  if (!binder.bind("dflash2/feature_projection", {g.hidden, kDflash2FeatureTaps * g.hidden},
+                   w.feature_projection) ||
+      !binder.bind("dflash2/context_norm", {g.hidden}, w.context_norm)) {
+    return false;
+  }
+  for (std::size_t l = 0; l < kDflash2Layers; ++l) {
+    const std::string prefix = "dflash2/layers/" + std::to_string(l) + "/";
+    if (!bind_dflash2_layer(binder, prefix, g, w.layers[l])) {
+      return false;
+    }
+  }
+  return binder.bind("dflash2/final_norm", {g.hidden}, w.final_norm) &&
+         binder.bind("dflash2/selector/hidden", {kDflash2SelectorRank, g.hidden},
+                     w.selector_hidden) &&
+         binder.bind("dflash2/selector/predecessor", {g.vocab, kDflash2SelectorRank},
+                     w.selector_predecessor) &&
+         binder.bind("dflash2/selector/successor", {g.vocab, kDflash2SelectorRank},
+                     w.selector_successor);
+}
+
+// One lane's drafter window: BF16 K and V for every layer across the sliding
+// window (40 MiB at the module's geometry).
+std::size_t dflash2_window_lane_bytes() {
+  return static_cast<std::size_t>(kDflash2Layers) * kDflash2WindowTokens * kDflash2KvHeads *
+         kDflash2HeadDim * 2 * sizeof(std::uint16_t);
+}
+
+// ---------------------------------------------------------------------------
 // P2-01 (GitHub #83): the program scratch reservation.
 //
 // Sized once at load for a prefill chunk of `prefill_chunk_tokens` tokens,
@@ -476,7 +538,9 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                                      const struct ignis_topology *topology,
                                      uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
-                                     int32_t kv_format, struct ignis_model **out_model) {
+                                     int32_t kv_format,
+                                     const struct ignis_model_load_options *options,
+                                     struct ignis_model **out_model) {
   if (out_model != nullptr) {
     *out_model = nullptr;
   }
@@ -527,6 +591,37 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
   const ninfer::DType cache_dtype = ignis_kv_cache_dtype(kv_format);
 
+  // P5-02 (GitHub #150, ADR 0016): the load options, validated before any
+  // binding -- a NULL pointer is the production default, no speculation.
+  int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
+  uint32_t draft_tokens = 0;
+  if (options != nullptr) {
+    if (options->size != sizeof(struct ignis_model_load_options)) {
+      set_error("ignis_model_load: options.size " + std::to_string(options->size) +
+                " is not a recognized ignis_model_load_options size");
+      return -1;
+    }
+    speculative_backend = options->speculative_backend;
+    draft_tokens = options->draft_tokens;
+  }
+  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
+      speculative_backend != IGNIS_SPECULATIVE_DFLASH2) {
+    set_error("ignis_model_load: speculative_backend " + std::to_string(speculative_backend) +
+              " is not an ignis_speculative_backend");
+    return -1;
+  }
+  if (speculative_backend == IGNIS_SPECULATIVE_NONE && draft_tokens != 0) {
+    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
+              " needs a speculative_backend");
+    return -1;
+  }
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 &&
+      (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
+    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
+              " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
+    return -1;
+  }
+
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {
     return -1;
@@ -554,9 +649,17 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     }
   }
 
+  // Without the option the `dflash2/*` tensors are not asked for, so a caller
+  // that hands them over anyway fails on `require_no_extras` below.
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
+    return -1;
+  }
+
   if (!binder.require_no_extras()) {
     return -1;
   }
+  model->speculative_backend = speculative_backend;
+  model->draft_tokens = draft_tokens;
 
   uint64_t vram_bytes = 0;
   for (uint64_t i = 0; i < count; ++i) {
@@ -680,6 +783,22 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;
+  }
+
+  // P5-02 (GitHub #150): the drafter's per-lane window pool and its rewrite
+  // checkpoint, reserved once for every decode lane.
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+    try {
+      const std::size_t pool_bytes = dflash2_window_lane_bytes() * IGNIS_DECODE_MAX_BATCH;
+      model->dflash2_window = std::make_unique<ninfer::DeviceBuffer>(pool_bytes);
+      model->dflash2_checkpoint = std::make_unique<ninfer::DeviceBuffer>(pool_bytes);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: dflash2 window pool allocation failed: ") +
+                e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
   }
 
   *out_model = model.release();
