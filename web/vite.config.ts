@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { mockIgnis } from "./mock.ts";
 
 // The Playground (GitHub #163, ADR 0026). `ignis-server --ui` serves the
@@ -10,7 +11,7 @@ export default defineConfig(({ mode }) => {
   const target = loadEnv(mode, process.cwd(), "").IGNIS_URL || "http://127.0.0.1:8000";
   return {
     base: "/ui/",
-    plugins: [react(), ...(mode === "mock" ? [mockIgnis()] : [])],
+    plugins: [react(), tailwindcss(), ...(mode === "mock" ? [mockIgnis()] : [])],
     server:
       mode === "mock"
         ? {}

@@ -5,7 +5,8 @@ import type { Plugin } from "vite";
 // /v1/chat/completions and /metrics to work on the Playground without the
 // shared GPU. Development only — never part of the build.
 //
-// Chat: honours `enable_thinking` (no reasoning when false) and stops on a
+// Chat: honours the thinking controls (no reasoning for `reasoning_effort`
+// "none" or `enable_thinking` false) and stops on a
 // client disconnect; a last user message containing "/error" gets ignis's
 // 503 "engine full" error instead of a stream.
 
@@ -57,7 +58,8 @@ export function mockIgnis(): Plugin {
         const id = `chatcmpl-mock-${Date.now()}`;
         const chunk = (delta: object, finish: string | null = null) =>
           `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-        const reasoning = body.enable_thinking === false ? [] : ["Thinking ", "about ", "it."];
+        const thinkingOff = body.reasoning_effort === "none" || body.enable_thinking === false;
+        const reasoning = thinkingOff ? [] : ["Thinking ", "about ", "it."];
         const content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
         const pieces = [
           ...reasoning.map((t) => chunk({ reasoning_content: t })),

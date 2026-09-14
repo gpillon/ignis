@@ -1,8 +1,16 @@
 // The chat request the Playground sends (GitHub #164): ignis's own
-// `POST /v1/chat/completions`, streaming with the usage chunk, plus the two
-// ignis extensions it exposes — `enable_thinking` and the lane tag `class`.
+// `POST /v1/chat/completions`, streaming with the usage chunk, plus the
+// thinking effort and the ignis lane tag extension `class`.
 
 export type LaneTag = "interactive" | "agent";
+
+/**
+ * The efforts the loaded Qwen 3.8 template accepts (`high` is refused).
+ * `none` turns thinking off, so the request never also sends
+ * `enable_thinking` — ignis rejects the two when they disagree.
+ */
+export const REASONING_EFFORTS = ["none", "low", "medium", "xhigh"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export type Settings = {
   model: string;
@@ -11,7 +19,7 @@ export type Settings = {
   topP: number;
   /** `null` leaves the cap to the engine. */
   maxTokens: number | null;
-  thinking: boolean;
+  reasoningEffort: ReasoningEffort;
   laneTag: LaneTag;
 };
 
@@ -25,7 +33,7 @@ export type ChatRequest = {
   temperature: number;
   top_p: number;
   max_tokens?: number;
-  enable_thinking: boolean;
+  reasoning_effort: ReasoningEffort;
   class: LaneTag;
 };
 
@@ -64,7 +72,7 @@ export function buildChatRequest(settings: Settings, turns: Turn[]): ChatRequest
     temperature: settings.temperature,
     top_p: settings.topP,
     ...(settings.maxTokens !== null ? { max_tokens: settings.maxTokens } : {}),
-    enable_thinking: settings.thinking,
+    reasoning_effort: settings.reasoningEffort,
     class: settings.laneTag,
   };
 }

@@ -35,12 +35,12 @@ const settings: Settings = {
   temperature: 0.7,
   topP: 0.9,
   maxTokens: 512,
-  thinking: true,
+  reasoningEffort: "xhigh",
   laneTag: "agent",
 };
 
 describe("buildChatRequest", () => {
-  it("streams with usage and carries the sampling, thinking and lane tag fields", () => {
+  it("streams with usage and carries the sampling, reasoning effort and lane tag fields", () => {
     const body = buildChatRequest(settings, [{ role: "user", content: "hi" }]);
     expect(body).toEqual({
       model: "qwen3.8-27b",
@@ -53,9 +53,15 @@ describe("buildChatRequest", () => {
       temperature: 0.7,
       top_p: 0.9,
       max_tokens: 512,
-      enable_thinking: true,
+      reasoning_effort: "xhigh",
       class: "agent",
     });
+  });
+
+  it("turns thinking off with the `none` effort alone, never a conflicting enable_thinking", () => {
+    const body = buildChatRequest({ ...settings, reasoningEffort: "none" }, [{ role: "user", content: "hi" }]);
+    expect(body.reasoning_effort).toBe("none");
+    expect("enable_thinking" in body).toBe(false);
   });
 
   it("sends the whole conversation, and no system message when the prompt is blank", () => {

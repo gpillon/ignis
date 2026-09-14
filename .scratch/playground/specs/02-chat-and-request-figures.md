@@ -27,7 +27,9 @@ A single-page chat in `web/` against ignis's own `POST /v1/chat/completions` wit
 ## Implementation Decisions
 
 - Model id from `GET /v1/models` (first entry); lane tag sent as the ignis `class` extension field (not the `@<lane>` model suffix).
-- Thinking toggle maps to the request's `enable_thinking` field; reasoning read from `delta.reasoning_content`, answer from `delta.content`.
+- Thinking is chosen as an effort — `none` / `low` / `medium` / `xhigh`, the values the loaded template accepts (`high` is refused) — sent as `reasoning_effort` only (`none` turns thinking off; never also `enable_thinking`, which ignis rejects when it disagrees); reasoning read from `delta.reasoning_content`, answer from `delta.content`.
+- The conversation follows new tokens only while the reader is at its bottom; scrolling up stops the autoscroll, sending a prompt resumes it.
+- Styled with Tailwind CSS (`@tailwindcss/vite`), dev-only dependency.
 - SSE parsing is a pure module (`fetch` + `ReadableStream`, no `EventSource` — POST body needed); abort via `AbortController`.
 - Figures, all measured with `performance.now()` in the browser:
   - TTFT = request sent → first chunk carrying `content` or `reasoning_content`.
