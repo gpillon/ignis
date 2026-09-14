@@ -66,7 +66,8 @@ pub struct CudaLeafConfig {
     /// Speculative decoding, fixed for the life of the model handle (P5-02,
     /// GitHub #150). With it, the leaf binds the drafter's weights — which
     /// `handles` must then carry (`ignis_artifact::bind_model_scope_27b`) —
-    /// and allocates its window pool; `None` is today's load.
+    /// and the sequence pool carries its per-slot window; `None` is today's
+    /// load.
     pub speculation: Option<ignis_core::Speculation>,
 }
 
@@ -242,7 +243,9 @@ impl StepLeaf for CudaLeaf {
         // per-sequence cap drawn against it.
         // `ignis_server::runtime::cuda_scheduler` reads the same plan, so
         // admission can never promise more pages than this pool holds.
-        let pool = SeqPool::create(
+        // P5-03 (GitHub #152): the drafter's window is per-sequence state,
+        // so a speculative load's pool carries it for every slot.
+        let pool = SeqPool::create_with_speculation(
             &cfg,
             &SeqPoolBudget {
                 kv_format: self.config.kv_format,
@@ -250,6 +253,7 @@ impl StepLeaf for CudaLeaf {
                 max_context_tokens: self.config.max_context_tokens,
                 slot_count: self.config.slot_count,
             },
+            self.config.speculation.map(|s| s.backend()),
         )
         .map_err(|e| leaf_error("seq pool create", e))?;
         // GitHub #122: report what the budget actually bought, read back

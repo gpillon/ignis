@@ -109,7 +109,8 @@ When output names a domain concept, use the term as defined here.
   presence/frequency penalties read and atomically update it; zeroed at
   `ignis_seq_alloc` like every other slot section.
 - **State section** — one part of what a sequence is made of: its KV pages, its
-  GDN slot, its conv taps, its position and last token, its penalty-count row.
+  GDN slot, its conv taps, its position and last token, its penalty-count row,
+  and on a pool built with DFlash2 its **drafter window** and checkpoint.
   Each is either shareable read-only (KV pages) or must be cloned per sequence
   (everything mutable). The table of them lives inside the leaf, and adding one
   is the act that re-earns the **snapshot point** permission rather than
@@ -232,9 +233,15 @@ When output names a domain concept, use the term as defined here.
   66 `dflash2/*` objects is bound.
 - **Draft window** — the number of tokens the drafter proposes per round
   (`--draft-tokens`, 1..7), fixed for the life of a load. Not to be confused
-  with the drafter's own 2048-token sliding **drafter window**, whose per-lane
-  BF16 K+V pool (40 MiB, twice with its rewrite checkpoint) the load reserves
-  for every decode lane.
+  with the drafter's own 2048-token sliding **drafter window**.
+- **Drafter window** — a sequence's DFlash2 context: every drafter layer's
+  BF16 K and V for the last 2048 positions (40 MiB), plus its rewrite
+  checkpoint (40 MiB more). Per-sequence state in the sequence pool, one lane
+  per slot, and two **state sections** of a pool built with the drafter. A
+  prefill fills it from the **feature taps** of its span's last 2048 positions.
+- **Feature taps** — the target's hidden states at layers 5, 19, 33, 47 and 61,
+  concatenated and projected into the drafter's context. Chunk-scoped scratch:
+  never persisted, never a state section.
 - **MTP** — the model's native multi-token-prediction heads (draft window 3,
   adaptive verification width).
 - **Vision** — multimodal (image/video) input.

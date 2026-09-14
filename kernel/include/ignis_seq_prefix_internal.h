@@ -210,6 +210,27 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
       copy(pool.token_counts_for(seq.slot), image + section.offset,
            static_cast<std::size_t>(section.bytes), ignis_seq_section_name(section.kind));
       break;
+    case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT: {
+      /* P5-03 (GitHub #152): the slot's lane of every drafter layer's K and
+       * V, packed in the order `CyclicKVCache::copy_lane_to_host` packs it,
+       * so this image and a snapshot blob lay the section out the same way.
+       * Ten 4 MiB copies per section at the 27B geometry. */
+      const ninfer::CyclicKVCache &cache = section.kind == IGNIS_SEQ_SECTION_DFLASH_WINDOW
+                                               ? *pool.dflash2_window
+                                               : *pool.dflash2_checkpoint;
+      std::size_t cursor = 0;
+      for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+        const ninfer::CyclicKVCacheLayerView view = cache.layer_view(layer);
+        for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
+          const ninfer::Tensor lane = plane->slice(3, seq.slot, 1);
+          copy(lane.data, image + section.offset + cursor, lane.bytes(),
+               ignis_seq_section_name(section.kind));
+          cursor += lane.bytes();
+        }
+      }
+      break;
+    }
     default:
       /* ADR 0024's "carried by all three or by none", for the third
        * consumer. A CLONE section added to the table without a case here is

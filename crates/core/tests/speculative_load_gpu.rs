@@ -1,7 +1,8 @@
 //! GPU test for speculation as a load option (P5-02, GitHub #150): a load
-//! with `--spec dflash2` reports the drafter's VRAM — its weights plus the
-//! per-lane window pool — in `ignis_program_stats`, and a load without it
-//! reports today's figure.
+//! with `--spec dflash2` reports the drafter's VRAM — its weights, its
+//! prefill scratch, and (P5-03, GitHub #152) the per-slot window and
+//! checkpoint its pool carries — in `ignis_program_stats`, and a load
+//! without it reports today's figure.
 //!
 //! One upload of the drafter-bearing plan serves both loads: the text scope
 //! is its first 906 handles (`bind_model_scope_27b` places the text tensors
@@ -72,7 +73,9 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
             speculation,
         )
         .unwrap_or_else(|e| panic!("ignis_model_load ({speculation:?}): {e}"));
-        let pool = SeqPool::create(
+        // P5-03 (GitHub #152): the window is per-sequence state, so the
+        // speculative load's pool carries it -- one slot's worth here.
+        let pool = SeqPool::create_with_speculation(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
                 kv_format: KvFormat::Bf16,
@@ -80,6 +83,7 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,
             },
+            speculation.map(|s| s.backend()),
         )
         .unwrap_or_else(|e| panic!("seq pool create: {e}"));
         let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("program stats: {e}"));
@@ -94,11 +98,12 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
 
     assert_eq!(plain_again, plain_vram, "a load without the option reports today's figure");
     assert_eq!(spec_bound, plain_bound + 66, "every dflash2 object crosses the ABI");
-    assert_eq!(spec.window_pool_bytes(), 8 * 80 * 1024 * 1024);
+    assert_eq!(spec.window_pool_bytes(1), 80 * 1024 * 1024);
     assert_eq!(
         spec_vram - plain_vram,
-        drafter_weight_bytes + spec.window_pool_bytes(),
-        "the drafter adds its weights and 8 lanes x 80 MiB of window pool, nothing else"
+        drafter_weight_bytes + spec.window_pool_bytes(1) + spec.prefill_scratch_bytes(128),
+        "the drafter adds its weights, one slot's 80 MiB of window and checkpoint, and its \
+         prefill scratch at a 128-token chunk, nothing else"
     );
 
     let _ = artifact.release_arena(&mut device);

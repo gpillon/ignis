@@ -43,7 +43,10 @@
  * changes: a blob does not survive a version change, which is the intent --
  * a snapshot taken before a layout change is unusable and must be rejected,
  * not reinterpreted (ADR 0024). */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 1;
+/* 2 (P5-03, GitHub #152): the drafter's window and checkpoint sections, the
+ * drafter frontier in the progress image, and the drafter's lane size in the
+ * geometry. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 2;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
@@ -78,7 +81,15 @@ enum ignis_seq_section_kind {
    * program frontier, the pending token and every GQA layer's own frontier.
    * A section like any other, so that "what a sequence is made of" has no
    * footnotes. */
-  IGNIS_SEQ_SECTION_PROGRESS = 4
+  IGNIS_SEQ_SECTION_PROGRESS = 4,
+  /* The DFlash2 drafter's sliding K/V window for this slot's lane (P5-03,
+   * GitHub #152): every drafter layer's K then V over the whole ring
+   * (`ninfer::CyclicKVCache::copy_lane_to_host` order). Listed only by a pool
+   * built with the drafter, and placed before the progress section in blob
+   * order. Mutable: the drafter rewrites it every round. */
+  IGNIS_SEQ_SECTION_DFLASH_WINDOW = 5,
+  /* That window's rewrite checkpoint, in the same layout. */
+  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT = 6
 };
 
 /* How a second sequence may come to hold a section (ADR 0024).
@@ -105,10 +116,16 @@ struct ignis_seq_section {
   std::uint64_t bytes;
 };
 
-/* How many rows `ignis_seq_section_table` returns. Named so a caller can
+/* How many rows `ignis_seq_section_table` returns: every pool's sections,
+ * plus the drafter's two on a pool built with it. Named so a caller can
  * reserve for it and a test can assert against it, and so that adding a
  * section is one edit in one place rather than a literal to chase. */
 inline constexpr std::size_t kIgnisSeqSectionCount = 5;
+inline constexpr std::size_t kIgnisSeqDflash2SectionCount = 2;
+
+inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
+  return kIgnisSeqSectionCount + (pool.has_dflash2() ? kIgnisSeqDflash2SectionCount : 0);
+}
 
 /* The progress scalars, as the IGNIS_SEQ_SECTION_PROGRESS payload. Fixed
  * width and explicitly padded: it is written to a host buffer that another
@@ -118,11 +135,14 @@ struct ignis_seq_progress_image {
   std::uint64_t position;
   std::int32_t pending_token;
   std::int32_t reserved;
+  /* The drafter window's frontier (`ignis_seq::dflash2_position`); 0 on a
+   * pool without the drafter. */
+  std::uint64_t dflash2_position;
   std::uint32_t gqa_positions[kIgnisGqaLayerCount];
   std::uint32_t gdn_positions[kIgnisGdnLayerCount];
 };
 static_assert(sizeof(ignis_seq_progress_image) ==
-                  16 + 4 * (kIgnisGqaLayerCount + kIgnisGdnLayerCount),
+                  24 + 4 * (kIgnisGqaLayerCount + kIgnisGdnLayerCount),
               "ignis_seq_progress_image has gained padding; bump "
               "kIgnisSeqSnapshotFormatVersion and restate the size");
 
@@ -154,8 +174,13 @@ struct ignis_seq_snapshot_geometry {
   std::uint32_t vocab;
   std::uint64_t gdn_conv_slot_bytes;
   std::uint64_t gdn_recurrent_slot_bytes;
+  /* One slot's lane of the drafter window, as the pool planned it; 0 on a
+   * pool without the drafter. This is the field that refuses a blob taken
+   * with the drafter on a pool without it, and the reverse (P5-03, GitHub
+   * #152). */
+  std::uint64_t dflash2_window_lane_bytes;
 };
-static_assert(sizeof(ignis_seq_snapshot_geometry) == 72,
+static_assert(sizeof(ignis_seq_snapshot_geometry) == 80,
               "the snapshot geometry layout changed; bump kIgnisSeqSnapshotFormatVersion, "
               "restate the size, and add the new field to ignis_seq_snapshot_geometry_names");
 
@@ -184,7 +209,7 @@ struct ignis_seq_snapshot_header {
    * enough to refuse a buffer that is neither a snapshot nor empty. */
   std::uint64_t header_checksum;
 };
-static_assert(sizeof(ignis_seq_snapshot_header) == 120,
+static_assert(sizeof(ignis_seq_snapshot_header) == 128,
               "the snapshot header layout changed; bump kIgnisSeqSnapshotFormatVersion "
               "and restate the size");
 static_assert(sizeof(ignis_seq_section) == 24,
@@ -255,6 +280,7 @@ inline ignis_seq_snapshot_geometry ignis_seq_snapshot_geometry_of(const ignis_se
   geometry.vocab                    = static_cast<std::uint32_t>(pool.vocab);
   geometry.gdn_conv_slot_bytes      = pool.gdn_pool.conv_slot_bytes();
   geometry.gdn_recurrent_slot_bytes = pool.gdn_pool.recurrent_slot_bytes();
+  geometry.dflash2_window_lane_bytes = pool.dflash2_lane_bytes();
   return geometry;
 }
 
@@ -287,6 +313,11 @@ inline const char *ignis_seq_snapshot_geometry_names(const ignis_seq_snapshot_ge
   if (blob.gdn_recurrent_slot_bytes != target.gdn_recurrent_slot_bytes) {
     return "gdn recurrent slot bytes";
   }
+  if (blob.dflash2_window_lane_bytes != target.dflash2_window_lane_bytes) {
+    return blob.dflash2_window_lane_bytes == 0 || target.dflash2_window_lane_bytes == 0
+               ? "dflash2 drafter state (one side was built without the drafter)"
+               : "dflash2 window lane bytes";
+  }
   return "an unnamed geometry field";
 }
 
@@ -303,6 +334,7 @@ inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
   ignis_seq_progress_image image{};
   image.position      = seq.position;
   image.pending_token = seq.pending_token;
+  image.dflash2_position = seq.dflash2_position;
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     image.gqa_positions[i] = seq.gqa_positions[i];
   }
@@ -315,6 +347,7 @@ inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
 inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_image &image) {
   seq.position      = image.position;
   seq.pending_token = image.pending_token;
+  seq.dflash2_position = image.dflash2_position;
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     seq.gqa_positions[i] = image.gqa_positions[i];
   }
@@ -356,7 +389,7 @@ inline std::uint32_t ignis_seq_snapshot_page_count(const ignis_seq &seq) {
 inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_pool &pool,
                                                               std::uint32_t kv_page_count) {
   std::vector<ignis_seq_section> sections;
-  sections.reserve(kIgnisSeqSectionCount);
+  sections.reserve(ignis_seq_section_count(pool));
   const auto push = [&sections](ignis_seq_section_kind kind, ignis_seq_section_transfer transfer,
                                 std::uint64_t bytes) {
     sections.push_back({static_cast<std::int32_t>(kind), static_cast<std::int32_t>(transfer), 0,
@@ -375,12 +408,28 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
        pool.gdn_pool.recurrent_host_image_bytes());
   push(IGNIS_SEQ_SECTION_PENALTY_COUNTS, IGNIS_SEQ_SECTION_CLONE,
        static_cast<std::uint64_t>(pool.vocab) * sizeof(std::int32_t));
+  // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint.
+  // CLONE, not SHAREABLE: unlike KV pages the window is rewritten in place
+  // every round, so a claimant writes it from its first step. Consistent
+  // with the sections above at the same completed chunk boundary, because
+  // the prefill chunk that writes it synchronizes once for both (and
+  // advances `dflash2_position` with the rest of the progress scalars).
+  if (pool.has_dflash2()) {
+    push(IGNIS_SEQ_SECTION_DFLASH_WINDOW, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
+    push(IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
+  }
   push(IGNIS_SEQ_SECTION_PROGRESS, IGNIS_SEQ_SECTION_CLONE, sizeof(ignis_seq_progress_image));
-  assert(sections.size() == kIgnisSeqSectionCount &&
-         "kIgnisSeqSectionCount has drifted from the table above");
+  assert(sections.size() == ignis_seq_section_count(pool) &&
+         "ignis_seq_section_count has drifted from the table above");
 
+  // The payload starts after room for every section this leaf knows, not
+  // only the ones this pool lists: two more records would otherwise push the
+  // first payload across an alignment boundary, and a drafter pool's blob
+  // would outgrow a plain one's by more than its two lanes (P5-03, GitHub
+  // #152). The unused records' bytes are zeroed like any other gap.
   std::uint64_t cursor = ignis_seq_align_up(
-      sizeof(ignis_seq_snapshot_header) + sections.size() * sizeof(ignis_seq_section),
+      sizeof(ignis_seq_snapshot_header) +
+          (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount) * sizeof(ignis_seq_section),
       kIgnisSeqSectionAlign);
   for (ignis_seq_section &section : sections) {
     section.offset = cursor;
@@ -416,6 +465,10 @@ inline const char *ignis_seq_section_name(std::int32_t kind) {
     return "penalty_counts";
   case IGNIS_SEQ_SECTION_PROGRESS:
     return "progress";
+  case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    return "dflash_window";
+  case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
+    return "dflash_checkpoint";
   default:
     return "unknown";
   }

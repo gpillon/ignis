@@ -28,6 +28,7 @@
 // = ok, -1 = error, IGNIS_SEQ_ERR_NOT_AT_BOUNDARY / _BAD_SNAPSHOT for the
 // two refusals state transfer makes), no C++ types across the boundary.
 
+#include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 #include "ignis_seq_prefix_internal.h"
@@ -92,6 +93,29 @@ void push_layer_planes(ninfer::PagedKVPoolSpec &spec, int32_t kv_format, uint32_
 
 bool known_kv_format(int32_t kv_format) {
   return kv_format == IGNIS_KV_FORMAT_BF16 || kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
+}
+
+// Zero `slot`'s lane of the drafter window and of its checkpoint (P5-03,
+// GitHub #152), so a re-allocated slot never attends over another request's
+// context. A no-op on a pool without the drafter.
+void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
+  if (!pool.has_dflash2()) {
+    return;
+  }
+  for (const ninfer::CyclicKVCache *cache : {pool.dflash2_window.get(),
+                                             pool.dflash2_checkpoint.get()}) {
+    for (std::uint32_t layer = 0; layer < cache->layer_count(); ++layer) {
+      const ninfer::CyclicKVCacheLayerView view = cache->layer_view(layer);
+      for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
+        const ninfer::Tensor lane = plane->slice(3, slot, 1);
+        const cudaError_t err     = cudaMemset(lane.data, 0, lane.bytes());
+        if (err != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemset(dflash2 window lane) failed: ") +
+                                   cudaGetErrorString(err));
+        }
+      }
+    }
+  }
 }
 
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
@@ -280,6 +304,12 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
               std::to_string(kIgnisHqHeadDim) + ", got " + std::to_string(spec->head_dim));
     return -1;
   }
+  if (spec->speculative_backend != IGNIS_SPECULATIVE_NONE &&
+      spec->speculative_backend != IGNIS_SPECULATIVE_DFLASH2) {
+    set_error("ignis_seq_pool_create: speculative_backend " +
+              std::to_string(spec->speculative_backend) + " is not an ignis_speculative_backend");
+    return -1;
+  }
 
   try {
     const auto logical_page_capacity = ninfer::pages_for_tokens(spec->max_context_tokens);
@@ -332,6 +362,29 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     pool->kv_format       = spec->kv_format;
     pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
     pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
+
+    // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint,
+    // one cyclic lane per slot, planned by the vendored cache itself so the
+    // lane layout the drafter's kernels address is the one sized here.
+    if (spec->speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+      ninfer::LayoutBuilder dflash2_builder;
+      const auto lanes = static_cast<std::int32_t>(spec->slot_count);
+      const ninfer::CyclicKVCacheLayout window_layout = ninfer::plan_cyclic_kv_cache(
+          dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
+          kIgnisDflash2HeadDim, lanes);
+      const ninfer::CyclicKVCacheLayout checkpoint_layout = ninfer::plan_cyclic_kv_cache(
+          dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
+          kIgnisDflash2HeadDim, lanes);
+      const std::size_t dflash2_bytes = dflash2_builder.finish(256);
+      pool->dflash2_arena = std::make_unique<ninfer::DeviceArena>(dflash2_bytes);
+      const ninfer::DeviceSpan backing{pool->dflash2_arena->base(),
+                                       pool->dflash2_arena->capacity()};
+      pool->dflash2_window     = std::make_unique<ninfer::CyclicKVCache>(backing, window_layout);
+      pool->dflash2_checkpoint =
+          std::make_unique<ninfer::CyclicKVCache>(backing, checkpoint_layout);
+      pool->speculative_backend = spec->speculative_backend;
+    }
+
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
       pool->free_slots.push_back(static_cast<std::int32_t>(i));
@@ -418,6 +471,7 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
       throw std::runtime_error(std::string("cudaMemset(sampling counts) failed: ") +
                                cudaGetErrorString(err));
     }
+    zero_dflash2_lane(*pool, slot);
     seq->slot = slot;
 
     pool->free_slots.pop_back();
@@ -568,6 +622,12 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
                              static_cast<std::size_t>(section.bytes), cudaMemcpyDeviceToHost,
                              "penalty counts");
         break;
+      case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+        pool->dflash2_window->copy_lane_to_host(seq->slot, at, nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
+        pool->dflash2_checkpoint->copy_lane_to_host(seq->slot, at, nullptr);
+        break;
       case IGNIS_SEQ_SECTION_PROGRESS: {
         const ignis_seq_progress_image image = ignis_seq_progress_of(*seq);
         std::memcpy(at, &image, sizeof(image));
@@ -668,6 +728,12 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
         checked_memcpy_async(pool->token_counts_for(seq->slot), at,
                              static_cast<std::size_t>(section.bytes), cudaMemcpyHostToDevice,
                              "penalty counts");
+        break;
+      case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+        pool->dflash2_window->copy_lane_from_host(at, seq->slot, nullptr);
+        break;
+      case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
+        pool->dflash2_checkpoint->copy_lane_from_host(at, seq->slot, nullptr);
         break;
       case IGNIS_SEQ_SECTION_PROGRESS:
         std::memcpy(&image, at, sizeof(image));

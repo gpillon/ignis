@@ -13,6 +13,8 @@
 
 #include "ignis_seq.h"
 
+#include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 
@@ -20,6 +22,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -45,6 +48,16 @@ inline constexpr int32_t kIgnisGqaLayerCount = 16;
  * so the pool is sized by this count and `ignis_seq::gdn_positions` carries
  * one frontier per layer, exactly as `gqa_positions` does for the 16 above. */
 inline constexpr int32_t kIgnisGdnLayerCount = 48;
+
+/* The DFlash2 drafter's per-sequence window geometry (P5-03, GitHub #152;
+ * the reference's `DFlash2Config` and `qwen3.8-27b-artifact.md` §15.1):
+ * five sliding-attention layers, each keeping BF16 K and V for the last
+ * 2048 positions of 8 KV heads of 128. kernel/src/model.cu binds the
+ * drafter's weights against the same numbers and checks it. */
+inline constexpr std::uint32_t kIgnisDflash2Layers       = 5;
+inline constexpr std::uint32_t kIgnisDflash2WindowTokens = 2048;
+inline constexpr std::int32_t kIgnisDflash2KvHeads       = 8;
+inline constexpr std::int32_t kIgnisDflash2HeadDim       = 128;
 
 /* The hq-e8-2b per-row plane extents (`ops/kernel/hq_codec.cuh`'s
  * kHqRowBudgetBytes / kHqMetaBytes, restated here so this header stays
@@ -126,6 +139,25 @@ struct ignis_seq_pool {
   ninfer::DeviceBuffer sampling_counts;
   std::int32_t vocab = 0;
 
+  // P5-03 (GitHub #152): the DFlash2 drafter's per-sequence state, present
+  // only when the pool was built with IGNIS_SPECULATIVE_DFLASH2. One cyclic
+  // lane per slot -- the lane index IS the slot, as it is for the GDN pool --
+  // in the window the drafter attends over and in its rewrite checkpoint.
+  // Both are carved from `dflash2_arena`; all three stay null without the
+  // drafter, so a plain pool costs nothing and lists no drafter section.
+  std::int32_t speculative_backend = 0;
+  std::unique_ptr<ninfer::DeviceArena> dflash2_arena;
+  std::unique_ptr<ninfer::CyclicKVCache> dflash2_window;
+  std::unique_ptr<ninfer::CyclicKVCache> dflash2_checkpoint;
+
+  bool has_dflash2() const { return dflash2_window != nullptr; }
+
+  // Bytes one slot's lane of the window occupies (the checkpoint's is the
+  // same): every layer's K and V over the whole ring. 0 without the drafter.
+  std::uint64_t dflash2_lane_bytes() const {
+    return has_dflash2() ? static_cast<std::uint64_t>(dflash2_window->lane_host_bytes()) : 0;
+  }
+
   ignis_seq_pool(std::size_t kv_bytes, const ninfer::PagedKVPoolLayout &kv_layout,
                  std::size_t gdn_bytes, const ninfer::LinearAttentionStatePoolLayout &gdn_layout,
                  std::size_t sampling_counts_bytes, std::int32_t vocab_size)
@@ -186,6 +218,13 @@ struct ignis_seq {
   // above.  It pins span prefill's start_position contract even for GDN-only
   // prefixes.
   std::uint64_t position = 0;
+  // P5-03 (GitHub #152): the drafter window's own frontier -- one past the
+  // last absolute position whose context K/V it holds (the ring keeps the
+  // 2048 before it). Only a pool with the drafter moves it: a prefill writes
+  // its span's tail into the window and leaves this at the span's end.
+  // Decode does not move it yet, so it may trail `position`; that is why it
+  // is carried in the progress image rather than derived from `position`.
+  std::uint64_t dflash2_position = 0;
   // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
   // One reference is held for as long as this handle lives; `shared_pages`
   // restates its page count so every capacity question here can be answered
