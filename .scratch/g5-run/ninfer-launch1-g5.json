@@ -1,0 +1,62 @@
+{
+  "session": "g5-20260914T140231Z",
+  "label": "reference",
+  "endpoint": "http://127.0.0.1:8080",
+  "engine": "qwen3.8-27b-nvfp4full-v2",
+  "artifact": "F:\\ai\\q38\\ninfer-models\\qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "reference hq-e8-2b, max-context 262144, chunk 1024, kv-capacity 465984, graphs+prefix reuse on, --spec dflash2 --draft-tokens 7",
+  "date": "2026-09-14T14:22:32Z",
+  "cells": [
+    {
+      "prompt_tokens": 24576,
+      "max_tokens": 512,
+      "concurrency": 1,
+      "samples": [
+        {
+          "id": "thr-24576-1-0",
+          "ttft_ms": 4831.1137,
+          "total_ms": 8781.0109,
+          "n_tokens": 512,
+          "ok": true,
+          "computed_prefill_tokens": 24576,
+          "void": false
+        }
+      ],
+      "aggregate_tok_s": 129.37045551463976
+    },
+    {
+      "prompt_tokens": 100352,
+      "max_tokens": 512,
+      "concurrency": 1,
+      "samples": [
+        {
+          "id": "thr-100352-1-0",
+          "ttft_ms": 36536.090899999996,
+          "total_ms": 42037.1839,
+          "n_tokens": 512,
+          "ok": true,
+          "computed_prefill_tokens": 100352,
+          "void": false
+        }
+      ],
+      "aggregate_tok_s": 92.89063100732878
+    },
+    {
+      "prompt_tokens": 200704,
+      "max_tokens": 512,
+      "concurrency": 1,
+      "samples": [
+        {
+          "id": "thr-200704-1-0",
+          "ttft_ms": 109627.54789999999,
+          "total_ms": 114430.2804,
+          "n_tokens": 512,
+          "ok": true,
+          "computed_prefill_tokens": 200704,
+          "void": false
+        }
+      ],
+      "aggregate_tok_s": 106.39776418944813
+    }
+  ]
+}
