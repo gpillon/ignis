@@ -31,6 +31,7 @@
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE is set on this test
 // (kernel/tests/CMakeLists.txt), so a missing/busy GPU fails it, never skips.
 
+#include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 #include "ignis_seq_prefix_internal.h"
@@ -390,6 +391,67 @@ void check_a_claimant_receives_the_mutable_state() {
   ignis_seq_pool_free(pool);
 }
 
+// P5-03 (GitHub #152): on a pool with the DFlash2 drafter, the device clone
+// carries the drafter's window and its checkpoint like any other CLONE
+// section -- a sibling's window is the publisher's at the prefix's end.
+std::vector<unsigned char> lane_image_of(const ninfer::CyclicKVCache &cache, std::int32_t slot) {
+  std::vector<unsigned char> image(cache.lane_host_bytes());
+  cache.copy_lane_to_host(slot, image.data(), nullptr);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  return image;
+}
+
+void fill_lane(ninfer::CyclicKVCache &cache, std::int32_t slot, std::uint32_t seed) {
+  const std::vector<unsigned char> host = pattern(cache.lane_host_bytes(), seed);
+  cache.copy_lane_from_host(host.data(), slot, nullptr);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+}
+
+void check_a_claimant_receives_the_drafter_window() {
+  ignis_seq_pool_spec spec  = small_spec();
+  spec.speculative_backend  = IGNIS_SPECULATIVE_DFLASH2;
+  ignis_seq_pool *pool      = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "drafter clone: pool create");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "drafter clone: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x61u);
+  fill_lane(*pool->dflash2_window, publisher->slot, 0x62u);
+  fill_lane(*pool->dflash2_checkpoint, publisher->slot, 0x63u);
+  publisher->dflash2_position = kPrefix;
+  const std::vector<unsigned char> window     = lane_image_of(*pool->dflash2_window, publisher->slot);
+  const std::vector<unsigned char> checkpoint = lane_image_of(*pool->dflash2_checkpoint, publisher->slot);
+  const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, publisher->slot);
+
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0,
+            "drafter clone: publish");
+  const std::uint64_t lane_bytes = pool->dflash2_lane_bytes();
+  expect(stats_of(prefix, "drafter clone: prefix stats").clone_image_bytes >= 2 * lane_bytes,
+         "drafter clone: the prefix's device image holds both drafter lanes");
+
+  // The publisher's drafter moves on past the prefix.
+  fill_lane(*pool->dflash2_window, publisher->slot, 0x71u);
+  fill_lane(*pool->dflash2_checkpoint, publisher->slot, 0x72u);
+  publisher->dflash2_position = kPrefix + kPageTokens;
+
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "drafter clone: claim");
+  expect(lane_image_of(*pool->dflash2_window, claimant->slot) == window,
+         "drafter clone: the sibling's window equals the publisher's at the prefix's end");
+  expect(lane_image_of(*pool->dflash2_checkpoint, claimant->slot) == checkpoint,
+         "drafter clone: the sibling's checkpoint equals the publisher's at the prefix's end");
+  expect(mutable_image_of(*pool, claimant->slot) == at_boundary,
+         "drafter clone: the rest of the mutable state still clones");
+  expect(claimant->dflash2_position == kPrefix,
+         "drafter clone: the sibling's drafter frontier is the prefix's end");
+
+  ignis_seq_release(pool, claimant);
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_pool_free(pool);
+}
+
 // ---- 3. a page is freed only when the last holder releases ----------------
 
 void check_the_last_holder_frees_the_pages() {
@@ -595,6 +657,7 @@ int main() {
 
   check_publish_shares_pages_and_charges_once();
   check_a_claimant_receives_the_mutable_state();
+  check_a_claimant_receives_the_drafter_window();
   check_the_last_holder_frees_the_pages();
   check_refusals();
   report_clone_cost();

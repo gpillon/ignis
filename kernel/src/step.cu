@@ -19,8 +19,10 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 
@@ -354,6 +356,129 @@ bool validate_program(const ignis_model *model, const ignis_seq_pool *pool,
   return true;
 }
 
+// P5-03 (GitHub #152): the drafter's weights come with the model and its
+// per-sequence window with the pool, so the two must have been built for the
+// same speculative backend. A drafter-bearing model over a plain pool would
+// have no window to write; a plain model over a drafter pool would leave
+// every window unwritten while snapshots carry it as if it were state. Either
+// is refused by name before any device work.
+bool dflash2_matches_load(const ignis_model *model, const ignis_seq_pool *pool, const char *op) {
+  if (pool->speculative_backend == model->speculative_backend) {
+    return true;
+  }
+  set_error(std::string(op) + ": the sequence pool was built for speculative backend " +
+            std::to_string(pool->speculative_backend) + ", this model was loaded with " +
+            std::to_string(model->speculative_backend) +
+            "; the drafter's weights and its per-sequence window come as a pair");
+  return false;
+}
+
+// The first absolute position of a prefill span whose target features reach
+// the drafter's window: the span's last kIgnisDflash2WindowTokens positions,
+// or all of it when it is shorter. Anything earlier would be overwritten in
+// the ring before the span ends, so it is never tapped or projected -- which
+// is what bounds the drafter's TTFT cost by the window, not by the prompt.
+std::uint64_t dflash2_tap_from(std::uint64_t span_start, std::uint64_t num_tokens) {
+  return span_start + num_tokens -
+         std::min<std::uint64_t>(num_tokens, kIgnisDflash2WindowTokens);
+}
+
+// `dst` ([rows, T]) receives rows [first_row, first_row + rows) of every
+// column of `src` ([*, T]), device to device, in one strided copy.
+void copy_bf16_rows(ninfer::Tensor &dst, const ninfer::Tensor &src, std::int32_t first_row,
+                    cudaStream_t stream) {
+  const auto *from = static_cast<const std::uint8_t *>(src.data) +
+                     static_cast<std::size_t>(first_row) * sizeof(std::uint16_t);
+  const cudaError_t err = cudaMemcpy2DAsync(
+      dst.data, static_cast<std::size_t>(dst.nb[1]), from, static_cast<std::size_t>(src.nb[1]),
+      static_cast<std::size_t>(dst.ne[0]) * sizeof(std::uint16_t),
+      static_cast<std::size_t>(dst.ne[1]), cudaMemcpyDeviceToDevice, stream);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemcpy2DAsync(bf16 rows) failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+void copy_i32_to_device(ninfer::Tensor &dst, const std::int32_t *src, std::size_t count,
+                        cudaStream_t stream) {
+  const cudaError_t err = cudaMemcpyAsync(dst.data, src, count * sizeof(std::int32_t),
+                                          cudaMemcpyHostToDevice, stream);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemcpyAsync(i32) failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+// P5-03 (GitHub #152): the drafter's context append over one chunk's feature
+// taps -- the reference's `dflash2_append_context`, for one lane. `features`
+// is BF16 [5 x hidden, count]: the target's layer-5/19/33/47/61 outputs for
+// positions `host_scalars[2..]`, concatenated per column. They are projected
+// (`feature_projection`) and normalized (`context_norm`) once; every drafter
+// layer then evaluates its fused query/key/value parent over that context,
+// keeps the key and value rows, normalizes and ropes the keys (the drafter's
+// own unscaled base-1e7 table, at absolute positions) and appends both into
+// the slot's lane of the window, where position p lands in ring slot p mod
+// 2048. `host_scalars` is [count, lane, positions...] and must outlive the
+// caller's synchronize: every copy here is enqueued on the model's stream.
+//
+// No workspace: the A16 `linear` overload needs none, and the drafter's
+// NVFP4 matrices are weight-only (P5-02), so A16 is the only route they have.
+void append_dflash2_context(ignis_model *model, ignis_seq_pool *pool,
+                            const ninfer::Tensor &features, const std::int32_t *host_scalars,
+                            std::int32_t count) {
+  const cudaStream_t stream     = model->stream;
+  const auto hidden             = static_cast<std::int32_t>(model->hidden);
+  const std::int32_t head_dim   = kIgnisDflash2HeadDim;
+  const std::int32_t kv_heads   = kIgnisDflash2KvHeads;
+  const std::int32_t kv_width   = head_dim * kv_heads;
+  const auto query_size         = static_cast<std::int32_t>(kDflash2QuerySize);
+  const Dflash2Weights &weights = model->dflash2;
+
+  ninfer::Tensor commit_count = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
+  ninfer::Tensor lane         = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
+  ninfer::Tensor positions    = model->scratch->alloc(ninfer::DType::I32, {count, 1, 1, 1});
+  copy_i32_to_device(commit_count, host_scalars, 1, stream);
+  copy_i32_to_device(lane, host_scalars + 1, 1, stream);
+  copy_i32_to_device(positions, host_scalars + 2, static_cast<std::size_t>(count), stream);
+
+  ninfer::Tensor projected = model->scratch->alloc(ninfer::DType::BF16, {hidden, count, 1, 1});
+  ninfer::ops::linear(features, weights.feature_projection, projected, stream);
+  const ninfer::Tensor context_norm(const_cast<void *>(weights.context_norm.qdata),
+                                    ninfer::DType::BF16, {hidden, 1, 1, 1});
+  ninfer::Tensor context = model->scratch->alloc(ninfer::DType::BF16, {hidden, count, 1, 1});
+  ninfer::ops::rmsnorm(projected, context_norm, kDflash2RmsEps, /*unit_offset=*/false, context,
+                       stream);
+
+  static const ninfer::ops::RopeFrequencies frequencies =
+      ninfer::ops::rope_linear_frequencies(kDflash2RopeTheta, head_dim);
+  const ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope{
+      static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)};
+  for (std::size_t layer = 0; layer < kDflash2Layers; ++layer) {
+    ninfer::DeviceArena::Scope layer_scope = model->scratch->scope();
+    const Dflash2LayerWeights &w = weights.layers[layer];
+    ninfer::Tensor qkv =
+        model->scratch->alloc(ninfer::DType::BF16, {query_size + 2 * kv_width, count, 1, 1});
+    ninfer::ops::linear(context, w.query_key_value, qkv, stream);
+    ninfer::Tensor key_raw = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
+    ninfer::Tensor key     = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
+    ninfer::Tensor value   = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
+    copy_bf16_rows(key_raw, qkv, query_size, stream);
+    copy_bf16_rows(value, qkv, query_size + kv_width, stream);
+
+    const ninfer::Tensor key_norm(const_cast<void *>(w.key_norm.qdata), ninfer::DType::BF16,
+                                  {head_dim, 1, 1, 1});
+    ninfer::Tensor key_heads = key.view({head_dim, kv_heads, count});
+    ninfer::ops::rmsnorm(key_raw.view({head_dim, kv_heads, count}), key_norm, kDflash2RmsEps,
+                         /*unit_offset=*/false, key_heads, stream);
+    ninfer::ops::rope(positions.view({count}), head_dim, frequencies, key_heads,
+                      ninfer::ops::RopeSide::Key, stream);
+    ninfer::ops::kv_cache_append_prefix(
+        key.view({head_dim, kv_heads, count, 1}), value.view({head_dim, kv_heads, count, 1}),
+        positions.view({count, 1}), commit_count.view({1}), lane.view({1}), envelope,
+        pool->dflash2_window->layer_view(static_cast<std::uint32_t>(layer)), stream);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GitHub #92, acceptance criterion 1: where per-chunk prefill wall time goes.
 //
@@ -566,13 +691,27 @@ private:
 // a kernel error (message set via set_error, naming `chunk_offset` and
 // `seq`); the caller is responsible for not advancing `seq`'s position
 // state when this returns -1.
+//
+// P5-03 (GitHub #152): on a pool with the drafter, the chunk also taps the
+// target's layer-5/19/33/47/61 outputs for its positions at or past
+// `dflash2_tap_from` into chunk-scoped scratch and appends their projected
+// context to the drafter's window before the same synchronization, so the
+// window and the sequence's other sections complete together.
 int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
-                          bool compute_output, const ignis_sampling_params &sampling,
-                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode) {
+                          uint64_t dflash2_tap_from, bool compute_output,
+                          const ignis_sampling_params &sampling, int32_t *out_token_id,
+                          float *out_logits, LinearPolicyMode mode) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
+  // The chunk's own columns the drafter taps: [tap_first, T).
+  const std::uint64_t chunk_start = seq->position;
+  const std::int32_t tap_first =
+      dflash2_tap_from > chunk_start
+          ? static_cast<std::int32_t>(std::min<std::uint64_t>(dflash2_tap_from - chunk_start, num_tokens))
+          : 0;
+  const std::int32_t tap_count = pool->has_dflash2() ? T - tap_first : 0;
   // GitHub #92 criterion 1: inert unless IGNIS_CHUNK_PROFILE is set.
   ChunkProfiler &profiler = ChunkProfiler::instance();
   profiler.ensure_events(model->layers.size());
@@ -592,6 +731,22 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor left = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
     ninfer::Tensor right = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
     ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
+
+    // P5-03 (GitHub #152): the feature taps, never persisted and never a
+    // section -- the scratch scope above frees them with the chunk.
+    ninfer::Tensor features;
+    std::vector<std::int32_t> dflash2_scalars;
+    if (tap_count > 0) {
+      features = model->scratch->alloc(
+          ninfer::DType::BF16,
+          {static_cast<std::int32_t>(kDflash2TapLayers.size()) * hidden, tap_count, 1, 1});
+      dflash2_scalars.reserve(static_cast<std::size_t>(tap_count) + 2);
+      dflash2_scalars.push_back(tap_count);
+      dflash2_scalars.push_back(seq->slot);
+      for (std::int32_t i = 0; i < tap_count; ++i) {
+        dflash2_scalars.push_back(static_cast<std::int32_t>(chunk_start + tap_first + i));
+      }
+    }
 
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
@@ -614,6 +769,30 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       profiler.record_layer_end(layer, model->stream);
       std::swap(left, right);
       ++dispatches;
+      if (tap_count > 0) {
+        // `left` is this layer's output now. Tap j occupies rows
+        // [j * hidden, (j + 1) * hidden) of every feature column.
+        const auto tap = std::find(kDflash2TapLayers.begin(), kDflash2TapLayers.end(), layer);
+        if (tap != kDflash2TapLayers.end()) {
+          const auto j = static_cast<std::size_t>(tap - kDflash2TapLayers.begin());
+          const std::size_t row_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+          err = cudaMemcpy2DAsync(
+              static_cast<std::uint8_t *>(features.data) + j * row_bytes,
+              static_cast<std::size_t>(features.nb[1]),
+              static_cast<const std::uint8_t *>(left.data) +
+                  static_cast<std::size_t>(tap_first) * row_bytes,
+              static_cast<std::size_t>(left.nb[1]), row_bytes, static_cast<std::size_t>(tap_count),
+              cudaMemcpyDeviceToDevice, model->stream);
+          if (err != cudaSuccess) {
+            set_error("ignis_program_prefill: feature tap at layer " + std::to_string(layer) +
+                      " failed: " + cudaGetErrorString(err));
+            return -1;
+          }
+        }
+      }
+    }
+    if (tap_count > 0) {
+      append_dflash2_context(model, pool, features, dflash2_scalars.data(), tap_count);
     }
     profiler.record_head_begin(model->stream);
 
@@ -701,6 +880,9 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
             static_cast<std::uint32_t>(num_tokens);
       }
     }
+    if (tap_count > 0) {
+      seq->dflash2_position = chunk_start + num_tokens;
+    }
     model->last_step_kernel_count = dispatches;
     return 0;
   } catch (const std::exception &e) {
@@ -726,14 +908,15 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     LinearPolicyMode mode) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
+  const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
   uint64_t offset = 0;
   while (offset < num_tokens) {
     const uint64_t chunk_len = std::min<uint64_t>(chunk_width, num_tokens - offset);
     const bool is_last_chunk = (offset + chunk_len == num_tokens);
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
-    if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, is_last_chunk,
-                          sampling, &successor, slot_logits, mode) != 0) {
+    if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
+                          is_last_chunk, sampling, &successor, slot_logits, mode) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -801,6 +984,9 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                                            const struct ignis_prefill_options *options,
                                            float *out_logits) {
   if (!validate_program(model, pool, seq, token_ids, num_tokens, sampling)) {
+    return -1;
+  }
+  if (!dflash2_matches_load(model, pool, "ignis_program_prefill")) {
     return -1;
   }
   if (seq->position != start_position) {
@@ -1208,6 +1394,9 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
               " exceeds IGNIS_DECODE_MAX_BATCH (" + std::to_string(IGNIS_DECODE_MAX_BATCH) + ")");
     return -1;
   }
+  if (!dflash2_matches_load(model, pool, "ignis_program_decode")) {
+    return -1;
+  }
   for (uint64_t i = 0; i < batch_size; ++i) {
     if (!sampling_size_ok(sampling[i])) {
       set_error("ignis_program_decode: unrecognized ignis_sampling_params size " +
@@ -1435,10 +1624,11 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
       model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
       model->decode_graph_slots->bytes;
-  // P5-02 (GitHub #150): the drafter's window pool, present only under a
-  // speculative load -- its weights are already in `model->vram_bytes`.
-  if (model->dflash2_window != nullptr) {
-    out_stats->vram_bytes += model->dflash2_window->bytes + model->dflash2_checkpoint->bytes;
+  // P5-02 (GitHub #150) / P5-03 (GitHub #152): the drafter's window and its
+  // checkpoint, one lane per slot of a pool built with the drafter -- its
+  // weights are already in `model->vram_bytes`.
+  if (pool->has_dflash2()) {
+    out_stats->vram_bytes += pool->dflash2_arena->capacity();
   }
   // P5-04 (GitHub #153): the verify substrate's own buffers, records and
   // accept scratch, present only under a draft window (its traversal scratch

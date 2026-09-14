@@ -328,12 +328,17 @@ bool bind_dflash2(ModelBinder &binder, const Geometry &g, Dflash2Weights &w) {
                      w.selector_successor);
 }
 
-// One lane's drafter window: BF16 K and V for every layer across the sliding
-// window (40 MiB at the module's geometry).
-std::size_t dflash2_window_lane_bytes() {
-  return static_cast<std::size_t>(kDflash2Layers) * kDflash2WindowTokens * kDflash2KvHeads *
-         kDflash2HeadDim * 2 * sizeof(std::uint16_t);
-}
+// P5-03 (GitHub #152): the drafter's window lives in the sequence pool, one
+// lane per slot (kernel/src/seq.cu), and the context append in step.cu writes
+// the query/key/value widths below into it -- the three places must agree.
+static_assert(kDflash2Layers == kIgnisDflash2Layers &&
+                  kDflash2WindowTokens == kIgnisDflash2WindowTokens &&
+                  kDflash2KvHeads == kIgnisDflash2KvHeads &&
+                  kDflash2HeadDim == kIgnisDflash2HeadDim,
+              "the drafter geometry bound here has drifted from the sequence pool's window");
+static_assert(kDflash2FeatureTaps == static_cast<int64_t>(kDflash2TapLayers.size()) &&
+                  kDflash2QueryHeads * kDflash2HeadDim == kDflash2QuerySize,
+              "the drafter geometry bound here has drifted from step.cu's context append");
 
 // ---------------------------------------------------------------------------
 // P2-01 (GitHub #83): the program scratch reservation.
@@ -619,6 +624,34 @@ std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topol
   return verify;
 }
 
+// P5-03 (GitHub #152): what one prefill chunk adds to the program scratch on
+// a load with the DFlash2 drafter -- the feature taps and the context append
+// kernel/src/step.cu runs over them (`append_dflash2_context`), in the order
+// it allocates them. A chunk taps at most the span's last window of
+// positions, so no buffer here is wider than kIgnisDflash2WindowTokens
+// columns. The taps are live across the target layers and the rest after
+// them, so the sum is conservative rather than exact; one drafter layer's
+// buffers are live at a time.
+std::size_t dflash2_prefill_scratch_bytes(const ignis_topology &topology, std::int32_t chunk) {
+  const auto hidden = static_cast<int64_t>(topology.hidden);
+  const int64_t columns =
+      std::min<int64_t>(chunk, static_cast<int64_t>(kIgnisDflash2WindowTokens));
+  const int64_t kv_width = kDflash2KvHeads * kDflash2HeadDim;
+
+  std::size_t bytes = 0;
+  bytes += bf16_bytes(kDflash2FeatureTaps * hidden * columns); // features
+  bytes += i32_bytes(columns);                                 // positions
+  bytes += i32_bytes(1);                                       // commit count
+  bytes += i32_bytes(1);                                       // lane
+  bytes += bf16_bytes(hidden * columns);                       // projected
+  bytes += bf16_bytes(hidden * columns);                       // context
+  bytes += bf16_bytes((kDflash2QuerySize + 2 * kv_width) * columns); // query_key_value
+  bytes += bf16_bytes(kv_width * columns);                     // key_raw
+  bytes += bf16_bytes(kv_width * columns);                     // key
+  bytes += bf16_bytes(kv_width * columns);                     // value
+  return bytes;
+}
+
 } // namespace
 
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
@@ -790,6 +823,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     scratch_bytes = compute_program_scratch_bytes(
         *model, *topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
         cache_dtype, /*batch=*/1);
+    if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+      scratch_bytes += dflash2_prefill_scratch_bytes(
+          *topology, static_cast<std::int32_t>(prefill_chunk_tokens));
+    }
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: prefill scratch sizing failed: ") + e.what());
     cudaStreamDestroy(model->stream);
@@ -880,22 +917,6 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;
-  }
-
-  // P5-02 (GitHub #150): the drafter's per-lane window pool and its rewrite
-  // checkpoint, reserved once for every decode lane.
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
-    try {
-      const std::size_t pool_bytes = dflash2_window_lane_bytes() * IGNIS_DECODE_MAX_BATCH;
-      model->dflash2_window = std::make_unique<ninfer::DeviceBuffer>(pool_bytes);
-      model->dflash2_checkpoint = std::make_unique<ninfer::DeviceBuffer>(pool_bytes);
-    } catch (const std::exception &e) {
-      set_error(std::string("ignis_model_load: dflash2 window pool allocation failed: ") +
-                e.what());
-      cudaStreamDestroy(model->stream);
-      model->stream = nullptr;
-      return -1;
-    }
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, for either windowed

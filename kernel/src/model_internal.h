@@ -68,6 +68,15 @@ struct Dflash2LayerWeights {
 
 inline constexpr std::size_t kDflash2Layers = 5;
 
+// P5-03 (GitHub #152): the target layers whose outputs the drafter consumes,
+// in the order their features are concatenated (5 x 5120 = the
+// `feature_projection` input width), and the constants the context append
+// (kernel/src/step.cu) projects them with -- the reference's `DFlash2Config`.
+inline constexpr std::array<std::uint32_t, 5> kDflash2TapLayers{5, 19, 33, 47, 61};
+inline constexpr std::int64_t kDflash2QuerySize = 4096; // 32 query heads x 128
+inline constexpr float kDflash2RmsEps          = 1.0e-6F;
+inline constexpr float kDflash2RopeTheta       = 1.0e7F;
+
 struct Dflash2Weights {
   ninfer::Weight feature_projection;
   ninfer::Weight context_norm;
@@ -254,17 +263,14 @@ struct ignis_model {
   uint64_t last_step_graph_launches = 0;
 
   // P5-02 (GitHub #150): speculation, chosen at load. Under
-  // IGNIS_SPECULATIVE_DFLASH2, `dflash2` is bound and the drafter's window
-  // pool is allocated: one BF16 K+V window per lane in `dflash2_window` and
-  // its rewrite checkpoint in `dflash2_checkpoint`, each
-  // `IGNIS_DECODE_MAX_BATCH` lanes wide. Both stay null without the option,
-  // so the VRAM report does not move. The ticket that runs the drafter lays
-  // its own structure over these reservations.
+  // IGNIS_SPECULATIVE_DFLASH2, `dflash2` is bound and the prefill scratch
+  // carries the drafter's context append. The drafter's window and its
+  // rewrite checkpoint are per-sequence state, so they live in the sequence
+  // pool, one lane per slot (P5-03, GitHub #152, `ignis_seq_pool`); a pool
+  // built without the same backend is refused by the program entry points.
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   Dflash2Weights dflash2{};
-  std::unique_ptr<ninfer::DeviceBuffer> dflash2_window;
-  std::unique_ptr<ninfer::DeviceBuffer> dflash2_checkpoint;
 
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
   // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,

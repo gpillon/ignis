@@ -3,7 +3,7 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-09-12
-- Last verified: 2026-09-12
+- Last verified: 2026-09-14
 - Scope: kernel / sequence state transfer, KV-RAM host tier
 - Related: [GitHub #124](https://github.com/gpillon/ignis/issues/124),
   [GitHub #125](https://github.com/gpillon/ignis/issues/125),
@@ -107,6 +107,42 @@ the decision does not turn on the difference.
   at all on this link.
 - **A faster host would change the number, not the conclusion.** On a Gen 5
   x16 board the same copies would land near the ADR's 21 ms.
+
+### Re-verified 2026-09-14 with the DFlash2 drafter's sections (GitHub #152)
+
+A pool built with the DFlash2 drafter adds two state sections per sequence,
+its window and the window's rewrite checkpoint, 40 MiB each (5 layers x 2048
+positions x 8 KV heads x 128 x K+V, BF16). The snapshot format moved to
+version 2. `kernel/tests/test_seq_snapshot.cpp` now prints the table with and
+without the drafter. Three consecutive runs, RTX 5090, no other process on the
+card, same host and link as above:
+
+| sequence | blob | snapshot (mean) | restore (mean) |
+| --- | ---: | ---: | ---: |
+| 128 tokens | 148.89 MiB | 16.5 ms | 16.3 ms |
+| 128 tokens, dflash2 | 228.89 MiB | 27.6 ms | 26.2 ms |
+| 40,960 tokens | 507.76 MiB | 56.0 ms | 49.3 ms |
+| 40,960 tokens, dflash2 | 587.76 MiB | 68.8 ms | 65.1 ms |
+
+**Observed.** The blob grows by exactly 83,886,080 bytes (2 x 40 MiB) at every
+length. The leaf's own test asserts it. The first payload offset reserves
+room for all seven section records, so the two extra records cost no
+alignment padding.
+
+**Observed.** Paired per run, the drafter adds a median of ~7 ms to a snapshot
+and ~6 to 12 ms to a restore. That matches 80 MiB at the ~10 to 11 GB/s this
+link ran at. One of the three runs was slower across every cell (7 to 8
+GB/s), which pulls up the means above but not the medians. All rates this
+session were ~15% below the 2026-09-12 readings. The link speed is what
+changed; nothing in the blob layout did.
+
+**Implications.** Spec 05's estimate (+80 MiB, ~+7 ms per direction) holds. The
+snapshot floor goes from 149 MiB to 229 MiB. At the default 2 GiB host budget
+(`--kv-host-pool-bytes`), that is ~8.9 short sequences instead of ~13.7.
+Whether to raise the budget is the operator's call (spec 05); this finding
+does not change it. The asymmetry that justifies the host tier is unaffected.
+A drafter-bearing 40,960-token round trip is still ~130 ms, against a
+re-prefill that now also re-runs the drafter's context append.
 
 ## Limits and unknowns
 

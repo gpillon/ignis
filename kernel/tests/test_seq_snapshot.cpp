@@ -29,6 +29,7 @@
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE is set on this test
 // (kernel/tests/CMakeLists.txt), so a missing/busy GPU fails it, never skips.
 
+#include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_internal.h"
 #include "ignis_seq_sections.h"
@@ -91,6 +92,30 @@ void fill_device(void *dst, std::size_t bytes, std::uint32_t seed) {
   CUDA_CHECK(cudaMemcpy(dst, host.data(), bytes, cudaMemcpyHostToDevice));
 }
 
+// One slot's lane of a drafter cache (P5-03, GitHub #152), packed the way its
+// state section packs it.
+std::vector<unsigned char> lane_image_of(const ninfer::CyclicKVCache &cache, std::int32_t slot) {
+  std::vector<unsigned char> image(cache.lane_host_bytes());
+  cache.copy_lane_to_host(slot, image.data(), nullptr);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  return image;
+}
+
+void fill_lane(ninfer::CyclicKVCache &cache, std::int32_t slot, std::uint32_t seed) {
+  const std::vector<unsigned char> host = pattern(cache.lane_host_bytes(), seed);
+  cache.copy_lane_from_host(host.data(), slot, nullptr);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+}
+
+bool all_zero(const std::vector<unsigned char> &bytes) {
+  for (unsigned char b : bytes) {
+    if (b != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Put `seq` at a completed chunk boundary `tokens` in: the program frontier
 // and every layer's own, GDN included (a GDN layer's state is updated in
 // place, so its counter is the only thing that can say it has consumed the
@@ -129,6 +154,11 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
   }
   fill_device(pool.token_counts_for(seq.slot),
               static_cast<std::size_t>(pool.vocab) * sizeof(std::int32_t), ++salt);
+  if (pool.has_dflash2()) {
+    fill_lane(*pool.dflash2_window, seq.slot, ++salt);
+    fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
+    seq.dflash2_position = tokens;
+  }
 }
 
 // The whole blob for `seq`, sized by the leaf's own query.
@@ -193,6 +223,11 @@ ignis_seq_pool_spec qwen38_27b_spec(int32_t kv_format, std::uint32_t context_tok
   spec.gdn_value_heads     = 48;
   spec.gdn_head_dim        = 128;
   spec.vocab               = 248320;
+  return spec;
+}
+
+ignis_seq_pool_spec with_drafter(ignis_seq_pool_spec spec) {
+  spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
   return spec;
 }
 
@@ -624,8 +659,9 @@ void check_pinned_alloc() {
 // be measured rather than assumed. Both directions are timed over pinned
 // host memory -- the transport the host tier uses (GitHub #125) -- at a
 // short and a full-context sequence of the real 27B geometry.
-void report_transfer_cost(std::uint32_t context_tokens, const char *label) {
-  const ignis_seq_pool_spec spec = qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, context_tokens, 1);
+void report_transfer_cost(std::uint32_t context_tokens, const char *label, bool drafter) {
+  const ignis_seq_pool_spec plain = qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, context_tokens, 1);
+  const ignis_seq_pool_spec spec  = drafter ? with_drafter(plain) : plain;
   ignis_seq_pool *pool           = nullptr;
   if (ignis_seq_pool_create(&spec, &pool) != 0) {
     std::fprintf(stderr, "FAIL: cost (%s): pool create: %s\n", label, ignis_seq_last_error());
@@ -670,15 +706,180 @@ void report_transfer_cost(std::uint32_t context_tokens, const char *label) {
   restore_ms /= kReps;
 
   const double mib = static_cast<double>(bytes) / (1024.0 * 1024.0);
-  std::printf("transfer cost %s (%u tokens, hq-e8-2b): %.2f MiB, snapshot %.2f ms (%.1f GB/s), "
+  std::printf("transfer cost %s (%u tokens, hq-e8-2b%s): %.2f MiB, snapshot %.2f ms (%.1f GB/s), "
               "restore %.2f ms (%.1f GB/s)\n",
-              label, context_tokens, mib, snapshot_ms,
+              label, context_tokens, drafter ? ", dflash2" : "", mib, snapshot_ms,
               static_cast<double>(bytes) / (snapshot_ms * 1e6), restore_ms,
               static_cast<double>(bytes) / (restore_ms * 1e6));
 
   CUDA_CHECK(cudaFreeHost(pinned));
   ignis_seq_release(pool, seq);
   ignis_seq_pool_free(pool);
+}
+
+// ---- 6. the drafter's sections (P5-03, GitHub #152) -------------------------
+
+// The DFlash2 window and its rewrite checkpoint are two CLONE sections of a
+// pool built with the drafter. This is the G3 caveat's "re-earn the
+// snapshot-point permission by test": the sections are listed with their
+// sizes, the blob carries the slot's lanes, a whole sequence round-trips with
+// them byte-identical, and a blob from the other kind of pool is refused
+// both ways with the target untouched.
+void check_drafter_sections() {
+  const std::uint64_t lane_bytes = static_cast<std::uint64_t>(kIgnisDflash2Layers) *
+                                   kIgnisDflash2WindowTokens * kIgnisDflash2KvHeads *
+                                   kIgnisDflash2HeadDim * 2 * sizeof(std::uint16_t);
+  expect(lane_bytes == 40ULL * 1024 * 1024, "drafter: a lane is 40 MiB");
+
+  {
+    ignis_seq_pool_spec unknown = small_spec();
+    unknown.speculative_backend = 7;
+    ignis_seq_pool *refused     = nullptr;
+    expect_rc(ignis_seq_pool_create(&unknown, &refused), -1,
+              "drafter: an unknown speculative backend is refused");
+    expect(refused == nullptr, "drafter: nothing is built on a refusal");
+  }
+
+  // P5-04 (GitHub #153): a verify-only pool is a valid backend with no
+  // per-slot state -- the same sections and snapshot bytes as a plain pool,
+  // and a plain blob restores into it.
+  {
+    const ignis_seq_pool_spec plain_spec = small_spec();
+    ignis_seq_pool_spec verify_spec      = small_spec();
+    verify_spec.speculative_backend      = IGNIS_SPECULATIVE_VERIFY_ONLY;
+    ignis_seq_pool *plain                = nullptr;
+    ignis_seq_pool *verify               = nullptr;
+    expect_rc(ignis_seq_pool_create(&plain_spec, &plain), 0, "verify-only: plain pool create");
+    expect_rc(ignis_seq_pool_create(&verify_spec, &verify), 0, "verify-only: pool create");
+    expect(verify->speculative_backend == IGNIS_SPECULATIVE_VERIFY_ONLY,
+           "verify-only: the pool names its backend");
+    expect(!verify->has_dflash2(), "verify-only: no drafter state");
+    ignis_seq *plain_seq  = nullptr;
+    ignis_seq *verify_seq = nullptr;
+    expect_rc(ignis_seq_alloc(plain, 128, &plain_seq), 0, "verify-only: plain alloc");
+    expect_rc(ignis_seq_alloc(verify, 128, &verify_seq), 0, "verify-only: alloc");
+    give_history(*plain, *plain_seq, 100, 0x71u);
+    give_history(*verify, *verify_seq, 100, 0x71u);
+    const std::uint32_t pages = ignis_seq_snapshot_page_count(*verify_seq);
+    expect(ignis_seq_section_table(*verify, pages).size() == kIgnisSeqSectionCount,
+           "verify-only: no drafter section");
+    std::uint64_t plain_bytes  = 0;
+    std::uint64_t verify_bytes = 0;
+    expect_rc(ignis_seq_snapshot_size(plain, plain_seq, &plain_bytes), 0, "verify-only: plain size");
+    expect_rc(ignis_seq_snapshot_size(verify, verify_seq, &verify_bytes), 0, "verify-only: size");
+    expect(verify_bytes == plain_bytes, "verify-only: the snapshot is a plain pool's size");
+    const std::vector<unsigned char> plain_blob = snapshot_of(*plain, *plain_seq, "verify-only: plain snapshot");
+    ignis_seq_release(verify, verify_seq);
+    ignis_seq *target = nullptr;
+    expect_rc(ignis_seq_alloc(verify, 128, &target), 0, "verify-only: alloc target");
+    expect_rc(ignis_seq_restore(verify, target, plain_blob.data(), plain_blob.size()), 0,
+              "verify-only: a plain blob restores");
+    ignis_seq_release(verify, target);
+    ignis_seq_release(plain, plain_seq);
+    ignis_seq_pool_free(verify);
+    ignis_seq_pool_free(plain);
+  }
+
+  const ignis_seq_pool_spec plain_spec   = small_spec();
+  const ignis_seq_pool_spec drafter_spec = with_drafter(small_spec());
+  ignis_seq_pool *plain                  = nullptr;
+  ignis_seq_pool *drafter                = nullptr;
+  expect_rc(ignis_seq_pool_create(&plain_spec, &plain), 0, "drafter: plain pool create");
+  expect_rc(ignis_seq_pool_create(&drafter_spec, &drafter), 0, "drafter: drafter pool create");
+  expect(!plain->has_dflash2(), "drafter: a plain pool carries no drafter state");
+  expect(drafter->dflash2_lane_bytes() == lane_bytes,
+         "drafter: the pool's lane is the window's geometry");
+
+  ignis_seq *plain_seq   = nullptr;
+  ignis_seq *drafter_seq = nullptr;
+  expect_rc(ignis_seq_alloc(plain, 128, &plain_seq), 0, "drafter: plain alloc");
+  expect_rc(ignis_seq_alloc(drafter, 128, &drafter_seq), 0, "drafter: drafter alloc");
+  expect(all_zero(lane_image_of(*drafter->dflash2_window, drafter_seq->slot)) &&
+             all_zero(lane_image_of(*drafter->dflash2_checkpoint, drafter_seq->slot)),
+         "drafter: a fresh sequence's window and checkpoint are zero");
+  give_history(*plain, *plain_seq, 100, 0x61u);
+  give_history(*drafter, *drafter_seq, 100, 0x61u);
+  const std::vector<unsigned char> window     = lane_image_of(*drafter->dflash2_window, drafter_seq->slot);
+  const std::vector<unsigned char> checkpoint = lane_image_of(*drafter->dflash2_checkpoint, drafter_seq->slot);
+  expect(window != checkpoint, "drafter: the window and the checkpoint hold different bytes");
+
+  // The table lists the two sections, in blob order, with their sizes.
+  const std::uint32_t pages                     = ignis_seq_snapshot_page_count(*drafter_seq);
+  const std::vector<ignis_seq_section> sections = ignis_seq_section_table(*drafter, pages);
+  expect(ignis_seq_section_table(*plain, pages).size() == kIgnisSeqSectionCount,
+         "drafter: a plain pool lists no drafter section");
+  expect(sections.size() == kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount,
+         "drafter: a drafter pool lists both drafter sections");
+  const std::int32_t want_kind[] = {IGNIS_SEQ_SECTION_KV_PAGES,       IGNIS_SEQ_SECTION_GDN_CONV,
+                                    IGNIS_SEQ_SECTION_GDN_RECURRENT,  IGNIS_SEQ_SECTION_PENALTY_COUNTS,
+                                    IGNIS_SEQ_SECTION_DFLASH_WINDOW,  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT,
+                                    IGNIS_SEQ_SECTION_PROGRESS};
+  for (std::size_t i = 0; i < sections.size() && i < 7; ++i) {
+    expect(sections[i].kind == want_kind[i], "drafter: section kind in blob order");
+  }
+  if (sections.size() == 7) {
+    expect(sections[4].transfer == IGNIS_SEQ_SECTION_CLONE &&
+               sections[5].transfer == IGNIS_SEQ_SECTION_CLONE,
+           "drafter: both drafter sections are cloned per sequence");
+    expect(sections[4].bytes == lane_bytes && sections[5].bytes == lane_bytes,
+           "drafter: each drafter section is one lane");
+  }
+
+  // The snapshot grows by exactly the two lanes.
+  std::uint64_t plain_bytes   = 0;
+  std::uint64_t drafter_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(plain, plain_seq, &plain_bytes), 0, "drafter: plain size");
+  expect_rc(ignis_seq_snapshot_size(drafter, drafter_seq, &drafter_bytes), 0,
+            "drafter: drafter size");
+  expect(drafter_bytes - plain_bytes == 2 * lane_bytes,
+         "drafter: ignis_seq_snapshot_size grows by exactly 2 x the window's bytes");
+  std::printf("snapshot size with the drafter: %llu B, without: %llu B (+%llu B)\n",
+              static_cast<unsigned long long>(drafter_bytes),
+              static_cast<unsigned long long>(plain_bytes),
+              static_cast<unsigned long long>(drafter_bytes - plain_bytes));
+
+  // The blob carries the slot's lanes and the drafter frontier.
+  const std::vector<unsigned char> blob = snapshot_of(*drafter, *drafter_seq, "drafter: snapshot");
+  if (sections.size() == 7 && blob.size() == drafter_bytes) {
+    expect(std::memcmp(blob.data() + sections[4].offset, window.data(), window.size()) == 0,
+           "drafter: the window section is the slot's window lane");
+    expect(std::memcmp(blob.data() + sections[5].offset, checkpoint.data(), checkpoint.size()) == 0,
+           "drafter: the checkpoint section is the slot's checkpoint lane");
+    ignis_seq_progress_image progress{};
+    std::memcpy(&progress, blob.data() + sections[6].offset, sizeof(progress));
+    expect(progress.dflash2_position == 100, "drafter: the progress image carries the drafter frontier");
+  }
+
+  // Snapshot -> release -> restore into a fresh handle.
+  ignis_seq_release(drafter, drafter_seq);
+  ignis_seq *target = nullptr;
+  expect_rc(ignis_seq_alloc(drafter, 128, &target), 0, "drafter: alloc target");
+  expect(all_zero(lane_image_of(*drafter->dflash2_window, target->slot)),
+         "drafter: the fresh target's window is zero before the restore");
+  expect_rc(ignis_seq_restore(drafter, target, blob.data(), blob.size()), 0, "drafter: restore");
+  expect(lane_image_of(*drafter->dflash2_window, target->slot) == window,
+         "drafter: the restored window is byte-identical");
+  expect(lane_image_of(*drafter->dflash2_checkpoint, target->slot) == checkpoint,
+         "drafter: the restored checkpoint is byte-identical");
+  expect(target->dflash2_position == 100, "drafter: the restored drafter frontier");
+  expect(snapshot_of(*drafter, *target, "drafter: re-snapshot") == blob,
+         "drafter: the restored sequence snapshots to the same bytes");
+
+  // A blob from the other kind of pool is refused both ways, target untouched.
+  const std::vector<unsigned char> plain_blob = snapshot_of(*plain, *plain_seq, "drafter: plain snapshot");
+  expect_refused(drafter, target, plain_blob, plain_blob.size(),
+                 "drafter: a blob without the drafter is refused by a pool with it");
+  expect(std::string(ignis_seq_last_error()).find("dflash2") != std::string::npos,
+         "drafter: the refusal names the drafter");
+  expect_refused(plain, plain_seq, blob, blob.size(),
+                 "drafter: a blob with the drafter is refused by a pool without it");
+  expect(std::string(ignis_seq_last_error()).find("dflash2") != std::string::npos,
+         "drafter: the reverse refusal names the drafter");
+
+  ignis_seq_release(drafter, target);
+  ignis_seq_release(plain, plain_seq);
+  ignis_seq_pool_free(drafter);
+  ignis_seq_pool_free(plain);
 }
 
 } // namespace
@@ -703,14 +904,20 @@ int main() {
   check_round_trip(small_spec(), 128, 100, "bf16, small geometry");
   check_round_trip(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2), 256, 200,
                    "hq-e8-2b, 27B geometry");
+  check_round_trip(with_drafter(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2)), 256, 200,
+                   "hq-e8-2b, 27B geometry, dflash2");
   check_refusals();
   check_both_formats();
   check_pinned_alloc();
+  check_drafter_sections();
   // 128 tokens is the "short sequence" the spec prices at the snapshot's
   // floor (the GDN slot plus the conv taps and the penalty-count row);
-  // 40,960 is the engine's own default context, where KV dominates.
-  report_transfer_cost(128, "short");
-  report_transfer_cost(40960, "full-context");
+  // 40,960 is the engine's own default context, where KV dominates. Each
+  // again with the DFlash2 drafter's window and checkpoint (spec 05: +80 MiB).
+  report_transfer_cost(128, "short", false);
+  report_transfer_cost(40960, "full-context", false);
+  report_transfer_cost(128, "short", true);
+  report_transfer_cost(40960, "full-context", true);
 
   if (failures != 0) {
     std::fprintf(stderr, "sequence snapshot test: %d check(s) failed\n", failures);

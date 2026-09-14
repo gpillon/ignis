@@ -84,12 +84,23 @@ const TOTAL: usize = 24;
 /// the width and however many columns per lane (GitHub #111's counter).
 const LAYERS: u64 = 64;
 
+/// A pool for a plain load.
 fn new_pool(slot_count: u32) -> SeqPool {
-    new_pool_in(KvFormat::Bf16, slot_count)
+    pool_for(KvFormat::Bf16, slot_count, None)
 }
 
-fn new_pool_in(kv_format: KvFormat, slot_count: u32) -> SeqPool {
-    SeqPool::create(
+/// A pool for a verify-only load: the program entry points pair a pool with
+/// a model of the same speculative backend (P5-03, GitHub #152).
+fn verify_pool(slot_count: u32) -> SeqPool {
+    verify_pool_in(KvFormat::Bf16, slot_count)
+}
+
+fn verify_pool_in(kv_format: KvFormat, slot_count: u32) -> SeqPool {
+    pool_for(kv_format, slot_count, Some(SpeculativeBackend::VerifyOnly))
+}
+
+fn pool_for(kv_format: KvFormat, slot_count: u32, backend: Option<SpeculativeBackend>) -> SeqPool {
+    SeqPool::create_with_speculation(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
             kv_format,
@@ -97,6 +108,7 @@ fn new_pool_in(kv_format: KvFormat, slot_count: u32) -> SeqPool {
             max_context_tokens: MAX_CONTEXT,
             slot_count,
         },
+        backend,
     )
     .unwrap_or_else(|e| panic!("seq pool create: {e}"))
 }
@@ -297,7 +309,7 @@ fn assert_near_tie(kv_format: KvFormat, model: &Model, prompt: &[i32], agreed: &
     let mut tokens = prompt.to_vec();
     tokens.extend_from_slice(agreed);
     let gap = |route: PrefillRoute| {
-        let pool = new_pool_in(kv_format, 1);
+        let pool = verify_pool_in(kv_format, 1);
         let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
         let mut logits = vec![0f32; vocab];
         prefill_program_with_route(model, &pool, &mut seq, &tokens, 0, route, Some(&mut logits))
@@ -421,7 +433,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     // --- AC 1: greedy spec-on == spec-off at widths 1 and 4, both drafters -
     let model = load_verify(&reader, &artifact, &handles);
     for width in [1usize, 4] {
-        let pool = new_pool(width as u32);
+        let pool = verify_pool(width as u32);
         let capture = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
         let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert!(capture.is_ready(width as u32), "width {width}: no decode graph");
@@ -477,7 +489,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     drop(pool);
     drop(model);
     let model = load_verify(&reader, &artifact, &handles);
-    let pool = new_pool(4);
+    let pool = verify_pool(4);
     let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
     let oracle = run_verify(&model, &pool, &prompts8[..4], peaked, Drafter::Oracle(&peaked_streams), &[], TOTAL, true);
     let agreed = assert_equivalent(KvFormat::Bf16, &model, &prompts8[..4], &peaked_streams, &oracle.emitted, "top_k=1 sampling");
@@ -520,7 +532,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     // pending, and a prefix published at the cut continuing the same text on
     // a claimant.
     let model = load_verify(&reader, &artifact, &handles);
-    let pool = new_pool(3);
+    let pool = verify_pool(3);
     let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
     let mut exercised = false;
     for (stop_at, (prompt, stream)) in (1..=6usize).zip(page_prompts.iter().zip(&page_streams)) {
@@ -610,13 +622,13 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     for width in 1..=8usize {
         let prompts = &prompts8[..width];
         let model = load_verify(&reader, &artifact, &handles);
-        let eager_pool = new_pool(width as u32);
+        let eager_pool = verify_pool(width as u32);
         let eager = run_verify(&model, &eager_pool, prompts, greedy, Drafter::Random, &[], TOTAL, false);
         drop(eager_pool);
         drop(model);
 
         let model = load_verify(&reader, &artifact, &handles);
-        let graph_pool = new_pool(width as u32);
+        let graph_pool = verify_pool(width as u32);
         let _ = capture_decode_graphs(&model, &graph_pool).unwrap_or_else(|e| panic!("capture: {e}"));
         let stats = program_stats(&model, &graph_pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "width {width}: no verify graph");
@@ -631,7 +643,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     {
         const WIDTH: usize = 2;
         let model = load_verify(&reader, &artifact, &handles);
-        let pool = new_pool(WIDTH as u32 + 1);
+        let pool = verify_pool(WIDTH as u32 + 1);
         let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
         let two_rounds = |interleave: bool| -> Vec<Vec<Vec<i32>>> {
             let mut lanes: Vec<Seq<'_>> = (0..WIDTH)
@@ -690,7 +702,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     let hq = KvFormat::HqE8_2b;
     {
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let pool = new_pool_in(hq, 4);
+        let pool = verify_pool_in(hq,4);
         let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("hq capture: {e}"));
         let nothing = run_verify(&model, &pool, &prompts8[..4], greedy, Drafter::Nothing, &[], TOTAL, true);
         let own = run_verify(&model, &pool, &prompts8[..4], greedy, Drafter::Oracle(&nothing.emitted), &[], TOTAL, true);
@@ -704,13 +716,13 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     for width in 1..=8usize {
         let prompts = &prompts8[..width];
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let eager_pool = new_pool_in(hq, width as u32);
+        let eager_pool = verify_pool_in(hq,width as u32);
         let eager = run_verify(&model, &eager_pool, prompts, greedy, Drafter::Random, &[], TOTAL, false);
         drop(eager_pool);
         drop(model);
 
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let graph_pool = new_pool_in(hq, width as u32);
+        let graph_pool = verify_pool_in(hq,width as u32);
         let _ = capture_decode_graphs(&model, &graph_pool).unwrap_or_else(|e| panic!("hq capture: {e}"));
         let stats = program_stats(&model, &graph_pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "hq width {width}: no verify graph");

@@ -12,8 +12,10 @@
 //
 // Host-only by construction: a topology with no decoder layers needs three
 // text tensors, and every check below fails at binding -- ahead of the
-// stream, the scratch reservation and the window pool, which are the load's
-// only device calls. The descriptors therefore carry shapes and no planes.
+// stream and the scratch reservation (the drafter's prefill scratch
+// included), which are the load's only device calls; the drafter's window
+// lives in the sequence pool (P5-03, GitHub #152).
+// The descriptors therefore carry shapes and no planes.
 // A load that *succeeds* would touch the device, so no arm here lets one;
 // the "all 66 bound" arm proves the binding completed by failing on an
 // extra tensor appended after them instead.

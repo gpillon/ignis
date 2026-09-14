@@ -3,11 +3,12 @@
 //! Speculative decoding is engine residency, chosen at load and frozen for
 //! the life of that load, as in the reference: a backend and a draft window.
 //! `None` (no [`Speculation`]) is today's engine — the drafter's weights are
-//! not bound and its window pool is not allocated.
+//! not bound and no pool carries its window.
 //!
-//! The drafter's per-lane window pool is sized here as well as in the leaf
-//! (`kernel/src/model.cu`), on purpose: the GPU load test compares the leaf's
-//! reported VRAM against this arithmetic, so the two cannot drift silently.
+//! The drafter's per-slot window and its prefill scratch are sized here as
+//! well as in the leaf (`kernel/src/seq.cu`, `kernel/src/model.cu`), on
+//! purpose: the GPU load test compares the leaf's reported VRAM against this
+//! arithmetic, so the two cannot drift silently.
 
 /// The widest draft window DFlash2 accepts (the reference's `--draft-tokens`
 /// range for the 27B DFlash2 module, spec 05: `1..7`).
@@ -20,9 +21,18 @@ pub const DFLASH2_KV_HEADS: u64 = 8;
 pub const DFLASH2_HEAD_DIM: u64 = 128;
 pub const DFLASH2_WINDOW_TOKENS: u64 = 2048;
 
-/// The lanes a drafter window pool is allocated for: one per decode lane
-/// (`IGNIS_DECODE_MAX_BATCH`, [`crate::N_DECODE_LANES`]).
-pub const DFLASH2_WINDOW_LANES: u64 = crate::N_DECODE_LANES as u64;
+/// The target layers whose outputs feed the drafter (`[5, 19, 33, 47, 61]`),
+/// concatenated into its `feature_projection` input.
+pub const DFLASH2_FEATURE_TAPS: u64 = 5;
+
+/// The drafter's query width (32 heads x 128).
+pub const DFLASH2_QUERY_SIZE: u64 = 4096;
+
+/// The target's hidden width, which the drafter shares.
+const HIDDEN: u64 = 5120;
+
+/// The leaf's scratch-arena allocation alignment (`DeviceArena::alloc_bytes`).
+const ARENA_ALIGN: u64 = 256;
 
 /// A speculative backend a load can select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,24 +104,53 @@ impl Speculation {
         self.draft_tokens
     }
 
-    /// The device bytes the drafter's window pool takes: BF16, layers ×
-    /// window × KV heads × head width × (K + V) per lane — 40 MiB — twice
-    /// with the rewrite checkpoint, for every decode lane. Independent of the
-    /// draft window. Zero for [`SpeculativeBackend::VerifyOnly`], which binds
-    /// no drafter.
-    pub fn window_pool_bytes(&self) -> u64 {
+    /// The device bytes the drafter's per-sequence state takes in a pool of
+    /// `slot_count` slots: BF16, layers × window × KV heads × head width ×
+    /// (K + V) per slot — 40 MiB — twice with the rewrite checkpoint.
+    /// Independent of the draft window. The state lives in the sequence pool
+    /// (P5-03, GitHub #152), one lane per slot, because snapshot, restore and
+    /// prefix clone carry it with the rest of a sequence. Zero for
+    /// [`SpeculativeBackend::VerifyOnly`], which binds no drafter.
+    pub fn window_pool_bytes(&self, slot_count: u32) -> u64 {
         match self.backend {
             SpeculativeBackend::VerifyOnly => 0,
             SpeculativeBackend::Dflash2 => {
                 let bf16 = 2;
-                let per_lane = DFLASH2_LAYERS
+                let per_slot = DFLASH2_LAYERS
                     * DFLASH2_WINDOW_TOKENS
                     * DFLASH2_KV_HEADS
                     * DFLASH2_HEAD_DIM
                     * 2
                     * bf16;
-                let with_checkpoint = 2 * per_lane;
-                DFLASH2_WINDOW_LANES * with_checkpoint
+                let with_checkpoint = 2 * per_slot;
+                u64::from(slot_count) * with_checkpoint
+            }
+        }
+    }
+
+    /// What a `prefill_chunk_tokens`-wide chunk adds to the leaf's prefill
+    /// scratch under this backend (`dflash2_prefill_scratch_bytes`,
+    /// `kernel/src/model.cu`): the feature taps, their projection and
+    /// normalization, and one drafter layer's query/key/value parent with the
+    /// key and value rows kept from it — each at most one window of columns
+    /// wide, each rounded to the arena's alignment.
+    pub fn prefill_scratch_bytes(&self, prefill_chunk_tokens: u32) -> u64 {
+        match self.backend {
+            // No drafter bound, nothing tapped (P5-04, GitHub #153).
+            SpeculativeBackend::VerifyOnly => 0,
+            SpeculativeBackend::Dflash2 => {
+                let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                let i32 = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                let columns = u64::from(prefill_chunk_tokens).min(DFLASH2_WINDOW_TOKENS);
+                let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
+                bf16(DFLASH2_FEATURE_TAPS * HIDDEN * columns)
+                    + i32(columns)
+                    + i32(1)
+                    + i32(1)
+                    + bf16(HIDDEN * columns)
+                    + bf16(HIDDEN * columns)
+                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+                    + 3 * bf16(kv_width * columns)
             }
         }
     }
@@ -150,21 +189,36 @@ mod tests {
     }
 
     #[test]
-    fn verify_only_takes_the_same_window_rule_and_no_window_pool() {
+    fn verify_only_takes_the_same_window_rule_and_no_drafter_state() {
         let spec = Speculation::new(SpeculativeBackend::VerifyOnly, 7).expect("in range");
         assert_eq!(spec.draft_tokens(), 7);
         assert_eq!(spec.backend().abi_code(), 2);
-        assert_eq!(spec.window_pool_bytes(), 0, "no drafter, no window pool");
+        assert_eq!(spec.window_pool_bytes(8), 0, "no drafter, no window pool");
+        assert_eq!(spec.prefill_scratch_bytes(128), 0, "no drafter, no prefill taps");
         let err = Speculation::new(SpeculativeBackend::VerifyOnly, 8).expect_err("out of range");
         assert!(err.contains("1..7"), "{err}");
     }
 
     #[test]
-    fn the_dflash2_window_pool_is_80_mib_per_lane_for_eight_lanes() {
-        // Spec 05: 40 MiB per lane, x2 with the checkpoint, 640 MiB for eight.
+    fn the_dflash2_window_pool_is_80_mib_per_slot() {
+        // Spec 05: 40 MiB per sequence, x2 with the checkpoint, 640 MiB for
+        // the server's eight slots.
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        assert_eq!(spec.window_pool_bytes(), 8 * 80 * 1024 * 1024);
+        assert_eq!(spec.window_pool_bytes(1), 80 * 1024 * 1024);
+        assert_eq!(spec.window_pool_bytes(crate::N_DECODE_LANES as u32), 8 * 80 * 1024 * 1024);
         let narrow = Speculation::new(SpeculativeBackend::Dflash2, 1).unwrap();
-        assert_eq!(narrow.window_pool_bytes(), spec.window_pool_bytes(), "the window does not size the pool");
+        assert_eq!(narrow.window_pool_bytes(8), spec.window_pool_bytes(8), "the window does not size the pool");
+    }
+
+    #[test]
+    fn the_dflash2_prefill_scratch_is_bounded_by_the_window() {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        // 128 columns, worked by hand: taps 6,553,600 + positions 512 + two
+        // scalars 256 each + projected and context 1,310,720 each + qkv
+        // 1,572,864 + key_raw, key, value 262,144 each.
+        assert_eq!(spec.prefill_scratch_bytes(128), 11_535_360);
+        // A chunk wider than the window taps at most the window.
+        assert_eq!(spec.prefill_scratch_bytes(4096), spec.prefill_scratch_bytes(2048));
+        assert!(spec.prefill_scratch_bytes(1024) < spec.prefill_scratch_bytes(2048));
     }
 }
