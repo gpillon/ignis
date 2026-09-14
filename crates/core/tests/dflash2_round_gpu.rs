@@ -347,7 +347,8 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         prefill_all(&model, &pool, std::slice::from_mut(&mut seq), &canaries[..1]);
         let drafts = [canaries[0][0]];
         let refused = decode_program_verify_rounds(&model, &pool, &mut [&mut seq], &[VerifyLane::greedy(&drafts)], WINDOW);
-        assert!(refused.is_err(), "a DFlash2 load took caller drafts");
+        let refusal = refused.err().expect("a DFlash2 load took caller drafts");
+        assert!(refusal.contains("must be NULL"), "the wrong refusal: {refusal}");
     }
     drop(model);
 
