@@ -78,6 +78,9 @@ pub struct Config {
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
+    /// Serve the Playground under `/ui/` (`--ui`, GitHub #163, ADR 0026).
+    /// Flag-only: no env var, no alias.
+    pub ui: bool,
 }
 
 /// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES`'s default (P4-07,
@@ -138,6 +141,7 @@ pub fn resolve(
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
+    let mut ui = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -156,6 +160,7 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--ui" => ui = true,
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
         i += 1;
@@ -209,6 +214,7 @@ pub fn resolve(
         host_pool_bytes,
         speculation,
         request_timeout_secs,
+        ui,
     }))
 }
 
@@ -439,6 +445,7 @@ fn help_text() -> String {
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
          \n\
@@ -1021,5 +1028,33 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--spec") && text.contains("--draft-tokens"), "{text}");
+    }
+
+    // ── the Playground (GitHub #163, ADR 0026) ───────────────────────────
+
+    #[test]
+    fn the_playground_is_off_by_default_and_on_with_ui() {
+        assert!(!expect_config(resolve(&[], no_env).expect("resolve")).ui);
+        assert!(expect_config(resolve(&args(&["--ui"]), no_env).expect("resolve")).ui);
+    }
+
+    #[test]
+    fn ui_takes_no_value_and_has_no_env_var() {
+        // A bare switch: the next argument is parsed as a flag of its own.
+        let config = expect_config(resolve(&args(&["--ui", "--bind", "b"]), no_env).expect("resolve"));
+        assert!(config.ui);
+        assert_eq!(config.bind, "b");
+
+        let env = env_map(&[("IGNIS_UI", "true")]);
+        assert!(!expect_config(resolve(&[], env).expect("resolve")).ui);
+    }
+
+    #[test]
+    fn help_lists_the_ui_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--ui"), "{text}");
     }
 }

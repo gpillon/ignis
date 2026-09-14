@@ -103,6 +103,7 @@ ignis/
 │   ├── logging/     # structured logging (tracing layers, hotpath lint, trace context)
 │   ├── bench/       # trace-replay harness + gate/canary runner
 │   └── vendor/      # ADR 0010 vendoring tool (manifest, hashes, patch records)
+├── web/             # the Playground: React + Vite page served at /ui/ with --ui (ADR 0026)
 ├── kernel/          # C++/CUDA leaf: program + vendored ops (CMake + nvcc) + build.ps1
 ├── bench/traces/    # recorded load traces (JSONL; only the *.meta.json ship)
 ├── scripts/         # gpu-preflight / gpu-profile / vendor-ninfer (PowerShell)
@@ -167,6 +168,25 @@ The cargo build reuses an already-built `kernel/build/ignis_kernel.lib` when
 present (incremental), so it does not recompile the C++ leaf from scratch each
 time. The resulting binary lands in the workspace target dir — on the MSVC
 triple, `target/x86_64-pc-windows-msvc/debug/ignis-server`.
+
+### 3. Playground (optional)
+
+The Playground (`web/`, React + Vite, ADR 0026) is embedded into `ignis-server`
+only if `web/dist` exists when cargo builds it — cargo never runs npm. Build
+the frontend first (needs Node.js), then the server, then run with `--ui`:
+
+```
+npm --prefix web ci
+npm --prefix web run build
+cargo build --release -p ignis-server
+target\x86_64-pc-windows-msvc\release\ignis-server.exe --ui    # http://127.0.0.1:8000/ui/
+```
+
+A server built without `web/dist` still accepts `--ui` and serves a page with
+these instructions. For frontend work, `npm --prefix web run dev` proxies `/v1`
+and `/metrics` to a running ignis (`IGNIS_URL`, default
+`http://127.0.0.1:8000`); `npm --prefix web run dev:mock` serves a fake engine
+instead, so no GPU is needed.
 
 ```
 cargo test          # workspace-wide, CPU-only and fast — never touches the GPU
@@ -246,6 +266,7 @@ full, always-current table.
 | `IGNIS_KV_FORMAT` | `--kv-format <fmt>` | — | `hq-e8-2b` | The KV cache format for this load: `hq-e8-2b` (the serving default) or `bf16` (retained, and the format every correctness oracle runs against) — ADR 0022. Decides what a pool byte budget is worth in tokens. |
 | `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | auto (4 GiB) | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context` fails the load by name. |
 | `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
+| — | `--ui` | — | off | Serve the Playground at `/ui/` (flag only, no env var — ADR 0026). |
 | — | `--help` | `-h` | — | Print the flag table and exit. |
 | — | `--version` | `-V` | — | Print the crate version and exit. |
 
@@ -267,6 +288,7 @@ a one-line readiness note (`model <id> on http://<bind>`) when ready.
 | `/v1/models` | GET | The loaded model. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
+| `/ui/` | GET | The Playground page — only with `--ui`. |
 
 Errors use OpenAI's `{"error": {message, type, code}}` body with the matching
 status: 400 bad request, 404 unknown model, 413 oversized request, 503 engine

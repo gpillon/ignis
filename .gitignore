@@ -6,7 +6,7 @@ kernel/build-b/
 kernel/build-c/
 kernel/build-119/
 
-# webui (later phase)
+# the Playground frontend (web/, ADR 0026): dependencies and build output
 node_modules/
 dist/
 

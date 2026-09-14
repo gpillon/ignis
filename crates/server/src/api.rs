@@ -56,13 +56,18 @@ use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
 /// emitted from inside the span (including this handler's own tail) gets
 /// the request's real `trace_id` (`ignis_logging::trace_context`).
 pub fn router(state: Arc<Server>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/v1/models", get(list_models).options(cors_preflight))
         .route(
             "/v1/chat/completions",
             post(chat_completions).options(cors_preflight),
         )
-        .route("/v1/responses", post(responses_api).options(cors_preflight))
+        .route("/v1/responses", post(responses_api).options(cors_preflight));
+    // The Playground (GitHub #163): present only when `--ui` gave it assets.
+    if let Some(assets) = state.playground {
+        router = router.merge(crate::playground::router(assets));
+    }
+    router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))
         .with_state(state)
