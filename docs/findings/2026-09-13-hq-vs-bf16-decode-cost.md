@@ -5,7 +5,7 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: runtime / KV format, decode throughput, GPU utilization
-- Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [ADR 0020](../adr/0020-batch-wide-decode-round.md), [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md), [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [ITL lane terminator race](2026-09-13-itl-lane-terminator-race.md)
+- Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [ADR 0020](../adr/0020-batch-wide-decode-round.md), [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md), [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [ITL lane terminator race](2026-09-13-itl-lane-terminator-race.md), [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md) (the same question re-measured under ADR 0015 / ADR 0021)
 - Superseded by: none
 
 ## Question
@@ -171,7 +171,12 @@ same pair.
   launches of one binary (`ignis-g3-launch1/2`), so its +48.5% carries much less
   weight than the ITL percentiles, which repeated to 0.05%.
 - Nothing here is live/live: no reference-engine run shares these sessions, so
-  none of these numbers can decide a gate (ADR 0015).
+  none of these numbers can decide a gate (ADR 0015). **Lifted for the format
+  question by [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md)**,
+  which re-measured the same 2x2 in one session over two launches per cell and
+  reproduced the format cost (ITL p95 -14.5% / -14.3% against -13.5% / -13.0%
+  here). The pool-geometry result below is this document's own and was not
+  re-measured there.
 - Only the 27B NVFP4 artifact on one RTX 5090 was measured.
 - None of these runs is live/live: each engine measured in its own session, so
   no G3 verdict can be computed from them and none of the engine-to-engine

@@ -14,7 +14,7 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 | 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `runtime/specs/02-real-prefill.md` |
 | 3 — serving loop: chunk-level prefill/decode interleaving, batched decode rounds, per-width CUDA graphs, sampling, request log | G3: three cells live/live (ADR 0015) — C=1 ≥ 99% of the live reference, C=4 aggregate ≥ 99%, p95 inter-token latency under a cold 32K prefill within the live envelope; plus the K-agnostic anti-serialization property | #64 | `runtime/specs/03-serving-loop.md` |
 | 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | `runtime/specs/04-reference-feature-floor.md` |
-| 5 — speculative decoding: MTP + ReplaySSM, then DFlash2 | G5: ≥ 99% of reference MTP7-adaptive / DFlash2-7 committed tok/s @24K/98K/196K | #66 | to write when G4 lands |
+| 5 — speculative decoding: the verify round + ReplaySSM fold, then the DFlash2 drafter (MTP deferred) | G5: ≥ 99% of the reference's DFlash2-7 committed tok/s @24K/98K/196K, live/live, pooled over two launches, run once at phase end; greedy spec-on == spec-off as the correctness floor | #66 | `runtime/specs/05-speculative-decoding.md` |
 | 6 — beyond the reference (north star) | per-item gates | — | concurrent prefill / prefill-decode overlap, PDL + fusion, lazy graphs, hot reload, own artifact recipe |
 
 ## Phase 1 decomposition (G1, master #36)
@@ -166,7 +166,7 @@ for prefix reuse). Ticket numbers go in this table when they are published.
 | P4-09 (#120) | Tagged lanes: the class as an ignis extension field, mapped to `RequestClass`, echoed in the request log and carried by the trace | — | Every request's class is attributable in the log; unknown maps to `Interactive` |
 | P4-10 (#126) | Device prefix reuse: leaf-owned page refcount and sharing, device-to-device clone of the mutable sections through the section machinery | P4-06 (#124) | A sibling claiming a prefix produces the same tokens as one that prefilled it; shared pages charged once |
 | P4-11 (#121) | Tool-call stream hardening and preserve-thinking against a real agent session | — | A recorded session's tool-call and thinking streams survive round-trip |
-| P4-12 (#128) | G4 gate run and verdict | all | **Run 2026-09-12: gaps filed (#137, #138, #139, #143, #144, #145), not a waiver.** Full verdict: `.scratch/REVIEW-2026-09-05.md` §6 Phase 4. Dogfood clean; GPU profile green but flaky across attempts (#145). Both engines measured over 2 launches each; the per-class throughput cell is unverified (#137: the bench client ignores `reasoning_content`), needle@128K fails identically on both engines (#138), and G3-under-hq has only one decidable launch pair (#139 blocks the reference's second), which misses C=1 by a hair and only tolerates ITL (#143). #65 stays open pending #137/#138/#139 and a follow-up two-launch-per-engine session with a fixed harness. |
+| P4-12 (#128) | G4 gate run and verdict | all | **Run 2 (2026-09-13, session `g4-20260913T163557Z`): the gate reaches a verdict on real numbers and fails one cell.** `main` 1.264 PASS, `sub` **0.969 FAIL** (filed **#148**), `aggregate` 1.013 PASS; needle@64K and @128K retrieved on 8 of 8 launch-cells; canary PASS at the serving default (thinking on); dogfood streams intact; the G3-under-hq cells inside their band on both pairs (C=1 0.990/0.982, C=4 3.197/3.836, ITL p95 0.986/1.028). Every gap run 1 filed is closed and was exercised here: #137, #138, #139, #143, #144, #146, #147. A live/live 2x2 over engine and format (8 legs, 2 launches per cell) retires the KV-format inequality with a measurement: `docs/findings/2026-09-13-hq-vs-bf16-live-live.md`. Records: `.scratch/g4-run2/`; full verdict: `.scratch/REVIEW-2026-09-05.md` §6 Phase 4. **Run 1 (2026-09-12): gaps filed (#137, #138, #139, #143, #144, #145), not a waiver** — the per-class cell was unverifiable (#137), needle@128K failed on both engines (#138) and the reference's second G3 leg was unscorable (#139). |
 
 Frontier at start: **#117**, **#118**, **#119**, **#120**, **#121** in
 parallel (P4-01 and P4-09 are Rust only, no GPU; P4-02 needs the owner and the
@@ -179,6 +179,36 @@ more than one active prefill and prefill preemption (built only if the
 per-class TTFT cell fails without them); the exact-key side store (built only
 if long-context retrieval under hq comes back short); a third request class.
 
-## Phase 5 candidate decomposition (not published; refined when the gate before lands)
+## Phase 5 decomposition (G5, master #66)
 
-- **G5**: MTP round + pack + adaptive width + ReplaySSM records/fold · DFlash2 drafter load + draft kernels + RAM-tier carry · G5 gate.
+Tracer bullets from `.scratch/runtime/specs/05-speculative-decoding.md`, cut
+in the grilling session of 2026-09-13 (decisions in
+`.scratch/DEFERRED-DECISIONS.md`, "From the G5 grilling session"). No ADR
+introduced: the round is an options struct on the existing decode entry
+point (ADR 0016), the drafter's state is two sections in ADR 0024's table,
+the backend is a load flag. The session reversed the roadmap's order — the
+DFlash2 drafter ships, MTP is deferred — and decided that the ~1 h gate
+session runs once at the end of the phase, never per ticket.
+
+| # | Ticket | Blocked by | Delivers (verifiable) |
+|---|---|---|---|
+| P5-01 (#149) | Vendor the speculative substrate and the DFlash2 drafter sources (`speculative_round`, `dflash2_draft`, `cyclic_kv_cache`) with their op tests; fix the manifest's stale branch name | — | Leaf builds; vendored op tests green at 27B geometry under the GPU profile |
+| P5-02 (#150) | Speculation as a load option: bind the 66 `dflash2/*` objects, size the drafter's window pool, `ignis-server --spec dflash2 --draft-tokens N` | — | CPU: the binder's plan consumes every drafter object with the option and is byte-identical without it; GPU: VRAM report shows the drafter |
+| P5-03 (#152) | Feature taps (layers 5/19/33/47/61, last 2048 tokens, chunk-scoped scratch) and the two drafter sections (window, checkpoint; `CLONE`) in the section table; blob version bump | P5-01, P5-02 | Snapshot/restore/clone carry the sections byte-identically; a blob without them is refused; the snapshot cost table re-printed (+80 MiB, ~+7 ms) |
+| P5-04 (#153) | The verify round behind `ignis_program_decode` + `ignis_decode_options`: k+1 columns per lane, GDN record mode, hq width-8 verify tile, vendored accept (greedy and T>0), stop-aware commit, KV trim, ReplaySSM fold, one graph per batch width at the window — proven with a **fake drafter** at an internal seam | P5-01 | Greedy spec-on == spec-off on the canaries with an oracle drafter (100% acceptance) and a random drafter (≤ 1/round); sampled equality at a fixed seed; stop cut proven by a claimable prefix; replay == eager at widths 1..8 |
+| P5-05 (#155) | The DFlash2 drafter at that seam: features → dynamic conv → five layers → selector lattice → top-k → walk → next drafts; window and checkpoint advanced per round | P5-02, P5-03, P5-04 | Greedy spec-on == spec-off with the real drafter at widths 1, 4, 8; acceptance per round reported; restore mid-generation continues identically |
+| P5-06 (#154) | The Rust seam carries a run: `DecodeOutcome` with 1..k+1 tokens, `remaining_tokens` and stop ids down to the leaf, one SSE delta per token, `usage` on committed tokens, `spec.rounds/drafted/accepted` in the request log, CLI | P5-04 | Scheduler and server CPU tests over a mock returning runs (EOS mid-run, `max_tokens` mid-run); hotpath lint green; one GPU e2e with `--spec dflash2` |
+| P5-07 (#151) | G5 instrument: `ignis-bench g5` (the `g3` C=1 cell at 24K/98K/196K with the reference's committed-token counter, first token excluded), `g5-gate` (pooling reused from `g4-gate`), the greedy equivalence subcommand | — | Every cell CPU-tested against the stub endpoint; counter unit-tested |
+| P5-08 (#156) | G5 gate run and verdict (human: needs ninfer at the pinned commit and a free card) | all | Records under `.scratch/g5-run/`; verdict in REVIEW §6 Phase 5; every miss filed; #66 closed on the recorded verdict |
+
+Frontier at start: **#149**, **#150**, **#151** in parallel (P5-02's binder
+half and all of P5-07 are Rust only, no GPU; P5-01 needs the leaf's test
+binary).
+Critical path: #149 → #153 → #155 → #156, with #152 (after #149 and #150)
+feeding #155 and #154 (after #153) feeding #156.
+
+Out of the phase, tracked rather than dropped: MTP as a drafter and the
+adaptive window (`DEFERRED-DECISIONS.md` G5 item 1); rebuilding the drafter's
+state on restore (G5 item 2, re-opened on a measured restore rate); the G4
+`sub` cell (**#148**, optimization, beside the phase); packed prefill
+(decided after **#92**); prefill/decode overlap (phase 6).

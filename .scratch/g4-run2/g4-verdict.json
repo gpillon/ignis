@@ -1,0 +1,87 @@
+{
+  "session": "g4-20260913T163557Z",
+  "trace_sha256": "00fd08b810c44ed6ec1a422e4a0c476af786bccdc0219e733d346bd5a0c4ab01",
+  "ours_label": "ignis",
+  "reference_label": "ninfer",
+  "ours_launches": 2,
+  "reference_launches": 2,
+  "threshold": 0.99,
+  "per_class": [
+    {
+      "label": "main",
+      "ours_pooled_tok_s": 31.14689971001591,
+      "reference_pooled_tok_s": 24.646148849285545,
+      "ratio": 1.2637633530692083,
+      "passed": true,
+      "ours_launch_tok_s": [
+        30.48607273813046,
+        31.837010080951536
+      ],
+      "reference_launch_tok_s": [
+        23.853062847785324,
+        25.493786978913935
+      ],
+      "ours_across_launch_spread_pct": 2.167635620244781,
+      "reference_across_launch_spread_pct": 3.324881196855837,
+      "ours_within_launch_spread_pct": 0.0,
+      "reference_within_launch_spread_pct": 0.0,
+      "spread_flagged": true
+    },
+    {
+      "label": "sub",
+      "ours_pooled_tok_s": 26.98866604248141,
+      "reference_pooled_tok_s": 27.85792890545094,
+      "ratio": 0.9687965725693469,
+      "passed": false,
+      "ours_launch_tok_s": [
+        26.417187441285574,
+        27.58541675315161
+      ],
+      "reference_launch_tok_s": [
+        27.087594674724702,
+        28.673360142249777
+      ],
+      "ours_across_launch_spread_pct": 2.1632832884499575,
+      "reference_across_launch_spread_pct": 2.843863547046623,
+      "ours_within_launch_spread_pct": 22.066512549642148,
+      "reference_within_launch_spread_pct": 24.038695559551883,
+      "spread_flagged": false
+    }
+  ],
+  "aggregate": {
+    "label": "aggregate",
+    "ours_pooled_tok_s": 28.037013691401363,
+    "reference_pooled_tok_s": 27.66496653599971,
+    "ratio": 1.0134483139503356,
+    "passed": true,
+    "ours_launch_tok_s": [
+      27.443041826055712,
+      28.65726598860841
+    ],
+    "reference_launch_tok_s": [
+      26.89241132554754,
+      28.483221963985002
+    ],
+    "ours_across_launch_spread_pct": 2.1643805708946733,
+    "reference_across_launch_spread_pct": 2.8727628813198045,
+    "ours_within_launch_spread_pct": 22.815892194698158,
+    "reference_within_launch_spread_pct": 22.862999332787297,
+    "spread_flagged": false
+  },
+  "needles": [
+    {
+      "context_tokens": 65536,
+      "ours_retrieved": true,
+      "reference_retrieved": true,
+      "passed": true
+    },
+    {
+      "context_tokens": 131072,
+      "ours_retrieved": true,
+      "reference_retrieved": true,
+      "passed": true
+    }
+  ],
+  "notes": [],
+  "passed": false
+}

@@ -199,10 +199,11 @@ a symlink into the real store):
 set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
 ```
 
-ignis does not use DFlash2 speculative decoding itself (that is a `ninfer`
-CLI flag, `--spec dflash2`) — for ignis, v2 is used purely because it carries
-the same verified base weights as v1 with nothing removed; the drafter module
-sits unused in the container and costs no VRAM unless materialized.
+The grafted DFlash2 drafter module is what phase 5 (gate G5, GitHub #66,
+spec `.scratch/runtime/specs/05-speculative-decoding.md`) loads for
+speculative decoding. Until that phase lands, ignis binds only the text scope:
+the drafter module sits unused in the container and costs no VRAM unless
+materialized.
 
 ## Usage (in development)
 
