@@ -9,6 +9,11 @@ import type { Plugin } from "vite";
 // "none" or `enable_thinking` false) and stops on a
 // client disconnect; a last user message containing "/error" gets ignis's
 // 503 "engine full" error instead of a stream.
+//
+// Agents: with the `agent` tool declared, a prompt containing "/agents"
+// streams three agent calls (finish "tool_calls"); a request whose last
+// message is a tool result answers from those results; an agent-lane
+// request streams a longer report at its own pace.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -30,7 +35,14 @@ export function mockIgnis(): Plugin {
     configureServer(server) {
       server.middlewares.use("/v1/models", (_req, res) => {
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ object: "list", data: [{ id: "mock-model", object: "model", owned_by: "ignis" }] }));
+        // `max_model_len` (vLLM's name for the context length) feeds the
+        // Playground's context bar, as ignis reports it.
+        res.end(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "mock-model", object: "model", owned_by: "ignis", max_model_len: 40960 }],
+          }),
+        );
       });
 
       server.middlewares.use("/v1/chat/completions", async (req, res) => {
@@ -60,12 +72,35 @@ export function mockIgnis(): Plugin {
           `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
         const thinkingOff = body.reasoning_effort === "none" || body.enable_thinking === false;
         const reasoning = thinkingOff ? [] : ["Thinking ", "about ", "it."];
-        const content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
+        const tools = (body.tools as { function?: { name?: string } }[] | undefined) ?? [];
+        const offersAgents = tools.some((t) => t.function?.name === "agent");
+        const lastRole = messages.at(-1)?.role;
+        let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
+        let calls: { name: string; prompt: string }[] = [];
+        let pace = 120;
+        if (body.class === "agent") {
+          const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
+          content = words.split(/(?<= )/);
+          pace = 70 + Math.floor(Math.random() * 120);
+        } else if (offersAgents && lastRole === "tool") {
+          const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80)}`);
+          content = ["The ", "agents ", "reported ", "back:\n\n", results.join("\n")];
+        } else if (offersAgents && last.includes("/agents")) {
+          content = ["I'll ", "split ", "this ", "into ", "three ", "parts."];
+          calls = ["scheduler", "kv-cache", "telemetry"].map((name) => ({
+            name,
+            prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}`,
+          }));
+        }
+        const completion = reasoning.length + content.length + calls.length;
         const pieces = [
           ...reasoning.map((t) => chunk({ reasoning_content: t })),
           ...content.map((t) => chunk({ content: t })),
-          chunk({}, "stop"),
-          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: reasoning.length + content.length, total_tokens: 12 * messages.length + reasoning.length + content.length } })}\n\n`,
+          ...calls.map((c, index) =>
+            chunk({ tool_calls: [{ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name: "agent", arguments: JSON.stringify(c) } }] }),
+          ),
+          chunk({}, calls.length ? "tool_calls" : "stop"),
+          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: completion, total_tokens: 12 * messages.length + completion } })}\n\n`,
           "data: [DONE]\n\n",
         ];
         let i = 0;
@@ -76,7 +111,7 @@ export function mockIgnis(): Plugin {
             return;
           }
           res.write(pieces[i++]);
-        }, 120);
+        }, pace);
         req.on("close", () => clearInterval(timer));
       });
 

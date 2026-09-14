@@ -5,9 +5,13 @@
 
 export type Usage = { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 
+/** A complete tool call: ignis streams each one whole, in a single delta. */
+export type ToolCall = { id: string; name: string; arguments: string };
+
 export type ChunkEvent =
   | { kind: "reasoning"; text: string }
   | { kind: "content"; text: string }
+  | { kind: "tool_call"; call: ToolCall }
   | { kind: "finish"; reason: string }
   | { kind: "usage"; usage: Usage }
   | { kind: "done" };
@@ -35,7 +39,14 @@ export function createSseParser() {
 }
 
 type WireChunk = {
-  choices?: { delta?: { reasoning_content?: string; content?: string }; finish_reason?: string | null }[];
+  choices?: {
+    delta?: {
+      reasoning_content?: string;
+      content?: string;
+      tool_calls?: { id?: string; function?: { name?: string; arguments?: string } }[];
+    };
+    finish_reason?: string | null;
+  }[];
   usage?: Usage | null;
 };
 
@@ -52,6 +63,11 @@ export function parseChunk(data: string): ChunkEvent[] {
   for (const choice of chunk.choices ?? []) {
     if (choice.delta?.reasoning_content) events.push({ kind: "reasoning", text: choice.delta.reasoning_content });
     if (choice.delta?.content) events.push({ kind: "content", text: choice.delta.content });
+    for (const call of choice.delta?.tool_calls ?? []) {
+      if (call.id && call.function?.name) {
+        events.push({ kind: "tool_call", call: { id: call.id, name: call.function.name, arguments: call.function.arguments ?? "{}" } });
+      }
+    }
     if (choice.finish_reason) events.push({ kind: "finish", reason: choice.finish_reason });
   }
   if (chunk.usage) events.push({ kind: "usage", usage: chunk.usage });

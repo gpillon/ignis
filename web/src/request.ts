@@ -1,6 +1,10 @@
 // The chat request the Playground sends (GitHub #164): ignis's own
 // `POST /v1/chat/completions`, streaming with the usage chunk, plus the
-// thinking effort and the ignis lane tag extension `class`.
+// thinking effort and the ignis lane tag extension `class`. With tools on,
+// it also declares them, and the system message is the ignis prompt (what
+// the tools add, read-only) followed by the owner's own.
+
+import type { ToolCall } from "./sse.ts";
 
 export type LaneTag = "interactive" | "agent";
 
@@ -23,11 +27,26 @@ export type Settings = {
   laneTag: LaneTag;
 };
 
-export type Turn = { role: "user" | "assistant"; content: string };
+/** A turn of the conversation: an assistant turn may call tools, a tool turn answers one call. */
+export type Turn = { role: "user" | "assistant" | "tool"; content: string; toolCalls?: ToolCall[]; toolCallId?: string };
+
+/** An OpenAI function tool, as `tools[]` declares it. */
+export type ToolDefinition = {
+  type: "function";
+  function: { name: string; description: string; parameters: object };
+};
+
+type WireMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  tool_call_id?: string;
+};
 
 export type ChatRequest = {
   model: string;
-  messages: { role: "system" | "user" | "assistant"; content: string }[];
+  messages: WireMessage[];
+  tools?: ToolDefinition[];
   stream: true;
   stream_options: { include_usage: true };
   temperature: number;
@@ -49,7 +68,9 @@ export type Exchange = Turn & { failed: boolean };
  */
 export function conversationTurns(entries: Exchange[]): Turn[] {
   const turns: Turn[] = [];
-  const empty = (e: Exchange | undefined) => e !== undefined && e.role === "assistant" && (e.failed || !e.content);
+  // A reply that only called tools is not empty: its calls are the turn.
+  const empty = (e: Exchange | undefined) =>
+    e !== undefined && e.role === "assistant" && (e.failed || (!e.content && !e.toolCalls?.length));
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     if (entry.role === "user" && empty(entries[i + 1])) {
@@ -57,16 +78,42 @@ export function conversationTurns(entries: Exchange[]): Turn[] {
       continue;
     }
     if (empty(entry)) continue;
-    turns.push({ role: entry.role, content: entry.content });
+    turns.push({
+      role: entry.role,
+      content: entry.content,
+      ...(entry.toolCalls?.length ? { toolCalls: entry.toolCalls } : {}),
+      ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}),
+    });
   }
   return turns;
 }
 
-export function buildChatRequest(settings: Settings, turns: Turn[]): ChatRequest {
-  const system = settings.systemPrompt.trim();
+function wireMessage(turn: Turn): WireMessage {
+  return {
+    role: turn.role,
+    content: turn.content,
+    ...(turn.toolCalls?.length
+      ? {
+          tool_calls: turn.toolCalls.map((c) => ({
+            id: c.id,
+            type: "function" as const,
+            function: { name: c.name, arguments: c.arguments },
+          })),
+        }
+      : {}),
+    ...(turn.toolCallId ? { tool_call_id: turn.toolCallId } : {}),
+  };
+}
+
+/** What the enabled tools add to a request: their prompt, ahead of the owner's, and their definitions. */
+export type ToolExtras = { ignisPrompt?: string; tools?: ToolDefinition[] };
+
+export function buildChatRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
+  const system = [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
   return {
     model: settings.model,
-    messages: [...(system ? [{ role: "system" as const, content: settings.systemPrompt }] : []), ...turns],
+    messages: [...(system ? [{ role: "system" as const, content: system }] : []), ...turns.map(wireMessage)],
+    ...(extras.tools?.length ? { tools: extras.tools } : {}),
     stream: true,
     stream_options: { include_usage: true },
     temperature: settings.temperature,

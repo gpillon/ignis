@@ -25,6 +25,19 @@ function ticking() {
   return () => (t += 10);
 }
 
+describe("streamChat with tool calls", () => {
+  it("passes a tool call on and times it as output", async () => {
+    const events: ChunkEvent[] = [];
+    const call = { index: 0, id: "call_0", type: "function", function: { name: "agent", arguments: '{"prompt":"x"}' } };
+    const body = sse({ tool_calls: [call] }) + sse({}, "tool_calls") + "data: [DONE]\n\n";
+    const result = await streamChat({ body: {}, fetch: fakeFetch([body]), now: ticking(), onEvent: (e) => events.push(e) });
+    expect(result.ok).toBe(true);
+    expect(events[0]).toEqual({ kind: "tool_call", call: { id: "call_0", name: "agent", arguments: '{"prompt":"x"}' } });
+    expect(result.timeline.firstTokenAt).toBeDefined();
+    expect(result.timeline.finishReason).toBe("tool_calls");
+  });
+});
+
 describe("streamChat", () => {
   it("delivers the events in order and records the request's timeline", async () => {
     const events: ChunkEvent[] = [];

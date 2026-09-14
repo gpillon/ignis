@@ -1,15 +1,373 @@
 @import "tailwindcss";
 
-/* The Playground is styled with Tailwind utilities in the components; this
-   file only sets the page ground and the dark scheme (Tailwind's `dark:`
-   variant follows prefers-color-scheme). */
+/* The Playground's look follows the ignis brand: the faceted flame, the
+   chamfered wordmark (45° cuts, echoed by `.cut`), a kiln-charcoal band and
+   the ember orange of the i-dot. Colours are tokens so light and dark
+   schemes (prefers-color-scheme) swap them in one place. */
+
+@theme inline {
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-line: var(--line);
+  --color-ash: var(--ash);
+  --color-ink: var(--ink);
+  --color-ember: var(--ember);
+  --color-fault: var(--fault);
+  --color-kiln: #1c2026;
+  --color-kiln-line: #2e343c;
+  --font-display: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+}
 
 @layer base {
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
+    --ground: #e8eaed;
+    --surface: #f6f7f8;
+    --line: #d2d6db;
+    --ash: #5c646e;
+    --ink: #1f2328;
+    --ember: #e0480f;
+    --fault: #b42318;
+    --heat: linear-gradient(90deg, #c8161d, #ff5a1f 45%, #ff8a2a 60%, #c8161d);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --ground: #272c33;
+      --surface: #30363e;
+      --line: #3e454f;
+      --ash: #939ba4;
+      --ink: #eae8e4;
+      --ember: #ff6a2b;
+      --fault: #ff7b6b;
+    }
   }
 
   body {
-    @apply bg-stone-100 text-stone-900 antialiased dark:bg-stone-950 dark:text-stone-100;
+    @apply bg-ground font-sans text-ink antialiased;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--ember) 35%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ember);
+    outline-offset: 2px;
+  }
+
+  /* Thin scrollbars in the palette: the line colour at rest, ember while the
+     pointer is over the scrolling area. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+  *:hover {
+    scrollbar-color: color-mix(in oklab, var(--ember) 70%, var(--line)) transparent;
+  }
+}
+
+@layer components {
+  /* The wordmark's cut corner, top-left like the i-dot. */
+  .cut {
+    --cut-size: 10px;
+    clip-path: polygon(var(--cut-size) 0, 100% 0, 100% 100%, 0 100%, 0 var(--cut-size));
+  }
+
+  /* The strip under the header: dim at rest, heat running along it while a
+     reply streams. */
+  .heat {
+    height: 2px;
+    background: var(--color-kiln-line);
+  }
+  .heat[data-busy="true"] {
+    background: var(--heat);
+    background-size: 200% 100%;
+    animation: heat 1.4s linear infinite;
+  }
+  @keyframes heat {
+    to {
+      background-position: -200% 0;
+    }
+  }
+
+  .flame[data-busy="true"] {
+    animation: flicker 1.6s ease-in-out infinite;
+  }
+  @keyframes flicker {
+    0%,
+    100% {
+      filter: drop-shadow(0 0 4px rgb(255 90 31 / 0.35));
+    }
+    50% {
+      filter: drop-shadow(0 0 14px rgb(255 90 31 / 0.75));
+    }
+  }
+
+  /* The streaming caret: an ember block at the end of the reply. */
+  .caret {
+    display: inline-block;
+    width: 0.5em;
+    height: 1.05em;
+    margin-left: 2px;
+    vertical-align: -0.15em;
+    background: var(--ember);
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+
+  .range {
+    appearance: none;
+    height: 18px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .range::-webkit-slider-runnable-track {
+    height: 2px;
+    background: linear-gradient(90deg, var(--ember) var(--fill), var(--line) var(--fill));
+  }
+  .range::-moz-range-track {
+    height: 2px;
+    background: linear-gradient(90deg, var(--ember) var(--fill), var(--line) var(--fill));
+  }
+  .range::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    margin-top: -5px;
+    background: var(--ink);
+    clip-path: polygon(4px 0, 100% 0, 100% 100%, 0 100%, 0 4px);
+  }
+  .range::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border: 0;
+    border-radius: 0;
+    background: var(--ink);
+    clip-path: polygon(4px 0, 100% 0, 100% 100%, 0 100%, 0 4px);
+  }
+  .range:focus-visible {
+    outline-offset: 4px;
+  }
+
+  .reasoning > summary {
+    list-style: none;
+  }
+  .reasoning > summary::-webkit-details-marker {
+    display: none;
+  }
+  .reasoning > summary::before {
+    content: "";
+    display: inline-block;
+    width: 0.4em;
+    height: 0.4em;
+    margin-right: 0.5em;
+    vertical-align: 0.15em;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 120ms;
+  }
+  .reasoning[open] > summary::before {
+    transform: rotate(45deg);
+  }
+}
+
+/* Markdown replies (Markdown.tsx). Headings take the display face, code the
+   mono face on the kiln ground in both schemes, list markers the ember. */
+@layer components {
+  .md {
+    font-size: 15px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+  .md > * + * {
+    margin-top: 0.7em;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4,
+  .md h5,
+  .md h6 {
+    margin-top: 1.4em;
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+  }
+  .md > :first-child {
+    margin-top: 0;
+  }
+  .md h1 {
+    font-size: 1.55em;
+  }
+  .md h2 {
+    font-size: 1.3em;
+  }
+  .md h3 {
+    font-size: 1.1em;
+  }
+  .md h4,
+  .md h5,
+  .md h6 {
+    font-size: 1em;
+    color: var(--ash);
+  }
+  .md strong {
+    font-weight: 650;
+  }
+  .md a {
+    color: var(--ember);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+  .md ul,
+  .md ol {
+    padding-left: 1.4em;
+  }
+  .md ul {
+    list-style: square;
+  }
+  .md ol {
+    list-style: decimal;
+  }
+  .md li::marker {
+    color: var(--ember);
+  }
+  .md ol > li::marker {
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 0.9em;
+    color: var(--ash);
+  }
+  .md li + li,
+  .md li > ul,
+  .md li > ol {
+    margin-top: 0.2em;
+  }
+  .md li:has(> input[type="checkbox"]) {
+    margin-left: -1.4em;
+    list-style: none;
+  }
+  .md input[type="checkbox"] {
+    margin-right: 0.5em;
+    accent-color: var(--ember);
+  }
+  .md blockquote {
+    border-left: 2px solid var(--ember);
+    padding-left: 1em;
+    color: var(--ash);
+  }
+  .md hr {
+    border: 0;
+    border-top: 1px solid var(--line);
+  }
+  .md del {
+    color: var(--ash);
+  }
+  .md :not(pre) > code {
+    border-radius: 2px;
+    background: var(--surface);
+    padding: 0.1em 0.35em;
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 0.85em;
+  }
+
+  .md-code {
+    --cut-size: 12px;
+    background: #1c2026;
+    color: #e6e3de;
+  }
+  .md-code-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #2e343c;
+    padding: 0.3em 0.4em 0.3em 1em;
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-size: 12px;
+    color: #939ba4;
+  }
+  .md-code-bar button {
+    padding: 0.2em 0.7em;
+    color: #b9bec4;
+    cursor: pointer;
+  }
+  .md-code-bar button:hover {
+    background: #2e343c;
+    color: #fff;
+  }
+  .md-code pre {
+    overflow-x: auto;
+    padding: 0.9em 1em;
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 13px;
+    line-height: 1.45;
+    overflow-wrap: normal;
+    scrollbar-color: #3a414a transparent;
+  }
+
+  .md-table {
+    overflow-x: auto;
+  }
+  .md table {
+    border-collapse: collapse;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+  .md th {
+    border-bottom: 1px solid var(--line);
+    font-family: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
+    font-weight: 600;
+    text-align: left;
+  }
+  .md th,
+  .md td {
+    padding: 0.45em 0.9em;
+  }
+  .md th:first-child,
+  .md td:first-child {
+    padding-left: 0;
+  }
+  .md tbody tr + tr td {
+    border-top: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+  }
+
+  .md[data-streaming="true"] > :last-child::after {
+    content: "";
+    display: inline-block;
+    width: 0.5em;
+    height: 1.05em;
+    margin-left: 2px;
+    vertical-align: -0.15em;
+    background: var(--ember);
+    animation: blink 1s steps(1) infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .md[data-streaming="true"] > :last-child::after {
+    animation: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .heat[data-busy="true"] {
+    animation: none;
+    background-position: 0 0;
+  }
+  .flame[data-busy="true"] {
+    animation: none;
+    filter: drop-shadow(0 0 10px rgb(255 90 31 / 0.6));
+  }
+  .caret {
+    animation: none;
   }
 }

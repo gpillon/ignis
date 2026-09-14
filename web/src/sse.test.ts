@@ -39,6 +39,13 @@ describe("parseChunk", () => {
     expect(parseChunk(data)).toEqual([{ kind: "usage", usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } }]);
   });
 
+  it("reads a whole tool call from its delta", () => {
+    const call = { index: 0, id: "call_0", type: "function", function: { name: "agent", arguments: '{"prompt":"x"}' } };
+    expect(parseChunk(chunk({ tool_calls: [call] }))).toEqual([
+      { kind: "tool_call", call: { id: "call_0", name: "agent", arguments: '{"prompt":"x"}' } },
+    ]);
+  });
+
   it("recognises the end marker", () => {
     expect(parseChunk("[DONE]")).toEqual([{ kind: "done" }]);
   });

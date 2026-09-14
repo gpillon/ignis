@@ -44,7 +44,7 @@ export async function streamChat(options: StreamOptions): Promise<StreamResult> 
       for (const data of parser.push(value)) {
         const at = now();
         for (const event of parseChunk(data)) {
-          if (event.kind === "reasoning" || event.kind === "content") {
+          if (event.kind === "reasoning" || event.kind === "content" || event.kind === "tool_call") {
             timeline.firstTokenAt ??= at;
             timeline.lastTokenAt = at;
           } else if (event.kind === "finish") {
