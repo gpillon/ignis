@@ -29,7 +29,9 @@
 //! So "spec-on equals spec-off" is checked as: identical streams, or
 //! identical up to a first divergence where the two candidates are a
 //! near-tie *by the engine's own measure* -- its two prefill routes disagree
-//! about which wins, or rate the gap no wider than the spread between them
+//! about which wins, or rate the gap no wider than the spread between them --
+//! or both side with spec-on's pick, spec-off's own batched decode having
+//! drifted (#155 measured a width-4 decode 0.75 logits past both routes)
 //! ([`assert_equivalent`]). The tolerance is never a constant; a real defect
 //! in verify, accept or fold produces a divergence both routes agree on by a
 //! wide margin, and fails.
@@ -61,6 +63,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/near_tie.rs"]
+mod near_tie;
+
 use std::path::Path;
 
 use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader, bind_text_scope_27b, materialize};
@@ -69,10 +74,12 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{Model, load_qwen38_27b, load_qwen38_27b_with_speculation};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    PrefillRoute, SamplingParams, VerifyLane, capture_decode_graphs, decode_program_batch_sampled,
-    decode_program_verify, prefill_program_sampled, prefill_program_with_route, program_stats,
+    SamplingParams, VerifyLane, capture_decode_graphs, decode_program_batch_sampled, decode_program_verify,
+    prefill_program_sampled, program_stats,
 };
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
+
+use near_tie::assert_equivalent;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 128;
@@ -293,61 +300,6 @@ fn run_verify(
     VerifyRun { emitted, rounds }
 }
 
-fn first_divergence(a: &[i32], b: &[i32]) -> Option<usize> {
-    a.iter()
-        .zip(b)
-        .position(|(x, y)| x != y)
-        .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
-}
-
-/// `a` (the spec-off pick) against `b` (the spec-on pick) after `prompt` +
-/// `agreed`, by the engine's own two prefill routes: a near-tie when the
-/// routes disagree about which wins, or rate the gap no wider than the
-/// spread between them. Panics naming both gaps otherwise.
-fn assert_near_tie(kv_format: KvFormat, model: &Model, prompt: &[i32], agreed: &[i32], a: i32, b: i32, what: &str) {
-    let vocab = ModelConfig::qwen38_27b().vocab as usize;
-    let mut tokens = prompt.to_vec();
-    tokens.extend_from_slice(agreed);
-    let gap = |route: PrefillRoute| {
-        let pool = verify_pool_in(kv_format, 1);
-        let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
-        let mut logits = vec![0f32; vocab];
-        prefill_program_with_route(model, &pool, &mut seq, &tokens, 0, route, Some(&mut logits))
-            .unwrap_or_else(|e| panic!("near-tie probe prefill: {e}"));
-        logits[a as usize] - logits[b as usize]
-    };
-    let chunked = gap(PrefillRoute::Chunked);
-    let per_token = gap(PrefillRoute::PerToken);
-    let routes_disagree = (chunked > 0.0) != (per_token > 0.0) || chunked == 0.0 || per_token == 0.0;
-    let within_spread = chunked.abs().min(per_token.abs()) <= (chunked - per_token).abs();
-    assert!(
-        routes_disagree || within_spread,
-        "{what}: spec-on picked {b} where spec-off picked {a} after {} tokens, and it is not a near-tie: \
-         logit[{a}] - logit[{b}] = {chunked} (chunked route), {per_token} (per-token route)",
-        agreed.len()
-    );
-}
-
-/// Spec-on `on` against spec-off `off`, lane by lane: identical, or
-/// identical up to a near-tie divergence ([`assert_near_tie`]). Returns each
-/// lane's agreeing prefix length.
-fn assert_equivalent(kv_format: KvFormat, model: &Model, prompts: &[Vec<i32>], off: &[Vec<i32>], on: &[Vec<i32>], what: &str) -> Vec<usize> {
-    assert_eq!(off.len(), on.len(), "{what}: lane count");
-    prompts
-        .iter()
-        .zip(off.iter().zip(on))
-        .enumerate()
-        .map(|(lane, (prompt, (off, on)))| match first_divergence(off, on) {
-            None => off.len(),
-            Some(d) => {
-                assert!(d < off.len() && d < on.len(), "{what} lane {lane}: one stream ended early at {d}");
-                assert_near_tie(kv_format, model, prompt, &off[..d], off[d], on[d], &format!("{what} lane {lane}"));
-                d
-            }
-        })
-        .collect()
-}
-
 /// The oracle drafter's rounds wholly inside a lane's agreeing prefix must
 /// accept every draft.
 fn assert_oracle_accepts(run: &VerifyRun, agreed: &[usize], what: &str) {
@@ -405,6 +357,8 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     };
     let greedy = SamplingParams::greedy();
     let prompts8: Vec<Vec<i32>> = (0..8).map(prompt_for).collect();
+    // The near-tie probes run on the verify-only loads they judge.
+    let probe = || verify_pool(1);
 
     // --- the spec-off oracle: 8 greedy streams, one token per round -------
     let model = load_plain(&reader, &artifact, &handles);
@@ -445,7 +399,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
         let prompts = &prompts8[..width];
         let off = &streams_at[&width];
         let oracle = run_verify(&model, &pool, prompts, greedy, Drafter::Oracle(off), &[], TOTAL, true);
-        let agreed = assert_equivalent(KvFormat::Bf16, &model, prompts, off, &oracle.emitted, &format!("width {width} oracle"));
+        let agreed = assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &oracle.emitted, &format!("width {width} oracle"));
         assert_oracle_accepts(&oracle, &agreed, &format!("width {width}"));
         // The multi-token commit actually happened.
         assert!(
@@ -454,7 +408,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
         );
 
         let random = run_verify(&model, &pool, prompts, greedy, Drafter::Random, &[], TOTAL, true);
-        assert_equivalent(KvFormat::Bf16, &model, prompts, off, &random.emitted, &format!("width {width} random drafter (rollback)"));
+        assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &random.emitted, &format!("width {width} random drafter (rollback)"));
         for (round, lanes) in random.rounds.iter().enumerate() {
             for &(lane, _, _, accepted) in lanes {
                 assert!(accepted <= 1, "width {width} round {round} lane {lane}: {accepted} random drafts accepted");
@@ -463,7 +417,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
 
         // No proposal at all: today's round, one token each.
         let nothing = run_verify(&model, &pool, prompts, greedy, Drafter::Nothing, &[], TOTAL, true);
-        assert_equivalent(KvFormat::Bf16, &model, prompts, off, &nothing.emitted, &format!("width {width} extent 0"));
+        assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &nothing.emitted, &format!("width {width} extent 0"));
         assert_eq!(nothing.rounds.len(), TOTAL, "width {width}: extent 0 must commit one token per round");
         drop(pool);
     }
@@ -492,10 +446,10 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     let pool = verify_pool(4);
     let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
     let oracle = run_verify(&model, &pool, &prompts8[..4], peaked, Drafter::Oracle(&peaked_streams), &[], TOTAL, true);
-    let agreed = assert_equivalent(KvFormat::Bf16, &model, &prompts8[..4], &peaked_streams, &oracle.emitted, "top_k=1 sampling");
+    let agreed = assert_equivalent(&model, &probe, MAX_CONTEXT, &prompts8[..4], &peaked_streams, &oracle.emitted, "top_k=1 sampling");
     assert_oracle_accepts(&oracle, &agreed, "top_k=1 sampling");
     let random = run_verify(&model, &pool, &prompts8[..4], peaked, Drafter::Random, &[], TOTAL, true);
-    assert_equivalent(KvFormat::Bf16, &model, &prompts8[..4], &peaked_streams, &random.emitted, "top_k=1 sampling, random drafts");
+    assert_equivalent(&model, &probe, MAX_CONTEXT, &prompts8[..4], &peaked_streams, &random.emitted, "top_k=1 sampling, random drafts");
 
     // (b) a wide support: a fixed seed reproduces the stream, and a lane's
     // stream is its own whatever shares its round.
@@ -591,7 +545,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
             .unwrap_or_else(|e| panic!("prefill: {e}"));
         let from_fresh = continue_greedy(&model, &pool, &mut fresh, 8);
         drop(fresh);
-        assert_equivalent(KvFormat::Bf16, &model, &[text], &[from_publisher], &[from_fresh], "a fresh prefill of the emitted text");
+        assert_equivalent(&model, &probe, MAX_CONTEXT, &[text], &[from_publisher], &[from_fresh], "a fresh prefill of the emitted text");
         break;
     }
     assert!(exercised, "no stop candidate reached its stop: the stop-aware commit went unexercised");

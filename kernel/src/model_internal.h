@@ -76,6 +76,13 @@ inline constexpr std::array<std::uint32_t, 5> kDflash2TapLayers{5, 19, 33, 47, 6
 inline constexpr std::int64_t kDflash2QuerySize = 4096; // 32 query heads x 128
 inline constexpr float kDflash2RmsEps          = 1.0e-6F;
 inline constexpr float kDflash2RopeTheta       = 1.0e7F;
+// P5-05 (GitHub #155): the drafter's forward (kernel/src/dflash2_drafter.cu)
+// -- the mask token its query block pads with, the per-column candidates its
+// selector scores, and its attention scale (1/sqrt(128), the one the
+// vendored `swa` admits).
+inline constexpr std::int32_t kDflash2MaskToken    = 248070;
+inline constexpr std::int32_t kDflash2SelectorTopK = 16;
+inline constexpr float kDflash2AttentionScale      = 0.08838834764831845F;
 
 struct Dflash2Weights {
   ninfer::Weight feature_projection;
@@ -139,6 +146,20 @@ struct IgnisVerifyRound {
   // temperature > 0), sized once for `k` drafts across `B` lanes.
   std::unique_ptr<ninfer::DeviceArena> accept_workspace;
 
+  // P5-05 (GitHub #155): the DFlash2 drafter's round buffers, present only on
+  // a load with the drafter (null under VERIFY_ONLY, whose drafts come per
+  // call). `features` holds the traversal's feature taps -- the target's
+  // layer-5/19/33/47/61 outputs for every verify column, concatenated per
+  // column in kDflash2TapLayers order, lane-major like `positions` -- which
+  // the commit appends to each lane's window for its committed columns;
+  // `append_counts` is that column count per lane (0 at extent 0).
+  // `drafter_scratch` backs the drafter's forward (inside the verify graph)
+  // and that append (after it); a graph bakes the forward's addresses, so it
+  // is reserved once here and every call walks it from the same base.
+  std::unique_ptr<ninfer::DeviceBuffer> features;      // BF16 [5 * hidden, (k+1) * B]
+  std::unique_ptr<ninfer::DeviceBuffer> append_counts; // I32 [B]
+  std::unique_ptr<ninfer::DeviceArena> drafter_scratch;
+
   // One verify graph per exact width, captured by
   // `ignis_decode_graph_capture` after the decode graphs.
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> graph_exec{};
@@ -150,13 +171,16 @@ struct IgnisVerifyRound {
          {anchors.get(), drafts.get(), base_positions.get(), extents.get(), valid_columns.get(),
           lengths.get(), verify_ids.get(), positions.get(), target_tokens.get(), logits.get(),
           hidden.get(), licensed_tokens.get(), licensed_counts.get(), accepted.get(),
-          selectors.get(), selected_hidden.get(), records_backing.get()}) {
+          selectors.get(), selected_hidden.get(), records_backing.get(), features.get(),
+          append_counts.get()}) {
       if (buffer != nullptr) {
         bytes += buffer->bytes;
       }
     }
-    if (accept_workspace != nullptr) {
-      bytes += accept_workspace->capacity();
+    for (const auto *arena : {accept_workspace.get(), drafter_scratch.get()}) {
+      if (arena != nullptr) {
+        bytes += arena->capacity();
+      }
     }
     return bytes;
   }

@@ -238,10 +238,15 @@ When output names a domain concept, use the term as defined here.
   BF16 K and V for the last 2048 positions (40 MiB), plus its rewrite
   checkpoint (40 MiB more). Per-sequence state in the sequence pool, one lane
   per slot, and two **state sections** of a pool built with the drafter. A
-  prefill fills it from the **feature taps** of its span's last 2048 positions.
+  prefill fills it from the **feature taps** of its span's last 2048 positions,
+  and each **verify round** appends its **committed run**'s taps; a lane at
+  **extent** 0 leaves it untouched. The checkpoint is the window as the latest
+  prefill left it; nothing reads it yet (the reference restores it when a turn
+  rewrites text past its chat template's rewrite boundary).
 - **Feature taps** — the target's hidden states at layers 5, 19, 33, 47 and 61,
-  concatenated and projected into the drafter's context. Chunk-scoped scratch:
-  never persisted, never a state section.
+  concatenated and projected into the drafter's context. Taken by a prefill
+  chunk and by the verify traversal; scoped to that chunk or round: never
+  persisted, never a state section.
 - **Verify round** — the speculative form of the **decode round** (P5-04): each
   lane contributes `k+1` columns — its anchor (the pending successor) followed
   by the drafts, the tail padded with the anchor — and the 64 layers traverse
@@ -251,8 +256,9 @@ When output names a domain concept, use the term as defined here.
   is today's round. Widths stay exact: one **verify graph** per batch width
   1..8 at the window.
 - **Extent** — the draft columns a lane actually verifies in a round:
-  `min(k, proposed, remaining budget − 1, remaining context − 1)`. Extent 0 is
-  a fallback step inside the same round, one committed token.
+  `min(k, proposed, remaining budget − 1, remaining context − 1)`, where under
+  DFlash2 the drafter always proposes `k`. Extent 0 is a fallback step inside
+  the same round, one committed token.
 - **Committed run** — the tokens a verify round emits for a lane: the anchor
   plus the accepted drafts, cut at the first stop id inclusive (1..k+1). The
   KV frontier, the GDN slot and the pending token move by exactly the run, so
@@ -266,8 +272,10 @@ When output names a domain concept, use the term as defined here.
   conv taps in one vendored call. A rejected draft's transition is recorded
   and never folded — that is the whole rollback.
 - **Drafter** — whatever fills a verify round's proposal seam: **DFlash2**
-  once it is wired into the round, a fake drafter in the substrate's own
-  tests (`verify-only` load: the verify substrate with nothing bound).
+  inside the leaf (P5-05), proposing each lane's drafts from its **drafter
+  window** in the same pass that verifies them, or a fake drafter in the
+  substrate's own tests (`verify-only` load: the verify substrate with nothing
+  bound, the drafts passed per call).
 - **MTP** — the model's native multi-token-prediction heads (draft window 3,
   adaptive verification width).
 - **Vision** — multimodal (image/video) input.
