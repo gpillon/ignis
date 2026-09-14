@@ -93,12 +93,19 @@ Round cost is level (24K: ignis ~30 ms/round, reference ~32 ms); the gap at
 
 | file | main | sub | needles |
 |---|---:|---:|---|
-| `ninfer-launch2-g4trace.json` | 20.3 tok/s | 12.9 tok/s | 64K, 128K RETRIEVED |
+| `ninfer-launch2-g4trace.json` | **62.9** tok/s (record: 20.3) | **57.1** tok/s (record: 12.9) | 64K, 128K RETRIEVED |
 | `ignis-launch2-g4trace.json` | 42.3 tok/s | 61.1 tok/s | 64K, 128K RETRIEVED |
 
-One replay per engine, speculation on both sides, 11/11 requests. These
-figures are not comparable with G4 run 2's (no speculation, and the reader
-counted SSE chunks before #159).
+One replay per engine, speculation on both sides, 11/11 requests.
+**The reference's recorded figures are chunk-counted**: trace replay
+requests do not ask for the usage chunk (`trace.rs`, `include_usage:
+false`), so #159's fix does not reach them and each multi-token DFlash2
+chunk counts once (req-001: 5,165 recorded against the server's
+`gen=16000`). The bold figures re-derive the reference with the server log's
+own `gen=` per request over the record's decode times: main 16,000 tokens /
+254.2 s, sub 49,374 / 865.0 s. ignis streams one token per chunk, so its
+record stands. Informational only: ignis main 0.67, sub 1.07 of the
+reference. The replay path's gap is added to #159.
 
 **Other cells.**
 
@@ -108,6 +115,12 @@ counted SSE chunks before #159).
 | `equivalence-spec-off.json`, `equivalence-spec-on.json` | The two captures: ignis spec-off launch, ignis launch 2. |
 | `equivalence.json` | `g5-equivalence` over them: rust-hello and explain-reverse identical; **rust-sort diverges @44, math-greedy @33** — exit 1. |
 | `g5-verdict.json` | `g5-gate` pooled over the four launches. |
+
+**Session id on every record — not quite.** The `g5`, `g4` and capture
+records and the verdict carry `g5-20260914T140231Z`; `ignis-launch2-canary.json`
+(`canary` takes no `--session`, as in G4 run 2) and `equivalence.json` (a
+list of per-canary comparisons; its two input captures carry the session)
+do not.
 | `*-server.log`, `*.log` | Each launch's engine log and each bench step's own output. |
 
 ## Verdict
@@ -121,7 +134,7 @@ counted SSE chunks before #159).
 | committed tok/s @196K | 117.8 vs 110.8, ratio **1.063** | PASS |
 | greedy equivalence | 2/4 canaries diverge (@44, @33) | FAIL → #161 |
 | canary self-consistency | 4/4 | PASS |
-| G4 trace under speculation | main 42.3 vs 20.3, sub 61.1 vs 12.9 | informational |
+| G4 trace under speculation | main 42.3 vs 62.9, sub 61.1 vs 57.1 (reference re-derived from its log) | informational |
 
 **Reading the depth FAILs.** Both ignis launches agree to the round (198 /
 178 / 82 rounds, identical accepted counts), so the miss is not launch noise.
