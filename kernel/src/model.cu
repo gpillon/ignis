@@ -40,6 +40,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/swa.h"
 
 #include <cuda_runtime.h>
 
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -587,11 +589,15 @@ std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topol
   verify->selectors = i32(lanes);
   verify->selected_hidden = bf16(hidden * lanes);
   // The staging a capture reads before any round refreshed it must still be
-  // a legal input (a valid extent, a real slot): zero is one.
+  // a legal input (a valid extent, a real slot): zero is one. A lane's
+  // anchor column is always valid -- the drafter's query block (P5-05)
+  // admits no fewer than one -- so the valid-column count starts at 1.
   for (auto *buffer : {verify->anchors.get(), verify->drafts.get(), verify->base_positions.get(),
-                       verify->extents.get(), verify->valid_columns.get(), verify->lengths.get()}) {
+                       verify->extents.get(), verify->lengths.get()}) {
     buffer->fill(0);
   }
+  const std::vector<std::int32_t> anchor_only(static_cast<std::size_t>(lanes), 1);
+  verify->valid_columns->copy_from_host(anchor_only.data(), anchor_only.size() * sizeof(std::int32_t));
 
   std::int32_t gdn_layers = 0;
   for (uint32_t i = 0; i < topology.num_layers; ++i) {
@@ -650,6 +656,57 @@ std::size_t dflash2_prefill_scratch_bytes(const ignis_topology &topology, std::i
   bytes += bf16_bytes(kv_width * columns);                     // key
   bytes += bf16_bytes(kv_width * columns);                     // value
   return bytes;
+}
+
+// P5-05 (GitHub #155): the fixed allowance the drafter's round scratch
+// carries for the two vendored workspaces its forward calls into (`swa`,
+// `linear_swiglu`). A constant rather than their queried sizes, so the Rust
+// side (`Speculation::round_scratch_bytes`) states the reservation to the
+// byte; the load refuses if the queries ever outgrow it. `swa`'s split-KV
+// tiling saturates at 32 key tiles from a ~1k context on, where the two
+// queries total just over 16 MiB: 32 MiB covers every context.
+constexpr std::size_t kDflash2RoundWorkspaceBytes = 32 * 1024 * 1024;
+
+// P5-05 (GitHub #155): the activations the drafter's round allocates from
+// `drafter_scratch` (kernel/src/dflash2_drafter.cu) at window `k` across
+// IGNIS_DECODE_MAX_BATCH lanes, in the order it allocates them: its forward
+// -- both blocks of a layer counted together, so the sum is conservative --
+// or the round's context append, whichever is larger.
+std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::int32_t window) {
+  const auto hidden = static_cast<int64_t>(topology.hidden);
+  const auto vocab = static_cast<int64_t>(topology.vocab);
+  const auto intermediate = static_cast<int64_t>(topology.ffn_intermediate);
+  const int64_t columns = static_cast<int64_t>(window + 1) * IGNIS_DECODE_MAX_BATCH;
+  const int64_t drafts = static_cast<int64_t>(window) * IGNIS_DECODE_MAX_BATCH;
+  const int64_t kv_width = kDflash2KvHeads * kDflash2HeadDim;
+  const int64_t top_k = kDflash2SelectorTopK;
+
+  std::size_t forward = 0;
+  forward += i32_bytes(columns) * 2;                                // ids, positions
+  forward += bf16_bytes(hidden * columns);                          // residual
+  forward += bf16_bytes(hidden * columns) * 2;                      // attention: normed, conv
+  forward += bf16_bytes(kDflash2ConvProjRows * columns);            // dynamic
+  forward += bf16_bytes((kDflash2QuerySize + 2 * kv_width) * columns); // query_key_value
+  forward += bf16_bytes(kDflash2QuerySize * columns) * 3;           // query_raw, query, attention
+  forward += bf16_bytes(kv_width * columns) * 3;                    // key_raw, value, key
+  forward += bf16_bytes(hidden * columns) * 2;                      // projected, conv_attention
+  forward += bf16_bytes(hidden * columns) * 2;                      // mlp: normed, conv_hidden
+  forward += bf16_bytes(kDflash2ConvProjRows * columns);            // dynamic
+  forward += bf16_bytes(intermediate * columns);                    // intermediate
+  forward += bf16_bytes(hidden * columns) * 2;                      // projected, conv_projected
+  forward += bf16_bytes(hidden * drafts) * 2;                       // packed, proposal_hidden
+  forward += bf16_bytes(vocab * drafts);                            // logits
+  forward += i32_bytes(top_k * drafts) + bf16_bytes(top_k * drafts); // candidate ids, values
+  forward += fp32_bytes(top_k * drafts) + i32_bytes(top_k * drafts); // unary, predecessors
+  forward += bf16_bytes(kDflash2SelectorRank * drafts);             // hidden_proj
+  forward += fp32_bytes(kDflash2SelectorRank * drafts);             // hidden_proj_f32
+  forward += fp32_bytes(top_k * top_k * drafts);                    // scores
+
+  std::size_t append = 0;
+  append += bf16_bytes(hidden * columns) * 2;                       // projected, context
+  append += bf16_bytes((kDflash2QuerySize + 2 * kv_width) * columns); // query_key_value
+  append += bf16_bytes(kv_width * columns) * 3;                     // key_raw, key, value
+  return std::max(forward, append);
 }
 
 } // namespace
@@ -926,6 +983,38 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->verify = build_verify_round(*topology, draft_tokens);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: verify round allocation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
+  }
+
+  // P5-05 (GitHub #155): the drafter's round buffers (model_internal.h), on
+  // a load with the drafter only.
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+    try {
+      const auto block = static_cast<std::int32_t>(draft_tokens + 1);
+      const std::size_t workspace_bytes =
+          ninfer::ops::swa_workspace_capacity_bytes({0, max_context_tokens}, 1, block,
+                                                    IGNIS_DECODE_MAX_BATCH) +
+          ninfer::ops::linear_swiglu_workspace_capacity_bytes(
+              model->dflash2.layers[0].mlp_gate_up.qtype, static_cast<std::int32_t>(2 * g.ffn_intermediate),
+              static_cast<std::int32_t>(g.hidden), ninfer::ops::LinearPolicy::A16Only, 1, 16);
+      if (workspace_bytes > kDflash2RoundWorkspaceBytes) {
+        throw std::runtime_error("the drafter's vendored workspaces need " +
+                                 std::to_string(workspace_bytes) + " bytes, past the " +
+                                 std::to_string(kDflash2RoundWorkspaceBytes) + "-byte allowance");
+      }
+      const auto lanes = static_cast<std::size_t>(IGNIS_DECODE_MAX_BATCH);
+      model->verify->features = std::make_unique<ninfer::DeviceBuffer>(
+          kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) * block * lanes *
+          sizeof(std::uint16_t));
+      model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(lanes * sizeof(std::int32_t));
+      model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(
+          dflash2_round_activation_bytes(*topology, static_cast<std::int32_t>(draft_tokens)) +
+          kDflash2RoundWorkspaceBytes);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
       model->stream = nullptr;
       return -1;

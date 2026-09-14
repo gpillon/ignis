@@ -273,6 +273,18 @@ prefill's window against a host f64 recomputation from the target's taps.
 `crates/core/tests/speculative_round_gpu.rs` proves the verify round (GitHub
 #153) with a fake drafter under the test-only `verify-only` backend, whose
 sequence pool must be built for that backend too.
+`crates/core/tests/dflash2_round_gpu.rs` proves the real drafter in the round
+(GitHub #155): greedy spec-on against spec-off on the canary prompts at widths
+1, 4 and 8, its graph replay against eager, a lane at extent 0 leaving its
+window untouched, and a mid-generation snapshot/restore. Every stream is cut
+at the turn's first `<|im_end|>`/`<|endoftext|>`, where the server stops: past
+it the model loops on chat markers and the verify and decode tilings part by
+several logits on text no request emits. It prints acceptance
+per round and the mean committed tokens per full-window round against the
+reference's 3.4–5.75 band — read that line from the profile's output; a mean
+below the band is a finding to file, not a test failure. Since #155 a prefill
+leaves the rewrite checkpoint equal to the window, which `dflash2_window_gpu.rs`
+asserts.
 
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and

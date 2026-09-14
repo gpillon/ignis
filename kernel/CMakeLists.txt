@@ -197,6 +197,16 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/speculative_round.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/dflash2_draft.cu
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/dflash2_draft.cpp
+  # P5-05 (GitHub #155): the rest of the drafter's forward -- its
+  # non-causal sliding-window attention over the cyclic window (swa), the
+  # anchor-and-mask query block (prepare_masked_block) and the selector's
+  # BF16 -> FP32 widening (cast).
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/swa.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/swa.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/prepare_masked_block.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/prepare_masked_block.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/cast.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/cast.cpp
   # P1-13 (GitHub #49): the fused MLP gate_up projection with the SiLU-mul
   # epilogue, NVFP4 arm only. The large-T W4A4/TMA sources compile here but
   # are verified only at G2, same as P1-09's own W4A4/TMA route.

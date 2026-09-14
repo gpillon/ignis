@@ -14,6 +14,7 @@
 
 #include "ignis_step.h"
 
+#include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
@@ -169,6 +170,12 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
     const ninfer::Tensor extents(verify.extents->p, ninfer::DType::I32, {batch, 1, 1, 1});
     ninfer::Tensor verify_ids(verify.verify_ids->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
     ninfer::Tensor positions(verify.positions->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
+    // P5-05 (GitHub #155): on a load with the drafter, its forward writes
+    // this round's drafts from each lane's window before the verify inputs
+    // read them -- one pass, inside the same graph.
+    if (verify.drafter_scratch != nullptr) {
+      ignis_dflash2_propose(model, pool, width);
+    }
     ninfer::ops::speculative_prepare_verify_inputs(anchors, drafts, base_positions, extents,
                                                    verify_ids, positions, model->stream);
 
@@ -192,6 +199,24 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
         return -1;
       }
       std::swap(left, right);
+      // P5-05 (GitHub #155): `left` is this layer's output now. At a tapped
+      // layer every column's output lands in rows [j * hidden, (j + 1) *
+      // hidden) of `features` -- the prefill chunk's own tap, over the round's
+      // columns.
+      const auto tap = std::find(kDflash2TapLayers.begin(), kDflash2TapLayers.end(), layer);
+      if (verify.features != nullptr && tap != kDflash2TapLayers.end()) {
+        const auto j = static_cast<std::size_t>(tap - kDflash2TapLayers.begin());
+        const std::size_t row_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+        const cudaError_t tap_err = cudaMemcpy2DAsync(
+            static_cast<std::uint8_t *>(verify.features->p) + j * row_bytes,
+            kDflash2TapLayers.size() * row_bytes, left.data, static_cast<std::size_t>(left.nb[1]),
+            row_bytes, static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice, model->stream);
+        if (tap_err != cudaSuccess) {
+          set_error("ignis_verify_graph: feature tap at layer " + std::to_string(layer) +
+                    " failed: " + cudaGetErrorString(tap_err));
+          return -1;
+        }
+      }
     }
 
     // The final residual of every column, kept past the round for the

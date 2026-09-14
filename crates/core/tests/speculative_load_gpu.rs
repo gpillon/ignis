@@ -110,9 +110,12 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
     assert_eq!(spec.window_pool_bytes(1), 80 * 1024 * 1024);
     assert_eq!(
         spec_vram - verify_vram,
-        drafter_weight_bytes + spec.window_pool_bytes(1) + spec.prefill_scratch_bytes(128),
-        "the drafter adds its weights, one slot's 80 MiB of window and checkpoint, and its \
-         prefill scratch at a 128-token chunk, nothing else"
+        drafter_weight_bytes
+            + spec.window_pool_bytes(1)
+            + spec.prefill_scratch_bytes(128)
+            + spec.round_scratch_bytes(),
+        "the drafter adds its weights, one slot's 80 MiB of window and checkpoint, its \
+         prefill scratch at a 128-token chunk and its verify round's taps and scratch, nothing else"
     );
 
     let _ = artifact.release_arena(&mut device);

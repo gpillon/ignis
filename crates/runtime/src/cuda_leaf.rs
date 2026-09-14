@@ -445,10 +445,9 @@ impl StepLeaf for CudaLeaf {
             return Ok(ids.into_iter().map(|id| LaneRun::token(id as TokenId)).collect());
         };
         // P5-06 (GitHub #154, spec 05): a speculative load runs every round
-        // as a verify round at the window it was loaded with. No lane
-        // proposes drafts until the drafter fills this seam (P5-05, GitHub
-        // #155), so each commits its anchor alone -- through the verify
-        // round, its budget and stop cut, and its graphs.
+        // as a verify round at the window it was loaded with. The DFlash2
+        // drafter proposes inside the leaf (P5-05, GitHub #155), so no lane
+        // passes drafts here; the leaf reports what each lane verified.
         let stop_ids: Vec<Vec<i32>> = lanes
             .iter()
             .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
@@ -463,7 +462,7 @@ impl StepLeaf for CudaLeaf {
                 drafts: &[],
             })
             .collect();
-        let runs = step::decode_program_verify(
+        let rounds = step::decode_program_verify_rounds(
             &model.model,
             &model.pool,
             sequences,
@@ -471,15 +470,15 @@ impl StepLeaf for CudaLeaf {
             speculation.draft_tokens(),
         )
         .map_err(|e| leaf_error("decode", e))?;
-        Ok(runs
+        Ok(rounds
             .into_iter()
-            .zip(&verify)
-            .map(|(run, lane)| {
-                let drafted = lane.drafts.len() as u32;
-                let accepted = (run.len() as u32).saturating_sub(1).min(drafted);
+            .map(|round| {
+                // Committed drafts: the run past its anchor, which a stop cut
+                // may leave shorter than what the target accepted.
+                let accepted = (round.tokens.len() as u32).saturating_sub(1).min(round.drafted);
                 LaneRun {
-                    tokens: run.into_iter().map(|id| id as TokenId).collect(),
-                    spec: Some(SpecCounters::round(drafted, accepted)),
+                    tokens: round.tokens.into_iter().map(|id| id as TokenId).collect(),
+                    spec: Some(SpecCounters::round(round.drafted, accepted)),
                 }
             })
             .collect())

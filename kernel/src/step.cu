@@ -10,6 +10,7 @@
 
 #include "ignis_step.h"
 
+#include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "ignis_seq_internal.h"
@@ -383,22 +384,6 @@ std::uint64_t dflash2_tap_from(std::uint64_t span_start, std::uint64_t num_token
          std::min<std::uint64_t>(num_tokens, kIgnisDflash2WindowTokens);
 }
 
-// `dst` ([rows, T]) receives rows [first_row, first_row + rows) of every
-// column of `src` ([*, T]), device to device, in one strided copy.
-void copy_bf16_rows(ninfer::Tensor &dst, const ninfer::Tensor &src, std::int32_t first_row,
-                    cudaStream_t stream) {
-  const auto *from = static_cast<const std::uint8_t *>(src.data) +
-                     static_cast<std::size_t>(first_row) * sizeof(std::uint16_t);
-  const cudaError_t err = cudaMemcpy2DAsync(
-      dst.data, static_cast<std::size_t>(dst.nb[1]), from, static_cast<std::size_t>(src.nb[1]),
-      static_cast<std::size_t>(dst.ne[0]) * sizeof(std::uint16_t),
-      static_cast<std::size_t>(dst.ne[1]), cudaMemcpyDeviceToDevice, stream);
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("cudaMemcpy2DAsync(bf16 rows) failed: ") +
-                             cudaGetErrorString(err));
-  }
-}
-
 void copy_i32_to_device(ninfer::Tensor &dst, const std::int32_t *src, std::size_t count,
                         cudaStream_t stream) {
   const cudaError_t err = cudaMemcpyAsync(dst.data, src, count * sizeof(std::int32_t),
@@ -412,71 +397,24 @@ void copy_i32_to_device(ninfer::Tensor &dst, const std::int32_t *src, std::size_
 // P5-03 (GitHub #152): the drafter's context append over one chunk's feature
 // taps -- the reference's `dflash2_append_context`, for one lane. `features`
 // is BF16 [5 x hidden, count]: the target's layer-5/19/33/47/61 outputs for
-// positions `host_scalars[2..]`, concatenated per column. They are projected
-// (`feature_projection`) and normalized (`context_norm`) once; every drafter
-// layer then evaluates its fused query/key/value parent over that context,
-// keeps the key and value rows, normalizes and ropes the keys (the drafter's
-// own unscaled base-1e7 table, at absolute positions) and appends both into
-// the slot's lane of the window, where position p lands in ring slot p mod
-// 2048. `host_scalars` is [count, lane, positions...] and must outlive the
-// caller's synchronize: every copy here is enqueued on the model's stream.
-//
-// No workspace: the A16 `linear` overload needs none, and the drafter's
-// NVFP4 matrices are weight-only (P5-02), so A16 is the only route they have.
+// positions `host_scalars[2..]`, concatenated per column; the append itself
+// (kernel/src/dflash2_drafter.h, shared with the verify round since P5-05)
+// lands them in the slot's lane of the window. `host_scalars` is [count,
+// lane, positions...] and must outlive the caller's synchronize: every copy
+// here is enqueued on the model's stream.
 void append_dflash2_context(ignis_model *model, ignis_seq_pool *pool,
                             const ninfer::Tensor &features, const std::int32_t *host_scalars,
                             std::int32_t count) {
-  const cudaStream_t stream     = model->stream;
-  const auto hidden             = static_cast<std::int32_t>(model->hidden);
-  const std::int32_t head_dim   = kIgnisDflash2HeadDim;
-  const std::int32_t kv_heads   = kIgnisDflash2KvHeads;
-  const std::int32_t kv_width   = head_dim * kv_heads;
-  const auto query_size         = static_cast<std::int32_t>(kDflash2QuerySize);
-  const Dflash2Weights &weights = model->dflash2;
-
+  const cudaStream_t stream = model->stream;
   ninfer::Tensor commit_count = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
   ninfer::Tensor lane         = model->scratch->alloc(ninfer::DType::I32, {1, 1, 1, 1});
   ninfer::Tensor positions    = model->scratch->alloc(ninfer::DType::I32, {count, 1, 1, 1});
   copy_i32_to_device(commit_count, host_scalars, 1, stream);
   copy_i32_to_device(lane, host_scalars + 1, 1, stream);
   copy_i32_to_device(positions, host_scalars + 2, static_cast<std::size_t>(count), stream);
-
-  ninfer::Tensor projected = model->scratch->alloc(ninfer::DType::BF16, {hidden, count, 1, 1});
-  ninfer::ops::linear(features, weights.feature_projection, projected, stream);
-  const ninfer::Tensor context_norm(const_cast<void *>(weights.context_norm.qdata),
-                                    ninfer::DType::BF16, {hidden, 1, 1, 1});
-  ninfer::Tensor context = model->scratch->alloc(ninfer::DType::BF16, {hidden, count, 1, 1});
-  ninfer::ops::rmsnorm(projected, context_norm, kDflash2RmsEps, /*unit_offset=*/false, context,
-                       stream);
-
-  static const ninfer::ops::RopeFrequencies frequencies =
-      ninfer::ops::rope_linear_frequencies(kDflash2RopeTheta, head_dim);
-  const ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope{
-      static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)};
-  for (std::size_t layer = 0; layer < kDflash2Layers; ++layer) {
-    ninfer::DeviceArena::Scope layer_scope = model->scratch->scope();
-    const Dflash2LayerWeights &w = weights.layers[layer];
-    ninfer::Tensor qkv =
-        model->scratch->alloc(ninfer::DType::BF16, {query_size + 2 * kv_width, count, 1, 1});
-    ninfer::ops::linear(context, w.query_key_value, qkv, stream);
-    ninfer::Tensor key_raw = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
-    ninfer::Tensor key     = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
-    ninfer::Tensor value   = model->scratch->alloc(ninfer::DType::BF16, {kv_width, count, 1, 1});
-    copy_bf16_rows(key_raw, qkv, query_size, stream);
-    copy_bf16_rows(value, qkv, query_size + kv_width, stream);
-
-    const ninfer::Tensor key_norm(const_cast<void *>(w.key_norm.qdata), ninfer::DType::BF16,
-                                  {head_dim, 1, 1, 1});
-    ninfer::Tensor key_heads = key.view({head_dim, kv_heads, count});
-    ninfer::ops::rmsnorm(key_raw.view({head_dim, kv_heads, count}), key_norm, kDflash2RmsEps,
-                         /*unit_offset=*/false, key_heads, stream);
-    ninfer::ops::rope(positions.view({count}), head_dim, frequencies, key_heads,
-                      ninfer::ops::RopeSide::Key, stream);
-    ninfer::ops::kv_cache_append_prefix(
-        key.view({head_dim, kv_heads, count, 1}), value.view({head_dim, kv_heads, count, 1}),
-        positions.view({count, 1}), commit_count.view({1}), lane.view({1}), envelope,
-        pool->dflash2_window->layer_view(static_cast<std::uint32_t>(layer)), stream);
-  }
+  ignis_dflash2_append_context(
+      model, pool, *model->scratch, features, positions, commit_count, lane,
+      {static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)});
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +997,25 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (rc != 0) {
     return rc;
   }
+  // P5-05 (GitHub #155): the rewrite checkpoint is the window as the latest
+  // prefill span leaves it. The reference saves it during prefill, at its chat
+  // template's rewrite boundary, and restores it when a later turn rewrites
+  // the text past that boundary; ignis has no such reuse path, so nothing
+  // reads it yet. It is kept beside the window it was taken from, so a
+  // snapshot, restore or clone never carries one that belongs to other text.
+  if (pool->has_dflash2()) {
+    try {
+      pool->dflash2_checkpoint->copy_lane_from(*pool->dflash2_window, seq->slot, model->stream);
+      const cudaError_t err = cudaStreamSynchronize(model->stream);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaStreamSynchronize failed: ") +
+                                 cudaGetErrorString(err));
+      }
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_program_prefill: rewrite checkpoint copy failed: ") + e.what());
+      return -1;
+    }
+  }
   model->last_step_micros = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now() - began).count());
@@ -1128,6 +1085,15 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   const std::uint32_t lane_columns = k + 1;
   const auto batch = static_cast<std::int32_t>(batch_size);
   const auto hidden = static_cast<std::int32_t>(model->hidden);
+  // P5-05 (GitHub #155): on a load with the drafter the leaf proposes every
+  // lane's drafts itself, inside the verify pass, and appends the committed
+  // columns' feature taps to each lane's window after the cut.
+  const bool drafter = verify.drafter_scratch != nullptr;
+  if (drafter && (options.drafts != nullptr || options.draft_counts != nullptr)) {
+    set_error("ignis_program_decode: this model was loaded with the DFlash2 drafter, which "
+              "proposes every lane's drafts; drafts and draft_counts must be NULL");
+    return -1;
+  }
 
   std::vector<std::int32_t> anchors(batch_size, 0);
   std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch_size, 0);
@@ -1152,9 +1118,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       // leaves after the anchor, or than its context leaves after the
       // anchor. 0 is the fallback step inside this same round.
       uint64_t extent = k;
-      if (options.drafts == nullptr) {
+      if (!drafter && options.drafts == nullptr) {
         extent = 0;
-      } else if (options.draft_counts != nullptr) {
+      } else if (!drafter && options.draft_counts != nullptr) {
         extent = std::min<uint64_t>(extent, options.draft_counts[i]);
       }
       if (sampling[i].remaining_tokens != 0) {
@@ -1172,7 +1138,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       valid_columns[i] = static_cast<std::int32_t>(extent + 1);
       slots[i] = seq->slot;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
-      for (uint64_t j = 0; j < extent; ++j) {
+      for (uint64_t j = 0; j < extent && !drafter; ++j) {
         drafts[i * k + j] = options.drafts[i * k + j];
       }
     }
@@ -1190,7 +1156,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     };
     const std::size_t lane_bytes = batch_size * sizeof(std::int32_t);
     if (!stage(*verify.anchors, anchors.data(), lane_bytes, "verify anchors") ||
-        !stage(*verify.drafts, drafts.data(), drafts.size() * sizeof(std::int32_t), "verify drafts") ||
+        // The drafter writes this buffer on the device, inside the pass.
+        (!drafter &&
+         !stage(*verify.drafts, drafts.data(), drafts.size() * sizeof(std::int32_t), "verify drafts")) ||
         !stage(*verify.base_positions, base_positions.data(), lane_bytes, "verify base positions") ||
         !stage(*verify.extents, extents.data(), lane_bytes, "verify extents") ||
         !stage(*verify.valid_columns, valid_columns.data(), lane_bytes, "verify valid columns") ||
@@ -1300,6 +1268,20 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     ninfer::ops::speculative_select_accepted_hidden(hidden_columns, selector_tensor, selected,
                                                     model->stream);
 
+    // P5-05 (GitHub #155): the committed columns' feature taps into each
+    // lane's window -- its whole committed run, or nothing for a lane at
+    // extent 0, whose round read its window and leaves it as it was.
+    std::vector<std::int32_t> append_counts(batch_size, 0);
+    if (drafter) {
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        append_counts[i] = extents[i] == 0 ? 0 : committed[i];
+      }
+      if (!stage(*verify.append_counts, append_counts.data(), lane_bytes, "drafter append counts")) {
+        return -1;
+      }
+      ignis_dflash2_append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+    }
+
     err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_program_decode: cudaStreamSynchronize(fold) failed: ") +
@@ -1365,6 +1347,12 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       sequences[i]->pending_token = next_pending[i];
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
       options.out_committed_counts[i] = committed[i];
+      if (append_counts[i] > 0) {
+        sequences[i]->dflash2_position = sequences[i]->position;
+      }
+      if (options.out_draft_counts != nullptr) {
+        options.out_draft_counts[i] = static_cast<std::uint32_t>(extents[i]);
+      }
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;

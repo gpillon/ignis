@@ -60,6 +60,9 @@ set(ignis_vendored_op_tests
   dflash2_selector_predecessors
   dflash2_selector_scores
   dflash2_topk_walk
+  swa
+  prepare_masked_block
+  cast
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)

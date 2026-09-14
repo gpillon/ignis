@@ -462,6 +462,29 @@ P4-03 (GitHub #119) vendors the hq-e8-2b row codec's op-level oracle:
   `ignis_kernel` link. Its own CTest executable, `ignis_hq_codec_test`,
   since it brings its own `main()` like every other tool/test file above.
 
+P5-05 (GitHub #155) vendors the rest of the DFlash2 drafter's forward — the
+ops `dflash2_propose_batch_impl` calls around the P5-01 drafter kernels:
+
+- **swa** — `ops/launcher/swa.{h,cu}`, `ops/wrapper/swa.cpp`,
+  `ninfer/ops/swa.h` and the kernel they launch,
+  `ops/kernel/bidirectional_gqa_attention.cuh`: the symmetric non-causal
+  sliding-window GQA over a lane's cyclic context plus its live query block
+  (D=128, 32/8 heads, T=1..16, B=1..8).
+- **prepare_masked_block** — `ops/kernel/prepare_masked_block.cuh`,
+  `ops/launcher/prepare_masked_block.{h,cu}`,
+  `ops/wrapper/prepare_masked_block.cpp`, `ninfer/ops/prepare_masked_block.h`:
+  each lane's anchor-and-mask query block and its positions.
+- **cast** — `ops/kernel/cast.cuh`, `ops/launcher/cast.{h,cu}`,
+  `ops/wrapper/cast.cpp`, `ninfer/ops/cast.h`: the exact BF16 → FP32 widening
+  the selector scores take.
+- **their reference tests** — `tests/ops/test_swa.cpp`,
+  `test_prepare_masked_block.cpp` and `test_cast.cpp`, unmodified, in the
+  `ignis_<op>_test` CTest loop.
+- Not vendored: `prepare_ragged_prefix` and `scatter`, which the reference uses
+  to carry the verified columns' taps into the *next* round. ignis appends
+  them to the window at the end of the same round instead
+  (`kernel/src/dflash2_drafter.cu`, ours), so no tap outlives its round.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;

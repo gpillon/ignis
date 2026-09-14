@@ -29,6 +29,9 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/snapshot_blob.rs"]
+mod snapshot_blob;
+
 use std::path::Path;
 
 use ignis_artifact::{
@@ -43,6 +46,10 @@ use ignis_core::model_load::{load_qwen38_27b_with_speculation, Model};
 use ignis_core::seq::{snapshot_format_version, SeqPool, SeqPoolBudget};
 use ignis_core::step::prefill_program;
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
+
+use snapshot_blob::{
+    read_u64, section, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_CHECKPOINT, SECTION_DFLASH_WINDOW, SECTION_PROGRESS,
+};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 4096;
@@ -65,13 +72,6 @@ const ROPE_THETA: f64 = 1.0e7;
 /// wide per position), spread over the tapped span.
 const SAMPLES: usize = 16;
 
-/// The version-2 blob layout (`kernel/include/ignis_seq_sections.h`).
-const HEADER_BYTES: usize = 128;
-const RECORD_BYTES: usize = 24;
-const SECTION_PROGRESS: i32 = 4;
-const SECTION_DFLASH_WINDOW: i32 = 5;
-const SECTION_DFLASH_CHECKPOINT: i32 = 6;
-
 /// Relative L2 between the window's BF16 rows and the f64 recomputation,
 /// per role over every drafter layer, KV head and sampled position. Bounds the
 /// drafter's A16 projections, its norms, its RoPE and every BF16 rounding in
@@ -91,28 +91,6 @@ fn bf16_to_f64(bits: u16) -> f64 {
 fn f32_to_bf16(x: f32) -> u16 {
     let bits = u64::from(x.to_bits());
     ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
-}
-
-fn read_u64(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
-}
-
-/// `(offset, bytes)` of the blob's section of `kind`.
-fn section(blob: &[u8], kind: i32) -> (usize, usize) {
-    assert_eq!(read_u32(blob, 12) as usize, HEADER_BYTES, "snapshot header bytes");
-    assert_eq!(read_u32(blob, 16) as usize, RECORD_BYTES, "snapshot record bytes");
-    let count = read_u32(blob, 20) as usize;
-    for i in 0..count {
-        let at = HEADER_BYTES + i * RECORD_BYTES;
-        if read_u32(blob, at) as i32 == kind {
-            return (read_u64(blob, at + 8) as usize, read_u64(blob, at + 16) as usize);
-        }
-    }
-    panic!("the snapshot lists no section of kind {kind}");
 }
 
 /// Split-half NeoX RoPE over the whole 128-wide head, key side (no factor).
@@ -202,16 +180,22 @@ fn check_window(
     let (window_at, window_bytes) = section(&blob, SECTION_DFLASH_WINDOW);
     assert_eq!(window_bytes, DRAFTER_LAYERS * 2 * plane, "{label}: the window section is one lane");
     let (checkpoint_at, checkpoint_bytes) = section(&blob, SECTION_DFLASH_CHECKPOINT);
-    // #155 gives the checkpoint its writer; until then a prefill leaves it
-    // as `ignis_seq_alloc` zeroed it.
+    // P5-05 (GitHub #155): a prefill leaves the rewrite checkpoint equal to
+    // the window it just wrote -- and the window is not the zeros
+    // `ignis_seq_alloc` left, so this is not two untouched sections agreeing.
+    assert_eq!(checkpoint_bytes, window_bytes, "{label}: the checkpoint section is one lane");
     assert!(
-        blob[checkpoint_at..checkpoint_at + checkpoint_bytes].iter().all(|&b| b == 0),
-        "{label}: a prefill does not write the rewrite checkpoint"
+        blob[checkpoint_at..checkpoint_at + checkpoint_bytes] == blob[window_at..window_at + window_bytes],
+        "{label}: the rewrite checkpoint does not hold the window the prefill left"
+    );
+    assert!(
+        blob[window_at..window_at + window_bytes].iter().any(|&b| b != 0),
+        "{label}: the prefill left the window unwritten"
     );
     let (progress_at, _) = section(&blob, SECTION_PROGRESS);
     assert_eq!(read_u64(&blob, progress_at) as usize, n, "{label}: the program frontier");
     assert_eq!(
-        read_u64(&blob, progress_at + 16) as usize,
+        read_u64(&blob, progress_at + PROGRESS_DRAFTER_FRONTIER) as usize,
         n,
         "{label}: the drafter frontier stands at the prompt's end"
     );

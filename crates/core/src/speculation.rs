@@ -31,6 +31,21 @@ pub const DFLASH2_QUERY_SIZE: u64 = 4096;
 /// The target's hidden width, which the drafter shares.
 const HIDDEN: u64 = 5120;
 
+/// The target's MLP width and vocabulary, which the drafter's forward shares
+/// (its MLP, and the target's output head over its draft columns).
+const FFN_INTERMEDIATE: u64 = 17408;
+const VOCAB: u64 = 248_320;
+
+/// The drafter's dynamic-conv coefficient rows (320 groups x 2 taps x 2
+/// sides), its selector rank and the candidates per draft column it scores.
+const DFLASH2_CONV_PROJ_ROWS: u64 = 1280;
+const DFLASH2_SELECTOR_RANK: u64 = 256;
+const DFLASH2_SELECTOR_TOP_K: u64 = 16;
+
+/// The leaf's fixed allowance for the vendored workspaces inside the
+/// drafter's forward (`kDflash2RoundWorkspaceBytes`, `kernel/src/model.cu`).
+const DFLASH2_ROUND_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// The leaf's scratch-arena allocation alignment (`DeviceArena::alloc_bytes`).
 const ARENA_ALIGN: u64 = 256;
 
@@ -154,6 +169,57 @@ impl Speculation {
             }
         }
     }
+
+    /// What the drafter's verify round adds to the load under this backend
+    /// (P5-05, GitHub #155; `kernel/src/model.cu`): the feature taps of every
+    /// verify column of the widest round, one append count per lane, and the
+    /// round scratch -- the larger of the drafter's forward activations and
+    /// the round's context append, each rounded to the arena's alignment,
+    /// plus the fixed allowance for the vendored workspaces the forward calls
+    /// into.
+    pub fn round_scratch_bytes(&self) -> u64 {
+        match self.backend {
+            // The fake drafter proposes from the host: nothing to reserve.
+            SpeculativeBackend::VerifyOnly => 0,
+            SpeculativeBackend::Dflash2 => {
+                let bf16 = |elements: u64| (elements * 2).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                let wide = |elements: u64| (elements * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
+                let lanes = crate::N_DECODE_LANES as u64;
+                let columns = u64::from(self.draft_tokens + 1) * lanes;
+                let drafts = u64::from(self.draft_tokens) * lanes;
+                let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
+                let hidden_columns = bf16(HIDDEN * columns);
+
+                let forward = 2 * wide(columns)
+                    + hidden_columns
+                    + 2 * hidden_columns
+                    + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
+                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+                    + 3 * bf16(DFLASH2_QUERY_SIZE * columns)
+                    + 3 * bf16(kv_width * columns)
+                    + 2 * hidden_columns
+                    + 2 * hidden_columns
+                    + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
+                    + bf16(FFN_INTERMEDIATE * columns)
+                    + 2 * hidden_columns
+                    + 2 * bf16(HIDDEN * drafts)
+                    + bf16(VOCAB * drafts)
+                    + wide(DFLASH2_SELECTOR_TOP_K * drafts)
+                    + bf16(DFLASH2_SELECTOR_TOP_K * drafts)
+                    + 2 * wide(DFLASH2_SELECTOR_TOP_K * drafts)
+                    + bf16(DFLASH2_SELECTOR_RANK * drafts)
+                    + wide(DFLASH2_SELECTOR_RANK * drafts)
+                    + wide(DFLASH2_SELECTOR_TOP_K * DFLASH2_SELECTOR_TOP_K * drafts);
+                let append = 2 * hidden_columns
+                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+                    + 3 * bf16(kv_width * columns);
+
+                let features = DFLASH2_FEATURE_TAPS * HIDDEN * columns * 2;
+                let append_counts = lanes * 4;
+                features + append_counts + forward.max(append) + DFLASH2_ROUND_WORKSPACE_BYTES
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +261,7 @@ mod tests {
         assert_eq!(spec.backend().abi_code(), 2);
         assert_eq!(spec.window_pool_bytes(8), 0, "no drafter, no window pool");
         assert_eq!(spec.prefill_scratch_bytes(128), 0, "no drafter, no prefill taps");
+        assert_eq!(spec.round_scratch_bytes(), 0, "no drafter, no round scratch");
         let err = Speculation::new(SpeculativeBackend::VerifyOnly, 8).expect_err("out of range");
         assert!(err.contains("1..7"), "{err}");
     }
@@ -220,5 +287,25 @@ mod tests {
         // A chunk wider than the window taps at most the window.
         assert_eq!(spec.prefill_scratch_bytes(4096), spec.prefill_scratch_bytes(2048));
         assert!(spec.prefill_scratch_bytes(1024) < spec.prefill_scratch_bytes(2048));
+    }
+
+    #[test]
+    fn the_dflash2_round_scratch_is_the_widest_rounds_forward_plus_the_allowance() {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        // Window 7, eight lanes: 64 columns, 56 draft columns, worked by hand.
+        // Forward 40,321,792: ids and positions 512, residual 655,360, the
+        // attention block 5,537,792 (normed, conv 1,310,720; dynamic 163,840;
+        // qkv 786,432; query_raw, query, attention 1,572,864; key_raw, value,
+        // key 393,216; projected, conv 1,310,720), the MLP block 5,013,504
+        // (normed, conv_hidden 1,310,720; dynamic 163,840; intermediate
+        // 2,228,224; projected, conv 1,310,720), the head 29,114,624 (packed,
+        // proposal 1,146,880; logits 27,811,840; ids 3,584 + values 1,792;
+        // unary 3,584 + predecessors 3,584; hidden_proj 28,672 + its FP32
+        // 57,344; scores 57,344). The append (2,490,368) is smaller. Taps
+        // 3,276,800, counts 32, allowance 33,554,432.
+        assert_eq!(spec.round_scratch_bytes(), 77_153_056);
+        // A narrower window reserves less; the window pool does not change.
+        let narrow = Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap();
+        assert!(narrow.round_scratch_bytes() < spec.round_scratch_bytes());
     }
 }

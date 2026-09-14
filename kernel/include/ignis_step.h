@@ -289,13 +289,23 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
  * `[batch_size][speculative_window + 1]` and lane i's committed run is its
  * first `out_committed_counts[i]` entries: the anchor (the successor the
  * prior round made ready) followed by the accepted drafts, cut at the first
- * stop id inclusive. */
+ * stop id inclusive.
+ *
+ * P5-05 (GitHub #155): on a load with the DFlash2 drafter the leaf proposes
+ * every lane's drafts itself, from the lane's own window, so `drafts` and
+ * `draft_counts` must be NULL there; a lane's extent is then `min(k,
+ * remaining_tokens - 1, remaining context - 1)`. After the commit the
+ * committed columns' feature taps are appended to each lane's window; a lane
+ * at extent 0 appends nothing. `out_draft_counts` (`batch_size` entries, or
+ * NULL) receives each lane's extent -- the drafts this round verified for
+ * it, whichever side proposed them. */
 struct ignis_decode_options {
   uint32_t size;               /* sizeof(struct ignis_decode_options) */
   uint32_t speculative_window; /* 0: today's round; k: the verify round at the load's window */
   const int32_t *drafts;       /* [batch_size][speculative_window], or NULL */
   const uint32_t *draft_counts; /* [batch_size], or NULL (every lane proposes the window) */
   int32_t *out_committed_counts; /* [batch_size]; required when speculative_window > 0 */
+  uint32_t *out_draft_counts;  /* [batch_size], or NULL: each lane's extent this round */
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is
