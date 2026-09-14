@@ -55,6 +55,10 @@
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
 //! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); off by default.
+//! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
+//!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
+//!   leaves the API open. `auto` generates a key at start and prints it to
+//!   stdout — the only case a key is ever printed.
 
 use std::sync::Arc;
 
@@ -208,7 +212,26 @@ async fn main() {
         speculation: _,
         request_timeout_secs,
         ui,
+        api_key,
     } = config;
+    let api_key = match api_key {
+        None => None,
+        Some(ignis_server::config::ApiKeySetting::Fixed(key)) => Some(key),
+        Some(ignis_server::config::ApiKeySetting::Generate) => match ignis_server::config::ApiKey::generate() {
+            Ok(key) => {
+                // Printed on purpose, and only for a generated key: nobody
+                // else knows it. A plain line, not a log record — the
+                // logger redacts credentials. `make start`/`dev-ui` pick it
+                // out of the log (mk/windows/common.ps1).
+                println!("ignis-server: generated API key: {}", key.as_str());
+                Some(key)
+            }
+            Err(err) => {
+                tracing::error!(name: "ignis.config.api_key_generate_failed", error = %err, "refusing to start");
+                exit_after_flush(&logging_handle, 1);
+            }
+        },
+    };
 
     let server = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
@@ -301,6 +324,11 @@ async fn main() {
     } else {
         server
     };
+    let auth = api_key.is_some();
+    let server = match api_key {
+        Some(key) => server.with_api_key(key),
+        None => server,
+    };
 
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the
@@ -309,7 +337,8 @@ async fn main() {
         name: "ignis.process.started",
         model = %model,
         bind = %bind,
-        "localhost, no auth; OpenAI API at /v1"
+        api_key_required = auth,
+        "OpenAI API at /v1"
     );
     let serve_result = server.serve(bind).await;
 

@@ -55,7 +55,9 @@ if ($settled) { exit $code }
 
 try {
     $env:IGNIS_URL = $Url
-    $vite = Start-Process -FilePath $Node -ArgumentList "`"$ViteJs`"" `
+    # --clearScreen false: Vite would otherwise wipe the generated API key
+    # printed just above.
+    $vite = Start-Process -FilePath $Node -ArgumentList "`"$ViteJs`" --clearScreen false" `
         -WorkingDirectory (Join-Path $Repo 'web') -NoNewWindow -PassThru
     $null = $vite.Handle
     Add-ProcessToJob $job $vite

@@ -35,7 +35,21 @@ function Test-Ready {
         Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri "$Url/v1/models" | Out-Null
         return $true
     } catch {
-        return $false
+        # A 401 is a server that is up and wants an API key (--api-key).
+        $response = $_.Exception.Response
+        return ($null -ne $response -and [int]$response.StatusCode -eq 401)
+    }
+}
+
+# `--api-key auto`: the server prints the key it generated once, into its
+# stdout log; repeat it on the console.
+function Show-GeneratedKey {
+    if (-not (Test-Path $LogFile)) { return }
+    $hit = Select-String -Path $LogFile -Pattern 'generated API key: (\S+)' | Select-Object -Last 1
+    if ($hit) {
+        Write-Host ""
+        Write-Host "API key (generated for this run): $($hit.Matches[0].Groups[1].Value)"
+        Write-Host ""
     }
 }
 
@@ -109,6 +123,7 @@ function Wait-IgnisReady($Process) {
         Start-Sleep -Milliseconds 500
     }
     Write-Host ("ready: {0} (pid {1}, {2:N1}s)" -f $Url, $Process.Id, $clock.Elapsed.TotalSeconds)
+    Show-GeneratedKey
     return 'ready'
 }
 

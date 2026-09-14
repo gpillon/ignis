@@ -1,3 +1,4 @@
+import { authHeaders, keyRequired } from "./auth.ts";
 import { apiErrorMessage } from "./errors.ts";
 import type { Timeline } from "../metrics/figures.ts";
 import { type ChunkEvent, createSseParser, parseChunk } from "./sse.ts";
@@ -25,10 +26,11 @@ export async function streamChat(options: StreamOptions): Promise<StreamResult> 
   try {
     const response = await doFetch("/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify(options.body),
       signal: options.signal,
     });
+    if (response.status === 401) keyRequired();
     if (!response.ok) {
       const text = await response.text();
       timeline.endedAt = now();

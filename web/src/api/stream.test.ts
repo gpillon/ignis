@@ -1,6 +1,23 @@
 import { describe, expect, it } from "vitest";
+import { getAuth, saveKey } from "./auth.ts";
 import type { ChunkEvent } from "./sse.ts";
 import { streamChat } from "./stream.ts";
+
+describe("streamChat and the API key", () => {
+  it("sends the saved key and turns a 401 into the key prompt", async () => {
+    saveKey("sk-test");
+    let sent: HeadersInit | undefined;
+    const refusing = (async (_url: string, init?: RequestInit) => {
+      sent = init?.headers;
+      return new Response('{"error":{"message":"incorrect API key provided"}}', { status: 401 });
+    }) as typeof fetch;
+    const result = await streamChat({ body: {}, fetch: refusing, now: ticking(), onEvent: () => {} });
+    expect(sent).toMatchObject({ Authorization: "Bearer sk-test" });
+    expect(result).toMatchObject({ ok: false, message: "401: incorrect API key provided" });
+    expect(getAuth()).toMatchObject({ needsKey: true, rejected: true });
+    saveKey("sk-test");
+  });
+});
 
 const sse = (delta: object, finish: string | null = null) =>
   `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;

@@ -64,6 +64,9 @@ pub struct Server {
     /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
+    /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
+    /// `None` leaves the API open.
+    pub api_key: Option<crate::config::ApiKey>,
 }
 
 impl Server {
@@ -76,6 +79,7 @@ impl Server {
             default_enable_thinking: true,
             default_reasoning_effort: None,
             playground: None,
+            api_key: None,
         }
     }
 
@@ -121,6 +125,13 @@ impl Server {
     /// table, including the empty one that selects the fallback page).
     pub fn with_playground(mut self, assets: playground::Assets) -> Self {
         self.playground = Some(assets);
+        self
+    }
+
+    /// Require `key` as `Authorization: Bearer <key>` on every `/v1` route
+    /// (`main` wires this to `--api-key` / `IGNIS_API_KEY`).
+    pub fn with_api_key(mut self, key: crate::config::ApiKey) -> Self {
+        self.api_key = Some(key);
         self
     }
 

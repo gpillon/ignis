@@ -81,6 +81,57 @@ pub struct Config {
     /// Serve the Playground under `/ui/` (`--ui`, GitHub #163, ADR 0026).
     /// Flag-only: no env var, no alias.
     pub ui: bool,
+    /// The key every `/v1` request must present as `Authorization: Bearer
+    /// <key>` (`--api-key` / `IGNIS_API_KEY`). `None` (the default) keeps
+    /// the API open, as it has always been on localhost.
+    pub api_key: Option<ApiKeySetting>,
+}
+
+/// What `--api-key` asked for: a key the operator chose, or `auto` — one
+/// `main` generates at start and prints, the only time a key is printed.
+/// Resolved here, generated in `main`, so [`resolve`] stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeySetting {
+    Fixed(ApiKey),
+    Generate,
+}
+
+/// An API key. Its `Debug` never prints the value, so a `Config` dumped
+/// into a log line or a test failure does not leak the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// A fresh key from the OS random source: `sk-ignis-` and 256 random
+    /// bits in hex.
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes)?;
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(Self(format!("sk-ignis-{hex}")))
+    }
+
+    /// The key itself — for the one place that has to show it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `presented` is this key. Compares every byte whatever the
+    /// first mismatch, so the time taken does not reveal a correct prefix.
+    pub fn matches(&self, presented: &str) -> bool {
+        let (a, b) = (self.0.as_bytes(), presented.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey([REDACTED])")
+    }
 }
 
 /// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES`'s default (P4-07,
@@ -142,6 +193,7 @@ pub fn resolve(
     let mut spec = None;
     let mut draft_tokens = None;
     let mut ui = false;
+    let mut api_key = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -161,6 +213,7 @@ pub fn resolve(
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
+            "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
         i += 1;
@@ -200,6 +253,10 @@ pub fn resolve(
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
+    let api_key = non_empty(api_key.or_else(|| env("IGNIS_API_KEY"))).map(|key| match key.as_str() {
+        "auto" => ApiKeySetting::Generate,
+        _ => ApiKeySetting::Fixed(ApiKey(key)),
+    });
 
     Ok(ConfigOutcome::Config(Config {
         model,
@@ -215,6 +272,7 @@ pub fn resolve(
         speculation,
         request_timeout_secs,
         ui,
+        api_key,
     }))
 }
 
@@ -427,7 +485,7 @@ fn help_text() -> String {
     let default_kv_pool_gib = ignis_core::DEFAULT_KV_POOL_BYTES / (1024 * 1024 * 1024);
     let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
     format!(
-        "ignis-server: the OpenAI-compatible HTTP entrypoint (localhost, no auth)\n\
+        "ignis-server: the OpenAI-compatible HTTP entrypoint\n\
          \n\
          USAGE:\n    ignis-server [OPTIONS]\n\
          \n\
@@ -446,6 +504,7 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
+         \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
          \n\
@@ -1056,5 +1115,66 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--ui"), "{text}");
+    }
+
+    // ── the API key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_api_key_is_unset_by_default_and_an_empty_value_stays_unset() {
+        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).api_key, None);
+        let env = env_map(&[("IGNIS_API_KEY", "")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, None);
+    }
+
+    #[test]
+    fn the_api_key_resolves_flag_over_env() {
+        let env = env_map(&[("IGNIS_API_KEY", "from-env")]);
+        let config = expect_config(resolve(&[], &env).expect("resolve"));
+        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("from-env"))));
+
+        let config = expect_config(resolve(&args(&["--api-key", "from-flag"]), &env).expect("resolve"));
+        assert_eq!(
+            config.api_key,
+            Some(ApiKeySetting::Fixed(ApiKey::new("from-flag"))),
+            "flag must win over env"
+        );
+    }
+
+    #[test]
+    fn auto_asks_for_a_generated_key_from_the_flag_or_the_env() {
+        let config = expect_config(resolve(&args(&["--api-key", "auto"]), no_env).expect("resolve"));
+        assert_eq!(config.api_key, Some(ApiKeySetting::Generate));
+        let env = env_map(&[("IGNIS_API_KEY", "auto")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, Some(ApiKeySetting::Generate));
+    }
+
+    #[test]
+    fn a_generated_key_is_fresh_and_long() {
+        let a = ApiKey::generate().expect("random source");
+        let b = ApiKey::generate().expect("random source");
+        assert_ne!(a, b);
+        let hex = a.as_str().strip_prefix("sk-ignis-").expect("prefix");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{hex}");
+    }
+
+    #[test]
+    fn an_api_key_matches_only_itself_and_never_prints() {
+        let key = ApiKey::new("sk-secret");
+        assert!(key.matches("sk-secret"));
+        for other in ["", "sk-secre", "sk-secret!", "sk-Secret"] {
+            assert!(!key.matches(other), "{other:?}");
+        }
+        let config = expect_config(resolve(&args(&["--api-key", "sk-secret"]), no_env).expect("resolve"));
+        assert!(!format!("{config:?}").contains("sk-secret"));
+    }
+
+    #[test]
+    fn help_lists_the_api_key_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--api-key") && text.contains("IGNIS_API_KEY"), "{text}");
     }
 }

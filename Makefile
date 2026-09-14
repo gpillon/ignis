@@ -5,6 +5,7 @@
 #   make run             run the last build; refuses a missing or stale binary
 #   make mock            the same loop on the CPU mock (no GPU, no kernel leaf)
 #   make dev-ui          server in the background + Playground with hot reload
+#                        (API_KEY=auto: the server generates a key and prints it)
 #   make config          the resolved knobs
 #
 # Layout
@@ -92,9 +93,12 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(MODEL),--model $(MODEL)) \
   $(if $(filter 1,$(UI)),--ui) \
+  $(if $(API_KEY),--api-key $(API_KEY)) \
   $(ARGS)
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
 SMOKE_MODEL := $(or $(MODEL),qwen3.8-27b)
+# A generated key (API_KEY=auto) is unknown to make: pass the printed one.
+SMOKE_AUTH := $(if $(filter-out auto,$(API_KEY)),-H 'Authorization: Bearer $(API_KEY)')
 
 GPU_GUARDED := $(and $(filter 1,$(CUDA)),$(filter 1,$(GPU_CHECK)))
 
@@ -161,6 +165,7 @@ config: ## Print the resolved knobs and paths
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"
+	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),(none: /v1 is open))"
 	@echo "ARGS            $(ARGS)"
 	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"
 	@echo "server binary   $(SERVER_BIN)"
@@ -273,9 +278,12 @@ redeploy: ## Build, and only if it succeeds: stop + start
 .PHONY: status
 status: ## Is the server up? (process, pid file, /v1/models)
 	-@$(SERVER_STATUS)
-	@if curl -fsS --max-time 2 "$(SERVER_URL)/v1/models" >/dev/null 2>&1; \
-	then echo "http: $(SERVER_URL) is serving"; \
-	else echo "http: nothing answering on $(SERVER_URL)"; fi
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$(SERVER_URL)/v1/models" 2>/dev/null); \
+	case "$$code" in \
+	  200) echo "http: $(SERVER_URL) is serving";; \
+	  401) echo "http: $(SERVER_URL) is serving (API key required)";; \
+	  *) echo "http: nothing answering on $(SERVER_URL)";; \
+	esac
 
 .PHONY: logs
 logs: ## Follow the background server log
@@ -284,9 +292,9 @@ logs: ## Follow the background server log
 
 .PHONY: smoke
 smoke: ## One /v1/models + one short chat completion against BIND
-	curl -fsS "$(SERVER_URL)/v1/models"
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/models"
 	@echo ""
-	curl -fsS "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
 	  -d '{"model":"$(SMOKE_MODEL)","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
 	@echo ""
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { forgetKey, useAuth } from "../api/auth.ts";
 import { useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
@@ -12,6 +13,7 @@ import { AgentReader } from "../tools/agents/AgentReader.tsx";
 import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { NO_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header } from "./Header.tsx";
+import { KeyPage } from "./KeyPage.tsx";
 import { useConversation } from "./useConversation.ts";
 
 // The Playground (GitHub #164): a streaming chat against ignis's own
@@ -22,6 +24,7 @@ import { useConversation } from "./useConversation.ts";
 type Drawer = "sessions" | "settings" | null;
 
 export function App() {
+  const auth = useAuth();
   const model = useModel();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tools, setTools] = useState<ToolsState>(NO_TOOLS);
@@ -66,9 +69,13 @@ export function App() {
   const set = <K extends keyof PlaygroundSettings>(key: K, value: PlaygroundSettings[K]) =>
     setSettings((s) => ({ ...s, [key]: value }));
 
+  // A 401 anywhere shows the key prompt in place of the page; App stays
+  // mounted, so the sessions are still here once the key is in.
+  if (auth.needsKey) return <KeyPage rejected={auth.rejected} />;
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={setDrawer} />
+      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} />
 
       <div className="relative flex min-h-0 flex-1">
         {drawer && (
