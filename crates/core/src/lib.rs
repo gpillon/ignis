@@ -73,5 +73,6 @@ pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
-    RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError, TokenId,
+    RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SpecCounters, SubmitError,
+    TokenId,
 };

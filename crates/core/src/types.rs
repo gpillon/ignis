@@ -207,12 +207,54 @@ pub enum BackfillClass {
     Temporal,
 }
 
+/// A request's speculative decode rounds (P5-06, GitHub #154, spec 05): how
+/// many verify rounds it ran, how many drafts those rounds proposed, and how
+/// many of them were committed. The reference's counters, same names.
+///
+/// One round is [`SpecCounters::round`]; a request's total is the sum of its
+/// rounds. Carried per round on [`crate::DecodeOutcome`] and per request on
+/// [`SchedEvent::Done`] — never per token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpecCounters {
+    /// Verify rounds run.
+    pub rounds: u32,
+    /// Draft tokens proposed to those rounds.
+    pub drafted: u32,
+    /// Draft tokens committed (the run past its anchor).
+    pub accepted: u32,
+}
+
+impl SpecCounters {
+    /// One verify round that proposed `drafted` tokens and committed
+    /// `accepted` of them.
+    pub fn round(drafted: u32, accepted: u32) -> Self {
+        Self {
+            rounds: 1,
+            drafted,
+            accepted,
+        }
+    }
+}
+
+impl std::ops::Add for SpecCounters {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            rounds: self.rounds.saturating_add(other.rounds),
+            drafted: self.drafted.saturating_add(other.drafted),
+            accepted: self.accepted.saturating_add(other.accepted),
+        }
+    }
+}
+
 /// An event emitted by a scheduler step. This is what the server streams to
 /// clients and what the telemetry writer logs (ADR 0007: the telemetry
 /// counters are derived from these events).
 #[derive(Debug, Clone)]
 pub enum SchedEvent {
-    /// A new token was generated for a request.
+    /// A token was committed for a request — one event per token of a
+    /// round's run, in order (P5-06, GitHub #154).
     Token { request: RequestId, token: TokenId },
     /// A request completed (`tokens` = total generated this request).
     Done {
@@ -221,6 +263,10 @@ pub enum SchedEvent {
         /// Why generation stopped (GitHub #61 / P1-25) — the server maps
         /// this straight to the OpenAI `finish_reason` field.
         reason: FinishReason,
+        /// The request's speculative rounds, summed (P5-06, GitHub #154):
+        /// `None` when it ran none — a load without speculation — so the
+        /// request log never reports placeholder zeros.
+        spec: Option<SpecCounters>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

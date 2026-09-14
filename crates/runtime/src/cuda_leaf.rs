@@ -26,11 +26,11 @@ use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{PinnedBuffer, Seq, SeqPool, SeqPoolBudget, SeqPrefix};
 use ignis_core::step;
 use ignis_core::{
-    DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, TokenId,
-    plan_kv_pool_for_context,
+    DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, SpecCounters,
+    TokenId, plan_kv_pool_for_context,
 };
 
-use crate::{RuntimeStats, StepLeaf};
+use crate::{DecodeLane, LaneRun, RuntimeStats, StepLeaf};
 
 /// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
@@ -419,29 +419,70 @@ impl StepLeaf for CudaLeaf {
         &self,
         model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
-        params: &[DecodeParams],
-    ) -> Result<Vec<TokenId>, i32> {
-        if params.len() > N_DECODE_LANES {
+        lanes: &[DecodeLane<'_>],
+    ) -> Result<Vec<LaneRun>, i32> {
+        if lanes.len() > N_DECODE_LANES {
             return Err(leaf_error(
                 "decode",
                 format!(
                     "batch has {} sampling parameter sets; maximum is {N_DECODE_LANES}",
-                    params.len()
+                    lanes.len()
                 ),
             ));
         }
-        let mut sampling = [step::SamplingParams::greedy(); N_DECODE_LANES];
-        for (target, source) in sampling.iter_mut().zip(params.iter().copied()) {
-            *target = sampling_params(source);
-        }
-        let ids = step::decode_program_batch_sampled(
+        let Some(speculation) = self.config.speculation else {
+            let mut sampling = [step::SamplingParams::greedy(); N_DECODE_LANES];
+            for (target, lane) in sampling.iter_mut().zip(lanes) {
+                *target = sampling_params(lane.params);
+            }
+            let ids = step::decode_program_batch_sampled(
+                &model.model,
+                &model.pool,
+                sequences,
+                &sampling[..lanes.len()],
+            )
+            .map_err(|e| leaf_error("decode", e))?;
+            return Ok(ids.into_iter().map(|id| LaneRun::token(id as TokenId)).collect());
+        };
+        // P5-06 (GitHub #154, spec 05): a speculative load runs every round
+        // as a verify round at the window it was loaded with. No lane
+        // proposes drafts until the drafter fills this seam (P5-05, GitHub
+        // #155), so each commits its anchor alone -- through the verify
+        // round, its budget and stop cut, and its graphs.
+        let stop_ids: Vec<Vec<i32>> = lanes
+            .iter()
+            .map(|lane| lane.stop_ids.iter().map(|&id| id as i32).collect())
+            .collect();
+        let verify: Vec<step::VerifyLane<'_>> = lanes
+            .iter()
+            .zip(&stop_ids)
+            .map(|(lane, stops)| step::VerifyLane {
+                sampling: sampling_params(lane.params),
+                remaining_tokens: lane.remaining_tokens,
+                stop_ids: stops,
+                drafts: &[],
+            })
+            .collect();
+        let runs = step::decode_program_verify(
             &model.model,
             &model.pool,
             sequences,
-            &sampling[..params.len()],
+            &verify,
+            speculation.draft_tokens(),
         )
         .map_err(|e| leaf_error("decode", e))?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
+        Ok(runs
+            .into_iter()
+            .zip(&verify)
+            .map(|(run, lane)| {
+                let drafted = lane.drafts.len() as u32;
+                let accepted = (run.len() as u32).saturating_sub(1).min(drafted);
+                LaneRun {
+                    tokens: run.into_iter().map(|id| id as TokenId).collect(),
+                    spec: Some(SpecCounters::round(drafted, accepted)),
+                }
+            })
+            .collect())
     }
 
     fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {

@@ -795,11 +795,13 @@ impl ConcreteScheduler {
         // then the request has already been released).
         let _span =
             tracing::info_span!("ignis.completion", request_id = self.requests[idx].id).entered();
+        let spec = self.requests[idx].spec;
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
             reason,
+            spec,
         });
     }
 
@@ -1757,6 +1759,7 @@ impl Scheduler for ConcreteScheduler {
                     request: self.requests[i].id,
                     lane: self.requests[i].lane.expect("running requests hold a lane"),
                     params: self.requests[i].input.params,
+                    remaining_tokens: self.requests[i].remaining_work.min(u32::MAX as u64) as u32,
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -1780,45 +1783,70 @@ impl Scheduler for ConcreteScheduler {
                             round = self.tick,
                         )
                         .entered();
-                        match res {
-                            DecodeOutcome::Token(token) => {
-                                self.requests[i].tokens += 1;
-                                // Service-work decay (core-05): one
-                                // quantum per generated token.
-                                self.requests[i].remaining_work =
-                                    self.requests[i].remaining_work.saturating_sub(1);
-                                events.push(SchedEvent::Token {
-                                    request: self.requests[i].id,
-                                    token: *token,
-                                });
-                                // core-06: record a GDN checkpoint at the
-                                // new position (the host tier may snapshot
-                                // the request at this boundary — the GDN
-                                // state is resumable there). The position is
-                                // absolute over the whole sequence (prompt +
-                                // generated), not just the decode-token
-                                // count: P3-01's chunked prefill now
-                                // checkpoints at real prompt positions too
-                                // (`GdnState::checkpoint` only accepts a
-                                // position `>=` the current one), so a
-                                // decode checkpoint that restarted counting
-                                // from 0 would be silently dropped the
-                                // instant it fell behind the prompt length.
-                                let new_pos = self.requests[i].input.tokens.len()
-                                    + self.requests[i].tokens as usize;
-                                self.requests[i].checkpoint(new_pos);
-                                // The reservation cap: the request
-                                // completes on its final reserved token.
-                                if self.requests[i].remaining_work == 0 {
-                                    self.mark_done(i, &mut events, FinishReason::Length);
-                                }
+                        let DecodeOutcome {
+                            tokens,
+                            finish,
+                            spec,
+                        } = res;
+                        debug_assert!(
+                            !tokens.is_empty() || finish.is_some(),
+                            "a decode outcome commits a token or finishes the request"
+                        );
+                        if let Some(spec) = spec {
+                            let r = &mut self.requests[i];
+                            r.spec = Some(r.spec.unwrap_or_default() + *spec);
+                        }
+                        // P5-06 (GitHub #154): the round committed a run,
+                        // emitted one event per token, in order.
+                        let mut run_truncated_by_budget = false;
+                        for (n, &token) in tokens.iter().enumerate() {
+                            self.requests[i].tokens += 1;
+                            // Service-work decay (core-05): one quantum per
+                            // generated token.
+                            self.requests[i].remaining_work =
+                                self.requests[i].remaining_work.saturating_sub(1);
+                            events.push(SchedEvent::Token { request: request_id, token });
+                            // The reservation cap: nothing past the final
+                            // reserved token is emitted, whatever the
+                            // backend committed.
+                            if self.requests[i].remaining_work == 0 {
+                                run_truncated_by_budget = n + 1 < tokens.len();
+                                break;
                             }
-                            DecodeOutcome::Finished(reason) => {
-                                // Finished (EOS or the backend's own
-                                // `max_tokens` enforcement): Done, lane
-                                // released.
-                                self.mark_done(i, &mut events, *reason);
+                        }
+                        if !tokens.is_empty() {
+                            // core-06: record a GDN checkpoint at the new
+                            // position (the host tier may snapshot the
+                            // request at this boundary — the GDN state is
+                            // resumable there). Once per round, at the end
+                            // of the run: the positions inside it are not
+                            // boundaries the device state ever stood on. The
+                            // position is absolute over the whole sequence
+                            // (prompt + generated), not just the decode-token
+                            // count: P3-01's chunked prefill now checkpoints
+                            // at real prompt positions too
+                            // (`GdnState::checkpoint` only accepts a position
+                            // `>=` the current one), so a decode checkpoint
+                            // that restarted counting from 0 would be
+                            // silently dropped the instant it fell behind the
+                            // prompt length.
+                            let new_pos = self.requests[i].input.tokens.len()
+                                + self.requests[i].tokens as usize;
+                            self.requests[i].checkpoint(new_pos);
+                        }
+                        match finish {
+                            // Finished (EOS or the backend's own `max_tokens`
+                            // enforcement) after the whole run: Done, lane
+                            // released.
+                            Some(reason) if !run_truncated_by_budget => {
+                                self.mark_done(i, &mut events, *reason)
                             }
+                            // The request completes on its final reserved
+                            // token.
+                            _ if self.requests[i].remaining_work == 0 => {
+                                self.mark_done(i, &mut events, FinishReason::Length)
+                            }
+                            _ => {}
                         }
                     }
                 }

@@ -38,9 +38,9 @@ impl Compute for SamplingEchoCompute {
             .iter()
             .map(|job| {
                 if !generated.insert(job.request) {
-                    return DecodeOutcome::Finished(FinishReason::Length);
+                    return DecodeOutcome::finished(FinishReason::Length);
                 }
-                DecodeOutcome::Token(token_for(job.params))
+                DecodeOutcome::token(token_for(job.params))
             })
             .collect())
     }

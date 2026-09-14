@@ -153,6 +153,43 @@ async fn the_request_class_rides_the_canonical_request_events() {
     }
 }
 
+/// P5-06 (GitHub #154): a request whose rounds commit runs reports its
+/// speculative counters on its one `done` line, through the engine's real
+/// event → facts → telemetry wiring.
+#[tokio::test]
+async fn the_request_log_carries_the_speculative_counters() {
+    let (log_sink, _guard) = capture_events();
+    // Rounds of 3 against a 7-token cap commit 3, 3, 1: three rounds, six
+    // drafts proposed, four committed.
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "test-model".into(),
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::with_runs(&[3])),
+    );
+    let engine = Engine::with_clock(Box::new(scheduler), Arc::new(FixedClock::new(0)));
+    let (_id, mut rx) = engine
+        .submit(input(vec![1, 2, 3], 7), RequestClass::Interactive)
+        .await
+        .expect("submit");
+    let (tokens, _) = collect_tokens(&mut rx, Duration::from_secs(5))
+        .await
+        .expect("the request completes");
+    nudge().await;
+
+    assert_eq!(tokens.len(), 7);
+    let events = events(&log_sink);
+    let done = events
+        .iter()
+        .find(|e| e["event_name"] == "ignis.request.done")
+        .unwrap_or_else(|| panic!("a done event: {events:?}"));
+    assert_eq!(done["attributes"]["tokens"], 7);
+    assert_eq!(done["attributes"]["spec.rounds"], 3, "{done}");
+    assert_eq!(done["attributes"]["spec.drafted"], 6, "{done}");
+    assert_eq!(done["attributes"]["spec.accepted"], 4, "{done}");
+}
+
 #[tokio::test]
 async fn the_interval_counters_track_inflight_requests() {
     let (log_sink, _guard) = capture_events();

@@ -20,7 +20,8 @@ use crate::admission::AdmissionResources;
 use crate::gdn::GdnState;
 use crate::prefix::PrefixId;
 use crate::types::{
-    BackfillClass, LaneId, RequestClass, RequestId, RequestInput, RequestState, TokenId,
+    BackfillClass, LaneId, RequestClass, RequestId, RequestInput, RequestState, SpecCounters,
+    TokenId,
 };
 
 /// A request in flight in the engine: its lifecycle state, its class (for
@@ -48,6 +49,9 @@ pub struct Request {
     pub resident: bool,
     /// Tokens generated so far for this request.
     pub tokens: u32,
+    /// The speculative rounds this request ran, summed (P5-06, GitHub
+    /// #154); `None` until its first one.
+    pub spec: Option<SpecCounters>,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -127,6 +131,7 @@ impl Request {
             lane: None,
             resident: false,
             tokens: 0,
+            spec: None,
             resources,
             remaining_work,
             backfill_epoch: 0,

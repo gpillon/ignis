@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use ignis_core::{
     Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason, N_DECODE_LANES,
-    PrefillJob, RequestId, TokenId,
+    PrefillJob, RequestId, SpecCounters, TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -103,6 +103,38 @@ impl From<RuntimeError> for ComputeError {
     }
 }
 
+/// One lane's inputs to a decode round (P5-06, GitHub #154).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeLane<'a> {
+    /// The lane's sampling parameters.
+    pub params: DecodeParams,
+    /// Tokens the lane may commit this round, `>= 1`: the anchor plus the
+    /// drafts a verify round may accept.
+    pub remaining_tokens: u32,
+    /// The committed run is cut at the first of these, inclusive: the
+    /// model's EOS, or none for a lane that decodes past it.
+    pub stop_ids: &'a [TokenId],
+}
+
+/// One lane's committed run from a decode round (P5-06, GitHub #154).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneRun {
+    /// The committed tokens, in order.
+    pub tokens: Vec<TokenId>,
+    /// The round's speculative counters, when it was a verify round.
+    pub spec: Option<SpecCounters>,
+}
+
+impl LaneRun {
+    /// Today's round: one committed token.
+    pub fn token(token: TokenId) -> Self {
+        Self {
+            tokens: vec![token],
+            spec: None,
+        }
+    }
+}
+
 /// The replaceable step-ABI leaf seam.
 ///
 /// The FFI implementation will map these calls to ADR 0009. Its opaque
@@ -170,16 +202,19 @@ pub trait StepLeaf: Send + Sync + 'static {
         start_position: u32,
         params: DecodeParams,
     ) -> Result<(), i32>;
-    /// Decode one round over a batch of warmed sequences with one parameter
-    /// set per sequence. `params` is parallel to `sequences`. On an error,
-    /// the leaf must leave every input sequence unchanged so the scheduler
-    /// can retry the round without corrupting token order.
+    /// Decode one round over a batch of warmed sequences, `lanes` parallel
+    /// to `sequences`. Returns each lane's committed run (P5-06, GitHub
+    /// #154): at least one token, never more than its `remaining_tokens`,
+    /// cut at its first stop id inclusive — one token on a load without
+    /// speculation. On an error, the leaf must leave every input sequence
+    /// unchanged so the scheduler can retry the round without corrupting
+    /// token order.
     fn decode(
         &self,
         model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
-        params: &[DecodeParams],
-    ) -> Result<Vec<TokenId>, i32>;
+        lanes: &[DecodeLane<'_>],
+    ) -> Result<Vec<LaneRun>, i32>;
 
     // ── state transfer (P4-07, GitHub #125, ADR 0024) ────────────────────
 
@@ -453,7 +488,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         }
 
         // `None` until filled below; every index is either already-finished
-        // (a prior round's `max_tokens`, `Length`), gets a fresh token, or
+        // (a prior round's `max_tokens`, `Length`), gets a fresh run, or
         // finishes this round (EOS, `Stop`) — so every slot is set once.
         let mut outcomes: Vec<Option<DecodeOutcome>> = vec![None; jobs.len()];
         let mut active = vec![false; jobs.len()];
@@ -463,32 +498,55 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .max_tokens
                 .is_some_and(|max| sequence.generated >= max)
             {
-                outcomes[index] = Some(DecodeOutcome::Finished(FinishReason::Length));
+                outcomes[index] = Some(DecodeOutcome::finished(FinishReason::Length));
             } else {
                 active[index] = true;
             }
         }
+        // P5-06 (GitHub #154): the leaf cuts each lane's run at its budget
+        // and at the EOS, so the sequence never commits past the text its
+        // request emits.
+        let eos = [self.eos];
         let decoded = {
-            let mut params = [DecodeParams::default(); N_DECODE_LANES];
-            let mut params_len = 0;
-            for (index, (job, _)) in batch.iter().enumerate() {
-                if active[index] {
-                    params[params_len] = job.params;
-                    params_len += 1;
-                }
-            }
+            let lanes: Vec<DecodeLane<'_>> = batch
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| active[*index])
+                .map(|(_, (job, sequence))| DecodeLane {
+                    params: job.params,
+                    remaining_tokens: job
+                        .params
+                        .max_tokens
+                        .map_or(job.remaining_tokens, |max| {
+                            job.remaining_tokens.min(max.saturating_sub(sequence.generated))
+                        })
+                        .max(1),
+                    stop_ids: if job.params.ignore_eos { &[] } else { &eos },
+                })
+                .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
                 .iter_mut()
                 .enumerate()
                 .filter(|(index, _)| active[*index])
                 .map(|(_, (_, sequence))| &mut sequence.handle)
                 .collect();
-            self.model
-                .leaf
-                .decode(self.model.handle(), &mut handles, &params[..params_len])
+            // Every job was already capped: nothing for the leaf to run, and
+            // it refuses an empty batch.
+            if lanes.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.model
+                    .leaf
+                    .decode(self.model.handle(), &mut handles, &lanes)
+            }
         };
         let decoded = match decoded {
-            Ok(tokens) if tokens.len() == active.iter().filter(|&&active| active).count() => tokens,
+            Ok(runs)
+                if runs.len() == active.iter().filter(|&&active| active).count()
+                    && runs.iter().all(|run| !run.tokens.is_empty()) =>
+            {
+                runs
+            }
             Ok(_) => {
                 for (job, sequence) in batch {
                     sequences.insert(job.request, sequence);
@@ -510,15 +568,24 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 released.push(sequence);
                 continue;
             }
-            let token = decoded.next().expect("decoded result length was checked");
-            if token == self.eos && !job.params.ignore_eos {
-                outcomes[index] = Some(DecodeOutcome::Finished(FinishReason::Stop));
-                released.push(sequence);
-            } else {
-                sequence.generated += 1;
-                outcomes[index] = Some(DecodeOutcome::Token(token));
-                sequences.insert(job.request, sequence);
-            }
+            let LaneRun { mut tokens, spec } = decoded.next().expect("decoded result length was checked");
+            let eos_at = (!job.params.ignore_eos)
+                .then(|| tokens.iter().position(|&token| token == self.eos))
+                .flatten();
+            let outcome = match eos_at {
+                // The EOS itself is never emitted.
+                Some(at) => {
+                    tokens.truncate(at);
+                    released.push(sequence);
+                    DecodeOutcome::run_then_finished(tokens, FinishReason::Stop)
+                }
+                None => {
+                    sequence.generated = sequence.generated.saturating_add(tokens.len() as u32);
+                    sequences.insert(job.request, sequence);
+                    DecodeOutcome::run(tokens)
+                }
+            };
+            outcomes[index] = Some(DecodeOutcome { spec, ..outcome });
         }
         drop(sequences);
         for sequence in released {
