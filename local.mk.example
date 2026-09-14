@@ -1,0 +1,23 @@
+# Per-machine Makefile overrides. Copy to local.mk (gitignored) and edit.
+# The command line and the environment still win over anything set here.
+
+# Default to the CPU mock on a machine without the 5090:
+# CUDA := 0
+
+# A faster edit-compile loop:
+# PROFILE := dev
+
+# The artifact somewhere else:
+# ARTIFACT := F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer
+
+# Another port (ninfer on 8000, say):
+# BIND := 127.0.0.1:8001
+
+# The GPU engine (defaults: 262144 context, hq-e8-2b, dflash2 with 7 drafts):
+# SPEC :=                  # speculation off
+# DRAFT_TOKENS := 4
+# MAX_CONTEXT := 40960
+
+# Always-on server flags and logging:
+# ARGS := --kv-host-pool-bytes 0
+# LOG_LEVEL := debug

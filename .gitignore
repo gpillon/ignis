@@ -27,6 +27,11 @@ __pycache__/
 # local server pid
 .scratch/runtime/ignis-server.pid
 
+# per-machine Makefile overrides (template: local.mk.example), and the
+# server's pid file + logs from `make start` / `make run-ui`
+local.mk
+.scratch/serve/
+
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/
 

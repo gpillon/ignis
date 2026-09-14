@@ -3,3 +3,7 @@
 # end-of-line normalization on checkout or commit would change those bytes and
 # break the byte-identical guarantee of ADR 0010, so git must leave them alone.
 kernel/vendor/** -text
+
+# The Makefile and its includes run under a POSIX sh on every OS: keep them LF.
+Makefile text eol=lf
+*.mk text eol=lf

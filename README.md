@@ -129,6 +129,37 @@ ignis/
 The build has two parts: the C++/CUDA kernel leaf, then the Rust workspace that
 links it.
 
+### With make (the short path)
+
+The `Makefile` wraps the steps below (needs GNU make and a POSIX `sh` — on
+Windows, Git for Windows' `usr\bin` on `PATH`). `make` alone lists every
+target; the everyday ones:
+
+```
+make doctor          # toolchain, rust target, artifact, web deps
+make dev             # build (web + kernel + GPU server), then run it
+make run             # run the last build; fails, naming the changed files, if it is stale
+make mock            # the same on the CPU mock (no GPU, no kernel, no artifact)
+make start / stop    # daemon server (log in .scratch/serve/), waits for /v1/models, survives the terminal
+make dev-ui          # build, then server + Playground hot reload; Ctrl+C stops both
+make watch CUDA=0    # rebuild + restart on every Rust change (cargo-watch)
+make test            # cargo test, workspace-wide
+make gpu-status      # who holds the 5090
+```
+
+With `CUDA=1` the server starts in the G5 gate configuration: the full
+262144-token context, hq-e8-2b KV, DFlash2 speculation with 7 draft tokens
+(`MAX_CONTEXT`, `KV_FORMAT`, `SPEC`, `DRAFT_TOKENS`, `PREFILL_CHUNK`,
+`REQUEST_TIMEOUT`; `SPEC=` turns speculation off).
+Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
+`make dev-ui SPEC= MAX_CONTEXT=40960`) or in an untracked `local.mk`
+(`local.mk.example`); `make config` prints what is in force. A CUDA
+`run`/`start` first runs a GPU guard (the preflight plus a check for other
+ignis GPU work), skippable with `GPU_CHECK=0`. Per-OS behavior sits behind
+`mk/os/<os>.mk`: Windows is implemented, Linux is scaffolded (the CPU mock,
+web and test targets work; kernel, GPU and background-server hooks report
+"not implemented").
+
 ### 1. Kernel leaf (C++/CUDA)
 
 `kernel/build.ps1` configures and builds the kernel leaf with CMake + Ninja +

@@ -28,7 +28,7 @@ until the test suite is green.
 - Playground work (`web/`, ADR 0026) is not exercised by `cargo test`
   either: its logic lives in pure modules with vitest tests, so a change
   there also needs `npm --prefix web test` and `npm --prefix web run build`
-  (the typecheck) green. `cargo test` covers only the server's `/ui` routes.
+  (the typecheck) green — `make test-web web-build`. `cargo test` covers only the server's `/ui` routes.
 - A `--features cuda` build rebuilds the leaf for you.
   `crates/artifact/build.rs` watches every file under `kernel/src`,
   `kernel/include`, `kernel/tests`, `kernel/vendor/src` and
@@ -142,7 +142,8 @@ some. That includes another agent session in another worktree: the
 worktrees are separate, the card is not. `nvidia-smi` (or
 `scripts/gpu-preflight.ps1`) plus `tasklist` for stray `*_gpu-*.exe`,
 `ignis-server`, `ignis-bench` and `ninfer*` processes answers it in one
-step.
+step; `make gpu-status` prints both, and `make gpu-guard` turns them into a
+pass/fail.
 
 Runbook:
 
@@ -161,6 +162,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 # -SkipCargoTests      kernel leaf only, skip both cargo stages
 # 3. Restart ninfer.
 ```
+
+`make gpu-profile` runs the same script; `GPU_PROFILE_ARGS` forwards its
+switches (`make gpu-profile GPU_PROFILE_ARGS=-SkipKernelBuild`).
 
 `scripts/gpu-preflight.ps1` still exists as the standalone check
 (`scripts/gpu-profile.ps1` calls it) for a quick "is the GPU free" query
@@ -323,7 +327,9 @@ For the record: shrinking the hq pool from 7,281 pages to 1,024 moved ITL p50 by
 but that is a measured result, not an assumption to skip the matching on.
 
 Needs the GPU exclusively (ADR 0006) and `ninfer-serve` stopped for the ignis
-legs. Four runs, ~4 minutes each.
+legs. Four runs, ~4 minutes each. Launch the legs with the explicit commands
+below: `make start` brings up the G5 configuration (262144 context, DFlash2),
+a different engine from these legs.
 
 ```powershell
 $Artifact = "F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer"

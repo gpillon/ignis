@@ -37,6 +37,16 @@ that no other test, bench or agent session is already using the card — in
 any worktree. The 5090 fits one run at a time and the loser dies with no
 diagnostic. See `docs/agents/testing.md`.
 
+### Make
+
+`make help` lists the targets; `make config` prints the exact server command
+a run will use. An agent runs the server as a daemon — `make start`, then
+`make stop` — since `run`, `dev`, `dev-ui` and `watch` hold the terminal
+until Ctrl+C. `run` and `start` only ever launch the last build: a stale
+binary fails naming the changed files, and `make build` is the fix.
+`make gpu-status` is the one-command check before GPU work. Why it is
+shaped this way: ADR 0027.
+
 ### Worktrees
 
 All git worktrees for this repo live under `../.inference-qwen-worktrees/`
