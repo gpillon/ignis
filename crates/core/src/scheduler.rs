@@ -270,6 +270,10 @@ pub trait Scheduler: Send {
     /// The loaded model id (for `GET /v1/models`).
     fn model_id(&self) -> &str;
 
+    /// The model's context for one sequence, prompt plus generation, in
+    /// tokens (for `GET /v1/models`; `submit` refuses anything over it).
+    fn max_sequence_tokens(&self) -> u32;
+
     /// The operating mode (reported by telemetry interval lines).
     fn mode(&self) -> crate::types::EngineMode;
 }

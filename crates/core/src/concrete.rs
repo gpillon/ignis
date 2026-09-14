@@ -1904,6 +1904,10 @@ impl Scheduler for ConcreteScheduler {
         &self.config.model
     }
 
+    fn max_sequence_tokens(&self) -> u32 {
+        self.config.max_sequence_tokens
+    }
+
     fn mode(&self) -> EngineMode {
         if self.in_flight() > 0 {
             EngineMode::Serving

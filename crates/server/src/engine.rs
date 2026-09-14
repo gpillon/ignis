@@ -90,6 +90,8 @@ pub struct Engine {
     /// The loaded model id — immutable for the server's life, so it is
     /// captured once here instead of crossing the command channel.
     model_id: String,
+    /// The scheduler's per-sequence context, captured the same way.
+    max_model_len: u32,
     commands: std_mpsc::Sender<Command>,
     facts: UnboundedSender<TelemetryFact>,
     /// The latest interval counters, published wait-free by the telemetry
@@ -102,6 +104,7 @@ impl Clone for Engine {
     fn clone(&self) -> Self {
         Self {
             model_id: self.model_id.clone(),
+            max_model_len: self.max_model_len,
             commands: self.commands.clone(),
             facts: self.facts.clone(),
             counters: Arc::clone(&self.counters),
@@ -141,6 +144,7 @@ impl Engine {
         clock: Arc<dyn TelemetryClock>,
     ) -> (Self, std::thread::JoinHandle<()>) {
         let model_id = scheduler.model_id().to_string();
+        let max_model_len = scheduler.max_sequence_tokens();
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
@@ -161,6 +165,7 @@ impl Engine {
         (
             Self {
                 model_id,
+                max_model_len,
                 commands: command_tx,
                 facts: facts_tx,
                 counters,
@@ -182,6 +187,12 @@ impl Engine {
     /// model thread).
     pub fn model_id(&self) -> String {
         self.model_id.clone()
+    }
+
+    /// The model's context for one request, prompt plus `max_tokens`, in
+    /// tokens (for `GET /v1/models`) — immutable like the model id.
+    pub fn max_model_len(&self) -> u32 {
+        self.max_model_len
     }
 
     /// The latest interval counters, published wait-free by the telemetry
@@ -595,6 +606,9 @@ mod tests {
         fn model_id(&self) -> &str {
             Self::MODEL
         }
+        fn max_sequence_tokens(&self) -> u32 {
+            8192
+        }
         fn mode(&self) -> EngineMode {
             EngineMode::Serving
         }
@@ -656,6 +670,9 @@ mod tests {
         }
         fn model_id(&self) -> &str {
             ProtectedBatchScheduler::MODEL
+        }
+        fn max_sequence_tokens(&self) -> u32 {
+            8192
         }
         fn mode(&self) -> EngineMode {
             EngineMode::Serving

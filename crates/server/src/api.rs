@@ -640,6 +640,7 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
             id,
             object: "model",
             owned_by: "ignis",
+            max_model_len: server.engine.max_model_len(),
         }],
     })
 }
@@ -657,6 +658,9 @@ struct ModelInfo {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    /// The context for one request, prompt plus `max_tokens`, in tokens
+    /// (vLLM's name for it; the Playground's context bar reads it).
+    max_model_len: u32,
 }
 
 // ── POST /v1/chat/completions ─────────────────────────────────────────────
