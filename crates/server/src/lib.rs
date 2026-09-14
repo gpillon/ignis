@@ -25,6 +25,7 @@ pub mod config;
 pub mod decoder;
 pub mod engine;
 pub mod loader;
+pub mod playground;
 pub mod runtime;
 pub mod telemetry;
 pub mod template;
@@ -60,6 +61,9 @@ pub struct Server {
     pub default_enable_thinking: bool,
     /// The server-wide `reasoning_effort` default (`IGNIS_REASONING_EFFORT`).
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
+    /// 0026); `None` leaves the `/ui` routes out of the router entirely.
+    pub playground: Option<playground::Assets>,
 }
 
 impl Server {
@@ -71,6 +75,7 @@ impl Server {
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
             default_enable_thinking: true,
             default_reasoning_effort: None,
+            playground: None,
         }
     }
 
@@ -108,6 +113,14 @@ impl Server {
     ) -> Self {
         self.default_enable_thinking = enable_thinking;
         self.default_reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Serve the Playground from `assets` under `/ui/` (`main` passes
+    /// [`playground::EMBEDDED`] when `--ui` is set; tests inject their own
+    /// table, including the empty one that selects the fallback page).
+    pub fn with_playground(mut self, assets: playground::Assets) -> Self {
+        self.playground = Some(assets);
         self
     }
 

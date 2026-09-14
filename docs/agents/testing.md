@@ -25,6 +25,10 @@ until the test suite is green.
   `cargo test` *does* check is the vendored subtree's integrity
   (`crates/vendor`): a vendored file edited without a recorded patch turns the
   workspace red (ADR 0010, `kernel/vendor/VENDOR.md`).
+- Playground work (`web/`, ADR 0026) is not exercised by `cargo test`
+  either: its logic lives in pure modules with vitest tests, so a change
+  there also needs `npm --prefix web test` and `npm --prefix web run build`
+  (the typecheck) green. `cargo test` covers only the server's `/ui` routes.
 - A `--features cuda` build rebuilds the leaf for you.
   `crates/artifact/build.rs` watches every file under `kernel/src`,
   `kernel/include`, `kernel/tests`, `kernel/vendor/src` and

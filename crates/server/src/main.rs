@@ -53,6 +53,8 @@
 //! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
 //!   non-streaming completion waits before the handler gives up with a
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
+//! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
+//!   (GitHub #163, ADR 0026); off by default.
 
 use std::sync::Arc;
 
@@ -205,6 +207,7 @@ async fn main() {
         host_pool_bytes: _,
         speculation: _,
         request_timeout_secs,
+        ui,
     } = config;
 
     let server = if let Some(artifact_path) = &artifact {
@@ -284,6 +287,20 @@ async fn main() {
         exit_after_flush(&logging_handle, 1);
     }
     let server = server.with_thinking_defaults(default_enable_thinking, default_reasoning_effort);
+
+    // The Playground (GitHub #163, ADR 0026): whatever this binary embedded
+    // — the frontend build, or nothing, which serves the fallback page.
+    let server = if ui {
+        if ignis_server::playground::EMBEDDED.is_empty() {
+            tracing::warn!(
+                name: "ignis.playground.not_built",
+                "--ui set but this binary was built without web/dist — /ui/ serves the build instructions"
+            );
+        }
+        server.with_playground(ignis_server::playground::EMBEDDED)
+    } else {
+        server
+    };
 
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the

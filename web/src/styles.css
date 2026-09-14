@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+/* The Playground is styled with Tailwind utilities in the components; this
+   file only sets the page ground and the dark scheme (Tailwind's `dark:`
+   variant follows prefers-color-scheme). */
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+
+  body {
+    @apply bg-stone-100 text-stone-900 antialiased dark:bg-stone-950 dark:text-stone-100;
+  }
+}
