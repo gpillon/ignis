@@ -82,9 +82,42 @@ pub fn compare_endpoints(
     tokenizer: &dyn Tokenize,
     max_tokens: u32,
 ) -> Result<Vec<CanaryEquivalence>, String> {
-    let on = capture(spec_on, tokenizer, max_tokens).map_err(|e| format!("spec-on: {e}"))?;
-    let off = capture(spec_off, tokenizer, max_tokens).map_err(|e| format!("spec-off: {e}"))?;
+    let on = capture(spec_on, tokenizer, max_tokens, Side::SpecOn, LIVE_SESSION)
+        .map_err(|e| format!("spec-on: {e}"))?;
+    let off = capture(spec_off, tokenizer, max_tokens, Side::SpecOff, LIVE_SESSION)
+        .map_err(|e| format!("spec-off: {e}"))?;
     compare_captures(&on, &off)
+}
+
+/// The session [`compare_endpoints`] stamps on both of its in-memory
+/// captures: they are taken in one call, so they share it by construction.
+const LIVE_SESSION: &str = "live";
+
+/// Which side of the check a capture was taken on. The endpoint cannot tell
+/// the harness whether speculation is on, so the operator names it and the
+/// capture carries it: a spec-off capture compared with itself is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Side {
+    SpecOn,
+    SpecOff,
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::SpecOn => "spec-on",
+            Side::SpecOff => "spec-off",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "spec-on" => Ok(Side::SpecOn),
+            "spec-off" => Ok(Side::SpecOff),
+            other => Err(format!("side must be spec-on or spec-off, not {other:?}")),
+        }
+    }
 }
 
 /// One side of the check, taken against one launch and kept on disk (#156).
@@ -95,6 +128,10 @@ pub fn compare_endpoints(
 /// and compares the two files with [`compare_captures`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capture {
+    pub side: Side,
+    /// The gate session the capture belongs to; two captures compare only
+    /// within one session (ADR 0015).
+    pub session: String,
     /// The output budget every request was sent with; two captures compare
     /// only at the same budget.
     pub max_tokens: u32,
@@ -131,12 +168,14 @@ pub fn capture(
     endpoint: &dyn Endpoint,
     tokenizer: &dyn Tokenize,
     max_tokens: u32,
+    side: Side,
+    session: &str,
 ) -> Result<Capture, String> {
     let canaries = CANARIES
         .iter()
         .map(|c| {
             let req = Request {
-                id: format!("equiv-{}", c.id),
+                id: format!("equiv-{}-{}", c.id, side.as_str()),
                 // `Sub` only because `Request` needs some class and nothing
                 // here ever feeds `class_stats` — matches `oracle::record`'s
                 // own canary requests.
@@ -154,17 +193,51 @@ pub fn capture(
             Ok(CanaryCapture { id: c.id.to_string(), text: out.output, tokens })
         })
         .collect::<Result<_, String>>()?;
-    Ok(Capture { max_tokens, canaries })
+    Ok(Capture { side, session: session.to_string(), max_tokens, canaries })
 }
 
 /// Compare a spec-on and a spec-off capture canary by canary, in
-/// [`CANARIES`] order. Refuses captures taken at different budgets (a
-/// shorter budget would read as a divergence at its end) and a capture that
-/// lacks a canary of the suite.
+/// [`CANARIES`] order. Refuses a capture on the wrong side, captures from
+/// different sessions or at different budgets (a shorter budget would read
+/// as a divergence at its end), and a capture whose canaries are not
+/// exactly the suite — one missing, repeated or unknown.
 pub fn compare_captures(
     spec_on: &Capture,
     spec_off: &Capture,
 ) -> Result<Vec<CanaryEquivalence>, String> {
+    for (capture, expected) in [(spec_on, Side::SpecOn), (spec_off, Side::SpecOff)] {
+        if capture.side != expected {
+            return Err(format!(
+                "the {} capture was taken on the {} side",
+                expected.as_str(),
+                capture.side.as_str()
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in &capture.canaries {
+            if !CANARIES.iter().any(|k| k.id == c.id) {
+                return Err(format!(
+                    "canary {} in the {} capture is not in the suite",
+                    c.id,
+                    expected.as_str()
+                ));
+            }
+            if !seen.insert(c.id.as_str()) {
+                return Err(format!(
+                    "canary {} appears more than once in the {} capture",
+                    c.id,
+                    expected.as_str()
+                ));
+            }
+        }
+    }
+    if spec_on.session != spec_off.session {
+        return Err(format!(
+            "the spec-on capture is from session {} and the spec-off capture from {}: \
+             captures compare only within one session",
+            spec_on.session, spec_off.session
+        ));
+    }
     if spec_on.max_tokens != spec_off.max_tokens {
         return Err(format!(
             "the spec-on capture ran at max_tokens {} and the spec-off capture at {}: \
@@ -307,38 +380,101 @@ mod tests {
         let live = compare_endpoints(&on, &off, &MockTokenizer, EQUIVALENCE_MAX_TOKENS)
             .expect("live results");
 
-        let on_capture = capture(&on, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture on");
+        let on_capture = capture(&on, &MockTokenizer, EQUIVALENCE_MAX_TOKENS, Side::SpecOn, "s1")
+            .expect("capture on");
         let off_capture =
-            capture(&off, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture off");
-        let path = std::env::temp_dir()
-            .join(format!("ignis-bench-equivalence-capture-{}.json", std::process::id()));
-        off_capture.write(&path).expect("write the capture");
-        let reloaded = Capture::read(&path).expect("read the capture back");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(reloaded, off_capture);
+            capture(&off, &MockTokenizer, EQUIVALENCE_MAX_TOKENS, Side::SpecOff, "s1")
+                .expect("capture off");
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let reload = |c: &Capture, name: &str| {
+            let path = dir.join(format!("ignis-bench-equivalence-{name}-{pid}.json"));
+            c.write(&path).expect("write the capture");
+            let back = Capture::read(&path).expect("read the capture back");
+            let _ = std::fs::remove_file(&path);
+            back
+        };
+        let on_back = reload(&on_capture, "on");
+        let off_back = reload(&off_capture, "off");
+        assert_eq!(on_back, on_capture);
+        assert_eq!(off_back, off_capture);
 
-        let from_files = compare_captures(&on_capture, &reloaded).expect("file results");
+        let from_files = compare_captures(&on_back, &off_back).expect("file results");
         assert_eq!(from_files, live);
+        let (id, pos) = first_failure(&from_files).expect("the divergence survives the files");
+        assert_eq!((id, pos), (CANARIES[0].id, 2));
+    }
+
+    /// Every request names its side, so an engine log tells the two apart.
+    #[test]
+    fn a_capture_sends_requests_named_by_side() {
+        use std::sync::Mutex;
+        struct Recording(Mutex<Vec<String>>);
+        impl Endpoint for Recording {
+            fn complete(&self, req: &Request) -> Result<Outcome, String> {
+                self.0.lock().unwrap().push(req.id.clone());
+                FixedEndpoint("x").complete(req)
+            }
+        }
+        let ep = Recording(Mutex::new(Vec::new()));
+        capture(&ep, &MockTokenizer, 8, Side::SpecOff, "s1").expect("capture");
+        let ids = ep.0.into_inner().unwrap();
+        assert_eq!(ids[0], format!("equiv-{}-spec-off", CANARIES[0].id));
     }
 
     #[test]
     fn captures_at_different_budgets_are_refused() {
         let ep = FixedEndpoint("same output every time");
-        let on = capture(&ep, &MockTokenizer, 64).expect("capture on");
-        let off = capture(&ep, &MockTokenizer, 32).expect("capture off");
+        let on = capture(&ep, &MockTokenizer, 64, Side::SpecOn, "s1").expect("capture on");
+        let off = capture(&ep, &MockTokenizer, 32, Side::SpecOff, "s1").expect("capture off");
         let err = compare_captures(&on, &off).expect_err("budgets differ");
         assert!(err.contains("64") && err.contains("32"), "{err}");
+    }
+
+    /// A spec-off capture compared with itself must not pass as equivalence.
+    #[test]
+    fn captures_on_the_wrong_side_are_refused() {
+        let ep = FixedEndpoint("same output every time");
+        let off = capture(&ep, &MockTokenizer, 8, Side::SpecOff, "s1").expect("capture off");
+        let err = compare_captures(&off, &off).expect_err("both sides are spec-off");
+        assert!(err.contains("spec-on"), "{err}");
+    }
+
+    #[test]
+    fn captures_from_different_sessions_are_refused() {
+        let ep = FixedEndpoint("same output every time");
+        let on = capture(&ep, &MockTokenizer, 8, Side::SpecOn, "g5-a").expect("capture on");
+        let off = capture(&ep, &MockTokenizer, 8, Side::SpecOff, "g5-b").expect("capture off");
+        let err = compare_captures(&on, &off).expect_err("sessions differ");
+        assert!(err.contains("g5-a") && err.contains("g5-b"), "{err}");
     }
 
     #[test]
     fn a_capture_missing_a_canary_is_refused_naming_it() {
         let ep = FixedEndpoint("same output every time");
-        let on = capture(&ep, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture on");
-        let mut off = on.clone();
+        let on = capture(&ep, &MockTokenizer, 8, Side::SpecOn, "s1").expect("capture on");
+        let mut off = capture(&ep, &MockTokenizer, 8, Side::SpecOff, "s1").expect("capture off");
         let dropped = off.canaries.pop().expect("a canary").id;
         let err = compare_captures(&on, &off).expect_err("a canary is missing");
         assert!(err.contains(&dropped), "{err}");
         assert!(err.contains("spec-off"), "{err}");
+    }
+
+    #[test]
+    fn a_capture_with_an_extra_or_repeated_canary_is_refused() {
+        let ep = FixedEndpoint("same output every time");
+        let on = capture(&ep, &MockTokenizer, 8, Side::SpecOn, "s1").expect("capture on");
+        let off = capture(&ep, &MockTokenizer, 8, Side::SpecOff, "s1").expect("capture off");
+
+        let mut repeated = off.clone();
+        repeated.canaries.push(repeated.canaries[0].clone());
+        let err = compare_captures(&on, &repeated).expect_err("a canary repeats");
+        assert!(err.contains(CANARIES[0].id), "{err}");
+
+        let mut extra = off.clone();
+        extra.canaries.push(CanaryCapture { id: "stale".into(), text: String::new(), tokens: vec![] });
+        let err = compare_captures(&on, &extra).expect_err("an unknown canary");
+        assert!(err.contains("stale"), "{err}");
     }
 
     #[test]
@@ -349,8 +485,17 @@ mod tests {
                 Err("endpoint down".into())
             }
         }
-        let err = capture(&Failing, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect_err("must fail");
+        let err = capture(&Failing, &MockTokenizer, EQUIVALENCE_MAX_TOKENS, Side::SpecOn, "s1")
+            .expect_err("must fail");
         assert!(err.contains(CANARIES[0].id), "{err}");
+    }
+
+    #[test]
+    fn a_side_parses_from_its_flag_spelling() {
+        assert_eq!(Side::parse("spec-on"), Ok(Side::SpecOn));
+        assert_eq!(Side::parse("spec-off"), Ok(Side::SpecOff));
+        assert!(Side::parse("on").is_err());
+        assert_eq!(Side::SpecOff.as_str(), "spec-off");
     }
 
     #[test]

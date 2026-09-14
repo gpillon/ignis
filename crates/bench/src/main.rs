@@ -82,12 +82,13 @@
 //!       the same endpoint restarted between runs), compared token-for-token
 //!       for exact equality. Exits non-zero on the first divergence, naming
 //!       the canary and the position.
-//!   `g5-equivalence capture --endpoint <url> --artifact <artifact.ninfer> --out <capture.json>`
+//!   `g5-equivalence capture --endpoint <url> --artifact <artifact.ninfer>
+//!             --side spec-on|spec-off --session <id> --out <capture.json>`
 //!       One side of that check against the launch live now, kept on disk
-//!       (#156): two engines do not fit on the card at once, so the gate
-//!       captures the spec-off launch, restarts with speculation on, and
-//!       compares with `--spec-off-capture <capture.json>` (either side may
-//!       be a capture).
+//!       with its side and session (#156): two engines do not fit on the card
+//!       at once, so the gate captures the spec-off launch, restarts with
+//!       speculation on, captures again, and compares with
+//!       `--spec-on-capture <on.json> --spec-off-capture <off.json>`.
 //!
 //! `replay`/`canary` drive a live endpoint through the real `HttpEndpoint`
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
@@ -165,9 +166,12 @@ fn print_usage() {
                       [--note <text>] [--out <verdict.json>]
   ignis-bench g5-equivalence (--spec-on <url> | --spec-on-capture <capture.json>)
                       (--spec-off <url> | --spec-off-capture <capture.json>)
-                      [--artifact <artifact.ninfer>] [--max-tokens 64] [--out <report.json>]
-  ignis-bench g5-equivalence capture --endpoint <url> --artifact <artifact.ninfer> --out <capture.json>
-                      [--max-tokens 64]
+                      [--artifact <artifact.ninfer> (required for a live side)] [--session <id>]
+                      [--max-tokens 64] [--out <report.json>]
+  ignis-bench g5-equivalence capture --endpoint <url> --artifact <artifact.ninfer>
+                      --side spec-on|spec-off --session <id> --out <capture.json> [--max-tokens 64]
+    two launches, one card: capture --side spec-off, restart with speculation on,
+    capture --side spec-on, then --spec-on-capture <on.json> --spec-off-capture <off.json>
 
 environment:
   {timeout_env}=<seconds>   the per-request deadline every subcommand drives an engine with
@@ -1231,11 +1235,6 @@ fn cmd_g5_gate(args: &[String]) -> ExitCode {
     }
 }
 
-/// `g5-equivalence` (P5-07, GitHub #151): the phase 5 correctness oracle —
-/// the canary suite run greedy against a speculation-on and a
-/// speculation-off endpoint (or the same endpoint restarted between runs),
-/// compared token-for-token for exact equality. Exits non-zero on the first
-/// divergence, naming the canary and the position.
 /// Where one side of `g5-equivalence` comes from: a live endpoint, or a
 /// capture file an earlier launch wrote (`g5-equivalence capture`, #156).
 #[derive(Debug, Clone, PartialEq)]
@@ -1261,37 +1260,41 @@ fn equivalence_side(args: &[String], side: &str) -> Result<EquivalenceSide, Stri
 /// the canaries through it.
 fn capture_endpoint(
     url: &str,
-    side: &str,
+    side: equivalence::Side,
+    session: &str,
     artifact: Option<&str>,
     max_tokens: u32,
 ) -> Result<equivalence::Capture, String> {
-    let artifact =
-        artifact.ok_or_else(|| format!("--artifact is required to capture {side} from {url}"))?;
+    let side_name = side.as_str();
+    let artifact = artifact
+        .ok_or_else(|| format!("--artifact is required to capture {side_name} from {url}"))?;
     let frontend = open_frontend(artifact)?;
     let endpoint = endpoint_for(url);
-    endpoint.list_models().map_err(|e| format!("{side} endpoint {url}: {e}"))?;
-    equivalence::capture(&endpoint, frontend.tokenizer(), max_tokens)
-        .map_err(|e| format!("{side}: {e}"))
+    endpoint.list_models().map_err(|e| format!("{side_name} endpoint {url}: {e}"))?;
+    equivalence::capture(&endpoint, frontend.tokenizer(), max_tokens, side, session)
+        .map_err(|e| format!("{side_name}: {e}"))
 }
 
 /// `g5-equivalence capture --endpoint <url> --artifact <a> --out <file>`:
 /// one side of the check against the launch that is live now (#156).
 fn cmd_g5_equivalence_capture(args: &[String]) -> ExitCode {
-    let (url, out) = match (require(args, "endpoint"), require(args, "out")) {
-        (Ok(u), Ok(o)) => (u, o),
-        (u, o) => {
-            for err in [u.err(), o.err()].into_iter().flatten() {
-                eprintln!("{err}");
+    let side = require(args, "side").and_then(|s| equivalence::Side::parse(&s));
+    let (url, out, side, session) =
+        match (require(args, "endpoint"), require(args, "out"), side, require(args, "session")) {
+            (Ok(u), Ok(o), Ok(s), Ok(n)) => (u, o, s, n),
+            (u, o, s, n) => {
+                for err in [u.err(), o.err(), s.err(), n.err()].into_iter().flatten() {
+                    eprintln!("{err}");
+                }
+                print_usage();
+                return ExitCode::FAILURE;
             }
-            print_usage();
-            return ExitCode::FAILURE;
-        }
-    };
+        };
     let max_tokens = opt(args, "max-tokens")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(equivalence::EQUIVALENCE_MAX_TOKENS);
     let artifact = opt(args, "artifact");
-    let captured = match capture_endpoint(&url, "endpoint", artifact.as_deref(), max_tokens) {
+    let captured = match capture_endpoint(&url, side, &session, artifact.as_deref(), max_tokens) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -1306,6 +1309,11 @@ fn cmd_g5_equivalence_capture(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `g5-equivalence` (P5-07, GitHub #151): the phase 5 correctness oracle —
+/// the canary suite run greedy with speculation on and off, each side a live
+/// endpoint or a capture an earlier launch wrote (#156), compared
+/// token-for-token for exact equality. Exits non-zero on the first
+/// divergence, naming the canary and the position.
 fn cmd_g5_equivalence(args: &[String]) -> ExitCode {
     if args.first().map(String::as_str) == Some("capture") {
         return cmd_g5_equivalence_capture(&args[1..]);
@@ -1328,15 +1336,23 @@ fn cmd_g5_equivalence(args: &[String]) -> ExitCode {
         .unwrap_or(equivalence::EQUIVALENCE_MAX_TOKENS);
     let out = opt(args, "out");
     let artifact = opt(args, "artifact");
+    let session = opt(args, "session").unwrap_or_else(new_session_id);
+    let both_captures = matches!(
+        (&on_side, &off_side),
+        (EquivalenceSide::Capture(_), EquivalenceSide::Capture(_))
+    );
+    if both_captures && opt(args, "max-tokens").is_some() {
+        eprintln!("note: --max-tokens is ignored: both sides are captures, which carry their own budget");
+    }
 
-    let load = |side: &EquivalenceSide, name: &str| match side {
+    let load = |source: &EquivalenceSide, side: equivalence::Side| match source {
         EquivalenceSide::Endpoint(url) => {
-            capture_endpoint(url, name, artifact.as_deref(), max_tokens)
+            capture_endpoint(url, side, &session, artifact.as_deref(), max_tokens)
         }
         EquivalenceSide::Capture(path) => equivalence::Capture::read(Path::new(path)),
     };
-    let results = match load(&on_side, "spec-on")
-        .and_then(|on| load(&off_side, "spec-off").map(|off| (on, off)))
+    let results = match load(&on_side, equivalence::Side::SpecOn)
+        .and_then(|on| load(&off_side, equivalence::Side::SpecOff).map(|off| (on, off)))
         .and_then(|(on, off)| equivalence::compare_captures(&on, &off))
     {
         Ok(r) => r,
