@@ -333,6 +333,12 @@ When output names a domain concept, use the term as defined here.
   there. What makes the **hot-path logging constraint** checkable in review,
   not only provable later at the G4 gate. A `hotpath-lint-allow:` comment
   marks a reviewed, intentional exception, never a silent one.
+- **Playground** — the opt-in browser page ignis serves for trying the engine
+  by hand: a chat against its own OpenAI surface, with per-request figures the
+  browser measures itself, and later a live view of the Prometheus metrics.
+  A debugging aid for the owner — not a product UI, not an operator surface
+  (that is Prometheus), and never a source of facts the engine does not
+  already expose.
 
 ## Acceptance
 
