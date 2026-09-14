@@ -246,6 +246,30 @@ pub fn measure_throughput_cell_from_corpus(
     })
 }
 
+/// [`measure_throughput_cell_from_corpus`] with a fixed instruction appended
+/// to every prompt (the window shortens to absorb it, so the prompt still
+/// lands on `prompt_tokens`) — how G5 asks an engine that cannot be told to
+/// ignore EOS for a long answer (#159).
+pub fn measure_throughput_cell_from_corpus_with_suffix(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    prompt_tokens: u32,
+    max_tokens: u32,
+    concurrency: usize,
+    corpus: &[u32],
+    suffix: &str,
+) -> ThroughputCell {
+    measure_throughput_cell_with(ep, prompt_tokens, max_tokens, concurrency, || {
+        ttft::generate_cell_prompts_from_corpus_with_suffix(
+            template,
+            corpus,
+            prompt_tokens as usize,
+            concurrency,
+            suffix,
+        )
+    })
+}
+
 /// The shared measurement: one prompt set (generated however the caller
 /// says), fired at `concurrency`, each sample proving its own cold prefix.
 fn measure_throughput_cell_with(

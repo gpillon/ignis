@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::client::Endpoint;
-use crate::g3::{measure_throughput_cell, measure_throughput_cell_from_corpus, ThroughputCell, C1_CONCURRENCY};
+use crate::g3::{
+    measure_throughput_cell, measure_throughput_cell_from_corpus_with_suffix, ThroughputCell, C1_CONCURRENCY,
+};
 use crate::time::{unix_now, utc_timestamp};
 use crate::ttft::{load_corpus, PromptTemplate};
 
@@ -68,6 +70,32 @@ fn failed_cell(depth_tokens: u32, max_tokens: u32, error: String) -> ThroughputC
         aggregate_tok_s: 0.0,
         error: Some(error),
     }
+}
+
+/// The instruction every depth prompt ends with (#159). The reference
+/// ignores `ignore_eos` and a `logit_bias` exclusion has been recorded as
+/// insufficient against it, so the prompt is the one lever both engines see
+/// identically — the same one `g3`'s ITL lanes use.
+pub fn decode_instruction(committed_tokens: u32) -> String {
+    format!("Produce at least {committed_tokens} tokens. Do not stop, conclude, or emit EOS earlier.")
+}
+
+/// Void every completed sample that committed fewer than `committed_tokens`
+/// (#159): a run that stopped at EOS after a few verify rounds measures
+/// those rounds, not decode, and must not enter a ratio against an engine
+/// that ran the whole budget.
+fn require_committed_budget(mut cell: ThroughputCell, committed_tokens: u32) -> ThroughputCell {
+    for sample in &mut cell.samples {
+        if sample.ok && !sample.void && sample.n_tokens < committed_tokens {
+            sample.void = true;
+            sample.void_reason = Some(format!(
+                "the engine stopped after {} of the {committed_tokens} committed tokens: a short \
+                 run measures a few verify rounds, not decode",
+                sample.n_tokens
+            ));
+        }
+    }
+    cell
 }
 
 /// A G5 record: what one engine measured at the three depths, in which
@@ -209,20 +237,30 @@ pub fn measure(
     cfg: &G5Config,
 ) -> Record {
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
+    let instruction = decode_instruction(cfg.committed_tokens);
     let cells = DEPTHS
         .iter()
-        .map(|&depth| match &corpus {
-            Some(Ok(ids)) => measure_throughput_cell_from_corpus(
-                ep,
-                template,
-                depth,
-                cfg.committed_tokens,
-                C1_CONCURRENCY,
-                ids,
-            ),
+        .enumerate()
+        .map(|(index, &depth)| match &corpus {
+            Some(Ok(ids)) => {
+                // Each depth's window starts in its own third of the bank,
+                // so no two depths share a prefix the engine could reuse.
+                let mut rotated = ids.clone();
+                rotated.rotate_left(index * ids.len() / DEPTHS.len());
+                measure_throughput_cell_from_corpus_with_suffix(
+                    ep,
+                    template,
+                    depth,
+                    cfg.committed_tokens,
+                    C1_CONCURRENCY,
+                    &rotated,
+                    &instruction,
+                )
+            }
             Some(Err(error)) => failed_cell(depth, cfg.committed_tokens, error.clone()),
             None => measure_throughput_cell(ep, template, depth, cfg.committed_tokens, C1_CONCURRENCY),
         })
+        .map(|cell| require_committed_budget(cell, cfg.committed_tokens))
         .collect();
     Record {
         session: cfg.session.clone(),
@@ -294,12 +332,8 @@ mod tests {
     /// The real `DEPTHS` (up to 200,704) go through the corpus path in
     /// every test below, never the filler word-growth generator: this
     /// module's own doc comment already names that path as "impractical at
-    /// this scale" (O(n²) re-encoding). Unlike `g4::build_haystack_from_corpus`
-    /// (which wraps a short bank around itself for its own needle cell),
-    /// `g3`'s underlying `land_corpus_window` (`ttft.rs`) caps a window at
-    /// the corpus's own length — a bank shorter than the largest depth
-    /// cannot land it at all, one id per token being the mock template's
-    /// exact ratio.
+    /// this scale" (O(n²) re-encoding). A bank shorter than a depth tiles
+    /// (#159); this one is longer so the plain path stays covered too.
     fn corpus_bank() -> Vec<u32> {
         (0..(DEPTH_196K as usize + 1_000)).map(|i| ((i * 37) % 900) as u32 + 100).collect()
     }
@@ -363,6 +397,89 @@ mod tests {
                 cell.aggregate_tok_s,
                 expected_tok_s,
             );
+        }
+    }
+
+    fn cfg_with(corpus: PathBuf) -> G5Config {
+        G5Config {
+            label: "ignis".into(),
+            profile: "test-profile".into(),
+            artifact: "mock.ninfer".into(),
+            session: "S1".into(),
+            committed_tokens: COMMITTED_TOKENS,
+            corpus: Some(corpus),
+        }
+    }
+
+    /// An endpoint that stops every request after `stop_after` tokens (the
+    /// reference at its own EOS) and remembers the prompts it was sent.
+    struct StoppingEndpoint {
+        stop_after: Option<u32>,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Endpoint for StoppingEndpoint {
+        fn complete(&self, req: &Request) -> Result<Outcome, String> {
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            let mut short = req.clone();
+            if let Some(n) = self.stop_after {
+                short.max_tokens = short.max_tokens.min(n);
+            }
+            let mut out = DeterministicEndpoint { ttft_ms: 40.0, interval_ms: 8.0 }.complete(&short)?;
+            if self.stop_after.is_some() {
+                out.finish_reason = Some(FinishReason::Engine("stop".into()));
+            }
+            Ok(out)
+        }
+    }
+
+    /// #159 A: the reference's bank is 65,536 ids; every depth still lands,
+    /// and each depth's window starts elsewhere in the bank so prefix reuse
+    /// cannot warm a deeper cell from a shallower one.
+    #[test]
+    fn a_bank_shorter_than_the_deepest_cell_is_tiled_from_a_distinct_offset_per_depth() {
+        let bank: Vec<u32> = (0..65_536).map(|i| ((i * 37) % 900) as u32 + 100).collect();
+        let (dir, corpus) = write_corpus_file(&bank);
+        let ep = StoppingEndpoint { stop_after: None, prompts: Default::default() };
+        let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(record.all_cold(), "{}", record.render());
+        let prompts = ep.prompts.into_inner().unwrap();
+        assert_eq!(prompts.len(), 3);
+        let heads: Vec<String> =
+            prompts.iter().map(|p| p.split_whitespace().take(8).collect::<Vec<_>>().join(" ")).collect();
+        assert_ne!(heads[0], heads[1], "24K and 98K must not share a prefix");
+        assert_ne!(heads[1], heads[2], "98K and 196K must not share a prefix");
+        assert_ne!(heads[0], heads[2], "24K and 196K must not share a prefix");
+    }
+
+    /// #159 B: the reference cannot be told to ignore EOS, so the prompt
+    /// asks for a long answer, the same text to both engines.
+    #[test]
+    fn every_depth_prompt_asks_for_at_least_the_committed_budget() {
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
+        let ep = StoppingEndpoint { stop_after: None, prompts: Default::default() };
+        measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
+        std::fs::remove_dir_all(&dir).ok();
+        for prompt in ep.prompts.into_inner().unwrap() {
+            assert!(prompt.ends_with(&decode_instruction(COMMITTED_TOKENS)), "{}", &prompt[prompt.len() - 200..]);
+        }
+    }
+
+    /// #159 B: a sample that stopped short of the committed budget measured
+    /// a few rounds, not decode: void, with the reason in the record.
+    #[test]
+    fn a_sample_that_stops_short_of_the_committed_budget_is_void() {
+        let (dir, corpus) = write_corpus_file(&corpus_bank());
+        let ep = StoppingEndpoint { stop_after: Some(10), prompts: Default::default() };
+        let record = measure(&ep, &MockTemplate, "mock-engine".into(), "http://mock".into(), &cfg_with(corpus));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!record.all_cold());
+        for cell in &record.cells {
+            let sample = &cell.samples[0];
+            assert!(sample.void, "{sample:?}");
+            let reason = sample.void_reason.as_deref().unwrap_or("");
+            assert!(reason.contains("10") && reason.contains("512"), "{reason}");
         }
     }
 
