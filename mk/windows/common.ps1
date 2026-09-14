@@ -41,14 +41,20 @@ function Test-Ready {
     }
 }
 
-# `--api-key auto`: the server prints the key it generated once, into its
-# stdout log; repeat it on the console.
+# `--api-key auto` and `--expose`: the server prints the key it generated
+# and its public URL once, into its stdout log; repeat them on the console.
 function Show-GeneratedKey {
     if (-not (Test-Path $LogFile)) { return }
-    $hit = Select-String -Path $LogFile -Pattern 'generated API key: (\S+)' | Select-Object -Last 1
-    if ($hit) {
+    $lines = @()
+    $key = Select-String -Path $LogFile -Pattern 'generated API key: (\S+)' | Select-Object -Last 1
+    if ($key) { $lines += "API key (generated for this run): $($key.Matches[0].Groups[1].Value)" }
+    $url = Select-String -Path $LogFile -Pattern 'public URL: (\S+)' | Select-Object -Last 1
+    if ($url) { $lines += "Public URL: $($url.Matches[0].Groups[1].Value)" }
+    $ui = Select-String -Path $LogFile -Pattern 'Playground: (\S+)' | Select-Object -Last 1
+    if ($ui) { $lines += "Public Playground: $($ui.Matches[0].Groups[1].Value)" }
+    if ($lines.Count -gt 0) {
         Write-Host ""
-        Write-Host "API key (generated for this run): $($hit.Matches[0].Groups[1].Value)"
+        $lines | ForEach-Object { Write-Host $_ }
         Write-Host ""
     }
 }

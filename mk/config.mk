@@ -22,6 +22,10 @@ LOG_FORMAT ?=
 # The key /v1 requires (--api-key). Empty = no key; auto = the server
 # generates one and prints it when ready: make dev-ui API_KEY=auto
 API_KEY ?=
+# Expose the server beyond BIND (--expose, ADR 0028). Empty = not exposed;
+# cloudflare-quick = a public https://*.trycloudflare.com URL, printed when
+# ready. An exposed server always requires a key (auto when API_KEY is empty).
+EXPOSE ?=
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults are the G5 gate legs (.scratch/runtime/specs/05, the g5-run driver):

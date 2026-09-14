@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Patched third-party crates (see each one's IGNIS-PATCH.md): built through
+# [patch.crates-io] below, never as workspace members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,9 +45,19 @@ tower-http = { version = "0.6", features = ["trace"] }
 http-body-util = "0.1"
 # `--api-key auto`: the OS random source for the generated key.
 getrandom = "0.3"
+# `--expose cloudflare-quick`: a public https://*.trycloudflare.com URL,
+# spoken natively (QUIC + capnp-RPC) rather than through a cloudflared child.
+cloudflare-quick-tunnel = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 # Target-specific, inherited by members via `workspace = true` under their own
 # `[target.'cfg(...)'.dependencies]` sections.
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
 libc = "0.2"
+
+[patch.crates-io]
+# 0.3.1 forwards a chunked response (every streamed axum body: SSE) with its
+# chunk framing inside the body and never ends it on a keep-alive socket.
+# vendor/cloudflare-quick-tunnel/IGNIS-PATCH.md has the fix; drop this once
+# upstream carries it.
+cloudflare-quick-tunnel = { path = "vendor/cloudflare-quick-tunnel" }

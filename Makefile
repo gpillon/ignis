@@ -5,7 +5,8 @@
 #   make run             run the last build; refuses a missing or stale binary
 #   make mock            the same loop on the CPU mock (no GPU, no kernel leaf)
 #   make dev-ui          server in the background + Playground with hot reload
-#                        (API_KEY=auto: the server generates a key and prints it)
+#                        (API_KEY=auto: the server generates a key and prints it;
+#                        EXPOSE=cloudflare-quick: a public URL, key required)
 #   make config          the resolved knobs
 #
 # Layout
@@ -94,6 +95,7 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(MODEL),--model $(MODEL)) \
   $(if $(filter 1,$(UI)),--ui) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
+  $(if $(EXPOSE),--expose $(EXPOSE)) \
   $(ARGS)
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
 SMOKE_MODEL := $(or $(MODEL),qwen3.8-27b)
@@ -165,7 +167,8 @@ config: ## Print the resolved knobs and paths
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"
-	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),(none: /v1 is open))"
+	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),$(if $(EXPOSE),(none: auto, required by EXPOSE),(none: /v1 is open)))"
+	@echo "EXPOSE          $(or $(EXPOSE),(none: reachable at BIND only))"
 	@echo "ARGS            $(ARGS)"
 	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"
 	@echo "server binary   $(SERVER_BIN)"

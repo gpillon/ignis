@@ -85,7 +85,13 @@ pub struct Config {
     /// <key>` (`--api-key` / `IGNIS_API_KEY`). `None` (the default) keeps
     /// the API open, as it has always been on localhost.
     pub api_key: Option<ApiKeySetting>,
+    /// How the server is exposed beyond its bind address (`--expose` /
+    /// `IGNIS_EXPOSE`, ADR 0028). `Some` always comes with an API key:
+    /// without one, [`resolve`] sets `api_key` to [`ApiKeySetting::Generate`].
+    pub expose: Option<Expose>,
 }
+
+pub use crate::expose::Expose;
 
 /// What `--api-key` asked for: a key the operator chose, or `auto` — one
 /// `main` generates at start and prints, the only time a key is printed.
@@ -194,6 +200,7 @@ pub fn resolve(
     let mut draft_tokens = None;
     let mut ui = false;
     let mut api_key = None;
+    let mut expose = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -214,6 +221,7 @@ pub fn resolve(
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
+            "--expose" => expose = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
         }
         i += 1;
@@ -257,6 +265,15 @@ pub fn resolve(
         "auto" => ApiKeySetting::Generate,
         _ => ApiKeySetting::Fixed(ApiKey(key)),
     });
+    let expose = non_empty(expose.or_else(|| env("IGNIS_EXPOSE")))
+        .map(|raw| Expose::parse(&raw).map_err(|e| ConfigError(format!("`--expose`: {e}"))))
+        .transpose()?;
+    // An exposed API is never open: the operator's key if they named one,
+    // otherwise the same generated key `--api-key auto` gives.
+    let api_key = match (&expose, api_key) {
+        (Some(_), None) => Some(ApiKeySetting::Generate),
+        (_, api_key) => api_key,
+    };
 
     Ok(ConfigOutcome::Config(Config {
         model,
@@ -273,6 +290,7 @@ pub fn resolve(
         request_timeout_secs,
         ui,
         api_key,
+        expose,
     }))
 }
 
@@ -505,6 +523,7 @@ fn help_text() -> String {
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
          \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
+         \x20       --expose <mode>           env: IGNIS_EXPOSE         (default: unset — reachable at --bind only; cloudflare-quick = public https://*.trycloudflare.com URL, printed at start; always requires an API key, auto when none is set)\n\
          \x20   -h, --help                    print this help and exit\n\
          \x20   -V, --version                 print the version and exit\n\
          \n\
@@ -1176,5 +1195,63 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--api-key") && text.contains("IGNIS_API_KEY"), "{text}");
+    }
+
+    // ── exposure (ADR 0028) ──────────────────────────────────────────────
+
+    #[test]
+    fn nothing_is_exposed_by_default() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.expose, None);
+        assert_eq!(config.api_key, None, "no exposure, no forced key");
+    }
+
+    #[test]
+    fn expose_resolves_flag_over_env() {
+        let config =
+            expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), no_env).expect("resolve"));
+        assert_eq!(config.expose, Some(Expose::CloudflareQuick));
+
+        let env = env_map(&[("IGNIS_EXPOSE", "cloudflare-quick")]);
+        assert_eq!(expect_config(resolve(&[], &env).expect("resolve")).expose, Some(Expose::CloudflareQuick));
+        let err = resolve(&args(&["--expose", "nope"]), &env).expect_err("the flag wins, and is checked");
+        assert!(err.0.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_expose_mode_is_a_usage_error() {
+        let err = resolve(&args(&["--expose", "ngrok"]), no_env).expect_err("unknown mode");
+        assert!(err.0.contains("--expose") && err.0.contains("ngrok"), "{err}");
+        assert!(err.0.contains("cloudflare-quick"), "{err}");
+    }
+
+    #[test]
+    fn exposing_without_a_key_generates_one() {
+        let config =
+            expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), no_env).expect("resolve"));
+        assert_eq!(config.api_key, Some(ApiKeySetting::Generate));
+        // An empty key is no key.
+        let env = env_map(&[("IGNIS_API_KEY", ""), ("IGNIS_EXPOSE", "cloudflare-quick")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).api_key, Some(ApiKeySetting::Generate));
+    }
+
+    #[test]
+    fn exposing_keeps_the_key_the_operator_chose() {
+        let a = args(&["--expose", "cloudflare-quick", "--api-key", "sk-mine"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("sk-mine"))));
+
+        let env = env_map(&[("IGNIS_API_KEY", "sk-env")]);
+        let config = expect_config(resolve(&args(&["--expose", "cloudflare-quick"]), env).expect("resolve"));
+        assert_eq!(config.api_key, Some(ApiKeySetting::Fixed(ApiKey::new("sk-env"))));
+    }
+
+    #[test]
+    fn help_lists_the_expose_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--expose") && text.contains("cloudflare-quick"), "{text}");
     }
 }

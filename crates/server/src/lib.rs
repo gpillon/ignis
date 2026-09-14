@@ -24,6 +24,7 @@ pub mod artifact_template;
 pub mod config;
 pub mod decoder;
 pub mod engine;
+pub mod expose;
 pub mod loader;
 pub mod playground;
 pub mod runtime;
@@ -151,8 +152,24 @@ impl Server {
     /// logging queue after this returns, since that is the true last event.
     pub async fn serve(self, addr: String) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
+        self.serve_on(listener).await
+    }
+
+    /// [`Server::serve`] on a listener the caller already bound — `main`
+    /// binds first when `--expose` needs the bound port before serving.
+    pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        self.serve_on_until(listener, shutdown_signal()).await
+    }
+
+    /// [`Server::serve_on`], stopping gracefully when `shutdown` resolves
+    /// instead of on a process signal (tests).
+    pub async fn serve_on_until(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
         let app = self.app();
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await
+        axum::serve(listener, app).with_graceful_shutdown(shutdown).await
     }
 }
 
