@@ -1,4 +1,4 @@
-import type { LogRow } from "./sessions.ts";
+import type { LogRow } from "../sessions/sessions.ts";
 
 // How much of the model's context a session fills, from what the browser
 // already has: the usage of the session's last complete reply and the

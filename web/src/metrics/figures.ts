@@ -1,4 +1,4 @@
-import type { Usage } from "./sse.ts";
+import type { Usage } from "../api/sse.ts";
 
 // Per-request figures (GitHub #164). Every time here is HTTP-observed — read
 // with the browser's clock around the stream — never an engine-internal

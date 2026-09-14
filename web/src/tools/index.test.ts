@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents.ts";
+import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents/agents.ts";
 import { ignisPrompt, NO_TOOLS, toolExtras } from "./index.ts";
 
 describe("tools", () => {

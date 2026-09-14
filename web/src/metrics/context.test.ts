@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compactTokens, contextUsage } from "./context.ts";
 import type { Figures } from "./figures.ts";
-import type { LogRow } from "./sessions.ts";
+import type { LogRow } from "../sessions/sessions.ts";
 
 const figures = (promptTokens: number | null, completionTokens: number | null): Figures => ({
   ttftMs: 100,

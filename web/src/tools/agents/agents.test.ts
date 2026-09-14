@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { Timeline } from "../figures.ts";
-import type { ChatRequest, Settings } from "../request.ts";
-import type { StreamOptions, StreamResult } from "../stream.ts";
+import type { Timeline } from "../../metrics/figures.ts";
+import type { ChatRequest, Settings } from "../../api/request.ts";
+import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import {
   AGENT_SYSTEM_PROMPT,
   agentRequest,

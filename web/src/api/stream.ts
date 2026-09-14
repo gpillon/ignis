@@ -1,5 +1,5 @@
 import { apiErrorMessage } from "./errors.ts";
-import type { Timeline } from "./figures.ts";
+import type { Timeline } from "../metrics/figures.ts";
 import { type ChunkEvent, createSseParser, parseChunk } from "./sse.ts";
 
 // One streaming chat request, end to end (GitHub #164): send, read the SSE

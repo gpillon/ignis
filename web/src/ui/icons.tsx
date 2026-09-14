@@ -1,0 +1,69 @@
+const icon = { width: 16, height: 16, viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: 1.5, "aria-hidden": true } as const;
+
+export function IconPencil() {
+  return (
+    <svg {...icon} width={13} height={13}>
+      <path d="M10.5 2.5l3 3L6 13H3v-3z" />
+    </svg>
+  );
+}
+
+export function IconFork() {
+  return (
+    <svg {...icon} width={13} height={13}>
+      <circle cx="4" cy="3.5" r="1.5" />
+      <circle cx="12" cy="3.5" r="1.5" />
+      <circle cx="8" cy="12.5" r="1.5" />
+      <path d="M4 5v1c0 1.7 1.3 3 3 3h2c1.7 0 3-1.3 3-3V5M8 9v2" />
+    </svg>
+  );
+}
+
+export function IconRegenerate() {
+  return (
+    <svg {...icon} width={13} height={13}>
+      <path d="M13 8a5 5 0 1 1-1.46-3.54M13.5 2v3h-3" />
+    </svg>
+  );
+}
+
+export function IconPlus() {
+  return (
+    <svg {...icon}>
+      <path d="M8 3v10M3 8h10" />
+    </svg>
+  );
+}
+
+export function IconClose() {
+  return (
+    <svg {...icon} width={14} height={14}>
+      <path d="M4 4l8 8M12 4l-8 8" />
+    </svg>
+  );
+}
+
+export function IconChevron({ className }: { className?: string }) {
+  return (
+    <svg {...icon} className={className}>
+      <path d="M4 10l4-4 4 4" />
+    </svg>
+  );
+}
+
+export function IconSessions() {
+  return (
+    <svg {...icon} width={18} height={18}>
+      <path d="M2.5 4h11M2.5 8h11M2.5 12h7" />
+    </svg>
+  );
+}
+
+export function IconSliders() {
+  return (
+    <svg {...icon} width={18} height={18}>
+      <path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" />
+      <path d="M8.5 3v3M4.5 10v3" />
+    </svg>
+  );
+}

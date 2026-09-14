@@ -1,5 +1,5 @@
-import type { ToolExtras } from "../request.ts";
-import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents.ts";
+import type { ToolExtras } from "../api/request.ts";
+import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents/agents.ts";
 
 // The Playground's tools. Turning one on declares it to the model and adds
 // its part to the ignis system prompt; the conversation loop reacts to its

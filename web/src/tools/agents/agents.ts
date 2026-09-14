@@ -1,7 +1,7 @@
-import { computeFigures, type Figures } from "../figures.ts";
-import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition } from "../request.ts";
-import type { ToolCall } from "../sse.ts";
-import { streamChat } from "../stream.ts";
+import { computeFigures, type Figures } from "../../metrics/figures.ts";
+import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition } from "../../api/request.ts";
+import type { ToolCall } from "../../api/sse.ts";
+import { streamChat } from "../../api/stream.ts";
 
 // The `agent` tool: the model hands one self-contained sub-task to an agent,
 // a separate request on an agent lane that sees only that task. Several calls

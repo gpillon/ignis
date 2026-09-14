@@ -1,7 +1,7 @@
-import type { Figures } from "./figures.ts";
-import type { LaneTag, ReasoningEffort } from "./request.ts";
-import type { ToolCall } from "./sse.ts";
-import type { AgentRun } from "./tools/agents.ts";
+import type { Figures } from "../metrics/figures.ts";
+import type { LaneTag, ReasoningEffort } from "../api/request.ts";
+import type { ToolCall } from "../api/sse.ts";
+import type { AgentRun } from "../tools/agents/agents.ts";
 
 // Playground sessions: separate conversations, each with its own log of
 // per-reply figures. They live in memory only; a reload starts over.
