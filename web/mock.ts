@@ -1,8 +1,28 @@
+import type { IncomingMessage } from "node:http";
 import type { Plugin } from "vite";
 
 // A fake ignis for `npm run dev:mock`: enough of /v1/models, streaming
 // /v1/chat/completions and /metrics to work on the Playground without the
 // shared GPU. Development only — never part of the build.
+//
+// Chat: honours `enable_thinking` (no reasoning when false) and stops on a
+// client disconnect; a last user message containing "/error" gets ignis's
+// 503 "engine full" error instead of a stream.
+
+function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let raw = "";
+    req.on("data", (part) => (raw += part));
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(raw) as Record<string, unknown>);
+      } catch {
+        resolve({});
+      }
+    });
+  });
+}
+
 export function mockIgnis(): Plugin {
   return {
     name: "ignis-mock",
@@ -12,22 +32,38 @@ export function mockIgnis(): Plugin {
         res.end(JSON.stringify({ object: "list", data: [{ id: "mock-model", object: "model", owned_by: "ignis" }] }));
       });
 
-      server.middlewares.use("/v1/chat/completions", (req, res) => {
+      server.middlewares.use("/v1/chat/completions", async (req, res) => {
         if (req.method !== "POST") {
           res.statusCode = 405;
           res.end();
           return;
         }
+        const body = await readJson(req);
+        const messages = (body.messages as { role: string; content: string }[] | undefined) ?? [];
+        const last = messages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+        if (last.includes("/error")) {
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              error: { message: "the engine cannot admit the request right now (all lanes in use); retry", type: "server_error", code: "engine_full" },
+            }),
+          );
+          return;
+        }
+
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         const id = `chatcmpl-mock-${Date.now()}`;
         const chunk = (delta: object, finish: string | null = null) =>
           `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+        const reasoning = body.enable_thinking === false ? [] : ["Thinking ", "about ", "it."];
+        const content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
         const pieces = [
-          ...["Thinking ", "about ", "it."].map((t) => chunk({ reasoning_content: t })),
-          ...["Hello ", "from ", "the ", "mock ", "engine."].map((t) => chunk({ content: t })),
+          ...reasoning.map((t) => chunk({ reasoning_content: t })),
+          ...content.map((t) => chunk({ content: t })),
           chunk({}, "stop"),
-          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } })}\n\n`,
+          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: reasoning.length + content.length, total_tokens: 12 * messages.length + reasoning.length + content.length } })}\n\n`,
           "data: [DONE]\n\n",
         ];
         let i = 0;
@@ -38,7 +74,7 @@ export function mockIgnis(): Plugin {
             return;
           }
           res.write(pieces[i++]);
-        }, 60);
+        }, 120);
         req.on("close", () => clearInterval(timer));
       });
 

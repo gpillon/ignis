@@ -31,7 +31,7 @@ A single-page chat in `web/` against ignis's own `POST /v1/chat/completions` wit
 - SSE parsing is a pure module (`fetch` + `ReadableStream`, no `EventSource` — POST body needed); abort via `AbortController`.
 - Figures, all measured with `performance.now()` in the browser:
   - TTFT = request sent → first chunk carrying `content` or `reasoning_content`.
-  - Decode tok/s = `completion_tokens` / (last token chunk − first token chunk).
+  - Decode tok/s = (`completion_tokens` − 1) / (last token chunk − first token chunk) — the first token belongs to TTFT; no rate for a one-token reply.
   - Duration = request sent → `[DONE]`.
   - Tokens and finish reason from the usage chunk / final chunk. A stopped request records its figures as partial (no usage).
   - These are HTTP-observed figures, labelled as such — never presented as engine-internal timings.
