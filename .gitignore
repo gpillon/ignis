@@ -12,6 +12,7 @@ dist/
 
 # logs
 *.log
+*.log.err
 _bench_logs/
 
 # python

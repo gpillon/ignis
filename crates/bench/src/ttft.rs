@@ -511,10 +511,12 @@ fn land_corpus_window(
         // the window length (each decoded id is at least one re-encoded
         // token, usually exactly one), so the largest length whose count
         // does not pass the target bounds every exact landing from above.
-        // The upper bound is the shorter of the target and the whole
-        // corpus: a window longer than `target_tokens` ids cannot land on
-        // `target_tokens` post-template tokens.
-        let mut hi = target_tokens.min(len);
+        // The upper bound is the target: a window longer than
+        // `target_tokens` ids cannot land on `target_tokens` post-template
+        // tokens. A window longer than the corpus tiles it (#159: G5 cuts
+        // 196K from a 65,536-id bank, whose manifest says repetition fills
+        // length only).
+        let mut hi = target_tokens;
         let mut lo = 1usize;
         while lo < hi {
             let mid = lo + (hi - lo + 1) / 2;
@@ -535,26 +537,12 @@ fn land_corpus_window(
                 return Ok((text, tokens));
             }
         }
-        last = (
-            lo,
-            actual(lo)?,
-            if lo + 1 <= len {
-                actual(lo + 1)?
-            } else {
-                0
-            },
-        );
+        last = (lo, actual(lo)?, actual(lo + 1)?);
     }
     // Every bounded rotation missed: refuse the cell rather than measure
     // a length the engine will not compute (the word-growth fallback is
     // the O(n²) this path exists to avoid).
     let (lo, under, over) = last;
-    if lo == len {
-        return Err(format!(
-            "cannot land on {target_tokens} tokens: the whole corpus is {len} ids, re-encoding \
-             to {under} post-template tokens — the corpus is too short for the cell"
-        ));
-    }
     Err(format!(
         "cannot land on {target_tokens} tokens from a corpus window: {ROTATIONS} rotations \
          searched; the {lo}-id cut re-encodes to {under} tokens and the {next}-id cut to \
@@ -1193,6 +1181,19 @@ mod tests {
         for (prompt, ids) in set.prompts.iter().zip(&set.tokens) {
             assert_eq!(template.encode_user_message(prompt).unwrap(), *ids);
         }
+    }
+
+    /// #159: the reference's bank is 65,536 ids and G5 cuts 196K; a window
+    /// longer than the bank tiles it (the bank's own manifest: "repetition
+    /// fills length only").
+    #[test]
+    fn a_corpus_shorter_than_the_target_is_tiled_to_land_it() {
+        let template = CorpusMock::exact();
+        let bank = corpus_bank();
+        let target = bank.len() * 3 + 17;
+        let set = generate_cell_prompts_from_corpus(&template, &bank, target, 1).expect("cut");
+        assert_eq!(set.tokens[0].len(), target, "the window tiles past the bank's end");
+        assert_eq!(template.encode_user_message(&set.prompts[0]).unwrap(), set.tokens[0]);
     }
 
     #[test]

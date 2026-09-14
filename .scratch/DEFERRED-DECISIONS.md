@@ -200,3 +200,122 @@ leaves the gate metric alone. It is the first number to turn if C=4 misses.
 clause is stated K-agnostically — while a prefill is active, no decode-ready
 lane waits more than one prefill chunk between two of its decode
 opportunities — precisely so that raising K cannot fail the gate.
+
+---
+
+## From the G5 grilling session (2026-09-13, GitHub #66)
+
+Source conversation: the design session that produced
+`.scratch/runtime/specs/05-speculative-decoding.md` and closed #65 on the
+G4 run-2 verdict. Four items below.
+
+### 1. MTP as a drafter — deferred behind DFlash2
+
+**Deferred to:** built only if short calls (classifier, tool-call turns) pay
+the DFlash2 drafter's TTFT penalty visibly in real agent use.
+
+The roadmap said "MTP first, then DFlash2". The session reversed it. The
+reference's own clean depth discriminator (`SEPT-OPTIMIZAZION.md` §1,
+2026-09-01, greedy, one request at a time, 512 tokens) reads MTP7-adaptive
+150 / 104 / 79 tok/s against DFlash2-7 147 / 132 / 144 tok/s at 24K / 98K /
+196K: level at 24K, +27% at 98K, +82% at 196K for DFlash2, which pays 0.5–5 s
+of TTFT for it. Agentic prompts live at the deep end. Most of the work is the
+shared substrate either drafter needs (verify traversal of k+1 columns per
+lane, the accept kernel with its greedy and distribution-preserving branches,
+KV rollback, the ReplaySSM fold, one graph per batch width at the verify
+window, prefill feature taps); the drafter itself is the small part. Building
+MTP first would exercise that substrate on the drafter that loses where it
+matters. The G5 reference lane is therefore ninfer DFlash2-7 alone; MTP7 is
+not measured.
+
+What MTP would still buy: no drafter TTFT (the head is one layer fed by the
+target's own hidden state), `--lm-head-draft`, and the adaptive width
+controller, which DFlash2 in the reference does not have. The glossary keeps
+the term; `CONTEXT.md` marks it deferred.
+
+### 2. Rebuilding the DFlash2 drafter state on restore, instead of carrying it
+
+**Deferred to:** re-opened if the host tier's restore and prefix-clone rate
+in real agent use makes the +80 MiB per sequence the thing that limits how
+many sequences the tier holds — the owner expects ignis to checkpoint and
+restore far more often than the reference does.
+
+The owner's first preference was to rebuild: no new snapshot sections, the
+drafter re-derives its state on restore. The session recorded the fact that
+decides it and chose to carry the state (option a), the reference's own
+layout (sections `dflash_local` and `dflash_checkpoint`, header
+`dflash_context_frontier`).
+
+**The fact.** The drafter does not consume tokens. It consumes the target's
+hidden states at layers 5, 19, 33, 47 and 61 (five 5120-wide features,
+projected by `dflash2/feature_projection [5120, 25600]`) and keeps a
+2048-token sliding BF16 KV window over them, plus a rewrite checkpoint copy of
+that window. The reference keeps those features as chunk-scoped scratch and
+never persists them (`program_impl.h:1111`). So "rebuild on restore" is not a
+5-layer pass over the tail: it is a **64-layer target pass over the last 2048
+tokens** to regenerate the features, then the drafter. That is a real
+re-prefill on the restore path and on every device-side prefix clone.
+
+**The numbers** (snapshot blob from
+`docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md`, hq-e8-2b,
+9 KiB/token; drafter window from `src/core/cyclic_kv_cache.cpp`, BF16,
+5 layers × 2048 × 8 heads × 128 × K+V = 40 MiB, ×2 with the checkpoint):
+
+| context | blob today | of which GDN slot | blob carrying the drafter | delta |
+|---|---:|---:|---:|---:|
+| 128 tokens (floor) | 149 MiB | 144 MiB | 229 MiB | +54% |
+| 24K | ~365 MiB | 144 MiB | ~445 MiB | +22% |
+| 40,960 (measured) | 508 MiB | 144 MiB | 588 MiB | +16% |
+| 98K | ~1.03 GiB | 144 MiB | ~1.11 GiB | +8% |
+| 196K | ~1.92 GiB | 144 MiB | ~2.0 GiB | +4% |
+
+| cost | carry (a) | rebuild (b) |
+|---|---:|---:|
+| per restore | +7 ms at the measured ~11 GB/s | ~0.3 s at 24K, ~0.7 s at 196K (a 2048-token target re-prefill at the reference's prefill rate for that depth) |
+| per device prefix clone | ~0.1 ms | the same re-prefill |
+| host tier | +80 MiB per resident snapshot against the 2 GiB default (`--kv-host-pool-bytes`; the machine has 64 GB) | nothing |
+| VRAM | identical: 8 lanes × 80 MiB = 640 MiB for the drafter's own window either way | identical |
+
+Today's 2 GiB default holds ~5 snapshots at 24K, 1 at 98K, 0 at 196K; with
+the drafter carried, ~4 at 24K. The default budget is the actual limit on how
+many sequences the tier holds, not the drafter's share of a blob.
+
+**Why carry.** The ratio is about 100× on every restore and clone, and (b)
+puts its cost exactly on the subagent-burst path where restores and clones are
+the norm. The owner's principle for ignis — agentic work first, small raw-speed
+sacrifices are acceptable when they buy a lot for that use — points at (a)
+here, not (b): the ~0.3 s is paid per restore by the agent waiting, and the
+80 MiB is paid by a host budget that can be raised.
+
+**What re-opens it.** If a later measurement shows the tier evicting because
+of blob size rather than the budget, the trade is ~0.3 s of restore latency
+against 80 MiB of host RAM per snapshot, and the snapshot blob is versioned
+(ADR 0024), so dropping the two sections is a format bump, not a redesign.
+The number to write down first is the real restore-per-minute rate under an
+agent session, which nobody has measured.
+
+### 3. The G4 `sub` cell at 0.969 — accepted, not fixed before G5
+
+**Deferred to:** an optimization ticket, not blocking #66.
+
+Run 2 of the G4 gate (`.scratch/g4-run2/`, session `g4-20260913T163557Z`)
+returned `main` 1.264, `sub` 0.969, aggregate 1.013, both needles retrieved,
+the G3 cells inside their band. The `sub` miss is real (both launches agree,
+0.975 and 0.962, spreads 2–3%) and the owner accepted it as optimization on
+the decode round, which G5 rewrites anyway. #65 closed on the recorded
+verdict with the gap filed as **#148**, an optimization ticket that blocks
+nothing, the way #64 closed with #110. Where the 3% most likely lives is in
+#148's own text: admission and the single prefill lane under a burst, not
+raw decode speed (`main` wins by 26% in the same run).
+
+### 4. Gate sessions per ticket
+
+**Deferred to:** never; the phase gate runs once, at the end of the phase.
+
+The G3 and G4 sessions (two launches per engine, pooled cells, thresholds
+inside launch noise, eight harness issues) cost more than the engine work
+they checked. The ≥ 99% objective stays as the phase gate, pooled over two
+launches per engine (ADR 0021 stands). Per ticket, the check is the smallest
+instrument that catches a large error: the op test, and for the speculative
+substrate the greedy equivalence spec-on == spec-off on the existing
+canaries. No gate cell, no extra launch, no sub-1% comparison inside a phase.

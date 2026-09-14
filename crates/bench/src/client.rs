@@ -499,6 +499,7 @@ fn request_body_suppressing_eos(req: &Request, eos: &[u32]) -> serde_json::Value
 struct Usage {
     prompt_tokens: Option<u32>,
     cached_prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
 }
 
 impl Usage {
@@ -510,6 +511,7 @@ impl Usage {
         Self {
             prompt_tokens: as_u32(value.pointer("/usage/prompt_tokens")),
             cached_prompt_tokens: as_u32(value.pointer("/usage/prompt_tokens_details/cached_tokens")),
+            completion_tokens: as_u32(value.pointer("/usage/completion_tokens")),
         }
     }
 }
@@ -666,6 +668,10 @@ pub fn read_sse_stream<R: BufRead>(
     // in which case the engine never got to name a reason at all.
     let mut engine_finish: Option<String> = None;
     let mut cancelled = false;
+    // GitHub #159: a speculative engine may stream a verify round's whole
+    // run as one chunk, so the chunk count undercounts it. The trailing
+    // usage chunk's `completion_tokens` is the engine's own count.
+    let mut usage_completion_tokens: Option<u32> = None;
     for line in reader.lines() {
         let line = line.map_err(|e| {
             if is_client_deadline(&e) {
@@ -696,6 +702,9 @@ pub fn read_sse_stream<R: BufRead>(
         if let Some(prompt) = usage.prompt_tokens {
             prompt_tokens = Some(prompt);
             cached_prompt_tokens = usage.cached_prompt_tokens;
+        }
+        if usage.completion_tokens.is_some() {
+            usage_completion_tokens = usage.completion_tokens;
         }
         if let Some(reason) = chunk
             .pointer("/choices/0/finish_reason")
@@ -735,6 +744,12 @@ pub fn read_sse_stream<R: BufRead>(
     // No token chunk on either channel: nothing to measure (ttft = total,
     // tok_s = 0).
     let ttft_ms = first_token_ms.unwrap_or(total_ms);
+    // A cancelled stream never reads the usage chunk; the chunk count is
+    // then all there is.
+    let n_tokens = match usage_completion_tokens {
+        Some(engine_count) if !cancelled => engine_count,
+        _ => n_tokens,
+    };
     Ok(Outcome {
         ttft_ms,
         total_ms,
@@ -1258,6 +1273,31 @@ mod tests {
         assert_eq!(out.reasoning_tokens, Some(2), "the split stays readable");
         assert_eq!(out.output, "42", "the answer alone is what a correctness check reads");
         assert_eq!(out.reasoning_output, "let me think about it ");
+    }
+
+    /// #159 C: under DFlash2 the reference streams a verify round's run as
+    /// one chunk. The trailing usage chunk's `completion_tokens` is the
+    /// engine's own count and wins over the chunk count.
+    #[test]
+    fn the_usage_chunk_counts_tokens_a_multi_token_chunk_would_hide() {
+        let usage = serde_json::json!({
+            "id": "cmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "choices": [],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110 },
+        });
+        let sse = format!(
+            "{}{}{}{}data: {usage}\n\ndata: [DONE]\n\n",
+            sse_chunk(serde_json::json!({ "content": "one" })),
+            sse_chunk(serde_json::json!({ "content": " two three four" })),
+            sse_chunk(serde_json::json!({ "content": " five six" })),
+            sse_chunk(serde_json::json!({ "content": " seven eight nine ten" })),
+        );
+        let out = read_recorded(&sse);
+        assert_eq!(out.n_tokens, 10, "the engine's count, not the four chunks");
+        assert_eq!(out.token_times_ms.len(), 4, "arrival times stay per chunk");
     }
 
     #[test]

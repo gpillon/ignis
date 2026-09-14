@@ -1,0 +1,43 @@
+{
+  "session": "g4-20260913T163557Z",
+  "ours_label": "ignis",
+  "reference_label": "ninfer",
+  "ours_engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "reference_engine": "qwen3.8-27b-nvfp4full-hq-e8-2b-262k",
+  "ours_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-pool auto(4GiB=465984 tok), max-context 262144, request-timeout 900",
+  "reference_profile": "hq-e8-2b KV, 1024 chunk, graphs, kv-capacity 465984, max-context 262144",
+  "ours_date": "2026-09-13T17:42:46Z",
+  "reference_date": "2026-09-13T17:29:51Z",
+  "throughput_threshold": 0.99,
+  "itl_pass_threshold": 1.0,
+  "itl_fail_threshold": 1.1,
+  "c1": {
+    "ours_tok_s": 56.00793072299037,
+    "reference_tok_s": 57.01879665359395,
+    "ratio": 0.9822713562907178,
+    "passed": false
+  },
+  "c4": {
+    "ours_tok_s": 28.74846587732091,
+    "reference_tok_s": 7.49459255778715,
+    "ratio": 3.835894433974296,
+    "passed": true
+  },
+  "itl": {
+    "ours_p50_ms": 177.79164999999557,
+    "ours_p95_ms": 240.61628499999134,
+    "ours_p99_ms": 252.60071899999784,
+    "ours_max_ms": 253.85800000000017,
+    "reference_p50_ms": 159.46040000000357,
+    "reference_p95_ms": 233.98482000000223,
+    "reference_p99_ms": 253.2477560000008,
+    "reference_max_ms": 254.77260000000388,
+    "ours_prefillers_covered": 10,
+    "reference_prefillers_covered": 6,
+    "ratio": 1.0283414325766478,
+    "passed": true,
+    "warning": "ITL p95 ratio 1.028 exceeds the reference's own p95 (tolerated up to 1.1, but not a clean pass — flagged for review); the reference's measurement window covered 6 of 10 prefill window(s); the two sides pooled over different amounts of the series (10 vs 6 prefill window(s)), so the ratio is noisier on the shorter side"
+  },
+  "notes": [],
+  "passed": false
+}

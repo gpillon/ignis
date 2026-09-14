@@ -276,8 +276,9 @@ When output names a domain concept, use the term as defined here.
   window** in the same pass that verifies them, or a fake drafter in the
   substrate's own tests (`verify-only` load: the verify substrate with nothing
   bound, the drafts passed per call).
-- **MTP** — the model's native multi-token-prediction heads (draft window 3,
-  adaptive verification width).
+- **MTP** — the model's native multi-token-prediction head, the alternative
+  drafter (draft window 1..7 chosen at load, verification width chosen per
+  round). Deferred behind **DFlash2** at G5.
 - **Vision** — multimodal (image/video) input.
 
 ## Observability
