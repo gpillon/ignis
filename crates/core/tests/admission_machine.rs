@@ -306,6 +306,82 @@ fn oversized_requests_are_rejected_at_submit() {
     );
 }
 
+/// GitHub #166 — the leaf reserves at most `max_context`
+/// (`max_sequence_tokens`) for one sequence, however empty the pool: a
+/// request past it is refused at submit, never dispatched, and a request
+/// without `max_tokens` reserves the limit itself, not prompt + limit.
+#[test]
+fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_limit() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            kv_page_tokens: 16,
+            max_sequence_tokens: 64,
+            // The pool holds several whole sequences: only the per-sequence
+            // limit is at stake here, never the pool.
+            kv_capacity_pages: 64,
+            ..small_pool()
+        },
+        compute.clone(),
+    );
+
+    // 4 + 60 = 64 == the limit: allowed.
+    assert!(sched.submit(input(&[1, 2, 3, 4], 60), RequestClass::Agent).is_ok());
+    // 4 + 61 = 65 > the limit: refused, though the pool has room for it.
+    assert_eq!(
+        sched.submit(input(&[1, 2, 3, 4], 61), RequestClass::Agent),
+        Err(SubmitError::ContextExceeded {
+            requested: 65,
+            limit: 64
+        })
+    );
+    // No `max_tokens`, and a prompt that already fills the limit: no room
+    // to generate a single token.
+    let full_prompt: Vec<u32> = (0..64).collect();
+    assert_eq!(
+        sched.submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: full_prompt,
+                params: DecodeParams::default(),
+            },
+            RequestClass::Agent,
+        ),
+        Err(SubmitError::ContextExceeded {
+            requested: 64,
+            limit: 64
+        })
+    );
+    // No `max_tokens`, 10-token prompt: reserves the 64-token limit (it may
+    // generate 54), not 10 + 64.
+    let uncapped = sched
+        .submit(
+            RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: (0..10).collect(),
+                params: DecodeParams::default(),
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+
+    sched.advance();
+    let reservations: Vec<(u64, u32)> = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .map(|job| (job.request, job.context_tokens))
+        .collect();
+    assert!(
+        reservations.contains(&(uncapped, 64)),
+        "the uncapped request reserves the limit: {reservations:?}"
+    );
+    assert!(
+        reservations.iter().all(|&(_, tokens)| tokens <= 64),
+        "nothing past the limit reaches the compute seam: {reservations:?}"
+    );
+}
+
 /// GitHub #98 (P3-02) — the scheduler's capacity is built from
 /// `ignis_core::kv::verified_kv_pool`'s output, i.e. the *leaf-verified*
 /// page geometry (`ignis_seq_pool_stats`), not an arbitrary constant: once

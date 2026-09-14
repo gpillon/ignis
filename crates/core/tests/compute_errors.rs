@@ -6,8 +6,8 @@
 use std::sync::{Arc, Mutex};
 
 use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
-use ignis_core::types::{ComputeError, RequestId, SchedEvent};
-use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
+use ignis_core::types::{ComputeError, FinishReason, RequestId, SchedEvent};
+use ignis_core::{ConcreteScheduler, MAX_PREFILL_ATTEMPTS, MockCompute, Scheduler};
 
 /// A compute that fails its first `prefill_step` with a kernel fault, then
 /// behaves like the deterministic mock (so a single scheduler can be driven
@@ -96,6 +96,67 @@ fn failed_prefill_leaves_the_request_retryable() {
     assert!(sched.last_error().is_none());
     // Exactly one prefill call faulted (the retry went to the mock).
     assert_eq!(compute.faults(), 1);
+}
+
+/// A compute whose `prefill_step` always faults — the leaf refusing a
+/// sequence alloc it will never grant (GitHub #166).
+struct AlwaysFailingPrefill {
+    faults: Mutex<u32>,
+}
+
+impl Compute for AlwaysFailingPrefill {
+    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+        *self.faults.lock().unwrap() += 1;
+        Err(ComputeError::Kernel(-1))
+    }
+
+    fn decode_step(&self, _jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        Ok(Vec::new())
+    }
+}
+
+/// GitHub #166 — a prefill that keeps failing is retried a bounded number
+/// of times, then its request ends with `FinishReason::Error` and releases
+/// everything, instead of being retried on every advance forever.
+#[test]
+fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
+    let compute = Arc::new(AlwaysFailingPrefill {
+        faults: Mutex::new(0),
+    });
+    let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute.clone());
+    let id = sched
+        .submit(
+            ignis_core::types::RequestInput {
+                model: "qwen3.8-27b".into(),
+                tokens: vec![1, 2],
+                params: Default::default(),
+            },
+            ignis_core::types::RequestClass::Agent,
+        )
+        .unwrap();
+
+    // Every attempt but the last is the ordinary retryable fault.
+    for attempt in 1..MAX_PREFILL_ATTEMPTS {
+        let ev = sched.advance();
+        assert!(ev.is_empty(), "attempt {attempt} is still retryable");
+        assert!(!sched.is_idle());
+    }
+    // The last attempt ends the request.
+    let ev = sched.advance();
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, tokens: 0, reason: FinishReason::Error, .. } if *request == id
+        )),
+        "the request ends with an error: {ev:?}"
+    );
+    assert_eq!(sched.last_error(), Some(&ComputeError::Kernel(-1)));
+    assert!(sched.is_idle(), "nothing is left to retry");
+    assert_eq!(sched.kv_used_pages(), 0, "its reservation is released");
+
+    // No further attempt reaches the backend.
+    sched.advance();
+    assert_eq!(*compute.faults.lock().unwrap(), MAX_PREFILL_ATTEMPTS);
 }
 
 /// A compute that always faults on `decode_step`.

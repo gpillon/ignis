@@ -20,17 +20,35 @@ tokens), speculation `dflash2 draft_tokens=7`.
 
 ## What happened
 
+(Corrected at triage: the first draft said the storm ran ~5 min at ~13k/s
+while other requests were served. The excerpt says otherwise.)
+
 - 16:09:37, six seconds after request 5 finished (`stop`, 2,629 tokens),
   `ignis.runtime.leaf_error {context: "sequence alloc", error:
-  "ignis_seq_alloc: sequence pool exhausted (KV pages)"}` starts and never
-  stops until the process is killed (~16:14:30).
-- 4,135,039 of the log's 4,135,090 lines are that event — about 13,000 per
-  second, ERROR severity, each identical.
-- Requests kept being served meanwhile (14 admitted / 14 done in total; the
-  last, request 14, 2,695 tokens at 82 tok/s), so some request was stuck
-  retrying while others went through.
+  "ignis_seq_alloc: sequence pool exhausted (KV pages)"}` starts; the last
+  one is at 16:10:17 — about 40 s.
+- 4,135,039 of the log's 4,135,090 lines are that event — about 100,000 per
+  second (the excerpt's per-second counts), ERROR severity, each identical.
+- The stuck request is **request 10**: it never logs `admitted`. No request
+  was admitted during the storm; it ends when request 10 goes away (most
+  likely the client's cancel), and requests 11–14 are served normally
+  afterwards.
 - The owner's conversation was about 10K tokens — far below the context
   limit.
+
+## Root cause (triage)
+
+Not a core/leaf page-accounting drift. The leaf caps one sequence's
+reservation at `logical_page_capacity = pages_for_tokens(max_context)`
+(`kernel/src/seq.cu`, `PagedKVPool::can_reserve`): 4,096 pages at 262,144
+tokens. A request without `max_tokens` reserved `prompt + max_context`,
+always past that cap, so its alloc failed however empty the pool was — the
+"pool exhausted" message is misleading. Core's `Oversized` check only
+compared against the whole pool (7,281 pages), so the request was accepted;
+the failed prefill was then retried on every advance with no bound. The
+Playground omits `max_tokens` when its field is empty; requests 0–5 must
+have carried one. Drafter window (separate arena) and prefix pages ruled
+out.
 
 ## Facts from the code
 

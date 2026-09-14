@@ -110,6 +110,11 @@ pub struct Request {
     /// was already in flight has, by construction, already returned: compute
     /// calls are synchronous, so there is nothing to interrupt).
     pub cancelled: bool,
+    /// Consecutive `prefill_step` calls that failed with this request in
+    /// the batch (GitHub #166). Reset by a successful chunk; at
+    /// `MAX_PREFILL_ATTEMPTS` the scheduler ends the request with
+    /// [`crate::types::FinishReason::Error`] instead of retrying it forever.
+    pub prefill_failures: u32,
 }
 
 impl Request {
@@ -143,6 +148,7 @@ impl Request {
             publish_tokens: 0,
             prefill_progress: 0,
             cancelled: false,
+            prefill_failures: 0,
         }
     }
 
@@ -342,6 +348,7 @@ impl Request {
         // whatever chunk progress it had before eviction is gone with the
         // KV it warmed.
         self.prefill_progress = 0;
+        self.prefill_failures = 0;
         true
     }
 

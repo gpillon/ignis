@@ -631,7 +631,10 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
 
     scheduler.advance();
     let calls = leaf.calls.lock().unwrap();
-    assert_eq!(calls.sequences_allocated, vec![23]);
+    // GitHub #166: without `max_tokens` the reservation is the sequence
+    // limit itself (prompt included), never prompt + limit — the leaf
+    // refuses anything past its `max_context`.
+    assert_eq!(calls.sequences_allocated, vec![20]);
     assert_eq!(calls.prefill_positions, vec![0]);
 }
 
