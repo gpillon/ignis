@@ -5,8 +5,9 @@
 //! before it commits, so a correct implementation's greedy output is
 //! byte-for-byte identical whether speculation is on or off — never merely
 //! close. This runs [`crate::canary::CANARIES`] against two endpoints (one
-//! with speculation on, one with it off — or the same endpoint restarted
-//! between runs, #151) and compares the token sequences for **exact**
+//! with speculation on, one with it off — or, since two engines do not fit
+//! on the card, a [`Capture`] of each taken against its own launch, #156)
+//! and compares the token sequences for **exact**
 //! equality, naming the first divergence rather than scoring an agreement
 //! percentage.
 //!
@@ -81,11 +82,61 @@ pub fn compare_endpoints(
     tokenizer: &dyn Tokenize,
     max_tokens: u32,
 ) -> Result<Vec<CanaryEquivalence>, String> {
-    CANARIES
+    let on = capture(spec_on, tokenizer, max_tokens).map_err(|e| format!("spec-on: {e}"))?;
+    let off = capture(spec_off, tokenizer, max_tokens).map_err(|e| format!("spec-off: {e}"))?;
+    compare_captures(&on, &off)
+}
+
+/// One side of the check, taken against one launch and kept on disk (#156).
+///
+/// Two 27B engines do not fit on the one card (ADR 0006), so the gate cannot
+/// hold a spec-on and a spec-off endpoint live at once: it captures the
+/// spec-off launch, restarts the engine with speculation on, captures again,
+/// and compares the two files with [`compare_captures`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Capture {
+    /// The output budget every request was sent with; two captures compare
+    /// only at the same budget.
+    pub max_tokens: u32,
+    pub canaries: Vec<CanaryCapture>,
+}
+
+/// One canary's greedy output from one endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanaryCapture {
+    pub id: String,
+    pub text: String,
+    pub tokens: Vec<u32>,
+}
+
+impl Capture {
+    pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("serialize the capture: {e}"))?;
+        std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    pub fn read(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+}
+
+/// Run every canary against one endpoint (greedy — this crate's
+/// `HttpEndpoint` fixes `temperature: 0` / `seed: 0` on every request) and
+/// tokenize its output. A request or tokenize failure fails the whole
+/// capture with that canary named (a partial capture is not a capture).
+pub fn capture(
+    endpoint: &dyn Endpoint,
+    tokenizer: &dyn Tokenize,
+    max_tokens: u32,
+) -> Result<Capture, String> {
+    let canaries = CANARIES
         .iter()
         .map(|c| {
-            let req = |suffix: &str| Request {
-                id: format!("equiv-{}-{suffix}", c.id),
+            let req = Request {
+                id: format!("equiv-{}", c.id),
                 // `Sub` only because `Request` needs some class and nothing
                 // here ever feeds `class_stats` — matches `oracle::record`'s
                 // own canary requests.
@@ -96,25 +147,51 @@ pub fn compare_endpoints(
                 include_usage: false,
                 enable_thinking: Some(false),
             };
-            let on = spec_on
-                .complete(&req("on"))
-                .map_err(|e| format!("canary {} (spec-on): {e}", c.id))?;
-            let off = spec_off
-                .complete(&req("off"))
-                .map_err(|e| format!("canary {} (spec-off): {e}", c.id))?;
-            let spec_on_tokens = tokenizer
-                .encode(&on.output)
-                .map_err(|e| format!("canary {} (spec-on): tokenize: {e}", c.id))?;
-            let spec_off_tokens = tokenizer
-                .encode(&off.output)
-                .map_err(|e| format!("canary {} (spec-off): tokenize: {e}", c.id))?;
-            let divergence = first_divergence(&spec_on_tokens, &spec_off_tokens);
+            let out = endpoint.complete(&req).map_err(|e| format!("canary {}: {e}", c.id))?;
+            let tokens = tokenizer
+                .encode(&out.output)
+                .map_err(|e| format!("canary {}: tokenize: {e}", c.id))?;
+            Ok(CanaryCapture { id: c.id.to_string(), text: out.output, tokens })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Capture { max_tokens, canaries })
+}
+
+/// Compare a spec-on and a spec-off capture canary by canary, in
+/// [`CANARIES`] order. Refuses captures taken at different budgets (a
+/// shorter budget would read as a divergence at its end) and a capture that
+/// lacks a canary of the suite.
+pub fn compare_captures(
+    spec_on: &Capture,
+    spec_off: &Capture,
+) -> Result<Vec<CanaryEquivalence>, String> {
+    if spec_on.max_tokens != spec_off.max_tokens {
+        return Err(format!(
+            "the spec-on capture ran at max_tokens {} and the spec-off capture at {}: \
+             captures compare only at the same budget",
+            spec_on.max_tokens, spec_off.max_tokens
+        ));
+    }
+    let find = |capture: &Capture, side: &str, id: &str| {
+        capture
+            .canaries
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| format!("canary {id} is missing from the {side} capture"))
+    };
+    CANARIES
+        .iter()
+        .map(|c| {
+            let on = find(spec_on, "spec-on", c.id)?;
+            let off = find(spec_off, "spec-off", c.id)?;
+            let divergence = first_divergence(&on.tokens, &off.tokens);
             Ok(CanaryEquivalence {
                 id: c.id.to_string(),
-                spec_on_text: on.output,
-                spec_off_text: off.output,
-                spec_on_tokens,
-                spec_off_tokens,
+                spec_on_text: on.text,
+                spec_off_text: off.text,
+                spec_on_tokens: on.tokens,
+                spec_off_tokens: off.tokens,
                 first_divergence: divergence,
             })
         })
@@ -219,6 +296,61 @@ mod tests {
             .expect_err("must fail");
         assert!(err.contains(CANARIES[0].id), "{err}");
         assert!(err.contains("spec-on"), "{err}");
+    }
+
+    /// #156: two 27B engines do not fit on the one card, so the gate
+    /// captures each side against its own launch and compares the files.
+    #[test]
+    fn captures_taken_one_launch_at_a_time_compare_like_two_live_endpoints() {
+        let on = FixedEndpoint("the quick brown fox");
+        let off = FixedEndpoint("the quick red fox");
+        let live = compare_endpoints(&on, &off, &MockTokenizer, EQUIVALENCE_MAX_TOKENS)
+            .expect("live results");
+
+        let on_capture = capture(&on, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture on");
+        let off_capture =
+            capture(&off, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture off");
+        let path = std::env::temp_dir()
+            .join(format!("ignis-bench-equivalence-capture-{}.json", std::process::id()));
+        off_capture.write(&path).expect("write the capture");
+        let reloaded = Capture::read(&path).expect("read the capture back");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(reloaded, off_capture);
+
+        let from_files = compare_captures(&on_capture, &reloaded).expect("file results");
+        assert_eq!(from_files, live);
+    }
+
+    #[test]
+    fn captures_at_different_budgets_are_refused() {
+        let ep = FixedEndpoint("same output every time");
+        let on = capture(&ep, &MockTokenizer, 64).expect("capture on");
+        let off = capture(&ep, &MockTokenizer, 32).expect("capture off");
+        let err = compare_captures(&on, &off).expect_err("budgets differ");
+        assert!(err.contains("64") && err.contains("32"), "{err}");
+    }
+
+    #[test]
+    fn a_capture_missing_a_canary_is_refused_naming_it() {
+        let ep = FixedEndpoint("same output every time");
+        let on = capture(&ep, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect("capture on");
+        let mut off = on.clone();
+        let dropped = off.canaries.pop().expect("a canary").id;
+        let err = compare_captures(&on, &off).expect_err("a canary is missing");
+        assert!(err.contains(&dropped), "{err}");
+        assert!(err.contains("spec-off"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_capture_request_names_the_canary() {
+        struct Failing;
+        impl Endpoint for Failing {
+            fn complete(&self, _req: &Request) -> Result<Outcome, String> {
+                Err("endpoint down".into())
+            }
+        }
+        let err = capture(&Failing, &MockTokenizer, EQUIVALENCE_MAX_TOKENS).expect_err("must fail");
+        assert!(err.contains(CANARIES[0].id), "{err}");
     }
 
     #[test]
