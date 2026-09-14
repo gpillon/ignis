@@ -10,8 +10,9 @@
 //!   4 and 8 -- identical, or identical up to a divergence the engine's own
 //!   two prefill routes call a near-tie (`support/near_tie.rs`; why, measured,
 //!   in `speculative_round_gpu.rs`'s header). The drafter runs inside the
-//!   captured verify graph, so a width-4 run on an uncaptured load must
-//!   replay it bit for bit.
+//!   captured verify graph, so at every width 1..8 a run on an uncaptured
+//!   load must replay it bit for bit, and a prefill chunk between two
+//!   replays must change nothing.
 //! - AC 2: acceptance is printed per round, with the mean committed tokens per
 //!   full-window round against the reference's 3.4-5.75 band at draft 7. A
 //!   mean below the band is printed as a finding, not failed; a drafter that
@@ -52,8 +53,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b, load_qwen38_27b_with_speculation, Model};
 use ignis_core::seq::{snapshot_format_version, Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_rounds, prefill_program_sampled,
-    program_stats, SamplingParams, VerifyLane, VerifyRound,
+    capture_decode_graphs, decode_program_batch_sampled, decode_program_verify_runs, prefill_program_sampled,
+    program_stats, SamplingParams, VerifyLane, LaneVerifyRun,
 };
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
 
@@ -146,16 +147,16 @@ fn round(
     sequences: &mut [&mut Seq<'_>],
     budgets: &[u32],
     stop_ids: &[i32],
-) -> Vec<VerifyRound> {
+) -> Vec<LaneVerifyRun> {
     let lanes: Vec<VerifyLane<'_>> = budgets
         .iter()
         .map(|&remaining_tokens| VerifyLane { remaining_tokens, stop_ids, ..VerifyLane::greedy(&[]) })
         .collect();
-    decode_program_verify_rounds(model, pool, sequences, &lanes, WINDOW).unwrap_or_else(|e| panic!("verify round: {e}"))
+    decode_program_verify_runs(model, pool, sequences, &lanes, WINDOW).unwrap_or_else(|e| panic!("verify round: {e}"))
 }
 
 /// What one spec-on run recorded: each lane's text, and per round the
-/// `(lane, drafted, committed)` of every lane that rode it.
+/// `(lane, extent, committed)` of every lane that rode it.
 #[derive(Debug, PartialEq)]
 struct SpecRun {
     emitted: Vec<Vec<i32>>,
@@ -191,9 +192,9 @@ fn spec_on(
         let mut this_round = Vec::new();
         for ((&i, result), &budget) in active.iter().zip(results).zip(&budgets) {
             let expected_extent = WINDOW.min(budget - 1);
-            assert_eq!(result.drafted, expected_extent, "lane {i}: the leaf's reported extent");
-            assert!(!result.tokens.is_empty() && result.tokens.len() <= result.drafted as usize + 1, "lane {i}: run of {}", result.tokens.len());
-            this_round.push((i, result.drafted, result.tokens.len()));
+            assert_eq!(result.extent, expected_extent, "lane {i}: the leaf's reported extent");
+            assert!(!result.tokens.is_empty() && result.tokens.len() <= result.extent as usize + 1, "lane {i}: run of {}", result.tokens.len());
+            this_round.push((i, result.extent, result.tokens.len()));
             done[i] = result.tokens.iter().any(|t| stop_ids.contains(t));
             emitted[i].extend(result.tokens);
             done[i] |= emitted[i].len() >= total;
@@ -213,12 +214,12 @@ fn report_acceptance(label: &str, run: &SpecRun) -> usize {
     for (index, lanes) in run.rounds.iter().enumerate() {
         let cells: Vec<String> = lanes
             .iter()
-            .map(|&(lane, drafted, committed)| format!("lane {lane}: {}/{drafted}", committed - 1))
+            .map(|&(lane, extent, committed)| format!("lane {lane}: {}/{extent}", committed - 1))
             .collect();
         println!("{label} round {index}: accepted/drafted {}", cells.join(", "));
-        for &(_, drafted, committed) in lanes {
+        for &(_, extent, committed) in lanes {
             accepted += committed - 1;
-            if drafted == WINDOW {
+            if extent == WINDOW {
                 committed_full += committed;
                 full_rounds += 1;
             }
@@ -319,7 +320,6 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     // --- AC 1 + AC 2: the drafter's text, and its acceptance --------------
     let model = load_drafter(&reader, &artifact, &handles);
     let probe = || drafter_pool(1);
-    let mut graph_width4 = None;
     let mut accepted = 0usize;
     for (&width, off) in widths.iter().zip(&off) {
         let pool = drafter_pool(width as u32);
@@ -335,9 +335,6 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         let run = spec_on(&model, &pool, prompts, &stop_ids, TOTAL, true);
         assert_equivalent(&model, &probe, MAX_CONTEXT, prompts, off, &run.emitted, &format!("width {width} drafter"));
         accepted += report_acceptance(&format!("width {width}"), &run);
-        if width == 4 {
-            graph_width4 = Some(run);
-        }
     }
     assert!(accepted > 0, "the drafter never landed a draft: it is not proposing from its window");
     // The drafter proposes every lane's drafts: a caller's are refused.
@@ -346,19 +343,59 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
         prefill_all(&model, &pool, std::slice::from_mut(&mut seq), &canaries[..1]);
         let drafts = [canaries[0][0]];
-        let refused = decode_program_verify_rounds(&model, &pool, &mut [&mut seq], &[VerifyLane::greedy(&drafts)], WINDOW);
+        let refused = decode_program_verify_runs(&model, &pool, &mut [&mut seq], &[VerifyLane::greedy(&drafts)], WINDOW);
         let refusal = refused.err().expect("a DFlash2 load took caller drafts");
         assert!(refusal.contains("must be NULL"), "the wrong refusal: {refusal}");
     }
     drop(model);
 
-    // The drafter's forward runs inside the captured verify graph: a load
-    // that captured nothing runs the same round eagerly, bit for bit.
+    // The drafter's forward runs inside the captured verify graph: at every
+    // width 1..8 a load that captured nothing runs the same rounds eagerly,
+    // bit for bit -- runs, extents and every lane's acceptance.
+    let eager: Vec<SpecRun> = {
+        let model = load_drafter(&reader, &artifact, &handles);
+        (1..=8usize)
+            .map(|width| {
+                let pool = drafter_pool(width as u32);
+                spec_on(&model, &pool, &prompts8[..width], &stop_ids, TOTAL, false)
+            })
+            .collect()
+    };
     {
         let model = load_drafter(&reader, &artifact, &handles);
-        let pool = drafter_pool(4);
-        let eager = spec_on(&model, &pool, &prompts8[..4], &stop_ids, TOTAL, false);
-        assert_eq!(Some(eager), graph_width4, "width 4: the drafter's graph replay diverged from eager");
+        for (width, eager) in (1..=8usize).zip(eager) {
+            let pool = drafter_pool(width as u32);
+            let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+            let graph = spec_on(&model, &pool, &prompts8[..width], &stop_ids, TOTAL, true);
+            assert_eq!(eager, graph, "width {width}: the drafter's graph replay diverged from eager");
+        }
+
+        // A prefill chunk between two replays changes nothing: the drafter's
+        // round allocates from its own reservation, never the prefill's
+        // `scratch`, and the interloper's window is its own slot's lane.
+        const WIDTH: usize = 2;
+        let pool = drafter_pool(WIDTH as u32 + 1);
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        let two_rounds = |interleave: bool| -> Vec<Vec<LaneVerifyRun>> {
+            let mut lanes: Vec<Seq<'_>> =
+                (0..WIDTH).map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+            prefill_all(&model, &pool, &mut lanes, &canaries[..WIDTH]);
+            let mut out = Vec::new();
+            for index in 0..2 {
+                if interleave && index == 1 {
+                    let mut interloper = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+                    prefill_all(&model, &pool, std::slice::from_mut(&mut interloper), &canaries[3..4]);
+                }
+                let mut refs: Vec<&mut Seq<'_>> = lanes.iter_mut().collect();
+                out.push(round(&model, &pool, &mut refs, &[TOTAL as u32; WIDTH], &[]));
+                let stats = program_stats(&model, &pool).unwrap_or_else(|e| panic!("stats: {e}"));
+                assert_eq!(stats.graph_launches, 1, "the drafter's round did not replay a verify graph");
+            }
+            out
+        };
+        let baseline = two_rounds(false);
+        let interleaved = two_rounds(true);
+        assert_eq!(baseline, interleaved, "a prefill chunk between two drafter replays changed the second replay");
     }
 
     // --- AC 3: a lane at extent 0 leaves its window alone -----------------
@@ -382,10 +419,10 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         let results =
             round(&model, &pool, &mut [&mut budgeted, &mut cramped, &mut drafting], &[1, 0, TOTAL as u32], &[]);
         for (label, result) in [("out of budget", &results[0]), ("out of context", &results[1])] {
-            assert_eq!(result.drafted, 0, "{label}: the lane must run at extent 0");
+            assert_eq!(result.extent, 0, "{label}: the lane must run at extent 0");
             assert_eq!(result.tokens.len(), 1, "{label}: the lane commits its anchor alone");
         }
-        assert_eq!(results[2].drafted, WINDOW, "the drafting lane proposes a full window beside them");
+        assert_eq!(results[2].extent, WINDOW, "the drafting lane proposes a full window beside them");
 
         for (label, seq, before) in
             [("out of budget", &budgeted, &budgeted_before), ("out of context", &cramped, &cramped_before)]

@@ -284,7 +284,9 @@ per round and the mean committed tokens per full-window round against the
 reference's 3.4–5.75 band — read that line from the profile's output; a mean
 below the band is a finding to file, not a test failure. Since #155 a prefill
 leaves the rewrite checkpoint equal to the window, which `dflash2_window_gpu.rs`
-asserts.
+asserts. `crates/runtime/tests/cuda_leaf_dflash2_gpu.rs` drives the same
+drafter end to end through `RuntimeCompute`: the leaf passes no drafts, and
+every round's speculative counters match the lane's extent and committed run.
 
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and

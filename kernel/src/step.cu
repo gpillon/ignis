@@ -1350,8 +1350,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       if (append_counts[i] > 0) {
         sequences[i]->dflash2_position = sequences[i]->position;
       }
-      if (options.out_draft_counts != nullptr) {
-        options.out_draft_counts[i] = static_cast<std::uint32_t>(extents[i]);
+      if (options.out_extents != nullptr) {
+        options.out_extents[i] = static_cast<std::uint32_t>(extents[i]);
       }
     }
     model->last_step_kernel_count = model->layers.size();

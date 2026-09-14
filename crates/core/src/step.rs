@@ -58,7 +58,7 @@ mod ffi {
         pub draft_counts: *const u32,
         pub out_committed_counts: *mut i32,
         /// P5-05 (GitHub #155): each lane's extent this round, or null.
-        pub out_draft_counts: *mut u32,
+        pub out_extents: *mut u32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -705,19 +705,19 @@ pub fn decode_program_verify(
     lanes: &[VerifyLane<'_>],
     window: u32,
 ) -> Result<Vec<Vec<i32>>, String> {
-    Ok(decode_program_verify_rounds(model, pool, sequences, lanes, window)?
+    Ok(decode_program_verify_runs(model, pool, sequences, lanes, window)?
         .into_iter()
-        .map(|round| round.tokens)
+        .map(|run| run.tokens)
         .collect())
 }
 
-/// One lane's verify round (P5-05, GitHub #155): the committed run, and how
+/// One lane's run through a verify round (P5-05, GitHub #155): the committed run, and how
 /// many drafts the round verified for the lane -- its extent, whether the
 /// caller proposed them or the DFlash2 drafter did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifyRound {
+pub struct LaneVerifyRun {
     pub tokens: Vec<i32>,
-    pub drafted: u32,
+    pub extent: u32,
 }
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
@@ -726,13 +726,13 @@ pub struct VerifyRound {
 /// the leaf proposes every lane's drafts from the lane's own window, so every
 /// lane's `drafts` must be empty; the leaf refuses a proposal it would
 /// otherwise ignore.
-pub fn decode_program_verify_rounds(
+pub fn decode_program_verify_runs(
     model: &Model,
     pool: &SeqPool,
     sequences: &mut [&mut Seq<'_>],
     lanes: &[VerifyLane<'_>],
     window: u32,
-) -> Result<Vec<VerifyRound>, String> {
+) -> Result<Vec<LaneVerifyRun>, String> {
     if lanes.len() != sequences.len() {
         return Err(format!(
             "decode_program_verify: {} lanes for {} sequences",
@@ -779,7 +779,7 @@ pub fn decode_program_verify_rounds(
     }
     let mut tokens = vec![-1i32; handles.len() * (width + 1)];
     let mut committed = vec![0i32; handles.len()];
-    let mut drafted = vec![0u32; handles.len()];
+    let mut extents = vec![0u32; handles.len()];
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
     let proposes = lanes.iter().any(|lane| !lane.drafts.is_empty());
@@ -789,7 +789,7 @@ pub fn decode_program_verify_rounds(
         drafts: if proposes { drafts.as_ptr() } else { std::ptr::null() },
         draft_counts: if proposes { draft_counts.as_ptr() } else { std::ptr::null() },
         out_committed_counts: committed.as_mut_ptr(),
-        out_draft_counts: drafted.as_mut_ptr(),
+        out_extents: extents.as_mut_ptr(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -807,13 +807,13 @@ pub fn decode_program_verify_rounds(
     }
     Ok(committed
         .iter()
-        .zip(&drafted)
+        .zip(&extents)
         .enumerate()
-        .map(|(index, (&count, &drafted))| {
+        .map(|(index, (&count, &extent))| {
             let start = index * (width + 1);
-            VerifyRound {
+            LaneVerifyRun {
                 tokens: tokens[start..start + count as usize].to_vec(),
-                drafted,
+                extent,
             }
         })
         .collect())

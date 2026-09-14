@@ -5,7 +5,7 @@
 - Observed: 2026-09-14
 - Last verified: 2026-09-14
 - Scope: kernel / window-0 batched decode, batch invariance
-- Related: https://github.com/gpillon/ignis/issues/155, https://github.com/gpillon/ignis/issues/153
+- Related: https://github.com/gpillon/ignis/issues/155, https://github.com/gpillon/ignis/issues/153, https://github.com/gpillon/ignis/issues/158
 - Superseded by: none
 
 ## Question

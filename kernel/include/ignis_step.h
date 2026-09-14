@@ -296,7 +296,7 @@ int32_t ignis_program_prefill(struct ignis_model *model, struct ignis_seq_pool *
  * `draft_counts` must be NULL there; a lane's extent is then `min(k,
  * remaining_tokens - 1, remaining context - 1)`. After the commit the
  * committed columns' feature taps are appended to each lane's window; a lane
- * at extent 0 appends nothing. `out_draft_counts` (`batch_size` entries, or
+ * at extent 0 appends nothing. `out_extents` (`batch_size` entries, or
  * NULL) receives each lane's extent -- the drafts this round verified for
  * it, whichever side proposed them. */
 struct ignis_decode_options {
@@ -305,7 +305,7 @@ struct ignis_decode_options {
   const int32_t *drafts;       /* [batch_size][speculative_window], or NULL */
   const uint32_t *draft_counts; /* [batch_size], or NULL (every lane proposes the window) */
   int32_t *out_committed_counts; /* [batch_size]; required when speculative_window > 0 */
-  uint32_t *out_draft_counts;  /* [batch_size], or NULL: each lane's extent this round */
+  uint32_t *out_extents;  /* [batch_size], or NULL: each lane's extent this round */
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

@@ -462,7 +462,7 @@ impl StepLeaf for CudaLeaf {
                 drafts: &[],
             })
             .collect();
-        let rounds = step::decode_program_verify_rounds(
+        let runs = step::decode_program_verify_runs(
             &model.model,
             &model.pool,
             sequences,
@@ -470,15 +470,15 @@ impl StepLeaf for CudaLeaf {
             speculation.draft_tokens(),
         )
         .map_err(|e| leaf_error("decode", e))?;
-        Ok(rounds
+        Ok(runs
             .into_iter()
-            .map(|round| {
+            .map(|run| {
                 // Committed drafts: the run past its anchor, which a stop cut
                 // may leave shorter than what the target accepted.
-                let accepted = (round.tokens.len() as u32).saturating_sub(1).min(round.drafted);
+                let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
                 LaneRun {
-                    tokens: round.tokens.into_iter().map(|id| id as TokenId).collect(),
-                    spec: Some(SpecCounters::round(round.drafted, accepted)),
+                    tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
+                    spec: Some(SpecCounters::round(run.extent, accepted)),
                 }
             })
             .collect())
