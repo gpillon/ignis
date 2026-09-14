@@ -512,17 +512,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_unbounded_request_completes_at_its_reservation_cap() {
-        // `max_tokens: None`: the request reserves `max_sequence_tokens`
-        // (8192) and completes exactly there (the reservation is a hard
-        // cap — pins that un-capped requests still terminate, so their
-        // streams never hang).
+        // `max_tokens: None`: the request's sequence is capped at
+        // `max_sequence_tokens` (8192), prompt included (GitHub #166), and
+        // it completes exactly there (the reservation is a hard cap — pins
+        // that un-capped requests still terminate, so their streams never
+        // hang).
         let (engine, _) = test_engine();
         let (_id, mut rx) = engine
             .submit(input("test-model", vec![1], None), RequestClass::Interactive)
             .await
             .expect("submit");
         let (tokens, reason) = drain_to_done(&mut rx).await;
-        assert_eq!(tokens.len(), 8192);
+        assert_eq!(tokens.len(), 8191, "1 prompt token + 8191 generated = the 8192 limit");
         assert_eq!(reason, FinishReason::Length);
     }
 

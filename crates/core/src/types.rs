@@ -18,10 +18,10 @@ pub type TokenId = u32;
 /// concurrent coding workload; overflow goes to the host KV-RAM tier).
 pub const N_DECODE_LANES: usize = 8;
 
-/// Why a request's generation stopped (GitHub #61 / P1-25) — the two
-/// reasons the OpenAI surface reports as `finish_reason`: `stop` (the
-/// model's own EOS token) or `length` (`max_tokens`, or a scheduler-side
-/// reservation cap, reached first).
+/// Why a request's generation stopped (GitHub #61 / P1-25) — the reasons
+/// the OpenAI surface reports as `finish_reason`: `stop` (the model's own
+/// EOS token), `length` (`max_tokens`, or a scheduler-side reservation cap,
+/// reached first), or `error` (the engine gave up on the request).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
     /// The model generated its end-of-sequence token.
@@ -29,6 +29,10 @@ pub enum FinishReason {
     /// `max_tokens` or the engine's KV reservation cap was reached before
     /// EOS.
     Length,
+    /// The compute backend failed the request's prefill
+    /// `MAX_PREFILL_ATTEMPTS` times in a row (GitHub #166): the request is
+    /// ended rather than retried on every advance.
+    Error,
 }
 
 /// The engine's operating mode (what the scheduler + telemetry report).
@@ -344,6 +348,17 @@ pub enum SubmitError {
     /// exceeds the whole pool — it can never be admitted, even alone.
     /// Rejected at submit rather than left to block the queue forever.
     Oversized,
+    /// The request's sequence (prompt + `max_tokens`, or a prompt that
+    /// leaves no room to generate when `max_tokens` is absent) is longer
+    /// than the engine's per-sequence limit, `max_context` (GitHub #166).
+    /// The leaf cannot reserve more than that for one sequence however
+    /// empty the pool is, so it is rejected at submit.
+    ContextExceeded {
+        /// Prompt tokens plus the requested generation budget.
+        requested: u64,
+        /// The per-sequence limit (`SchedulerConfig::max_sequence_tokens`).
+        limit: u32,
+    },
 }
 
 impl std::fmt::Display for SubmitError {
@@ -354,6 +369,10 @@ impl std::fmt::Display for SubmitError {
             SubmitError::Oversized => write!(
                 f,
                 "request KV reservation exceeds the whole pool (oversized)"
+            ),
+            SubmitError::ContextExceeded { requested, limit } => write!(
+                f,
+                "request needs {requested} tokens (prompt + max_tokens), over the {limit}-token context limit"
             ),
         }
     }

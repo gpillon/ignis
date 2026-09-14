@@ -81,7 +81,12 @@
 //! tier (core-06) provides overflow — a blocked head is admitted by
 //! evicting a retained lane to the host tier, and a request whose KV
 //! reservation exceeds the whole pool is rejected with
-//! [`SubmitError::Oversized`].
+//! [`SubmitError::Oversized`]. One whose sequence (prompt + `max_tokens`)
+//! is longer than `max_sequence_tokens` is rejected with
+//! [`SubmitError::ContextExceeded`] (GitHub #166): the leaf never reserves
+//! more than its `max_context` for one sequence, however empty the pool.
+//! A prefill that the backend keeps failing ends its request with
+//! [`FinishReason::Error`] after [`MAX_PREFILL_ATTEMPTS`] tries.
 //!
 //! **Request-lifecycle spans (GitHub #81, ADR 0012)** — the full hierarchy
 //! is documented once in `docs/design/tracing-spans.md`; this crate's own
@@ -146,11 +151,13 @@ pub struct SchedulerConfig {
     /// The KV block size in tokens (one KV page holds this many tokens):
     /// sets the per-request reservation granularity (core-05).
     pub kv_page_tokens: u32,
-    /// The per-request decode reservation cap (effective max tokens) for
-    /// requests submitted without an explicit `max_tokens` (core-05: an
-    /// unbounded request reserves `ceil((prompt + this) / kv_page_tokens)`
-    /// pages and is completed when it reaches it — the reservation cannot
-    /// grow mid-generation).
+    /// The per-sequence token limit, prompt included — the leaf's
+    /// `max_context` in production (GitHub #166). A request submitted
+    /// without `max_tokens` may generate `this - prompt` tokens, reserves
+    /// `ceil(this / kv_page_tokens)` pages and is completed when it reaches
+    /// the limit (core-05: the reservation cannot grow mid-generation). A
+    /// request whose prompt + `max_tokens` exceeds it is refused with
+    /// [`SubmitError::ContextExceeded`].
     pub max_sequence_tokens: u32,
     /// The KV pool capacity in pages (core-05: the admission machine's
     /// resource dimension; production auto-sizes this from the pool,
@@ -190,6 +197,31 @@ pub struct SchedulerConfig {
 /// [`resolve_serving_chunk_tokens`] is `crates/runtime`'s job, not this
 /// crate's.
 pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
+
+/// Consecutive failed `prefill_step` calls a request survives (GitHub
+/// #166): a single fault is retried on the next advance (core-04), but one
+/// that keeps repeating is not transient, and retrying it every advance
+/// spins the model thread. The attempt that reaches this ends the request
+/// with [`FinishReason::Error`].
+pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
+
+/// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
+/// absent that — whatever the per-sequence limit leaves after the prompt.
+fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    input.params.max_tokens.unwrap_or_else(|| {
+        config
+            .max_sequence_tokens
+            .saturating_sub(u32::try_from(input.tokens.len()).unwrap_or(u32::MAX))
+    })
+}
+
+/// The whole-sequence reservation handed to the leaf: prompt + generation
+/// budget. `submit` refuses anything over `max_sequence_tokens`, so for an
+/// admitted request this always fits.
+fn sequence_tokens(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    (input.tokens.len() as u64 + u64::from(generation_budget(config, input))).min(u32::MAX as u64)
+        as u32
+}
 
 /// Resolve a serving-time chunk width against the width the program scratch
 /// was reserved for at model load (P2-01 / #83, ADR 0018): narrowing at
@@ -963,11 +995,7 @@ impl ConcreteScheduler {
         let prefix_entry = r.prefix_entry;
         r.requeue(); // Evicted → Admitted, lane released (there is none).
         r.tokens = 0;
-        let effective_max = r
-            .input
-            .params
-            .max_tokens
-            .unwrap_or(self.config.max_sequence_tokens);
+        let effective_max = generation_budget(&self.config, &r.input);
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
         r.backfill_epoch = 0;
@@ -975,9 +1003,8 @@ impl ConcreteScheduler {
         // request re-prefills its *entire* prompt (not just its tail), so
         // its pool charge must cover `prompt + max` pages again (the claim
         // loop shrinks it to the tail if a live entry is re-claimed).
-        let full_pages = ((r.input.tokens.len() as u64) + (effective_max as u64))
-            .div_ceil(self.config.kv_page_tokens as u64)
-            .min(u32::MAX as u64) as u32;
+        let full_pages = u64::from(sequence_tokens(&self.config, &r.input))
+            .div_ceil(self.config.kv_page_tokens as u64) as u32;
         r.resources.kv_pages = full_pages;
         events.push(SchedEvent::Requeued { request: r.id });
         // core-07: release the shared-prefix claim (its pages return to
@@ -1245,15 +1272,7 @@ impl ConcreteScheduler {
                 .iter()
                 .position(|r| r.id == victim.request)
                 .expect("a host-tier snapshot always maps to a request");
-            let context_tokens = ((self.requests[idx].input.tokens.len() as u64)
-                .saturating_add(
-                    self.requests[idx]
-                        .input
-                        .params
-                        .max_tokens
-                        .unwrap_or(self.config.max_sequence_tokens) as u64,
-                )
-                .min(u32::MAX as u64)) as u32;
+            let context_tokens = sequence_tokens(&self.config, &self.requests[idx].input);
             let started = Instant::now();
             match self.compute.restore(victim.request, context_tokens) {
                 Ok(()) => {
@@ -1312,17 +1331,25 @@ impl Scheduler for ConcreteScheduler {
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);
         }
+        // GitHub #166: the leaf reserves at most `max_sequence_tokens` (its
+        // `max_context`) for one sequence, whatever the pool holds. A prompt
+        // that already fills the limit, or a prompt + `max_tokens` that
+        // overruns it, can never be allocated — refused here rather than
+        // failing at the leaf on every advance.
+        let prompt_tokens = input.tokens.len() as u64;
+        let effective_max = generation_budget(&self.config, &input);
+        let reserved_tokens = prompt_tokens + u64::from(effective_max);
+        let limit = self.config.max_sequence_tokens;
+        if prompt_tokens >= u64::from(limit) || reserved_tokens > u64::from(limit) {
+            return Err(SubmitError::ContextExceeded {
+                requested: reserved_tokens,
+                limit,
+            });
+        }
         // core-05: compute the request's KV reservation (prompt + the
         // effective token budget, in pages) and reject requests that can
         // never fit — even alone (they would block the queue forever).
-        let effective_max = input
-            .params
-            .max_tokens
-            .unwrap_or(self.config.max_sequence_tokens);
-        let reserved_tokens = (input.tokens.len() as u64).saturating_add(effective_max as u64);
-        let kv_pages = ((reserved_tokens + self.config.kv_page_tokens as u64 - 1)
-            / self.config.kv_page_tokens as u64)
-            .min(u32::MAX as u64) as u32;
+        let kv_pages = reserved_tokens.div_ceil(self.config.kv_page_tokens as u64) as u32;
         let resources = AdmissionResources {
             lanes: 1,
             kv_pages,
@@ -1565,15 +1592,7 @@ impl Scheduler for ConcreteScheduler {
                 PrefillJob {
                     request: r.id,
                     tokens,
-                    context_tokens: ((r.input.tokens.len() as u64)
-                        .saturating_add(
-                            r.input
-                                .params
-                                .max_tokens
-                                .unwrap_or(self.config.max_sequence_tokens)
-                                as u64,
-                        )
-                        .min(u32::MAX as u64)) as u32,
+                    context_tokens: sequence_tokens(&self.config, &r.input),
                     start_position: start,
                     params,
                     // Carried on the request's *first* job only — the one
@@ -1619,6 +1638,7 @@ impl Scheduler for ConcreteScheduler {
                         // request continuing from its snapshot boundary).
                         self.materialize(i);
                         let r = &mut self.requests[i];
+                        r.prefill_failures = 0;
                         if r.state == RequestState::Admitted {
                             r.advance(RequestState::Prefilling);
                         }
@@ -1712,6 +1732,19 @@ impl Scheduler for ConcreteScheduler {
                     // (`Self::materialize`, above).
                     for &i in &batch {
                         self.unmaterialize(i);
+                        self.requests[i].prefill_failures += 1;
+                    }
+                    // GitHub #166: a failure that repeats is not transient.
+                    // Retried every advance, it spun the model thread and
+                    // logged the leaf's error ~100k times a second. After
+                    // `MAX_PREFILL_ATTEMPTS` in a row the request ends with
+                    // `FinishReason::Error`. Every request in the failed
+                    // batch is charged the attempt: the backend's error does
+                    // not say which job failed.
+                    for &i in &batch {
+                        if self.requests[i].prefill_failures >= MAX_PREFILL_ATTEMPTS {
+                            self.mark_done(i, &mut events, FinishReason::Error);
+                        }
                     }
                     self.last_error = Some(e);
                     return events;

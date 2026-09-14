@@ -304,7 +304,9 @@ async fn dropping_a_streaming_response_cancels_the_request_and_releases_its_slot
             serde_json::json!({
                 "model": MODEL,
                 "messages": [{ "role": "user", "content": "keep decoding" }],
-                "max_tokens": 8192,
+                // Long enough to still be decoding at the drop; prompt +
+                // this stays inside the 8192-token sequence limit (#166).
+                "max_tokens": 4096,
                 "stream": true
             })
             .to_string(),

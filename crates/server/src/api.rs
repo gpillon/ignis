@@ -482,9 +482,18 @@ fn split_reasoning_and_tools(
 }
 
 /// Map a [`SubmitError`] from the engine's submit to the OpenAI-shaped
-/// error response (404 unknown model, 413 oversized, 503 engine full).
+/// error response (404 unknown model, 400 context exceeded, 413 oversized,
+/// 503 engine full).
 fn submit_error(server: &Server, err: SubmitError) -> Response {
     match err {
+        SubmitError::ContextExceeded { requested, limit } => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "context_length_exceeded",
+            format!(
+                "request needs {requested} tokens (prompt + max_tokens), over the model's {limit}-token context; lower max_tokens or shorten the prompt"
+            ),
+        ),
         SubmitError::UnknownModel(m) => error_response(
             StatusCode::NOT_FOUND,
             "model_not_found",
@@ -549,14 +558,27 @@ fn request_timeout_message(timeout: std::time::Duration) -> String {
 
 /// Map the engine's [`FinishReason`] to the OpenAI `finish_reason` string
 /// (GitHub #61 / P1-25): `stop` on the model's own EOS token, `length` on
-/// `max_tokens` or the engine's reservation cap. `pub(crate)` since P3-06:
+/// `max_tokens` or the engine's reservation cap, `error` when the engine
+/// gave up on the request (GitHub #166). `pub(crate)` since P3-06:
 /// `telemetry.rs`'s `ignis.request.done` event reuses this exact mapping so
 /// the request log and the HTTP response never disagree on the string.
 pub(crate) fn finish_reason_str(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+        FinishReason::Error => "error",
     }
+}
+
+/// The `500` a non-streaming request gets when the engine ended it with
+/// [`FinishReason::Error`] (GitHub #166): there is no completion to return.
+fn engine_error_response() -> Response {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "engine_error",
+        "engine_error",
+        "the engine could not run the request (its prefill failed repeatedly); see the server log",
+    )
 }
 
 /// The OpenAI `finish_reason`, tool-calls aware (GitHub #121). A generation
@@ -759,6 +781,7 @@ async fn chat_completions(
     // Non-streaming: collect the request's tokens to its completion (a
     // timeout guards a wedged engine from hanging the client).
     match collect_tokens(&mut stream, server.request_timeout).await {
+        Ok((_, FinishReason::Error)) => engine_error_response(),
         Ok((tokens, reason)) => {
             let (reasoning_content, content, tool_calls) =
                 split_reasoning_and_tools(server.template.as_ref(), &tokens, &thinking);
@@ -1334,6 +1357,7 @@ async fn responses_api(
     // GitHub #81 / ADR 0012: see the matching comment in `chat_completions`.
     tracing::Span::current().record("request_id", id);
     match collect_tokens(&mut stream, server.request_timeout).await {
+        Ok((_, FinishReason::Error)) => engine_error_response(),
         Ok((tokens, _reason)) => {
             // The responses API's v1 shape carries no `finish_reason`
             // field (only `status: "completed"`); the stop reason is not
@@ -1695,6 +1719,13 @@ mod tests {
     fn length_is_reported_regardless_of_calls_seen() {
         assert_eq!(resolve_finish_reason(FinishReason::Length, true, false), "length");
         assert_eq!(resolve_finish_reason(FinishReason::Length, false, false), "length");
+    }
+
+    #[test]
+    fn an_engine_error_is_reported_as_error_regardless_of_calls_seen() {
+        // GitHub #166: a request the engine gave up on is never a clean stop.
+        assert_eq!(resolve_finish_reason(FinishReason::Error, true, false), "error");
+        assert_eq!(resolve_finish_reason(FinishReason::Error, false, false), "error");
     }
 
     #[test]

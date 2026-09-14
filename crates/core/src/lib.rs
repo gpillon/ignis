@@ -59,7 +59,8 @@ pub use admission::{
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{
-    ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, SchedulerConfig, resolve_serving_chunk_tokens,
+    ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
+    resolve_serving_chunk_tokens,
 };
 pub use host::{HostEntry, HostError, HostTier, Tier};
 pub use kv_format::{
