@@ -371,7 +371,8 @@ async fn telemetry_task(
                     request,
                     tokens,
                     reason,
-                } => telemetry.on_done(request, tokens, reason),
+                    spec,
+                } => telemetry.on_done(request, tokens, reason, spec),
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
@@ -583,6 +584,7 @@ mod tests {
                     request: Self::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,
+                    spec: None,
                 },
             ]
         }
@@ -644,6 +646,7 @@ mod tests {
                     request: ProtectedBatchScheduler::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,
+                    spec: None,
                 },
             ]
         }

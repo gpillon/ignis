@@ -256,7 +256,9 @@ When output names a domain concept, use the term as defined here.
 - **Committed run** — the tokens a verify round emits for a lane: the anchor
   plus the accepted drafts, cut at the first stop id inclusive (1..k+1). The
   KV frontier, the GDN slot and the pending token move by exactly the run, so
-  a sequence never stands past the text it emitted.
+  a sequence never stands past the text it emitted. It crosses the compute
+  seam whole (`DecodeOutcome`, P5-06), and the server streams it one token at
+  a time; today's round is a run of one.
 - **ReplaySSM record and fold** — how the GDN layers speculate without
   advancing: the verify traversal records each column's conv input, key,
   value and gates (the **records**), and after accept the **fold** replays

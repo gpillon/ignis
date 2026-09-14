@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
     N_DECODE_LANES, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
+    SpecCounters,
 };
-use ignis_runtime::{Model, RuntimeCompute, RuntimeStats, StepLeaf};
+use ignis_runtime::{DecodeLane, LaneRun, Model, RuntimeCompute, RuntimeStats, StepLeaf};
 
 #[derive(Default)]
 struct Calls {
@@ -17,6 +18,8 @@ struct Calls {
     prefill_params: Vec<DecodeParams>,
     decode_batch_sizes: Vec<usize>,
     decode_params: Vec<Vec<DecodeParams>>,
+    /// P5-06 (GitHub #154): each decode round's per-lane budget and stop ids.
+    decode_lanes: Vec<Vec<(u32, Vec<u32>)>>,
     /// P4-10 (GitHub #126): the prefixes published (their token counts) and
     /// the claims served (the context each claimant reserved), so a test can
     /// see that a claimant was allocated *against* a prefix rather than
@@ -31,6 +34,8 @@ struct Calls {
 struct StubLeaf {
     calls: Mutex<Calls>,
     tokens: Mutex<VecDeque<u32>>,
+    /// Whole runs to commit, one per lane, before `tokens` is drawn from.
+    runs: Mutex<VecDeque<LaneRun>>,
     allocation_error: Option<i32>,
     prefill_error: Option<i32>,
     prefill_error_on_call: Option<(usize, i32)>,
@@ -42,6 +47,7 @@ impl StubLeaf {
         Self {
             calls: Mutex::new(Calls::default()),
             tokens: Mutex::new(tokens.into_iter().collect()),
+            runs: Mutex::new(VecDeque::new()),
             allocation_error: None,
             prefill_error: None,
             prefill_error_on_call: None,
@@ -49,10 +55,17 @@ impl StubLeaf {
         }
     }
 
+    fn with_runs(runs: impl IntoIterator<Item = LaneRun>) -> Self {
+        let leaf = Self::with_tokens([]);
+        *leaf.runs.lock().unwrap() = runs.into_iter().collect();
+        leaf
+    }
+
     fn failing_prefill(code: i32) -> Self {
         Self {
             calls: Mutex::new(Calls::default()),
             tokens: Mutex::new(VecDeque::new()),
+            runs: Mutex::new(VecDeque::new()),
             allocation_error: None,
             prefill_error: Some(code),
             prefill_error_on_call: None,
@@ -64,6 +77,7 @@ impl StubLeaf {
         Self {
             calls: Mutex::new(Calls::default()),
             tokens: Mutex::new(VecDeque::new()),
+            runs: Mutex::new(VecDeque::new()),
             allocation_error: Some(code),
             prefill_error: None,
             prefill_error_on_call: None,
@@ -75,6 +89,7 @@ impl StubLeaf {
         Self {
             calls: Mutex::new(Calls::default()),
             tokens: Mutex::new(VecDeque::new()),
+            runs: Mutex::new(VecDeque::new()),
             allocation_error: None,
             prefill_error: None,
             prefill_error_on_call: Some((2, code)),
@@ -86,6 +101,7 @@ impl StubLeaf {
         Self {
             calls: Mutex::new(Calls::default()),
             tokens: Mutex::new(VecDeque::new()),
+            runs: Mutex::new(VecDeque::new()),
             allocation_error: None,
             prefill_error: None,
             prefill_error_on_call: None,
@@ -199,19 +215,29 @@ impl StepLeaf for StubLeaf {
         &self,
         _model: &Self::Model,
         sequences: &mut [&mut Self::Sequence],
-        params: &[DecodeParams],
-    ) -> Result<Vec<u32>, i32> {
+        lanes: &[DecodeLane<'_>],
+    ) -> Result<Vec<LaneRun>, i32> {
         if let Some(code) = self.decode_error {
             return Err(code);
         }
         let mut calls = self.calls.lock().unwrap();
         calls.decode_batch_sizes.push(sequences.len());
-        calls.decode_params.push(params.to_vec());
+        calls.decode_params.push(lanes.iter().map(|lane| lane.params).collect());
+        calls.decode_lanes.push(
+            lanes
+                .iter()
+                .map(|lane| (lane.remaining_tokens, lane.stop_ids.to_vec()))
+                .collect(),
+        );
         drop(calls);
+        let mut runs = self.runs.lock().unwrap();
         let mut tokens = self.tokens.lock().unwrap();
         Ok(sequences
             .iter()
-            .map(|_| tokens.pop_front().unwrap_or(7))
+            .map(|_| {
+                runs.pop_front()
+                    .unwrap_or_else(|| LaneRun::token(tokens.pop_front().unwrap_or(7)))
+            })
             .collect())
     }
 
@@ -308,11 +334,13 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 request: 1,
                 lane: 0,
                 params: left,
+                remaining_tokens: 3,
             },
             DecodeJob {
                 request: 2,
                 lane: 1,
                 params: right,
+                remaining_tokens: 4,
             },
         ])
         .unwrap();
@@ -332,6 +360,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
             request: request as u64,
             lane: request,
             params: DecodeParams::default(),
+            remaining_tokens: 8,
         })
         .collect();
 
@@ -424,6 +453,7 @@ fn adapter_maps_allocation_and_decode_errors_without_losing_live_state() {
             request: 1,
             lane: 0,
             params: DecodeParams::default(),
+            remaining_tokens: 8,
         }]),
         Err(ComputeError::Kernel(-19))
     );
@@ -458,17 +488,18 @@ fn adapter_enforces_max_tokens_and_eos() {
             max_tokens: Some(1),
             ..DecodeParams::default()
         },
+        remaining_tokens: 1,
     };
     assert_eq!(
         compute.decode_step(&[job.clone()]).unwrap(),
-        vec![DecodeOutcome::Token(7)]
+        vec![DecodeOutcome::token(7)]
     );
     // The cap (`max_tokens: Some(1)`) was already reached by the first
     // token: `Length`, not `Stop` (the leaf never even runs — see
     // `decode_batch_sizes` below).
     assert_eq!(
         compute.decode_step(&[job]).unwrap(),
-        vec![DecodeOutcome::Finished(FinishReason::Length)]
+        vec![DecodeOutcome::finished(FinishReason::Length)]
     );
 
     // Request 2 has no `max_tokens`: the only way it stops is the leaf's
@@ -480,9 +511,10 @@ fn adapter_enforces_max_tokens_and_eos() {
                 request: 2,
                 lane: 1,
                 params: DecodeParams::default(),
+                remaining_tokens: 8,
             }])
             .unwrap(),
-        vec![DecodeOutcome::Finished(FinishReason::Stop)]
+        vec![DecodeOutcome::finished(FinishReason::Stop)]
     );
     assert_eq!(leaf.calls.lock().unwrap().sequences_released, 2);
 }
@@ -500,13 +532,14 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
             ignore_eos: true,
             ..DecodeParams::default()
         },
+        remaining_tokens: 8,
     };
 
     assert_eq!(
         compute.decode_step(std::slice::from_ref(&job)).unwrap(),
-        vec![DecodeOutcome::Token(99)]
+        vec![DecodeOutcome::token(99)]
     );
-    assert_eq!(compute.decode_step(&[job]).unwrap(), vec![DecodeOutcome::Token(7)]);
+    assert_eq!(compute.decode_step(&[job]).unwrap(), vec![DecodeOutcome::token(7)]);
     assert_eq!(compute.live_sequences(), 1);
 }
 
@@ -526,15 +559,17 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     request: 1,
                     lane: 0,
                     params: DecodeParams::default(),
+                    remaining_tokens: 8,
                 },
                 DecodeJob {
                     request: 2,
                     lane: 1,
                     params: DecodeParams::default(),
+                    remaining_tokens: 8,
                 },
             ])
             .unwrap(),
-        vec![DecodeOutcome::Token(17), DecodeOutcome::Token(23)]
+        vec![DecodeOutcome::token(17), DecodeOutcome::token(23)]
     );
     assert_eq!(leaf.calls.lock().unwrap().decode_batch_sizes, vec![2]);
     assert_eq!(compute.live_sequences(), 2);
@@ -763,4 +798,142 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         leaf.calls.lock().unwrap().restores, 1,
         "restore threads the snapshot back through `StepLeaf::restore_sequence`"
     );
+}
+
+// ── P5-06 (GitHub #154): a decode round commits a run ───────────────────
+
+fn job(request: u64, params: DecodeParams, remaining_tokens: u32) -> DecodeJob {
+    DecodeJob {
+        request,
+        lane: request as usize,
+        params,
+        remaining_tokens,
+    }
+}
+
+#[test]
+fn the_leaf_is_handed_each_lanes_budget_and_stop_ids() {
+    let leaf = Arc::new(StubLeaf::with_runs([
+        LaneRun {
+            tokens: vec![5, 6, 7],
+            spec: None,
+        },
+        LaneRun::token(8),
+    ]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let capped = DecodeParams {
+        max_tokens: Some(10),
+        ..DecodeParams::default()
+    };
+    let past_eos = DecodeParams {
+        ignore_eos: true,
+        ..DecodeParams::default()
+    };
+    compute
+        .prefill_step(&[prefill(1, Some(10)), prefill(2, None)])
+        .unwrap();
+
+    compute
+        .decode_step(&[job(1, capped, 4), job(2, past_eos, 6)])
+        .unwrap();
+    // Request 1 committed three of its ten: the scheduler's budget (20) is
+    // no longer the tighter one, its own `max_tokens` is.
+    compute
+        .decode_step(&[job(1, capped, 20), job(2, past_eos, 5)])
+        .unwrap();
+
+    assert_eq!(
+        leaf.calls.lock().unwrap().decode_lanes,
+        vec![
+            vec![(4, vec![99]), (6, vec![])],
+            vec![(7, vec![99]), (5, vec![])],
+        ],
+        "the budget is the tighter of the scheduler's and max_tokens; a lane past EOS has no stop"
+    );
+}
+
+#[test]
+fn a_run_cut_at_eos_emits_the_tokens_before_it_and_finishes_with_stop() {
+    let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
+        tokens: vec![5, 6, 99],
+        spec: None,
+    }]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+
+    assert_eq!(
+        compute
+            .decode_step(&[job(1, DecodeParams::default(), 8)])
+            .unwrap(),
+        vec![DecodeOutcome::run_then_finished(vec![5, 6], FinishReason::Stop)]
+    );
+    assert_eq!(compute.live_sequences(), 0);
+    assert_eq!(leaf.calls.lock().unwrap().sequences_released, 1);
+}
+
+#[test]
+fn a_committed_run_counts_toward_max_tokens() {
+    let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
+        tokens: vec![5, 6, 7],
+        spec: None,
+    }]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let params = DecodeParams {
+        max_tokens: Some(3),
+        ..DecodeParams::default()
+    };
+    compute.prefill_step(&[prefill(1, Some(3))]).unwrap();
+
+    assert_eq!(
+        compute.decode_step(&[job(1, params, 3)]).unwrap(),
+        vec![DecodeOutcome::run(vec![5, 6, 7])]
+    );
+    assert_eq!(
+        compute.decode_step(&[job(1, params, 3)]).unwrap(),
+        vec![DecodeOutcome::finished(FinishReason::Length)]
+    );
+    assert_eq!(
+        leaf.calls.lock().unwrap().decode_batch_sizes,
+        vec![1],
+        "the capped request never reaches the leaf again"
+    );
+}
+
+#[test]
+fn a_verify_rounds_counters_ride_its_outcome() {
+    let spec = SpecCounters::round(3, 2);
+    let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
+        tokens: vec![5, 6, 7],
+        spec: Some(spec),
+    }]));
+    let model = Arc::new(Model::load(leaf).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+
+    assert_eq!(
+        compute
+            .decode_step(&[job(1, DecodeParams::default(), 8)])
+            .unwrap(),
+        vec![DecodeOutcome::run(vec![5, 6, 7]).with_spec(spec)]
+    );
+}
+
+#[test]
+fn an_empty_run_is_refused_without_losing_the_sequence() {
+    let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
+        tokens: vec![],
+        spec: None,
+    }]));
+    let model = Arc::new(Model::load(leaf).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute.prefill_step(&[prefill(1, None)]).unwrap();
+
+    assert_eq!(
+        compute.decode_step(&[job(1, DecodeParams::default(), 8)]),
+        Err(ComputeError::Kernel(-1))
+    );
+    assert_eq!(compute.live_sequences(), 1);
 }

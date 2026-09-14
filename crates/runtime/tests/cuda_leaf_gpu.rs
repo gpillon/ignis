@@ -88,13 +88,17 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
                     max_tokens: Some(MAX_GENERATED as u32),
                     ..DecodeParams::default()
                 },
+                remaining_tokens: (MAX_GENERATED - generated.len()) as u32,
             }])
             .unwrap_or_else(|e| panic!("decode_step: {e}"));
-        match out.into_iter().next() {
-            Some(DecodeOutcome::Token(token)) => generated.push(token),
-            // `Finished`: the request hit EOS or its `max_tokens` cap and
-            // the adapter already released its leaf sequence.
-            Some(DecodeOutcome::Finished(_)) | None => break,
+        let Some(DecodeOutcome { tokens, finish, .. }) = out.into_iter().next() else {
+            break;
+        };
+        generated.extend(tokens);
+        // A finish: the request hit EOS or its `max_tokens` cap and the
+        // adapter already released its leaf sequence.
+        if finish.is_some() {
+            break;
         }
     }
     assert!(

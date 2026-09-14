@@ -265,9 +265,9 @@ mod tests {
             &self,
             _model: &Self::Model,
             sequences: &mut [&mut Self::Sequence],
-            _params: &[DecodeParams],
-        ) -> Result<Vec<TokenId>, i32> {
-            Ok(vec![7; sequences.len()])
+            _lanes: &[ignis_runtime::DecodeLane<'_>],
+        ) -> Result<Vec<ignis_runtime::LaneRun>, i32> {
+            Ok(vec![ignis_runtime::LaneRun::token(7); sequences.len()])
         }
         fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
             Ok(vec![0u8; bytes as usize])

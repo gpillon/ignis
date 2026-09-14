@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ignis_core::{FinishReason, LaneId, RequestClass, RequestId};
+use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
@@ -264,10 +264,17 @@ impl Telemetry {
     }
 
     /// A request completed (`n` = its total tokens, `reason` why it
-    /// stopped): emit the `done` line — carrying `n`, `reason`, and the
-    /// decode phase's per-lane inter-token-latency summary (P3-06) — and
-    /// drop the request from the in-flight set.
-    pub fn on_done(&mut self, id: RequestId, n: u32, reason: FinishReason) {
+    /// stopped): emit the `done` line — carrying `n`, `reason`, the decode
+    /// phase's per-lane inter-token-latency summary (P3-06) and its
+    /// speculative counters when it ran any rounds (P5-06, GitHub #154) —
+    /// and drop the request from the in-flight set.
+    pub fn on_done(
+        &mut self,
+        id: RequestId,
+        n: u32,
+        reason: FinishReason,
+        spec: Option<SpecCounters>,
+    ) {
         let rt = self.requests.remove(&id);
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
             Some(rt) => (
@@ -297,6 +304,7 @@ impl Telemetry {
             itl_max_ms,
             itl_count,
             class,
+            spec,
         );
     }
 
@@ -465,7 +473,9 @@ impl Telemetry {
     /// the same window (ADR 0011: the request log is diagnosis, never the
     /// gate's own oracle — that stays HTTP/SSE-side, P3-07). `class`
     /// (GitHub #120) makes that same attribution per-class, not just
-    /// per-window.
+    /// per-window. `spec.rounds`/`spec.drafted`/`spec.accepted` (P5-06,
+    /// GitHub #154) are the request's speculative rounds, summed once here
+    /// rather than logged per round, and absent on a request that ran none.
     ///
     /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
     /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
@@ -487,8 +497,11 @@ impl Telemetry {
         itl_ms_max: u64,
         itl_samples: u64,
         class: RequestClass,
+        spec: Option<SpecCounters>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        // A `None` field records nothing, so a request without speculative
+        // rounds carries no `spec.*` attributes at all.
         tracing::info!(
             name: "ignis.request.done",
             request_id = id,
@@ -501,6 +514,9 @@ impl Telemetry {
             itl_ms_max,
             itl_samples,
             class = class.as_extension_str(),
+            spec.rounds = spec.map(|s| s.rounds),
+            spec.drafted = spec.map(|s| s.drafted),
+            spec.accepted = spec.map(|s| s.accepted),
             "request done"
         );
     }
@@ -574,7 +590,7 @@ mod tests {
             for _ in 0..3 {
                 returned.push(telemetry.emit_interval());
             }
-            telemetry.on_done(1, 3, FinishReason::Stop);
+            telemetry.on_done(1, 3, FinishReason::Stop, None);
             returned.push(telemetry.emit_interval());
         });
         let intervals = intervals(&events);
@@ -615,7 +631,7 @@ mod tests {
             telemetry.on_admitted(7, 2);
             telemetry.on_token(7); // first token → ttft
             telemetry.on_token(7); // subsequent tokens are not re-emitted
-            telemetry.on_done(7, 4, FinishReason::Stop);
+            telemetry.on_done(7, 4, FinishReason::Stop, None);
         });
 
         let event_names: Vec<&str> = events.iter().map(|e| e["event_name"].as_str().unwrap()).collect();
@@ -632,6 +648,46 @@ mod tests {
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["tokens"], 4, "the done event carries the total tokens");
         assert_eq!(done["attributes"]["finish_reason"], "stop");
+        for field in ["spec.rounds", "spec.drafted", "spec.accepted"] {
+            assert!(
+                done["attributes"].get(field).is_none(),
+                "no speculative rounds, no placeholder `{field}`: {done}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_done_event_carries_the_speculative_counters_once() {
+        // P5-06 (GitHub #154): three verify rounds that proposed 21 drafts and
+        // committed 9 of them, reported on the one `done` line.
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(3, 10, RequestClass::Agent);
+            telemetry.on_admitted(3, 1);
+            for _ in 0..12 {
+                telemetry.on_token(3);
+            }
+            telemetry.on_done(
+                3,
+                12,
+                FinishReason::Stop,
+                Some(SpecCounters {
+                    rounds: 3,
+                    drafted: 21,
+                    accepted: 9,
+                }),
+            );
+        });
+
+        let done: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_name"] == "ignis.request.done")
+            .collect();
+        assert_eq!(done.len(), 1, "{events:?}");
+        assert_eq!(done[0]["attributes"]["spec.rounds"], 3);
+        assert_eq!(done[0]["attributes"]["spec.drafted"], 21);
+        assert_eq!(done[0]["attributes"]["spec.accepted"], 9);
+        assert_eq!(events.len(), 3, "admitted, ttft, done -- nothing per token or per round");
     }
 
     #[test]
@@ -640,7 +696,7 @@ mod tests {
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
-            telemetry.on_done(1, 3, FinishReason::Stop);
+            telemetry.on_done(1, 3, FinishReason::Stop, None);
         });
         let done = events.last().unwrap();
         // FixedClock(0): a zero elapsed span → `duration_ms` and `tok_s` are 0.
@@ -668,7 +724,7 @@ mod tests {
             }));
         let events = capture_events(|| {
             telemetry.note_submit(1, 5, RequestClass::Interactive); // read #1 → 100 ms
-            telemetry.on_done(1, 5, FinishReason::Length); // read #2 → 200 ms, so ms = 100
+            telemetry.on_done(1, 5, FinishReason::Length, None); // read #2 → 200 ms, so ms = 100
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["duration_ms"], 100, "200 - 100 = 100 ms elapsed");
@@ -794,7 +850,7 @@ mod tests {
             telemetry.on_token(1); // ttft — no ITL sample yet
             telemetry.on_token(1); // 1st gap: 10ms
             telemetry.on_token(1); // 2nd gap: 10ms
-            telemetry.on_done(1, 3, FinishReason::Stop);
+            telemetry.on_done(1, 3, FinishReason::Stop, None);
         });
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["itl_samples"], 2);
@@ -837,7 +893,7 @@ mod tests {
             telemetry.on_prefill_chunk(2, 32_768); // the wide chunk lands
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
-            telemetry.on_done(1, 3, FinishReason::Stop); // t=220 (clock re-read), lane 0 finishes
+            telemetry.on_done(1, 3, FinishReason::Stop, None); // t=220 (clock re-read), lane 0 finishes
         });
 
         // Request 2's `admitted` line shows the wide cold-prefill chunk

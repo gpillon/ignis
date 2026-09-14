@@ -16,7 +16,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
-use crate::types::{ComputeError, FinishReason, RequestId, TokenId};
+use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
 /// Recording handle onto the mock's call history (shared through the
 /// `Arc<dyn Compute>` the scheduler holds, so tests can assert the batch
@@ -31,6 +31,13 @@ struct Inner {
     stops: HashMap<RequestId, u32>,
     /// Tokens generated so far, per request.
     generated: HashMap<RequestId, u32>,
+    /// Run lengths to commit per decode round (P5-06, GitHub #154), cycled
+    /// per request; empty is today's round of one.
+    run_lengths: Vec<u32>,
+    /// Decode rounds served so far, per request (indexes `run_lengths`).
+    rounds: HashMap<RequestId, usize>,
+    /// The generation step whose token is EOS (`eos_after`), per request.
+    eos: HashMap<RequestId, u32>,
     /// Every prefill batch the mock received (batch shape for assertions).
     prefill_batches: Vec<Vec<PrefillJob>>,
     /// Every decode batch the mock received (batch shape for assertions).
@@ -66,6 +73,24 @@ impl MockCompute {
             seed,
             inner: Mutex::new(Inner::default()),
         }
+    }
+
+    /// A mock that commits runs like a speculative round (P5-06, GitHub
+    /// #154): round `r` of a request commits up to `lengths[r % len]` tokens,
+    /// cut short by the request's limit or its EOS, and reports the round's
+    /// counters — `length - 1` drafted, `committed - 1` accepted.
+    pub fn with_runs(lengths: &[u32]) -> Self {
+        assert!(lengths.iter().all(|&n| n >= 1), "a run commits at least its anchor");
+        let mock = Self::new();
+        mock.inner.lock().unwrap().run_lengths = lengths.to_vec();
+        mock
+    }
+
+    /// Make `request`'s token at generation step `step` its EOS: the round
+    /// that commits it finishes the request with `Stop`, emitting only the
+    /// tokens before it.
+    pub fn eos_after(&self, request: RequestId, step: u32) {
+        self.inner.lock().unwrap().eos.insert(request, step);
     }
 
     /// The prefill batches the mock received, in order (each entry is one
@@ -128,7 +153,15 @@ impl Compute for MockCompute {
         Ok(jobs
             .iter()
             .map(|job| {
-                let step = *g.generated.entry(job.request).or_insert(0);
+                let round = {
+                    let rounds = g.rounds.entry(job.request).or_insert(0);
+                    *rounds += 1;
+                    *rounds - 1
+                };
+                let length = match g.run_lengths.len() {
+                    0 => 1,
+                    n => g.run_lengths[round % n],
+                };
                 // An explicit stop_after overrides the learned limit; an
                 // unlearned request (no prefill seen) is treated as
                 // unbounded.
@@ -137,17 +170,35 @@ impl Compute for MockCompute {
                     .get(&job.request)
                     .copied()
                     .or_else(|| g.limits.get(&job.request).copied().flatten());
-                match limit {
-                    // The mock has no real EOS token — its stop condition
-                    // is always a token-count cap, so it always finishes
-                    // with `Length` (never `Stop`).
-                    Some(n) if step >= n => DecodeOutcome::Finished(FinishReason::Length),
-                    _ => {
-                        let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
-                        let token = Self::mix(self.seed, job.request, seed, step);
-                        *g.generated.get_mut(&job.request).unwrap() += 1;
-                        DecodeOutcome::Token(token)
+                let eos = g.eos.get(&job.request).copied();
+                let seed = g.seeds.get(&job.request).copied().unwrap_or(0);
+                let mut run = Vec::new();
+                let mut committed = 0;
+                let mut finish = None;
+                for _ in 0..length {
+                    let step = *g.generated.entry(job.request).or_insert(0);
+                    if limit.is_some_and(|n| step >= n) {
+                        break;
                     }
+                    *g.generated.get_mut(&job.request).unwrap() += 1;
+                    committed += 1;
+                    if eos == Some(step) {
+                        finish = Some(FinishReason::Stop);
+                        break;
+                    }
+                    run.push(Self::mix(self.seed, job.request, seed, step));
+                }
+                if committed == 0 {
+                    // Without `eos_after` the mock has no real EOS token —
+                    // its stop condition is a token-count cap, reached
+                    // before this round committed anything: `Length`.
+                    return DecodeOutcome::finished(FinishReason::Length);
+                }
+                DecodeOutcome {
+                    tokens: run,
+                    finish,
+                    spec: (!g.run_lengths.is_empty())
+                        .then(|| SpecCounters::round(length - 1, committed - 1)),
                 }
             })
             .collect())

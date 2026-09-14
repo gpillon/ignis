@@ -72,6 +72,11 @@ impl Drop for Harness {
 /// oracles ask for BF16 by name instead — `oracle_teacher_forced_gpu.rs`,
 /// `chunked_prefill_self_oracle_gpu.rs`, `logit_divergence_gpu.rs`.
 fn harness() -> Option<Harness> {
+    harness_with(EngineShape::default())
+}
+
+/// [`harness`] over an explicit engine shape.
+fn harness_with(shape: EngineShape) -> Option<Harness> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -82,7 +87,7 @@ fn harness() -> Option<Harness> {
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
 
-    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, EngineShape::default()) {
+    let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
         Ok(scheduler) => scheduler,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
@@ -327,6 +332,62 @@ async fn a_streaming_completion_with_a_multi_thousand_token_prompt_finishes_cohe
             "the templated prompt must actually be multi-thousand tokens, got {prompt_tokens}"
         );
     }
+}
+
+/// P5-06 (GitHub #154): with `--spec dflash2 --draft-tokens 7` every decode
+/// round is a verify round, and its committed runs reach the SSE stream as
+/// deltas ending in the model's own EOS. A direct one-word question within a
+/// generous budget, so `stop` is the reason and `length` would be a finding.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_streaming_completion_with_dflash2_speculation_finishes_with_stop() {
+    let speculation = ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 7)
+        .expect("7 is a valid draft window");
+    let Some(h) = harness_with(EngineShape {
+        speculation: Some(speculation),
+        ..EngineShape::default()
+    }) else {
+        return;
+    };
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "user", "content": "In one word, what is the capital of France?" }
+        ],
+        "max_tokens": 64,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+        "enable_thinking": false
+    });
+    let (status, body) = call(h.app(), "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 200, "streaming chat with speculation should be 200: {body}");
+
+    let data_lines: Vec<String> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:").map(|s| s.trim().to_string()))
+        .collect();
+    assert_eq!(data_lines.last().map(|s| s.as_str()), Some("[DONE]"), "{body}");
+    let chunks: Vec<serde_json::Value> = data_lines
+        .iter()
+        .filter(|l| l.as_str() != "[DONE]")
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let streamed: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert!(streamed.contains("Paris"), "a real answer through the verify round: {body}");
+
+    let finish = chunks
+        .iter()
+        .find_map(|c| c["choices"][0]["finish_reason"].as_str())
+        .unwrap_or_else(|| panic!("a finish_reason chunk: {body}"));
+    assert_eq!(finish, "stop", "{body}");
+
+    let usage = &chunks.last().unwrap()["usage"];
+    let completion_tokens = usage["completion_tokens"].as_u64().unwrap();
+    assert!(completion_tokens > 0 && completion_tokens < 64, "{body}");
 }
 
 /// GitHub #68: a thinking-disabled request against the real model and the

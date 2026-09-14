@@ -13,7 +13,7 @@
 
 use crate::types::{
     ComputeError, DecodeParams, FinishReason, LaneId, RequestClass, RequestId, RequestInput,
-    SchedEvent, SubmitError, TokenId,
+    SchedEvent, SpecCounters, SubmitError, TokenId,
 };
 
 /// The shared prefix a prefill job claims (P4-10, GitHub #126, ADR 0024):
@@ -78,18 +78,72 @@ pub struct DecodeJob {
     /// The request's generation parameters (sampler setup, `max_tokens` /
     /// EOS handling, fixed seed — ADR 0007).
     pub params: DecodeParams,
+    /// Tokens the request may still emit, `>= 1` (P5-06, GitHub #154): the
+    /// scheduler's remaining reservation, which a speculative round clamps
+    /// its lane's extent to so the sequence never commits past the text the
+    /// request can emit.
+    pub remaining_tokens: u32,
 }
 
-/// One job's result from a decode step (GitHub #61 / P1-25): either the
-/// token generated this step, or the reason the request finished instead
-/// of generating one — the scheduler forwards the reason straight into the
-/// [`SchedEvent::Done`] it emits, which the server maps to `finish_reason`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeOutcome {
-    /// The job produced a token and the request keeps running.
-    Token(TokenId),
-    /// The request finished this step instead of producing a token.
-    Finished(FinishReason),
+/// One job's result from a decode step (GitHub #61 / P1-25; a run since
+/// P5-06, GitHub #154): the tokens the round committed for the lane, in
+/// order, and whether the request finished.
+///
+/// Today's round commits one token ([`DecodeOutcome::token`]); a speculative
+/// round commits 1..=k+1 ([`DecodeOutcome::run`]). A request that finishes
+/// carries the reason — the scheduler forwards it straight into the
+/// [`SchedEvent::Done`] it emits, which the server maps to `finish_reason` —
+/// after whatever tokens preceded it in the round: a run cut at EOS is the
+/// tokens before the EOS plus [`FinishReason::Stop`]. `tokens` is empty only
+/// on a finished outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeOutcome {
+    /// The committed tokens to emit, in order.
+    pub tokens: Vec<TokenId>,
+    /// Why the request finished this round, after `tokens`; `None` while it
+    /// keeps running.
+    pub finish: Option<FinishReason>,
+    /// The round's speculative counters, when it was a verify round.
+    pub spec: Option<SpecCounters>,
+}
+
+impl DecodeOutcome {
+    /// One committed token; the request keeps running.
+    pub fn token(token: TokenId) -> Self {
+        Self::run(vec![token])
+    }
+
+    /// A run of committed tokens (`tokens.len() >= 1`); the request keeps
+    /// running.
+    pub fn run(tokens: Vec<TokenId>) -> Self {
+        Self {
+            tokens,
+            finish: None,
+            spec: None,
+        }
+    }
+
+    /// The request finished without committing a token to emit.
+    pub fn finished(reason: FinishReason) -> Self {
+        Self::run_then_finished(Vec::new(), reason)
+    }
+
+    /// `tokens`, then the request finished.
+    pub fn run_then_finished(tokens: Vec<TokenId>, reason: FinishReason) -> Self {
+        Self {
+            tokens,
+            finish: Some(reason),
+            spec: None,
+        }
+    }
+
+    /// The same outcome, from a verify round with these counters.
+    pub fn with_spec(self, spec: SpecCounters) -> Self {
+        Self {
+            spec: Some(spec),
+            ..self
+        }
+    }
 }
 
 /// The compute seam the scheduler drives for actual token generation.
@@ -104,10 +158,10 @@ pub trait Compute: Send + Sync {
     /// No tokens are emitted; this only sets the request up for decode.
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError>;
 
-    /// Generate the next token for each running lane (one decode step).
-    /// Returns, per job in order, [`DecodeOutcome::Token`] when a token was
-    /// generated, or [`DecodeOutcome::Finished`] with why (EOS or
-    /// `max_tokens`) when that request finished this step instead.
+    /// Run one decode round over every running lane. Returns, per job in
+    /// order, the [`DecodeOutcome`]: the tokens the round committed for that
+    /// lane (one, or a run under speculation) and, when the request finished
+    /// (EOS or `max_tokens`), why.
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError>;
 
     /// Release leaf-owned state for a request that completed or was
