@@ -702,7 +702,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     let hq = KvFormat::HqE8_2b;
     {
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let pool = verify_pool_in(hq,4);
+        let pool = verify_pool_in(hq, 4);
         let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("hq capture: {e}"));
         let nothing = run_verify(&model, &pool, &prompts8[..4], greedy, Drafter::Nothing, &[], TOTAL, true);
         let own = run_verify(&model, &pool, &prompts8[..4], greedy, Drafter::Oracle(&nothing.emitted), &[], TOTAL, true);
@@ -716,13 +716,13 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
     for width in 1..=8usize {
         let prompts = &prompts8[..width];
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let eager_pool = verify_pool_in(hq,width as u32);
+        let eager_pool = verify_pool_in(hq, width as u32);
         let eager = run_verify(&model, &eager_pool, prompts, greedy, Drafter::Random, &[], TOTAL, false);
         drop(eager_pool);
         drop(model);
 
         let model = load_verify_in(hq, &reader, &artifact, &handles);
-        let graph_pool = verify_pool_in(hq,width as u32);
+        let graph_pool = verify_pool_in(hq, width as u32);
         let _ = capture_decode_graphs(&model, &graph_pool).unwrap_or_else(|e| panic!("hq capture: {e}"));
         let stats = program_stats(&model, &graph_pool).unwrap_or_else(|e| panic!("stats: {e}"));
         assert!(stats.verify_graph_ready_mask & (1 << (width - 1)) != 0, "hq width {width}: no verify graph");
