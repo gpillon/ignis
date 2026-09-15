@@ -21,25 +21,171 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::http::header;
 use axum::routing::get;
+use ignis_core::SubmitError;
 
 /// The exposition's content type: Prometheus text format 0.0.4.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// The aggregate the telemetry consumer maintains while metrics are on.
-#[derive(Debug, Default)]
+/// `ignis_request_ttft_seconds`' bucket boundaries (ADR 0017), in
+/// milliseconds — the telemetry clock's unit.
+const TTFT_BOUNDS_MS: [u64; 12] =
+    [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000];
+
+/// `ignis_request_duration_seconds`' bucket boundaries (ADR 0017), in
+/// milliseconds.
+const DURATION_BOUNDS_MS: [u64; 12] =
+    [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000];
+
+/// Why a submission was rejected: `ignis_requests_rejected_total`'s fixed
+/// `reason` set (ADR 0017).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// The engine could not admit it right now.
+    Full,
+    /// It named a model the engine does not load.
+    UnknownModel,
+    /// It can never fit, however empty the engine is.
+    Oversized,
+}
+
+impl Rejection {
+    /// The reason a submit error counts under. A request longer than the
+    /// per-sequence context (GitHub #166, after ADR 0017's table) is a
+    /// request that can never fit, like one larger than the KV pool.
+    pub fn of(err: &SubmitError) -> Self {
+        match err {
+            SubmitError::Full => Self::Full,
+            SubmitError::UnknownModel(_) => Self::UnknownModel,
+            SubmitError::Oversized | SubmitError::ContextExceeded { .. } => Self::Oversized,
+        }
+    }
+
+    const ALL: [Rejection; 3] = [Self::Full, Self::UnknownModel, Self::Oversized];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::UnknownModel => "unknown_model",
+            Self::Oversized => "oversized",
+        }
+    }
+}
+
+/// A fixed-bucket histogram over millisecond observations.
+#[derive(Debug)]
+struct Histogram {
+    bounds_ms: &'static [u64; 12],
+    /// Observations per bucket, not cumulative; the last is `+Inf`'s own.
+    buckets: [AtomicU64; 13],
+    sum_ms: AtomicU64,
+}
+
+impl Histogram {
+    fn new(bounds_ms: &'static [u64; 12]) -> Self {
+        Self { bounds_ms, buckets: Default::default(), sum_ms: AtomicU64::new(0) }
+    }
+
+    fn observe(&self, ms: u64) {
+        let bucket = self.bounds_ms.iter().position(|&bound| ms <= bound).unwrap_or(self.bounds_ms.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Cumulative `_bucket` lines, then `_sum` and `_count`. The count is the
+    /// `+Inf` bucket as read here, so the two always agree.
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        declare(out, name, "histogram", help);
+        let mut cumulative = 0;
+        for (bucket, count) in self.buckets.iter().enumerate() {
+            cumulative += count.load(Ordering::Relaxed);
+            let le = match self.bounds_ms.get(bucket) {
+                Some(&bound) => seconds(bound),
+                None => "+Inf".to_owned(),
+            };
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {cumulative}");
+        }
+        let _ = writeln!(out, "{name}_sum {}", seconds(self.sum_ms.load(Ordering::Relaxed)));
+        let _ = writeln!(out, "{name}_count {cumulative}");
+    }
+}
+
+/// `ms` milliseconds as a decimal number of seconds, without trailing zeros.
+fn seconds(ms: u64) -> String {
+    let (whole, frac) = (ms / 1000, ms % 1000);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac = format!("{frac:03}");
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
+/// The aggregate the telemetry consumer maintains while metrics are on —
+/// except the rejections, which the HTTP handler records after the submit
+/// call returns its error (ADR 0017).
+#[derive(Debug)]
 pub struct Metrics {
     waiting: AtomicU64,
     running: AtomicU64,
     accepted: AtomicU64,
     completed: AtomicU64,
     cancelled: AtomicU64,
+    rejected: [AtomicU64; 3],
     generated_tokens: AtomicU64,
+    kv_evictions: AtomicU64,
+    prefix_reused_tokens: AtomicU64,
+    ttft: Histogram,
+    duration: Histogram,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Metrics {
     /// An all-zero projection.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            waiting: AtomicU64::new(0),
+            running: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            rejected: Default::default(),
+            generated_tokens: AtomicU64::new(0),
+            kv_evictions: AtomicU64::new(0),
+            prefix_reused_tokens: AtomicU64::new(0),
+            ttft: Histogram::new(&TTFT_BOUNDS_MS),
+            duration: Histogram::new(&DURATION_BOUNDS_MS),
+        }
+    }
+
+    /// A submission was rejected, for `reason`.
+    pub fn record_rejected(&self, reason: Rejection) {
+        // `ALL` lists the reasons in declaration order, so a reason's
+        // discriminant is its slot.
+        self.rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request was evicted to the host KV-RAM tier.
+    pub(crate) fn record_eviction(&self) {
+        self.kv_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request's prefill skipped `tokens` through a sibling's prefix.
+    pub(crate) fn record_prefix_reused(&self, tokens: u32) {
+        self.prefix_reused_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
+    }
+
+    /// A request's first token came `ms` after its submission.
+    pub(crate) fn observe_ttft_ms(&self, ms: u64) {
+        self.ttft.observe(ms);
+    }
+
+    /// A request completed `ms` after its submission.
+    pub(crate) fn observe_duration_ms(&self, ms: u64) {
+        self.duration.observe(ms);
     }
 
     /// A submission was accepted by the scheduler.
@@ -96,11 +242,28 @@ impl Metrics {
                 "Generated tokens on completed requests.",
                 &self.generated_tokens,
             ),
+            ("ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", &self.kv_evictions),
+            (
+                "ignis_prefix_reused_tokens_total",
+                "Cumulative tokens skipped through sibling-prefix reuse.",
+                &self.prefix_reused_tokens,
+            ),
         ];
         for (name, help, series) in counters {
             declare(&mut out, name, "counter", help);
             let _ = writeln!(out, "{name} {}", read(series));
         }
+        declare(
+            &mut out,
+            "ignis_requests_rejected_total",
+            "counter",
+            "Rejected submissions by fixed reason.",
+        );
+        for (reason, series) in Rejection::ALL.iter().zip(&self.rejected) {
+            let _ = writeln!(out, "ignis_requests_rejected_total{{reason=\"{}\"}} {}", reason.label(), read(series));
+        }
+        self.ttft.render(&mut out, "ignis_request_ttft_seconds", "Submission-to-first-token latency.");
+        self.duration.render(&mut out, "ignis_request_duration_seconds", "Submission-to-completion latency.");
         out
     }
 }
@@ -166,6 +329,11 @@ mod tests {
             ("ignis_requests_completed_total", "counter"),
             ("ignis_requests_cancelled_total", "counter"),
             ("ignis_generated_tokens_total", "counter"),
+            ("ignis_kv_cache_evictions_total", "counter"),
+            ("ignis_prefix_reused_tokens_total", "counter"),
+            ("ignis_requests_rejected_total", "counter"),
+            ("ignis_request_ttft_seconds", "histogram"),
+            ("ignis_request_duration_seconds", "histogram"),
         ];
         let lines: Vec<&str> = text.lines().collect();
         for (name, kind) in expected {
@@ -176,7 +344,11 @@ mod tests {
             assert_eq!(lines[help + 1], format!("# TYPE {name} {kind}"), "{text}");
             let first_sample = lines
                 .iter()
-                .position(|l| l.starts_with(&format!("{name} ")) || l.starts_with(&format!("{name}{{")))
+                .position(|l| {
+                    l.starts_with(&format!("{name} "))
+                        || l.starts_with(&format!("{name}{{"))
+                        || (kind == "histogram" && l.starts_with(&format!("{name}_bucket{{")))
+                })
                 .unwrap_or_else(|| panic!("no sample for {name}:\n{text}"));
             assert!(first_sample > help + 1, "{name}'s samples follow its TYPE:\n{text}");
             assert_eq!(
@@ -200,9 +372,34 @@ mod tests {
             "ignis_requests_completed_total",
             "ignis_requests_cancelled_total",
             "ignis_generated_tokens_total",
+            "ignis_kv_cache_evictions_total",
+            "ignis_prefix_reused_tokens_total",
         ] {
             assert_eq!(value(&text, name, ""), "0", "{name}");
         }
+        for reason in ["full", "unknown_model", "oversized"] {
+            assert_eq!(value(&text, "ignis_requests_rejected_total", &format!("reason=\"{reason}\"")), "0");
+        }
+    }
+
+    #[test]
+    fn a_submit_error_counts_under_its_fixed_reason() {
+        assert_eq!(Rejection::of(&SubmitError::Full), Rejection::Full);
+        assert_eq!(Rejection::of(&SubmitError::UnknownModel("x".into())), Rejection::UnknownModel);
+        assert_eq!(Rejection::of(&SubmitError::Oversized), Rejection::Oversized);
+        assert_eq!(
+            Rejection::of(&SubmitError::ContextExceeded { requested: 9000, limit: 8192 }),
+            Rejection::Oversized
+        );
+    }
+
+    #[test]
+    fn seconds_are_rendered_without_trailing_zeros() {
+        assert_eq!(seconds(0), "0");
+        assert_eq!(seconds(50), "0.05");
+        assert_eq!(seconds(2_500), "2.5");
+        assert_eq!(seconds(600_000), "600");
+        assert_eq!(seconds(1_001), "1.001");
     }
 
     #[test]
@@ -224,6 +421,84 @@ mod tests {
         // Gauges are the latest state, not a sum.
         assert_eq!(value(&text, "ignis_scheduler_requests", "state=\"waiting\""), "1");
         assert_eq!(value(&text, "ignis_scheduler_requests", "state=\"running\""), "2");
+    }
+
+    #[test]
+    fn the_operational_counters_move_with_their_facts() {
+        let metrics = Metrics::new();
+        metrics.record_eviction();
+        metrics.record_eviction();
+        metrics.record_prefix_reused(32);
+        metrics.record_prefix_reused(64);
+        metrics.record_rejected(Rejection::Full);
+        metrics.record_rejected(Rejection::Oversized);
+        metrics.record_rejected(Rejection::Oversized);
+
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_kv_cache_evictions_total", ""), "2");
+        assert_eq!(value(&text, "ignis_prefix_reused_tokens_total", ""), "96");
+        assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"full\""), "1");
+        assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"unknown_model\""), "0");
+        assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"oversized\""), "2");
+    }
+
+    /// ADR 0017's fixed boundaries, in seconds, `+Inf` implied.
+    const TTFT_BOUNDS: [&str; 12] =
+        ["0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300"];
+    const DURATION_BOUNDS: [&str; 12] =
+        ["0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "600"];
+
+    /// The `le` values of `name`'s buckets, in exposition order.
+    fn bucket_bounds(text: &str, name: &str) -> Vec<String> {
+        samples(text)
+            .into_iter()
+            .filter(|(n, _, _)| *n == format!("{name}_bucket"))
+            .map(|(_, labels, _)| {
+                labels.strip_prefix("le=\"").and_then(|l| l.strip_suffix('"')).expect("only `le`").to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_histograms_use_exactly_the_adr_s_buckets_and_positive_infinity() {
+        let text = Metrics::new().render();
+        for (name, bounds) in [
+            ("ignis_request_ttft_seconds", TTFT_BOUNDS),
+            ("ignis_request_duration_seconds", DURATION_BOUNDS),
+        ] {
+            let mut expected: Vec<String> = bounds.iter().map(|b| (*b).to_owned()).collect();
+            expected.push("+Inf".to_owned());
+            assert_eq!(bucket_bounds(&text, name), expected, "{text}");
+            assert_eq!(value(&text, &format!("{name}_sum"), ""), "0");
+            assert_eq!(value(&text, &format!("{name}_count"), ""), "0");
+        }
+    }
+
+    #[test]
+    fn an_observation_lands_in_every_bucket_at_or_above_it() {
+        let metrics = Metrics::new();
+        // 50 ms sits on the first TTFT boundary (`le` is inclusive); 250 ms
+        // on the third; 400 s is past the last one, so only `+Inf` has it.
+        metrics.observe_ttft_ms(50);
+        metrics.observe_ttft_ms(250);
+        metrics.observe_ttft_ms(400_000);
+        metrics.observe_duration_ms(700);
+
+        let text = metrics.render();
+        let ttft = |le: &str| value(&text, "ignis_request_ttft_seconds_bucket", &format!("le=\"{le}\""));
+        assert_eq!(ttft("0.05"), "1");
+        assert_eq!(ttft("0.1"), "1");
+        assert_eq!(ttft("0.25"), "2");
+        assert_eq!(ttft("300"), "2");
+        assert_eq!(ttft("+Inf"), "3");
+        assert_eq!(value(&text, "ignis_request_ttft_seconds_count", ""), "3");
+        assert_eq!(value(&text, "ignis_request_ttft_seconds_sum", ""), "400.3");
+
+        let duration = |le: &str| value(&text, "ignis_request_duration_seconds_bucket", &format!("le=\"{le}\""));
+        assert_eq!(duration("0.5"), "0");
+        assert_eq!(duration("1"), "1");
+        assert_eq!(duration("+Inf"), "1");
+        assert_eq!(value(&text, "ignis_request_duration_seconds_sum", ""), "0.7");
     }
 
     #[test]

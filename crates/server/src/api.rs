@@ -556,8 +556,13 @@ fn split_reasoning_and_tools(
 
 /// Map a [`SubmitError`] from the engine's submit to the OpenAI-shaped
 /// error response (404 unknown model, 400 context exceeded, 413 oversized,
-/// 503 engine full).
+/// 503 engine full). With metrics on, the rejection is counted here, on the
+/// HTTP side, once the submit call has returned its error (ADR 0017): the
+/// model thread sends no fact for it.
 fn submit_error(server: &Server, err: SubmitError) -> Response {
+    if let Some(metrics) = &server.metrics {
+        metrics.record_rejected(crate::metrics::Rejection::of(&err));
+    }
     match err {
         SubmitError::ContextExceeded { requested, limit } => error_response(
             StatusCode::BAD_REQUEST,

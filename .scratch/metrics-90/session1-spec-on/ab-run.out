@@ -1,0 +1,48 @@
+[12:33:15] leg warm-0: start (METRICS=0)
+[12:33:27] leg warm-0: g3
+[12:36:15] leg warm-0: g3 exit 0
+[12:36:17] leg warm-0: stopped
+[12:36:37] leg off-1: start (METRICS=0)
+[12:36:49] leg off-1: g3
+[12:39:36] leg off-1: g3 exit 0
+[12:39:36] leg off-1: g4
+[12:42:39] leg off-1: g4 exit 0
+[12:42:41] leg off-1: stopped
+[12:43:01] leg on-1: start (METRICS=1)
+[12:43:13] leg on-1: g3
+[12:46:02] leg on-1: g3 exit 0
+[12:46:02] leg on-1: g4
+[12:49:11] leg on-1: g4 exit 0
+[12:49:14] leg on-1: stopped
+[12:49:34] leg s15-1: start (METRICS=1)
+[12:49:46] leg s15-1: g3
+[12:52:38] leg s15-1: g3 exit 0
+[12:52:38] leg s15-1: g4
+[12:55:45] leg s15-1: g4 exit 0
+[12:55:50] leg s15-1: stopped
+[12:56:10] leg off-2: start (METRICS=0)
+[12:56:21] leg off-2: g3
+[12:59:12] leg off-2: g3 exit 0
+[12:59:12] leg off-2: g4
+[13:02:19] leg off-2: g4 exit 0
+[13:02:22] leg off-2: stopped
+[13:02:42] leg on-2: start (METRICS=1)
+[13:02:54] leg on-2: g3
+[13:05:45] leg on-2: g3 exit 0
+[13:05:45] leg on-2: g4
+[13:08:53] leg on-2: g4 exit 0
+[13:08:55] leg on-2: stopped
+[13:09:15] leg s15-2: start (METRICS=1)
+[13:09:27] leg s15-2: g3
+[13:12:19] leg s15-2: g3 exit 0
+[13:12:19] leg s15-2: g4
+[13:15:29] leg s15-2: g4 exit 0
+[13:15:46] leg s15-2: stopped
+[13:16:06] leg s1-1: start (METRICS=1)
+[13:16:18] leg s1-1: g3
+[13:19:09] leg s1-1: g3 exit 0
+[13:19:09] leg s1-1: g4
+[13:22:16] leg s1-1: g4 exit 0
+[13:22:19] leg s1-1: stopped
+[13:22:39] A/B done, session metrics90-20260915T123315Z
+AB EXIT 0

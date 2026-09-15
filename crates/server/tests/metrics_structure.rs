@@ -66,6 +66,35 @@ fn the_scheduler_runtime_and_kernel_leaf_never_name_metrics() {
     assert!(offenders.is_empty(), "metrics-aware code on the inference path:\n{}", offenders.join("\n"));
 }
 
+/// GitHub #90 / ADR 0017: a scrape reads fixed atomics and formats them —
+/// nothing else. The projection's module names no lock, no channel, no
+/// waker and no engine handle, so however many scrapers there are, and
+/// however slow, a scrape has no way to send a command to, wait for, lock,
+/// wake or backpressure the model thread or the telemetry consumer.
+#[test]
+fn a_scrape_has_no_way_to_reach_the_model_thread_or_the_telemetry_consumer() {
+    let source = std::fs::read_to_string(repo_root().join("crates/server/src/metrics.rs")).unwrap();
+    // The code, not its unit tests or the doc comments that explain what it
+    // avoids.
+    let production = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+    // Whole identifiers, so a longer name that merely contains one (`awake`)
+    // is not an offender.
+    let identifiers: std::collections::BTreeSet<&str> = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let forbidden = [
+        "Mutex", "RwLock", "Condvar", "Notify", "Barrier", "mpsc", "oneshot", "watch", "broadcast",
+        "channel", "unbounded_channel", "Engine", "engine", "TelemetryFact", "facts", "lock", "await",
+        "block_on", "spawn", "spawn_blocking", "Waker", "wake", "ArcSwap", "SystemTime", "Instant",
+    ];
+    let offenders: Vec<&str> = forbidden.into_iter().filter(|name| identifiers.contains(name)).collect();
+    assert!(offenders.is_empty(), "metrics.rs can reach past its atomics: {offenders:?}");
+    assert!(identifiers.contains("AtomicU64"), "metrics.rs no longer holds fixed atomics; update this test");
+}
+
 #[test]
 fn the_model_thread_loop_never_names_metrics() {
     let source = std::fs::read_to_string(repo_root().join("crates/server/src/engine.rs")).unwrap();
