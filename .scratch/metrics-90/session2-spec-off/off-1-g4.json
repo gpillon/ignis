@@ -1,0 +1,115 @@
+{
+  "session": "metrics90-20260915T132424Z",
+  "trace_sha256": "00fd08b810c44ed6ec1a422e4a0c476af786bccdc0219e733d346bd5a0c4ab01",
+  "label": "ignis-off",
+  "endpoint": "http://127.0.0.1:8000",
+  "engine": "qwen3.8-27b",
+  "artifact": "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "make serving config SPEC=, METRICS=0",
+  "date": "2026-09-15T13:40:00Z",
+  "run": {
+    "label": "ignis-off",
+    "metrics": [
+      {
+        "id": "req-001",
+        "class": "main",
+        "ttft_ms": 3696.5539,
+        "n_tokens": 15591,
+        "total_ms": 502311.2094,
+        "ok": true
+      },
+      {
+        "id": "req-002",
+        "class": "sub",
+        "ttft_ms": 5988.192599999999,
+        "n_tokens": 11455,
+        "total_ms": 416672.69909999997,
+        "ok": true
+      },
+      {
+        "id": "req-003",
+        "class": "sub",
+        "ttft_ms": 5137.655900000001,
+        "n_tokens": 3652,
+        "total_ms": 147968.6692,
+        "ok": true
+      },
+      {
+        "id": "req-004",
+        "class": "sub",
+        "ttft_ms": 4652.4217,
+        "n_tokens": 414,
+        "total_ms": 26218.7482,
+        "ok": true
+      },
+      {
+        "id": "req-005",
+        "class": "sub",
+        "ttft_ms": 5023.0378,
+        "n_tokens": 755,
+        "total_ms": 45197.642,
+        "ok": true
+      },
+      {
+        "id": "req-006",
+        "class": "sub",
+        "ttft_ms": 6066.8664,
+        "n_tokens": 505,
+        "total_ms": 29875.594100000002,
+        "ok": true
+      },
+      {
+        "id": "req-007",
+        "class": "sub",
+        "ttft_ms": 5929.4964,
+        "n_tokens": 11102,
+        "total_ms": 408252.12690000003,
+        "ok": true
+      },
+      {
+        "id": "req-008",
+        "class": "sub",
+        "ttft_ms": 4775.3234999999995,
+        "n_tokens": 334,
+        "total_ms": 18225.5121,
+        "ok": true
+      },
+      {
+        "id": "req-009",
+        "class": "sub",
+        "ttft_ms": 1165.6439,
+        "n_tokens": 218,
+        "total_ms": 17278.6228,
+        "ok": true
+      },
+      {
+        "id": "req-010",
+        "class": "sub",
+        "ttft_ms": 3594.8857,
+        "n_tokens": 11249,
+        "total_ms": 398256.3146,
+        "ok": true
+      },
+      {
+        "id": "req-011",
+        "class": "sub",
+        "ttft_ms": 4292.9151,
+        "n_tokens": 399,
+        "total_ms": 19266.8903,
+        "ok": true
+      }
+    ]
+  },
+  "needles": [
+    {
+      "context_tokens": 65536,
+      "secret": "432896",
+      "retrieved": true
+    },
+    {
+      "context_tokens": 131072,
+      "secret": "765792",
+      "retrieved": true
+    }
+  ]
+}
