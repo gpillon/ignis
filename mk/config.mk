@@ -11,6 +11,15 @@ PROFILE ?= release
 # 1 = build web/dist before the server (so it is embedded) and pass --ui.
 UI ?= 1
 
+# 1 = pass --metrics (ADR 0017): Prometheus text at GET /metrics on its own
+# listener (METRICS_BIND, no key, never exposed) and, with UI=1, at
+# /ui/metrics on BIND (behind API_KEY when set). Off until #90 measures it on
+# the GPU, so gate runs started through make do not carry it by default.
+# make metrics scrapes the metrics listener.
+METRICS ?= 0
+# The metrics listener (--metrics-bind). Empty = the server's 127.0.0.1:9464.
+METRICS_BIND ?=
+
 # The .ninfer container (used with CUDA=1 only). See README "Models".
 ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2.ninfer
 

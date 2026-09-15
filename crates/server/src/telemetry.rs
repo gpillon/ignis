@@ -27,13 +27,14 @@
 //! never reach the interval event. That accessor is the missing seam this
 //! module is built to close.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
+use crate::metrics::Metrics;
 
 // ── the clock (the determinism seam) ────────────────────────────────────────
 
@@ -157,7 +158,20 @@ pub struct Telemetry {
     kv_evictions: u64,
     /// In-flight request telemetry (id → state); removed on completion.
     requests: HashMap<RequestId, RequestTelemetry>,
+    /// The Prometheus projection this consumer keeps up to date, when
+    /// `--metrics` installed one (GitHub #89, ADR 0017).
+    metrics: Option<Arc<Metrics>>,
+    /// The latest cancelled requests, kept only while `metrics` is set: a
+    /// request can finish in the same step its cancel is sent, and then its
+    /// `Done` reaches this consumer after the cancel. It was counted once,
+    /// as cancelled, and must not be counted again as completed.
+    recently_cancelled: VecDeque<RequestId>,
 }
+
+/// How many cancelled ids [`Telemetry`] remembers for that race. A late
+/// `Done` was emitted before the model thread handled the cancel — within one
+/// scheduler step — so this bound is far beyond any real window.
+const RECENTLY_CANCELLED: usize = 1024;
 
 impl Telemetry {
     /// Telemetry over `clock` (`ms` / `tok_s`). No live counter source is
@@ -170,6 +184,8 @@ impl Telemetry {
             last_logged: None,
             kv_evictions: 0,
             requests: HashMap::new(),
+            metrics: None,
+            recently_cancelled: VecDeque::new(),
         }
     }
 
@@ -178,11 +194,20 @@ impl Telemetry {
         self.stats = Some(stats);
     }
 
+    /// Keep `metrics` up to date from the same calls that emit the request
+    /// and interval events — never from their rendered output.
+    pub fn with_metrics(&mut self, metrics: Arc<Metrics>) {
+        self.metrics = Some(metrics);
+    }
+
     /// A request was submitted: anchor its `ms` timeline and record its
     /// prompt length (P3-06's `prompt_tokens` field) and admission class
     /// (GitHub #120). A re-submit of an in-flight id keeps the original
     /// anchor (and prompt length / class), so `ms` is not reset.
     pub fn note_submit(&mut self, id: RequestId, prompt_tokens: u32, class: RequestClass) {
+        if let Some(metrics) = self.metrics.as_ref().filter(|_| !self.requests.contains_key(&id)) {
+            metrics.record_accepted();
+        }
         self.requests
             .entry(id)
             .or_insert_with(|| RequestTelemetry {
@@ -198,26 +223,49 @@ impl Telemetry {
     /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
     /// `PrefillChunk` events already seen for this request.
     pub fn on_admitted(&mut self, id: RequestId, lane: LaneId) {
-        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class) = {
-            let rt = self
-                .requests
-                .entry(id)
-                .or_insert_with(|| RequestTelemetry {
-                    submitted_ms: self.clock.now_ms(),
-                    ..Default::default()
-                });
-            rt.admitted = true;
-            rt.lane = lane;
-            (
-                rt.submitted_ms,
-                rt.prompt_tokens,
-                rt.prefill_chunks,
-                rt.prefilled_tokens,
-                rt.class,
-            )
-        };
+        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class) =
+            match self.requests.get_mut(&id) {
+                Some(rt) => {
+                    rt.admitted = true;
+                    rt.lane = lane;
+                    (
+                        rt.submitted_ms,
+                        rt.prompt_tokens,
+                        rt.prefill_chunks,
+                        rt.prefilled_tokens,
+                        rt.class,
+                    )
+                }
+                // Not in flight — typically cancelled before this admission
+                // reached the consumer (GitHub #89). Still logged, but not
+                // re-added: no `Done` would ever remove it again, and it
+                // would count as running forever.
+                None => (self.clock.now_ms(), 0, 0, 0, RequestClass::default()),
+            };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
         self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens, class);
+    }
+
+    /// A request was cancelled — its client went away (GitHub #89). The
+    /// scheduler releases a cancelled request without a `Done`, so it leaves
+    /// the in-flight set here, or it would count as waiting or running
+    /// forever. Events the model thread emitted for it before the cancel may
+    /// still arrive afterwards; none of them re-adds it, and a late `Done`
+    /// does not count it a second time, as completed.
+    pub fn on_cancelled(&mut self, id: RequestId) {
+        if self.requests.remove(&id).is_none() {
+            return;
+        }
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        metrics.record_cancelled();
+        if self.recently_cancelled.len() == RECENTLY_CANCELLED {
+            self.recently_cancelled.pop_front();
+        }
+        self.recently_cancelled.push_back(id);
+        let counters = self.counters();
+        metrics.set_scheduler_requests(counters.waiting, counters.running);
     }
 
     /// A chunked-prefill step landed for a request still queued or mid-
@@ -275,6 +323,15 @@ impl Telemetry {
         reason: FinishReason,
         spec: Option<SpecCounters>,
     ) {
+        if let Some(metrics) = &self.metrics {
+            match self.recently_cancelled.iter().position(|&c| c == id) {
+                // Already counted as cancelled (see `recently_cancelled`).
+                Some(i) => {
+                    self.recently_cancelled.remove(i);
+                }
+                None => metrics.record_completed(n),
+            }
+        }
         let rt = self.requests.remove(&id);
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
             Some(rt) => (
@@ -377,6 +434,9 @@ impl Telemetry {
     pub fn emit_interval(&mut self) -> IntervalCounters {
         self.tick = self.tick.saturating_add(1);
         let counters = self.counters();
+        if let Some(metrics) = &self.metrics {
+            metrics.set_scheduler_requests(counters.waiting, counters.running);
+        }
         let logged = (counters.waiting, counters.running, counters.kv_evictions);
         if self.last_logged != Some(logged) {
             self.last_logged = Some(logged);
@@ -923,6 +983,90 @@ mod tests {
             "the stall shows up as the max gap"
         );
         assert_eq!(lane0_done["attributes"]["itl_samples"], 2);
+    }
+
+    /// GitHub #89 / ADR 0017: an installed projection follows the same
+    /// lifecycle calls that emit the request and interval events.
+    #[test]
+    fn an_installed_projection_follows_the_request_lifecycle() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let has = |line: &str| {
+            let text = metrics.render();
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        };
+
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.note_submit(2, 3, RequestClass::Agent);
+        telemetry.on_admitted(2, 0);
+        telemetry.emit_interval();
+        has("ignis_requests_accepted_total 2");
+        has("ignis_scheduler_requests{state=\"waiting\"} 1");
+        has("ignis_scheduler_requests{state=\"running\"} 1");
+        has("ignis_requests_completed_total 0");
+
+        telemetry.on_token(2);
+        telemetry.on_done(2, 5, FinishReason::Stop, None);
+        telemetry.emit_interval();
+        has("ignis_requests_completed_total 1");
+        has("ignis_generated_tokens_total 5");
+        has("ignis_scheduler_requests{state=\"waiting\"} 1");
+        has("ignis_scheduler_requests{state=\"running\"} 0");
+    }
+
+    /// GitHub #89: a cancelled request leaves the in-flight set, and an
+    /// admission the model thread emitted before the cancel — arriving after
+    /// it — does not bring it back.
+    #[test]
+    fn a_cancelled_request_leaves_the_counters_even_if_its_admission_arrives_late() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.note_submit(2, 3, RequestClass::Interactive);
+        telemetry.on_admitted(2, 0);
+
+        telemetry.on_cancelled(1);
+        let text = metrics.render();
+        assert!(text.contains("\nignis_scheduler_requests{state=\"waiting\"} 0\n"), "{text}");
+        assert!(text.contains("\nignis_scheduler_requests{state=\"running\"} 1\n"), "{text}");
+
+        telemetry.on_admitted(1, 1); // emitted before the cancel, routed after
+        telemetry.on_cancelled(2);
+        telemetry.on_cancelled(2); // a second cancel is a no-op
+        let counters = telemetry.emit_interval();
+        assert_eq!((counters.waiting, counters.running), (0, 0));
+        let text = metrics.render();
+        assert!(text.contains("\nignis_scheduler_requests{state=\"running\"} 0\n"), "{text}");
+        assert!(text.contains("\nignis_requests_completed_total 0\n"), "{text}");
+        assert!(text.contains("\nignis_requests_cancelled_total 2\n"), "{text}");
+    }
+
+    /// A request that finished in the same step its cancel was sent: the
+    /// cancel reaches the consumer first, its `Done` after. Counted once.
+    #[test]
+    fn a_done_arriving_after_the_cancel_is_not_counted_again() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.on_admitted(1, 0);
+        telemetry.on_cancelled(1);
+        telemetry.on_done(1, 4, FinishReason::Stop, None);
+        // A `Done` for a request that was never cancelled still counts.
+        telemetry.note_submit(2, 3, RequestClass::Interactive);
+        telemetry.on_done(2, 3, FinishReason::Length, None);
+
+        let text = metrics.render();
+        for line in [
+            "ignis_requests_accepted_total 2",
+            "ignis_requests_cancelled_total 1",
+            "ignis_requests_completed_total 1",
+            "ignis_generated_tokens_total 3",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
     }
 
     #[test]

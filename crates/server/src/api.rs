@@ -71,6 +71,17 @@ pub fn router(state: Arc<Server>) -> Router {
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
+    // The Playground's copy of the Prometheus exposition (GitHub #89, ADR
+    // 0017): only with both `--ui` and `--metrics`, and behind the same key
+    // as `/v1` when one is set — an exposed server (ADR 0028) must not
+    // publish its load to anyone. Prometheus itself scrapes the metrics
+    // listener (`Server::metrics_app`); this listener has no `/metrics`.
+    if let (Some(_), Some(metrics)) = (state.playground, &state.metrics) {
+        router = router.merge(
+            crate::metrics::router("/ui/metrics", Arc::clone(metrics))
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+        );
+    }
     router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))

@@ -37,6 +37,7 @@ use ignis_core::{
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use crate::metrics::Metrics;
 use crate::telemetry::{
     IntervalCounters, IntervalStatsProvider, SystemClock, Telemetry, TelemetryClock,
 };
@@ -71,16 +72,21 @@ enum Command {
 /// A message on the telemetry consumer's inbox. The model thread only ever
 /// sends the first three variants — lightweight facts, never event
 /// emission, never counter math (mirroring the call sites [`Telemetry`]
-/// has: a submission, a routed event, a per-step tick). `SetStats` is a
-/// different kind of message on the same channel: an async-side
-/// reconfiguration request the model thread never sends, used by
-/// [`Engine::with_stats`] to reach the already-running consumer without
+/// has: a submission, a routed event, a per-step tick). `Cancelled` is sent
+/// by [`Engine::cancel`] on the async side: the scheduler releases a
+/// cancelled request without a `Done`, so this is how the consumer learns it
+/// left (GitHub #89). `SetStats` and `SetMetrics` are a different kind of
+/// message on the same channel: async-side reconfiguration requests the
+/// model thread never sends, used by [`Engine::with_stats`] and
+/// [`Engine::install_metrics`] to reach the already-running consumer without
 /// ever sharing a lock with the model thread.
 enum TelemetryFact {
     Submitted(RequestId, u32, RequestClass),
     Routed(SchedEvent),
     Tick,
+    Cancelled(RequestId),
     SetStats(Arc<dyn IntervalStatsProvider>),
+    SetMetrics(Arc<Metrics>),
 }
 
 /// The server-side engine: a cheap, cloneable handle onto the model thread
@@ -182,6 +188,13 @@ impl Engine {
         self
     }
 
+    /// Have the telemetry consumer keep `metrics` up to date from the facts
+    /// it already receives (GitHub #89, ADR 0017). The model thread is not
+    /// told: it sends exactly the facts it sent before.
+    pub(crate) fn install_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.facts.send(TelemetryFact::SetMetrics(metrics));
+    }
+
     /// The loaded model id (for `GET /v1/models`) — immutable for the
     /// server's life, read lock-free off this handle (never touches the
     /// model thread).
@@ -230,6 +243,10 @@ impl Engine {
     /// fire-and-forget so an HTTP response body's `Drop` can call it.
     pub fn cancel(&self, request: RequestId) {
         let _ = self.commands.send(Command::Cancel { request });
+        // The scheduler releases a cancelled request without a `Done`, so the
+        // telemetry consumer hears of it from here rather than from the model
+        // thread, whose loop stays unchanged (ADR 0017).
+        let _ = self.facts.send(TelemetryFact::Cancelled(request));
     }
 }
 
@@ -395,7 +412,9 @@ async fn telemetry_task(
                 let snapshot = telemetry.emit_interval();
                 counters.store(Arc::new(snapshot));
             }
+            TelemetryFact::Cancelled(request) => telemetry.on_cancelled(request),
             TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
+            TelemetryFact::SetMetrics(metrics) => telemetry.with_metrics(metrics),
         }
     }
 }
@@ -795,6 +814,110 @@ mod tests {
         // Drop A's stream without draining it to completion — the model
         // thread's shutdown must not hang on an abandoned request.
         drop(rx_a);
+    }
+
+    /// A fact as the model thread sent it, in comparable form.
+    fn describe_fact(fact: &TelemetryFact) -> String {
+        match fact {
+            TelemetryFact::Submitted(id, prompt_tokens, class) => {
+                format!("submitted {id} {prompt_tokens} {class:?}")
+            }
+            TelemetryFact::Routed(event) => format!("routed {event:?}"),
+            TelemetryFact::Tick => "tick".to_owned(),
+            TelemetryFact::Cancelled(_) | TelemetryFact::SetStats(_) | TelemetryFact::SetMetrics(_) => {
+                unreachable!("only the async side sends these")
+            }
+        }
+    }
+
+    /// Runs a fixed workload through a real model thread and telemetry
+    /// consumer, with a recorder spliced into the facts channel between the
+    /// two, and returns every fact the model thread sent — plus the
+    /// exposition of `metrics` once the consumer has drained, if installed.
+    async fn model_thread_facts(metrics: Option<Arc<Metrics>>) -> (Vec<String>, Option<String>) {
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                ..SchedulerConfig::default()
+            },
+            Arc::new(MockCompute::new()),
+        );
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (thread_tx, mut thread_rx) = unbounded_channel();
+        let (consumer_tx, consumer_rx) = unbounded_channel();
+        let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let driver = std::thread::spawn(move || {
+            model_thread_loop(Box::new(scheduler), command_rx, thread_tx)
+        });
+        let clock = Arc::new(crate::telemetry::FixedClock::new(0));
+        let consumer = tokio::spawn(telemetry_task(
+            Telemetry::new(clock),
+            consumer_rx,
+            Arc::clone(&counters),
+        ));
+        let engine = Engine {
+            model_id: "test-model".into(),
+            max_model_len: 8192,
+            commands: command_tx,
+            facts: consumer_tx.clone(),
+            counters,
+        };
+        if let Some(metrics) = &metrics {
+            engine.install_metrics(Arc::clone(metrics));
+        }
+        let recorder = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(fact) = thread_rx.recv().await {
+                seen.push(describe_fact(&fact));
+                let _ = consumer_tx.send(fact);
+            }
+            seen
+        });
+
+        for max_tokens in [4, 2, 6] {
+            let (_id, mut rx) = engine
+                .submit(
+                    input("test-model", vec![1, 2, 3], Some(max_tokens)),
+                    RequestClass::Interactive,
+                )
+                .await
+                .expect("submit");
+            drain_to_done(&mut rx).await;
+        }
+        assert!(engine
+            .submit(input("no-such-model", vec![1], Some(1)), RequestClass::Interactive)
+            .await
+            .is_err());
+
+        // Dropping the handle stops the model thread, which closes the
+        // recorder's inbox, which closes the consumer's.
+        drop(engine);
+        driver.join().expect("the model thread exits cleanly");
+        let seen = recorder.await.expect("the recorder finishes");
+        consumer.await.expect("the consumer drains");
+        (seen, metrics.map(|metrics| metrics.render()))
+    }
+
+    /// GitHub #89 / ADR 0017: enabling metrics changes nothing the model
+    /// thread sends — same facts, same order — while the projection still
+    /// observes that traffic.
+    #[tokio::test]
+    async fn metrics_leave_the_model_thread_fact_traffic_unchanged() {
+        let (off, _) = model_thread_facts(None).await;
+        let (on, exposition) = model_thread_facts(Some(Arc::new(Metrics::new()))).await;
+
+        assert!(off.iter().any(|fact| fact.starts_with("routed Done")), "{off:?}");
+        assert_eq!(off, on, "metrics on must not change the model thread's facts");
+
+        let exposition = exposition.expect("metrics were installed");
+        for line in [
+            "ignis_requests_accepted_total 3",
+            "ignis_requests_completed_total 3",
+            "ignis_requests_cancelled_total 0",
+            "ignis_generated_tokens_total 12",
+        ] {
+            assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
+        }
     }
 
     /// Story 22 (GitHub #69): the model thread shuts down cleanly — no

@@ -13,8 +13,9 @@ fallback page telling the reader to run the frontend build. It is served only
 when the operator passes `--ui` (no alias, environment variable, or config
 key — the same shape as `--metrics`, ADR 0017), under `/ui/` on the existing
 listener; without the flag the route is absent. It talks only to surfaces ignis
-already exposes (`/v1/*`, and `/metrics` when enabled), measuring per-request
-figures in the browser; it adds no endpoint, no fact, and no work on the
+already exposes (`/v1/*`, and `/ui/metrics` when metrics are enabled — ADR
+0017 owns that route and its API-key rule), measuring per-request figures in
+the browser; it adds no endpoint of its own, no fact, and no work on the
 inference path, so it needs no GPU run or G4 gate for acceptance.
 
 ## Considered Options
@@ -30,5 +31,6 @@ inference path, so it needs no GPU run or G4 gate for acceptance.
 - Two binaries from the same commit can differ: one built after the frontend
   build carries the Playground, one built before carries the fallback. This is
   deliberate — do not "fix" it by making cargo invoke npm.
-- Prometheus in the Playground is a browser-side scrape of `/metrics` parsed
+- Prometheus in the Playground is a browser-side scrape of `/ui/metrics` — the
+  same text exposition Prometheus reads on the metrics listener — parsed
   client-side, not a JSON endpoint made for the UI.

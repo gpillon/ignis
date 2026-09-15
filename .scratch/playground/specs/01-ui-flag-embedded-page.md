@@ -18,8 +18,8 @@ A Vite + React + TypeScript project in `web/` builds into `web/dist/` (gitignore
 2. As the owner, I want `http://127.0.0.1:8000/ui/` to open the page from the same binary, so that there is nothing extra to deploy.
 3. As the owner, I want a binary built without a frontend build to still start and show a page telling me to run the frontend build, so that a missing `web/dist` is obvious, not a 404.
 4. As a developer, I want `cargo build` and `cargo test` to never run node/npm, so that the workspace stays node-free.
-5. As a developer, I want `npm run dev` in `web/` to proxy `/v1` and `/metrics` to `IGNIS_URL` (default `http://127.0.0.1:8000`), so that I get hot reload against a running ignis.
-6. As a developer, I want `npm run dev:mock` to serve a fake SSE chat and a fake `/metrics` from the Vite dev server, so that I can work on the UI without touching the shared GPU.
+5. As a developer, I want `npm run dev` in `web/` to proxy `/v1` and `/ui/metrics` to `IGNIS_URL` (default `http://127.0.0.1:8000`), so that I get hot reload against a running ignis.
+6. As a developer, I want `npm run dev:mock` to serve a fake SSE chat and a fake `/ui/metrics` from the Vite dev server, so that I can work on the UI without touching the shared GPU.
 
 ## Implementation Decisions
 
