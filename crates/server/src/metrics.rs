@@ -31,6 +31,7 @@ pub struct Metrics {
     running: AtomicU64,
     accepted: AtomicU64,
     completed: AtomicU64,
+    cancelled: AtomicU64,
     generated_tokens: AtomicU64,
 }
 
@@ -49,6 +50,12 @@ impl Metrics {
     pub(crate) fn record_completed(&self, tokens: u32) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.generated_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
+    }
+
+    /// An accepted request was cancelled before it completed (its client
+    /// went away).
+    pub(crate) fn record_cancelled(&self) {
+        self.cancelled.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The scheduler's current request counts by observable state.
@@ -78,6 +85,11 @@ impl Metrics {
         let counters = [
             ("ignis_requests_accepted_total", "Accepted submissions.", &self.accepted),
             ("ignis_requests_completed_total", "Completed requests.", &self.completed),
+            (
+                "ignis_requests_cancelled_total",
+                "Accepted requests cancelled before completion.",
+                &self.cancelled,
+            ),
             (
                 "ignis_generated_tokens_total",
                 "Generated tokens on completed requests.",
@@ -150,6 +162,7 @@ mod tests {
             ("ignis_scheduler_requests", "gauge"),
             ("ignis_requests_accepted_total", "counter"),
             ("ignis_requests_completed_total", "counter"),
+            ("ignis_requests_cancelled_total", "counter"),
             ("ignis_generated_tokens_total", "counter"),
         ];
         let lines: Vec<&str> = text.lines().collect();
@@ -183,6 +196,7 @@ mod tests {
         for name in [
             "ignis_requests_accepted_total",
             "ignis_requests_completed_total",
+            "ignis_requests_cancelled_total",
             "ignis_generated_tokens_total",
         ] {
             assert_eq!(value(&text, name, ""), "0", "{name}");
@@ -196,12 +210,14 @@ mod tests {
         metrics.record_accepted();
         metrics.record_completed(7);
         metrics.record_completed(5);
+        metrics.record_cancelled();
         metrics.set_scheduler_requests(3, 4);
         metrics.set_scheduler_requests(1, 2);
 
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_requests_accepted_total", ""), "2");
         assert_eq!(value(&text, "ignis_requests_completed_total", ""), "2");
+        assert_eq!(value(&text, "ignis_requests_cancelled_total", ""), "1");
         assert_eq!(value(&text, "ignis_generated_tokens_total", ""), "12");
         // Gauges are the latest state, not a sum.
         assert_eq!(value(&text, "ignis_scheduler_requests", "state=\"waiting\""), "1");

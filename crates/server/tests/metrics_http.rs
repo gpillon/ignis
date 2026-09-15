@@ -152,6 +152,7 @@ async fn with_metrics_the_exposition_is_served_in_the_text_format() {
         ("ignis_scheduler_requests", "gauge"),
         ("ignis_requests_accepted_total", "counter"),
         ("ignis_requests_completed_total", "counter"),
+        ("ignis_requests_cancelled_total", "counter"),
         ("ignis_generated_tokens_total", "counter"),
     ] {
         assert!(text.contains(&format!("\n# TYPE {name} {kind}\n")), "{name}:\n{text}");
@@ -185,6 +186,7 @@ async fn completed_requests_move_the_counters_and_leave_no_request_in_flight() {
     .await;
     assert_eq!(value(&text, "ignis_requests_accepted_total", None), 2);
     assert_eq!(value(&text, "ignis_generated_tokens_total", None), first + second);
+    assert_eq!(value(&text, "ignis_requests_cancelled_total", None), 0);
     assert_eq!(value(&text, "ignis_scheduler_requests", Some("waiting")), 0);
 }
 
@@ -245,14 +247,16 @@ async fn a_client_disconnect_takes_the_request_out_of_the_gauges() {
     tokio::task::spawn_blocking(move || controller.release()).await.unwrap();
 
     // A later request settles the projection: once it has completed, the
-    // abandoned one must be gone from both gauges.
+    // abandoned one must be gone from both gauges and counted as cancelled.
     complete(&app, 2).await;
     let text = scrape_until(&app, |t| {
         value(t, "ignis_requests_completed_total", None) == 1
+            && value(t, "ignis_requests_cancelled_total", None) == 1
             && value(t, "ignis_scheduler_requests", Some("waiting")) == 0
             && value(t, "ignis_scheduler_requests", Some("running")) == 0
     })
     .await;
+    // Every accepted request is accounted for exactly once.
     assert_eq!(value(&text, "ignis_requests_accepted_total", None), 2, "{text}");
 }
 
@@ -285,6 +289,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_scheduler_requests",
         "ignis_requests_accepted_total",
         "ignis_requests_completed_total",
+        "ignis_requests_cancelled_total",
         "ignis_generated_tokens_total",
     ]
     .into_iter()

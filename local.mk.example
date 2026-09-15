@@ -18,6 +18,9 @@
 # DRAFT_TOKENS := 4
 # MAX_CONTEXT := 40960
 
+# Prometheus metrics at /metrics on every start (make metrics scrapes it):
+# METRICS := 1
+
 # Always-on server flags and logging:
 # ARGS := --kv-host-pool-bytes 0
 # LOG_LEVEL := debug

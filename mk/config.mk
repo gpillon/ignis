@@ -11,6 +11,11 @@ PROFILE ?= release
 # 1 = build web/dist before the server (so it is embedded) and pass --ui.
 UI ?= 1
 
+# 1 = pass --metrics: Prometheus text at GET /metrics (ADR 0017), behind the
+# API key when one is set. Off until #90 measures it on the GPU, so gate runs
+# started through make do not carry it by default. make metrics scrapes it.
+METRICS ?= 0
+
 # The .ninfer container (used with CUDA=1 only). See README "Models".
 ARTIFACT ?= ./models/qwen3_8_27b_nvfp4full-v2.ninfer
 

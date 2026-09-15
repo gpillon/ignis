@@ -142,6 +142,7 @@ make run             # run the last build; fails, naming the changed files, if i
 make mock            # the same on the CPU mock (no GPU, no kernel, no artifact)
 make start / stop    # daemon server (log in .scratch/serve/), waits for /v1/models, survives the terminal
 make dev-ui          # build, then server + Playground hot reload; Ctrl+C stops both
+make metrics         # scrape /metrics from a server started with METRICS=1
 make watch CUDA=0    # rebuild + restart on every Rust change (cargo-watch)
 make test            # cargo test, workspace-wide
 make gpu-status      # who holds the 5090

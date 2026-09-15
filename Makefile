@@ -95,6 +95,7 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(MODEL),--model $(MODEL)) \
   $(if $(filter 1,$(UI)),--ui) \
+  $(if $(filter 1,$(METRICS)),--metrics) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
   $(if $(EXPOSE),--expose $(EXPOSE)) \
   $(ARGS)
@@ -151,7 +152,7 @@ help: ## Show this list
 	  /^##@/ { printf "\n%s\n", substr($$0, 5); next } \
 	  /^[a-zA-Z0-9_.%-]+:.*## / { printf "  %-16s %s\n", $$1, $$2 }' Makefile
 	@echo ""
-	@echo "Knobs (make config for all):  CUDA=$(CUDA)  PROFILE=$(PROFILE)  UI=$(UI)  BIND=$(BIND)  host=$(HOST_OS)"
+	@echo "Knobs (make config for all):  CUDA=$(CUDA)  PROFILE=$(PROFILE)  UI=$(UI)  METRICS=$(METRICS)  BIND=$(BIND)  host=$(HOST_OS)"
 	@echo "GPU engine: MAX_CONTEXT=$(MAX_CONTEXT)  SPEC=$(or $(SPEC),off)  DRAFT_TOKENS=$(DRAFT_TOKENS)  KV_FORMAT=$(KV_FORMAT)"
 	@echo "  e.g.  make dev CUDA=0 PROFILE=dev      make dev-ui SPEC= MAX_CONTEXT=40960"
 
@@ -162,6 +163,7 @@ config: ## Print the resolved knobs and paths
 	@echo "CUDA            $(CUDA)  (backend=$(BACKEND))"
 	@echo "PROFILE         $(PROFILE)  (dir=$(PROFILE_DIR))"
 	@echo "UI              $(UI)"
+	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(GET /metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(no /metrics))"
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
@@ -301,6 +303,10 @@ smoke: ## One /v1/models + one short chat completion against BIND
 	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
 	  -d '{"model":"$(SMOKE_MODEL)","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
 	@echo ""
+
+.PHONY: metrics
+metrics: ## Scrape /metrics from the server on BIND (started with METRICS=1)
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/metrics"
 
 .PHONY: canary
 canary: ## ignis-bench canary suite against the running server

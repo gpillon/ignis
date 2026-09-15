@@ -913,6 +913,7 @@ mod tests {
         for line in [
             "ignis_requests_accepted_total 3",
             "ignis_requests_completed_total 3",
+            "ignis_requests_cancelled_total 0",
             "ignis_generated_tokens_total 12",
         ] {
             assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
