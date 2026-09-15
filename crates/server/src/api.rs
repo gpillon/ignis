@@ -72,10 +72,13 @@ pub fn router(state: Arc<Server>) -> Router {
         router = router.merge(crate::playground::router(assets));
     }
     // Prometheus metrics (GitHub #89, ADR 0017): present only with
-    // `--metrics`. Outside the key like the Playground: the ADR adds no
-    // metrics-specific authentication.
+    // `--metrics`, and behind the same key as `/v1` when one is set — an
+    // exposed server (ADR 0028) must not publish its load to anyone.
     if let Some(metrics) = &state.metrics {
-        router = router.merge(crate::metrics::router(Arc::clone(metrics)));
+        router = router.merge(
+            crate::metrics::router(Arc::clone(metrics))
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
+        );
     }
     router
         .layer(middleware::from_fn(cors_headers))

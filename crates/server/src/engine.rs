@@ -72,16 +72,19 @@ enum Command {
 /// A message on the telemetry consumer's inbox. The model thread only ever
 /// sends the first three variants — lightweight facts, never event
 /// emission, never counter math (mirroring the call sites [`Telemetry`]
-/// has: a submission, a routed event, a per-step tick). `SetStats` and
-/// `SetMetrics` are a different kind of message on the same channel:
-/// async-side reconfiguration requests the model thread never sends, used by
-/// [`Engine::with_stats`] and [`Engine::install_metrics`] to reach the
-/// already-running consumer without ever sharing a lock with the model
-/// thread.
+/// has: a submission, a routed event, a per-step tick). `Cancelled` is sent
+/// by [`Engine::cancel`] on the async side: the scheduler releases a
+/// cancelled request without a `Done`, so this is how the consumer learns it
+/// left (GitHub #89). `SetStats` and `SetMetrics` are a different kind of
+/// message on the same channel: async-side reconfiguration requests the
+/// model thread never sends, used by [`Engine::with_stats`] and
+/// [`Engine::install_metrics`] to reach the already-running consumer without
+/// ever sharing a lock with the model thread.
 enum TelemetryFact {
     Submitted(RequestId, u32, RequestClass),
     Routed(SchedEvent),
     Tick,
+    Cancelled(RequestId),
     SetStats(Arc<dyn IntervalStatsProvider>),
     SetMetrics(Arc<Metrics>),
 }
@@ -188,7 +191,7 @@ impl Engine {
     /// Have the telemetry consumer keep `metrics` up to date from the facts
     /// it already receives (GitHub #89, ADR 0017). The model thread is not
     /// told: it sends exactly the facts it sent before.
-    pub fn install_metrics(&self, metrics: Arc<Metrics>) {
+    pub(crate) fn install_metrics(&self, metrics: Arc<Metrics>) {
         let _ = self.facts.send(TelemetryFact::SetMetrics(metrics));
     }
 
@@ -240,6 +243,10 @@ impl Engine {
     /// fire-and-forget so an HTTP response body's `Drop` can call it.
     pub fn cancel(&self, request: RequestId) {
         let _ = self.commands.send(Command::Cancel { request });
+        // The scheduler releases a cancelled request without a `Done`, so the
+        // telemetry consumer hears of it from here rather than from the model
+        // thread, whose loop stays unchanged (ADR 0017).
+        let _ = self.facts.send(TelemetryFact::Cancelled(request));
     }
 }
 
@@ -405,6 +412,7 @@ async fn telemetry_task(
                 let snapshot = telemetry.emit_interval();
                 counters.store(Arc::new(snapshot));
             }
+            TelemetryFact::Cancelled(request) => telemetry.on_cancelled(request),
             TelemetryFact::SetStats(provider) => telemetry.with_stats(provider),
             TelemetryFact::SetMetrics(metrics) => telemetry.with_metrics(metrics),
         }
@@ -809,15 +817,15 @@ mod tests {
     }
 
     /// A fact as the model thread sent it, in comparable form.
-    fn fact_kind(fact: &TelemetryFact) -> String {
+    fn describe_fact(fact: &TelemetryFact) -> String {
         match fact {
             TelemetryFact::Submitted(id, prompt_tokens, class) => {
                 format!("submitted {id} {prompt_tokens} {class:?}")
             }
             TelemetryFact::Routed(event) => format!("routed {event:?}"),
             TelemetryFact::Tick => "tick".to_owned(),
-            TelemetryFact::SetStats(_) | TelemetryFact::SetMetrics(_) => {
-                unreachable!("the model thread never reconfigures the consumer")
+            TelemetryFact::Cancelled(_) | TelemetryFact::SetStats(_) | TelemetryFact::SetMetrics(_) => {
+                unreachable!("only the async side sends these")
             }
         }
     }
@@ -860,7 +868,7 @@ mod tests {
         let recorder = tokio::spawn(async move {
             let mut seen = Vec::new();
             while let Some(fact) = thread_rx.recv().await {
-                seen.push(fact_kind(&fact));
+                seen.push(describe_fact(&fact));
                 let _ = consumer_tx.send(fact);
             }
             seen

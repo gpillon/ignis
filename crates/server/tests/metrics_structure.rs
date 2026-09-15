@@ -35,7 +35,8 @@ fn metrics_mentions(text: &str) -> Vec<(usize, String)> {
         .enumerate()
         .filter(|(_, line)| {
             let line = line.to_ascii_lowercase();
-            line.contains("metric") || line.contains("prometheus")
+            // `metrics`, not `metric`: "asymmetric" is not a metrics mention.
+            line.contains("metrics") || line.contains("prometheus")
         })
         .map(|(n, line)| (n + 1, line.to_owned()))
         .collect()

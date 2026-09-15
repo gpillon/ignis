@@ -11,8 +11,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
-use ignis_core::{ConcreteScheduler, MockCompute, SchedulerConfig};
+use ignis_core::mock::GatedCompute;
+use ignis_core::{Compute, ConcreteScheduler, MockCompute, SchedulerConfig};
 use ignis_server::Server;
+use ignis_server::config::ApiKey;
 use ignis_server::engine::Engine;
 use ignis_server::template::SimpleTemplateProvider;
 use tower::ServiceExt;
@@ -43,10 +45,10 @@ async fn scrape(app: &axum::Router) -> String {
     body_text(response).await
 }
 
-/// A non-streaming chat completion; returns its `usage.completion_tokens`.
-async fn complete(app: &axum::Router, max_tokens: u32) -> u64 {
+/// A non-streaming chat completion naming `model`.
+async fn chat(app: &axum::Router, model: &str, max_tokens: u32) -> axum::response::Response {
     let body = serde_json::json!({
-        "model": MODEL,
+        "model": model,
         "messages": [{ "role": "user", "content": "hello" }],
         "max_tokens": max_tokens,
         "stream": false
@@ -57,7 +59,12 @@ async fn complete(app: &axum::Router, max_tokens: u32) -> u64 {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
+    app.clone().oneshot(request).await.unwrap()
+}
+
+/// A successful completion; returns its `usage.completion_tokens`.
+async fn complete(app: &axum::Router, max_tokens: u32) -> u64 {
+    let response = chat(app, MODEL, max_tokens).await;
     assert_eq!(response.status(), StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
     json["usage"]["completion_tokens"].as_u64().expect("usage.completion_tokens")
@@ -184,10 +191,39 @@ async fn completed_requests_move_the_counters_and_leave_no_request_in_flight() {
 #[tokio::test]
 async fn a_rejected_submission_is_not_counted_as_accepted() {
     let app = server().with_metrics().app();
+    let response = chat(&app, "no-such-model", 2).await;
+    assert!(response.status().is_client_error(), "{}", response.status());
+
+    // A later accepted request settles the projection, so a stray count
+    // from the rejection would be visible by then.
+    complete(&app, 2).await;
+    let text = scrape_until(&app, |t| value(t, "ignis_requests_completed_total", None) == 1).await;
+    assert_eq!(value(&text, "ignis_requests_accepted_total", None), 1, "{text}");
+}
+
+/// A client that disconnects mid-generation cancels its request, and the
+/// scheduler releases a cancelled request without a `Done`. The request must
+/// still leave the gauges: `ignis_scheduler_requests` is the current state,
+/// not every request ever seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_disconnect_takes_the_request_out_of_the_gauges() {
+    let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+        gated.clone() as Arc<dyn Compute>,
+    );
+    let app = Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
+        .with_metrics()
+        .app();
+
+    // Hold the first decode step, so the stream is still generating when
+    // the client goes away.
+    gated.arm();
     let body = serde_json::json!({
-        "model": "no-such-model",
-        "messages": [{ "role": "user", "content": "hello" }],
-        "max_tokens": 2
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "keep decoding" }],
+        "max_tokens": 4096,
+        "stream": true
     });
     let request = Request::builder()
         .method("POST")
@@ -196,13 +232,45 @@ async fn a_rejected_submission_is_not_counted_as_accepted() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
-    assert!(response.status().is_client_error(), "{}", response.status());
+    assert_eq!(response.status(), StatusCode::OK);
+    let controller = tokio::task::spawn_blocking(move || {
+        controller.wait_entered();
+        controller
+    })
+    .await
+    .unwrap();
+    // Disconnect while the step is held, so the cancel is queued before the
+    // model thread can finish anything; then let it go.
+    drop(response);
+    tokio::task::spawn_blocking(move || controller.release()).await.unwrap();
 
-    // A later accepted request settles the projection, so a stray count
-    // from the rejection would be visible by then.
+    // A later request settles the projection: once it has completed, the
+    // abandoned one must be gone from both gauges.
     complete(&app, 2).await;
-    let text = scrape_until(&app, |t| value(t, "ignis_requests_completed_total", None) == 1).await;
-    assert_eq!(value(&text, "ignis_requests_accepted_total", None), 1, "{text}");
+    let text = scrape_until(&app, |t| {
+        value(t, "ignis_requests_completed_total", None) == 1
+            && value(t, "ignis_scheduler_requests", Some("waiting")) == 0
+            && value(t, "ignis_scheduler_requests", Some("running")) == 0
+    })
+    .await;
+    assert_eq!(value(&text, "ignis_requests_accepted_total", None), 2, "{text}");
+}
+
+/// With an API key configured, `/metrics` asks for it like `/v1` does: an
+/// exposed server (ADR 0028) must not publish its load without one.
+#[tokio::test]
+async fn with_an_api_key_metrics_require_it() {
+    let app = server().with_api_key(ApiKey::new("sk-metrics")).with_metrics().app();
+    assert_eq!(get(&app, "/metrics").await.status(), StatusCode::UNAUTHORIZED);
+
+    let request = Request::builder()
+        .uri("/metrics")
+        .header(header::AUTHORIZATION, "Bearer sk-metrics")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("# TYPE ignis_build_info gauge"));
 }
 
 #[tokio::test]

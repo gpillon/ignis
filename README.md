@@ -321,7 +321,7 @@ a one-line readiness note (`model <id> on http://<bind>`) when ready.
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
 | `/ui/` | GET | The Playground page — only with `--ui`. |
-| `/metrics` | GET | Prometheus text format 0.0.4 — only with `--metrics` (ADR 0017). No API key required. |
+| `/metrics` | GET | Prometheus text format 0.0.4 — only with `--metrics` (ADR 0017). Needs the API key when one is set, like `/v1`. |
 
 Errors use OpenAI's `{"error": {message, type, code}}` body with the matching
 status: 400 bad request, 404 unknown model, 413 oversized request, 503 engine

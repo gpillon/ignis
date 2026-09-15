@@ -194,7 +194,7 @@ impl Telemetry {
     /// (GitHub #120). A re-submit of an in-flight id keeps the original
     /// anchor (and prompt length / class), so `ms` is not reset.
     pub fn note_submit(&mut self, id: RequestId, prompt_tokens: u32, class: RequestClass) {
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = self.metrics.as_ref().filter(|_| !self.requests.contains_key(&id)) {
             metrics.record_accepted();
         }
         self.requests
@@ -212,26 +212,42 @@ impl Telemetry {
     /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
     /// `PrefillChunk` events already seen for this request.
     pub fn on_admitted(&mut self, id: RequestId, lane: LaneId) {
-        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class) = {
-            let rt = self
-                .requests
-                .entry(id)
-                .or_insert_with(|| RequestTelemetry {
-                    submitted_ms: self.clock.now_ms(),
-                    ..Default::default()
-                });
-            rt.admitted = true;
-            rt.lane = lane;
-            (
-                rt.submitted_ms,
-                rt.prompt_tokens,
-                rt.prefill_chunks,
-                rt.prefilled_tokens,
-                rt.class,
-            )
-        };
+        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class) =
+            match self.requests.get_mut(&id) {
+                Some(rt) => {
+                    rt.admitted = true;
+                    rt.lane = lane;
+                    (
+                        rt.submitted_ms,
+                        rt.prompt_tokens,
+                        rt.prefill_chunks,
+                        rt.prefilled_tokens,
+                        rt.class,
+                    )
+                }
+                // Not in flight — typically cancelled before this admission
+                // reached the consumer (GitHub #89). Still logged, but not
+                // re-added: no `Done` would ever remove it again, and it
+                // would count as running forever.
+                None => (self.clock.now_ms(), 0, 0, 0, RequestClass::default()),
+            };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
         self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens, class);
+    }
+
+    /// A request was cancelled — its client went away (GitHub #89). The
+    /// scheduler releases a cancelled request without a `Done`, so it leaves
+    /// the in-flight set here, or it would count as waiting or running
+    /// forever. Events the model thread emitted for it before the cancel may
+    /// still arrive afterwards; none of them re-adds it.
+    pub fn on_cancelled(&mut self, id: RequestId) {
+        if self.requests.remove(&id).is_none() {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            let counters = self.counters();
+            metrics.set_scheduler_requests(counters.waiting, counters.running);
+        }
     }
 
     /// A chunked-prefill step landed for a request still queued or mid-
@@ -973,6 +989,33 @@ mod tests {
         has("ignis_generated_tokens_total 5");
         has("ignis_scheduler_requests{state=\"waiting\"} 1");
         has("ignis_scheduler_requests{state=\"running\"} 0");
+    }
+
+    /// GitHub #89: a cancelled request leaves the in-flight set, and an
+    /// admission the model thread emitted before the cancel — arriving after
+    /// it — does not bring it back.
+    #[test]
+    fn a_cancelled_request_leaves_the_counters_even_if_its_admission_arrives_late() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.note_submit(2, 3, RequestClass::Interactive);
+        telemetry.on_admitted(2, 0);
+
+        telemetry.on_cancelled(1);
+        let text = metrics.render();
+        assert!(text.contains("\nignis_scheduler_requests{state=\"waiting\"} 0\n"), "{text}");
+        assert!(text.contains("\nignis_scheduler_requests{state=\"running\"} 1\n"), "{text}");
+
+        telemetry.on_admitted(1, 1); // emitted before the cancel, routed after
+        telemetry.on_cancelled(2);
+        telemetry.on_cancelled(2); // a second cancel is a no-op
+        let counters = telemetry.emit_interval();
+        assert_eq!((counters.waiting, counters.running), (0, 0));
+        let text = metrics.render();
+        assert!(text.contains("\nignis_scheduler_requests{state=\"running\"} 0\n"), "{text}");
+        assert!(text.contains("\nignis_requests_completed_total 0\n"), "{text}");
     }
 
     #[test]
