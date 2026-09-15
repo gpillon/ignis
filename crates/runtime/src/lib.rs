@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ignis_core::vision::{MediaItem, Multimodal};
 use ignis_core::{
     Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason, N_DECODE_LANES,
-    PrefillJob, RequestId, SpecCounters, TokenId,
+    PrefillJob, PrefillOutcome, RequestId, SpecCounters, TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -401,15 +401,21 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// the chunk covers unless its embedding is already live, prefill the
     /// span at its three-axis positions with the item's columns, and release
     /// the embedding once the chunk covered its last placeholder.
+    ///
+    /// Returns the microseconds the encode took (GitHub #192), 0 when this
+    /// chunk encoded nothing — the same clock read `ConcreteScheduler` takes
+    /// around `evict`, and taken unconditionally, so this path never varies
+    /// with what an operator turned on.
     fn prefill_multimodal_job(
         &self,
         sequence: &mut L::Sequence,
         media: &mut HashMap<RequestId, LiveMedia<L::Media>>,
         job: &PrefillJob,
         multimodal: &Multimodal,
-    ) -> Result<(), i32> {
+    ) -> Result<u64, i32> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
+        let mut encode_micros = 0;
         if let Some(chunk) = &chunk {
             if media.get(&job.request).is_some_and(|live| live.item != chunk.item) {
                 let stale = media.remove(&job.request).expect("checked above");
@@ -424,7 +430,9 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                     vision_tokens = item.grid.vision_tokens(),
                 )
                 .entered();
+                let started = std::time::Instant::now();
                 let handle = self.model.leaf.encode_media(self.model.handle(), item)?;
+                encode_micros = started.elapsed().as_micros() as u64;
                 media.insert(job.request, LiveMedia { item: chunk.item, handle });
             }
         }
@@ -451,7 +459,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         {
             self.release_media_handle(done.handle);
         }
-        Ok(())
+        Ok(encode_micros)
     }
 
     /// Number of live leaf sequences (the CPU-stub observation point).
@@ -483,7 +491,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
 }
 
 impl<L: StepLeaf> Compute for RuntimeCompute<L> {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        let mut outcomes = PrefillOutcome::none(jobs.len());
         let mut sequences = self.sequences.lock().unwrap();
         let mut prefixes = self.prefixes.lock().unwrap();
         let mut media = self.media.lock().unwrap();
@@ -528,7 +537,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 return Err($err);
             }};
         }
-        for job in jobs {
+        for (index, job) in jobs.iter().enumerate() {
             if !sequences.contains_key(&job.request) {
                 // A claimant is allocated *against* the prefix: its leading
                 // KV pages are the publisher's own, shared in place, and its
@@ -574,19 +583,24 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // publisher computed, so there is nothing left to warm.
             if !job.tokens.is_empty() {
                 let warmed = match &job.multimodal {
-                    None => self.model.leaf.prefill(
-                        self.model.handle(),
-                        &mut sequence.handle,
-                        &job.tokens,
-                        job.start_position,
-                        job.params,
-                    ),
+                    None => self
+                        .model
+                        .leaf
+                        .prefill(
+                            self.model.handle(),
+                            &mut sequence.handle,
+                            &job.tokens,
+                            job.start_position,
+                            job.params,
+                        )
+                        .map(|()| 0),
                     Some(multimodal) => {
                         self.prefill_multimodal_job(&mut sequence.handle, &mut media, job, multimodal)
                     }
                 };
-                if let Err(code) = warmed {
-                    unwind!(RuntimeError::Leaf(code).into());
+                match warmed {
+                    Ok(encode_micros) => outcomes[index].encode_micros = encode_micros,
+                    Err(code) => unwind!(RuntimeError::Leaf(code).into()),
                 }
             }
             if let Some(prefix_tokens) = job.publish_prefix_tokens {
@@ -612,7 +626,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 Err(code) => unwind!(RuntimeError::Leaf(code).into()),
             }
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

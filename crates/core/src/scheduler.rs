@@ -90,6 +90,31 @@ pub struct DecodeJob {
     pub remaining_tokens: u32,
 }
 
+/// One job's result from a prefill step (GitHub #192): what the chunk cost
+/// beyond warming its KV. Today that is the media encode alone — everything
+/// else a prefill does is already attributable from the chunk event itself.
+///
+/// `encode_micros` is the wall time the leaf's media encode took for this
+/// chunk, and is 0 on every chunk that encoded nothing: a text chunk, a
+/// chunk that reuses the embedding an earlier chunk of the same item
+/// encoded, and a full-prefix match that warms nothing at all. A request
+/// whose prefill failed and was retried (`MAX_PREFILL_ATTEMPTS`) re-encodes
+/// its item, and the retry's microseconds are reported too — the sum is the
+/// GPU time the request actually cost, not the cost of one image.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefillOutcome {
+    /// Wall time this chunk spent encoding a media item, in microseconds.
+    pub encode_micros: u64,
+}
+
+impl PrefillOutcome {
+    /// One outcome per job, none of which encoded anything — what every
+    /// text-only backend returns.
+    pub fn none(jobs: usize) -> Vec<Self> {
+        vec![Self::default(); jobs]
+    }
+}
+
 /// One job's result from a decode step (GitHub #61 / P1-25; a run since
 /// P5-06, GitHub #154): the tokens the round committed for the lane, in
 /// order, and whether the request finished.
@@ -161,7 +186,12 @@ impl DecodeOutcome {
 pub trait Compute: Send + Sync {
     /// Prefill a batch of prompts, warming their KV (fills the block tables).
     /// No tokens are emitted; this only sets the request up for decode.
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError>;
+    ///
+    /// Returns one [`PrefillOutcome`] per job, in order (GitHub #192) — the
+    /// same shape [`Compute::decode_step`] returns its outcomes in. A failed
+    /// batch returns none of them: the scheduler retries the whole batch, so
+    /// a partial answer would be attributed to a chunk that never landed.
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError>;
 
     /// Run one decode round over every running lane. Returns, per job in
     /// order, the [`DecodeOutcome`]: the tokens the round committed for that

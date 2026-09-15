@@ -19,7 +19,10 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use ignis_artifact::vision::{PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor};
 use ignis_core::mock::MockCompute;
-use ignis_core::{ConcreteScheduler, SchedulerConfig};
+use ignis_core::{
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome,
+    RequestId, SchedulerConfig,
+};
 use ignis_logging::MemorySink;
 use ignis_server::engine::Engine;
 use ignis_server::media::{MediaAcquirer, MediaPolicy, Preparer};
@@ -57,8 +60,106 @@ impl Preparer for Counting {
     }
 }
 
+/// The deterministic mock, reporting `micros` of encode time on every chunk
+/// of a multimodal prompt (GitHub #192) — what the CUDA leaf's real encode
+/// reports on the GPU, without one.
+struct EncodingCompute {
+    inner: MockCompute,
+    micros: u64,
+}
+
+impl Compute for EncodingCompute {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        self.inner.prefill_step(jobs)?;
+        Ok(jobs
+            .iter()
+            .map(|job| PrefillOutcome {
+                encode_micros: if job.multimodal.is_some() { self.micros } else { 0 },
+            })
+            .collect())
+    }
+
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+
+    fn release(&self, request: RequestId) {
+        self.inner.release(request);
+    }
+}
+
 fn counting() -> Arc<Counting> {
     Arc::new(Counting { inner: processor(limits()), builds: AtomicUsize::new(0) })
+}
+
+/// The router over `compute`, acquiring media through `preparer`.
+fn app(compute: Arc<dyn Compute>, preparer: Arc<dyn Preparer>) -> axum::Router {
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+        compute,
+    );
+    let acquirer = MediaAcquirer::new(preparer, limits(), MediaPolicy::new(false, 1 << 20));
+    Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
+        .with_request_timeout(Duration::from_secs(10))
+        .with_media(Arc::new(acquirer))
+        .app()
+}
+
+/// The chat request an image test sends.
+fn image_request(image: &str) -> Request<Body> {
+    let body = json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": image}},
+    ]}]});
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The `attributes` of every `ignis.request.admitted` event captured, in order.
+fn admitted_attributes(sink: &MemorySink) -> Vec<Value> {
+    sink.lines()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|e| e["event_name"] == "ignis.request.admitted")
+        .map(|e| e["attributes"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_encode_time_of_a_multimodal_prefill_reaches_the_admitted_event() {
+    let sink = Arc::new(MemorySink::new());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
+    );
+    let compute = Arc::new(EncodingCompute { inner: MockCompute::new(), micros: 250_000 });
+    let app = app(compute, counting());
+
+    let response = app.clone().oneshot(image_request(&data_uri(&png(64, 64)))).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    // A text request on the same load reports no media at all.
+    let text = json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": "hello"}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(text.to_string()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    nudge().await;
+
+    let admitted = admitted_attributes(&sink);
+    assert_eq!(admitted.len(), 2, "{admitted:?}");
+    // The prompt's 4 placeholders span one chunk, so one encode is reported.
+    assert_eq!(admitted[0]["media.encode_seconds"], 0.25, "{:?}", admitted[0]);
+    let text = admitted[1].as_object().expect("attributes are an object");
+    assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
 }
 
 #[tokio::test]

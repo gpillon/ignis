@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{
     ComputeError, DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent,
 };
@@ -105,6 +105,7 @@ fn advance_emits_a_prefill_chunk_event_per_chunk_with_cumulative_progress() {
                 request,
                 chunk_tokens,
                 prefilled_tokens,
+                ..
             } = event
                 && request == id
             {
@@ -275,7 +276,7 @@ struct PrefillFailsOnce {
 }
 
 impl Compute for PrefillFailsOnce {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut n = self.call.lock().unwrap();
         let this_call = *n;
         *n += 1;

@@ -71,7 +71,7 @@ pub use kv_format::{
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
-pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
+pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler};
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,

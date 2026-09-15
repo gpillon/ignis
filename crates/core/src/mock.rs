@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
 /// Recording handle onto the mock's call history (shared through the
@@ -140,7 +140,7 @@ impl Default for MockCompute {
 }
 
 impl Compute for MockCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         for job in jobs {
             // Learn the request's limits / seed from its params.
@@ -148,7 +148,7 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
         }
         g.prefill_batches.push(jobs.to_vec());
-        Ok(())
+        Ok(PrefillOutcome::none(jobs.len()))
     }
 
     fn release_prefix(&self, publisher: RequestId) {
@@ -312,7 +312,7 @@ impl GatedCompute {
 }
 
 impl Compute for GatedCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         self.inner.prefill_step(jobs)
     }
 

@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
@@ -290,7 +290,7 @@ struct PrefillFailsOn {
 }
 
 impl Compute for PrefillFailsOn {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let n = *self.call.lock().unwrap();
         *self.call.lock().unwrap() += 1;
         if n == self.fail_on {

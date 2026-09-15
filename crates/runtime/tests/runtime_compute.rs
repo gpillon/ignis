@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
-    SpecCounters,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestClass, RequestInput, Scheduler,
+    SchedulerConfig, SpecCounters,
 };
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_runtime::{
@@ -1040,10 +1040,16 @@ fn a_media_item_is_encoded_once_and_released_after_its_last_placeholder() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     let prompt = multimodal(40, vec![image(10, 20)]);
 
-    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
+    let encoding = compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
+    assert_eq!(encoding.len(), 1, "one outcome per job (GitHub #192)");
     assert_eq!(compute.live_media(), 1, "the item spans into the next chunk");
-    compute.prefill_step(&[multimodal_job(1, &prompt, 18, 22)]).unwrap();
+    let continuation = compute.prefill_step(&[multimodal_job(1, &prompt, 18, 22)]).unwrap();
     assert_eq!(compute.live_media(), 0);
+    // GitHub #192: the continuation reuses the live embedding, so it encodes
+    // nothing and reports no encode time. (The encoding chunk's own
+    // microseconds are whatever the stub leaf took — near zero, so asserting
+    // a lower bound on it would only be flaky.)
+    assert_eq!(continuation, [PrefillOutcome::default()]);
 
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(calls.media_encoded, [10], "one encode for the whole item");
@@ -1072,7 +1078,8 @@ fn a_media_item_is_encoded_once_and_released_after_its_last_placeholder() {
 fn a_text_chunk_of_a_multimodal_prompt_carries_positions_but_no_media() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     let prompt = multimodal(40, vec![image(30, 4)]);
-    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 30)]).unwrap();
+    let outcomes = compute.prefill_step(&[multimodal_job(1, &prompt, 0, 30)]).unwrap();
+    assert_eq!(outcomes, [PrefillOutcome::default()], "a text chunk encodes nothing");
     let calls = leaf.calls.lock().unwrap();
     assert!(calls.media_encoded.is_empty());
     assert_eq!(calls.multimodal_spans[0].media, None);

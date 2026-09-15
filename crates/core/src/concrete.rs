@@ -129,7 +129,7 @@ use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
-    Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler, SharedPrefixClaim,
+    Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
@@ -1684,8 +1684,14 @@ impl Scheduler for ConcreteScheduler {
             .collect();
         if !jobs.is_empty() {
             match self.compute.prefill_step(&jobs) {
-                Ok(()) => {
-                    for (&i, job) in batch.iter().zip(&jobs) {
+                Ok(outcomes) => {
+                    // One outcome per job, in order (GitHub #192). A backend
+                    // that returns fewer would have its chunks misattributed
+                    // by the zip below rather than caught.
+                    debug_assert_eq!(outcomes.len(), jobs.len(), "one prefill outcome per job");
+                    for ((&i, job), outcome) in batch.iter().zip(&jobs).zip(
+                        outcomes.iter().copied().chain(std::iter::repeat(PrefillOutcome::default())),
+                    ) {
                         // GitHub #81 / ADR 0012: the prefill span — one per
                         // request per `prefill_step` call (the chunked-
                         // prefill call boundary), opened here rather than
@@ -1726,6 +1732,7 @@ impl Scheduler for ConcreteScheduler {
                             request: request_id,
                             chunk_tokens: job.tokens.len() as u32,
                             prefilled_tokens: r.prefill_progress,
+                            encode_micros: outcome.encode_micros,
                         });
                         // core-07 — registration, driven by the job that
                         // actually published (P4-10, GitHub #126). The leaf

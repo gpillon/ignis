@@ -422,8 +422,9 @@ async fn telemetry_task(
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
+                    encode_micros,
                     ..
-                } => telemetry.on_prefill_chunk(request, prefilled_tokens),
+                } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros),
                 SchedEvent::PrefixReused { tokens, .. } => telemetry.on_prefix_reused(tokens),
                 _ => {}
             },

@@ -144,6 +144,9 @@ struct RequestTelemetry {
     /// What acquiring the request's media cost (GitHub #179); `None` for a
     /// request without media.
     media: Option<MediaStats>,
+    /// Microseconds this request's prefill chunks spent encoding media
+    /// (GitHub #192), summed as the chunks land.
+    encode_micros: u64,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -246,7 +249,7 @@ impl Telemetry {
                         rt.prefill_chunks,
                         rt.prefilled_tokens,
                         rt.class,
-                        rt.media,
+                        rt.media.map(|media| (media, rt.encode_micros)),
                     )
                 }
                 // Not in flight — typically cancelled before this admission
@@ -286,10 +289,11 @@ impl Telemetry {
     /// `admitted` line reports once the request finishes prefill. Not
     /// itself logged — a request may sit `Prefilling` across many chunks,
     /// and per-chunk log lines would be per-round logging by another name.
-    pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32) {
+    pub fn on_prefill_chunk(&mut self, id: RequestId, prefilled_tokens: u32, encode_micros: u64) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = rt.prefill_chunks.saturating_add(1);
             rt.prefilled_tokens = prefilled_tokens;
+            rt.encode_micros = rt.encode_micros.saturating_add(encode_micros);
         }
     }
 
@@ -431,6 +435,11 @@ impl Telemetry {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
             rt.prefilled_tokens = 0;
+            // GitHub #192: a requeued multimodal request is released and
+            // re-prefilled (#178's fence), so it encodes its items again —
+            // the encode seconds of the discarded attempt are not this
+            // prefill's, for the same reason its chunks are not.
+            rt.encode_micros = 0;
         }
     }
 
@@ -511,9 +520,11 @@ impl Telemetry {
         prefill_chunks_consumed: u32,
         prefilled_tokens: u32,
         class: RequestClass,
-        media: Option<MediaStats>,
+        media: Option<(MediaStats, u64)>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        let encode_seconds = media.map(|(_, micros)| micros as f64 / 1e6);
+        let media = media.map(|(media, _)| media);
         tracing::info!(
             name: "ignis.request.admitted",
             request_id = id,
@@ -529,6 +540,7 @@ impl Telemetry {
             media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
             media.cache_hits = media.map(|m| m.cache_hits),
             media.cache_misses = media.map(|m| m.cache_misses),
+            media.encode_seconds = encode_seconds,
             "request admitted"
         );
     }
@@ -838,6 +850,49 @@ mod tests {
     }
 
     #[test]
+    fn encode_seconds_sum_across_the_chunks_and_reset_on_a_requeue() {
+        let mut telemetry = telemetry();
+        let media = MediaStats { items: 1, vision_tokens: 4, ..MediaStats::default() };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 20, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            // The encoding chunk, then one that reuses the live embedding.
+            telemetry.on_prefill_chunk(1, 8, 250_000);
+            telemetry.on_prefill_chunk(1, 20, 0);
+            // A discarded attempt's encode is not this prefill's: the
+            // multimodal request re-encodes after a requeue.
+            telemetry.on_requeued(1);
+            telemetry.on_prefill_chunk(1, 8, 125_000);
+            telemetry.on_prefill_chunk(1, 20, 0);
+            telemetry.on_admitted(1, 0);
+        });
+        let admitted = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.admitted")
+            .expect("an admitted event");
+        assert_eq!(admitted["attributes"]["media.encode_seconds"], 0.125);
+        assert_eq!(admitted["attributes"]["media.items"], 1);
+    }
+
+    #[test]
+    fn a_text_request_carries_no_encode_seconds_even_when_a_chunk_reports_some() {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(2, 5, RequestClass::Interactive);
+            telemetry.on_prefill_chunk(2, 5, 9_000);
+            telemetry.on_admitted(2, 0);
+        });
+        let attributes = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.admitted")
+            .expect("an admitted event")["attributes"]
+            .as_object()
+            .expect("attributes are an object")
+            .clone();
+        assert!(attributes.keys().all(|k| !k.starts_with("media.")), "{attributes:?}");
+    }
+
+    #[test]
     fn a_fixed_clock_keeps_request_events_deterministic() {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
@@ -940,9 +995,9 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive); // a 300-token prompt
-            telemetry.on_prefill_chunk(1, 128); // chunk 1: 128/300
-            telemetry.on_prefill_chunk(1, 256); // chunk 2: 256/300
-            telemetry.on_prefill_chunk(1, 300); // chunk 3: prefill complete
+            telemetry.on_prefill_chunk(1, 128, 0); // chunk 1: 128/300
+            telemetry.on_prefill_chunk(1, 256, 0); // chunk 2: 256/300
+            telemetry.on_prefill_chunk(1, 300, 0); // chunk 3: prefill complete
             telemetry.on_admitted(1, 4);
         });
         let admitted = events.last().unwrap();
@@ -962,10 +1017,10 @@ mod tests {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 300, RequestClass::Interactive);
-            telemetry.on_prefill_chunk(1, 128); // 1st attempt: 1 chunk, then evicted/discarded
+            telemetry.on_prefill_chunk(1, 128, 0); // 1st attempt: 1 chunk, then evicted/discarded
             telemetry.on_requeued(1); // re-queued: the summary resets
-            telemetry.on_prefill_chunk(1, 150); // 2nd attempt, chunk 1
-            telemetry.on_prefill_chunk(1, 300); // 2nd attempt, chunk 2: complete
+            telemetry.on_prefill_chunk(1, 150, 0); // 2nd attempt, chunk 1
+            telemetry.on_prefill_chunk(1, 300, 0); // 2nd attempt, chunk 2: complete
             telemetry.on_admitted(1, 4);
         });
         let admitted = events.last().unwrap();
@@ -1037,7 +1092,7 @@ mod tests {
             telemetry.on_token(1); // t=10, ttft
             telemetry.on_token(1); // t=20, 1st gap 10ms
             telemetry.note_submit(2, 32_768, RequestClass::Interactive); // t=25 (cold prefiller submitted)
-            telemetry.on_prefill_chunk(2, 32_768); // the wide chunk lands
+            telemetry.on_prefill_chunk(2, 32_768, 0); // the wide chunk lands
             telemetry.on_token(1); // t=220, 2nd gap: 200ms — the stall
             telemetry.on_admitted(2, 1); // t=230, prefiller starts decoding
             telemetry.on_done(1, 3, FinishReason::Stop, None); // t=220 (clock re-read), lane 0 finishes

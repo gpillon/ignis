@@ -391,6 +391,12 @@ pub enum SchedEvent {
         request: RequestId,
         chunk_tokens: u32,
         prefilled_tokens: u32,
+        /// Wall time this chunk spent encoding a media item (GitHub #192),
+        /// in microseconds — 0 on a text chunk and on one that reuses a
+        /// live embedding. Telemetry sums it per request, so a slow
+        /// multimodal TTFT is attributable to the encode and not only to
+        /// preprocessing.
+        encode_micros: u64,
     },
 }
 
