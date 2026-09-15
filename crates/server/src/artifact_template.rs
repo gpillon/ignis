@@ -475,6 +475,35 @@ mod tests {
     }
 
     #[test]
+    fn the_real_templates_tools_section_matches_the_references_bytes() {
+        // GitHub #172 AC1: the reference's `render_tools_system_block` text
+        // for the same tools — `", "` / `": "`, sorted keys, `<`, `&`, `'`
+        // literal — one tool per line inside `<tools>`.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let tools = [
+            json!({"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read <path> & print it's text",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+            }}),
+            json!({"type": "function", "function": {
+                "name": "bash",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }}),
+        ];
+        let prompt = template
+            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], true, None, Some(&tools))
+            .expect("render");
+        let expected = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n\
+{\"function\": {\"description\": \"Read <path> & print it's text\", \"name\": \"read_file\", \
+\"parameters\": {\"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \
+\"type\": \"function\"}\n\
+{\"function\": {\"name\": \"bash\", \"parameters\": {\"properties\": {\"command\": {\"type\": \"string\"}}, \
+\"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\n";
+        assert!(prompt.starts_with(expected), "{prompt}");
+    }
+
+    #[test]
     fn an_assistant_history_tool_call_renders_the_real_tag_dialect_and_121_parses_it_back() {
         // AC5 (GitHub #132): a prior assistant turn's `tool_calls` renders
         // as the real `<tool_call>` block, and — closing the loop with

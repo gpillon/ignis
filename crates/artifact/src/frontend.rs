@@ -21,6 +21,7 @@
 
 use std::collections::BTreeSet;
 
+use minijinja::value::{Kwargs, ValueKind};
 use minijinja::{Environment, Value};
 use serde_json::{json, Value as JsonValue};
 
@@ -540,6 +541,107 @@ fn register_template_builtins(env: &mut Environment<'static>) {
     });
     // The template renders raw chat text, never HTML.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+    env.add_filter("tojson", reference_tojson);
+}
+
+/// The reference's `tojson` (GitHub #172, ninfer `chat_template.cpp`
+/// `tojson_text`, itself HuggingFace's `json.dumps(ensure_ascii=False)`),
+/// replacing minijinja's in the chat template only: `", "` / `": "`
+/// separators (`","` / `": "` once indented), no HTML escaping of `<`,
+/// `>`, `&`, `'`, and Python's float spelling. minijinja's own filter is
+/// `serde_json::to_string` plus HTML escaping, which shortens every tool
+/// definition the prompt carries. Keys come out in the value's own order,
+/// which for request JSON is sorted, as the reference's `nlohmann::json`
+/// sorts them.
+fn reference_tojson(
+    value: &Value,
+    indent: Option<usize>,
+    kwargs: Kwargs,
+) -> std::result::Result<Value, minijinja::Error> {
+    let indent = match indent {
+        Some(indent) => Some(indent),
+        None => kwargs.get::<Option<usize>>("indent")?,
+    };
+    kwargs.assert_all_used()?;
+    let mut out = String::new();
+    write_reference_json(&mut out, value, indent, 0)?;
+    Ok(Value::from_safe_string(out))
+}
+
+fn write_reference_json(
+    out: &mut String,
+    value: &Value,
+    indent: Option<usize>,
+    depth: usize,
+) -> std::result::Result<(), minijinja::Error> {
+    let line_break = |out: &mut String, depth: usize| {
+        if let Some(indent) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(indent * depth));
+        }
+    };
+    let separator = if indent.is_some() { "," } else { ", " };
+    let (open, close, is_map) = match value.kind() {
+        ValueKind::Map => ('{', '}', true),
+        ValueKind::Seq | ValueKind::Iterable => ('[', ']', false),
+        ValueKind::Number if !value.is_integer() => {
+            out.push_str(&python_float(f64::try_from(value.clone())?));
+            return Ok(());
+        }
+        // Strings escape as `json.dumps(ensure_ascii=False)` does: only
+        // `"`, `\` and control characters.
+        _ => {
+            let text = serde_json::to_string(value).map_err(|err| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "cannot serialize to JSON")
+                    .with_source(err)
+            })?;
+            out.push_str(&text);
+            return Ok(());
+        }
+    };
+    let items: Vec<Value> = value.try_iter()?.collect();
+    out.push(open);
+    for (index, item) in items.iter().enumerate() {
+        if index != 0 {
+            out.push_str(separator);
+        }
+        line_break(out, depth + 1);
+        if is_map {
+            let key = item.as_str().map_or_else(|| item.to_string(), str::to_owned);
+            write_reference_json(out, &Value::from(key), indent, depth + 1)?;
+            out.push_str(": ");
+            write_reference_json(out, &value.get_item(item)?, indent, depth + 1)?;
+        } else {
+            write_reference_json(out, item, indent, depth + 1)?;
+        }
+    }
+    if !items.is_empty() {
+        line_break(out, depth);
+    }
+    out.push(close);
+    Ok(())
+}
+
+/// Python's `float.__repr__`, which `json.dumps` writes: the shortest
+/// round-trip digits, in exponent form (`1e-05`, `1e+16`) below 1e-4 and
+/// from 1e16 up, otherwise decimal with at least one fractional digit.
+/// serde_json's ryu output differs in both ranges (`0.00001`, `1e16`).
+fn python_float(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".to_owned();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    let scientific = format!("{x:e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("`{:e}` always writes an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` writes an integer exponent");
+    if (-4..16).contains(&exponent) {
+        let decimal = format!("{x}");
+        if decimal.contains('.') { decimal } else { format!("{decimal}.0") }
+    } else {
+        format!("{mantissa}e{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.abs())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -953,12 +1055,91 @@ mod tests {
     #[test]
     fn template_engine_provides_the_tojson_filter() {
         // The container template serializes tool definitions / tool-call
-        // arguments with `|tojson` — the filter is provided by the
-        // `json` feature, not a minijinja default (guards the
-        // Cargo.toml feature wiring).
+        // arguments with `|tojson` — registered by
+        // `register_template_builtins` as the reference's filter (GitHub
+        // #172), not left to minijinja's own.
         let template = ChatTemplate::from_source("{{ {'a': 1} | tojson }}").expect("compile");
         let out = template.render(&[]).expect("render");
         assert!(out.contains("1"), "tojson output must carry the value: {out}");
+    }
+
+    /// Render `{{ x | <filter> }}`-style source with `x` bound to `value`.
+    fn render_with_x(source: &str, value: JsonValue) -> String {
+        let template = ChatTemplate::from_source(source).expect("compile");
+        let context = Value::from_iter([("x", Value::from_serialize(value))]);
+        template.env.get_template(template.name).unwrap().render(context).unwrap()
+    }
+
+    #[test]
+    fn tojson_renders_tools_as_the_reference_does() {
+        // GitHub #172: the reference renders each tool with `", "` / `": "`
+        // separators, sorted keys (its request JSON is `nlohmann::json`),
+        // and `<`, `>`, `&`, `'` and non-ASCII left literal.
+        let template =
+            ChatTemplate::from_source("{%- for tool in tools %}\n{{- tool | tojson }}{% endfor %}")
+                .expect("compile");
+        let tools = [json!({
+            "type": "function",
+            "function": {
+                "name": "run",
+                "description": "Run <cmd> & print 'it' — città",
+                "parameters": {"type": "object", "required": ["cmd"], "properties": {"cmd": {"type": "string"}}}
+            }
+        })];
+        let prompt = template
+            .render_with_thinking_and_tools(&[], true, None, Some(&tools))
+            .expect("render");
+        assert_eq!(
+            prompt,
+            "{\"function\": {\"description\": \"Run <cmd> & print 'it' — città\", \"name\": \"run\", \
+             \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \
+             \"type\": \"object\"}}, \"type\": \"function\"}"
+        );
+    }
+
+    #[test]
+    fn tojson_renders_history_tool_call_arguments_as_the_reference_does() {
+        // The real template walks `arguments|items` and renders non-string
+        // values with `tojson`.
+        let template = ChatTemplate::from_source(
+            "{%- for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments|items %}\
+             <{{ k }}>{{ v if v is string else v | tojson }}{% endfor %}{% endfor %}{% endfor %}",
+        )
+        .expect("compile");
+        let messages = [ChatMessage {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_calls: vec![ToolCall {
+                id: None,
+                name: "edit".to_owned(),
+                arguments: json!({"path": "b.rs", "edits": [{"old": "x", "new": "y"}], "all": true}),
+            }],
+            reasoning_content: None,
+        }];
+        let prompt = template.render(&messages).expect("render");
+        assert_eq!(prompt, r#"<all>true<edits>[{"new": "y", "old": "x"}]<path>b.rs"#);
+    }
+
+    #[test]
+    fn tojson_writes_numbers_and_control_characters_as_python_json_dumps() {
+        // json.dumps([1e-05, 1e-07, 1e16, 1.5e+300, 0.0001, 100.0, 1e15, -2.5, 7, "a<TAB>b<ESC><DEL><U+2028>"],
+        //            ensure_ascii=False)
+        let out = render_with_x(
+            "{{ x | tojson }}",
+            json!([1e-05, 1e-07, 1e16, 1.5e300, 0.0001, 100.0, 1e15, -2.5, 7, "a\tb\u{1b}\u{7f}\u{2028}"]),
+        );
+        assert_eq!(
+            out,
+            "[1e-05, 1e-07, 1e+16, 1.5e+300, 0.0001, 100.0, 1000000000000000.0, -2.5, 7, \"a\\tb\\u001b\u{7f}\u{2028}\"]"
+        );
+    }
+
+    #[test]
+    fn tojson_with_indent_matches_python_json_dumps() {
+        // json.dumps({"a": [], "b": [1, {}]}, ensure_ascii=False, indent=2)
+        let out = render_with_x("{{ x | tojson(indent=2) }}|{{ x | tojson(2) }}", json!({"b": [1, {}], "a": []}));
+        let expected = "{\n  \"a\": [],\n  \"b\": [\n    1,\n    {}\n  ]\n}";
+        assert_eq!(out, format!("{expected}|{expected}"));
     }
 
     #[test]

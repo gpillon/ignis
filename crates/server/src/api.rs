@@ -437,14 +437,16 @@ fn parse_tool_choice(tool_choice: Option<JsonValue>) -> Result<ToolChoice, Respo
 /// <non-empty string>, ...}}` — anything else is a 400 naming the entry
 /// and what is wrong with it. Extra fields (`description`, `parameters`,
 /// …) ride through untouched; they are opaque JSON to ignis, meaningful
-/// only to the template and the model. [`ToolChoice::None`] discards the
-/// validated tools — the template never sees them, so the model is never
-/// told tools exist.
+/// only to the template and the model — except the two defaults the
+/// reference fills in ([`normalize_tool`]). [`ToolChoice::None`] discards
+/// the validated tools — the template never sees them, so the model is
+/// never told tools exist.
 fn resolve_tools(
     tools: Option<Vec<JsonValue>>,
     tool_choice: Option<JsonValue>,
 ) -> Result<Vec<JsonValue>, Response> {
-    let tools = tools.unwrap_or_default();
+    let mut tools = tools.unwrap_or_default();
+    tools.iter_mut().for_each(normalize_tool);
     for (index, tool) in tools.iter().enumerate() {
         let is_type_function = tool.get("type").and_then(JsonValue::as_str) == Some("function");
         let has_name = tool
@@ -461,6 +463,27 @@ fn resolve_tools(
     match parse_tool_choice(tool_choice)? {
         ToolChoice::Auto => Ok(tools),
         ToolChoice::None => Ok(Vec::new()),
+    }
+}
+
+/// The reference's tool normalization (GitHub #172, ninfer
+/// `openai_schema.cpp` `parse_tools`), so the prompt carries the same tool
+/// text: a function without `parameters` gets `{"type": "object",
+/// "properties": {}}`, one without `strict` gets `false` (both also when
+/// sent as `null`). Anything that is not a function object is left for
+/// validation to reject.
+fn normalize_tool(tool: &mut JsonValue) {
+    let Some(function) = tool.get_mut("function").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    if function.get("parameters").is_none_or(JsonValue::is_null) {
+        function.insert(
+            "parameters".to_owned(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+    }
+    if function.get("strict").is_none_or(JsonValue::is_null) {
+        function.insert("strict".to_owned(), JsonValue::Bool(false));
     }
 }
 
@@ -1810,8 +1833,23 @@ mod tests {
 
     // ── GitHub #132: tools / tool_choice validation ─────────────────────
 
+    /// A well-formed tool already carrying the fields `normalize_tool`
+    /// would fill in.
     fn tool(name: &str) -> JsonValue {
-        serde_json::json!({"type": "function", "function": {"name": name}})
+        serde_json::json!({"type": "function", "function": {
+            "name": name, "parameters": {"type": "object"}, "strict": true
+        }})
+    }
+
+    #[test]
+    fn a_tool_gets_the_references_default_parameters_and_strict() {
+        let sent = serde_json::json!({"type": "function", "function": {"name": "a", "parameters": null}});
+        assert_eq!(
+            resolve_tools(Some(vec![sent]), None).unwrap(),
+            vec![serde_json::json!({"type": "function", "function": {
+                "name": "a", "parameters": {"type": "object", "properties": {}}, "strict": false
+            }})]
+        );
     }
 
     #[test]

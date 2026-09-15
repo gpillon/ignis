@@ -24,8 +24,9 @@ serde_json = { workspace = true }
 # renders `frontend/chat_template.jinja` (a Jinja template). Both are
 # pure-Rust, CPU-only, and idiomatic for their formats.
 tokenizers = "0.21"
-# The `json` feature (not a minijinja default) provides the `tojson`
-# filter the container chat template uses for tool definitions.
+# The `json` feature (not a minijinja default) brings serde_json into
+# minijinja; the chat template's `tojson` itself is the reference's
+# (`frontend.rs` `reference_tojson`, GitHub #172).
 minijinja = { version = "2", features = ["json"] }
 
 [dev-dependencies]
