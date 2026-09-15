@@ -12,8 +12,9 @@ export function WebStrip({ runs }: { runs: WebRun[] }) {
         <p className="font-display text-xs text-ash">{webSummary(runs)}</p>
       </div>
       <ul className="flex flex-col gap-1.5">
-        {runs.map((run) => (
-          <WebRow key={run.callId} run={run} />
+        {/* Keyed by position too: an agent's later requests may reuse call ids. */}
+        {runs.map((run, i) => (
+          <WebRow key={`${i}:${run.callId}`} run={run} />
         ))}
       </ul>
     </section>

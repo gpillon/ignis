@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents/agents.ts";
-import { ignisPrompt, NO_TOOLS, routeCall, toolExtras } from "./index.ts";
+import { agentExtras, ignisPrompt, NO_TOOLS, routeCall, setAllTools, toolExtras } from "./index.ts";
 import { WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL } from "./web/web.ts";
+
+const all = { enabled: true, agents: true, web: true };
 
 describe("tools", () => {
   it("adds nothing while no tool is on", () => {
@@ -10,14 +12,31 @@ describe("tools", () => {
   });
 
   it("declares agents and adds their part of the ignis prompt", () => {
-    expect(toolExtras({ agents: true, web: false })).toEqual({ ignisPrompt: AGENTS_IGNIS_PROMPT, tools: [AGENT_TOOL] });
+    expect(toolExtras({ enabled: true, agents: true, web: false })).toEqual({ ignisPrompt: AGENTS_IGNIS_PROMPT, tools: [AGENT_TOOL] });
   });
 
   it("declares search and fetch for web, after agents", () => {
-    expect(toolExtras({ agents: true, web: true })).toEqual({
+    expect(toolExtras(all)).toEqual({
       ignisPrompt: `${AGENTS_IGNIS_PROMPT}\n\n${WEB_IGNIS_PROMPT}`,
       tools: [AGENT_TOOL, WEB_SEARCH_TOOL, WEB_FETCH_TOOL],
     });
+  });
+
+  it("declares nothing while the switch for all tools is off", () => {
+    expect(toolExtras({ ...all, enabled: false })).toEqual({ ignisPrompt: "", tools: [] });
+    expect(agentExtras({ ...all, enabled: false })).toEqual({ ignisPrompt: "", tools: [] });
+  });
+
+  it("gives agents every tool but agent", () => {
+    expect(agentExtras(all)).toEqual({ ignisPrompt: WEB_IGNIS_PROMPT, tools: [WEB_SEARCH_TOOL, WEB_FETCH_TOOL] });
+    expect(agentExtras({ enabled: true, agents: true, web: false })).toEqual({ ignisPrompt: "", tools: [] });
+  });
+
+  it("keeps each tool's choice under the switch for all, and turns all on when none was chosen", () => {
+    const some = { enabled: true, agents: false, web: true };
+    expect(setAllTools(some, false)).toEqual({ ...some, enabled: false });
+    expect(setAllTools({ ...some, enabled: false }, true)).toEqual(some);
+    expect(setAllTools({ enabled: false, agents: false, web: false }, true)).toEqual(all);
   });
 
   it("routes declared web calls to web, the rest to agents while they are on", () => {

@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import { Markdown } from "../../ui/Markdown.tsx";
 import { isAtBottom } from "../../ui/scroll.ts";
+import { WebStrip } from "../web/WebStrip.tsx";
 import type { AgentRun } from "./agents.ts";
 import { StatusMark, statusLine, useNow } from "./status.tsx";
 
@@ -86,6 +87,7 @@ export function AgentReader(props: { run: AgentRun; markdown: boolean; figures: 
             </pre>
           </details>
         )}
+        {run.web && run.web.length > 0 && <WebStrip runs={run.web} />}
         <section aria-label="Answer" className="flex flex-col gap-3">
           {run.content ? (
             props.markdown ? (

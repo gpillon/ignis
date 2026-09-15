@@ -19,7 +19,7 @@ import {
 } from "../sessions/sessions.ts";
 import type { PlaygroundSettings } from "../settings/defaults.ts";
 import { type AgentRun, parseAgentCall, runAgents, toolResult } from "../tools/agents/agents.ts";
-import { routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
+import { agentExtras, routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
 import { getTavilyKey } from "../tools/web/tavilyKey.ts";
 import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
 
@@ -83,6 +83,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     if (busy || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
     const extras = toolExtras(tools);
+    const agentTools = agentExtras(tools);
     const abort = new AbortController();
     controller.current = abort;
     // Sending is a request to see the answer: follow it from the bottom.
@@ -108,7 +109,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
         break;
       }
-      conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, abort.signal))];
+      conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, abort.signal))];
       if (abort.signal.aborted) break;
     }
     controller.current = null;
@@ -151,7 +152,14 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
    * Runs a reply's calls — agents and web calls at once — shown on the reply
    * as they go; resolves with the tool results in call order.
    */
-  async function runToolCalls(sessionId: number, reply: Message, requestSettings: Settings, extras: ToolExtras, signal: AbortSignal) {
+  async function runToolCalls(
+    sessionId: number,
+    reply: Message,
+    requestSettings: Settings,
+    extras: ToolExtras,
+    agentTools: ToolExtras,
+    signal: AbortSignal,
+  ) {
     const calls = reply.toolCalls ?? [];
     const available = (extras.tools ?? []).map((t) => t.function.name);
     const parsed = calls.filter((c) => routeCall(c.name, available) === "agent").map((c) => parseAgentCall(c, available));
@@ -169,6 +177,8 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     await Promise.all([
       runAgents(tasks, {
         settings: requestSettings,
+        tools: agentTools,
+        tavilyKey: getTavilyKey(),
         signal,
         onUpdate: (run) => {
           runs = runs.map((r) => (r.callId === run.callId ? run : r));
@@ -184,15 +194,12 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         },
       }),
     ]);
+    // A row per request an agent made; a run that failed adds one for its error.
     for (const run of runs) {
-      if (!tasks.some((t) => t.callId === run.callId) || (!run.figures && !run.error)) continue;
-      logRow(sessionId, {
-        laneTag: "agent",
-        reasoningEffort: requestSettings.reasoningEffort,
-        figures: run.figures ?? null,
-        error: run.error,
-        agent: run.name,
-      });
+      if (!tasks.some((t) => t.callId === run.callId)) continue;
+      const row = { laneTag: "agent" as const, reasoningEffort: requestSettings.reasoningEffort, agent: run.name };
+      for (const figures of run.rounds ?? []) logRow(sessionId, { ...row, figures });
+      if (run.error) logRow(sessionId, { ...row, figures: null, error: run.error });
     }
     const results = new Map([
       ...runs.map((run) => [run.callId, toolResult(run)] as const),

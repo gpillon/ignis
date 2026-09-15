@@ -1,14 +1,17 @@
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
-import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition } from "../../api/request.ts";
+import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
 import { streamChat } from "../../api/stream.ts";
 import { unknownToolError } from "../errors.ts";
+import { parseWebCall, runWeb, type WebRun, webToolResult } from "../web/web.ts";
 
 // The `agent` tool: the model hands one self-contained sub-task to an agent,
 // a separate request on an agent lane that sees only that task. Several calls
 // in one reply run in parallel; each agent's answer goes back to the model as
-// the call's tool result. Agents get no tools of their own, and run with the
-// session's sampling and thinking settings.
+// the call's tool result. Agents run with the session's sampling and thinking
+// settings, and get every other tool that is on — never `agent` itself, so
+// agents do not start agents. An agent that calls tools runs its own loop:
+// stream, run the calls, send back the results, until it answers without one.
 
 export const AGENT_TOOL_NAME = "agent";
 
@@ -34,17 +37,29 @@ export const AGENT_TOOL: ToolDefinition = {
 
 /** What the agent tool adds to the ignis system prompt of the conversation. */
 export const AGENTS_IGNIS_PROMPT = `# Agents
-You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history and no tools.
+You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history. It can use your other tools, if you have any, but cannot start agents of its own.
 - Agents run in parallel on dedicated lanes. When a task splits into independent parts, call \`agent\` several times in the same reply, one call per part, rather than one after another.
 - Make every prompt self-contained: include the facts, text or code the agent needs, and say exactly what it should return.
 - Each agent's answer comes back to you as that call's result. Check the results, then write your reply to the user from them.
 - Answer directly when the question is simple; agents are for work that benefits from being split.`;
 
-/** The system prompt every agent request carries. */
+/** The system prompt of an agent without tools. */
 export const AGENT_SYSTEM_PROMPT = `You are an agent working for another assistant on one self-contained task. You cannot ask questions and have no tools. Do the task and reply with the result only: complete, accurate and concise, ready to be merged into a larger answer.`;
+
+/** The system prompt of an agent with tools, after what the tools add. */
+export const AGENT_TOOLS_SYSTEM_PROMPT = `You are an agent working for another assistant on one self-contained task. You cannot ask questions or start agents. Use your tools when the task needs them, then reply with the result only: complete, accurate and concise, ready to be merged into a larger answer.`;
+
+/** The whole system prompt an agent with `extras` receives, as the reader shows it. */
+export function agentSystemPrompt(extras: ToolExtras = {}): string {
+  if (!extras.tools?.length) return AGENT_SYSTEM_PROMPT;
+  return [extras.ignisPrompt ?? "", AGENT_TOOLS_SYSTEM_PROMPT].filter((part) => part.trim() !== "").join("\n\n");
+}
 
 /** ignis admits 8 requests in flight; the main reply has finished while its agents run. */
 export const MAX_PARALLEL_AGENTS = 8;
+
+/** How many replies in a row an agent may call tools in before it is failed. */
+export const MAX_AGENT_TOOL_ROUNDS = 8;
 
 export type AgentStatus = "queued" | "running" | "done" | "failed" | "stopped";
 
@@ -54,11 +69,19 @@ export type AgentRun = {
   name: string;
   prompt: string;
   status: AgentStatus;
+  /** Across every request of the run. */
   reasoning: string;
+  /** The text of the run's latest request: its answer, once done. */
   content: string;
-  /** When its current attempt started, on the stream's clock. */
+  /** When its first request started, on the stream's clock. */
   startedAt?: number;
+  /** The latest request's figures. */
   figures?: Figures;
+  /** Every finished request's figures, in order. */
+  rounds?: Figures[];
+  /** The web calls the agent made, in order. */
+  web?: WebRun[];
+  systemPrompt?: string;
   error?: string;
 };
 
@@ -94,9 +117,14 @@ export function parseAgentCall(
   return { ok: true, task: { callId: call.id, name: label, prompt } };
 }
 
-/** An agent's request: its own system prompt and task, no tools, on an agent lane. */
-export function agentRequest(settings: Settings, prompt: string): ChatRequest {
-  return buildChatRequest({ ...settings, systemPrompt: AGENT_SYSTEM_PROMPT, laneTag: "agent" }, [{ role: "user", content: prompt }]);
+/** An agent's request: its own system prompt and turns, its tools if any, on an agent lane. */
+export function agentRequest(settings: Settings, turns: Turn[], extras: ToolExtras = {}): ChatRequest {
+  const withTools = (extras.tools?.length ?? 0) > 0;
+  return buildChatRequest(
+    { ...settings, systemPrompt: withTools ? AGENT_TOOLS_SYSTEM_PROMPT : AGENT_SYSTEM_PROMPT, laneTag: "agent" },
+    turns,
+    withTools ? extras : {},
+  );
 }
 
 /** The tool result the model receives for a finished run. */
@@ -131,11 +159,16 @@ export type RunAgentsOptions = {
   signal: AbortSignal;
   /** Every change to a run, as a whole new run. */
   onUpdate: (run: AgentRun) => void;
+  /** The tools agents get: the session's, less `agent`. */
+  tools?: ToolExtras;
+  /** For the agents' web searches. */
+  tavilyKey?: string | null;
   limit?: number;
   /** A full engine is retried, not failed: agents wait for a lane. */
   retryDelayMs?: number;
   maxRetries?: number;
   stream?: typeof streamChat;
+  runWeb?: typeof runWeb;
   now?: () => number;
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 };
@@ -143,32 +176,49 @@ export type RunAgentsOptions = {
 /** Runs the tasks, at most `limit` at once, and resolves with every run finished (done, failed or stopped). */
 export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): Promise<AgentRun[]> {
   const stream = options.stream ?? streamChat;
+  const doRunWeb = options.runWeb ?? runWeb;
   const now = options.now ?? (() => performance.now());
   const sleep = options.sleep ?? abortableSleep;
   const limit = Math.max(1, options.limit ?? MAX_PARALLEL_AGENTS);
   const maxRetries = options.maxRetries ?? 60;
   const retryDelayMs = options.retryDelayMs ?? 1000;
+  const tools = options.tools ?? {};
+  const available = (tools.tools ?? []).map((t) => t.function.name);
+  const systemPrompt = agentSystemPrompt(tools);
   const { signal } = options;
 
-  const runs = new Map(tasks.map((task) => [task.callId, queued(task)]));
+  const runs = new Map(tasks.map((task) => [task.callId, { ...queued(task), systemPrompt }]));
+  const get = (callId: string) => runs.get(callId)!;
   const set = (callId: string, change: Partial<AgentRun>) => {
-    const run = { ...runs.get(callId)!, ...change };
+    const run = { ...get(callId), ...change };
     runs.set(callId, run);
     options.onUpdate(run);
   };
 
-  async function runOne(task: AgentTask) {
+  /** One request of the run, retried while the engine is full; null once the run was stopped. */
+  async function request(task: AgentTask, turns: Turn[], round: number) {
+    const before = get(task.callId).reasoning;
     for (let attempt = 0; ; attempt++) {
-      if (signal.aborted) return set(task.callId, { status: "stopped" });
-      set(task.callId, { status: "running", startedAt: now(), reasoning: "", content: "" });
+      if (signal.aborted) {
+        set(task.callId, { status: "stopped" });
+        return null;
+      }
+      set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) });
+      const calls: ToolCall[] = [];
+      // A later request's reasoning is set apart from the earlier ones'.
+      let separator = before ? "\n\n" : "";
       const result = await stream({
-        body: agentRequest(options.settings, task.prompt),
+        body: agentRequest(options.settings, turns, tools),
         signal,
         now,
         onEvent: (event) => {
-          const run = runs.get(task.callId)!;
-          if (event.kind === "reasoning") set(task.callId, { reasoning: run.reasoning + event.text });
+          const run = get(task.callId);
+          if (event.kind === "reasoning") {
+            set(task.callId, { reasoning: run.reasoning + separator + event.text });
+            separator = "";
+          }
           if (event.kind === "content") set(task.callId, { content: run.content + event.text });
+          if (event.kind === "tool_call") calls.push(event.call);
         },
       });
       if (!result.ok && isEngineFull(result.message) && attempt < maxRetries && !signal.aborted) {
@@ -176,11 +226,54 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         await sleep(retryDelayMs, signal);
         continue;
       }
+      return { result, calls };
+    }
+  }
+
+  /** Runs one request's calls — web calls; anything else is unknown to an agent — and resolves with each call's result. */
+  async function runCalls(callId: string, calls: ToolCall[]): Promise<Map<string, string>> {
+    const earlier = get(callId).web ?? [];
+    const parsed = calls.map((call) => parseWebCall(call, available));
+    let current: WebRun[] = parsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
+    set(callId, { web: [...earlier, ...current] });
+    await doRunWeb(
+      parsed.flatMap((p) => (p.ok ? [p.task] : [])),
+      {
+        tavilyKey: options.tavilyKey ?? null,
+        signal,
+        onUpdate: (run) => {
+          current = current.map((r) => (r.callId === run.callId ? run : r));
+          set(callId, { web: [...earlier, ...current] });
+        },
+      },
+    );
+    return new Map(current.map((run) => [run.callId, webToolResult(run)]));
+  }
+
+  async function runOne(task: AgentTask) {
+    let turns: Turn[] = [{ role: "user", content: task.prompt }];
+    for (let round = 0; ; round++) {
+      const answer = await request(task, turns, round);
+      if (!answer) return;
+      const { result, calls } = answer;
       if (!result.ok) return set(task.callId, { status: "failed", error: result.message });
-      return set(task.callId, {
-        status: result.timeline.stopped ? "stopped" : "done",
-        figures: computeFigures(result.timeline),
-      });
+      const figures = computeFigures(result.timeline);
+      set(task.callId, { figures, rounds: [...(get(task.callId).rounds ?? []), figures] });
+      if (result.timeline.stopped) return set(task.callId, { status: "stopped" });
+      if (calls.length === 0) return set(task.callId, { status: "done" });
+      if (round >= MAX_AGENT_TOOL_ROUNDS) {
+        return set(task.callId, {
+          status: "failed",
+          error: `An agent can call tools at most ${MAX_AGENT_TOOL_ROUNDS} times in a row; this one kept calling.`,
+        });
+      }
+      const content = get(task.callId).content;
+      const results = await runCalls(task.callId, calls);
+      turns = [
+        ...turns,
+        { role: "assistant", content, toolCalls: calls },
+        ...calls.map((call): Turn => ({ role: "tool", content: results.get(call.id) ?? "", toolCallId: call.id })),
+      ];
     }
   }
 
@@ -189,5 +282,5 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
     while (next < tasks.length) await runOne(tasks[next++]);
   };
   await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, worker));
-  return tasks.map((task) => runs.get(task.callId)!);
+  return tasks.map((task) => get(task.callId));
 }

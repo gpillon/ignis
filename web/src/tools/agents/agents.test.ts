@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { Timeline } from "../../metrics/figures.ts";
-import type { ChatRequest, Settings } from "../../api/request.ts";
+import type { ChatRequest, Settings, ToolExtras } from "../../api/request.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
+import { runWeb, WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL, type WebRun } from "../web/web.ts";
 import {
   AGENT_SYSTEM_PROMPT,
+  AGENT_TOOLS_SYSTEM_PROMPT,
   agentRequest,
   type AgentRun,
   agentSummary,
+  agentSystemPrompt,
   parseAgentCall,
   runAgents,
   toolResult,
@@ -65,7 +68,7 @@ describe("parseAgentCall", () => {
 
 describe("agentRequest", () => {
   it("sends only the task, with the agent system prompt, on the agent lane, without tools", () => {
-    const body = agentRequest(settings, "do it");
+    const body = agentRequest(settings, [{ role: "user", content: "do it" }]);
     expect(body.messages).toEqual([
       { role: "system", content: AGENT_SYSTEM_PROMPT },
       { role: "user", content: "do it" },
@@ -171,5 +174,104 @@ describe("runAgents", () => {
     const stream = async (): Promise<StreamResult> => ({ ok: true, timeline: timeline(true) });
     const [run] = await runAgents([task(1)], { settings, signal: new AbortController().signal, onUpdate: () => {}, stream });
     expect(run.status).toBe("stopped");
+  });
+});
+
+describe("agents with tools", () => {
+  const webTools: ToolExtras = { ignisPrompt: WEB_IGNIS_PROMPT, tools: [WEB_SEARCH_TOOL, WEB_FETCH_TOOL] };
+  const tasksSeen: number[] = [];
+  const doneWeb: typeof runWeb = async (tasks, o) => {
+    tasksSeen.push(tasks.length);
+    return tasks.map((t) => {
+      const run: WebRun = { ...t, status: "done", results: [{ title: "T", url: "https://t", content: "c" }] };
+      o.onUpdate(run);
+      return run;
+    });
+  };
+  const callEvent = (name: string, args: object) => ({ kind: "tool_call" as const, call: { id: "w1", name, arguments: JSON.stringify(args) } });
+
+  it("sends the tools with their prompt, runs the calls and streams again until the agent answers", async () => {
+    const bodies: ChatRequest[] = [];
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      bodies.push(o.body as ChatRequest);
+      if (bodies.length === 1) {
+        o.onEvent({ kind: "reasoning", text: "search first" });
+        o.onEvent(callEvent("web_search", { query: "ignis" }));
+      } else {
+        o.onEvent({ kind: "reasoning", text: "got it" });
+        o.onEvent({ kind: "content", text: "final" });
+      }
+      return { ok: true, timeline: timeline() };
+    };
+    const [run] = await runAgents([task(1)], {
+      settings,
+      tools: webTools,
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      stream,
+      runWeb: doneWeb,
+    });
+    expect(run).toMatchObject({
+      status: "done",
+      content: "final",
+      reasoning: "search first\n\ngot it",
+      systemPrompt: agentSystemPrompt(webTools),
+    });
+    expect(run.rounds).toHaveLength(2);
+    expect(run.web?.map((w) => [w.tool, w.status])).toEqual([["web_search", "done"]]);
+    expect(bodies[0].class).toBe("agent");
+    expect(bodies[0].tools?.map((t) => t.function.name)).toEqual(["web_search", "web_fetch"]);
+    expect(bodies[0].messages[0]).toEqual({ role: "system", content: `${WEB_IGNIS_PROMPT}\n\n${AGENT_TOOLS_SYSTEM_PROMPT}` });
+    expect(bodies[1].messages.slice(1)).toEqual([
+      { role: "user", content: "do 1" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "w1", type: "function", function: { name: "web_search", arguments: '{"query":"ignis"}' } }],
+      },
+      { role: "tool", content: "1. T\nhttps://t\nc", tool_call_id: "w1" },
+    ]);
+  });
+
+  it("answers an agent's call to agent as an unknown tool, without running it", async () => {
+    const bodies: ChatRequest[] = [];
+    tasksSeen.length = 0;
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      bodies.push(o.body as ChatRequest);
+      if (bodies.length === 1) o.onEvent(callEvent("agent", { name: "x", prompt: "y" }));
+      else o.onEvent({ kind: "content", text: "ok" });
+      return { ok: true, timeline: timeline() };
+    };
+    const [run] = await runAgents([task(1)], {
+      settings,
+      tools: webTools,
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      stream,
+      runWeb: doneWeb,
+    });
+    expect(run.status).toBe("done");
+    expect(tasksSeen).toEqual([0]);
+    expect(run.web?.[0].status).toBe("failed");
+    expect(bodies[1].messages.at(-1)?.content).toMatch(/Unknown tool "agent": the tools available are "web_search", "web_fetch"/);
+  });
+
+  it("fails an agent that keeps calling tools", async () => {
+    let calls = 0;
+    const stream = async (o: StreamOptions): Promise<StreamResult> => {
+      calls++;
+      o.onEvent(callEvent("web_search", { query: "again" }));
+      return { ok: true, timeline: timeline() };
+    };
+    const [run] = await runAgents([task(1)], {
+      settings,
+      tools: webTools,
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      stream,
+      runWeb: doneWeb,
+    });
+    expect(calls).toBe(9);
+    expect(run).toMatchObject({ status: "failed", error: expect.stringMatching(/at most 8 times/) });
   });
 });

@@ -56,7 +56,10 @@ function AgentCard({ run, now, open, onOpen }: { run: AgentRun; now: number; ope
         <span className={`block h-0.5 ${bar}`} aria-hidden />
       )}
       <span className="flex items-baseline justify-between gap-2 font-display text-xs tabular-nums">
-        <span className={run.status === "failed" ? "text-fault" : "text-ash"}>{statusLine(run, now)}</span>
+        <span className={run.status === "failed" ? "text-fault" : "text-ash"}>
+          {statusLine(run, now)}
+          {run.web?.length ? `, ${run.web.length} web` : ""}
+        </span>
         {d && run.status === "done" && <span className="font-semibold text-ember">{d.decode}</span>}
       </span>
     </button>

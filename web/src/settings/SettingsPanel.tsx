@@ -1,5 +1,5 @@
 import { REASONING_EFFORTS } from "../api/request.ts";
-import { ignisPrompt, type ToolsState } from "../tools/index.ts";
+import { ignisPrompt, setAllTools, type ToolsState } from "../tools/index.ts";
 import { setTavilyKey, useTavilyKey } from "../tools/web/tavilyKey.ts";
 import { caption, field } from "../ui/classes.ts";
 import { Segmented } from "../ui/Segmented.tsx";
@@ -80,30 +80,41 @@ export function SettingsPanel(props: {
 function ToolsSetting({ tools, onChange }: { tools: ToolsState; onChange: (tools: ToolsState) => void }) {
   return (
     <fieldset className="flex flex-col gap-2">
-      <legend className={`${caption} mb-2`}>Tools</legend>
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
-          <span id="tool-agents-label" className="font-display text-sm font-semibold text-ink">
-            Agents
-          </span>
-          <span className="text-xs leading-snug text-ash">
-            The model can hand sub-tasks to agents that run in parallel on agent lanes.
-          </span>
-        </div>
-        <Switch on={tools.agents} onChange={(agents) => onChange({ ...tools, agents })} labelledBy="tool-agents-label" />
+      <legend className="sr-only">Tools</legend>
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span id="tools-all-label" className={caption}>
+          Tools
+        </span>
+        <Switch on={tools.enabled} onChange={(on) => onChange(setAllTools(tools, on))} labelledBy="tools-all-label" />
       </div>
-      <div className="mt-2 flex items-start justify-between gap-3">
-        <div className="flex flex-col gap-0.5">
-          <span id="tool-web-label" className="font-display text-sm font-semibold text-ink">
-            Web
-          </span>
-          <span className="text-xs leading-snug text-ash">
-            The model can search the web (Tavily) and read pages (r.jina.ai), from this browser.
-          </span>
+      {tools.enabled && (
+      <div className="flex flex-col gap-2">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex flex-col gap-0.5">
+            <span id="tool-agents-label" className="font-display text-sm font-semibold text-ink">
+              Agents
+            </span>
+            <span className="text-xs leading-snug text-ash">
+              The model can hand sub-tasks to agents that run in parallel on agent lanes. Agents get the other tools
+              that are on.
+            </span>
+          </div>
+          <Switch on={tools.agents} onChange={(agents) => onChange({ ...tools, agents })} labelledBy="tool-agents-label" />
         </div>
-        <Switch on={tools.web} onChange={(web) => onChange({ ...tools, web })} labelledBy="tool-web-label" />
+        <div className="mt-2 flex items-start justify-between gap-3">
+          <div className="flex flex-col gap-0.5">
+            <span id="tool-web-label" className="font-display text-sm font-semibold text-ink">
+              Web
+            </span>
+            <span className="text-xs leading-snug text-ash">
+              The model can search the web and read pages, from this browser.
+            </span>
+          </div>
+          <Switch on={tools.web} onChange={(web) => onChange({ ...tools, web })} labelledBy="tool-web-label" />
+        </div>
+        {tools.web && <TavilyKeyField />}
       </div>
-      {tools.web && <TavilyKeyField />}
+      )}
     </fieldset>
   );
 }

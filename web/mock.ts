@@ -16,8 +16,9 @@ import type { Plugin } from "vite";
 // request streams a longer report at its own pace.
 //
 // Web: with `web_search` declared, a prompt containing "/web" streams one
-// search and one page read. The calls themselves run in the browser against
-// the real Tavily and r.jina.ai, as in production.
+// search and one page read; an agent-lane request with the web tools whose
+// task contains "/web" searches once before its report ("/agents /web …").
+// The calls themselves run in the browser against the real services.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -83,7 +84,11 @@ export function mockIgnis(): Plugin {
         let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
         let calls: { tool: string; args: object }[] = [];
         let pace = 120;
-        if (body.class === "agent") {
+        if (body.class === "agent" && offersWeb && lastRole === "user" && last.includes("/web")) {
+          // An agent with web tools whose task mentions "/web" searches before it reports.
+          content = ["Searching ", "first."];
+          calls = [{ tool: "web_search", args: { query: last.replace(/^.*\/web/s, "").trim() || "ignis inference engine" } }];
+        } else if (body.class === "agent") {
           const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
           content = words.split(/(?<= )/);
           pace = 70 + Math.floor(Math.random() * 120);

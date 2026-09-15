@@ -137,7 +137,7 @@ export function App() {
             key={readerRun.callId}
             run={readerRun}
             markdown={markdown}
-            systemPrompt={AGENT_SYSTEM_PROMPT}
+            systemPrompt={readerRun.systemPrompt ?? AGENT_SYSTEM_PROMPT}
             figures={readerRun.figures && <Readout figures={readerRun.figures} />}
             onClose={closeReader}
           />
