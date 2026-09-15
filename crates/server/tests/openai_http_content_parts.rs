@@ -237,6 +237,18 @@ async fn malformed_parts_are_refused_naming_the_part() {
 }
 
 #[tokio::test]
+async fn a_malformed_part_anywhere_wins_over_an_earlier_media_refusal() {
+    let (status, body) = chat(json!([
+        { "role": "user", "content": [
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+        ] },
+        { "role": "user", "content": [{ "type": "text" }] }
+    ]))
+    .await;
+    assert_refused(status, &body, "invalid_request_error", &["message 1", "part 0"]);
+}
+
+#[tokio::test]
 async fn an_empty_parts_array_is_refused() {
     let (status, body) = chat(json!([{ "role": "user", "content": [] }])).await;
     assert_refused(status, &body, "invalid_request_error", &["message 0"]);

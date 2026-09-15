@@ -169,12 +169,18 @@ pub struct ContentRejection {
 /// alike — unlike the reference's OpenAI schema, which refuses non-text
 /// parts on a tool message: a browser tool's screenshot result must reach
 /// the model the way its text does (spec user story 6).
+///
+/// Shape errors are checked across the whole conversation before any media
+/// refusal (the reference's order: schema first, then the vision check), so
+/// a malformed request is told it is malformed rather than that vision is
+/// off.
 pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentRejection> {
     let refuse = |code, message: String| Err(ContentRejection { code, message });
-    for (i, message) in messages.iter().enumerate() {
-        let MessageContent::Parts(parts) = &message.content else {
-            continue;
-        };
+    let parts = messages.iter().enumerate().filter_map(|(i, message)| match &message.content {
+        MessageContent::Parts(parts) => Some((i, message, parts)),
+        MessageContent::Text(_) => None,
+    });
+    for (i, _, parts) in parts.clone() {
         if parts.is_empty() {
             return refuse("invalid_request_error", format!("message {i} content must not be empty"));
         }
@@ -191,25 +197,13 @@ pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentReject
                     )
                 }
                 Some("text") => {}
-                Some(media @ ("image_url" | "video_url")) => {
-                    if part.url.is_none() {
-                        return refuse(
-                            "invalid_request_error",
-                            format!("{at}: {media} must be an object containing a string url"),
-                        );
-                    }
-                    if message.role == "system" {
-                        return refuse(
-                            "invalid_media",
-                            format!("{at}: system messages cannot contain images or videos"),
-                        );
-                    }
-                    return if media == "video_url" {
-                        refuse("video_unsupported", format!("{at}: video input is not supported"))
-                    } else {
-                        refuse("vision_disabled", format!("{at}: vision is disabled for this server"))
-                    };
+                Some(media @ ("image_url" | "video_url")) if part.url.is_none() => {
+                    return refuse(
+                        "invalid_request_error",
+                        format!("{at}: {media} must be an object containing a string url"),
+                    )
                 }
+                Some("image_url" | "video_url") => {}
                 Some(other) => {
                     return refuse(
                         "invalid_request_error",
@@ -217,6 +211,27 @@ pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentReject
                     )
                 }
             }
+        }
+    }
+    for (i, message, parts) in parts {
+        for (j, part) in parts.iter().enumerate() {
+            let at = format!("message {i} content part {j}");
+            let video = match part.kind.as_deref() {
+                Some("image_url") => false,
+                Some("video_url") => true,
+                _ => continue,
+            };
+            if message.role == "system" {
+                return refuse(
+                    "invalid_media",
+                    format!("{at}: system messages cannot contain images or videos"),
+                );
+            }
+            return if video {
+                refuse("video_unsupported", format!("{at}: video input is not supported"))
+            } else {
+                refuse("vision_disabled", format!("{at}: vision is disabled for this server"))
+            };
         }
     }
     Ok(())
