@@ -17,6 +17,8 @@
 //! language; clients of a dev build should not treat `content` as
 //! natural text.
 
+use ignis_artifact::vision::{layout, MediaItem, PreparedMedia, ProcessorError, IMAGE_PAD_ID};
+use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -184,7 +186,8 @@ pub struct ContentRejection {
 ///   media there). Checked first: it is wrong on any server, with or
 ///   without vision.
 /// - `video_url` → `video_unsupported` (images only, spec §Scope).
-/// - `image_url` → `vision_disabled`.
+/// - `image_url` → `vision_disabled`, unless `vision` (a `--vision` load,
+///   GitHub #179), where it passes to media acquisition.
 /// - an unknown part type → `modality_not_supported` (the reference's code
 ///   and wording).
 /// - an empty array, a part without a string `type`, a `text` part without
@@ -201,7 +204,7 @@ pub struct ContentRejection {
 /// shape errors (its schema), then media (its vision check), then unknown
 /// types (its prompt translation) — so a malformed request is told it is
 /// malformed rather than that vision is off.
-pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentRejection> {
+pub fn check_content_parts(messages: &[ChatMessage], vision: bool) -> Result<(), ContentRejection> {
     let refuse = |code, message: String| Err(ContentRejection { code, message });
     let parts = messages.iter().enumerate().filter_map(|(i, message)| match &message.content {
         MessageContent::Parts(parts) => Some((i, message, parts)),
@@ -248,11 +251,12 @@ pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentReject
                     format!("{at}: system messages cannot contain images or videos"),
                 );
             }
-            return if video {
-                refuse("video_unsupported", format!("{at}: video input is not supported"))
-            } else {
-                refuse("vision_disabled", format!("{at}: vision is disabled for this server"))
-            };
+            if video {
+                return refuse("video_unsupported", format!("{at}: video input is not supported"));
+            }
+            if !vision {
+                return refuse("vision_disabled", format!("{at}: vision is disabled for this server"));
+            }
         }
     }
     for (i, _, parts) in parts {
@@ -350,6 +354,32 @@ pub trait TemplateProvider: Send + Sync {
     fn decoder_starts_in_reasoning(&self, thinking: &ThinkingOptions) -> bool {
         thinking.enable_thinking
     }
+
+    /// Apply the chat template to a conversation carrying images (GitHub
+    /// #179): `media` are its image parts' prepared payloads in prompt
+    /// order. Each image's placeholder expands to its merged-grid run, and
+    /// the prompt comes back with its three-axis positions, `rope_delta` and
+    /// media items. A provider that cannot render images refuses with
+    /// `vision_disabled`.
+    fn prepare_multimodal(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+        let _ = (messages, options, tools, media);
+        Err(ContentRejection {
+            code: "vision_disabled",
+            message: "this server's chat template cannot render images".to_owned(),
+        })
+    }
+}
+
+/// A prepared prompt's refusal as a content rejection: the processor's own
+/// wire code (`invalid_media` or `media_budget_exceeded`).
+pub fn processor_rejection(error: ProcessorError) -> ContentRejection {
+    ContentRejection { code: error.code(), message: error.to_string() }
 }
 
 /// The minimal built-in provider (v1 placeholder, replaced by artifact-02):
@@ -409,6 +439,62 @@ impl TemplateProvider for SimpleTemplateProvider {
         // options (see the trait doc for why this must not default to
         // `thinking.enable_thinking` here).
         false
+    }
+
+    /// The placeholder's words, with each image part replaced by its
+    /// merged-grid run of `<|image_pad|>` ids, laid out by the processor's
+    /// own position rules.
+    fn prepare_multimodal(
+        &self,
+        messages: &[ChatMessage],
+        _options: &ThinkingOptions,
+        _tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+        let mut tokens = Vec::new();
+        let mut images = media.iter();
+        for message in messages {
+            let word = |word: &str| fnv1a32(format!("{}:{}", message.role, word).as_bytes());
+            match &message.content {
+                MessageContent::Text(text) => tokens.extend(text.split_whitespace().map(word)),
+                MessageContent::Parts(parts) => {
+                    for part in parts {
+                        match (part.kind.as_deref(), &part.text) {
+                            (Some("image_url"), _) => {
+                                let image = images.next().ok_or_else(|| {
+                                    processor_rejection(ProcessorError::PlaceholderMismatch(
+                                        "more image parts than prepared media",
+                                    ))
+                                })?;
+                                let run = image.grid.vision_tokens() as usize;
+                                tokens.extend(std::iter::repeat_n(IMAGE_PAD_ID, run));
+                            }
+                            (_, Some(text)) => tokens.extend(text.split_whitespace().map(word)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if images.next().is_some() {
+            return Err(processor_rejection(ProcessorError::PlaceholderMismatch(
+                "fewer image parts than prepared media",
+            )));
+        }
+        let grids: Vec<_> = media.iter().map(|m| m.grid).collect();
+        let (positions, spans, rope_delta) =
+            layout::assign_positions(&layout::token_types(&tokens), &grids).map_err(processor_rejection)?;
+        let media = media
+            .into_iter()
+            .zip(spans)
+            .map(|(m, token_span)| MediaItem {
+                grid: m.grid,
+                token_span,
+                patches: m.patches,
+                content_digest: m.content_digest,
+            })
+            .collect();
+        Ok((tokens, Multimodal { positions, rope_delta, media }))
     }
 }
 

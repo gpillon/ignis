@@ -29,7 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 
 [dev-dependencies]
-# Encodes the flat test images `tests/openai_http_media.rs` serves.
+# Encodes the flat test images the media tests send (`tests/support/media.rs`).
 png = "0.18"
 tower = { workspace = true }
 http-body-util = { workspace = true }

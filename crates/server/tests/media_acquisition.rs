@@ -14,7 +14,7 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -25,40 +25,15 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 
-use ignis_artifact::vision::{
-    Grid, InvalidMedia, PreparedMedia, ProcessorError, ProcessorOptions, VisionProcessor, IMAGE_PAD,
-    IMAGE_PAD_ID, VIDEO_PAD, VIDEO_PAD_ID,
-};
-use ignis_artifact::Tokenizer;
-use ignis_server::media::{AcquiredMedia, MediaAcquirer, MediaPolicy, MediaRejection, Preparer};
+use ignis_artifact::vision::{Grid, ProcessorOptions};
+use ignis_server::media::{AcquiredMedia, MediaAcquirer, MediaPolicy, MediaRejection};
 use ignis_server::template::{ChatMessage, ContentPart, MessageContent};
 
+#[path = "support/mod.rs"]
+mod support;
+use support::media::{data_uri, png, processor, until, Gated};
+
 // ── fixtures ────────────────────────────────────────────────────────────────
-
-/// A flat RGB PNG.
-fn png(width: u32, height: u32) -> Vec<u8> {
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().unwrap();
-        writer.write_image_data(&vec![100u8; (width * height * 3) as usize]).unwrap();
-    }
-    out
-}
-
-fn data_uri(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = "data:image/png;base64,".to_owned();
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
-        }
-    }
-    out
-}
 
 /// Limits far above the 64x64 test image, so a test lowers only the one it
 /// probes.
@@ -71,23 +46,6 @@ fn limits() -> ProcessorOptions {
         max_raw_patches: 1 << 16,
         max_vision_tokens: 1 << 14,
     }
-}
-
-/// The real processor over a word-level tokenizer carrying the model
-/// contract's placeholder ids.
-fn processor(limits: ProcessorOptions) -> VisionProcessor {
-    let added = |id: u32, content: &str| {
-        serde_json::json!({"id": id, "content": content, "single_word": false, "lstrip": false,
-                           "rstrip": false, "normalized": false, "special": true})
-    };
-    let json = serde_json::json!({
-        "version": "1.0",
-        "added_tokens": [added(IMAGE_PAD_ID, IMAGE_PAD), added(VIDEO_PAD_ID, VIDEO_PAD)],
-        "pre_tokenizer": {"type": "Whitespace"},
-        "model": {"type": "WordLevel", "vocab": {"x": 0, IMAGE_PAD: IMAGE_PAD_ID, VIDEO_PAD: VIDEO_PAD_ID}, "unk_token": "x"},
-    });
-    let tokenizer = Tokenizer::from_bytes(json.to_string().as_bytes()).unwrap();
-    VisionProcessor::new(&tokenizer, limits).unwrap()
 }
 
 fn acquirer(limits: ProcessorOptions, policy: MediaPolicy) -> MediaAcquirer {
@@ -119,16 +77,6 @@ fn assert_refused(result: Result<AcquiredMedia, MediaRejection>, code: &str) -> 
     let rejection = result.expect_err("expected a refusal");
     assert_eq!((rejection.status, rejection.code), (400, code), "{}", rejection.message);
     rejection
-}
-
-/// Poll `condition` until it holds (bounded, so a broken build fails the
-/// test instead of hanging it).
-async fn until(what: &str, condition: impl Fn() -> bool) {
-    let start = Instant::now();
-    while !condition() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
 }
 
 // ── the image server ────────────────────────────────────────────────────────
@@ -301,45 +249,9 @@ async fn the_vision_token_budget_accepts_exactly_its_limit_across_the_request() 
 
 // ── cache, single-flight, cancellation ─────────────────────────────────────
 
-/// The real processor behind a gate: counts builds, and holds each build
-/// until released — or until nobody wants it, which it records.
-struct Gated {
-    inner: VisionProcessor,
-    open: AtomicBool,
-    builds: AtomicUsize,
-    observed_cancel: AtomicBool,
-}
-
-impl Gated {
-    fn new(open: bool) -> Arc<Self> {
-        Arc::new(Self {
-            inner: processor(limits()),
-            open: AtomicBool::new(open),
-            builds: AtomicUsize::new(0),
-            observed_cancel: AtomicBool::new(false),
-        })
-    }
-}
-
-impl Preparer for Gated {
-    fn prepare_media(&self, item: usize, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<PreparedMedia, ProcessorError> {
-        self.builds.fetch_add(1, Ordering::SeqCst);
-        loop {
-            if self.open.load(Ordering::SeqCst) {
-                return self.inner.prepare_media(item, bytes);
-            }
-            if cancelled() {
-                self.observed_cancel.store(true, Ordering::SeqCst);
-                return Err(ProcessorError::InvalidMedia { item, reason: InvalidMedia::Undecodable("cancelled".to_owned()) });
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
 #[tokio::test]
 async fn the_same_image_sent_twice_is_a_cache_hit_the_second_time() {
-    let gated = Gated::new(true);
+    let gated = Gated::new(true, processor(limits()));
     let acquirer = MediaAcquirer::new(gated.clone(), limits(), MediaPolicy::new(false, 1 << 20));
     let image = data_uri(&png(64, 64));
 
@@ -354,7 +266,7 @@ async fn the_same_image_sent_twice_is_a_cache_hit_the_second_time() {
 
 #[tokio::test]
 async fn a_zero_cache_retains_nothing() {
-    let gated = Gated::new(true);
+    let gated = Gated::new(true, processor(limits()));
     let acquirer = MediaAcquirer::new(gated.clone(), limits(), MediaPolicy::new(false, 0));
     let image = data_uri(&png(64, 64));
     for _ in 0..2 {
@@ -366,7 +278,7 @@ async fn a_zero_cache_retains_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_concurrent_identical_misses_build_once() {
-    let gated = Gated::new(false);
+    let gated = Gated::new(false, processor(limits()));
     let acquirer = Arc::new(MediaAcquirer::new(gated.clone(), limits(), MediaPolicy::new(false, 0)));
     let image = data_uri(&png(64, 64));
     let request = |acquirer: Arc<MediaAcquirer>, image: String| {
@@ -388,7 +300,7 @@ async fn two_concurrent_identical_misses_build_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_acquisition_stops_the_preparation() {
-    let gated = Gated::new(false);
+    let gated = Gated::new(false, processor(limits()));
     let acquirer = Arc::new(MediaAcquirer::new(gated.clone(), limits(), MediaPolicy::new(false, 1 << 20)));
     let image = data_uri(&png(64, 64));
     let task = {
@@ -409,7 +321,7 @@ async fn dropping_the_acquisition_stops_the_preparation() {
 
 #[tokio::test]
 async fn a_passed_deadline_is_a_request_timeout() {
-    let gated = Gated::new(false);
+    let gated = Gated::new(false, processor(limits()));
     let acquirer = MediaAcquirer::new(gated, limits(), MediaPolicy::new(false, 0));
     let image = data_uri(&png(64, 64));
     let rejection = acquirer

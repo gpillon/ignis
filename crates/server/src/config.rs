@@ -315,6 +315,15 @@ pub fn resolve(
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
+    // GitHub #178: DFlash2's drafter does not follow a multimodal prompt yet,
+    // so the two load options are refused together here, before any load
+    // work, as the reference refuses `--spec dflash` with `--vision`.
+    if vision.is_some() && speculation.is_some_and(|s| s.backend() == SpeculativeBackend::Dflash2) {
+        return Err(ConfigError(
+            "`--vision` cannot be combined with `--spec dflash2` yet (speculative decoding does not follow image prompts)"
+                .to_owned(),
+        ));
+    }
     let media = resolve_media(vision.is_some(), media_allow_private_network, media_cache_mib, &env)?;
     // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
     // address without turning metrics on is refused rather than ignored, and
@@ -1353,6 +1362,18 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
+    }
+
+    #[test]
+    fn vision_with_dflash2_is_refused_naming_both() {
+        let a = args(&["--vision", "--spec", "dflash2", "--draft-tokens", "4"]);
+        let err = resolve(&a, no_env).expect_err("vision + dflash2");
+        assert!(err.0.contains("--vision") && err.0.contains("dflash2"), "{}", err.0);
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "4")]);
+        assert!(resolve(&[], env).is_err(), "the env form too");
+        // Each alone still loads.
+        assert!(resolve(&args(&["--vision"]), no_env).is_ok());
+        assert!(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).is_ok());
     }
 
     // ── media acquisition (GitHub #179) ──────────────────────────────────

@@ -55,7 +55,8 @@ pub struct MediaStats {
     pub vision_tokens: u64,
     /// Acquired (encoded) bytes across the items.
     pub media_bytes: u64,
-    /// Wall time from the first acquisition to the last prepared item.
+    /// Seconds spent decoding, resizing and packing the items this request
+    /// prepared itself (a cache hit costs none).
     pub preprocess_seconds: f64,
     /// Items served from the media cache (including single-flight joins).
     pub cache_hits: u32,
@@ -143,6 +144,31 @@ fn image_parts(messages: &[ChatMessage]) -> Vec<MediaPart> {
         }
     }
     out
+}
+
+/// The processor a `--vision` load prepares images with: the artifact's
+/// pixel bounds and the reference's limits, with the vision-token budget
+/// capped by the load's envelope and context (`min(max_context,
+/// --vision-max-tokens)`, spec §Scope) and the raw patches it implies.
+pub fn load_processor(
+    frontend: &ignis_artifact::FrontendSet,
+    vision: ignis_core::Vision,
+    max_context: u32,
+) -> Result<VisionProcessor, ProcessorError> {
+    let mut options = frontend.vision_processor()?.options().clone();
+    options.max_vision_tokens = u64::from(vision.envelope_tokens(max_context));
+    options.max_raw_patches = options.max_vision_tokens * 4;
+    VisionProcessor::new(frontend.tokenizer(), options)
+}
+
+/// Whether any message carries an `image_url` part.
+pub fn has_media(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| match &message.content {
+        MessageContent::Parts(parts) => {
+            parts.iter().any(|part| part.kind.as_deref() == Some("image_url") && part.url.is_some())
+        }
+        MessageContent::Text(_) => false,
+    })
 }
 
 /// Where an image part's bytes come from.
@@ -293,8 +319,13 @@ impl fmt::Debug for MediaPolicy {
 /// The reference's disallowed ranges (`acquire.cpp` `private_ipv4` /
 /// `private_address`): IPv4 0/8, 10/8, 127/8, 169.254/16, 172.16/12,
 /// 192.168/16, CGNAT 100.64/10, benchmarking 198.18/15 and everything from
-/// 224/4 up; IPv6 unspecified, loopback, link-local, multicast, unique-local,
-/// and a v4-mapped address by its IPv4 rule.
+/// 224/4 up; IPv6 unspecified, loopback, link-local, multicast, unique-local.
+///
+/// Two departures, both closing holes: the reference's benchmarking check
+/// (`>> 17 == 0x633f`) matches the public 198.126/15 instead of 198.18/15;
+/// and an IPv6 address that carries an IPv4 one — v4-mapped, v4-compatible,
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16` — is judged by its IPv4 rule, with
+/// deprecated site-local `fec0::/10` refused too.
 pub fn private_address(address: IpAddr) -> bool {
     let v4 = |a: Ipv4Addr| {
         let a = u32::from(a);
@@ -305,21 +336,27 @@ pub fn private_address(address: IpAddr) -> bool {
             || a >> 20 == 0xac1
             || a >> 16 == 0xc0a8
             || a >> 22 == 0x0191
-            || a >> 17 == 0x633f
+            || a >> 17 == 0x6309
             || a >> 24 >= 224
     };
     match address {
         IpAddr::V4(a) => v4(a),
         IpAddr::V6(a) => {
+            let s = a.segments();
+            let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
             if let Some(mapped) = a.to_ipv4_mapped() {
                 return v4(mapped);
             }
-            let first = a.segments()[0];
-            a.is_unspecified()
-                || a.is_loopback()
-                || first & 0xffc0 == 0xfe80
-                || first & 0xff00 == 0xff00
-                || first & 0xfe00 == 0xfc00
+            if a.is_unspecified() || a.is_loopback() {
+                return true;
+            }
+            if s[..6] == [0; 6] || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4]) {
+                return v4(embedded(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return v4(embedded(s[1], s[2]));
+            }
+            s[0] & 0xffc0 == 0xfe80 || s[0] & 0xffc0 == 0xfec0 || s[0] & 0xff00 == 0xff00 || s[0] & 0xfe00 == 0xfc00
         }
     }
 }
@@ -353,8 +390,12 @@ fn fetch_error(error: reqwest::Error) -> AcquireError {
     }
 }
 
-/// An HTTP(S) image's bytes, at most `max_bytes` of them.
+/// An HTTP(S) image's bytes, at most `max_bytes` of them. The fetch timeout
+/// is one total across resolution and every redirect, and never outlasts the
+/// request `deadline`; running out of either is a fetch timeout.
 async fn fetch(url: &str, policy: &MediaPolicy, max_bytes: u64, deadline: Instant) -> Result<Vec<u8>, AcquireError> {
+    let deadline = deadline.min(Instant::now() + policy.fetch_timeout);
+    let timed_out = || AcquireError::FetchTimeout("media URL fetch timed out".to_owned());
     let invalid = || AcquireError::Invalid("media URL must be credential-free HTTP(S)".to_owned());
     let mut url = reqwest::Url::parse(url).map_err(|_| AcquireError::Invalid("invalid media URL".to_owned()))?;
     for hop in 0..=policy.max_redirects {
@@ -363,16 +404,18 @@ async fn fetch(url: &str, policy: &MediaPolicy, max_bytes: u64, deadline: Instan
         }
         let host = url.host_str().filter(|h| !h.is_empty()).ok_or_else(invalid)?.to_owned();
         let port = url.port_or_known_default().ok_or_else(invalid)?;
-        let address = resolve_allowed(&host, port, policy).await?;
+        let address = tokio::time::timeout_at(deadline.into(), resolve_allowed(&host, port, policy))
+            .await
+            .map_err(|_| timed_out())??;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(AcquireError::Deadline);
+            return Err(timed_out());
         }
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(policy.connect_timeout.min(remaining))
-            .timeout(policy.fetch_timeout.min(remaining))
+            .timeout(remaining)
             .resolve(host.trim_start_matches('[').trim_end_matches(']'), address)
             .user_agent("ignis/vision")
             .build()
@@ -709,14 +752,20 @@ impl MediaAcquirer {
                 Ok(MediaSource::Data(value)) => decode_data_uri(value, remaining),
                 Ok(MediaSource::Http(url)) => tokio::time::timeout_at(deadline.into(), fetch(url, &self.policy, remaining, deadline))
                     .await
-                    .unwrap_or(Err(AcquireError::Deadline)),
+                    .unwrap_or_else(|_| Err(AcquireError::FetchTimeout("media URL fetch timed out".to_owned()))),
             };
             let bytes = acquired.map_err(|error| error.rejection(&part.at))?;
             remaining -= bytes.len() as u64;
             stats.media_bytes += bytes.len() as u64;
-            let (digest, bytes) = tokio::task::spawn_blocking(move || (<[u8; 32]>::from(Sha256::digest(&bytes)), bytes))
-                .await
-                .expect("hashing does not panic");
+            // The digest is CPU work on up to the whole byte budget: on the
+            // pool, like the preparation it keys.
+            let permit = Arc::clone(&self.pool).acquire_owned().await.expect("the pool is never closed");
+            let (digest, bytes) = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                (<[u8; 32]>::from(Sha256::digest(&bytes)), bytes)
+            })
+            .await
+            .expect("hashing does not panic");
             tickets.push(self.cache.begin(digest, item, bytes, &self.preparer, &self.pool));
         }
         let (mut raw_patches, mut vision_tokens) = (0u64, 0u64);
@@ -817,6 +866,25 @@ mod tests {
         // even when the payload is not valid base64.
         let huge = format!("data:image/png;base64,{}", "*".repeat(1000));
         assert!(matches!(decode_data_uri(&huge, 10), Err(AcquireError::Budget(_))));
+    }
+
+    #[test]
+    fn the_address_classifier_refuses_private_ranges_and_their_ipv6_wrappings() {
+        let private = |s: &str| private_address(s.parse().unwrap());
+        for address in [
+            "0.1.2.3", "10.0.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+            "100.64.0.1", "100.127.255.255", "198.18.0.1", "198.19.255.255", "224.0.0.1", "255.255.255.255",
+            "::", "::1", "fe80::1", "fec0::1", "ff02::1", "fc00::1", "fd12::1",
+            "::ffff:10.0.0.1", "::10.0.0.1", "64:ff9b::7f00:1", "2002:c0a8:0101::1",
+        ] {
+            assert!(private(address), "{address} must be refused");
+        }
+        for address in [
+            "8.8.8.8", "172.32.0.1", "100.128.0.1", "198.17.255.255", "198.20.0.1", "198.126.0.1",
+            "2001:4860::8888", "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:0808:0808::1",
+        ] {
+            assert!(!private(address), "{address} is public");
+        }
     }
 
     #[test]
