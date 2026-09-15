@@ -43,6 +43,7 @@ pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUN
 
 pub use ignis_core::KvFormat;
 pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
 
 /// The fully-resolved config `main` needs to start the server — one field
 /// per env var, each independently resolved as flag → env → default.
@@ -80,6 +81,9 @@ pub struct Config {
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
     /// GitHub #150). `None` loads nothing of the drafter.
     pub speculation: Option<Speculation>,
+    /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
+    /// `None` binds and reserves nothing of the vision tower.
+    pub vision: Option<Vision>,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
@@ -207,6 +211,8 @@ pub fn resolve(
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
+    let mut vision = false;
+    let mut vision_max_tokens = None;
     let mut ui = false;
     let mut metrics_on = false;
     let mut metrics_bind = None;
@@ -230,6 +236,8 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--vision" => vision = true,
+            "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
@@ -274,6 +282,7 @@ pub fn resolve(
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
+    let vision = resolve_vision(vision, vision_max_tokens, &env)?;
     // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
     // address without turning metrics on is refused rather than ignored, and
     // it can never share the API's.
@@ -317,12 +326,60 @@ pub fn resolve(
         kv_pool_bytes,
         host_pool_bytes,
         speculation,
+        vision,
         request_timeout_secs,
         ui,
         metrics,
         api_key,
         expose,
     }))
+}
+
+/// `--vision` / `IGNIS_VISION` and `--vision-max-tokens` /
+/// `IGNIS_VISION_MAX_TOKENS` (GitHub #177). Vision is off unless asked for;
+/// an envelope with vision off has nothing to size, so naming one alone is
+/// refused rather than ignored. With vision on, the envelope defaults to
+/// [`DEFAULT_VISION_MAX_TOKENS`].
+fn resolve_vision(
+    flag: bool,
+    max_tokens: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Vision>, ConfigError> {
+    let on = if flag {
+        true
+    } else {
+        match non_empty(env("IGNIS_VISION")) {
+            None => false,
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "`IGNIS_VISION` must be true or false, got `{raw}`"
+                    )));
+                }
+            },
+        }
+    };
+    let max_tokens = max_tokens.or_else(|| non_empty(env("IGNIS_VISION_MAX_TOKENS")));
+    if !on {
+        return match max_tokens {
+            Some(raw) => Err(ConfigError(format!(
+                "`--vision-max-tokens {raw}` requires `--vision` (vision is off without it)"
+            ))),
+            None => Ok(None),
+        };
+    }
+    let Some(raw) = max_tokens else {
+        return Ok(Some(Vision::default()));
+    };
+    let out_of_range = || {
+        ConfigError(format!(
+            "`--vision-max-tokens` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got `{raw}`"
+        ))
+    };
+    let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
+    Vision::new(n).map(Some).map_err(|_| out_of_range())
 }
 
 /// `--spec` / `IGNIS_SPEC` and `--draft-tokens` / `IGNIS_DRAFT_TOKENS`
@@ -552,6 +609,8 @@ fn help_text() -> String {
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
+         \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
          \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics with --ui (default: off; flag only)\n\
          \x20       --metrics-bind <addr>     the metrics listener (default: {DEFAULT_METRICS_BIND}; flag only; needs --metrics; no API key, never exposed)\n\
@@ -1130,6 +1189,75 @@ mod tests {
         let config =
             expect_config(resolve(&args(&["--draft-tokens", "7"]), env).expect("resolve"));
         assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7), "flag must win over env");
+    }
+
+    // ── vision as a load option (GitHub #177) ─────────────────────────────
+
+    #[test]
+    fn vision_is_off_by_default() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.vision, None);
+    }
+
+    #[test]
+    fn the_vision_flag_loads_the_default_envelope() {
+        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        assert_eq!(config.vision, Some(Vision::default()));
+        assert_eq!(config.vision.unwrap().max_tokens(), DEFAULT_VISION_MAX_TOKENS);
+    }
+
+    #[test]
+    fn the_vision_envelope_can_be_lowered() {
+        let a = args(&["--vision", "--vision-max-tokens", "8192"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(8192));
+    }
+
+    #[test]
+    fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
+        let err = resolve(&args(&["--vision-max-tokens", "8192"]), no_env).expect_err("no vision");
+        assert!(err.0.contains("--vision"), "{}", err.0);
+        let env = env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")]);
+        assert!(resolve(&[], env).is_err(), "the env form too");
+    }
+
+    #[test]
+    fn a_vision_envelope_outside_the_range_is_refused_naming_it() {
+        for raw in ["0", "1048577", "-1", "lots"] {
+            let a = args(&["--vision", "--vision-max-tokens", raw]);
+            let err = resolve(&a, no_env).expect_err("out of range");
+            assert!(err.0.contains("--vision-max-tokens"), "{}", err.0);
+            assert!(err.0.contains("1048576"), "{}", err.0);
+            assert!(err.0.contains(raw), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn the_vision_env_vars_apply_and_the_flags_win_over_them() {
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(4096));
+
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
+        let a = args(&["--vision-max-tokens", "2048"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(2048), "flag must win over env");
+
+        let env = env_map(&[("IGNIS_VISION", "false")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).vision, None);
+
+        let env = env_map(&[("IGNIS_VISION", "maybe")]);
+        let err = resolve(&[], env).expect_err("bad bool");
+        assert!(err.0.contains("IGNIS_VISION") && err.0.contains("maybe"), "{}", err.0);
+    }
+
+    #[test]
+    fn help_lists_the_vision_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
     }
 
     #[test]

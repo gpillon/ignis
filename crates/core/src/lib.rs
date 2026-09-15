@@ -52,6 +52,7 @@ pub mod speculation;
 #[cfg(feature = "cuda")]
 pub mod step;
 pub mod types;
+pub mod vision;
 
 pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
@@ -72,6 +73,10 @@ pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
 pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler};
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+pub use vision::{
+    DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
+    VisionEnvelopeOutOfRange,
+};
 pub use types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SpecCounters, SubmitError,

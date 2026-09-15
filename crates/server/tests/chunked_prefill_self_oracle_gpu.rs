@@ -18,10 +18,11 @@
 
 use std::path::Path;
 
-use ignis_artifact::{CudaDevice, FrontendSet, Reader, bind_text_scope_27b, materialize};
+use ignis_artifact::{CudaDevice, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize};
+use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::{load_qwen38_27b, Model};
+use ignis_core::model_load::{load_qwen38_27b_with_options, Model};
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program_with_route, PrefillRoute};
 
@@ -116,6 +117,18 @@ fn run_route(
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
+    self_oracle(None);
+}
+
+/// GitHub #177: with the vision tower loaded and its workspace reserved, a
+/// text-only chunked prefill still matches the per-token self-oracle.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn chunked_and_per_token_prefill_agree_with_vision_loaded() {
+    self_oracle(Some(Vision::default()));
+}
+
+fn self_oracle(vision: Option<Vision>) {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
@@ -123,7 +136,9 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
 
-    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let scope = ModelScope { draft: None, vision: vision.is_some() };
+    let (plan, handles) =
+        bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
         Err(e) => {
@@ -133,7 +148,7 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let artifact = match materialize(&reader, &plan, &mut device, None) {
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
         Ok(artifact) => artifact,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
@@ -142,8 +157,17 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(&reader, &artifact, &handles, PREFILL_CHUNK, MAX_CONTEXT, ignis_core::KvFormat::Bf16)
-        .unwrap_or_else(|e| panic!("ignis_model_load: {e}"));
+    let model = load_qwen38_27b_with_options(
+        &reader,
+        &artifact,
+        &handles,
+        PREFILL_CHUNK,
+        MAX_CONTEXT,
+        ignis_core::KvFormat::Bf16,
+        None,
+        vision,
+    )
+    .unwrap_or_else(|e| panic!("ignis_model_load (vision {vision:?}): {e}"));
 
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let span = token_span(&frontend, SPAN_TOKENS + FIRST_N);
@@ -200,7 +224,7 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
         );
     }
     eprintln!(
-        "self-oracle: chunked/per-token agreement {}/{} = {:.1}% (floor {:.0}%)",
+        "self-oracle (vision {vision:?}): chunked/per-token agreement {}/{} = {:.1}% (floor {:.0}%)",
         result.agree,
         result.compared,
         result.agreement * 100.0,
@@ -217,4 +241,10 @@ fn chunked_and_per_token_prefill_agree_on_a_long_prompt() {
         result.agreement * 100.0,
         G1_AGREEMENT_FLOOR * 100.0
     );
+
+    // Two loads share this test binary (with and without vision): release the
+    // weights explicitly, or the second load finds no free VRAM.
+    drop(pool);
+    drop(model);
+    let _ = artifact.release_arena(&mut device);
 }

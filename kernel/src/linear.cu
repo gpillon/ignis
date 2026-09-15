@@ -20,16 +20,18 @@
 // small-T; the large-T W4A4/TMA sources compile but are verified only at G2).
 // P1-10 (GitHub #46) adds the BF16 and W8G32 arms (their dispatch headers
 // need no workspace, so `dispatch_linear`'s `workspace` parameter stays
-// NVFP4-only). Q4/Q5/Q6/FP8 are in the reference's registry but never used by
-// this model's artifact
-// (`.scratch/runtime/specs/01-device-resident-forward.md`), so they stay
-// unsupported here rather than being vendored for nothing.
+// NVFP4-only). GitHub #177 adds the Q4/Q5/Q6 row-split arms the vision tower
+// is stored in. FP8 is in the reference's registry but never used by this
+// model's artifact, so it stays unsupported here.
 
 #include "ninfer/ops/linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/q4/q4_dispatch.h"
+#include "ops/linear/q5/q5_dispatch.h"
+#include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstdint>
@@ -109,11 +111,20 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::W8G32_F16S:
         detail::w8_dispatch(x, w, out, policy, stream);
         return;
+    case QType::Q4G64_F16S:
+        detail::q4_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::Q5G64_F16S:
+        detail::q5_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::Q6G64_F16S:
+        detail::q6_dispatch(x, w, out, policy, stream);
+        return;
     default:
         break;
     }
     throw std::invalid_argument(
-        "linear: unsupported weight qtype (only NVFP4/BF16/W8G32 are vendored here)");
+        "linear: unsupported weight qtype (only NVFP4/BF16/W8G32/Q4/Q5/Q6 are vendored here)");
 }
 
 } // namespace
@@ -141,11 +152,23 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_w8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_w8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
+    case QType::Q4G64_F16S:
+        (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::Q5G64_F16S:
+        (void)detail::select_q5_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q5_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
+    case QType::Q6G64_F16S:
+        (void)detail::select_q6_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_q6_launch(output_rows, input_rows, max_tokens, policy);
+        return 0;
     default:
         break;
     }
     throw std::invalid_argument(
-        "linear workspace: unsupported weight qtype (only NVFP4/BF16/W8G32 are vendored here)");
+        "linear workspace: unsupported weight qtype (only NVFP4/BF16/W8G32/Q4/Q5/Q6 are vendored here)");
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

@@ -150,6 +150,10 @@ fn cuda_scheduler(
                     || "off".to_owned(),
                     |s| format!("{} draft_tokens={}", s.backend().as_str(), s.draft_tokens())
                 ),
+                vision = %shape.vision.map_or_else(
+                    || "off".to_owned(),
+                    |v| format!("max_tokens={}", v.max_tokens())
+                ),
                 "model loaded on the GPU"
             );
             Box::new(scheduler)
@@ -220,6 +224,7 @@ async fn main() {
         kv_pool_bytes: _,
         host_pool_bytes: _,
         speculation: _,
+        vision: _,
         request_timeout_secs,
         ui,
         metrics,

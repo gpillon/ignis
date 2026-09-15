@@ -485,6 +485,31 @@ ops `dflash2_propose_batch_impl` calls around the P5-01 drafter kernels:
   them to the window at the end of the same round instead
   (`kernel/src/dflash2_drafter.cu`, ours), so no tap outlives its round.
 
+GitHub #177 (Vision 3/7) vendors the ops the vision tower runs on, at the same
+pinned commit:
+
+- **vision encoder ops** — `layer_norm`, `gelu` (tanh and exact modes),
+  `add_bias`, `vision_pos_embed` (the bilinear 48×48 position-table add) and
+  `vision_attention` (segmented, `cu_seqlens` per image): each op's kernel
+  (`src/ops/kernel`), launcher (`src/ops/launcher`), wrapper
+  (`src/ops/wrapper`) and public header (`include/ninfer/ops`).
+- **scatter** — the same four files: it writes the encoder's `[5120, V]`
+  output over a prefill span's placeholder columns.
+- **prepare_ragged_prefix** — the same four files, vendored because the
+  reference's `test_scatter.cpp` calls it; nothing in the leaf does.
+- **Q4/Q5/Q6 row-split linear** — `src/ops/linear/q4/`, `q5/` and `q6/` in
+  full (dispatch, GEMV, small-T / SIMT / MMA kernels, and the q6 storage
+  header; the q4/q5 storage headers were already vendored). The leaf's own
+  `ops::linear` dispatcher (`kernel/src/linear.cu`, ours, no provenance
+  claim) gains the three arms, modelled on the reference's `linear.cpp`.
+- Vision RoPE frequencies need nothing new: `rope_vision_frequencies` and the
+  Vision rotation mode live in the already-vendored `rope` family (P1-15).
+- **their reference tests** — `tests/ops/test_{layer_norm,gelu,add_bias,
+  vision_pos_embed,vision_attention,scatter}.cpp`, unmodified, in the
+  `ignis_<op>_test` CTest loop; `tests/ops/linear/test_{q4,q5,q6}_a16.cpp`,
+  unmodified, each its own executable (`ignis_kernel_<q>_linear_tests`)
+  linking the leaf's `ops::linear` like the W8 test.
+
 ## Updating to a newer reference commit
 
 1. move the reference checkout to the new commit;

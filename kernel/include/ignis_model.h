@@ -139,11 +139,25 @@ struct ignis_model_load_options {
    * the window the verify graphs are captured at, and the only
    * `speculative_window` `ignis_program_decode` accepts besides 0. */
   uint32_t draft_tokens;
+  /* The vision envelope in merged vision tokens per request (GitHub #177);
+   * 0 = no vision. Nonzero binds every `vision/*` tensor and reserves, at
+   * load, the encoder workspace and the per-item `[5120, V]` output
+   * transient for V = min(max_context_tokens, vision_max_tokens) -- before
+   * the caller builds its sequence pool. At most
+   * IGNIS_VISION_MAX_TOKENS_LIMIT. */
+  uint32_t vision_max_tokens;
 };
+
+/* The widest vision envelope a load accepts, in merged tokens: 4x that many
+ * raw patches must fit the encoder's int32 extents with room to spare. */
+#define IGNIS_VISION_MAX_TOKENS_LIMIT (1u << 20)
 
 struct ignis_model_stats {
   uint64_t vram_bytes;        /* sum of every bound tensor's payload bytes */
   uint64_t bound_tensor_count;
+  /* The vision reservation beside the weights (GitHub #177): the encoder
+   * workspace plus the per-item output transient. 0 without vision. */
+  uint64_t vision_reserved_bytes;
 };
 
 /* Build the leaf's per-layer weight structures from `tensors` (`count`

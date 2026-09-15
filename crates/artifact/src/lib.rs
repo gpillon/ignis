@@ -60,8 +60,9 @@ pub use frontend::{
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};
 pub use normalize::{normalize_tensor, NormalizedTensor};
 pub use inventory::{
-    bind_model_scope_27b, bind_text_scope_27b, dflash2_scope_27b, model_scope_27b, DraftModule,
-    InventoryEntry, DFLASH2_LAYERS, OUT_OF_SCOPE_TEXT_NAMES, text_scope_27b,
+    bind_model_scope_27b, bind_model_scope_27b_with, bind_text_scope_27b, dflash2_scope_27b,
+    model_scope_27b, model_scope_27b_with, vision_scope_27b, DraftModule, InventoryEntry,
+    ModelScope, DFLASH2_LAYERS, OUT_OF_SCOPE_TEXT_NAMES, VISION_LAYERS, text_scope_27b,
 };
 
 // ---------------------------------------------------------------------------

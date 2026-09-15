@@ -69,6 +69,12 @@ pub struct CudaLeafConfig {
     /// and the sequence pool carries its per-slot window; `None` is today's
     /// load.
     pub speculation: Option<ignis_core::Speculation>,
+    /// Vision, fixed for the life of the model handle (GitHub #177). With it,
+    /// `handles` must carry the `vision/*` objects
+    /// (`ignis_artifact::bind_model_scope_27b_with`) and the load reserves the
+    /// encoder workspace and output transient before the pool is built;
+    /// `None` is today's load.
+    pub vision: Option<ignis_core::Vision>,
 }
 
 impl Default for CudaLeafConfig {
@@ -95,6 +101,7 @@ impl Default for CudaLeafConfig {
             slot_count: N_DECODE_LANES as u32,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
             speculation: None,
+            vision: None,
         }
     }
 }
@@ -227,7 +234,9 @@ impl StepLeaf for CudaLeaf {
         // The format reaches the load itself (P4-05, GitHub #123), not just
         // the pool: the leaf sizes its attention workspace from it, and the
         // GQA layers refuse a pool built in the other one.
-        let model = model_load::load_qwen38_27b_with_speculation(
+        // GitHub #177: the vision reservation is taken inside this load, so it
+        // is on the device before the pool below is built.
+        let model = model_load::load_qwen38_27b_with_options(
             &self.reader,
             &self.artifact,
             &self.handles,
@@ -235,6 +244,7 @@ impl StepLeaf for CudaLeaf {
             self.config.max_context_tokens,
             self.config.kv_format,
             self.config.speculation,
+            self.config.vision,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
@@ -272,6 +282,10 @@ impl StepLeaf for CudaLeaf {
             page_count = pool_stats.kv_page_group_count,
             token_capacity = pool_stats.kv_token_capacity,
             max_context_tokens = self.config.max_context_tokens,
+            // GitHub #177: what vision took before the pool (0 without it),
+            // beside the capacity the pool holds after it.
+            vision_max_tokens = self.config.vision.map_or(0, |v| v.max_tokens()),
+            vision_reserved_bytes = model.stats().vision_reserved_bytes,
             "kv pool"
         );
         // P3-05 (GitHub #102, ADR 0019): capture the decode graphs once,
@@ -559,6 +573,28 @@ mod tests {
         assert!(plan.token_capacity >= u64::from(config.max_context_tokens));
         assert_eq!(config.max_context_tokens, crate::DEFAULT_MAX_CONTEXT);
         assert_eq!(config.prefill_chunk_tokens, crate::DEFAULT_PREFILL_CHUNK);
+    }
+
+    #[test]
+    fn vision_leaves_the_derived_kv_capacity_as_it_is_today() {
+        // GitHub #177: the vision reservation is taken beside the operator's
+        // KV byte budget, not out of it -- the pool a load plans is the same
+        // with or without vision, for every format.
+        for format in [KvFormat::Bf16, KvFormat::HqE8_2b] {
+            let plain = CudaLeafConfig {
+                kv_format: format,
+                ..CudaLeafConfig::default()
+            };
+            let with_vision = CudaLeafConfig {
+                vision: Some(ignis_core::Vision::default()),
+                ..plain
+            };
+            assert_eq!(
+                with_vision.kv_pool_plan().expect("plan"),
+                plain.kv_pool_plan().expect("plan"),
+                "{format:?}"
+            );
+        }
     }
 
     #[test]

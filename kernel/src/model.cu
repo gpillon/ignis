@@ -41,6 +41,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/swa.h"
+#include "ninfer/ops/vision_attention.h"
 
 #include <cuda_runtime.h>
 
@@ -99,6 +100,14 @@ ninfer::Weight to_weight(const ignis_bound_tensor &t) {
   if (w.qtype == ninfer::QType::W8G32_F16S) {
     w.group_size = 32;
     w.group = 32;
+    w.scale_dtype = ninfer::DType::FP16;
+  }
+  // GitHub #177: the vision tower's Q4/Q5/Q6 row-split G64 weights, F16
+  // scales (the reference's `materialized_weight` for these qtypes).
+  if (w.qtype == ninfer::QType::Q4G64_F16S || w.qtype == ninfer::QType::Q5G64_F16S ||
+      w.qtype == ninfer::QType::Q6G64_F16S) {
+    w.group_size = 64;
+    w.group = 64;
     w.scale_dtype = ninfer::DType::FP16;
   }
   // The NVFP4 blockscale group geometry + scale dtype (constant for the
@@ -709,6 +718,105 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   return std::max(forward, append);
 }
 
+// GitHub #177: the vision tower's 333 objects, shapes from the reference's
+// `impl/vision/bindings.cpp` and (merger fc2, the 27B's own out width)
+// `qwen3_6_27b/impl/load/bindings.cpp`.
+bool bind_vision(ModelBinder &binder, const Geometry &g, VisionWeights &w) {
+  const int64_t h = kVisionHidden;
+  const int64_t inter = kVisionIntermediate;
+  if (!binder.bind("vision/patch_embedding", {h, kVisionPatchDim}, w.patch_embedding) ||
+      !binder.bind("vision/patch_embedding_bias", {h}, w.patch_embedding_bias) ||
+      !binder.bind("vision/position_embedding", {kVisionPositionEmbeddings, h},
+                   w.position_embedding)) {
+    return false;
+  }
+  for (int32_t l = 0; l < kVisionLayers; ++l) {
+    const std::string p = "vision/layers/" + std::to_string(l) + "/";
+    VisionLayerWeights &layer = w.layers[l];
+    if (!binder.bind(p + "attention/qkv", {3 * h, h}, layer.qkv) ||
+        !binder.bind(p + "attention/qkv_bias", {3 * h}, layer.qkv_bias) ||
+        !binder.bind(p + "attention/output", {h, h}, layer.output) ||
+        !binder.bind(p + "attention/output_bias", {h}, layer.output_bias) ||
+        !binder.bind(p + "mlp/fc1", {inter, h}, layer.fc1) ||
+        !binder.bind(p + "mlp/fc1_bias", {inter}, layer.fc1_bias) ||
+        !binder.bind(p + "mlp/fc2", {h, inter}, layer.fc2) ||
+        !binder.bind(p + "mlp/fc2_bias", {h}, layer.fc2_bias) ||
+        !binder.bind(p + "norm1/weight", {h}, layer.norm1_weight) ||
+        !binder.bind(p + "norm1/bias", {h}, layer.norm1_bias) ||
+        !binder.bind(p + "norm2/weight", {h}, layer.norm2_weight) ||
+        !binder.bind(p + "norm2/bias", {h}, layer.norm2_bias)) {
+      return false;
+    }
+  }
+  return binder.bind("vision/merger/fc1", {kVisionMergerHidden, kVisionMergerHidden},
+                     w.merger_fc1) &&
+         binder.bind("vision/merger/fc1_bias", {kVisionMergerHidden}, w.merger_fc1_bias) &&
+         binder.bind("vision/merger/fc2", {g.hidden, kVisionMergerHidden}, w.merger_fc2) &&
+         binder.bind("vision/merger/fc2_bias", {g.hidden}, w.merger_fc2_bias) &&
+         binder.bind("vision/merger/norm/weight", {h}, w.merger_norm_weight) &&
+         binder.bind("vision/merger/norm/bias", {h}, w.merger_norm_bias);
+}
+
+constexpr std::size_t kVisionWorkspaceAlignment = 256;
+
+// GitHub #177: the encoder workspace for `tokens` merged tokens over
+// `segments` images -- the reference's `build_workspace_layout`
+// (`impl/runtime/vision_context_impl.h`), region for region and scope for
+// scope, so the encoder (#178) runs out of exactly this layout.
+std::size_t vision_workspace_bytes(std::int32_t tokens, std::int32_t segments) {
+  using ninfer::DType;
+  const std::int32_t patches = tokens * kVisionMergeUnit;
+  ninfer::LayoutBuilder builder;
+  const auto add = [&](DType dtype, std::initializer_list<std::int32_t> shape, const char *label) {
+    (void)builder.add_tensor(dtype, shape, kVisionWorkspaceAlignment, label);
+  };
+  add(DType::I32, {patches, 2}, "vision position ids");
+  add(DType::I32, {segments + 1}, "vision segment bounds");
+  add(DType::I32, {4, patches}, "vision position indices");
+  add(DType::FP32, {4, patches}, "vision position weights");
+  add(DType::BF16, {kVisionHidden, patches}, "vision residual");
+  add(DType::BF16, {kVisionPatchDim, patches}, "vision BF16 patches");
+  {
+    auto attention_scope = builder.scope();
+    add(DType::BF16, {kVisionHidden, patches}, "vision attended");
+    {
+      auto qkv_scope = builder.scope();
+      add(DType::BF16, {3 * kVisionHidden, patches}, "vision QKV");
+      {
+        auto norm_scope = builder.scope();
+        add(DType::BF16, {kVisionHidden, patches}, "vision attention norm");
+      }
+      const std::size_t attention_bytes = ninfer::ops::vision_attention_workspace_capacity_bytes(
+          patches, patches, segments, segments);
+      if (attention_bytes != 0) {
+        (void)builder.add(attention_bytes, kVisionWorkspaceAlignment, "vision attention workspace");
+      }
+    }
+    add(DType::BF16, {kVisionHidden, patches}, "vision projected");
+  }
+  {
+    auto mlp_scope = builder.scope();
+    add(DType::BF16, {kVisionIntermediate, patches}, "vision MLP up");
+    {
+      auto norm_scope = builder.scope();
+      add(DType::BF16, {kVisionHidden, patches}, "vision MLP norm");
+    }
+    add(DType::BF16, {kVisionHidden, patches}, "vision MLP down");
+  }
+  add(DType::BF16, {kVisionHidden, patches}, "vision merger norm");
+  add(DType::BF16, {kVisionMergerHidden, tokens}, "vision merger hidden");
+  return builder.finish(1, "vision workspace");
+}
+
+// GitHub #177: one item's `[hidden, tokens]` BF16 encoder output (the
+// reference's `VisionContext::output_transient_bytes`).
+std::size_t vision_output_transient_bytes(std::int64_t hidden, std::int32_t tokens) {
+  ninfer::LayoutBuilder layout;
+  (void)layout.add_tensor(ninfer::DType::BF16, {static_cast<std::int32_t>(hidden), tokens},
+                          kVisionWorkspaceAlignment, "vision item output transient");
+  return layout.finish(kVisionWorkspaceAlignment, "vision item output transient layout");
+}
+
 } // namespace
 
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
@@ -771,6 +879,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // binding -- a NULL pointer is the production default, no speculation.
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
+  uint32_t vision_max_tokens = 0;
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
       set_error("ignis_model_load: options.size " + std::to_string(options->size) +
@@ -779,6 +888,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     }
     speculative_backend = options->speculative_backend;
     draft_tokens = options->draft_tokens;
+    vision_max_tokens = options->vision_max_tokens;
+  }
+  if (vision_max_tokens > IGNIS_VISION_MAX_TOKENS_LIMIT) {
+    set_error("ignis_model_load: vision_max_tokens " + std::to_string(vision_max_tokens) +
+              " exceeds " + std::to_string(IGNIS_VISION_MAX_TOKENS_LIMIT));
+    return -1;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
       speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
@@ -831,6 +946,10 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // Without the option the `dflash2/*` tensors are not asked for, so a caller
   // that hands them over anyway fails on `require_no_extras` below.
   if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
+    return -1;
+  }
+  // GitHub #177: likewise the `vision/*` tensors, only with an envelope.
+  if (vision_max_tokens > 0 && !bind_vision(binder, g, model->vision)) {
     return -1;
   }
 
@@ -911,6 +1030,37 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;
+  }
+
+  // GitHub #177: the vision reservation, taken here at load -- before the
+  // caller builds its sequence pool -- so enabling vision can never OOM a
+  // later request: the encoder workspace for the envelope's merged tokens
+  // (capped by the context) and one item's output transient. A reservation
+  // that does not fit the free memory fails the load naming it.
+  if (vision_max_tokens > 0) {
+    model->vision_max_tokens = vision_max_tokens;
+    try {
+      const auto tokens = static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens));
+      const std::size_t workspace_bytes =
+          vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
+      const std::size_t output_bytes = vision_output_transient_bytes(g.hidden, tokens);
+      std::size_t vision_free = 0;
+      std::size_t vision_total = 0;
+      if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess &&
+          workspace_bytes + output_bytes > vision_free) {
+        throw std::runtime_error("a " + std::to_string(tokens) + "-token vision envelope needs " +
+                                 std::to_string(workspace_bytes + output_bytes) +
+                                 " bytes, but only " + std::to_string(vision_free) +
+                                 " are free -- lower --vision-max-tokens");
+      }
+      model->vision_workspace = std::make_unique<ninfer::DeviceArena>(workspace_bytes);
+      model->vision_output = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+    } catch (const std::exception &e) {
+      set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());
+      cudaStreamDestroy(model->stream);
+      model->stream = nullptr;
+      return -1;
+    }
   }
 
   // P3-03 (GitHub #99): device-side sampling's stable staging buffers and its
@@ -1032,6 +1182,7 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   }
   out_stats->vram_bytes = model->vram_bytes;
   out_stats->bound_tensor_count = model->bound_tensor_count;
+  out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
   return 0;
 }
 

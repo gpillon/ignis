@@ -1718,6 +1718,9 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->verify != nullptr) {
     out_stats->vram_bytes += model->verify->device_bytes();
   }
+  // GitHub #177: the vision encoder workspace and output transient (its
+  // weights are already in `model->vram_bytes`).
+  out_stats->vram_bytes += model->vision_reserved_bytes();
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;

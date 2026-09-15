@@ -94,6 +94,49 @@ struct Dflash2Weights {
   ninfer::Weight selector_successor;
 };
 
+// GitHub #177: the vision tower's geometry (the reference's
+// `VisionBackboneConfig`, `targets/qwen3_6/export/.../vision.h`) and its
+// weights, named after the artifact's `vision/*` objects.
+inline constexpr std::int32_t kVisionLayers = 27;
+inline constexpr std::int32_t kVisionHidden = 1152;
+inline constexpr std::int32_t kVisionIntermediate = 4304;
+inline constexpr std::int32_t kVisionHeads = 16;
+inline constexpr std::int32_t kVisionPatchDim = 3 * 2 * 16 * 16;
+inline constexpr std::int32_t kVisionMergeUnit = 4;
+inline constexpr std::int32_t kVisionMergerHidden = kVisionHidden * kVisionMergeUnit;
+inline constexpr std::int32_t kVisionPositionEmbeddings = 48 * 48;
+// The frontend's per-request segment bound the workspace is sized for (the
+// reference's `kFrontendSegmentLimit`, 768 / 2).
+inline constexpr std::int32_t kVisionMaxSegments = 768 / 2;
+
+struct VisionLayerWeights {
+  ninfer::Weight qkv;
+  ninfer::Weight qkv_bias;
+  ninfer::Weight output;
+  ninfer::Weight output_bias;
+  ninfer::Weight fc1;
+  ninfer::Weight fc1_bias;
+  ninfer::Weight fc2;
+  ninfer::Weight fc2_bias;
+  ninfer::Weight norm1_weight;
+  ninfer::Weight norm1_bias;
+  ninfer::Weight norm2_weight;
+  ninfer::Weight norm2_bias;
+};
+
+struct VisionWeights {
+  ninfer::Weight patch_embedding;
+  ninfer::Weight patch_embedding_bias;
+  ninfer::Weight position_embedding;
+  std::array<VisionLayerWeights, kVisionLayers> layers{};
+  ninfer::Weight merger_fc1;
+  ninfer::Weight merger_fc1_bias;
+  ninfer::Weight merger_fc2;
+  ninfer::Weight merger_fc2_bias;
+  ninfer::Weight merger_norm_weight;
+  ninfer::Weight merger_norm_bias;
+};
+
 struct LayerWeights {
   ignis_layer_kind kind = IGNIS_LAYER_GDN;
   GqaLayerWeights gqa{};
@@ -295,6 +338,19 @@ struct ignis_model {
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   Dflash2Weights dflash2{};
+
+  // GitHub #177: the vision tower, bound in its stored formats when the load
+  // names a vision envelope (`vision_max_tokens > 0`), and its fixed device
+  // reservation -- the encoder workspace and one item's output transient,
+  // sized once for the envelope. Nothing runs on them yet (#178).
+  uint32_t vision_max_tokens = 0;
+  VisionWeights vision{};
+  std::unique_ptr<ninfer::DeviceArena> vision_workspace;
+  std::unique_ptr<ninfer::DeviceBuffer> vision_output;
+  uint64_t vision_reserved_bytes() const {
+    return (vision_workspace ? vision_workspace->capacity() : 0) +
+           (vision_output ? vision_output->bytes : 0);
+  }
 
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
   // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,

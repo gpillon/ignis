@@ -299,6 +299,19 @@ asserts. `crates/runtime/tests/cuda_leaf_dflash2_gpu.rs` drives the same
 drafter end to end through `RuntimeCompute`: the leaf passes no drafts, and
 every round's speculative counters match the lane's extent and committed run.
 
+Vision is a load option too (GitHub #177): `--vision` (with
+`--vision-max-tokens N`, default 32,768 merged tokens) binds the 333 `vision/*`
+objects in their stored Q4/Q5/Q6/W8/BF16 formats and reserves, inside
+`ignis_model_load` and so before the sequence pool is built, the encoder
+workspace and one item's `[5120, V]` output transient for
+`V = min(max_context, N)`. `ignis.runtime.kv_pool` reports it as
+`vision_reserved_bytes` beside the pool's `token_capacity`; the KV byte budget
+itself is the operator's and is not shrunk. Absent, nothing vision-related is
+bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
+(weights plus the reported reservation) and prints the reservation at the
+default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the
+envelope check and the leaf's vision schema host-side.
+
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`

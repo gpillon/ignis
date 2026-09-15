@@ -288,7 +288,100 @@ pub fn bind_model_scope_27b(
     reader: &Reader,
     draft: Option<DraftModule>,
 ) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
-    let entries = model_scope_27b(draft);
+    bind_model_scope_27b_with(reader, ModelScope { draft, vision: false })
+}
+
+// ---------------------------------------------------------------------------
+// The vision tower (GitHub #177)
+// ---------------------------------------------------------------------------
+
+/// The vision encoder's block count.
+pub const VISION_LAYERS: usize = 27;
+
+const SH_V_HIDDEN: [u64; 1] = [1152]; // the encoder width
+const SH_V_PATCH: [u64; 2] = [1152, 1536]; // hidden x (3 x 2 x 16 x 16)
+const SH_V_POSITION: [u64; 2] = [2304, 1152]; // the 48 x 48 position table
+const SH_V_QKV: [u64; 2] = [3456, 1152];
+const SH_V_QKV_BIAS: [u64; 1] = [3456];
+const SH_V_SQUARE: [u64; 2] = [1152, 1152];
+const SH_V_FC1: [u64; 2] = [4304, 1152];
+const SH_V_FC1_BIAS: [u64; 1] = [4304];
+const SH_V_FC2: [u64; 2] = [1152, 4304];
+const SH_V_MERGER: [u64; 2] = [4608, 4608]; // the 2 x 2 merge block
+const SH_V_MERGER_BIAS: [u64; 1] = [4608];
+const SH_V_MERGER_OUT: [u64; 2] = [5120, 4608]; // into the target's hidden width
+
+/// The 333 `vision/*` objects in the artifact's directory order (the
+/// reference's `qwen3.8-27b-artifact.md` §vision): patch embedding, bias and
+/// position table, 27 blocks of twelve, then the merger. Stored natively —
+/// Q6 patch embedding, Q4 qkv/fc1, Q5 output/fc2, W8 merger, BF16 biases and
+/// norms, every quantized one row-split. The `tests/real_artifact` cross-check
+/// pins this table against the container (ADR 0002).
+pub fn vision_scope_27b() -> Vec<InventoryEntry> {
+    let row_split = StorageLayout::RowSplitK128V1;
+    let q4 = (NumericFormat::Q4G64F16S, row_split);
+    let q5 = (NumericFormat::Q5G64F16S, row_split);
+    let q6 = (NumericFormat::Q6G64F16S, row_split);
+    let w8 = (NumericFormat::W8G32F16S, row_split);
+    let bf16 = (NumericFormat::Bf16, StorageLayout::ContiguousLeV1);
+    let mut entries = Vec::with_capacity(3 + VISION_LAYERS * 12 + 6);
+    let mut push = |name: &str, (format, layout): (NumericFormat, StorageLayout), shape: &'static [u64]| {
+        entries.push(mk(name, format, layout, shape));
+    };
+    push("vision/patch_embedding", q6, &SH_V_PATCH);
+    push("vision/patch_embedding_bias", bf16, &SH_V_HIDDEN);
+    push("vision/position_embedding", bf16, &SH_V_POSITION);
+    for b in 0..VISION_LAYERS {
+        let name = |suffix: &str| format!("vision/layers/{b}/{suffix}");
+        push(&name("attention/qkv"), q4, &SH_V_QKV);
+        push(&name("attention/qkv_bias"), bf16, &SH_V_QKV_BIAS);
+        push(&name("attention/output"), q5, &SH_V_SQUARE);
+        push(&name("attention/output_bias"), bf16, &SH_V_HIDDEN);
+        push(&name("mlp/fc1"), q4, &SH_V_FC1);
+        push(&name("mlp/fc1_bias"), bf16, &SH_V_FC1_BIAS);
+        push(&name("mlp/fc2"), q5, &SH_V_FC2);
+        push(&name("mlp/fc2_bias"), bf16, &SH_V_HIDDEN);
+        push(&name("norm1/weight"), bf16, &SH_V_HIDDEN);
+        push(&name("norm1/bias"), bf16, &SH_V_HIDDEN);
+        push(&name("norm2/weight"), bf16, &SH_V_HIDDEN);
+        push(&name("norm2/bias"), bf16, &SH_V_HIDDEN);
+    }
+    push("vision/merger/fc1", w8, &SH_V_MERGER);
+    push("vision/merger/fc1_bias", bf16, &SH_V_MERGER_BIAS);
+    push("vision/merger/fc2", w8, &SH_V_MERGER_OUT);
+    push("vision/merger/fc2_bias", bf16, &SH_HIDDEN);
+    push("vision/merger/norm/weight", bf16, &SH_V_HIDDEN);
+    push("vision/merger/norm/bias", bf16, &SH_V_HIDDEN);
+    entries
+}
+
+/// Every module a load binds beside the text scope: the drafter, the vision
+/// tower, both or neither (GitHub #177). The default is the text scope alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelScope {
+    pub draft: Option<DraftModule>,
+    pub vision: bool,
+}
+
+/// [`model_scope_27b`] for a full [`ModelScope`]: the text scope, then the
+/// drafter's objects, then the vision tower's — so neither module moves a
+/// text placement, and the vision tower does not move the drafter's.
+pub fn model_scope_27b_with(scope: ModelScope) -> Vec<InventoryEntry> {
+    let mut entries = model_scope_27b(scope.draft);
+    if scope.vision {
+        entries.extend(vision_scope_27b());
+    }
+    entries
+}
+
+/// [`bind_model_scope_27b`] for a full [`ModelScope`]. A missing or
+/// mis-shaped vision object is a load failure naming it. Returns the handles
+/// in [`model_scope_27b_with`] order.
+pub fn bind_model_scope_27b_with(
+    reader: &Reader,
+    scope: ModelScope,
+) -> Result<(MaterializationPlan, Vec<ObjectHandle>)> {
+    let entries = model_scope_27b_with(scope);
     let mut binder = Binder::new(reader);
     let mut handles = Vec::with_capacity(entries.len());
     bind_entries(&mut binder, &entries, &mut handles)?;
@@ -499,6 +592,43 @@ mod tests {
         assert_eq!(scope.len(), text.len() + 66);
         assert_eq!(&scope[..text.len()], text.as_slice(), "text entries unchanged and first");
         assert_eq!(&scope[text.len()..], dflash2_scope_27b().as_slice());
+    }
+
+    #[test]
+    fn the_vision_scope_is_the_artifacts_333_objects_in_their_stored_formats() {
+        let vision = vision_scope_27b();
+        assert_eq!(vision.len(), 333);
+        let mut by_format = BTreeMap::new();
+        for entry in &vision {
+            assert!(entry.name.starts_with("vision/"), "{}", entry.name);
+            *by_format.entry(entry.format.name()).or_insert(0) += 1;
+            // Every entry's (layout, format, shape) is a valid encoding.
+            tensor_encoded_size(entry.layout, entry.format, entry.shape)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.name));
+        }
+        assert_eq!(by_format["Q6G64_F16S"], 1);
+        assert_eq!(by_format["Q4G64_F16S"], 54);
+        assert_eq!(by_format["Q5G64_F16S"], 54);
+        assert_eq!(by_format["W8G32_F16S"], 2);
+        assert_eq!(by_format["BF16"], 222);
+        let names: std::collections::BTreeSet<_> = vision.iter().map(|e| e.name).collect();
+        assert_eq!(names.len(), 333, "no duplicate name");
+    }
+
+    #[test]
+    fn the_model_scope_appends_vision_after_the_text_and_the_drafter() {
+        assert_eq!(model_scope_27b_with(ModelScope::default()), text_scope_27b());
+        let text = text_scope_27b();
+        let vision = vision_scope_27b();
+
+        let only_vision = model_scope_27b_with(ModelScope { draft: None, vision: true });
+        assert_eq!(&only_vision[..text.len()], text.as_slice());
+        assert_eq!(&only_vision[text.len()..], vision.as_slice());
+
+        let both = model_scope_27b_with(ModelScope { draft: Some(DraftModule::Dflash2), vision: true });
+        let with_drafter = model_scope_27b(Some(DraftModule::Dflash2));
+        assert_eq!(&both[..with_drafter.len()], with_drafter.as_slice());
+        assert_eq!(&both[with_drafter.len()..], vision.as_slice());
     }
 
     /// `bind_entries` over the drafter table, on a fixture carrying the
