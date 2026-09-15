@@ -1,0 +1,1 @@
+{"case":{"name":"error_aspect","messages":[{"role":"user","content":[{"type":"image","file":"strip_too_wide.png"}]}]},"decoded":[{"file":"strip_too_wide.png","width":4020,"height":20,"rgb_sha256":"ce63e01ff141ca2a540566c3a70e23b3b70fad1d7314dcc67044ec826317ca01"}],"error":"image aspect ratio must be at most 200"}

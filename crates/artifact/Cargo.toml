@@ -28,6 +28,15 @@ tokenizers = "0.21"
 # minijinja; the chat template's `tojson` itself is the reference's
 # (`frontend.rs` `reference_tojson`, GitHub #172).
 minijinja = { version = "2", features = ["json"] }
+# The vision processor (GitHub #176): the SHA-256 content digest of acquired
+# media, and pure-Rust decoders for the lossless image formats (PNG, GIF,
+# lossless WebP), whose pixels are exactly what the reference's FFmpeg
+# decoders produce. JPEG goes through the processor's own port of the
+# reference's FFmpeg path (`vision/jpeg.rs`).
+sha2 = "0.10"
+png = "0.18"
+gif = "0.14"
+image-webp = "0.2"
 
 [dev-dependencies]
 # GitHub #135: `tests/layer_reference_real.rs` is a CPU-only oracle, but it

@@ -1,0 +1,44 @@
+[
+  {"name": "on_grid", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "on_grid.png"}, {"type": "text", "text": "What is in this picture?"}]}]},
+  {"name": "upscale", "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Describe it."}, {"type": "image", "file": "upscale.png"}]}]},
+  {"name": "downscale", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "downscale.png"}, {"type": "text", "text": "Describe it."}]}]},
+  {"name": "odd_aspect", "messages": [
+    {"role": "system", "content": "You are a careful assistant."},
+    {"role": "user", "content": [{"type": "image", "file": "odd_aspect.png"}, {"type": "text", "text": "Read the picture."}]}]},
+  {"name": "strip", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "strip.png"}]}]},
+  {"name": "alpha", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "alpha.png"}, {"type": "text", "text": "Colors?"}]}]},
+  {"name": "exif_rotated", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "exif_rotated.jpg"}, {"type": "text", "text": "Which way is up?"}]}]},
+  {"name": "two_images", "messages": [
+    {"role": "user", "content": [
+      {"type": "text", "text": "Before:"}, {"type": "image", "file": "on_grid.png"},
+      {"type": "text", "text": "After:"}, {"type": "image", "file": "second.png"},
+      {"type": "text", "text": "What changed?"}]}]},
+  {"name": "tool_message", "messages": [
+    {"role": "user", "content": "Take a screenshot of the page."},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "name": "screenshot", "arguments": {"url": "http://localhost/"}}]},
+    {"role": "tool", "tool_call_id": "call_0", "content": [{"type": "text", "text": "Screenshot:"}, {"type": "image", "file": "second.png"}]}]},
+  {"name": "thinking_single_turn", "enable_thinking": true, "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "upscale.png"}, {"type": "text", "text": "Compare with"}, {"type": "image", "file": "alpha.png"}]}]},
+  {"name": "jpeg_progressive", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "progressive.jpg"}]}]},
+  {"name": "jpeg_422", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "subsampled_422.jpg"}]}]},
+  {"name": "jpeg_restart", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "restart.jpg"}]}]},
+  {"name": "jpeg_odd_width", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "odd_width.jpg"}]}]},
+  {"name": "gif_first_frame", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "animated.gif"}]}]},
+  {"name": "webp_lossless", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "lossless.webp"}]}]},
+  {"name": "error_aspect", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "strip_too_wide.png"}]}]},
+  {"name": "error_corrupt", "messages": [
+    {"role": "user", "content": [{"type": "image", "file": "corrupt.png"}]}]}
+]

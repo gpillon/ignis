@@ -30,6 +30,7 @@ pub mod inventory;
 pub mod materializer;
 pub mod normalize;
 pub mod f64_reference;
+pub mod vision;
 
 /// FFI declarations for the kernel leaf's device surface (feature `cuda`
 /// only — the default build is pure Rust).
