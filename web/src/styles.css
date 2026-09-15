@@ -13,10 +13,80 @@
   --color-ink: var(--ink);
   --color-ember: var(--ember);
   --color-fault: var(--fault);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
   --color-kiln: #1c2026;
   --color-kiln-line: #2e343c;
   --font-display: "Chakra Petch", ui-sans-serif, system-ui, sans-serif;
   --font-sans: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+}
+
+/* The Monitor (GitHub #165). The kiln band keeps the dark palette in both
+   schemes; the live dot breathes, a fresh scrape flares the clock, and the
+   throughput figure glows like the i-dot. */
+@layer components {
+  .monitor-kiln {
+    --line: #2e343c;
+    --ash: #939ba4;
+    --ink: #eae8e4;
+    --surface: #1c2026;
+    --good: #3ecf8e;
+    --warn: #fab219;
+    --fault: #ff7b6b;
+    --series-1: #f05a1e;
+    --series-2: #3987e5;
+    --series-3: #199e70;
+    --series-4: #9085e9;
+    background:
+      radial-gradient(110% 120% at 100% 0%, rgb(255 90 31 / 0.13), transparent 55%),
+      radial-gradient(80% 90% at 0% 100%, rgb(57 135 229 / 0.07), transparent 60%),
+      #1c2026;
+  }
+  .pulse-dot {
+    position: relative;
+  }
+  .pulse-dot::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: inherit;
+    animation: pulse-dot 1.8s ease-out infinite;
+  }
+  @keyframes pulse-dot {
+    from {
+      opacity: 0.65;
+      transform: scale(1);
+    }
+    to {
+      opacity: 0;
+      transform: scale(3);
+    }
+  }
+  .live-ring {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: pulse-dot 1.8s ease-out infinite;
+  }
+  .scrape-flash {
+    animation: scrape-flash 900ms ease-out;
+  }
+  @keyframes scrape-flash {
+    from {
+      color: #ff8a4c;
+      text-shadow: 0 0 10px rgb(255 90 31 / 0.6);
+    }
+  }
+  .hero-glow {
+    text-shadow: 0 0 32px rgb(255 90 31 / 0.35);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pulse-dot::after,
+    .live-ring,
+    .scrape-flash {
+      animation: none;
+    }
+  }
 }
 
 @layer base {
@@ -29,7 +99,15 @@
     --ink: #1f2328;
     --ember: #e0480f;
     --fault: #b42318;
+    --good: #16895a;
+    --warn: #b76e00;
     --heat: linear-gradient(90deg, #c8161d, #ff5a1f 45%, #ff8a2a 60%, #c8161d);
+    /* Chart series (the Monitor): ember, blue, aqua, violet, in this order —
+       validated for colour-vision deficiency against the surface. */
+    --series-1: #e0480f;
+    --series-2: #2a78d6;
+    --series-3: #1baf7a;
+    --series-4: #4a3aa7;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -42,6 +120,12 @@
       --ink: #eae8e4;
       --ember: #ff6a2b;
       --fault: #ff7b6b;
+      --good: #3ecf8e;
+      --warn: #fab219;
+      --series-1: #f05a1e;
+      --series-2: #3987e5;
+      --series-3: #199e70;
+      --series-4: #9085e9;
     }
   }
 

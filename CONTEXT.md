@@ -335,10 +335,14 @@ When output names a domain concept, use the term as defined here.
   marks a reviewed, intentional exception, never a silent one.
 - **Playground** — the opt-in browser page ignis serves for trying the engine
   by hand: a chat against its own OpenAI surface, with per-request figures the
-  browser measures itself, and later a live view of the Prometheus metrics.
-  A debugging aid for the owner — not a product UI, not an operator surface
-  (that is Prometheus), and never a source of facts the engine does not
-  already expose.
+  browser measures itself, and the **Monitor**. A debugging aid for the owner
+  — not a product UI, not an operator surface (that is Prometheus), and never
+  a source of facts the engine does not already expose.
+- **Monitor** — the Playground's live dashboard over the Prometheus
+  exposition (GitHub #165): the browser scrapes `/ui/metrics`, keeps a rolling
+  in-memory history, and derives rates, latency quantiles and a plain-words
+  verdict from ADR 0017's contract metrics only. Offered only when metrics are
+  on; not a replacement for Prometheus, and gone on reload.
 
 ## Acceptance
 

@@ -75,3 +75,31 @@ export function IconSliders() {
     </svg>
   );
 }
+
+export function IconPause() {
+  return (
+    <svg {...icon} width={12} height={12}>
+      <path d="M5 3v10M11 3v10" strokeWidth={2} />
+    </svg>
+  );
+}
+
+export function IconPlay() {
+  return (
+    <svg {...icon} width={12} height={12}>
+      <path d="M4.5 2.5v11l9-5.5z" fill="currentColor" />
+    </svg>
+  );
+}
+
+/** A health verdict's mark, so its colour never carries the meaning alone. */
+export function IconHealth({ level }: { level: "idle" | "healthy" | "busy" | "saturated" }) {
+  return (
+    <svg {...icon} width={22} height={22} strokeWidth={1.8}>
+      {level === "idle" && <path d="M3 8h2.5M10.5 8H13M8 3v2.5M8 10.5V13" />}
+      {level === "healthy" && <path d="M3 8.5l3.2 3L13 4.5" />}
+      {level === "busy" && <path d="M2.5 11a5.5 5.5 0 0 1 11 0M8 11l2.6-3.4" />}
+      {level === "saturated" && <path d="M8 2.5l6 11H2zM8 6.5v3.2M8 11.5v.2" />}
+    </svg>
+  );
+}

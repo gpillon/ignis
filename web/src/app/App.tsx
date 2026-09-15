@@ -5,6 +5,8 @@ import { Composer } from "../conversation/Composer.tsx";
 import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
 import { contextUsage } from "../metrics/context.ts";
 import { Readout } from "../metrics/Readout.tsx";
+import { MonitorView } from "../monitor/MonitorView.tsx";
+import { useMonitor, useMonitorVisible } from "../monitor/useMonitor.ts";
 import { SessionLog } from "../sessions/SessionLog.tsx";
 import { SessionsPanel } from "../sessions/SessionsPanel.tsx";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.ts";
@@ -13,7 +15,7 @@ import { AgentReader } from "../tools/agents/AgentReader.tsx";
 import { MemoryManager } from "../tools/local/MemoryManager.tsx";
 import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
-import { Header } from "./Header.tsx";
+import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
 import { useConversation } from "./useConversation.ts";
 
@@ -21,12 +23,16 @@ import { useConversation } from "./useConversation.ts";
 // /v1/chat/completions, with per-request figures measured in the browser.
 // Sessions, settings and figures live in memory; a reload starts over.
 // This is the page's layout; the conversation loop is useConversation.
+// With metrics on, the header switches to the Monitor (GitHub #165); the
+// chat stays mounted underneath, so a streaming reply carries on.
 
 type Drawer = "sessions" | "settings" | null;
 
 export function App() {
   const auth = useAuth();
   const model = useModel();
+  const monitorVisible = useMonitorVisible();
+  const [view, setView] = useState<View>("chat");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
@@ -39,10 +45,16 @@ export function App() {
   const [drawer, setDrawer] = useState<Drawer>(null);
   const chat = useConversation({ model, settings, tools });
   const { active } = chat;
+  const monitoring = view === "monitor" && monitorVisible;
 
   const readerRun: AgentRun | undefined = reader
     ? active.messages.find((m) => m.id === reader.messageId)?.agents?.find((r) => r.callId === reader.callId)
     : undefined;
+
+  // Metrics going away drops back to the chat, so their return never flips the page on its own.
+  useEffect(() => {
+    if (!monitorVisible) setView("chat");
+  }, [monitorVisible]);
 
   useEffect(() => {
     if (!drawer) return;
@@ -78,68 +90,72 @@ export function App() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} />
+      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : "chat"} onView={monitorVisible ? setView : undefined} />
 
-      <div className="relative flex min-h-0 flex-1">
-        {drawer && (
-          <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => setDrawer(null)} aria-hidden />
-        )}
+      {monitoring && <Monitor />}
 
-        <SessionsPanel
-          open={drawer === "sessions"}
-          list={chat.list}
-          activeId={active.id}
-          streamingId={chat.streamingId}
-          onNew={newSession}
-          onSelect={selectSession}
-          onRemove={chat.deleteSession}
-        />
+      <div className={monitoring ? "hidden" : "contents"}>
+        <div className="relative flex min-h-0 flex-1">
+          {drawer && (
+            <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => setDrawer(null)} aria-hidden />
+          )}
 
-        <main className="flex min-w-0 flex-1 flex-col">
-          <Transcript
-            session={active}
-            model={model}
+          <SessionsPanel
+            open={drawer === "sessions"}
+            list={chat.list}
+            activeId={active.id}
+            streamingId={chat.streamingId}
+            onNew={newSession}
+            onSelect={selectSession}
+            onRemove={chat.deleteSession}
+          />
+
+          <main className="flex min-w-0 flex-1 flex-col">
+            <Transcript
+              session={active}
+              model={model}
+              markdown={markdown}
+              canRerun={chat.canRun}
+              following={chat.following}
+              openAgent={reader}
+              onOpenAgent={setReader}
+              onRerun={chat.rerun}
+              onSave={chat.saveEdit}
+              onFork={chat.fork}
+              onAnswer={chat.answer}
+            />
+            <Composer
+              value={input}
+              onChange={setInput}
+              ready={model.state === "ready"}
+              busy={chat.busy}
+              streamingHere={chat.streamingId === active.id}
+              usage={contextUsage(active.log, settings.maxTokens, model.state === "ready" ? model.contextLimit : null)}
+              onSend={send}
+              onStop={chat.stop}
+              canAttach={tools.enabled && tools.readFiles}
+              attachments={active.attachments}
+              attachError={chat.attachError}
+              onAttach={(files) => void chat.attach(files)}
+              onDetach={chat.detach}
+            />
+          </main>
+
+          <SettingsPanel
+            open={drawer === "settings"}
+            settings={settings}
+            set={set}
+            tools={tools}
+            onToolsChange={setTools}
             markdown={markdown}
-            canRerun={chat.canRun}
-            following={chat.following}
-            openAgent={reader}
-            onOpenAgent={setReader}
-            onRerun={chat.rerun}
-            onSave={chat.saveEdit}
-            onFork={chat.fork}
-            onAnswer={chat.answer}
-          />
-          <Composer
-            value={input}
-            onChange={setInput}
-            ready={model.state === "ready"}
-            busy={chat.busy}
-            streamingHere={chat.streamingId === active.id}
-            usage={contextUsage(active.log, settings.maxTokens, model.state === "ready" ? model.contextLimit : null)}
-            onSend={send}
-            onStop={chat.stop}
-            canAttach={tools.enabled && tools.readFiles}
+            onMarkdownChange={setMarkdown}
             attachments={active.attachments}
-            attachError={chat.attachError}
-            onAttach={(files) => void chat.attach(files)}
-            onDetach={chat.detach}
+            onOpenMemory={() => setMemoryOpen(true)}
           />
-        </main>
+        </div>
 
-        <SettingsPanel
-          open={drawer === "settings"}
-          settings={settings}
-          set={set}
-          tools={tools}
-          onToolsChange={setTools}
-          markdown={markdown}
-          onMarkdownChange={setMarkdown}
-          attachments={active.attachments}
-          onOpenMemory={() => setMemoryOpen(true)}
-        />
+        <SessionLog rows={active.log} open={logOpen} onToggle={() => setLogOpen((o) => !o)} />
       </div>
-
-      <SessionLog rows={active.log} open={logOpen} onToggle={() => setLogOpen((o) => !o)} />
 
       {memoryOpen && <MemoryManager onClose={closeMemory} />}
 
@@ -158,4 +174,9 @@ export function App() {
       )}
     </div>
   );
+}
+
+/** The Monitor subscribes on its own, so a scrape re-renders it and not the chat. */
+function Monitor() {
+  return <MonitorView state={useMonitor()} />;
 }
