@@ -88,6 +88,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(MAX_CONTEXT),--max-context $(MAX_CONTEXT)) \
   $(if $(PREFILL_CHUNK),--prefill-chunk $(PREFILL_CHUNK)) \
   $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES)) \
+  $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
   $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)))
 SERVER_FLAGS = --bind $(BIND) \
@@ -162,7 +163,7 @@ config: ## Print the resolved knobs and paths
 	@echo "PROFILE         $(PROFILE)  (dir=$(PROFILE_DIR))"
 	@echo "UI              $(UI)"
 	@echo "ARTIFACT        $(ARTIFACT)"
-	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
+	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
