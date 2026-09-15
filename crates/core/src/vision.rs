@@ -95,6 +95,11 @@ impl Vision {
 /// The multimodal part of a request (GitHub #178): the prompt's three-axis
 /// rope positions, its `rope_delta` and its media items, as the processor
 /// prepared them. A text-only request carries none and takes today's path.
+///
+/// Invariant: `positions` is `3 * prompt tokens` long and every media item's
+/// token span lies inside the prompt — [`Multimodal::from_prepared`] checks
+/// it at the seam where a prepared prompt becomes a request, so the scheduler
+/// and the leaf can index it without asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Multimodal {
     /// Axis-major `[3, T]`: temporal, height, width, over the whole prompt.
@@ -121,7 +126,25 @@ pub struct ChunkMedia {
 impl Multimodal {
     /// Split a prepared prompt into the tokens the scheduler submits and the
     /// multimodal part the request carries beside them.
+    ///
+    /// Panics when the prompt breaks the type's invariant (positions three
+    /// per token, every span inside the prompt) — a logic error in whoever
+    /// built it, caught here rather than indexing out of bounds on the model
+    /// thread. The processor's own output always satisfies it.
     pub fn from_prepared(prompt: PreparedPrompt) -> (Vec<TokenId>, Self) {
+        let tokens = prompt.token_ids.len();
+        assert_eq!(
+            prompt.positions.len(),
+            3 * tokens,
+            "a prepared prompt carries three positions per token"
+        );
+        assert!(
+            prompt
+                .media
+                .iter()
+                .all(|item| item.token_span.begin + item.token_span.count <= tokens),
+            "a prepared prompt's media spans lie inside it"
+        );
         let multimodal = Self {
             positions: prompt.positions,
             rope_delta: prompt.rope_delta,

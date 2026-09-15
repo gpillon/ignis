@@ -140,10 +140,10 @@ struct ignis_prefill_options {
   uint32_t size;           /* sizeof(struct ignis_prefill_options) */
   int32_t route;           /* enum ignis_prefill_route */
   int32_t compute_policy;  /* enum ignis_prefill_compute_policy */
-  /* GitHub #178: a span of a multimodal prompt (fields appended, size bumped;
-   * IGNIS_PREFILL_OPTIONS_TEXT_SIZE, the size before them, is still
-   * recognized and means a text span). NULL `mrope_positions` is a text span,
-   * whose media fields must be empty. Non-NULL -- a load with vision, the
+  /* GitHub #178: a span of a multimodal prompt (fields appended and the size
+   * bumped -- one recognized size, ADR 0016: no compatibility wrapper is
+   * kept). NULL `mrope_positions` is a text span, whose media fields must be
+   * empty. Non-NULL -- a load with vision, the
    * chunked route -- it is the span's axis-major [3, num_tokens] positions,
    * which its GQA layers rotate at (MRoPE: pair i on axis i mod 3), and
    * `rope_delta` becomes the sequence's: every later decode round rotates at
@@ -159,9 +159,6 @@ struct ignis_prefill_options {
   const int32_t *media_scatter_indices;
   uint32_t media_first_column;
 };
-
-/* The size of `struct ignis_prefill_options` before GitHub #178's fields. */
-#define IGNIS_PREFILL_OPTIONS_TEXT_SIZE 12u
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus
  * its grid and host-computed encoder control, in; an opaque, leaf-owned,
@@ -195,13 +192,6 @@ int32_t ignis_media_encode(struct ignis_model *model, const struct ignis_media_e
 
 /* The embedding's merged columns. 0 for NULL. */
 uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embedding);
-
-/* Debug-only (like `ignis_program_prefill`'s `out_logits`): copy the
- * embedding's `[hidden, columns]` BF16 bits, column-major, into `out` (at
- * least hidden * columns entries). Returns 0, or -1 on a null argument or a
- * device error. */
-int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding, uint16_t *out,
-                                   uint64_t count);
 
 /* Release an embedding, freeing the load's reservation for the next item.
  * NULL is a no-op; the model must still be live. */

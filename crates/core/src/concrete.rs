@@ -205,8 +205,6 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 /// with [`FinishReason::Error`].
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
 
-/// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
-/// absent that — whatever the per-sequence limit leaves after the prompt.
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
 /// (GitHub #178: one media item per chunk).
@@ -219,6 +217,8 @@ fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     }
 }
 
+/// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
+/// absent that — whatever the per-sequence limit leaves after the prompt.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
     input.params.max_tokens.unwrap_or_else(|| {
         config
@@ -1065,10 +1065,10 @@ impl ConcreteScheduler {
         lane: Option<LaneId>,
         events: &mut Vec<SchedEvent>,
     ) -> bool {
-        // GitHub #178: a multimodal sequence is released and re-prefilled
-        // rather than snapshotted -- the snapshot blob does not carry its
-        // `rope_delta` yet (a later ticket versions it).
-        if self.requests[v_idx].input.multimodal.is_some() {
+        // GitHub #178: a sequence the blob cannot describe (a multimodal
+        // one, whose `rope_delta` it does not record yet) is released and
+        // re-prefilled instead.
+        if !self.requests[v_idx].can_snapshot() {
             self.release_and_requeue(v_idx, resume_phase, lane, events);
             return true;
         }
@@ -1201,6 +1201,9 @@ impl ConcreteScheduler {
         if self.protection.as_ref().map(|p| p.head_request_id) == Some(v_id) {
             self.protection = None;
         }
+        // 0 microseconds because no snapshot was taken at all: the
+        // `Requeued` this same call emits next is what tells the two
+        // eviction shapes apart.
         events.push(SchedEvent::Evicted {
             request: v_id,
             snapshot_micros: 0,
@@ -1419,9 +1422,8 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        // GitHub #178: a multimodal request neither publishes nor claims a
-        // shared prefix until prefix identity carries its media (a later
-        // ticket) -- two same-size images would otherwise share one head.
+        // GitHub #178: a multimodal request publishes nothing (see
+        // `Request::may_share_prefix`).
         let publish_tokens = match input.multimodal {
             Some(_) => 0,
             None => self.prefix.shareable_head_tokens(input.tokens.len()),
@@ -1501,7 +1503,7 @@ impl Scheduler for ConcreteScheduler {
                     // at completion).
                     // GitHub #178: nor does a multimodal request claim one.
                     if self.requests[i].prefix_entry.is_some()
-                        || self.requests[i].input.multimodal.is_some()
+                        || !self.requests[i].may_share_prefix()
                     {
                         continue;
                     }

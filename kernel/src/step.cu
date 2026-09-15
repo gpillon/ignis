@@ -1103,8 +1103,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   int32_t route = IGNIS_PREFILL_ROUTE_CHUNKED;
   LinearPolicyMode mode = LinearPolicyMode::kEngineDefault;
   if (options != nullptr) {
-    if (options->size != sizeof(struct ignis_prefill_options) &&
-        options->size != IGNIS_PREFILL_OPTIONS_TEXT_SIZE) {
+    if (options->size != sizeof(struct ignis_prefill_options)) {
       set_error("ignis_program_prefill: unrecognized ignis_prefill_options size " +
                 std::to_string(options->size));
       return -1;
@@ -1127,7 +1126,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                : LinearPolicyMode::kEngineDefault;
   }
   SpanMultimodal multimodal;
-  if (options != nullptr && options->size == sizeof(struct ignis_prefill_options)) {
+  if (options != nullptr) {
     multimodal.positions = options->mrope_positions;
     multimodal.span_tokens = num_tokens;
     multimodal.rope_delta = options->rope_delta;

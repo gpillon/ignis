@@ -320,31 +320,6 @@ extern "C" uint32_t ignis_media_embedding_columns(const struct ignis_media_embed
   return embedding == nullptr ? 0 : static_cast<uint32_t>(embedding->columns);
 }
 
-extern "C" int32_t ignis_media_embedding_read(const struct ignis_media_embedding *embedding,
-                                              uint16_t *out, uint64_t count) {
-  if (embedding == nullptr || embedding->model == nullptr || out == nullptr) {
-    set_error("ignis_media_embedding_read: null argument");
-    return -1;
-  }
-  const ignis_model &model = *embedding->model;
-  const std::uint64_t values = model.hidden * static_cast<std::uint64_t>(embedding->columns);
-  if (count < values) {
-    set_error("ignis_media_embedding_read: the buffer holds " + std::to_string(count) +
-              " values, the embedding " + std::to_string(values));
-    return -1;
-  }
-  cudaError_t err = cudaMemcpyAsync(out, model.vision_output->p, values * sizeof(std::uint16_t),
-                                    cudaMemcpyDeviceToHost, model.stream);
-  if (err == cudaSuccess) {
-    err = cudaStreamSynchronize(model.stream);
-  }
-  if (err != cudaSuccess) {
-    set_error(std::string("ignis_media_embedding_read: ") + cudaGetErrorString(err));
-    return -1;
-  }
-  return 0;
-}
-
 extern "C" void ignis_media_embedding_release(struct ignis_media_embedding *embedding) {
   if (embedding == nullptr) {
     return;

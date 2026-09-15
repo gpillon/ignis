@@ -5,26 +5,26 @@
     {
       "id": "number",
       "image": "number.png",
-      "question": "What number is shown in the image? Answer with the number only.",
-      "text": "47"
+      "question": "What number is shown in the image? Answer in one short sentence.",
+      "text": " I can see that the number shown in the image is 47."
     },
     {
       "id": "colour",
       "image": "colour.png",
-      "question": "What colour is the square in the image? Answer with one word.",
-      "text": "Red"
+      "question": "What colour is the square in the image? Answer in one short sentence.",
+      "text": "The square in the image is red."
     },
     {
       "id": "circles",
       "image": "circles.png",
-      "question": "How many circles are in the image? Answer with a number only.",
-      "text": "3"
+      "question": "How many circles are in the image? Answer in one short sentence.",
+      "text": "There are 3 circles in the image."
     },
     {
       "id": "text",
       "image": "text.png",
-      "question": "What does the text in the image say? Reply with the text only.",
-      "text": "error: config.yaml not found"
+      "question": "What does the text in the image say? Answer in one short sentence.",
+      "text": "The text in the image says \"error: config.yaml not found\"."
     }
   ]
 }

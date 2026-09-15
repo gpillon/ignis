@@ -769,15 +769,6 @@ bool bind_vision(ModelBinder &binder, const Geometry &g, VisionWeights &w) {
 
 constexpr std::size_t kVisionWorkspaceAlignment = 256;
 
-// GitHub #177: the encoder workspace for `tokens` merged tokens over
-// `segments` images -- the reference's `build_workspace_layout`
-// (`impl/runtime/vision_context_impl.h`), region for region and scope for
-// scope, so the encoder (#178) runs out of exactly this layout.
-std::size_t vision_workspace_bytes(std::int32_t tokens, std::int32_t segments) {
-  // GitHub #178: the layout itself lives beside the encode that binds it.
-  return ignis_vision_workspace_bytes(tokens, segments);
-}
-
 // GitHub #177: one item's `[hidden, tokens]` BF16 encoder output (the
 // reference's `VisionContext::output_transient_bytes`).
 std::size_t vision_output_transient_bytes(std::int64_t hidden, std::int32_t tokens) {
@@ -1019,7 +1010,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     try {
       const auto tokens = static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens));
       const std::size_t workspace_bytes =
-          vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
+          ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
       const std::size_t output_bytes = vision_output_transient_bytes(g.hidden, tokens);
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;

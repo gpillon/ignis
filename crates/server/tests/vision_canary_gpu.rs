@@ -7,9 +7,13 @@
 //!
 //! Each prompt is scored twice: prefilled in one span, and cut into 48-token
 //! spans so every image's placeholder run crosses span boundaries -- the
-//! embedding is encoded once and its columns placed chunk by chunk. A wrong
-//! merge order, patch layout, MRoPE axis or scatter offset is a gross error
-//! and craters both.
+//! embedding is encoded once and its columns placed chunk by chunk. Each way
+//! of prefilling clears the floor on its own, pooled over the canaries the
+//! way ADR 0014 pools its own suite. The answers are sentences rather than
+//! single words precisely so the score has resolution: at one token per
+//! answer a single near-tie flip moves the suite by a seventh. A wrong merge
+//! order, patch layout, MRoPE axis or scatter offset is a gross error and
+//! craters both ways.
 //!
 //! Two more checks ride the same load. Decode rotates at `position +
 //! rope_delta` from its own staging (through a captured graph): its greedy run
@@ -360,16 +364,29 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
     let _ = artifact.release_arena(&mut device);
 
     assert!(compared > 0, "the fixture must contribute scored positions");
-    // ADR 0014: the floor is the suite's, not each canary's -- a flip between
-    // near-equivalent forms of one answer (" red" / "Red") counts as a
-    // mismatch and the suite still has to clear 95%.
-    assert!(
-        meets_g1_floor(overall),
-        "vision canary floor: teacher-forced agreement {agree}/{compared} = {:.1}% < {:.0}% -- a \
-         gross error in the encoder, the placeholder scatter or the MRoPE rotation",
-        overall * 100.0,
-        G1_AGREEMENT_FLOOR * 100.0
-    );
+    // Each way of prefilling clears the floor on its own -- the issue's "an
+    // image whose placeholder run spans more than one prefill chunk scores
+    // the same canary floor" -- pooled over the canaries the way ADR 0014
+    // pools its own suite.
+    for label in ["whole", "spanning"] {
+        let mode: Vec<TeacherForcedResult> =
+            results.iter().filter(|r| r.id.ends_with(label)).cloned().collect();
+        let mode_agree: usize = mode.iter().map(|r| r.agree).sum();
+        let mode_compared: usize = mode.iter().map(|r| r.compared).sum();
+        let agreement = overall_teacher_forced_agreement(&mode);
+        eprintln!(
+            "vision canary {label}: teacher-forced agreement {mode_agree}/{mode_compared} = {:.1}%",
+            agreement * 100.0
+        );
+        assert!(
+            meets_g1_floor(agreement),
+            "vision canary ({label}): teacher-forced agreement {mode_agree}/{mode_compared} = \
+             {:.1}% < {:.0}% -- a gross error in the encoder, the placeholder scatter or the \
+             MRoPE rotation",
+            agreement * 100.0,
+            G1_AGREEMENT_FLOOR * 100.0
+        );
+    }
     assert_eq!(
         decode_agree, decode_compared,
         "decode at position + rope_delta must continue the prefill path's greedy chain"

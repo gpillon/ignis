@@ -61,11 +61,15 @@ def screenshot_text() -> Image.Image:
     return image
 
 
+# Unambiguous questions, answered in a sentence: the fact is still checkable
+# by eye, and the answer is long enough for the teacher-forced score to have
+# resolution -- at one or two tokens per answer a single near-tie flip moves
+# the suite by 7%, which is noise, not a floor.
 CANARIES = [
-    ("number", number, "What number is shown in the image? Answer with the number only."),
-    ("colour", colour, "What colour is the square in the image? Answer with one word."),
-    ("circles", circles, "How many circles are in the image? Answer with a number only."),
-    ("text", screenshot_text, "What does the text in the image say? Reply with the text only."),
+    ("number", number, "What number is shown in the image? Answer in one short sentence."),
+    ("colour", colour, "What colour is the square in the image? Answer in one short sentence."),
+    ("circles", circles, "How many circles are in the image? Answer in one short sentence."),
+    ("text", screenshot_text, "What does the text in the image say? Answer in one short sentence."),
 ]
 
 

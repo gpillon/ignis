@@ -363,6 +363,22 @@ impl Request {
     pub fn prompt_tokens(&self) -> &[TokenId] {
         &self.input.tokens
     }
+
+    /// Whether this request may publish or claim a shared prefix (GitHub
+    /// #178): a multimodal one may not, because prefix identity is token ids
+    /// alone until it learns about media — two same-size images would
+    /// otherwise share one head. Lifted by GitHub #180.
+    pub fn may_share_prefix(&self) -> bool {
+        self.input.multimodal.is_none()
+    }
+
+    /// Whether this request's device state can be snapshotted to the KV-RAM
+    /// tier (GitHub #178): a multimodal one cannot, because the snapshot blob
+    /// does not record its `rope_delta` yet — it is released and re-prefilled
+    /// instead. Lifted by GitHub #180.
+    pub fn can_snapshot(&self) -> bool {
+        self.input.multimodal.is_none()
+    }
 }
 
 /// **Basic admission** (core-03): assign free decode lanes to `Prefilling`

@@ -280,6 +280,23 @@ When output names a domain concept, use the term as defined here.
   drafter (draft window 1..7 chosen at load, verification width chosen per
   round). Deferred behind **DFlash2** at G5.
 - **Vision** — multimodal (image/video) input.
+- **Media item** — one image in a prompt: its patch grid, the run of
+  placeholder tokens it expands to, its BF16 patch rows and the digest of the
+  bytes it came from. The unit the processor prepares, the encoder encodes and
+  a prefill chunk carries at most one of.
+- **Vision tokens** — a media item's *merged* tokens, one per 2x2 block of
+  patches: the placeholder run's length, and what the per-request envelope
+  (`--vision-max-tokens`) is counted in.
+- **Media embedding** — a media item's encoder output, `[hidden, vision
+  tokens]`, device-resident and leaf-owned. Live from its encode until the
+  item's last placeholder is prefilled; the load reserves room for one.
+- **Vision encoder** — the 27-block tower plus the 2x2 merger that turns patch
+  rows into a media embedding. Run once per item by the **media encode** step,
+  never per chunk.
+- **Rope delta** — `max_position + 1 - prompt_length` for a multimodal prompt,
+  whose three-axis positions advance more slowly than its tokens. Every decode
+  round after such a prompt rotates at `position + rope_delta`; the position
+  itself stays the KV index and the sampler's key.
 
 ## Observability
 

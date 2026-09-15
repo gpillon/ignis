@@ -203,12 +203,6 @@ mod ffi {
 
         pub fn ignis_media_embedding_columns(embedding: *const IgnisMediaEmbedding) -> u32;
 
-        pub fn ignis_media_embedding_read(
-            embedding: *const IgnisMediaEmbedding,
-            out: *mut u16,
-            count: u64,
-        ) -> i32;
-
         pub fn ignis_media_embedding_release(embedding: *mut IgnisMediaEmbedding);
 
         pub fn ignis_media_last_error() -> *const c_char;
@@ -893,19 +887,6 @@ impl MediaEmbedding<'_> {
     /// The embedding's merged columns.
     pub fn columns(&self) -> u32 {
         unsafe { ffi::ignis_media_embedding_columns(self.handle) }
-    }
-
-    /// Debug-only: the embedding's values promoted to `f32`, column-major
-    /// `[hidden, columns]` (column `c` at `c * hidden ..`).
-    pub fn read_host(&self, hidden: usize) -> Result<Vec<f32>, String> {
-        let mut bits = vec![0u16; hidden * self.columns() as usize];
-        let rc = unsafe {
-            ffi::ignis_media_embedding_read(self.handle, bits.as_mut_ptr(), bits.len() as u64)
-        };
-        if rc != 0 {
-            return Err(media_last_error());
-        }
-        Ok(bits.into_iter().map(|b| f32::from_bits(u32::from(b) << 16)).collect())
     }
 
     /// Detach the embedding from its model's borrow.
