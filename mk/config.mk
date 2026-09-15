@@ -39,6 +39,9 @@ REQUEST_TIMEOUT ?= 1800
 SPEC ?= dflash2
 DRAFT_TOKENS ?= 7
 KV_POOL_BYTES ?=
+# The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
+# 0 disables the host tier entirely (no evict-to-RAM overflow path).
+KV_HOST_POOL_BYTES ?= 8G
 
 # Extra ignis-server flags, verbatim: ARGS='--kv-host-pool-bytes 0'
 ARGS ?=
