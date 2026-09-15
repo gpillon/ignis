@@ -2,8 +2,8 @@ import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
 import { streamChat } from "../../api/stream.ts";
-import { unknownToolError } from "../errors.ts";
-import { parseWebCall, runWeb, type WebRun, webToolResult } from "../web/web.ts";
+import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
+import { isWebTool, parseWebCall, runWeb, type WebRun, webToolResult } from "../web/web.ts";
 
 // The `agent` tool: the model hands one self-contained sub-task to an agent,
 // a separate request on an agent lane that sees only that task. Several calls
@@ -37,7 +37,7 @@ export const AGENT_TOOL: ToolDefinition = {
 
 /** What the agent tool adds to the ignis system prompt of the conversation. */
 export const AGENTS_IGNIS_PROMPT = `# Agents
-You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history. It can use your other tools, if you have any, but cannot start agents of its own.
+You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history. It gets your other tools except \`ask_user\`, if you have any, and cannot start agents of its own.
 - Agents run in parallel on dedicated lanes. When a task splits into independent parts, call \`agent\` several times in the same reply, one call per part, rather than one after another.
 - Make every prompt self-contained: include the facts, text or code the agent needs, and say exactly what it should return.
 - Each agent's answer comes back to you as that call's result. Check the results, then write your reply to the user from them.
@@ -81,6 +81,8 @@ export type AgentRun = {
   rounds?: Figures[];
   /** The web calls the agent made, in order. */
   web?: WebRun[];
+  /** Calls the agent made to tools it was not given. */
+  unknownTools?: UnknownCall[];
   systemPrompt?: string;
   error?: string;
 };
@@ -230,12 +232,17 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
     }
   }
 
-  /** Runs one request's calls — web calls; anything else is unknown to an agent — and resolves with each call's result. */
+  /** Runs one request's declared web calls, answers any other call as an unknown tool, and resolves with each call's result. */
   async function runCalls(callId: string, calls: ToolCall[]): Promise<Map<string, string>> {
     const earlier = get(callId).web ?? [];
-    const parsed = calls.map((call) => parseWebCall(call, available));
+    const declared = calls.filter((call) => isWebTool(call.name) && available.includes(call.name));
+    const unknown = calls.filter((call) => !declared.includes(call)).map((call) => unknownCall(call, available));
+    const parsed = declared.map((call) => parseWebCall(call, available));
     let current: WebRun[] = parsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
-    set(callId, { web: [...earlier, ...current] });
+    set(callId, {
+      web: [...earlier, ...current],
+      ...(unknown.length > 0 ? { unknownTools: [...(get(callId).unknownTools ?? []), ...unknown] } : {}),
+    });
     await doRunWeb(
       parsed.flatMap((p) => (p.ok ? [p.task] : [])),
       {
@@ -247,7 +254,10 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         },
       },
     );
-    return new Map(current.map((run) => [run.callId, webToolResult(run)]));
+    return new Map([
+      ...current.map((run) => [run.callId, webToolResult(run)] as const),
+      ...unknown.map((call) => [call.callId, call.error] as const),
+    ]);
   }
 
   async function runOne(task: AgentTask) {

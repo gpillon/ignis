@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import type { ModelState } from "../api/model.ts";
 import { buildChatRequest, conversationTurns, type Exchange, type Settings, type ToolExtras } from "../api/request.ts";
+import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
 import { computeFigures } from "../metrics/figures.ts";
 import {
@@ -19,6 +20,8 @@ import {
 } from "../sessions/sessions.ts";
 import type { PlaygroundSettings } from "../settings/defaults.ts";
 import { type AgentRun, parseAgentCall, runAgents, toolResult } from "../tools/agents/agents.ts";
+import { askToolResult, parseAskCall } from "../tools/ask/ask.ts";
+import { unknownCall } from "../tools/errors.ts";
 import { agentExtras, routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
 import { getTavilyKey } from "../tools/web/tavilyKey.ts";
 import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
@@ -47,6 +50,8 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   // The session a reply is streaming into; one stream at a time.
   const [streamingId, setStreamingId] = useState<number | null>(null);
   const controller = useRef<AbortController | null>(null);
+  // Questions waiting for the user, by `messageId:callId`: each settles with the answer.
+  const waiting = useRef(new Map<string, (answer: string | null) => void>());
   // Whether the reader is at the bottom of the conversation: only then do
   // new tokens pull the view down.
   const following = useRef(true);
@@ -82,8 +87,10 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   async function exchange(sessionId: number, history: Message[], prompt: string | null) {
     if (busy || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
-    const extras = toolExtras(tools);
-    const agentTools = agentExtras(tools);
+    // The date and time the tools write into the prompt: when the turn started.
+    const startedAt = new Date();
+    const extras = toolExtras(tools, startedAt);
+    const agentTools = agentExtras(tools, startedAt);
     const abort = new AbortController();
     controller.current = abort;
     // Sending is a request to see the answer: follow it from the bottom.
@@ -96,24 +103,48 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
       setList((l) => ({ ...l, sessions: addMessages(l.sessions, sessionId, [user]) }));
       conversation = [...conversation, user];
     }
-    for (let round = 0; ; round++) {
-      const reply = await streamReply(sessionId, conversation, requestSettings, extras, abort.signal);
-      conversation = [...conversation, reply];
-      const calls = reply.toolCalls ?? [];
-      if (calls.length === 0 || reply.error) break;
-      // Every call gets a result, even one that never ran: the history must stay well-formed.
-      if (abort.signal.aborted || round >= MAX_TOOL_ROUNDS) {
-        const reason = abort.signal.aborted
-          ? "Stopped before the call ran."
-          : `Not run: a turn can call tools at most ${MAX_TOOL_ROUNDS} times in a row.`;
-        addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
-        break;
+    // Calls of the latest reply still without a result, if the loop breaks while they run.
+    let unanswered: ToolCall[] = [];
+    try {
+      for (let round = 0; ; round++) {
+        const reply = await streamReply(sessionId, conversation, requestSettings, extras, abort.signal);
+        conversation = [...conversation, reply];
+        const calls = reply.toolCalls ?? [];
+        if (calls.length === 0 || reply.error) break;
+        // Every call gets a result, even one that never ran: the history must stay well-formed.
+        if (abort.signal.aborted || round >= MAX_TOOL_ROUNDS) {
+          const reason = abort.signal.aborted
+            ? "Stopped before the call ran."
+            : `Not run: a turn can call tools at most ${MAX_TOOL_ROUNDS} times in a row.`;
+          addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
+          break;
+        }
+        unanswered = calls;
+        conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, abort.signal))];
+        unanswered = [];
+        if (abort.signal.aborted) break;
       }
-      conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, abort.signal))];
-      if (abort.signal.aborted) break;
+    } catch (err) {
+      // A fault in the loop must not leave the page busy for good: it ends the turn, says what broke and
+      // answers the calls it left open, so the next turn starts from a well-formed history.
+      console.error(err);
+      const message = `The Playground failed: ${err instanceof Error ? err.message : String(err)}`;
+      if (unanswered.length > 0) addToolResults(sessionId, unanswered.map((c) => ({ callId: c.id, content: message })));
+      const failure: Message = { id: newId(), role: "assistant", content: "", reasoning: "", streaming: false, error: message };
+      setList((l) => ({
+        ...l,
+        sessions: addMessages(
+          l.sessions.map((s) =>
+            s.id === sessionId ? { ...s, messages: s.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m)) } : s,
+          ),
+          sessionId,
+          [failure],
+        ),
+      }));
+    } finally {
+      controller.current = null;
+      setStreamingId(null);
     }
-    controller.current = null;
-    setStreamingId(null);
   }
 
   /** Streams one assistant reply and logs it; resolves with the reply as it ended. */
@@ -168,12 +199,40 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     const webParsed = calls.filter((c) => routeCall(c.name, available) === "web").map((c) => parseWebCall(c, available));
     const webTasks = webParsed.flatMap((p) => (p.ok ? [p.task] : []));
     let webRuns: WebRun[] = webParsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
+    const unknownTools = calls.filter((c) => routeCall(c.name, available) === "unknown").map((c) => unknownCall(c, available));
+    let questions = calls.filter((c) => routeCall(c.name, available) === "ask").map(parseAskCall);
     const show = () => {
       const agents = runs;
       const web = webRuns;
-      setList((l) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({ ...m, agents, web })) }));
+      const asked = questions;
+      setList((l) => ({
+        ...l,
+        sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({ ...m, agents, web, unknownTools, questions: asked })),
+      }));
     };
     show();
+    // Each waiting question settles when the user answers it (answer) or the turn is stopped.
+    const asking = questions
+      .filter((q) => q.status === "waiting")
+      .map(
+        (q) =>
+          new Promise<void>((resolve) => {
+            const key = `${reply.id}:${q.callId}`;
+            const settle = (text: string | null) => {
+              waiting.current.delete(key);
+              signal.removeEventListener("abort", onAbort);
+              questions = questions.map((x) =>
+                x.callId !== q.callId ? x : text === null ? { ...x, status: "skipped" } : { ...x, status: "answered", answer: text },
+              );
+              show();
+              resolve();
+            };
+            const onAbort = () => settle(null);
+            if (signal.aborted) return settle(null);
+            signal.addEventListener("abort", onAbort, { once: true });
+            waiting.current.set(key, settle);
+          }),
+      );
     await Promise.all([
       runAgents(tasks, {
         settings: requestSettings,
@@ -193,6 +252,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
           show();
         },
       }),
+      ...asking,
     ]);
     // A row per request an agent made; a run that failed adds one for its error.
     for (const run of runs) {
@@ -204,6 +264,8 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     const results = new Map([
       ...runs.map((run) => [run.callId, toolResult(run)] as const),
       ...webRuns.map((run) => [run.callId, webToolResult(run)] as const),
+      ...unknownTools.map((call) => [call.callId, call.error] as const),
+      ...questions.map((q) => [q.callId, askToolResult(q)] as const),
     ]);
     return addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: results.get(c.id) ?? "" })));
   }
@@ -247,6 +309,11 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     setList((l) => forkSession(l, sessionId, messageId, id));
   }
 
+  /** The user's answer to a question a reply is waiting on. */
+  function answer(messageId: number, callId: string, text: string) {
+    waiting.current.get(`${messageId}:${callId}`)?.(text);
+  }
+
   function stop() {
     controller.current?.abort();
   }
@@ -265,6 +332,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     rerun,
     saveEdit,
     fork,
+    answer,
     stop,
   };
 }

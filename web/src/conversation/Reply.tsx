@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Readout } from "../metrics/Readout.tsx";
 import type { Message } from "../sessions/sessions.ts";
 import { AgentStrip } from "../tools/agents/AgentStrip.tsx";
+import { Questions } from "../tools/ask/Questions.tsx";
+import { UnknownCalls } from "../tools/UnknownCalls.tsx";
 import { WebStrip } from "../tools/web/WebStrip.tsx";
 import { IconFork, IconPencil, IconRegenerate } from "../ui/icons.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
@@ -16,6 +18,7 @@ export function Reply(props: {
   onRegenerate: () => void;
   openCallId: string | null;
   onOpenAgent: (callId: string) => void;
+  onAnswer: (callId: string, text: string) => void;
 }) {
   const { message: m, markdown, actions } = props;
   const [editing, setEditing] = useState(false);
@@ -64,6 +67,8 @@ export function Reply(props: {
         <AgentStrip runs={m.agents} openCallId={props.openCallId} onOpen={props.onOpenAgent} />
       )}
       {m.web && m.web.length > 0 && <WebStrip runs={m.web} />}
+      {m.questions && m.questions.length > 0 && <Questions questions={m.questions} onAnswer={props.onAnswer} />}
+      {m.unknownTools && m.unknownTools.length > 0 && <UnknownCalls calls={m.unknownTools} />}
       {m.error && (
         <p className="border-l-2 border-fault pl-3 text-sm text-fault" role="alert">
           {m.error}

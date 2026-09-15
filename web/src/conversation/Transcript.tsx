@@ -25,6 +25,7 @@ export function Transcript(props: {
   onRerun: (messageId: number, prompt: string | null) => void;
   onSave: (messageId: number, text: string) => void;
   onFork: (messageId: number) => void;
+  onAnswer: (messageId: number, callId: string, text: string) => void;
 }) {
   const { session: active, following, openAgent } = props;
   const transcript = useRef<HTMLDivElement>(null);
@@ -66,6 +67,7 @@ export function Transcript(props: {
                 onRegenerate={() => props.onRerun(m.id, null)}
                 openCallId={openAgent?.messageId === m.id ? openAgent.callId : null}
                 onOpenAgent={(callId) => props.onOpenAgent({ messageId: m.id, callId })}
+                onAnswer={(callId, text) => props.onAnswer(m.id, callId, text)}
               />
             );
           })}

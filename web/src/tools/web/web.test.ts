@@ -201,6 +201,22 @@ describe("runWeb", () => {
     expect(runs[0].error).toBe("Tavily answered 401: Unauthorized: missing or invalid API key.");
   });
 
+  it("fails a call with no answer in time, and a page the reader says failed", async () => {
+    const hanging = ((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)))) as typeof fetch;
+    const [late] = await runWeb([read], { tavilyKey: null, signal: new AbortController().signal, onUpdate: () => {}, fetch: hanging, timeoutMs: 20 });
+    expect(late).toMatchObject({ status: "failed", error: "No answer within 0 s." });
+
+    const page = "Title: \n\nURL Source: https://httpstat.us/502\n\nWarning: Target URL returned error 502: Bad Gateway\n\nMarkdown Content:\n502 Bad Gateway";
+    const [bad] = await runWeb([read], {
+      tavilyKey: null,
+      signal: new AbortController().signal,
+      onUpdate: () => {},
+      fetch: fakeFetch(() => new Response(page)),
+    });
+    expect(bad).toMatchObject({ status: "failed", error: "The page answered 502: Bad Gateway." });
+  });
+
   it("stops calls when the turn is stopped", async () => {
     const abort = new AbortController();
     abort.abort();

@@ -53,6 +53,8 @@ You can reach the web with two tools.
 - Base your reply on what the tools returned and cite the URLs you used. If they found nothing useful, say so.`;
 
 export const SEARCH_RESULTS = 5;
+/** A web call with no answer by then fails, so a hung service never holds the turn. */
+export const WEB_TIMEOUT_MS = 60_000;
 /** A fetched page is cut to this many characters before it goes to the model. */
 export const FETCH_LIMIT = 20_000;
 
@@ -116,6 +118,7 @@ export type RunWebOptions = {
   signal: AbortSignal;
   onUpdate: (run: WebRun) => void;
   fetch?: typeof fetch;
+  timeoutMs?: number;
 };
 
 async function failure(res: Response, service: string): Promise<string> {
@@ -145,7 +148,11 @@ async function search(query: string, key: string, signal: AbortSignal, doFetch: 
 async function read(url: string, signal: AbortSignal, doFetch: typeof fetch): Promise<string> {
   const res = await doFetch(`https://r.jina.ai/${url}`, { signal });
   if (!res.ok) throw new Error(await failure(res, "The Jina reader"));
-  return res.text();
+  const text = await res.text();
+  // The reader answers 200 for a page that failed, with a warning ahead of the error page.
+  const warning = /^Warning: Target URL returned error (\d{3})(?::\s*(.*))?$/m.exec(text);
+  if (warning) throw new Error(`The page answered ${warning[1]}${warning[2] ? `: ${warning[2].trim()}` : ""}.`);
+  return text;
 }
 
 /** DuckDuckGo's own result links are redirects carrying the target in `uddg`. */
@@ -254,13 +261,17 @@ export async function runWeb(tasks: WebTask[], options: RunWebOptions): Promise<
       };
       if (signal.aborted) return finish({ status: "stopped" });
       options.onUpdate({ ...task, status: "running" });
+      const timeoutMs = options.timeoutMs ?? WEB_TIMEOUT_MS;
+      const timeout = AbortSignal.timeout(timeoutMs);
+      const callSignal = AbortSignal.any([signal, timeout]);
       try {
-        if (task.tool === WEB_FETCH_TOOL_NAME) return finish({ status: "done", page: await read(task.target, signal, doFetch) });
+        if (task.tool === WEB_FETCH_TOOL_NAME) return finish({ status: "done", page: await read(task.target, callSignal, doFetch) });
         return options.tavilyKey
-          ? finish({ status: "done", via: "tavily", results: await search(task.target, options.tavilyKey, signal, doFetch) })
-          : finish({ status: "done", ...(await keylessSearch(task.target, signal, doFetch)) });
+          ? finish({ status: "done", via: "tavily", results: await search(task.target, options.tavilyKey, callSignal, doFetch) })
+          : finish({ status: "done", ...(await keylessSearch(task.target, callSignal, doFetch)) });
       } catch (err) {
         if (signal.aborted) return finish({ status: "stopped" });
+        if (timeout.aborted) return finish({ status: "failed", error: `No answer within ${Math.round(timeoutMs / 1000)} s.` });
         return finish({ status: "failed", error: err instanceof Error ? err.message : String(err) });
       }
     }),

@@ -252,7 +252,8 @@ describe("agents with tools", () => {
     });
     expect(run.status).toBe("done");
     expect(tasksSeen).toEqual([0]);
-    expect(run.web?.[0].status).toBe("failed");
+    expect(run.web).toEqual([]);
+    expect(run.unknownTools?.map((u) => [u.name, u.arguments])).toEqual([["agent", '{"name":"x","prompt":"y"}']]);
     expect(bodies[1].messages.at(-1)?.content).toMatch(/Unknown tool "agent": the tools available are "web_search", "web_fetch"/);
   });
 

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { REASONING_EFFORTS } from "../api/request.ts";
 import { ignisPrompt, setAllTools, type ToolsState } from "../tools/index.ts";
 import { setTavilyKey, useTavilyKey } from "../tools/web/tavilyKey.ts";
@@ -8,7 +9,9 @@ import { Switch } from "../ui/Switch.tsx";
 import { EFFORT_LABELS, type PlaygroundSettings } from "./defaults.ts";
 import { SystemPromptField } from "./SystemPromptField.tsx";
 
-/** The right-hand panel: request settings, tools and display. A drawer below `lg`, shown when `open`. */
+type Tab = "general" | "tools";
+
+/** The right-hand panel, in two tabs: request settings and display, and the tools. A drawer below `lg`, shown when `open`. */
 export function SettingsPanel(props: {
   open: boolean;
   settings: PlaygroundSettings;
@@ -18,14 +21,54 @@ export function SettingsPanel(props: {
   markdown: boolean;
   onMarkdownChange: (on: boolean) => void;
 }) {
+  const [tab, setTab] = useState<Tab>("general");
+  const { tools } = props;
+  const toolsOn = tools.enabled ? [tools.agents, tools.web, tools.askUser, tools.dateTime].filter(Boolean).length : 0;
+  return (
+    <aside
+      aria-label="Settings"
+      className={`fixed inset-y-0 right-0 z-40 flex w-72 flex-col overflow-y-auto border-l border-line bg-ground px-5 pb-5 transition-transform motion-reduce:transition-none lg:static lg:z-auto lg:w-68 lg:translate-x-0 ${props.open ? "translate-x-0" : "max-lg:invisible max-lg:translate-x-full"}`}
+    >
+      <div role="tablist" aria-label="Settings sections" className="sticky top-0 z-10 -mx-5 mb-5 flex gap-5 border-b border-line bg-ground px-5 pt-4">
+        {(["general", "tools"] as const).map((t) => (
+          <button
+            key={t}
+            type="button"
+            role="tab"
+            id={`settings-tab-${t}`}
+            aria-selected={tab === t}
+            aria-controls="settings-tab-panel"
+            onClick={() => setTab(t)}
+            className={`-mb-px flex items-center gap-1.5 border-b-2 pb-2 font-display text-[13px] font-semibold ${tab === t ? "border-ember text-ink" : "border-transparent text-ash hover:text-ink"}`}
+          >
+            {t === "general" ? "General" : "Tools"}
+            {t === "tools" && (
+              <span className="font-display text-xs font-medium tabular-nums text-ash" aria-label={`${toolsOn} on`}>
+                {toolsOn}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+      <div id="settings-tab-panel" role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="flex flex-1 flex-col gap-6">
+        {tab === "general" ? <GeneralSettings {...props} /> : <ToolsSetting tools={tools} onChange={props.onToolsChange} />}
+      </div>
+    </aside>
+  );
+}
+
+function GeneralSettings(props: {
+  settings: PlaygroundSettings;
+  set: <K extends keyof PlaygroundSettings>(key: K, value: PlaygroundSettings[K]) => void;
+  tools: ToolsState;
+  markdown: boolean;
+  onMarkdownChange: (on: boolean) => void;
+}) {
   const { settings, set } = props;
   // ignis refuses greedy sampling with a top_p it would ignore.
   const greedyConflict = settings.temperature === 0 && settings.topP !== 1;
   return (
-    <aside
-      aria-label="Settings"
-      className={`fixed inset-y-0 right-0 z-40 flex w-72 flex-col gap-6 overflow-y-auto border-l border-line bg-ground px-5 py-5 transition-transform motion-reduce:transition-none lg:static lg:z-auto lg:w-68 lg:translate-x-0 ${props.open ? "translate-x-0" : "max-lg:invisible max-lg:translate-x-full"}`}
-    >
+    <>
       <SystemPromptField value={settings.systemPrompt} onChange={(v) => set("systemPrompt", v)} ignis={ignisPrompt(props.tools)} />
 
       <Segmented
@@ -70,10 +113,8 @@ export function SettingsPanel(props: {
         onChange={(v) => set("laneTag", v)}
       />
 
-      <ToolsSetting tools={props.tools} onChange={props.onToolsChange} />
-
       <MarkdownSetting on={props.markdown} onChange={props.onMarkdownChange} />
-    </aside>
+    </>
   );
 }
 
@@ -83,39 +124,58 @@ function ToolsSetting({ tools, onChange }: { tools: ToolsState; onChange: (tools
       <legend className="sr-only">Tools</legend>
       <div className="mb-2 flex items-center justify-between gap-3">
         <span id="tools-all-label" className={caption}>
-          Tools
+          All tools
         </span>
         <Switch on={tools.enabled} onChange={(on) => onChange(setAllTools(tools, on))} labelledBy="tools-all-label" />
       </div>
       {tools.enabled && (
-      <div className="flex flex-col gap-2">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex flex-col gap-0.5">
-            <span id="tool-agents-label" className="font-display text-sm font-semibold text-ink">
-              Agents
-            </span>
-            <span className="text-xs leading-snug text-ash">
-              The model can hand sub-tasks to agents that run in parallel on agent lanes. Agents get the other tools
-              that are on.
-            </span>
-          </div>
-          <Switch on={tools.agents} onChange={(agents) => onChange({ ...tools, agents })} labelledBy="tool-agents-label" />
+        <div className="flex flex-col gap-4">
+          <ToolRow
+            id="agents"
+            label="Agents"
+            on={tools.agents}
+            onChange={(agents) => onChange({ ...tools, agents })}
+            description="The model can hand sub-tasks to agents that run in parallel on agent lanes. Agents get the other tools that are on, except asking you."
+          />
+          <ToolRow
+            id="web"
+            label="Web"
+            on={tools.web}
+            onChange={(web) => onChange({ ...tools, web })}
+            description="The model can search the web and read pages, from this browser."
+          />
+          {tools.web && <TavilyKeyField />}
+          <ToolRow
+            id="ask-user"
+            label="Ask me"
+            on={tools.askUser}
+            onChange={(askUser) => onChange({ ...tools, askUser })}
+            description="The model can stop to ask you a question, with answers to pick or your own."
+          />
+          <ToolRow
+            id="date-time"
+            label="Date and time"
+            on={tools.dateTime}
+            onChange={(dateTime) => onChange({ ...tools, dateTime })}
+            description="The day, date and time, in this browser's time zone, go into the ignis system prompt."
+          />
         </div>
-        <div className="mt-2 flex items-start justify-between gap-3">
-          <div className="flex flex-col gap-0.5">
-            <span id="tool-web-label" className="font-display text-sm font-semibold text-ink">
-              Web
-            </span>
-            <span className="text-xs leading-snug text-ash">
-              The model can search the web and read pages, from this browser.
-            </span>
-          </div>
-          <Switch on={tools.web} onChange={(web) => onChange({ ...tools, web })} labelledBy="tool-web-label" />
-        </div>
-        {tools.web && <TavilyKeyField />}
-      </div>
       )}
     </fieldset>
+  );
+}
+
+function ToolRow(props: { id: string; label: string; description: string; on: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-col gap-0.5">
+        <span id={`tool-${props.id}-label`} className="font-display text-sm font-semibold text-ink">
+          {props.label}
+        </span>
+        <span className="text-xs leading-snug text-ash">{props.description}</span>
+      </div>
+      <Switch on={props.on} onChange={props.onChange} labelledBy={`tool-${props.id}-label`} />
+    </div>
   );
 }
 

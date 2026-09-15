@@ -19,6 +19,8 @@ import type { Plugin } from "vite";
 // search and one page read; an agent-lane request with the web tools whose
 // task contains "/web" searches once before its report ("/agents /web …").
 // The calls themselves run in the browser against the real services.
+//
+// Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -80,6 +82,7 @@ export function mockIgnis(): Plugin {
         const tools = (body.tools as { function?: { name?: string } }[] | undefined) ?? [];
         const offersAgents = tools.some((t) => t.function?.name === "agent");
         const offersWeb = tools.some((t) => t.function?.name === "web_search");
+        const offersAsk = tools.some((t) => t.function?.name === "ask_user");
         const lastRole = messages.at(-1)?.role;
         let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
         let calls: { tool: string; args: object }[] = [];
@@ -92,7 +95,7 @@ export function mockIgnis(): Plugin {
           const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
           content = words.split(/(?<= )/);
           pace = 70 + Math.floor(Math.random() * 120);
-        } else if ((offersAgents || offersWeb) && lastRole === "tool") {
+        } else if ((offersAgents || offersWeb || offersAsk) && lastRole === "tool") {
           const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80).replace(/\s+/g, " ")}`);
           content = ["The ", "tools ", "reported ", "back:\n\n", results.join("\n")];
         } else if (offersAgents && last.includes("/agents")) {
@@ -101,6 +104,9 @@ export function mockIgnis(): Plugin {
             tool: "agent",
             args: { name, prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}` },
           }));
+        } else if (offersAsk && last.includes("/ask")) {
+          content = ["I ", "need ", "one ", "detail ", "first."];
+          calls = [{ tool: "ask_user", args: { question: "Which team do you mean?", options: ["AS Roma", "SS Lazio"] } }];
         } else if (offersWeb && last.includes("/web")) {
           content = ["Let ", "me ", "look ", "that ", "up."];
           calls = [

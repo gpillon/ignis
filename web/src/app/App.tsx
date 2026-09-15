@@ -11,7 +11,7 @@ import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.
 import { SettingsPanel } from "../settings/SettingsPanel.tsx";
 import { AgentReader } from "../tools/agents/AgentReader.tsx";
 import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
-import { NO_TOOLS, type ToolsState } from "../tools/index.ts";
+import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
 import { useConversation } from "./useConversation.ts";
@@ -27,7 +27,7 @@ export function App() {
   const auth = useAuth();
   const model = useModel();
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [tools, setTools] = useState<ToolsState>(NO_TOOLS);
+  const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
   const [input, setInput] = useState("");
   const [logOpen, setLogOpen] = useState(false);
@@ -104,6 +104,7 @@ export function App() {
             onRerun={chat.rerun}
             onSave={chat.saveEdit}
             onFork={chat.fork}
+            onAnswer={chat.answer}
           />
           <Composer
             value={input}

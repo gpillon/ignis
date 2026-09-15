@@ -2,6 +2,8 @@ import type { Figures } from "../metrics/figures.ts";
 import type { LaneTag, ReasoningEffort } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import type { AgentRun } from "../tools/agents/agents.ts";
+import type { Question } from "../tools/ask/ask.ts";
+import type { UnknownCall } from "../tools/errors.ts";
 import type { WebRun } from "../tools/web/web.ts";
 
 // Playground sessions: separate conversations, each with its own log of
@@ -27,6 +29,10 @@ export type Message = {
   agents?: AgentRun[];
   /** The web searches and page reads an assistant reply's calls made, as they run. */
   web?: WebRun[];
+  /** Calls an assistant reply made to tools the request did not declare. */
+  unknownTools?: UnknownCall[];
+  /** The questions an assistant reply asked the user. */
+  questions?: Question[];
 };
 
 export type LogRow = {
