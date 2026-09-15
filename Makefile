@@ -5,6 +5,8 @@
 #   make run             run the last build; refuses a missing or stale binary
 #   make mock            the same loop on the CPU mock (no GPU, no kernel leaf)
 #   make dev-ui          server in the background + Playground with hot reload
+#                        (API_KEY=auto: the server generates a key and prints it;
+#                        EXPOSE=cloudflare-quick: a public URL, key required)
 #   make config          the resolved knobs
 #
 # Layout
@@ -86,15 +88,20 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(MAX_CONTEXT),--max-context $(MAX_CONTEXT)) \
   $(if $(PREFILL_CHUNK),--prefill-chunk $(PREFILL_CHUNK)) \
   $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES)) \
+  $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
   $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)))
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(MODEL),--model $(MODEL)) \
   $(if $(filter 1,$(UI)),--ui) \
+  $(if $(API_KEY),--api-key $(API_KEY)) \
+  $(if $(EXPOSE),--expose $(EXPOSE)) \
   $(ARGS)
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
 SMOKE_MODEL := $(or $(MODEL),qwen3.8-27b)
+# A generated key (API_KEY=auto) is unknown to make: pass the printed one.
+SMOKE_AUTH := $(if $(filter-out auto,$(API_KEY)),-H 'Authorization: Bearer $(API_KEY)')
 
 GPU_GUARDED := $(and $(filter 1,$(CUDA)),$(filter 1,$(GPU_CHECK)))
 
@@ -156,11 +163,13 @@ config: ## Print the resolved knobs and paths
 	@echo "PROFILE         $(PROFILE)  (dir=$(PROFILE_DIR))"
 	@echo "UI              $(UI)"
 	@echo "ARTIFACT        $(ARTIFACT)"
-	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
+	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"
+	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),$(if $(EXPOSE),(none: auto, required by EXPOSE),(none: /v1 is open)))"
+	@echo "EXPOSE          $(or $(EXPOSE),(none: reachable at BIND only))"
 	@echo "ARGS            $(ARGS)"
 	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"
 	@echo "server binary   $(SERVER_BIN)"
@@ -273,9 +282,12 @@ redeploy: ## Build, and only if it succeeds: stop + start
 .PHONY: status
 status: ## Is the server up? (process, pid file, /v1/models)
 	-@$(SERVER_STATUS)
-	@if curl -fsS --max-time 2 "$(SERVER_URL)/v1/models" >/dev/null 2>&1; \
-	then echo "http: $(SERVER_URL) is serving"; \
-	else echo "http: nothing answering on $(SERVER_URL)"; fi
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$(SERVER_URL)/v1/models" 2>/dev/null); \
+	case "$$code" in \
+	  200) echo "http: $(SERVER_URL) is serving";; \
+	  401) echo "http: $(SERVER_URL) is serving (API key required)";; \
+	  *) echo "http: nothing answering on $(SERVER_URL)";; \
+	esac
 
 .PHONY: logs
 logs: ## Follow the background server log
@@ -284,9 +296,9 @@ logs: ## Follow the background server log
 
 .PHONY: smoke
 smoke: ## One /v1/models + one short chat completion against BIND
-	curl -fsS "$(SERVER_URL)/v1/models"
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/models"
 	@echo ""
-	curl -fsS "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
+	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/v1/chat/completions" -H 'Content-Type: application/json' \
 	  -d '{"model":"$(SMOKE_MODEL)","messages":[{"role":"user","content":"Say hi in five words."}],"max_tokens":32}'
 	@echo ""
 

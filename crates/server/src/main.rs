@@ -55,6 +55,15 @@
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
 //! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); off by default.
+//! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
+//!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
+//!   leaves the API open. `auto` generates a key at start and prints it to
+//!   stdout — the only case a key is ever printed.
+//! - `IGNIS_EXPOSE` / `--expose` — make the server reachable from outside
+//!   this machine (ADR 0028). `cloudflare-quick` opens a Cloudflare quick
+//!   tunnel once the listener is bound and prints its public URL on stdout.
+//!   An exposed server always requires an API key: with none set, it
+//!   behaves as `--api-key auto`.
 
 use std::sync::Arc;
 
@@ -208,7 +217,27 @@ async fn main() {
         speculation: _,
         request_timeout_secs,
         ui,
+        api_key,
+        expose,
     } = config;
+    let api_key = match api_key {
+        None => None,
+        Some(ignis_server::config::ApiKeySetting::Fixed(key)) => Some(key),
+        Some(ignis_server::config::ApiKeySetting::Generate) => match ignis_server::config::ApiKey::generate() {
+            Ok(key) => {
+                // Printed on purpose, and only for a generated key: nobody
+                // else knows it. A plain line, not a log record — the
+                // logger redacts credentials. `make start`/`dev-ui` pick it
+                // out of the log (mk/windows/common.ps1).
+                println!("ignis-server: generated API key: {}", key.as_str());
+                Some(key)
+            }
+            Err(err) => {
+                tracing::error!(name: "ignis.config.api_key_generate_failed", error = %err, "refusing to start");
+                exit_after_flush(&logging_handle, 1);
+            }
+        },
+    };
 
     let server = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
@@ -301,17 +330,80 @@ async fn main() {
     } else {
         server
     };
+    let auth = api_key.is_some();
+    let server = match api_key {
+        Some(key) => server.with_api_key(key),
+        None => server,
+    };
 
     // The driver loop: the single task that advances the engine and routes
     // its per-request events into the request handlers' streams (the
     // server's `serve` spawns it; see `Server::serve`).
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::error!(name: "ignis.server.failed", bind = %bind, error = %err, "server exited");
+            exit_after_flush(&logging_handle, 1);
+        }
+    };
+
+    // `--expose` (ADR 0028): opened on the bound port, before serving, so a
+    // tunnel that cannot open refuses the start instead of leaving a server
+    // the operator believes is reachable.
+    let exposure = match expose {
+        None => None,
+        Some(mode) => {
+            let opened = match listener.local_addr() {
+                Ok(local) => ignis_server::expose::start(mode, local).await,
+                Err(err) => Err(err.to_string()),
+            };
+            match opened {
+                Ok(exposure) => {
+                    // A plain stdout line like the generated key's, so the
+                    // Makefile helpers can repeat it (mk/windows/common.ps1).
+                    println!("ignis-server: public URL: {}", exposure.url());
+                    if ui {
+                        println!("ignis-server: Playground: {}/ui/", exposure.url());
+                    }
+                    tracing::info!(
+                        name: "ignis.expose.opened",
+                        mode = mode.as_str(),
+                        url = %exposure.url(),
+                        location = %exposure.location(),
+                        "exposed beyond the bind address"
+                    );
+                    Some(exposure)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        name: "ignis.expose.failed",
+                        mode = mode.as_str(),
+                        error = %err,
+                        "refusing to start"
+                    );
+                    exit_after_flush(&logging_handle, 1);
+                }
+            }
+        }
+    };
+
     tracing::info!(
         name: "ignis.process.started",
         model = %model,
         bind = %bind,
-        "localhost, no auth; OpenAI API at /v1"
+        api_key_required = auth,
+        exposed = exposure.as_ref().map_or("no", |_| "yes"),
+        "OpenAI API at /v1"
     );
-    let serve_result = server.serve(bind).await;
+    let serve_result = server.serve_on(listener).await;
+
+    // The tunnel outlives the drain above, so in-flight remote requests
+    // finish through it; only then is it unregistered.
+    if let Some(exposure) = exposure {
+        if let Err(err) = exposure.shutdown().await {
+            tracing::warn!(name: "ignis.expose.close_failed", error = %err, "tunnel did not close cleanly");
+        }
+    }
 
     // `ignis.process.stopped` MUST be the last event emitted (spec §28) —
     // whichever branch below runs, nothing after it logs anything. The

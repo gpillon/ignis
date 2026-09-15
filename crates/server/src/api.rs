@@ -1,7 +1,8 @@
 //! The OpenAI-compatible HTTP surface (server-01): routes, request /
 //! response schemas, handlers.
 //!
-//! Endpoints (localhost, no auth — `docs/design/ignis-v1.md` §2):
+//! Endpoints (`docs/design/ignis-v1.md` §2; open unless `--api-key` is set,
+//! then each needs `Authorization: Bearer <key>` or answers `401`):
 //! - `GET /v1/models` — the loaded model.
 //! - `POST /v1/chat/completions` — chat completions, streaming (SSE) and
 //!   non-streaming; routes into the core scheduler and streams tokens back
@@ -62,7 +63,10 @@ pub fn router(state: Arc<Server>) -> Router {
             "/v1/chat/completions",
             post(chat_completions).options(cors_preflight),
         )
-        .route("/v1/responses", post(responses_api).options(cors_preflight));
+        .route("/v1/responses", post(responses_api).options(cors_preflight))
+        // Only the `/v1` routes above: the Playground's static pages stay
+        // reachable without a key.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     // The Playground (GitHub #163): present only when `--ui` gave it assets.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
@@ -92,6 +96,41 @@ impl<B> MakeSpan<B> for RootSpanMaker {
             request_id = tracing::field::Empty,
         )
     }
+}
+
+/// With an API key configured, refuses a request that does not present it
+/// as `Authorization: Bearer <key>` with OpenAI's `401 invalid_api_key`.
+/// A CORS preflight passes untouched: browsers never attach credentials to
+/// one, so gating it would break every cross-origin client.
+async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
+    let Some(key) = &server.api_key else {
+        return next.run(req).await;
+    };
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    if presented.is_some_and(|p| key.matches(p)) {
+        return next.run(req).await;
+    }
+    let message = match presented {
+        None => "missing API key: send `Authorization: Bearer <key>`",
+        Some(_) => "incorrect API key provided",
+    };
+    let mut res = error_response(
+        StatusCode::UNAUTHORIZED,
+        "invalid_request_error",
+        "invalid_api_key",
+        message,
+    );
+    res.headers_mut()
+        .insert(axum::http::header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    res
 }
 
 /// Answers a CORS preflight request with no body; `cors_headers` attaches
@@ -640,6 +679,7 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
             id,
             object: "model",
             owned_by: "ignis",
+            max_model_len: server.engine.max_model_len(),
         }],
     })
 }
@@ -657,6 +697,9 @@ struct ModelInfo {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    /// The context for one request, prompt plus `max_tokens`, in tokens
+    /// (vLLM's name for it; the Playground's context bar reads it).
+    max_model_len: u32,
 }
 
 // ── POST /v1/chat/completions ─────────────────────────────────────────────

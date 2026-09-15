@@ -151,6 +151,11 @@ async fn list_models_returns_the_loaded_model() {
     assert_eq!(v["object"], "list");
     assert_eq!(v["data"][0]["id"], MODEL, "the loaded model id");
     assert_eq!(v["data"][0]["object"], "model");
+    assert_eq!(
+        v["data"][0]["max_model_len"],
+        SchedulerConfig::default().max_sequence_tokens,
+        "the per-sequence context the scheduler enforces"
+    );
 }
 
 // ── POST /v1/chat/completions (non-streaming) ────────────────────────────

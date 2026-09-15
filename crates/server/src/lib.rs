@@ -24,6 +24,7 @@ pub mod artifact_template;
 pub mod config;
 pub mod decoder;
 pub mod engine;
+pub mod expose;
 pub mod loader;
 pub mod playground;
 pub mod runtime;
@@ -64,6 +65,9 @@ pub struct Server {
     /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
+    /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
+    /// `None` leaves the API open.
+    pub api_key: Option<crate::config::ApiKey>,
 }
 
 impl Server {
@@ -76,6 +80,7 @@ impl Server {
             default_enable_thinking: true,
             default_reasoning_effort: None,
             playground: None,
+            api_key: None,
         }
     }
 
@@ -124,6 +129,13 @@ impl Server {
         self
     }
 
+    /// Require `key` as `Authorization: Bearer <key>` on every `/v1` route
+    /// (`main` wires this to `--api-key` / `IGNIS_API_KEY`).
+    pub fn with_api_key(mut self, key: crate::config::ApiKey) -> Self {
+        self.api_key = Some(key);
+        self
+    }
+
     /// The axum app (build once, share across a listener; the state the
     /// router serves is an `Arc` of this server).
     pub fn app(&self) -> Router {
@@ -140,8 +152,24 @@ impl Server {
     /// logging queue after this returns, since that is the true last event.
     pub async fn serve(self, addr: String) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
+        self.serve_on(listener).await
+    }
+
+    /// [`Server::serve`] on a listener the caller already bound — `main`
+    /// binds first when `--expose` needs the bound port before serving.
+    pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        self.serve_on_until(listener, shutdown_signal()).await
+    }
+
+    /// [`Server::serve_on`], stopping gracefully when `shutdown` resolves
+    /// instead of on a process signal (tests).
+    pub async fn serve_on_until(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
         let app = self.app();
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await
+        axum::serve(listener, app).with_graceful_shutdown(shutdown).await
     }
 }
 

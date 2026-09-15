@@ -9,6 +9,20 @@ import type { Plugin } from "vite";
 // "none" or `enable_thinking` false) and stops on a
 // client disconnect; a last user message containing "/error" gets ignis's
 // 503 "engine full" error instead of a stream.
+//
+// Agents: with the `agent` tool declared, a prompt containing "/agents"
+// streams three agent calls (finish "tool_calls"); a request whose last
+// message is a tool result answers from those results; an agent-lane
+// request streams a longer report at its own pace.
+//
+// Web: with `web_search` declared, a prompt containing "/web" streams one
+// search and one page read; an agent-lane request with the web tools whose
+// task contains "/web" searches once before its report ("/agents /web …").
+// The calls themselves run in the browser against the real services.
+//
+// Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
+// Local: "/js", "/plan", "/file" and "/html" call run_js, update_plan and create_file.
+// "/math" answers with formulas; "/long" streams a long reply for scrolling.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -30,7 +44,14 @@ export function mockIgnis(): Plugin {
     configureServer(server) {
       server.middlewares.use("/v1/models", (_req, res) => {
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ object: "list", data: [{ id: "mock-model", object: "model", owned_by: "ignis" }] }));
+        // `max_model_len` (vLLM's name for the context length) feeds the
+        // Playground's context bar, as ignis reports it.
+        res.end(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "mock-model", object: "model", owned_by: "ignis", max_model_len: 40960 }],
+          }),
+        );
       });
 
       server.middlewares.use("/v1/chat/completions", async (req, res) => {
@@ -60,12 +81,91 @@ export function mockIgnis(): Plugin {
           `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
         const thinkingOff = body.reasoning_effort === "none" || body.enable_thinking === false;
         const reasoning = thinkingOff ? [] : ["Thinking ", "about ", "it."];
-        const content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
+        const tools = (body.tools as { function?: { name?: string } }[] | undefined) ?? [];
+        const offersAgents = tools.some((t) => t.function?.name === "agent");
+        const offersWeb = tools.some((t) => t.function?.name === "web_search");
+        const offersAsk = tools.some((t) => t.function?.name === "ask_user");
+        const offers = (name: string) => tools.some((t) => t.function?.name === name);
+        const offersLocal = offers("run_js") || offers("update_plan") || offers("create_file");
+        const lastRole = messages.at(-1)?.role;
+        let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
+        let calls: { tool: string; args: object }[] = [];
+        let pace = 120;
+        if (last.includes("/long") && lastRole === "user") {
+          // Long reasoning and a long answer, streamed fast: for checking how the transcript scrolls.
+          const sentence = (n: number) => `This is sentence ${n} of a long stream, written to fill the transcript and wrap across several lines. `;
+          reasoning.splice(0, reasoning.length, ...(thinkingOff ? [] : Array.from({ length: 60 }, (_, i) => sentence(i + 1))));
+          content = Array.from({ length: 120 }, (_, i) => (i % 12 === 11 ? `${sentence(i + 1)}\n\n` : sentence(i + 1)));
+          pace = 25;
+        } else if (body.class === "agent" && offersWeb && lastRole === "user" && last.includes("/web")) {
+          // An agent with web tools whose task mentions "/web" searches before it reports.
+          content = ["Searching ", "first."];
+          calls = [{ tool: "web_search", args: { query: last.replace(/^.*\/web/s, "").trim() || "ignis inference engine" } }];
+        } else if (body.class === "agent") {
+          const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
+          content = words.split(/(?<= )/);
+          pace = 70 + Math.floor(Math.random() * 120);
+        } else if ((offersAgents || offersWeb || offersAsk || offersLocal) && lastRole === "tool") {
+          const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80).replace(/\s+/g, " ")}`);
+          content = ["The ", "tools ", "reported ", "back:\n\n", results.join("\n")];
+        } else if (offersAgents && last.includes("/agents")) {
+          content = ["I'll ", "split ", "this ", "into ", "three ", "parts."];
+          calls = ["scheduler", "kv-cache", "telemetry"].map((name) => ({
+            tool: "agent",
+            args: { name, prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}` },
+          }));
+        } else if (offers("run_js") && last.includes("/js")) {
+          content = ["Let ", "me ", "compute ", "it."];
+          calls = [{ tool: "run_js", args: { code: "const squares = [1, 2, 3, 4].map((x) => x * x);\nconsole.log('squares', squares);\nreturn squares.reduce((a, b) => a + b);" } }];
+        } else if (offers("update_plan") && last.includes("/plan")) {
+          content = ["Here ", "is ", "the ", "plan."];
+          calls = [
+            {
+              tool: "update_plan",
+              args: { steps: [{ step: "Read the question", status: "done" }, { step: "Look things up", status: "in_progress" }, { step: "Write the answer", status: "pending" }] },
+            },
+          ];
+        } else if (last.includes("/math") && lastRole === "user") {
+          content = [
+            "Hydrostatic pressure grows with depth:\n\n",
+            "$$P = \\rho \\cdot g \\cdot h$$\n\n",
+            "where $\\rho$ is the density, \\(g\\) the gravity and $h$ the depth. In display form:\n\n",
+            "\\[\n\\int_0^h \\rho g \\, dz = \\rho g h\n\\]",
+          ];
+        } else if (offers("create_file") && last.includes("/html")) {
+          content = ["Here ", "is ", "the ", "page."];
+          calls = [
+            {
+              tool: "create_file",
+              args: {
+                name: "hello.html",
+                content:
+                  '<!doctype html>\n<html>\n<body style="font-family: sans-serif; padding: 24px">\n  <h1>Hello from ignis</h1>\n  <button onclick="this.textContent = \'Clicked\'">Click me</button>\n</body>\n</html>\n',
+              },
+            },
+          ];
+        } else if (offers("create_file") && last.includes("/file")) {
+          content = ["I ", "wrote ", "it ", "to ", "a ", "file."];
+          calls = [{ tool: "create_file", args: { name: "notes.md", content: "# Notes\n\n- one\n- two\n" } }];
+        } else if (offersAsk && last.includes("/ask")) {
+          content = ["I ", "need ", "one ", "detail ", "first."];
+          calls = [{ tool: "ask_user", args: { question: "Which team do you mean?", options: ["AS Roma", "SS Lazio"] } }];
+        } else if (offersWeb && last.includes("/web")) {
+          content = ["Let ", "me ", "look ", "that ", "up."];
+          calls = [
+            { tool: "web_search", args: { query: last.replace("/web", "").trim() || "ignis inference engine" } },
+            { tool: "web_fetch", args: { url: "https://example.com/" } },
+          ];
+        }
+        const completion = reasoning.length + content.length + calls.length;
         const pieces = [
           ...reasoning.map((t) => chunk({ reasoning_content: t })),
           ...content.map((t) => chunk({ content: t })),
-          chunk({}, "stop"),
-          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: reasoning.length + content.length, total_tokens: 12 * messages.length + reasoning.length + content.length } })}\n\n`,
+          ...calls.map((c, index) =>
+            chunk({ tool_calls: [{ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name: c.tool, arguments: JSON.stringify(c.args) } }] }),
+          ),
+          chunk({}, calls.length ? "tool_calls" : "stop"),
+          `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: completion, total_tokens: 12 * messages.length + completion } })}\n\n`,
           "data: [DONE]\n\n",
         ];
         let i = 0;
@@ -76,7 +176,7 @@ export function mockIgnis(): Plugin {
             return;
           }
           res.write(pieces[i++]);
-        }, 120);
+        }, pace);
         req.on("close", () => clearInterval(timer));
       });
 
