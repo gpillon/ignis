@@ -26,6 +26,7 @@ pub mod decoder;
 pub mod engine;
 pub mod expose;
 pub mod loader;
+pub mod metrics;
 pub mod playground;
 pub mod runtime;
 pub mod telemetry;
@@ -65,6 +66,9 @@ pub struct Server {
     /// The Playground's asset table when `--ui` is on (GitHub #163, ADR
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
+    /// The Prometheus projection when `--metrics` is on (GitHub #89, ADR
+    /// 0017); `None` installs neither the projection nor `GET /metrics`.
+    pub metrics: Option<std::sync::Arc<metrics::Metrics>>,
     /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
@@ -80,6 +84,7 @@ impl Server {
             default_enable_thinking: true,
             default_reasoning_effort: None,
             playground: None,
+            metrics: None,
             api_key: None,
         }
     }
@@ -126,6 +131,17 @@ impl Server {
     /// table, including the empty one that selects the fallback page).
     pub fn with_playground(mut self, assets: playground::Assets) -> Self {
         self.playground = Some(assets);
+        self
+    }
+
+    /// Serve Prometheus metrics at `GET /metrics` (`main` calls this when
+    /// `--metrics` is set): installs the projection into the engine's
+    /// telemetry consumer, which alone keeps it up to date from the facts it
+    /// already receives.
+    pub fn with_metrics(mut self) -> Self {
+        let metrics = std::sync::Arc::new(metrics::Metrics::new());
+        self.engine.install_metrics(std::sync::Arc::clone(&metrics));
+        self.metrics = Some(metrics);
         self
     }
 

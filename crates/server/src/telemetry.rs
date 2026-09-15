@@ -34,6 +34,7 @@ use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
+use crate::metrics::Metrics;
 
 // ── the clock (the determinism seam) ────────────────────────────────────────
 
@@ -157,6 +158,9 @@ pub struct Telemetry {
     kv_evictions: u64,
     /// In-flight request telemetry (id → state); removed on completion.
     requests: HashMap<RequestId, RequestTelemetry>,
+    /// The Prometheus projection this consumer keeps up to date, when
+    /// `--metrics` installed one (GitHub #89, ADR 0017).
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Telemetry {
@@ -170,6 +174,7 @@ impl Telemetry {
             last_logged: None,
             kv_evictions: 0,
             requests: HashMap::new(),
+            metrics: None,
         }
     }
 
@@ -178,11 +183,20 @@ impl Telemetry {
         self.stats = Some(stats);
     }
 
+    /// Keep `metrics` up to date from the same calls that emit the request
+    /// and interval events — never from their rendered output.
+    pub fn with_metrics(&mut self, metrics: Arc<Metrics>) {
+        self.metrics = Some(metrics);
+    }
+
     /// A request was submitted: anchor its `ms` timeline and record its
     /// prompt length (P3-06's `prompt_tokens` field) and admission class
     /// (GitHub #120). A re-submit of an in-flight id keeps the original
     /// anchor (and prompt length / class), so `ms` is not reset.
     pub fn note_submit(&mut self, id: RequestId, prompt_tokens: u32, class: RequestClass) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_accepted();
+        }
         self.requests
             .entry(id)
             .or_insert_with(|| RequestTelemetry {
@@ -275,6 +289,9 @@ impl Telemetry {
         reason: FinishReason,
         spec: Option<SpecCounters>,
     ) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_completed(n);
+        }
         let rt = self.requests.remove(&id);
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
             Some(rt) => (
@@ -377,6 +394,9 @@ impl Telemetry {
     pub fn emit_interval(&mut self) -> IntervalCounters {
         self.tick = self.tick.saturating_add(1);
         let counters = self.counters();
+        if let Some(metrics) = &self.metrics {
+            metrics.set_scheduler_requests(counters.waiting, counters.running);
+        }
         let logged = (counters.waiting, counters.running, counters.kv_evictions);
         if self.last_logged != Some(logged) {
             self.last_logged = Some(logged);
@@ -923,6 +943,36 @@ mod tests {
             "the stall shows up as the max gap"
         );
         assert_eq!(lane0_done["attributes"]["itl_samples"], 2);
+    }
+
+    /// GitHub #89 / ADR 0017: an installed projection follows the same
+    /// lifecycle calls that emit the request and interval events.
+    #[test]
+    fn an_installed_projection_follows_the_request_lifecycle() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let has = |line: &str| {
+            let text = metrics.render();
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        };
+
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.note_submit(2, 3, RequestClass::Agent);
+        telemetry.on_admitted(2, 0);
+        telemetry.emit_interval();
+        has("ignis_requests_accepted_total 2");
+        has("ignis_scheduler_requests{state=\"waiting\"} 1");
+        has("ignis_scheduler_requests{state=\"running\"} 1");
+        has("ignis_requests_completed_total 0");
+
+        telemetry.on_token(2);
+        telemetry.on_done(2, 5, FinishReason::Stop, None);
+        telemetry.emit_interval();
+        has("ignis_requests_completed_total 1");
+        has("ignis_generated_tokens_total 5");
+        has("ignis_scheduler_requests{state=\"waiting\"} 1");
+        has("ignis_scheduler_requests{state=\"running\"} 0");
     }
 
     #[test]

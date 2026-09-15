@@ -298,6 +298,7 @@ full, always-current table.
 | `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | auto (4 GiB) | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context` fails the load by name. |
 | `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | — | `--ui` | — | off | Serve the Playground at `/ui/` (flag only, no env var — ADR 0026). |
+| — | `--metrics` | — | off | Serve Prometheus metrics at `/metrics` (flag only, no env var — ADR 0017). |
 | — | `--help` | `-h` | — | Print the flag table and exit. |
 | — | `--version` | `-V` | — | Print the crate version and exit. |
 
@@ -320,6 +321,7 @@ a one-line readiness note (`model <id> on http://<bind>`) when ready.
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
 | `/ui/` | GET | The Playground page — only with `--ui`. |
+| `/metrics` | GET | Prometheus text format 0.0.4 — only with `--metrics` (ADR 0017). No API key required. |
 
 Errors use OpenAI's `{"error": {message, type, code}}` body with the matching
 status: 400 bad request, 404 unknown model, 413 oversized request, 503 engine

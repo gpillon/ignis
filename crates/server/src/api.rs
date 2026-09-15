@@ -71,6 +71,12 @@ pub fn router(state: Arc<Server>) -> Router {
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
+    // Prometheus metrics (GitHub #89, ADR 0017): present only with
+    // `--metrics`. Outside the key like the Playground: the ADR adds no
+    // metrics-specific authentication.
+    if let Some(metrics) = &state.metrics {
+        router = router.merge(crate::metrics::router(Arc::clone(metrics)));
+    }
     router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))

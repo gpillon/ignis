@@ -81,6 +81,9 @@ pub struct Config {
     /// Serve the Playground under `/ui/` (`--ui`, GitHub #163, ADR 0026).
     /// Flag-only: no env var, no alias.
     pub ui: bool,
+    /// Serve Prometheus metrics at `GET /metrics` (`--metrics`, GitHub #89,
+    /// ADR 0017). Flag-only: no env var, no alias, no config-file key.
+    pub metrics: bool,
     /// The key every `/v1` request must present as `Authorization: Bearer
     /// <key>` (`--api-key` / `IGNIS_API_KEY`). `None` (the default) keeps
     /// the API open, as it has always been on localhost.
@@ -199,6 +202,7 @@ pub fn resolve(
     let mut spec = None;
     let mut draft_tokens = None;
     let mut ui = false;
+    let mut metrics = false;
     let mut api_key = None;
     let mut expose = None;
 
@@ -220,6 +224,7 @@ pub fn resolve(
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
+            "--metrics" => metrics = true,
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
             "--expose" => expose = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
@@ -289,6 +294,7 @@ pub fn resolve(
         speculation,
         request_timeout_secs,
         ui,
+        metrics,
         api_key,
         expose,
     }))
@@ -522,6 +528,7 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
+         \x20       --metrics                 serve Prometheus metrics at /metrics (default: off; flag only)\n\
          \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
          \x20       --expose <mode>           env: IGNIS_EXPOSE         (default: unset — reachable at --bind only; cloudflare-quick = public https://*.trycloudflare.com URL, printed at start; always requires an API key, auto when none is set)\n\
          \x20   -h, --help                    print this help and exit\n\
@@ -1134,6 +1141,40 @@ mod tests {
             panic!("expected Help");
         };
         assert!(text.contains("--ui"), "{text}");
+    }
+
+    // ── Prometheus metrics (GitHub #89, ADR 0017) ────────────────────────
+
+    #[test]
+    fn metrics_are_off_by_default_and_on_with_metrics() {
+        assert!(!expect_config(resolve(&[], no_env).expect("resolve")).metrics);
+        assert!(expect_config(resolve(&args(&["--metrics"]), no_env).expect("resolve")).metrics);
+    }
+
+    #[test]
+    fn metrics_is_a_bare_flag_with_no_env_var_and_no_alias() {
+        // A bare switch: the next argument is parsed as a flag of its own.
+        let config =
+            expect_config(resolve(&args(&["--metrics", "--bind", "b"]), no_env).expect("resolve"));
+        assert!(config.metrics);
+        assert_eq!(config.bind, "b");
+
+        for name in ["IGNIS_METRICS", "IGNIS_PROMETHEUS"] {
+            let env = move |key: &str| (key == name).then(|| "true".to_owned());
+            assert!(!expect_config(resolve(&[], env).expect("resolve")).metrics, "{name}");
+        }
+        for alias in ["-M", "--prometheus", "--metrics=true"] {
+            assert!(resolve(&args(&[alias]), no_env).is_err(), "`{alias}` is not a metrics alias");
+        }
+    }
+
+    #[test]
+    fn help_lists_the_metrics_flag() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--metrics"), "{text}");
     }
 
     // ── the API key ──────────────────────────────────────────────────────

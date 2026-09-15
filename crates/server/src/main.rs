@@ -55,6 +55,9 @@
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
 //! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); off by default.
+//! - `--metrics` (flag only, no env var) — serve Prometheus metrics at
+//!   `GET /metrics` (GitHub #89, ADR 0017); off by default, and off means
+//!   neither the route nor the projection behind it exists.
 //! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
 //!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
 //!   leaves the API open. `auto` generates a key at start and prints it to
@@ -217,6 +220,7 @@ async fn main() {
         speculation: _,
         request_timeout_secs,
         ui,
+        metrics,
         api_key,
         expose,
     } = config;
@@ -330,6 +334,9 @@ async fn main() {
     } else {
         server
     };
+    // Prometheus metrics (GitHub #89, ADR 0017): without `--metrics`, neither
+    // the projection nor `GET /metrics` exists.
+    let server = if metrics { server.with_metrics() } else { server };
     let auth = api_key.is_some();
     let server = match api_key {
         Some(key) => server.with_api_key(key),
@@ -392,6 +399,7 @@ async fn main() {
         model = %model,
         bind = %bind,
         api_key_required = auth,
+        metrics,
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );
