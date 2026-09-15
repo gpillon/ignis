@@ -307,6 +307,9 @@ impl Telemetry {
         };
         if let Some((submitted_ms, lane, class)) = first {
             let ms = now.saturating_sub(submitted_ms);
+            if let Some(metrics) = &self.metrics {
+                metrics.observe_ttft_ms(ms);
+            }
             self.emit_ttft(id, ms, lane, class);
         }
     }
@@ -333,6 +336,7 @@ impl Telemetry {
             }
         }
         let rt = self.requests.remove(&id);
+        let known = rt.is_some();
         let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
@@ -345,6 +349,13 @@ impl Telemetry {
             None => (self.clock.now_ms(), 0, 0, 0, 0, RequestClass::default()),
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
+        // Only a request this consumer saw submitted has a real span; one
+        // already counted as cancelled is not observed as completed.
+        if known {
+            if let Some(metrics) = &self.metrics {
+                metrics.observe_duration_ms(ms);
+            }
+        }
         let itl_mean_ms = if itl_count == 0 {
             0.0
         } else {
@@ -371,7 +382,19 @@ impl Telemetry {
     /// request log alone, without a second run.
     pub fn on_evicted(&mut self, id: RequestId, snapshot_micros: u64) {
         self.kv_evictions = self.kv_evictions.saturating_add(1);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_eviction();
+        }
         self.emit_evicted(id, snapshot_micros);
+    }
+
+    /// A request's prefill skipped `tokens` prompt tokens through a sibling's
+    /// cached prefix (core-07). Not logged — the request log has no line for
+    /// it — so only the installed projection observes it (GitHub #90).
+    pub fn on_prefix_reused(&mut self, tokens: u32) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_prefix_reused(tokens);
+        }
     }
 
     /// A request was restored from the host tier onto a decode lane: emit
@@ -1067,6 +1090,63 @@ mod tests {
         ] {
             assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
         }
+    }
+
+    /// GitHub #90 / ADR 0017: evictions, prefix reuse and both latency
+    /// histograms follow the same lifecycle calls, on the telemetry clock.
+    #[test]
+    fn an_installed_projection_observes_evictions_prefix_reuse_and_latency() {
+        // Reads, in order: submit 0, first token 120, second token 130,
+        // done 3000.
+        struct ScriptClock(std::sync::atomic::AtomicUsize, Vec<u64>);
+        impl TelemetryClock for ScriptClock {
+            fn now_ms(&self) -> u64 {
+                self.1[self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)]
+            }
+        }
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry =
+            Telemetry::new(Arc::new(ScriptClock(Default::default(), vec![0, 120, 130, 3000])));
+        telemetry.with_metrics(Arc::clone(&metrics));
+
+        telemetry.note_submit(1, 3, RequestClass::Agent);
+        telemetry.on_prefix_reused(32);
+        telemetry.on_evicted(1, 450);
+        telemetry.on_token(1);
+        telemetry.on_token(1);
+        telemetry.on_done(1, 2, FinishReason::Stop, None);
+
+        let text = metrics.render();
+        for line in [
+            "ignis_kv_cache_evictions_total 1",
+            "ignis_prefix_reused_tokens_total 32",
+            "ignis_request_ttft_seconds_bucket{le=\"0.1\"} 0",
+            "ignis_request_ttft_seconds_bucket{le=\"0.25\"} 1",
+            "ignis_request_ttft_seconds_sum 0.12",
+            "ignis_request_ttft_seconds_count 1",
+            "ignis_request_duration_seconds_bucket{le=\"2.5\"} 0",
+            "ignis_request_duration_seconds_bucket{le=\"5\"} 1",
+            "ignis_request_duration_seconds_sum 3",
+            "ignis_request_duration_seconds_count 1",
+        ] {
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
+    }
+
+    /// A cancelled request never completed: its late `Done` is not a
+    /// request-duration observation, and one never seen submitted has no span.
+    #[test]
+    fn cancelled_and_unknown_requests_are_not_observed_as_durations() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.on_cancelled(1);
+        telemetry.on_done(1, 4, FinishReason::Stop, None);
+        telemetry.on_done(99, 4, FinishReason::Stop, None);
+
+        let text = metrics.render();
+        assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");
     }
 
     #[test]

@@ -11,6 +11,14 @@ fact. Amended again 2026-09-15 (#89, owner decision): `GET /metrics` moves to
 its own listener (`--metrics-bind`, no API key, never exposed), and the
 Playground reads the same exposition at `/ui/metrics` on the API listener,
 under the API key when one is set. This replaces "on the existing listener".
+Clarified 2026-09-15 (#90): a submission longer than the per-sequence context
+(`ContextExceeded`, #166, which postdates the table) counts under
+`reason="oversized"` — like a request larger than the KV pool, it can never
+fit — so the reason set stays the three below. The latency histograms' "submission"
+is the scheduler's acceptance as the telemetry consumer observes it, the same
+anchor as the `ignis.request.ttft`/`done` log events: measuring from HTTP
+ingress would take a fact the consumer does not already receive. A request
+cancelled after its first token has a TTFT observation but no duration one.
 
 ## Context
 

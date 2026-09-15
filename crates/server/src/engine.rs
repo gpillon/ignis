@@ -406,6 +406,7 @@ async fn telemetry_task(
                     prefilled_tokens,
                     ..
                 } => telemetry.on_prefill_chunk(request, prefilled_tokens),
+                SchedEvent::PrefixReused { tokens, .. } => telemetry.on_prefix_reused(tokens),
                 _ => {}
             },
             TelemetryFact::Tick => {
@@ -862,9 +863,22 @@ mod tests {
             facts: consumer_tx.clone(),
             counters,
         };
-        if let Some(metrics) = &metrics {
+        // With metrics on, a scraper renders the projection for as long as
+        // the workload runs (GitHub #90): scraping must not change the facts
+        // either.
+        let scraping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scraper = metrics.as_ref().map(|metrics| {
             engine.install_metrics(Arc::clone(metrics));
-        }
+            let (metrics, scraping) = (Arc::clone(metrics), Arc::clone(&scraping));
+            std::thread::spawn(move || {
+                let mut scrapes = 0u64;
+                while scraping.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert!(metrics.render().ends_with('\n'));
+                    scrapes += 1;
+                }
+                scrapes
+            })
+        });
         let recorder = tokio::spawn(async move {
             let mut seen = Vec::new();
             while let Some(fact) = thread_rx.recv().await {
@@ -895,6 +909,10 @@ mod tests {
         driver.join().expect("the model thread exits cleanly");
         let seen = recorder.await.expect("the recorder finishes");
         consumer.await.expect("the consumer drains");
+        scraping.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(scraper) = scraper {
+            assert!(scraper.join().expect("the scraper never panics") > 0);
+        }
         (seen, metrics.map(|metrics| metrics.render()))
     }
 

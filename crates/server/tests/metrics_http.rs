@@ -29,10 +29,11 @@ const KEY: &str = "sk-metrics";
 const PAGE: Assets = &[("index.html", b"<!doctype html>")];
 
 fn server_over(compute: Arc<dyn Compute>) -> Server {
-    let scheduler = ConcreteScheduler::with_config(
-        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
-        compute,
-    );
+    server_with(SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() }, compute)
+}
+
+fn server_with(config: SchedulerConfig, compute: Arc<dyn Compute>) -> Server {
+    let scheduler = ConcreteScheduler::with_config(config, compute);
     Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
 }
 
@@ -188,6 +189,11 @@ async fn the_metrics_listener_serves_only_the_exposition_in_the_text_format() {
         ("ignis_requests_completed_total", "counter"),
         ("ignis_requests_cancelled_total", "counter"),
         ("ignis_generated_tokens_total", "counter"),
+        ("ignis_kv_cache_evictions_total", "counter"),
+        ("ignis_prefix_reused_tokens_total", "counter"),
+        ("ignis_requests_rejected_total", "counter"),
+        ("ignis_request_ttft_seconds", "histogram"),
+        ("ignis_request_duration_seconds", "histogram"),
     ] {
         assert!(text.contains(&format!("\n# TYPE {name} {kind}\n")), "{name}:\n{text}");
         assert!(text.contains(&format!("# HELP {name} ")), "{name}:\n{text}");
@@ -341,6 +347,228 @@ async fn a_client_disconnect_takes_the_request_out_of_the_gauges() {
     assert_eq!(value(&text, "ignis_requests_accepted_total", None), 2, "{text}");
 }
 
+/// The value of the sample `name` carrying exactly the one label `key=value`.
+fn labelled(text: &str, name: &str, key: &str, label: &str) -> u64 {
+    samples(text)
+        .into_iter()
+        .find(|(n, labels, _)| n == name && labels.len() == 1 && labels[0] == (key.to_owned(), label.to_owned()))
+        .unwrap_or_else(|| panic!("no {name}{{{key}={label}}} in:\n{text}"))
+        .2
+        .parse()
+        .unwrap()
+}
+
+fn rejected(text: &str, reason: &str) -> u64 {
+    labelled(text, "ignis_requests_rejected_total", "reason", reason)
+}
+
+/// GitHub #90: every rejection is counted on the HTTP side, after the submit
+/// call returned its error — so it is already in the very next scrape, with
+/// no telemetry fact to wait for — and never as accepted.
+#[tokio::test]
+async fn rejections_are_counted_by_fixed_reason() {
+    let (api, metrics) = apps(server().with_metrics());
+    assert_eq!(chat(&api, "no-such-model", 2).await.status(), StatusCode::NOT_FOUND);
+    // Longer than the per-sequence context (GitHub #166): a request that
+    // can never fit, counted with the oversized ones.
+    assert_eq!(chat(&api, MODEL, 100_000).await.status(), StatusCode::BAD_REQUEST);
+
+    let text = scrape(&metrics).await;
+    assert_eq!(rejected(&text, "unknown_model"), 1, "{text}");
+    assert_eq!(rejected(&text, "oversized"), 1, "{text}");
+    assert_eq!(rejected(&text, "full"), 0, "{text}");
+    assert_eq!(value(&text, "ignis_requests_accepted_total", None), 0, "{text}");
+
+    // Larger than the whole KV pool: 413.
+    let tiny_pool = SchedulerConfig { model: MODEL.into(), kv_capacity_pages: 4, ..SchedulerConfig::default() };
+    let (api, metrics) = apps(server_with(tiny_pool, Arc::new(MockCompute::new())).with_metrics());
+    assert_eq!(chat(&api, MODEL, 1000).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let text = scrape(&metrics).await;
+    assert_eq!(rejected(&text, "oversized"), 1, "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_engine_counts_a_full_rejection() {
+    let (gated, controller) = GatedCompute::new(Arc::new(MockCompute::new()));
+    let one_lane = SchedulerConfig { model: MODEL.into(), max_in_flight: 1, ..SchedulerConfig::default() };
+    let (api, metrics) = apps(server_with(one_lane, gated.clone() as Arc<dyn Compute>).with_metrics());
+
+    // Hold the only request mid-decode, one step at a time, so the engine
+    // stays full.
+    gated.arm();
+    let body = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hold the lane" }],
+        "max_tokens": 4096,
+        "stream": true
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let held = api.clone().oneshot(request).await.unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let mut controller = tokio::task::spawn_blocking(move || {
+        controller.wait_entered();
+        controller
+    })
+    .await
+    .unwrap();
+
+    // The model thread takes the second submit between two held steps,
+    // while the first request is still in flight.
+    let second = tokio::spawn({
+        let api = api.clone();
+        async move { chat(&api, MODEL, 2).await.status() }
+    });
+    while !second.is_finished() {
+        gated.arm();
+        controller = tokio::task::spawn_blocking(move || {
+            controller.release();
+            controller.wait_entered();
+            controller
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(second.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+    let text = scrape(&metrics).await;
+    assert_eq!(rejected(&text, "full"), 1, "{text}");
+
+    drop(held);
+    tokio::task::spawn_blocking(move || controller.release()).await.unwrap();
+}
+
+/// GitHub #90: a completed request is one TTFT and one request-duration
+/// observation.
+#[tokio::test]
+async fn a_completed_request_is_observed_by_both_latency_histograms() {
+    let (api, metrics) = apps(server().with_metrics());
+    complete(&api, 3).await;
+    let text = scrape_until(&metrics, |t| value(t, "ignis_request_duration_seconds_count", None) == 1).await;
+    assert_eq!(value(&text, "ignis_request_ttft_seconds_count", None), 1, "{text}");
+    for name in ["ignis_request_ttft_seconds_bucket", "ignis_request_duration_seconds_bucket"] {
+        assert_eq!(labelled(&text, name, "le", "+Inf"), 1, "{text}");
+    }
+}
+
+/// GitHub #90: scrapes running concurrently with each other and with the
+/// workload all succeed, and the workload is fully accounted for once they
+/// settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_scrapes_neither_fail_nor_disturb_the_workload() {
+    let (api, metrics) = apps(server().with_metrics());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scrapers: Vec<_> = (0..16)
+        .map(|_| {
+            let (metrics, stop) = (metrics.clone(), Arc::clone(&stop));
+            tokio::spawn(async move {
+                let mut scrapes = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) || scrapes == 0 {
+                    let text = scrape(&metrics).await;
+                    assert!(text.ends_with('\n') && text.contains("# TYPE ignis_build_info gauge"));
+                    scrapes += 1;
+                    tokio::task::yield_now().await;
+                }
+                scrapes
+            })
+        })
+        .collect();
+    let requests: Vec<_> = (0..8u32).map(|i| {
+        let api = api.clone();
+        tokio::spawn(async move { complete(&api, 2 + i % 3).await })
+    }).collect();
+    let mut generated = 0;
+    for request in requests {
+        generated += request.await.unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for scraper in scrapers {
+        assert!(scraper.await.unwrap() > 0);
+    }
+
+    let text = scrape_until(&metrics, |t| value(t, "ignis_requests_completed_total", None) == 8).await;
+    assert_eq!(value(&text, "ignis_requests_accepted_total", None), 8, "{text}");
+    assert_eq!(value(&text, "ignis_generated_tokens_total", None), generated, "{text}");
+}
+
+/// GitHub #90 / ADR 0017, over real sockets: scrapers that never read their
+/// responses, or hang up mid-request, stall only their own connections. The
+/// API keeps completing requests and the telemetry consumer keeps the
+/// projection current for a well-behaved scraper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_and_disconnected_scrapers_cannot_hold_back_inference_or_telemetry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = server().with_metrics();
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (api_addr, metrics_addr) = (api_listener.local_addr().unwrap(), metrics_listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(server.serve_on_until(api_listener, Some(metrics_listener), async {
+        let _ = stopped.await;
+    }));
+
+    // Slow: hundreds of pipelined scrapes per connection, never read, so
+    // each connection's socket buffers fill and its writer stalls.
+    let mut slow = Vec::new();
+    for _ in 0..8 {
+        let mut stream = tokio::net::TcpStream::connect(metrics_addr).await.unwrap();
+        let burst = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n".repeat(500);
+        // The server stops reading once its writes back up; a partial write
+        // is enough to wedge the connection.
+        let _ = tokio::time::timeout(Duration::from_millis(200), stream.write_all(burst.as_bytes())).await;
+        slow.push(stream);
+    }
+    // Disconnected: half a request, then gone.
+    for _ in 0..8 {
+        let mut stream = tokio::net::TcpStream::connect(metrics_addr).await.unwrap();
+        stream.write_all(b"GET /metr").await.unwrap();
+        drop(stream);
+    }
+
+    let body = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hello" }],
+        "max_tokens": 3,
+        "stream": false
+    })
+    .to_string();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        for _ in 0..3 {
+            let mut stream = tokio::net::TcpStream::connect(api_addr).await.unwrap();
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        loop {
+            let mut stream = tokio::net::TcpStream::connect(metrics_addr).await.unwrap();
+            stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            if response.contains("\nignis_requests_completed_total 3\n") {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(outcome.is_ok(), "stalled scrapers held back the API or the telemetry consumer");
+
+    drop(slow);
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+}
+
 #[tokio::test]
 async fn labels_stay_within_the_bounded_sets() {
     let (api, metrics) = apps(server().with_metrics());
@@ -355,16 +583,32 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_requests_completed_total",
         "ignis_requests_cancelled_total",
         "ignis_generated_tokens_total",
+        "ignis_kv_cache_evictions_total",
+        "ignis_prefix_reused_tokens_total",
+        "ignis_requests_rejected_total",
+        "ignis_request_ttft_seconds_bucket",
+        "ignis_request_ttft_seconds_sum",
+        "ignis_request_ttft_seconds_count",
+        "ignis_request_duration_seconds_bucket",
+        "ignis_request_duration_seconds_sum",
+        "ignis_request_duration_seconds_count",
     ]
     .into_iter()
     .map(str::to_owned)
     .collect();
     assert_eq!(names, expected, "{text}");
 
+    const TTFT_LE: &[&str] =
+        &["0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "+Inf"];
+    const DURATION_LE: &[&str] =
+        &["0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "600", "+Inf"];
     for (name, labels, _) in samples(&text) {
         let allowed: &[(&str, &[&str])] = match name.as_str() {
             "ignis_build_info" => &[("version", &[env!("CARGO_PKG_VERSION")])],
             "ignis_scheduler_requests" => &[("state", &["waiting", "running"])],
+            "ignis_requests_rejected_total" => &[("reason", &["full", "unknown_model", "oversized"])],
+            "ignis_request_ttft_seconds_bucket" => &[("le", TTFT_LE)],
+            "ignis_request_duration_seconds_bucket" => &[("le", DURATION_LE)],
             _ => &[],
         };
         assert_eq!(labels.len(), allowed.len(), "{name} {labels:?}");
