@@ -18,8 +18,10 @@
 # DRAFT_TOKENS := 4
 # MAX_CONTEXT := 40960
 
-# Prometheus metrics at /metrics on every start (make metrics scrapes it):
+# Prometheus metrics on every start: GET /metrics on their own listener
+# (no key; make metrics scrapes it) and /ui/metrics for the Playground:
 # METRICS := 1
+# METRICS_BIND := 127.0.0.1:9100   # empty = the server's 127.0.0.1:9464
 
 # Always-on server flags and logging:
 # ARGS := --kv-host-pool-bytes 0

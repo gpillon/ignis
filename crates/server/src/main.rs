@@ -418,7 +418,7 @@ async fn main() {
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );
-    let serve_result = server.serve_on_with_metrics(listener, metrics_listener).await;
+    let serve_result = server.serve_on(listener, metrics_listener).await;
 
     // The tunnel outlives the drain above, so in-flight remote requests
     // finish through it; only then is it unregistered.

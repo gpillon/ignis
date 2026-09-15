@@ -173,8 +173,10 @@ dimension.
   scheduler over deterministic `MockCompute`; the secondary seam is pure CLI
   configuration resolution.
 - CLI coverage proves that metrics default to disabled, that `--metrics`
-  enables them, and that no alias, environment variable, or configuration-file
-  path is introduced.
+  enables them on the default metrics address, that `--metrics-bind` moves
+  that address and is refused without `--metrics` or on the API's `--bind`,
+  and that no alias, environment variable, or configuration-file path is
+  introduced for either flag.
 - Router coverage proves route absence when disabled, valid exposition and
   content type when enabled, lifecycle-driven value changes, bounded labels,
   concurrent scrapes, and slow-scraper isolation; which listener serves which

@@ -179,41 +179,28 @@ impl Server {
     /// logging queue after this returns, since that is the true last event.
     pub async fn serve(self, addr: String) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        self.serve_on(listener).await
+        self.serve_on(listener, None).await
     }
 
     /// [`Server::serve`] on a listener the caller already bound — `main`
     /// binds first when `--expose` needs the bound port before serving.
-    pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-        self.serve_on_with_metrics(listener, None).await
-    }
-
-    /// [`Server::serve_on`], stopping gracefully when `shutdown` resolves
-    /// instead of on a process signal (tests).
-    pub async fn serve_on_until(
-        self,
-        listener: tokio::net::TcpListener,
-        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> std::io::Result<()> {
-        self.serve_on_with_metrics_until(listener, None, shutdown).await
-    }
-
-    /// [`Server::serve_on`], plus [`Server::metrics_app`] on
-    /// `metrics_listener` when given (`--metrics`, GitHub #89): one process
-    /// signal stops both.
-    pub async fn serve_on_with_metrics(
+    ///
+    /// With `metrics_listener` (`--metrics`, GitHub #89), [`Server::metrics_app`]
+    /// is served there too, and one process signal stops both.
+    pub async fn serve_on(
         self,
         listener: tokio::net::TcpListener,
         metrics_listener: Option<tokio::net::TcpListener>,
     ) -> std::io::Result<()> {
-        self.serve_on_with_metrics_until(listener, metrics_listener, shutdown_signal())
-            .await
+        self.serve_on_until(listener, metrics_listener, shutdown_signal()).await
     }
 
-    /// [`Server::serve_on_with_metrics`], stopping both listeners gracefully
-    /// when `shutdown` resolves (tests). A metrics listener needs metrics on
-    /// ([`Server::with_metrics`]).
-    pub async fn serve_on_with_metrics_until(
+    /// [`Server::serve_on`], stopping gracefully — both listeners, when there
+    /// are two — once `shutdown` resolves instead of on a process signal
+    /// (tests). A metrics listener without metrics on
+    /// ([`Server::with_metrics`]) is refused with `InvalidInput` before
+    /// anything is served.
+    pub async fn serve_on_until(
         self,
         listener: tokio::net::TcpListener,
         metrics_listener: Option<tokio::net::TcpListener>,
@@ -222,12 +209,18 @@ impl Server {
         use std::future::IntoFuture;
 
         let app = self.app();
-        let Some(metrics_listener) = metrics_listener else {
-            return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+        let (metrics_listener, metrics_app) = match (metrics_listener, self.metrics_app()) {
+            (None, _) => {
+                return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+            }
+            (Some(metrics_listener), Some(metrics_app)) => (metrics_listener, metrics_app),
+            (Some(_), None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a metrics listener needs metrics on (Server::with_metrics)",
+                ));
+            }
         };
-        let metrics_app = self
-            .metrics_app()
-            .expect("a metrics listener is only served with metrics on (Server::with_metrics)");
         // One shutdown, fanned out to both listeners.
         let (stop, stopped) = tokio::sync::watch::channel(());
         let signal = async move {

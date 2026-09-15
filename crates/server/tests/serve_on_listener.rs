@@ -48,7 +48,7 @@ async fn a_server_serves_on_a_listener_bound_before_it_and_stops_on_request() {
     assert_eq!(ignis_server::expose::origin_port(addr), Ok(addr.port()));
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(server().serve_on_until(listener, async {
+    let serving = tokio::spawn(server().serve_on_until(listener, None, async {
         let _ = stopped.await;
     }));
 
@@ -72,7 +72,7 @@ async fn metrics_are_served_on_their_own_listener_and_stop_with_the_api() {
     let (addr, metrics_addr) = (listener.local_addr().unwrap(), metrics_listener.local_addr().unwrap());
 
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(server().with_metrics().serve_on_with_metrics_until(
+    let serving = tokio::spawn(server().with_metrics().serve_on_until(
         listener,
         Some(metrics_listener),
         async {
@@ -94,4 +94,17 @@ async fn metrics_are_served_on_their_own_listener_and_stop_with_the_api() {
         tokio::net::TcpStream::connect(metrics_addr).await.is_err(),
         "the metrics listener closed with the API"
     );
+}
+
+/// A metrics listener handed to a server whose metrics are off is a caller
+/// mistake: refused up front, with neither listener served.
+#[tokio::test]
+async fn a_metrics_listener_without_metrics_on_is_refused_before_serving() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind metrics");
+    let err = server()
+        .serve_on_until(listener, Some(metrics_listener), std::future::pending())
+        .await
+        .expect_err("metrics are off");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
 }
