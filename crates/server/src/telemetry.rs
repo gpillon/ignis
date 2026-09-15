@@ -475,7 +475,9 @@ impl Telemetry {
     /// (GitHub #120) makes that same attribution per-class, not just
     /// per-window. `spec.rounds`/`spec.drafted`/`spec.accepted` (P5-06,
     /// GitHub #154) are the request's speculative rounds, summed once here
-    /// rather than logged per round, and absent on a request that ran none.
+    /// rather than logged per round, and absent on a request that ran none;
+    /// `spec.pos` (GitHub #160) is their per-position acceptance profile,
+    /// the reference's `pos=[...]`, so the two logs read side by side.
     ///
     /// GitHub #81 / ADR 0012: this runs on the async telemetry consumer
     /// task (`engine.rs`'s `telemetry_task`), not inside the HTTP root span
@@ -502,6 +504,7 @@ impl Telemetry {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
         // rounds carries no `spec.*` attributes at all.
+        let spec_pos = spec.map(|s| s.acceptance_profile());
         tracing::info!(
             name: "ignis.request.done",
             request_id = id,
@@ -517,6 +520,7 @@ impl Telemetry {
             spec.rounds = spec.map(|s| s.rounds),
             spec.drafted = spec.map(|s| s.drafted),
             spec.accepted = spec.map(|s| s.accepted),
+            spec.pos = spec_pos.as_deref(),
             "request done"
         );
     }
@@ -648,7 +652,7 @@ mod tests {
         let done = events.last().unwrap();
         assert_eq!(done["attributes"]["tokens"], 4, "the done event carries the total tokens");
         assert_eq!(done["attributes"]["finish_reason"], "stop");
-        for field in ["spec.rounds", "spec.drafted", "spec.accepted"] {
+        for field in ["spec.rounds", "spec.drafted", "spec.accepted", "spec.pos"] {
             assert!(
                 done["attributes"].get(field).is_none(),
                 "no speculative rounds, no placeholder `{field}`: {done}"
@@ -659,7 +663,8 @@ mod tests {
     #[test]
     fn the_done_event_carries_the_speculative_counters_once() {
         // P5-06 (GitHub #154): three verify rounds that proposed 21 drafts and
-        // committed 9 of them, reported on the one `done` line.
+        // committed 9 of them, reported on the one `done` line -- with their
+        // per-position profile (GitHub #160): 7, 2 and 0 committed.
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(3, 10, RequestClass::Agent);
@@ -671,11 +676,7 @@ mod tests {
                 3,
                 12,
                 FinishReason::Stop,
-                Some(SpecCounters {
-                    rounds: 3,
-                    drafted: 21,
-                    accepted: 9,
-                }),
+                Some(SpecCounters::round(7, 7) + SpecCounters::round(7, 2) + SpecCounters::round(7, 0)),
             );
         });
 
@@ -687,6 +688,7 @@ mod tests {
         assert_eq!(done[0]["attributes"]["spec.rounds"], 3);
         assert_eq!(done[0]["attributes"]["spec.drafted"], 21);
         assert_eq!(done[0]["attributes"]["spec.accepted"], 9);
+        assert_eq!(done[0]["attributes"]["spec.pos"], "67,67,33,33,33,33,33");
         assert_eq!(events.len(), 3, "admitted, ttft, done -- nothing per token or per round");
     }
 

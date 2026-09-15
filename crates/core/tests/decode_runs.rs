@@ -190,6 +190,10 @@ fn speculative_rounds_add_up_on_the_done_event() {
             rounds: 3,
             drafted: 4,
             accepted: 2,
+            // GitHub #160: the first and third rounds proposed two drafts
+            // each; only the first committed them.
+            drafted_at: [2, 2, 0, 0, 0, 0, 0],
+            accepted_at: [1, 1, 0, 0, 0, 0, 0],
         })
     );
 }
