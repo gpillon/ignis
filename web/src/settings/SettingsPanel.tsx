@@ -1,5 +1,6 @@
 import { REASONING_EFFORTS } from "../api/request.ts";
 import { ignisPrompt, type ToolsState } from "../tools/index.ts";
+import { setTavilyKey, useTavilyKey } from "../tools/web/tavilyKey.ts";
 import { caption, field } from "../ui/classes.ts";
 import { Segmented } from "../ui/Segmented.tsx";
 import { Slider } from "../ui/Slider.tsx";
@@ -91,7 +92,47 @@ function ToolsSetting({ tools, onChange }: { tools: ToolsState; onChange: (tools
         </div>
         <Switch on={tools.agents} onChange={(agents) => onChange({ ...tools, agents })} labelledBy="tool-agents-label" />
       </div>
+      <div className="mt-2 flex items-start justify-between gap-3">
+        <div className="flex flex-col gap-0.5">
+          <span id="tool-web-label" className="font-display text-sm font-semibold text-ink">
+            Web
+          </span>
+          <span className="text-xs leading-snug text-ash">
+            The model can search the web (Tavily) and read pages (r.jina.ai), from this browser.
+          </span>
+        </div>
+        <Switch on={tools.web} onChange={(web) => onChange({ ...tools, web })} labelledBy="tool-web-label" />
+      </div>
+      {tools.web && <TavilyKeyField />}
     </fieldset>
+  );
+}
+
+/** The Tavily key, saved in this browser as it is typed. */
+function TavilyKeyField() {
+  const key = useTavilyKey();
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="font-display text-xs font-medium text-ash">Tavily API key</span>
+      <input
+        className={`${field} font-display text-xs`}
+        type="password"
+        name="tavily-key"
+        autoComplete="off"
+        spellCheck={false}
+        placeholder="tvly-…"
+        value={key ?? ""}
+        onChange={(e) => setTavilyKey(e.target.value)}
+      />
+      {key ? (
+        <span className="text-xs leading-snug text-ash">Kept in this browser, sent only to Tavily.</span>
+      ) : (
+        <span className="border-l-2 border-ember pl-2 text-xs leading-snug text-ash">
+          No key: searches go to search.tiago.zip, then to DuckDuckGo Lite through r.jina.ai if that fails. Keyless, but
+          less reliable.
+        </span>
+      )}
+    </label>
   );
 }
 

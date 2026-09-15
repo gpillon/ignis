@@ -2,6 +2,7 @@ import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
 import { streamChat } from "../../api/stream.ts";
+import { unknownToolError } from "../errors.ts";
 
 // The `agent` tool: the model hands one self-contained sub-task to an agent,
 // a separate request on an agent lane that sees only that task. Several calls
@@ -70,13 +71,16 @@ const queued = (task: AgentTask): AgentRun => ({ ...task, status: "queued", reas
  * error explains what was wrong (an unknown tool, arguments that are not a
  * JSON object with a prompt).
  */
-export function parseAgentCall(call: ToolCall): { ok: true; task: AgentTask } | { ok: false; run: AgentRun } {
+export function parseAgentCall(
+  call: ToolCall,
+  available: string[] = [AGENT_TOOL_NAME],
+): { ok: true; task: AgentTask } | { ok: false; run: AgentRun } {
   const fail = (error: string, name: string) => ({
     ok: false as const,
     run: { ...queued({ callId: call.id, name, prompt: call.arguments }), status: "failed" as const, error },
   });
-  if (call.name !== AGENT_TOOL_NAME) {
-    return fail(`Unknown tool "${call.name}": the only tool available is "${AGENT_TOOL_NAME}".`, call.name);
+  if (call.name !== AGENT_TOOL_NAME || !available.includes(AGENT_TOOL_NAME)) {
+    return fail(unknownToolError(call.name, available), call.name);
   }
   let args: unknown;
   try {

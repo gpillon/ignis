@@ -19,10 +19,12 @@ import {
 } from "../sessions/sessions.ts";
 import type { PlaygroundSettings } from "../settings/defaults.ts";
 import { type AgentRun, parseAgentCall, runAgents, toolResult } from "../tools/agents/agents.ts";
-import { toolExtras, type ToolsState } from "../tools/index.ts";
+import { routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
+import { getTavilyKey } from "../tools/web/tavilyKey.ts";
+import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
 
 // The conversation loop: the sessions, the one reply streaming at a time,
-// and the agents a reply calls. Sessions live in memory; a reload starts over.
+// and the tools a reply calls. Sessions live in memory; a reload starts over.
 
 /** How many replies in a row may call tools before the Playground stops running them. */
 const MAX_TOOL_ROUNDS = 8;
@@ -106,7 +108,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
         break;
       }
-      conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, abort.signal))];
+      conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, abort.signal))];
       if (abort.signal.aborted) break;
     }
     controller.current = null;
@@ -145,24 +147,43 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     return reply;
   }
 
-  /** Runs a reply's calls as agents, shown on the reply as they go; resolves with the tool results in call order. */
-  async function runToolCalls(sessionId: number, reply: Message, requestSettings: Settings, signal: AbortSignal) {
-    const parsed = (reply.toolCalls ?? []).map(parseAgentCall);
+  /**
+   * Runs a reply's calls — agents and web calls at once — shown on the reply
+   * as they go; resolves with the tool results in call order.
+   */
+  async function runToolCalls(sessionId: number, reply: Message, requestSettings: Settings, extras: ToolExtras, signal: AbortSignal) {
+    const calls = reply.toolCalls ?? [];
+    const available = (extras.tools ?? []).map((t) => t.function.name);
+    const parsed = calls.filter((c) => routeCall(c.name, available) === "agent").map((c) => parseAgentCall(c, available));
     const tasks = parsed.flatMap((p) => (p.ok ? [p.task] : []));
     let runs: AgentRun[] = parsed.map((p) => (p.ok ? { ...p.task, status: "queued", reasoning: "", content: "" } : p.run));
+    const webParsed = calls.filter((c) => routeCall(c.name, available) === "web").map((c) => parseWebCall(c, available));
+    const webTasks = webParsed.flatMap((p) => (p.ok ? [p.task] : []));
+    let webRuns: WebRun[] = webParsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
     const show = () => {
-      const snapshot = runs;
-      setList((l) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({ ...m, agents: snapshot })) }));
+      const agents = runs;
+      const web = webRuns;
+      setList((l) => ({ ...l, sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({ ...m, agents, web })) }));
     };
     show();
-    await runAgents(tasks, {
-      settings: requestSettings,
-      signal,
-      onUpdate: (run) => {
-        runs = runs.map((r) => (r.callId === run.callId ? run : r));
-        show();
-      },
-    });
+    await Promise.all([
+      runAgents(tasks, {
+        settings: requestSettings,
+        signal,
+        onUpdate: (run) => {
+          runs = runs.map((r) => (r.callId === run.callId ? run : r));
+          show();
+        },
+      }),
+      runWeb(webTasks, {
+        tavilyKey: getTavilyKey(),
+        signal,
+        onUpdate: (run) => {
+          webRuns = webRuns.map((r) => (r.callId === run.callId ? run : r));
+          show();
+        },
+      }),
+    ]);
     for (const run of runs) {
       if (!tasks.some((t) => t.callId === run.callId) || (!run.figures && !run.error)) continue;
       logRow(sessionId, {
@@ -173,7 +194,11 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         agent: run.name,
       });
     }
-    return addToolResults(sessionId, runs.map((run) => ({ callId: run.callId, content: toolResult(run) })));
+    const results = new Map([
+      ...runs.map((run) => [run.callId, toolResult(run)] as const),
+      ...webRuns.map((run) => [run.callId, webToolResult(run)] as const),
+    ]);
+    return addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: results.get(c.id) ?? "" })));
   }
 
   function addToolResults(sessionId: number, results: { callId: string; content: string }[]): Message[] {

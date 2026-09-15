@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Readout } from "../metrics/Readout.tsx";
 import type { Message } from "../sessions/sessions.ts";
 import { AgentStrip } from "../tools/agents/AgentStrip.tsx";
+import { WebStrip } from "../tools/web/WebStrip.tsx";
 import { IconFork, IconPencil, IconRegenerate } from "../ui/icons.tsx";
 import { Markdown } from "../ui/Markdown.tsx";
 import { MessageEditor } from "./MessageEditor.tsx";
@@ -62,6 +63,7 @@ export function Reply(props: {
       {m.agents && m.agents.length > 0 && (
         <AgentStrip runs={m.agents} openCallId={props.openCallId} onOpen={props.onOpenAgent} />
       )}
+      {m.web && m.web.length > 0 && <WebStrip runs={m.web} />}
       {m.error && (
         <p className="border-l-2 border-fault pl-3 text-sm text-fault" role="alert">
           {m.error}

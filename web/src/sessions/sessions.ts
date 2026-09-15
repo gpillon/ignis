@@ -2,6 +2,7 @@ import type { Figures } from "../metrics/figures.ts";
 import type { LaneTag, ReasoningEffort } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import type { AgentRun } from "../tools/agents/agents.ts";
+import type { WebRun } from "../tools/web/web.ts";
 
 // Playground sessions: separate conversations, each with its own log of
 // per-reply figures. They live in memory only; a reload starts over.
@@ -24,6 +25,8 @@ export type Message = {
   toolCallId?: string;
   /** The agents an assistant reply's calls started, as they run. */
   agents?: AgentRun[];
+  /** The web searches and page reads an assistant reply's calls made, as they run. */
+  web?: WebRun[];
 };
 
 export type LogRow = {

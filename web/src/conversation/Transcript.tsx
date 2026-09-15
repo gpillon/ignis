@@ -45,7 +45,7 @@ export function Transcript(props: {
       ) : (
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-7">
           {active.messages.map((m, i) => {
-            // A tool result shows through the agent card of the call it answers.
+            // A tool result shows through the agent card or web row of the call it answers.
             if (m.role === "tool") return null;
             const actions: TurnActions = {
               canRerun: props.canRerun,

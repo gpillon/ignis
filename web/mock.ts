@@ -14,6 +14,10 @@ import type { Plugin } from "vite";
 // streams three agent calls (finish "tool_calls"); a request whose last
 // message is a tool result answers from those results; an agent-lane
 // request streams a longer report at its own pace.
+//
+// Web: with `web_search` declared, a prompt containing "/web" streams one
+// search and one page read. The calls themselves run in the browser against
+// the real Tavily and r.jina.ai, as in production.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -74,30 +78,37 @@ export function mockIgnis(): Plugin {
         const reasoning = thinkingOff ? [] : ["Thinking ", "about ", "it."];
         const tools = (body.tools as { function?: { name?: string } }[] | undefined) ?? [];
         const offersAgents = tools.some((t) => t.function?.name === "agent");
+        const offersWeb = tools.some((t) => t.function?.name === "web_search");
         const lastRole = messages.at(-1)?.role;
         let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
-        let calls: { name: string; prompt: string }[] = [];
+        let calls: { tool: string; args: object }[] = [];
         let pace = 120;
         if (body.class === "agent") {
           const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
           content = words.split(/(?<= )/);
           pace = 70 + Math.floor(Math.random() * 120);
-        } else if (offersAgents && lastRole === "tool") {
-          const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80)}`);
-          content = ["The ", "agents ", "reported ", "back:\n\n", results.join("\n")];
+        } else if ((offersAgents || offersWeb) && lastRole === "tool") {
+          const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80).replace(/\s+/g, " ")}`);
+          content = ["The ", "tools ", "reported ", "back:\n\n", results.join("\n")];
         } else if (offersAgents && last.includes("/agents")) {
           content = ["I'll ", "split ", "this ", "into ", "three ", "parts."];
           calls = ["scheduler", "kv-cache", "telemetry"].map((name) => ({
-            name,
-            prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}`,
+            tool: "agent",
+            args: { name, prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}` },
           }));
+        } else if (offersWeb && last.includes("/web")) {
+          content = ["Let ", "me ", "look ", "that ", "up."];
+          calls = [
+            { tool: "web_search", args: { query: last.replace("/web", "").trim() || "ignis inference engine" } },
+            { tool: "web_fetch", args: { url: "https://example.com/" } },
+          ];
         }
         const completion = reasoning.length + content.length + calls.length;
         const pieces = [
           ...reasoning.map((t) => chunk({ reasoning_content: t })),
           ...content.map((t) => chunk({ content: t })),
           ...calls.map((c, index) =>
-            chunk({ tool_calls: [{ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name: "agent", arguments: JSON.stringify(c) } }] }),
+            chunk({ tool_calls: [{ index, id: `call_${Date.now()}_${index}`, type: "function", function: { name: c.tool, arguments: JSON.stringify(c.args) } }] }),
           ),
           chunk({}, calls.length ? "tool_calls" : "stop"),
           `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "mock-model", choices: [], usage: { prompt_tokens: 12 * messages.length, completion_tokens: completion, total_tokens: 12 * messages.length + completion } })}\n\n`,
