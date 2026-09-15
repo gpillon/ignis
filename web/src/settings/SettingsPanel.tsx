@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { REASONING_EFFORTS } from "../api/request.ts";
-import { ignisPrompt, setAllTools, type ToolsState } from "../tools/index.ts";
+import { ignisPrompt, setAllTools, type ToolsState, toolsInUse } from "../tools/index.ts";
+import type { Attachment } from "../tools/local/attachments.ts";
+import { useMemoryNotes } from "../tools/local/memory.ts";
 import { setTavilyKey, useTavilyKey } from "../tools/web/tavilyKey.ts";
 import { caption, field } from "../ui/classes.ts";
 import { Segmented } from "../ui/Segmented.tsx";
@@ -20,10 +22,13 @@ export function SettingsPanel(props: {
   onToolsChange: (tools: ToolsState) => void;
   markdown: boolean;
   onMarkdownChange: (on: boolean) => void;
+  /** The active session's files, which the ignis prompt lists. */
+  attachments: Attachment[];
+  onOpenMemory: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("general");
   const { tools } = props;
-  const toolsOn = tools.enabled ? [tools.agents, tools.web, tools.askUser, tools.dateTime].filter(Boolean).length : 0;
+  const toolsOn = toolsInUse(tools);
   return (
     <aside
       aria-label="Settings"
@@ -51,7 +56,7 @@ export function SettingsPanel(props: {
         ))}
       </div>
       <div id="settings-tab-panel" role="tabpanel" aria-labelledby={`settings-tab-${tab}`} className="flex flex-1 flex-col gap-6">
-        {tab === "general" ? <GeneralSettings {...props} /> : <ToolsSetting tools={tools} onChange={props.onToolsChange} />}
+        {tab === "general" ? <GeneralSettings {...props} /> : <ToolsSetting tools={tools} onChange={props.onToolsChange} onOpenMemory={props.onOpenMemory} />}
       </div>
     </aside>
   );
@@ -63,13 +68,19 @@ function GeneralSettings(props: {
   tools: ToolsState;
   markdown: boolean;
   onMarkdownChange: (on: boolean) => void;
+  attachments: Attachment[];
 }) {
   const { settings, set } = props;
+  const notes = useMemoryNotes();
   // ignis refuses greedy sampling with a top_p it would ignore.
   const greedyConflict = settings.temperature === 0 && settings.topP !== 1;
   return (
     <>
-      <SystemPromptField value={settings.systemPrompt} onChange={(v) => set("systemPrompt", v)} ignis={ignisPrompt(props.tools)} />
+      <SystemPromptField
+        value={settings.systemPrompt}
+        onChange={(v) => set("systemPrompt", v)}
+        ignis={ignisPrompt(props.tools, { notes, attachments: props.attachments })}
+      />
 
       <Segmented
         legend="Thinking"
@@ -118,7 +129,15 @@ function GeneralSettings(props: {
   );
 }
 
-function ToolsSetting({ tools, onChange }: { tools: ToolsState; onChange: (tools: ToolsState) => void }) {
+function ToolsSetting({
+  tools,
+  onChange,
+  onOpenMemory,
+}: {
+  tools: ToolsState;
+  onChange: (tools: ToolsState) => void;
+  onOpenMemory: () => void;
+}) {
   return (
     <fieldset className="flex flex-col gap-2">
       <legend className="sr-only">Tools</legend>
@@ -159,6 +178,60 @@ function ToolsSetting({ tools, onChange }: { tools: ToolsState; onChange: (tools
             onChange={(dateTime) => onChange({ ...tools, dateTime })}
             description="The day, date and time, in this browser's time zone, go into the ignis system prompt."
           />
+          <ToolRow
+            id="run-js"
+            label="Run JavaScript"
+            on={tools.runJs}
+            onChange={(runJs) => onChange({ ...tools, runJs })}
+            description="The model can run JavaScript in a sandboxed worker with no network, for exact results."
+          />
+          {tools.runJs && (
+            <div className="-mt-2 flex flex-col gap-1.5 border-l-2 border-line pl-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex flex-col gap-0.5">
+                  <span id="tool-js-check-label" className="font-display text-xs font-semibold text-ink">
+                    Safety check
+                  </span>
+                  <span className="text-xs leading-snug text-ash">The model reviews each piece of code on an agent lane before it runs.</span>
+                </div>
+                <Switch on={tools.jsSafetyCheck} onChange={(jsSafetyCheck) => onChange({ ...tools, jsSafetyCheck })} labelledBy="tool-js-check-label" />
+              </div>
+              {!tools.jsSafetyCheck && (
+                <span className="border-l-2 border-fault pl-2 text-xs leading-snug text-fault">
+                  Off: the code the model writes runs without review.
+                </span>
+              )}
+            </div>
+          )}
+          <ToolRow
+            id="plan"
+            label="Plan"
+            on={tools.plan}
+            onChange={(plan) => onChange({ ...tools, plan })}
+            description="The model keeps a checklist of its steps in the reply as it works."
+          />
+          <ToolRow
+            id="memory"
+            label="Memory"
+            on={tools.memory}
+            onChange={(memory) => onChange({ ...tools, memory })}
+            description="The model saves short notes in this browser and sees them in every session."
+          />
+          {tools.memory && <MemorySummary onOpen={onOpenMemory} />}
+          <ToolRow
+            id="files"
+            label="Create files"
+            on={tools.files}
+            onChange={(files) => onChange({ ...tools, files })}
+            description="The model can hand you a text file to download."
+          />
+          <ToolRow
+            id="read-files"
+            label="Attachments"
+            on={tools.readFiles}
+            onChange={(readFiles) => onChange({ ...tools, readFiles })}
+            description="Attach text or PDF files to a session; the model reads them in pieces."
+          />
         </div>
       )}
     </fieldset>
@@ -175,6 +248,25 @@ function ToolRow(props: { id: string; label: string; description: string; on: bo
         <span className="text-xs leading-snug text-ash">{props.description}</span>
       </div>
       <Switch on={props.on} onChange={props.onChange} labelledBy={`tool-${props.id}-label`} />
+    </div>
+  );
+}
+
+/** How many notes are saved, and the way into the memory sheet. */
+function MemorySummary({ onOpen }: { onOpen: () => void }) {
+  const notes = useMemoryNotes();
+  return (
+    <div className="-mt-2 flex items-center justify-between gap-3">
+      <span className="text-xs text-ash">
+        {notes.length === 0 ? "No notes yet" : `${notes.length} ${notes.length === 1 ? "note" : "notes"} saved`}
+      </span>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="cut shrink-0 bg-kiln px-3 py-1.5 font-display text-xs font-semibold text-[#eae8e4] [--cut-size:6px] hover:bg-kiln-line"
+      >
+        Open memory
+      </button>
     </div>
   );
 }

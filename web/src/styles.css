@@ -272,6 +272,19 @@
   .md del {
     color: var(--ash);
   }
+  /* KaTeX formulas: display math centred on its own line, scrolling sideways when it is wider than the reply. */
+  .md .katex {
+    font-size: 1.08em;
+  }
+  .md .katex-display {
+    margin: 0.4em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.35em 0;
+  }
+  .md .katex-error {
+    color: var(--fault);
+  }
   .md :not(pre) > code {
     border-radius: 2px;
     background: var(--surface);
@@ -354,6 +367,45 @@
 
 @media (prefers-reduced-motion: reduce) {
   .md[data-streaming="true"] > :last-child::after {
+    animation: none;
+  }
+}
+
+/* The memory sheet (MemoryManager.tsx): it rises as it opens, the rule under
+   its title runs from ember into the kiln line, and a note just saved or
+   edited flares white-hot and cools back to its heat. */
+@layer components {
+  .memory-sheet {
+    animation: sheet-rise 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  @keyframes sheet-rise {
+    from {
+      opacity: 0;
+      transform: translateY(14px);
+    }
+  }
+  .memory-rule {
+    height: 2px;
+    background: linear-gradient(90deg, #ff5a1f, #c8161d 22%, #2e343c 60%);
+  }
+  .note-fresh .note-heat {
+    animation: note-cool 1.8s ease-out;
+  }
+  @keyframes note-cool {
+    from {
+      background: #ffd2a8;
+      box-shadow: 0 0 16px 3px rgb(255 90 31 / 0.85);
+    }
+    55% {
+      background: #ff5a1f;
+      box-shadow: 0 0 8px rgb(255 90 31 / 0.45);
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .memory-sheet,
+  .note-fresh .note-heat {
     animation: none;
   }
 }

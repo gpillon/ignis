@@ -10,6 +10,7 @@ import { SessionsPanel } from "../sessions/SessionsPanel.tsx";
 import { DEFAULT_SETTINGS, type PlaygroundSettings } from "../settings/defaults.ts";
 import { SettingsPanel } from "../settings/SettingsPanel.tsx";
 import { AgentReader } from "../tools/agents/AgentReader.tsx";
+import { MemoryManager } from "../tools/local/MemoryManager.tsx";
 import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header } from "./Header.tsx";
@@ -33,6 +34,8 @@ export function App() {
   const [logOpen, setLogOpen] = useState(false);
   const [reader, setReader] = useState<OpenAgent | null>(null);
   const closeReader = useCallback(() => setReader(null), []);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const closeMemory = useCallback(() => setMemoryOpen(false), []);
   const [drawer, setDrawer] = useState<Drawer>(null);
   const chat = useConversation({ model, settings, tools });
   const { active } = chat;
@@ -75,7 +78,7 @@ export function App() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} />
+      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} />
 
       <div className="relative flex min-h-0 flex-1">
         {drawer && (
@@ -115,6 +118,11 @@ export function App() {
             usage={contextUsage(active.log, settings.maxTokens, model.state === "ready" ? model.contextLimit : null)}
             onSend={send}
             onStop={chat.stop}
+            canAttach={tools.enabled && tools.readFiles}
+            attachments={active.attachments}
+            attachError={chat.attachError}
+            onAttach={(files) => void chat.attach(files)}
+            onDetach={chat.detach}
           />
         </main>
 
@@ -126,10 +134,14 @@ export function App() {
           onToolsChange={setTools}
           markdown={markdown}
           onMarkdownChange={setMarkdown}
+          attachments={active.attachments}
+          onOpenMemory={() => setMemoryOpen(true)}
         />
       </div>
 
       <SessionLog rows={active.log} open={logOpen} onToggle={() => setLogOpen((o) => !o)} />
+
+      {memoryOpen && <MemoryManager onClose={closeMemory} />}
 
       {readerRun && (
         <>

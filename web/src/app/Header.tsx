@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { ModelState } from "../api/model.ts";
 import flame from "../brand/flame.webp";
 import wordmark from "../brand/wordmark-light.webp";
+import { useMemoryNotes } from "../tools/local/memory.ts";
 import { IconSessions, IconSliders } from "../ui/icons.tsx";
 
 /** The kiln bar: brand, model status, and the drawer buttons below `lg`. */
@@ -10,12 +11,14 @@ export function Header({
   busy,
   onOpen,
   onForgetKey,
+  onOpenMemory,
 }: {
   model: ModelState;
   busy: boolean;
   onOpen: (drawer: "sessions" | "settings") => void;
   /** Present when an API key is in use: drops it and returns to the key prompt. */
   onForgetKey?: () => void;
+  onOpenMemory: () => void;
 }) {
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
@@ -28,6 +31,7 @@ export function Header({
         <span className="hidden h-6 w-px bg-kiln-line sm:block" aria-hidden />
         <span className="hidden font-display text-[15px] font-medium tracking-wide text-[#b9bec4] sm:block">Playground</span>
         <ModelStatus model={model} busy={busy} />
+        <MemoryButton onOpen={onOpenMemory} />
         {onForgetKey && (
           <button
             type="button"
@@ -44,6 +48,22 @@ export function Header({
       </div>
       <div className="heat" data-busy={busy} aria-hidden />
     </header>
+  );
+}
+
+/** Opens what ignis remembers; the count is how many notes it keeps. */
+function MemoryButton({ onOpen }: { onOpen: () => void }) {
+  const count = useMemoryNotes().length;
+  return (
+    <button
+      type="button"
+      title="What ignis remembers"
+      className="flex shrink-0 items-baseline gap-1.5 px-2 py-1 font-display text-[13px] font-medium text-[#939ba4] hover:bg-kiln-line hover:text-white"
+      onClick={onOpen}
+    >
+      Memory
+      {count > 0 && <span className="text-[#ff8a4c] tabular-nums">{count}</span>}
+    </button>
   );
 }
 

@@ -5,6 +5,7 @@ import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
 import { computeFigures } from "../metrics/figures.ts";
 import {
+  addAttachments,
   addLogRow,
   addMessages,
   createSession,
@@ -13,6 +14,7 @@ import {
   type LogRow,
   type Message,
   openSession,
+  removeAttachment,
   removeSession,
   type SessionList,
   truncateFrom,
@@ -22,6 +24,8 @@ import type { PlaygroundSettings } from "../settings/defaults.ts";
 import { type AgentRun, parseAgentCall, runAgents, toolResult } from "../tools/agents/agents.ts";
 import { askToolResult, parseAskCall } from "../tools/ask/ask.ts";
 import { unknownCall } from "../tools/errors.ts";
+import { type Attachment, attachmentFromFile } from "../tools/local/attachments.ts";
+import { type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../tools/local/local.ts";
 import { agentExtras, routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
 import { getTavilyKey } from "../tools/web/tavilyKey.ts";
 import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
@@ -50,6 +54,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   // The session a reply is streaming into; one stream at a time.
   const [streamingId, setStreamingId] = useState<number | null>(null);
   const controller = useRef<AbortController | null>(null);
+  const [attachError, setAttachError] = useState<string | null>(null);
   // Questions waiting for the user, by `messageId:callId`: each settles with the answer.
   const waiting = useRef(new Map<string, (answer: string | null) => void>());
   // Whether the reader is at the bottom of the conversation: only then do
@@ -87,10 +92,17 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   async function exchange(sessionId: number, history: Message[], prompt: string | null) {
     if (busy || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
-    // The date and time the tools write into the prompt: when the turn started.
-    const startedAt = new Date();
-    const extras = toolExtras(tools, startedAt);
-    const agentTools = agentExtras(tools, startedAt);
+    // The date and time the tools write into the prompt are when the turn started; the notes and files, as they were then.
+    const attachments = list.sessions.find((s) => s.id === sessionId)?.attachments ?? [];
+    const promptContext = { now: new Date(), attachments };
+    const extras = toolExtras(tools, promptContext);
+    const agentTools = agentExtras(tools, promptContext);
+    const local: Omit<LocalContext, "settings" | "signal"> = {
+      jsSafetyCheck: tools.jsSafetyCheck,
+      attachments,
+      onCheck: (figures, error) =>
+        logRow(sessionId, { laneTag: "agent", reasoningEffort: "none", figures, error, agent: "run_js safety check" }),
+    };
     const abort = new AbortController();
     controller.current = abort;
     // Sending is a request to see the answer: follow it from the bottom.
@@ -120,7 +132,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
           break;
         }
         unanswered = calls;
-        conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, abort.signal))];
+        conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, local, abort.signal))];
         unanswered = [];
         if (abort.signal.aborted) break;
       }
@@ -189,6 +201,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     requestSettings: Settings,
     extras: ToolExtras,
     agentTools: ToolExtras,
+    local: Omit<LocalContext, "settings" | "signal">,
     signal: AbortSignal,
   ) {
     const calls = reply.toolCalls ?? [];
@@ -201,13 +214,23 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     let webRuns: WebRun[] = webParsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
     const unknownTools = calls.filter((c) => routeCall(c.name, available) === "unknown").map((c) => unknownCall(c, available));
     let questions = calls.filter((c) => routeCall(c.name, available) === "ask").map(parseAskCall);
+    const localCalls = calls.filter((c) => routeCall(c.name, available) === "local");
+    let localRuns: LocalRun[] = localCalls.map(startedRun);
     const show = () => {
       const agents = runs;
       const web = webRuns;
       const asked = questions;
+      const localNow = localRuns;
       setList((l) => ({
         ...l,
-        sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({ ...m, agents, web, unknownTools, questions: asked })),
+        sessions: updateMessage(l.sessions, sessionId, reply.id, (m) => ({
+          ...m,
+          agents,
+          web,
+          unknownTools,
+          questions: asked,
+          local: localNow,
+        })),
       }));
     };
     show();
@@ -238,6 +261,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         settings: requestSettings,
         tools: agentTools,
         tavilyKey: getTavilyKey(),
+        local,
         signal,
         onUpdate: (run) => {
           runs = runs.map((r) => (r.callId === run.callId ? run : r));
@@ -251,6 +275,10 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
           webRuns = webRuns.map((r) => (r.callId === run.callId ? run : r));
           show();
         },
+      }),
+      runLocalCalls(localCalls, { ...local, settings: requestSettings, signal }, (run) => {
+        localRuns = localRuns.map((r) => (r.callId === run.callId ? run : r));
+        show();
       }),
       ...asking,
     ]);
@@ -266,6 +294,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
       ...webRuns.map((run) => [run.callId, webToolResult(run)] as const),
       ...unknownTools.map((call) => [call.callId, call.error] as const),
       ...questions.map((q) => [q.callId, askToolResult(q)] as const),
+      ...localRuns.map((run) => [run.callId, localToolResult(run)] as const),
     ]);
     return addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: results.get(c.id) ?? "" })));
   }
@@ -309,6 +338,26 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     setList((l) => forkSession(l, sessionId, messageId, id));
   }
 
+  /** Attaches files to the active session, as text; files that cannot be read are named in `attachError`. */
+  async function attach(files: File[]) {
+    const sessionId = active.id;
+    const taken = active.attachments.map((a) => a.name);
+    const added: Attachment[] = [];
+    const errors: string[] = [];
+    for (const file of files) {
+      const result = await attachmentFromFile(file, [...taken, ...added.map((a) => a.name)]);
+      if (result.ok) added.push(result.attachment);
+      else errors.push(result.error);
+    }
+    setAttachError(errors.length > 0 ? errors.join(" ") : null);
+    if (added.length > 0) setList((l) => ({ ...l, sessions: addAttachments(l.sessions, sessionId, added) }));
+  }
+
+  function detach(name: string) {
+    const sessionId = active.id;
+    setList((l) => ({ ...l, sessions: removeAttachment(l.sessions, sessionId, name) }));
+  }
+
   /** The user's answer to a question a reply is waiting on. */
   function answer(messageId: number, callId: string, text: string) {
     waiting.current.get(`${messageId}:${callId}`)?.(text);
@@ -333,6 +382,9 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     saveEdit,
     fork,
     answer,
+    attach,
+    detach,
+    attachError,
     stop,
   };
 }

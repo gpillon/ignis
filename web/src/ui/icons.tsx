@@ -35,6 +35,14 @@ export function IconPlus() {
   );
 }
 
+export function IconPaperclip() {
+  return (
+    <svg {...icon} width={18} height={18}>
+      <path d="M13.5 7.5l-5.3 5.3a3.2 3.2 0 0 1-4.5-4.5l5.6-5.6a2.1 2.1 0 0 1 3 3L6.8 11.2a1 1 0 0 1-1.5-1.5l4.9-4.9" />
+    </svg>
+  );
+}
+
 export function IconClose() {
   return (
     <svg {...icon} width={14} height={14}>

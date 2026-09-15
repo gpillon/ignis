@@ -21,6 +21,8 @@ import type { Plugin } from "vite";
 // The calls themselves run in the browser against the real services.
 //
 // Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
+// Local: "/js", "/plan", "/file" and "/html" call run_js, update_plan and create_file.
+// "/math" answers with formulas; "/long" streams a long reply for scrolling.
 
 function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
@@ -83,11 +85,19 @@ export function mockIgnis(): Plugin {
         const offersAgents = tools.some((t) => t.function?.name === "agent");
         const offersWeb = tools.some((t) => t.function?.name === "web_search");
         const offersAsk = tools.some((t) => t.function?.name === "ask_user");
+        const offers = (name: string) => tools.some((t) => t.function?.name === name);
+        const offersLocal = offers("run_js") || offers("update_plan") || offers("create_file");
         const lastRole = messages.at(-1)?.role;
         let content = ["Hello ", "from ", "the ", "mock ", "engine. ", "You ", "said: ", last];
         let calls: { tool: string; args: object }[] = [];
         let pace = 120;
-        if (body.class === "agent" && offersWeb && lastRole === "user" && last.includes("/web")) {
+        if (last.includes("/long") && lastRole === "user") {
+          // Long reasoning and a long answer, streamed fast: for checking how the transcript scrolls.
+          const sentence = (n: number) => `This is sentence ${n} of a long stream, written to fill the transcript and wrap across several lines. `;
+          reasoning.splice(0, reasoning.length, ...(thinkingOff ? [] : Array.from({ length: 60 }, (_, i) => sentence(i + 1))));
+          content = Array.from({ length: 120 }, (_, i) => (i % 12 === 11 ? `${sentence(i + 1)}\n\n` : sentence(i + 1)));
+          pace = 25;
+        } else if (body.class === "agent" && offersWeb && lastRole === "user" && last.includes("/web")) {
           // An agent with web tools whose task mentions "/web" searches before it reports.
           content = ["Searching ", "first."];
           calls = [{ tool: "web_search", args: { query: last.replace(/^.*\/web/s, "").trim() || "ignis inference engine" } }];
@@ -95,7 +105,7 @@ export function mockIgnis(): Plugin {
           const words = `Report for "${last.slice(0, 60)}". The mock agent looked at the task, checked three things and found the answer. Everything it needs is in the prompt, so the result is short and ready to merge.`;
           content = words.split(/(?<= )/);
           pace = 70 + Math.floor(Math.random() * 120);
-        } else if ((offersAgents || offersWeb || offersAsk) && lastRole === "tool") {
+        } else if ((offersAgents || offersWeb || offersAsk || offersLocal) && lastRole === "tool") {
           const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80).replace(/\s+/g, " ")}`);
           content = ["The ", "tools ", "reported ", "back:\n\n", results.join("\n")];
         } else if (offersAgents && last.includes("/agents")) {
@@ -104,6 +114,39 @@ export function mockIgnis(): Plugin {
             tool: "agent",
             args: { name, prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}` },
           }));
+        } else if (offers("run_js") && last.includes("/js")) {
+          content = ["Let ", "me ", "compute ", "it."];
+          calls = [{ tool: "run_js", args: { code: "const squares = [1, 2, 3, 4].map((x) => x * x);\nconsole.log('squares', squares);\nreturn squares.reduce((a, b) => a + b);" } }];
+        } else if (offers("update_plan") && last.includes("/plan")) {
+          content = ["Here ", "is ", "the ", "plan."];
+          calls = [
+            {
+              tool: "update_plan",
+              args: { steps: [{ step: "Read the question", status: "done" }, { step: "Look things up", status: "in_progress" }, { step: "Write the answer", status: "pending" }] },
+            },
+          ];
+        } else if (last.includes("/math") && lastRole === "user") {
+          content = [
+            "Hydrostatic pressure grows with depth:\n\n",
+            "$$P = \\rho \\cdot g \\cdot h$$\n\n",
+            "where $\\rho$ is the density, \\(g\\) the gravity and $h$ the depth. In display form:\n\n",
+            "\\[\n\\int_0^h \\rho g \\, dz = \\rho g h\n\\]",
+          ];
+        } else if (offers("create_file") && last.includes("/html")) {
+          content = ["Here ", "is ", "the ", "page."];
+          calls = [
+            {
+              tool: "create_file",
+              args: {
+                name: "hello.html",
+                content:
+                  '<!doctype html>\n<html>\n<body style="font-family: sans-serif; padding: 24px">\n  <h1>Hello from ignis</h1>\n  <button onclick="this.textContent = \'Clicked\'">Click me</button>\n</body>\n</html>\n',
+              },
+            },
+          ];
+        } else if (offers("create_file") && last.includes("/file")) {
+          content = ["I ", "wrote ", "it ", "to ", "a ", "file."];
+          calls = [{ tool: "create_file", args: { name: "notes.md", content: "# Notes\n\n- one\n- two\n" } }];
         } else if (offersAsk && last.includes("/ask")) {
           content = ["I ", "need ", "one ", "detail ", "first."];
           calls = [{ tool: "ask_user", args: { question: "Which team do you mean?", options: ["AS Roma", "SS Lazio"] } }];

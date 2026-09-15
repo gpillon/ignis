@@ -3,6 +3,7 @@ import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition,
 import type { ToolCall } from "../../api/sse.ts";
 import { streamChat } from "../../api/stream.ts";
 import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
+import { isLocalTool, type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../local/local.ts";
 import { isWebTool, parseWebCall, runWeb, type WebRun, webToolResult } from "../web/web.ts";
 
 // The `agent` tool: the model hands one self-contained sub-task to an agent,
@@ -37,7 +38,7 @@ export const AGENT_TOOL: ToolDefinition = {
 
 /** What the agent tool adds to the ignis system prompt of the conversation. */
 export const AGENTS_IGNIS_PROMPT = `# Agents
-You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history. It gets your other tools except \`ask_user\`, if you have any, and cannot start agents of its own.
+You can delegate work with the \`agent\` tool. Each call starts an agent: a separate model instance that sees only the prompt you write, with no conversation history. It gets your other tools except \`ask_user\` and \`update_plan\`, if you have any, and cannot start agents of its own.
 - Agents run in parallel on dedicated lanes. When a task splits into independent parts, call \`agent\` several times in the same reply, one call per part, rather than one after another.
 - Make every prompt self-contained: include the facts, text or code the agent needs, and say exactly what it should return.
 - Each agent's answer comes back to you as that call's result. Check the results, then write your reply to the user from them.
@@ -81,6 +82,8 @@ export type AgentRun = {
   rounds?: Figures[];
   /** The web calls the agent made, in order. */
   web?: WebRun[];
+  /** The local tool calls the agent made, in order. */
+  local?: LocalRun[];
   /** Calls the agent made to tools it was not given. */
   unknownTools?: UnknownCall[];
   systemPrompt?: string;
@@ -165,6 +168,8 @@ export type RunAgentsOptions = {
   tools?: ToolExtras;
   /** For the agents' web searches. */
   tavilyKey?: string | null;
+  /** For the agents' local tools: the safety check, the attachments, the check log. */
+  local?: Omit<LocalContext, "settings" | "signal">;
   limit?: number;
   /** A full engine is retried, not failed: agents wait for a lane. */
   retryDelayMs?: number;
@@ -232,30 +237,49 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
     }
   }
 
-  /** Runs one request's declared web calls, answers any other call as an unknown tool, and resolves with each call's result. */
+  /**
+   * Runs one request's declared web and local calls at once, answers any
+   * other call as an unknown tool, and resolves with each call's result.
+   */
   async function runCalls(callId: string, calls: ToolCall[]): Promise<Map<string, string>> {
-    const earlier = get(callId).web ?? [];
-    const declared = calls.filter((call) => isWebTool(call.name) && available.includes(call.name));
-    const unknown = calls.filter((call) => !declared.includes(call)).map((call) => unknownCall(call, available));
-    const parsed = declared.map((call) => parseWebCall(call, available));
-    let current: WebRun[] = parsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
-    set(callId, {
-      web: [...earlier, ...current],
-      ...(unknown.length > 0 ? { unknownTools: [...(get(callId).unknownTools ?? []), ...unknown] } : {}),
-    });
-    await doRunWeb(
-      parsed.flatMap((p) => (p.ok ? [p.task] : [])),
-      {
-        tavilyKey: options.tavilyKey ?? null,
-        signal,
-        onUpdate: (run) => {
-          current = current.map((r) => (r.callId === run.callId ? run : r));
-          set(callId, { web: [...earlier, ...current] });
+    const earlierWeb = get(callId).web ?? [];
+    const earlierLocal = get(callId).local ?? [];
+    const declared = (call: ToolCall) => available.includes(call.name);
+    const webCalls = calls.filter((call) => declared(call) && isWebTool(call.name));
+    const localCalls = calls.filter((call) => declared(call) && isLocalTool(call.name));
+    const unknown = calls
+      .filter((call) => !webCalls.includes(call) && !localCalls.includes(call))
+      .map((call) => unknownCall(call, available));
+    const parsed = webCalls.map((call) => parseWebCall(call, available));
+    let web: WebRun[] = parsed.map((p) => (p.ok ? { ...p.task, status: "running" } : p.run));
+    let local: LocalRun[] = localCalls.map(startedRun);
+    const show = () => set(callId, { web: [...earlierWeb, ...web], local: [...earlierLocal, ...local] });
+    if (unknown.length > 0) set(callId, { unknownTools: [...(get(callId).unknownTools ?? []), ...unknown] });
+    show();
+    await Promise.all([
+      doRunWeb(
+        parsed.flatMap((p) => (p.ok ? [p.task] : [])),
+        {
+          tavilyKey: options.tavilyKey ?? null,
+          signal,
+          onUpdate: (run) => {
+            web = web.map((r) => (r.callId === run.callId ? run : r));
+            show();
+          },
         },
-      },
-    );
+      ),
+      runLocalCalls(
+        localCalls,
+        { jsSafetyCheck: true, attachments: [], ...options.local, settings: options.settings, signal },
+        (run) => {
+          local = local.map((r) => (r.callId === run.callId ? run : r));
+          show();
+        },
+      ),
+    ]);
     return new Map([
-      ...current.map((run) => [run.callId, webToolResult(run)] as const),
+      ...web.map((run) => [run.callId, webToolResult(run)] as const),
+      ...local.map((run) => [run.callId, localToolResult(run)] as const),
       ...unknown.map((call) => [call.callId, call.error] as const),
     ]);
   }

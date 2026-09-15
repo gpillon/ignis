@@ -4,6 +4,8 @@ import type { ToolCall } from "../api/sse.ts";
 import type { AgentRun } from "../tools/agents/agents.ts";
 import type { Question } from "../tools/ask/ask.ts";
 import type { UnknownCall } from "../tools/errors.ts";
+import type { Attachment } from "../tools/local/attachments.ts";
+import type { LocalRun } from "../tools/local/local.ts";
 import type { WebRun } from "../tools/web/web.ts";
 
 // Playground sessions: separate conversations, each with its own log of
@@ -33,6 +35,8 @@ export type Message = {
   unknownTools?: UnknownCall[];
   /** The questions an assistant reply asked the user. */
   questions?: Question[];
+  /** The local tool calls an assistant reply made: code, plan, memory, files. */
+  local?: LocalRun[];
 };
 
 export type LogRow = {
@@ -46,7 +50,14 @@ export type LogRow = {
   agent?: string;
 };
 
-export type Session = { id: number; title: string; messages: Message[]; log: LogRow[] };
+export type Session = {
+  id: number;
+  title: string;
+  messages: Message[];
+  log: LogRow[];
+  /** Files the user attached, for read_file. */
+  attachments: Attachment[];
+};
 
 export type SessionList = { sessions: Session[]; activeId: number };
 
@@ -55,7 +66,17 @@ export const UNTITLED = "New session";
 const TITLE_LENGTH = 48;
 
 export function createSession(id: number): Session {
-  return { id, title: UNTITLED, messages: [], log: [] };
+  return { id, title: UNTITLED, messages: [], log: [], attachments: [] };
+}
+
+/** Files attached to a session. */
+export function addAttachments(sessions: Session[], sessionId: number, added: Attachment[]): Session[] {
+  return sessions.map((s) => (s.id === sessionId ? { ...s, attachments: [...s.attachments, ...added] } : s));
+}
+
+/** Drops the attached file called `name`. */
+export function removeAttachment(sessions: Session[], sessionId: number, name: string): Session[] {
+  return sessions.map((s) => (s.id === sessionId ? { ...s, attachments: s.attachments.filter((a) => a.name !== name) } : s));
 }
 
 /** A session's title from its first prompt: the first non-blank line, shortened. */
@@ -137,6 +158,7 @@ export function forkSession(list: SessionList, sessionId: number, messageId: num
     title: `${source.title} (fork)`,
     messages: source.messages.slice(0, index + 1).map((m) => ({ ...m, streaming: false })),
     log: [],
+    attachments: source.attachments,
   };
   return { sessions: [fork, ...list.sessions], activeId: newId };
 }
