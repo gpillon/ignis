@@ -90,9 +90,15 @@ inline ninfer::ops::LinearPolicy ignis_linear_swiglu_policy_for(ninfer::QType qt
 // `compute_policy` field, resolved by the entry point that dispatches this
 // body): every NVFP4 projection in the layer is dispatched under the
 // policy `ignis_policy_for` resolves for it.
+//
+// `rope_positions` (GitHub #178) is a device I32 [num_tokens, 3] the span
+// rotates at -- a multimodal chunk's three axes -- or null, where the span
+// rotates at its cache positions shifted by the sequence's rope delta (0,
+// the cache positions themselves, for a text sequence).
 int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                   uint32_t layer, const void *in_residual, void *out_residual,
-                                  uint64_t num_tokens, LinearPolicyMode mode);
+                                  uint64_t num_tokens, LinearPolicyMode mode,
+                                  const void *rope_positions = nullptr);
 
 // The same body + one stream synchronization + the deferred
 // `gqa_positions` advance, for a caller that wants `ignis_gqa_layer_step`'s

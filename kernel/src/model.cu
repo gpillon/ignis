@@ -93,6 +93,16 @@ ninfer::Weight to_weight(const ignis_bound_tensor &t) {
     w.n = static_cast<int32_t>(t.shape[0]);
     w.k = static_cast<int32_t>(t.shape[1]);
   }
+  // GitHub #178: a row-split row is stored K-padded to a multiple of 128
+  // (`row-split-k128-v1`), and the row-split kernels step rows by that padded
+  // width (the reference's `row_split_weight`: `padded_shape[1] =
+  // padded_columns`). Every text-scope row-split weight is already 128-aligned,
+  // so only the vision tower's `mlp/fc2` (K = 4304, stored at 4352) differs --
+  // read at 4304 it came out as noise.
+  if (t.ndim == 2 && w.layout == ninfer::QuantLayout::RowSplit) {
+    constexpr int32_t kRowSplitKAlignment = 128;
+    w.padded_shape[1] = (w.k + kRowSplitKAlignment - 1) / kRowSplitKAlignment * kRowSplitKAlignment;
+  }
   // The W8G32_F16S group geometry + scale dtype (constant for the qtype,
   // not carried by `ignis_bound_tensor`): required by
   // ninfer::ops::embedding's W8 metadata validation (the two W8G32 text
@@ -764,48 +774,8 @@ constexpr std::size_t kVisionWorkspaceAlignment = 256;
 // (`impl/runtime/vision_context_impl.h`), region for region and scope for
 // scope, so the encoder (#178) runs out of exactly this layout.
 std::size_t vision_workspace_bytes(std::int32_t tokens, std::int32_t segments) {
-  using ninfer::DType;
-  const std::int32_t patches = tokens * kVisionMergeUnit;
-  ninfer::LayoutBuilder builder;
-  const auto add = [&](DType dtype, std::initializer_list<std::int32_t> shape, const char *label) {
-    (void)builder.add_tensor(dtype, shape, kVisionWorkspaceAlignment, label);
-  };
-  add(DType::I32, {patches, 2}, "vision position ids");
-  add(DType::I32, {segments + 1}, "vision segment bounds");
-  add(DType::I32, {4, patches}, "vision position indices");
-  add(DType::FP32, {4, patches}, "vision position weights");
-  add(DType::BF16, {kVisionHidden, patches}, "vision residual");
-  add(DType::BF16, {kVisionPatchDim, patches}, "vision BF16 patches");
-  {
-    auto attention_scope = builder.scope();
-    add(DType::BF16, {kVisionHidden, patches}, "vision attended");
-    {
-      auto qkv_scope = builder.scope();
-      add(DType::BF16, {3 * kVisionHidden, patches}, "vision QKV");
-      {
-        auto norm_scope = builder.scope();
-        add(DType::BF16, {kVisionHidden, patches}, "vision attention norm");
-      }
-      const std::size_t attention_bytes = ninfer::ops::vision_attention_workspace_capacity_bytes(
-          patches, patches, segments, segments);
-      if (attention_bytes != 0) {
-        (void)builder.add(attention_bytes, kVisionWorkspaceAlignment, "vision attention workspace");
-      }
-    }
-    add(DType::BF16, {kVisionHidden, patches}, "vision projected");
-  }
-  {
-    auto mlp_scope = builder.scope();
-    add(DType::BF16, {kVisionIntermediate, patches}, "vision MLP up");
-    {
-      auto norm_scope = builder.scope();
-      add(DType::BF16, {kVisionHidden, patches}, "vision MLP norm");
-    }
-    add(DType::BF16, {kVisionHidden, patches}, "vision MLP down");
-  }
-  add(DType::BF16, {kVisionHidden, patches}, "vision merger norm");
-  add(DType::BF16, {kVisionMergerHidden, tokens}, "vision merger hidden");
-  return builder.finish(1, "vision workspace");
+  // GitHub #178: the layout itself lives beside the encode that binds it.
+  return ignis_vision_workspace_bytes(tokens, segments);
 }
 
 // GitHub #177: one item's `[hidden, tokens]` BF16 encoder output (the
@@ -913,6 +883,13 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
     set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
               " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
+    return -1;
+  }
+  // GitHub #178: a fence until the drafter's context append and the verify
+  // round learn multimodal positions (a later ticket lifts it).
+  if (vision_max_tokens > 0 && speculative_backend != IGNIS_SPECULATIVE_NONE) {
+    set_error("ignis_model_load: vision with a speculative backend is not supported yet; "
+              "load with one of them");
     return -1;
   }
 
@@ -1077,6 +1054,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         sizeof(ninfer::ops::SamplingConfig) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_decode_positions =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    // GitHub #178: allocated before the decode graphs are captured, which
+    // bake its address into every GQA layer's rotation.
+    if (vision_max_tokens > 0) {
+      model->decode_rope_positions =
+          std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    }
     model->sampling_decode_out =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(

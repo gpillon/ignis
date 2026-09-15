@@ -347,6 +347,15 @@ struct ignis_model {
   VisionWeights vision{};
   std::unique_ptr<ninfer::DeviceArena> vision_workspace;
   std::unique_ptr<ninfer::DeviceBuffer> vision_output;
+  // GitHub #178: whether `vision_output` holds a live media embedding. One
+  // item at a time, like the reference's single output transient.
+  bool vision_output_live = false;
+  // GitHub #178: the decode round's per-lane rope positions (I32 x
+  // IGNIS_DECODE_MAX_BATCH), `position + rope_delta`, staged beside
+  // `sampling_decode_positions` and read by the graphs from this stable
+  // address. Only a vision load has one: a text load's rounds rotate at the
+  // positions themselves, exactly as before.
+  std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
   uint64_t vision_reserved_bytes() const {
     return (vision_workspace ? vision_workspace->capacity() : 0) +
            (vision_output ? vision_output->bytes : 0);
@@ -357,3 +366,16 @@ struct ignis_model {
   // which a windowed load sizes for `k+1` columns per lane instead of one.
   std::unique_ptr<IgnisVerifyRound> verify;
 };
+
+// GitHub #178: a media embedding -- the `[hidden, columns]` BF16 encoder
+// output in its model's `vision_output`, live until released.
+struct ignis_media_embedding {
+  ignis_model *model = nullptr;
+  std::int32_t columns = 0;
+};
+
+// GitHub #178: the encoder workspace for `tokens` merged tokens over
+// `segments` segments -- the reference's `build_workspace_layout`, shared by
+// the load's reservation (kernel/src/model.cu) and the encode that runs out
+// of it (kernel/src/vision_encode.cu), so the two cannot drift.
+std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segments);

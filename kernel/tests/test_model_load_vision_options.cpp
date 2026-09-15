@@ -207,6 +207,18 @@ int main() {
           "with a zero envelope the vision tensors are extras: " + m0);
   }
 
+  // --- 3. vision with speculation (GitHub #178) -------------------------------
+  // A fence until the drafter learns multimodal positions: refused before
+  // binding, whichever windowed backend asks.
+  for (const int32_t backend : {IGNIS_SPECULATIVE_DFLASH2, IGNIS_SPECULATIVE_VERIFY_ONLY}) {
+    ignis_model_load_options both = vision(32768);
+    both.speculative_backend = backend;
+    both.draft_tokens = 4;
+    const std::string m = load_error(concat(text, tower), &both);
+    check(contains(m, "vision") && contains(m, "speculative") && !contains(m, "bound tensor"),
+          "vision with speculative backend " + std::to_string(backend) + " is refused: " + m);
+  }
+
   if (g_failed != 0) {
     std::fprintf(stderr, "model load vision options test: %d check(s) failed\n", g_failed);
     return 1;

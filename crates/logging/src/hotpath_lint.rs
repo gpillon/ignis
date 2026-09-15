@@ -41,6 +41,8 @@ pub const HOT_PATH_FILES: &[&str] = &[
     "crates/core/src/admission.rs",
     "crates/core/src/host.rs",
     "crates/core/src/prefix.rs",
+    "crates/core/src/vision.rs",
+    "crates/runtime/src/lib.rs",
     "crates/runtime/src/cuda_leaf.rs",
     "crates/server/src/runtime.rs",
     "crates/server/src/engine.rs",

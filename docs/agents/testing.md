@@ -209,6 +209,40 @@ cargo run -p ignis-bench -- oracle compare `
 # 4. Stop ninfer-serve (frees the GPU) and commit the updated fixture.
 ```
 
+## The vision canary fixture (GitHub #178)
+
+`crates/server/tests/fixtures/vision_canary/` is ADR 0014's floor applied to
+multimodal prompts: four generated images (a rendered number, a coloured
+square, three circles, a line of screenshot text), one short question each,
+and the reference's greedy answers. `crates/server/tests/vision_canary_gpu.rs`
+scores ignis against them by teacher-forced agreement over the first 32 answer
+positions, floor 95% across the suite, each prompt prefilled twice — whole,
+and in 48-token spans so the placeholder run crosses span boundaries.
+
+The suite's floor, not each canary's: at 27/28 (2026-09-16) the one mismatch
+is a flip between `" red"` and `"Red"` on the colour canary, which the whole
+prompt picks one way and a span-cut prompt the other. Both are the answer; a
+wrong merge order, patch layout, MRoPE axis or scatter offset is a gross
+error and craters the suite, which is what this gate is for.
+
+Re-record it (needs the GPU and the reference, ADR 0006 — stop
+`ignis-server` first; the images are regenerated deterministically, so a
+re-record with the same PIL/font is a no-op on them):
+
+```powershell
+F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe `
+  F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer `
+  --host 127.0.0.1 --port 8080 --vision --greedy --no-thinking `
+  --max-context 8192 --max-concurrency 1 --kv-capacity auto
+python tools/vision-canary/record.py crates/server/tests/fixtures/vision_canary
+# then stop ninfer-serve and commit the fixture
+```
+
+`crates/runtime/tests/cuda_leaf_vision_gpu.rs` is the same load's serving-shape
+check: an image prompt chunked at 64 tokens while three text lanes decode, each
+lane still answering its own question, and 100 image requests leaving no media
+embedding live and the leaf's footprint where it was.
+
 ## The G2 measurement instrument (P2-05, GitHub #87)
 
 `ignis-bench ttft` measures time to first token at an **exact** prompt

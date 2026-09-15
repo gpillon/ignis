@@ -30,7 +30,9 @@ use ignis_core::{
     TokenId, plan_kv_pool_for_context,
 };
 
-use crate::{DecodeLane, LaneRun, RuntimeStats, StepLeaf};
+use ignis_core::vision::MediaItem;
+
+use crate::{DecodeLane, LaneRun, MultimodalSpan, RuntimeStats, StepLeaf};
 
 /// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
@@ -220,7 +222,51 @@ impl StepLeaf for CudaLeaf {
     type Sequence = Seq<'static>;
     type Prefix = SeqPrefix<'static>;
     type SnapshotBuf = PinnedBuffer;
-    type Media = ();
+    type Media = step::MediaEmbedding<'static>;
+
+    fn encode_media(&self, model: &Self::Model, item: &MediaItem) -> Result<Self::Media, i32> {
+        let control = ignis_core::vision::vision_item_control(item.grid);
+        let embedding = step::encode_media(&model.model, item.grid, &item.patches, &control)
+            .map_err(|e| leaf_error("media encode", e))?;
+        // Safety: as for sequences -- `RuntimeCompute` releases every live
+        // embedding before its `Arc<Model<L>>` (and so this model) can drop.
+        Ok(unsafe { embedding.into_static() })
+    }
+
+    fn release_media(&self, _model: &Self::Model, _media: Self::Media) {
+        // Drops here: `MediaEmbedding::drop` calls `ignis_media_embedding_release`.
+    }
+
+    fn prefill_multimodal(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        tokens: &[TokenId],
+        start_position: u32,
+        params: DecodeParams,
+        span: MultimodalSpan<'_, Self::Media>,
+    ) -> Result<(), i32> {
+        let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        step::prefill_program_multimodal(
+            &model.model,
+            &model.pool,
+            sequence,
+            &token_ids,
+            u64::from(start_position),
+            sampling_params(params),
+            step::MultimodalPrefill {
+                positions: span.positions,
+                rope_delta: span.rope_delta,
+                media: span.media.map(|media| step::SpanMediaColumns {
+                    embedding: media.embedding,
+                    first_column: media.first_column,
+                    scatter_indices: media.scatter_indices,
+                }),
+            },
+            None,
+        )
+        .map_err(|e| leaf_error("prefill", e))
+    }
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         // P4-04 (GitHub #122): plan the pool before the weights go up. A

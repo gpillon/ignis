@@ -1,0 +1,30 @@
+{
+  "engine": "ninfer-serve --vision --greedy --no-thinking",
+  "max_tokens": 32,
+  "canaries": [
+    {
+      "id": "number",
+      "image": "number.png",
+      "question": "What number is shown in the image? Answer with the number only.",
+      "text": "47"
+    },
+    {
+      "id": "colour",
+      "image": "colour.png",
+      "question": "What colour is the square in the image? Answer with one word.",
+      "text": "Red"
+    },
+    {
+      "id": "circles",
+      "image": "circles.png",
+      "question": "How many circles are in the image? Answer with a number only.",
+      "text": "3"
+    },
+    {
+      "id": "text",
+      "image": "text.png",
+      "question": "What does the text in the image say? Reply with the text only.",
+      "text": "error: config.yaml not found"
+    }
+  ]
+}

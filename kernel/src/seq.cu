@@ -544,6 +544,11 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
     return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
+  if (seq->rope_delta != 0) {
+    set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
+              " carries a multimodal rope delta, which the snapshot blob does not record yet");
+    return -1;
+  }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
               " is mid-chunk (program frontier " + std::to_string(seq->position) +
@@ -574,6 +579,11 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
   if (const char *refusal = shared_prefix_refusal(*seq)) {
     set_error(std::string("ignis_seq_snapshot: ") + refusal);
     return IGNIS_SEQ_ERR_SHARED_PREFIX;
+  }
+  if (seq->rope_delta != 0) {
+    set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
+              " carries a multimodal rope delta, which the snapshot blob does not record yet");
+    return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
     set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
