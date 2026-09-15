@@ -18,7 +18,7 @@ use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
-use crate::template::{ChatMessage, TemplateProvider};
+use crate::template::{ChatMessage, MessageContent, TemplateProvider};
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
 /// The [`TemplateProvider`] backed by the artifact's [`FrontendSet`]: the
@@ -64,8 +64,8 @@ impl TemplateProvider for ArtifactTemplateProvider {
             .iter()
             .map(|message| {
                 let role = Role::parse(&message.role).unwrap_or(Role::User);
-                let mut templated =
-                    ignis_artifact::ChatMessage::text(role, message.content.clone());
+                let mut templated = ignis_artifact::ChatMessage::text(role, "");
+                templated.content = artifact_content(&message.content);
                 // Prior assistant reasoning rides into the prompt only when
                 // the request opted in (GitHub #68) — dropped by default so
                 // a long conversation does not silently accumulate traces.
@@ -180,6 +180,23 @@ impl TokenDecoder for ArtifactTokenDecoder {
                 String::new()
             }
         }
+    }
+}
+
+/// The template-facing content of a wire message (GitHub #175). A parts
+/// array reaches the template as parts, so the real template's
+/// `render_content` loop renders it — for text parts, exactly as the
+/// concatenated string. Only text parts get here: `check_content_parts`
+/// refuses every other part before a request is templated.
+fn artifact_content(content: &MessageContent) -> ignis_artifact::MessageContent {
+    match content {
+        MessageContent::Text(text) => ignis_artifact::MessageContent::Text(text.clone()),
+        MessageContent::Parts(parts) => ignis_artifact::MessageContent::Parts(
+            parts
+                .iter()
+                .filter_map(|part| part.text.clone().map(ignis_artifact::ContentPart::Text))
+                .collect(),
+        ),
     }
 }
 
@@ -299,6 +316,25 @@ mod tests {
         assert!(!tokens.is_empty());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("hello"), "{text}");
+    }
+
+    /// GitHub #175: a text-parts message renders exactly as its
+    /// concatenated string, through a template shaped like the real one's
+    /// `render_content` (string → as-is, parts → each `text` in order).
+    #[test]
+    fn text_parts_render_the_same_prompt_as_the_concatenated_string() {
+        const PARTS_TEMPLATE: &str = "{%- for m in messages -%}{{ m.role }} {% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %} {% endfor -%}";
+        let (_fixture, _reader, provider) = build_provider_with(PARTS_TEMPLATE);
+        let string_form = [ChatMessage::text("user", "hello world")];
+        let parts: MessageContent =
+            serde_json::from_value(json!([{ "type": "text", "text": "hel" }, { "type": "text", "text": "lo world" }]))
+                .expect("parts deserialize");
+        let mut parts_form = ChatMessage::text("user", "");
+        parts_form.content = parts;
+        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools());
+        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools());
+        assert_eq!(parts_tokens, string_tokens);
+        assert!(provider.render_tokens(&parts_tokens).contains("hello world"));
     }
 
     // -- thinking controls (GitHub #68) --------------------------------------

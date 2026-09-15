@@ -40,7 +40,7 @@ use ignis_core::{
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Engine, EventStream, collect_tokens};
-use crate::template::{ChatMessage, TemplateProvider};
+use crate::template::{check_content_parts, ChatMessage, ContentRejection, TemplateProvider};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
@@ -603,6 +603,17 @@ fn bad_request(message: &str) -> Response {
     )
 }
 
+/// The 400 for refused content parts (GitHub #175): the rejection's own
+/// code, raised before the request reaches the engine.
+fn content_rejection(rejection: ContentRejection) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        rejection.code,
+        rejection.message,
+    )
+}
+
 /// The OpenAI error body (`{"error": {message, type, code}}`).
 fn error_response(
     status: StatusCode,
@@ -804,6 +815,9 @@ async fn chat_completions(
 ) -> Response {
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
+    }
+    if let Err(rejection) = check_content_parts(&req.messages) {
+        return content_rejection(rejection);
     }
     let params = match req.sampling.resolve(req.max_tokens, req.ignore_eos) {
         Ok(params) => params,
@@ -1399,6 +1413,9 @@ async fn responses_api(
     };
     if messages.is_empty() {
         return bad_request("input must not be empty");
+    }
+    if let Err(rejection) = check_content_parts(&messages) {
+        return content_rejection(rejection);
     }
     let thinking = match resolve_thinking(
         &server,

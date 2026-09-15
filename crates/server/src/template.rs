@@ -26,14 +26,16 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
 /// One conversation message in OpenAI wire shape (`role` + `content`).
 ///
-/// `content` is the plain-string form (v1: the structured content-parts
-/// form is rejected at the API boundary with a 400).
+/// `content` is a plain string or an array of OpenAI content parts
+/// (GitHub #175). The parts are parsed permissively so a malformed or
+/// unknown part reaches [`check_content_parts`] and is refused with a 400
+/// naming it, rather than failing deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// The message role (`system`, `user`, `assistant`, `tool`, …).
     pub role: String,
-    /// The message text.
-    pub content: String,
+    /// The message content.
+    pub content: MessageContent,
     /// A prior assistant turn's thinking trace (GitHub #68). Dropped before
     /// rendering unless the request sets `preserve_thinking: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,12 +60,166 @@ impl ChatMessage {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
     }
+}
+
+/// A message's `content`: the plain string, or OpenAI content parts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// The plain-string form.
+    Text(String),
+    /// The content-parts form, in wire order.
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// The text the chat template renders for this content once
+    /// [`check_content_parts`] has passed it: the string itself, or the
+    /// text parts joined with no separator — what the artifact template's
+    /// `render_content` loop emits for an all-text parts array.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts.iter().filter_map(|p| p.text.as_deref()).collect(),
+        }
+    }
+}
+
+/// One OpenAI content part, parsed permissively: every field is optional
+/// and unknown fields are ignored (the `image_url` object's `detail` among
+/// them), so what a part *is* gets decided by [`check_content_parts`] with
+/// an error that names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "JsonValue", into = "JsonValue")]
+pub struct ContentPart {
+    /// The part's `type`, when it is a string.
+    pub kind: Option<String>,
+    /// A `text` part's text, when it is a string.
+    pub text: Option<String>,
+    /// An `image_url` / `video_url` part's `url`, when it is a string
+    /// inside the object OpenAI's wire shape nests it in.
+    pub url: Option<String>,
+}
+
+impl From<ContentPart> for JsonValue {
+    fn from(part: ContentPart) -> Self {
+        let mut object = serde_json::Map::new();
+        if let Some(text) = part.text {
+            object.insert("text".to_owned(), JsonValue::String(text));
+        }
+        if let Some(kind) = part.kind {
+            if let Some(url) = part.url {
+                object.insert(kind.clone(), serde_json::json!({ "url": url }));
+            }
+            object.insert("type".to_owned(), JsonValue::String(kind));
+        }
+        JsonValue::Object(object)
+    }
+}
+
+impl From<JsonValue> for ContentPart {
+    fn from(value: JsonValue) -> Self {
+        let string = |v: Option<&JsonValue>| v.and_then(JsonValue::as_str).map(str::to_owned);
+        let kind = string(value.get("type"));
+        let url = kind
+            .as_deref()
+            .and_then(|kind| value.get(kind))
+            .and_then(|media| string(media.get("url")));
+        Self {
+            text: string(value.get("text")),
+            kind,
+            url,
+        }
+    }
+}
+
+/// Why a request's content parts were refused (GitHub #175): the OpenAI
+/// error `code` — the reference's name — and a message naming the offending
+/// message and part index. Always an HTTP 400, raised before admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRejection {
+    /// The error `code` (`vision_disabled`, `video_unsupported`,
+    /// `invalid_media` or `invalid_request_error`).
+    pub code: &'static str,
+    /// The human-readable message.
+    pub message: String,
+}
+
+/// Validate every message's content parts. Text parts pass; media parts are
+/// recognised but not served yet, so each is refused with the reference's
+/// error code:
+///
+/// - media in a `system` message → `invalid_media` (the reference's
+///   processor refuses it as invalid input; the template cannot render
+///   media there). Checked first: it is wrong on any server, with or
+///   without vision.
+/// - `video_url` → `video_unsupported` (images only, spec §Scope).
+/// - `image_url` → `vision_disabled`.
+/// - an empty array, a part without a string `type`, a `text` part without
+///   string text, a media part without a string `url`, or an unknown type →
+///   `invalid_request_error`.
+///
+/// Media parts are recognised on `user`, `assistant` and `tool` messages
+/// alike — unlike the reference's OpenAI schema, which refuses non-text
+/// parts on a tool message: a browser tool's screenshot result must reach
+/// the model the way its text does (spec user story 6).
+pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentRejection> {
+    let refuse = |code, message: String| Err(ContentRejection { code, message });
+    for (i, message) in messages.iter().enumerate() {
+        let MessageContent::Parts(parts) = &message.content else {
+            continue;
+        };
+        if parts.is_empty() {
+            return refuse("invalid_request_error", format!("message {i} content must not be empty"));
+        }
+        for (j, part) in parts.iter().enumerate() {
+            let at = format!("message {i} content part {j}");
+            match part.kind.as_deref() {
+                None => {
+                    return refuse("invalid_request_error", format!("{at} must have a string 'type'"))
+                }
+                Some("text") if part.text.is_none() => {
+                    return refuse(
+                        "invalid_request_error",
+                        format!("{at}: text content part must contain a string 'text'"),
+                    )
+                }
+                Some("text") => {}
+                Some(media @ ("image_url" | "video_url")) => {
+                    if part.url.is_none() {
+                        return refuse(
+                            "invalid_request_error",
+                            format!("{at}: {media} must be an object containing a string url"),
+                        );
+                    }
+                    if message.role == "system" {
+                        return refuse(
+                            "invalid_media",
+                            format!("{at}: system messages cannot contain images or videos"),
+                        );
+                    }
+                    return if media == "video_url" {
+                        refuse("video_unsupported", format!("{at}: video input is not supported"))
+                    } else {
+                        refuse("vision_disabled", format!("{at}: vision is disabled for this server"))
+                    };
+                }
+                Some(other) => {
+                    return refuse(
+                        "invalid_request_error",
+                        format!("{at} has unsupported content part type: {other}"),
+                    )
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One tool call an assistant history message carries (OpenAI wire shape).
@@ -175,9 +331,10 @@ impl TemplateProvider for SimpleTemplateProvider {
         messages
             .iter()
             .flat_map(|m| {
-                m.content.split_whitespace().map(move |word| {
-                    fnv1a32(format!("{}:{}", m.role, word).as_bytes())
-                })
+                let text = m.content.text();
+                text.split_whitespace()
+                    .map(|word| fnv1a32(format!("{}:{}", m.role, word).as_bytes()))
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -285,6 +442,33 @@ mod tests {
         assert!(p
             .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools())
             .is_empty());
+    }
+
+    #[test]
+    fn content_is_a_string_or_parts_and_serializes_back_to_the_wire_shape() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "a " },
+                { "type": "image_url", "image_url": { "url": "https://x/a.png", "detail": "low" } },
+                { "type": "text", "text": "b" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(message.content.text(), "a b");
+        let MessageContent::Parts(parts) = &message.content else {
+            panic!("expected parts: {message:?}");
+        };
+        assert_eq!(parts[1].kind.as_deref(), Some("image_url"));
+        assert_eq!(parts[1].url.as_deref(), Some("https://x/a.png"));
+        assert_eq!(
+            serde_json::to_value(&parts[1]).unwrap(),
+            serde_json::json!({ "type": "image_url", "image_url": { "url": "https://x/a.png" } })
+        );
+        let plain: ChatMessage =
+            serde_json::from_value(serde_json::json!({ "role": "user", "content": "hi" })).unwrap();
+        assert_eq!(plain, ChatMessage::text("user", "hi"));
+        assert_eq!(serde_json::to_value(&plain).unwrap()["content"], "hi");
     }
 
     #[test]
