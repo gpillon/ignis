@@ -19,8 +19,18 @@ tracing = { workspace = true }
 tower-http = { workspace = true }
 getrandom = { workspace = true }
 cloudflare-quick-tunnel = { workspace = true }
+# Media acquisition (GitHub #179): HTTP(S) image URLs, fetched with the
+# connection pinned to the address the SSRF check resolved, no proxy, no
+# automatic redirects (`media.rs`). Already in the tree through the tunnel
+# crate, with the same rustls backend.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The media cache's key: the SHA-256 of the acquired bytes, computed before
+# the lookup so a hit skips decode, resize and packing.
+sha2 = "0.10"
 
 [dev-dependencies]
+# Encodes the flat test images `tests/openai_http_media.rs` serves.
+png = "0.18"
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -225,6 +225,7 @@ async fn main() {
         host_pool_bytes: _,
         speculation: _,
         vision: _,
+        media: _,
         request_timeout_secs,
         ui,
         metrics,

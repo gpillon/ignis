@@ -46,6 +46,10 @@ use crate::thinking::{
 };
 use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
 
+/// The request body limit of a `--vision` load, in bytes (the reference's
+/// `--max-request-mib` default).
+pub const MEDIA_REQUEST_BODY_LIMIT: usize = 384 << 20;
+
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 ///
 /// `TraceLayer` (GitHub #81, ADR 0012) is the HTTP-ingress root span for
@@ -67,6 +71,14 @@ pub fn router(state: Arc<Server>) -> Router {
         // Only the `/v1` routes above: the Playground's static pages stay
         // reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    // A `--vision` load takes images inline as base64 data URIs (GitHub
+    // #179), far past axum's 2 MiB default body limit: the reference's
+    // 384 MiB request cap, enforced before JSON parsing, admits a full
+    // 256 MiB media budget once base64-encoded. A text-only load keeps the
+    // default it has always served with.
+    if state.media.is_some() {
+        router = router.layer(axum::extract::DefaultBodyLimit::max(MEDIA_REQUEST_BODY_LIMIT));
+    }
     // The Playground (GitHub #163): present only when `--ui` gave it assets.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));

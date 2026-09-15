@@ -34,6 +34,7 @@ use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
+use crate::media::MediaStats;
 use crate::metrics::Metrics;
 
 // ── the clock (the determinism seam) ────────────────────────────────────────
@@ -140,6 +141,9 @@ struct RequestTelemetry {
     itl_count: u64,
     itl_sum_ms: u64,
     itl_max_ms: u64,
+    /// What acquiring the request's media cost (GitHub #179); `None` for a
+    /// request without media.
+    media: Option<MediaStats>,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -218,12 +222,20 @@ impl Telemetry {
             });
     }
 
+    /// A submitted request carried media (GitHub #179): its acquisition
+    /// summary rides on the `admitted` line.
+    pub fn note_media(&mut self, id: RequestId, media: MediaStats) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.media = Some(media);
+        }
+    }
+
     /// A request was admitted (dealt `lane`): emit the `admitted` line,
     /// carrying the prefill phase's summary fields (P3-06: `prompt_tokens`,
     /// `prefill_chunks_consumed`, `prefilled_tokens`) accumulated from the
     /// `PrefillChunk` events already seen for this request.
     pub fn on_admitted(&mut self, id: RequestId, lane: LaneId) {
-        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class) =
+        let (submitted_ms, prompt_tokens, prefill_chunks, prefilled_tokens, class, media) =
             match self.requests.get_mut(&id) {
                 Some(rt) => {
                     rt.admitted = true;
@@ -234,16 +246,17 @@ impl Telemetry {
                         rt.prefill_chunks,
                         rt.prefilled_tokens,
                         rt.class,
+                        rt.media,
                     )
                 }
                 // Not in flight — typically cancelled before this admission
                 // reached the consumer (GitHub #89). Still logged, but not
                 // re-added: no `Done` would ever remove it again, and it
                 // would count as running forever.
-                None => (self.clock.now_ms(), 0, 0, 0, RequestClass::default()),
+                None => (self.clock.now_ms(), 0, 0, 0, RequestClass::default(), None),
             };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
-        self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens, class);
+        self.emit_admitted(id, ms, lane, prompt_tokens, prefill_chunks, prefilled_tokens, class, media);
     }
 
     /// A request was cancelled — its client went away (GitHub #89). The
@@ -483,7 +496,11 @@ impl Telemetry {
     /// alongside the lane dealt, how long the request queued, and its
     /// admission `class` (GitHub #120: the request log's per-class
     /// attribution). See [`Telemetry::emit_done`] for why this runs on the
-    /// telemetry consumer task rather than inline.
+    /// telemetry consumer task rather than inline. `media.*` (GitHub #179)
+    /// is the request's media acquisition — items, vision tokens, acquired
+    /// bytes, preprocessing seconds, cache hits and misses — and absent on a
+    /// request without media, so a slow multimodal TTFT is attributable
+    /// from this one line.
     #[allow(clippy::too_many_arguments)]
     fn emit_admitted(
         &self,
@@ -494,6 +511,7 @@ impl Telemetry {
         prefill_chunks_consumed: u32,
         prefilled_tokens: u32,
         class: RequestClass,
+        media: Option<MediaStats>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         tracing::info!(
@@ -505,6 +523,12 @@ impl Telemetry {
             prefill_chunks_consumed,
             prefilled_tokens,
             class = class.as_extension_str(),
+            media.items = media.map(|m| m.items),
+            media.vision_tokens = media.map(|m| m.vision_tokens),
+            media.bytes = media.map(|m| m.media_bytes),
+            media.preprocess_seconds = media.map(|m| m.preprocess_seconds),
+            media.cache_hits = media.map(|m| m.cache_hits),
+            media.cache_misses = media.map(|m| m.cache_misses),
             "request admitted"
         );
     }
@@ -776,6 +800,41 @@ mod tests {
         assert_eq!(done[0]["attributes"]["spec.accepted"], 9);
         assert_eq!(done[0]["attributes"]["spec.pos"], "67,67,33,33,33,33,33");
         assert_eq!(events.len(), 3, "admitted, ttft, done -- nothing per token or per round");
+    }
+
+    #[test]
+    fn admitted_carries_the_media_acquisition_only_for_a_request_with_media() {
+        let mut telemetry = telemetry();
+        let media = MediaStats {
+            items: 2,
+            vision_tokens: 8,
+            media_bytes: 4096,
+            preprocess_seconds: 0.25,
+            cache_hits: 1,
+            cache_misses: 1,
+        };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 20, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            telemetry.on_admitted(1, 0);
+            telemetry.note_submit(2, 3, RequestClass::Agent);
+            telemetry.on_admitted(2, 1);
+        });
+        let admitted = |id: u64| {
+            events
+                .iter()
+                .find(|e| e["event_name"] == "ignis.request.admitted" && e["attributes"]["request_id"] == id)
+                .unwrap_or_else(|| panic!("no admitted event for {id}: {events:?}"))
+        };
+        let attributes = &admitted(1)["attributes"];
+        assert_eq!(attributes["media.items"], 2, "{attributes}");
+        assert_eq!(attributes["media.vision_tokens"], 8);
+        assert_eq!(attributes["media.bytes"], 4096);
+        assert_eq!(attributes["media.preprocess_seconds"], 0.25);
+        assert_eq!(attributes["media.cache_hits"], 1);
+        assert_eq!(attributes["media.cache_misses"], 1);
+        let text = admitted(2)["attributes"].as_object().unwrap();
+        assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
     }
 
     #[test]
