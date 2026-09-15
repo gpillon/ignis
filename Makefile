@@ -80,6 +80,8 @@ SERVER_STAMP := $(BIN_DIR)/ignis-server.backend
 BUILT_BACKEND = $(strip $(if $(wildcard $(SERVER_STAMP)),$(file < $(SERVER_STAMP))))
 
 SERVER_URL := http://$(BIND)
+# The server's own default when METRICS_BIND is empty (DEFAULT_METRICS_BIND).
+METRICS_URL := http://$(or $(METRICS_BIND),127.0.0.1:9464)
 SERVER_PID := $(RUNTIME_DIR)/ignis-server.pid
 SERVER_LOG := $(RUNTIME_DIR)/ignis-server.log
 
@@ -95,7 +97,7 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(MODEL),--model $(MODEL)) \
   $(if $(filter 1,$(UI)),--ui) \
-  $(if $(filter 1,$(METRICS)),--metrics) \
+  $(if $(filter 1,$(METRICS)),--metrics $(if $(METRICS_BIND),--metrics-bind $(METRICS_BIND))) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
   $(if $(EXPOSE),--expose $(EXPOSE)) \
   $(ARGS)
@@ -163,7 +165,7 @@ config: ## Print the resolved knobs and paths
 	@echo "CUDA            $(CUDA)  (backend=$(BACKEND))"
 	@echo "PROFILE         $(PROFILE)  (dir=$(PROFILE_DIR))"
 	@echo "UI              $(UI)"
-	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(GET /metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(no /metrics))"
+	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
 	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
@@ -305,8 +307,8 @@ smoke: ## One /v1/models + one short chat completion against BIND
 	@echo ""
 
 .PHONY: metrics
-metrics: ## Scrape /metrics from the server on BIND (started with METRICS=1)
-	curl -fsS $(SMOKE_AUTH) "$(SERVER_URL)/metrics"
+metrics: ## Scrape the metrics listener (a server started with METRICS=1; no key)
+	curl -fsS "$(METRICS_URL)/metrics"
 
 .PHONY: canary
 canary: ## ignis-bench canary suite against the running server

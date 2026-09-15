@@ -1,5 +1,6 @@
-//! Prometheus metrics (GitHub #89, ADR 0017): the opt-in `GET /metrics`
-//! surface `ignis-server` serves with `--metrics`.
+//! Prometheus metrics (GitHub #89, ADR 0017): the opt-in exposition
+//! `ignis-server` serves with `--metrics` — at `GET /metrics` on its own
+//! listener, and at `GET /ui/metrics` on the API listener for the Playground.
 //!
 //! [`Metrics`] is an aggregate projection of facts the model thread already
 //! sends to the asynchronous telemetry consumer (`engine.rs`'s
@@ -116,13 +117,14 @@ fn escape_label_value(value: &str) -> String {
     value.replace('\\', r"\\").replace('"', "\\\"").replace('\n', r"\n")
 }
 
-/// The `/metrics` route over `metrics`, to be merged into the server's router.
-pub fn router<S>(metrics: Arc<Metrics>) -> Router<S>
+/// `GET path` over `metrics`: `/metrics` for the metrics listener,
+/// `/ui/metrics` for the Playground's copy on the API listener.
+pub fn router<S>(path: &str, metrics: Arc<Metrics>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new().route(
-        "/metrics",
+        path,
         get(move || async move { ([(header::CONTENT_TYPE, CONTENT_TYPE)], metrics.render()) }),
     )
 }

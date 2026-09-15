@@ -2,7 +2,7 @@ import type { IncomingMessage } from "node:http";
 import type { Plugin } from "vite";
 
 // A fake ignis for `npm run dev:mock`: enough of /v1/models, streaming
-// /v1/chat/completions and /metrics to work on the Playground without the
+// /v1/chat/completions and /ui/metrics to work on the Playground without the
 // shared GPU. Development only — never part of the build.
 //
 // Chat: honours the thinking controls (no reasoning for `reasoning_effort`
@@ -180,7 +180,7 @@ export function mockIgnis(): Plugin {
         req.on("close", () => clearInterval(timer));
       });
 
-      server.middlewares.use("/metrics", (_req, res) => {
+      server.middlewares.use("/ui/metrics", (_req, res) => {
         res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         res.end(
           [

@@ -7,7 +7,10 @@ remains compatible" consequence is superseded by ADR 0025; the projection
 still reads the telemetry consumer, never rendered log output. Amended
 2026-09-15 (#89, owner request): `ignis_requests_cancelled_total` joins the
 contract, recorded from the control plane's cancel rather than a model-thread
-fact.
+fact. Amended again 2026-09-15 (#89, owner decision): `GET /metrics` moves to
+its own listener (`--metrics-bind`, no API key, never exposed), and the
+Playground reads the same exposition at `/ui/metrics` on the API listener,
+under the API key when one is set. This replaces "on the existing listener".
 
 ## Context
 
@@ -47,9 +50,10 @@ it will not introduce metric work or new fact traffic on the inference path.
 
 When metrics are enabled, the existing asynchronous server telemetry consumer
 maintains a fixed-cardinality aggregate projection from facts that the model
-thread already emits. `GET /metrics` renders the latest projection on the
-existing server listener. When metrics are disabled, neither the projection nor
-the route exists.
+thread already emits. `GET /metrics` renders the latest projection on a
+metrics listener of its own, and the Playground reads the same rendering at
+`/ui/metrics` on the API listener. When metrics are disabled, neither the
+projection nor any route to it exists.
 
 Prometheus remains distinct from structured logging: it does not parse rendered
 logs, and the logging subsystem does not own metric aggregation or exposition.
@@ -61,7 +65,7 @@ critical-path performance regression. The only numerical allowance is at most
 ## User Stories
 
 1. As an operator, I want to enable metrics explicitly with `--metrics`, so that a default Ignis deployment has no metrics surface or aggregation work.
-2. As an operator, I want `GET /metrics` on the existing listener, so that I do not need to provision a second management endpoint.
+2. As an operator, I want `GET /metrics` on its own local listener, so that Prometheus can scrape it without the API key while an exposed API never publishes it.
 3. As an operator, I want the metrics route to be absent when disabled, so that opt-in behavior is unambiguous.
 4. As a Prometheus administrator, I want a standards-compatible text response, so that Prometheus can scrape Ignis without a custom adapter.
 5. As an operator, I want build identity, so that I can associate observations with the running Ignis version.
@@ -89,9 +93,17 @@ critical-path performance regression. The only numerical allowance is at most
 - Metrics are disabled by default and enabled only by the boolean CLI flag
   `--metrics`. There is no short alias, environment variable, or config-file
   key in this scope.
-- When enabled, `GET /metrics` is installed on the existing `ignis-server`
-  listener. When disabled, normal router not-found behavior applies. No second
-  management listener is introduced.
+- When enabled, `GET /metrics` is served by a second `ignis-server` listener
+  of its own, at `--metrics-bind <addr>` (flag only, default
+  `127.0.0.1:9464`; refused without `--metrics` or on the API's `--bind`). It
+  serves nothing else and asks for no API key: it is kept private by its bind
+  address, and `--expose` (ADR 0028) only ever tunnels the API listener. One
+  shutdown stops both listeners.
+- The API listener has no `/metrics`. With the Playground on (`--ui`, ADR
+  0026), it serves the same exposition at `GET /ui/metrics` for the browser,
+  behind the same API key as `/v1` when one is set and open when none is.
+- When disabled, there is no metrics listener and normal router not-found
+  behavior applies to both paths.
 - The response uses Prometheus text exposition format 0.0.4 and content type
   `text/plain; version=0.0.4; charset=utf-8`, with stable `HELP` and `TYPE`
   declarations.
@@ -165,7 +177,8 @@ dimension.
   path is introduced.
 - Router coverage proves route absence when disabled, valid exposition and
   content type when enabled, lifecycle-driven value changes, bounded labels,
-  concurrent scrapes, and slow-scraper isolation.
+  concurrent scrapes, and slow-scraper isolation; which listener serves which
+  path; and `/ui/metrics` following the API key.
 - Structural review and tests prove there is no metrics dependency or
   metrics-aware code in core, runtime, the kernel leaf, or the model-thread
   loop, and that flag-off and flag-on produce identical inference-side fact
@@ -190,7 +203,8 @@ dimension.
 
 - Pushgateway, remote write, OTLP metrics, and StatsD.
 - Dashboards, alerting rules, and deployment manifests.
-- A separate management listener or metrics-specific authentication/TLS.
+- Metrics-specific authentication or TLS (the metrics listener has none; the
+  Playground's copy reuses the API key).
 - Prefilling and KV usage/capacity metrics without authoritative zero-work
   sources.
 - Request-, trace-, token-, sequence-, lane-, prompt-, or error-derived labels.

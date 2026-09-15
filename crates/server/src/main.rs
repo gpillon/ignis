@@ -55,9 +55,11 @@
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
 //! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
 //!   (GitHub #163, ADR 0026); off by default.
-//! - `--metrics` (flag only, no env var) — serve Prometheus metrics at
-//!   `GET /metrics` (GitHub #89, ADR 0017); off by default, and off means
-//!   neither the route nor the projection behind it exists.
+//! - `--metrics` / `--metrics-bind <addr>` (flags only, no env var) — serve
+//!   Prometheus metrics at `GET /metrics` on their own listener (default
+//!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics` with
+//!   `--ui`, under the API key when one is set (GitHub #89, ADR 0017). Off by
+//!   default, and off means neither the routes nor the projection exist.
 //! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
 //!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
 //!   leaves the API open. `auto` generates a key at start and prints it to
@@ -335,8 +337,8 @@ async fn main() {
         server
     };
     // Prometheus metrics (GitHub #89, ADR 0017): without `--metrics`, neither
-    // the projection nor `GET /metrics` exists.
-    let server = if metrics { server.with_metrics() } else { server };
+    // the projection nor any route to it exists.
+    let server = if metrics.is_some() { server.with_metrics() } else { server };
     let auth = api_key.is_some();
     let server = match api_key {
         Some(key) => server.with_api_key(key),
@@ -352,6 +354,19 @@ async fn main() {
             tracing::error!(name: "ignis.server.failed", bind = %bind, error = %err, "server exited");
             exit_after_flush(&logging_handle, 1);
         }
+    };
+
+    // The metrics listener (ADR 0017): its own address, bound before serving
+    // like the API's, and never the one `--expose` tunnels.
+    let metrics_listener = match &metrics {
+        None => None,
+        Some(metrics_bind) => match tokio::net::TcpListener::bind(metrics_bind).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::error!(name: "ignis.server.failed", bind = %metrics_bind, error = %err, "metrics listener could not bind");
+                exit_after_flush(&logging_handle, 1);
+            }
+        },
     };
 
     // `--expose` (ADR 0028): opened on the bound port, before serving, so a
@@ -399,11 +414,11 @@ async fn main() {
         model = %model,
         bind = %bind,
         api_key_required = auth,
-        metrics,
+        metrics = metrics.as_deref().unwrap_or("off"),
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );
-    let serve_result = server.serve_on(listener).await;
+    let serve_result = server.serve_on_with_metrics(listener, metrics_listener).await;
 
     // The tunnel outlives the drain above, so in-flight remote requests
     // finish through it; only then is it unregistered.

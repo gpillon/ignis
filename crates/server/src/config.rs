@@ -18,6 +18,11 @@ pub const DEFAULT_MODEL: &str = "qwen3.8-27b";
 /// The default bind address: localhost, port 8000 (OpenAI convention).
 pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 
+/// Where `--metrics` serves Prometheus when `--metrics-bind` names nowhere
+/// else (GitHub #89, ADR 0017): localhost, on the port OpenTelemetry's
+/// Prometheus exporter uses — its own listener, never the API's.
+pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
+
 /// The default non-streaming completion timeout, in seconds (GitHub #95) —
 /// unchanged from the value `Server::new` hardcoded before this flag
 /// existed.
@@ -81,9 +86,10 @@ pub struct Config {
     /// Serve the Playground under `/ui/` (`--ui`, GitHub #163, ADR 0026).
     /// Flag-only: no env var, no alias.
     pub ui: bool,
-    /// Serve Prometheus metrics at `GET /metrics` (`--metrics`, GitHub #89,
-    /// ADR 0017). Flag-only: no env var, no alias, no config-file key.
-    pub metrics: bool,
+    /// The metrics listener's address when `--metrics` is on (GitHub #89,
+    /// ADR 0017): `--metrics-bind`, else [`DEFAULT_METRICS_BIND`]. `None` =
+    /// metrics off. Flag-only: no env var, no alias, no config-file key.
+    pub metrics: Option<String>,
     /// The key every `/v1` request must present as `Authorization: Bearer
     /// <key>` (`--api-key` / `IGNIS_API_KEY`). `None` (the default) keeps
     /// the API open, as it has always been on localhost.
@@ -202,7 +208,8 @@ pub fn resolve(
     let mut spec = None;
     let mut draft_tokens = None;
     let mut ui = false;
-    let mut metrics = false;
+    let mut metrics_on = false;
+    let mut metrics_bind = None;
     let mut api_key = None;
     let mut expose = None;
 
@@ -224,7 +231,8 @@ pub fn resolve(
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
-            "--metrics" => metrics = true,
+            "--metrics" => metrics_on = true,
+            "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
             "--expose" => expose = Some(take_value(args, &mut i, flag)?),
             other => return Err(ConfigError(format!("unrecognized flag `{other}`"))),
@@ -266,6 +274,23 @@ pub fn resolve(
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
+    // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
+    // address without turning metrics on is refused rather than ignored, and
+    // it can never share the API's.
+    let metrics = match (metrics_on, metrics_bind) {
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(ConfigError(
+                "`--metrics-bind` requires `--metrics` (metrics are off without it)".to_owned(),
+            ));
+        }
+        (true, metrics_bind) => Some(metrics_bind.unwrap_or_else(|| DEFAULT_METRICS_BIND.to_owned())),
+    };
+    if metrics.as_deref() == Some(bind.as_str()) {
+        return Err(ConfigError(format!(
+            "`--metrics-bind {bind}` is the API's `--bind`: metrics need their own listener"
+        )));
+    }
     let api_key = non_empty(api_key.or_else(|| env("IGNIS_API_KEY"))).map(|key| match key.as_str() {
         "auto" => ApiKeySetting::Generate,
         _ => ApiKeySetting::Fixed(ApiKey(key)),
@@ -528,7 +553,8 @@ fn help_text() -> String {
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
-         \x20       --metrics                 serve Prometheus metrics at /metrics (default: off; flag only)\n\
+         \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics with --ui (default: off; flag only)\n\
+         \x20       --metrics-bind <addr>     the metrics listener (default: {DEFAULT_METRICS_BIND}; flag only; needs --metrics; no API key, never exposed)\n\
          \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
          \x20       --expose <mode>           env: IGNIS_EXPOSE         (default: unset — reachable at --bind only; cloudflare-quick = public https://*.trycloudflare.com URL, printed at start; always requires an API key, auto when none is set)\n\
          \x20   -h, --help                    print this help and exit\n\
@@ -1146,9 +1172,37 @@ mod tests {
     // ── Prometheus metrics (GitHub #89, ADR 0017) ────────────────────────
 
     #[test]
-    fn metrics_are_off_by_default_and_on_with_metrics() {
-        assert!(!expect_config(resolve(&[], no_env).expect("resolve")).metrics);
-        assert!(expect_config(resolve(&args(&["--metrics"]), no_env).expect("resolve")).metrics);
+    fn metrics_are_off_by_default_and_on_their_own_listener_with_metrics() {
+        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).metrics, None);
+        assert_eq!(
+            expect_config(resolve(&args(&["--metrics"]), no_env).expect("resolve")).metrics,
+            Some(DEFAULT_METRICS_BIND.to_owned())
+        );
+        assert_ne!(DEFAULT_METRICS_BIND, DEFAULT_BIND);
+    }
+
+    #[test]
+    fn metrics_bind_moves_the_metrics_listener_in_either_order() {
+        for argv in [
+            ["--metrics", "--metrics-bind", "127.0.0.1:9100"],
+            ["--metrics-bind", "127.0.0.1:9100", "--metrics"],
+        ] {
+            let config = expect_config(resolve(&args(&argv), no_env).expect("resolve"));
+            assert_eq!(config.metrics.as_deref(), Some("127.0.0.1:9100"), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn metrics_bind_without_metrics_or_value_or_on_the_api_address_is_refused() {
+        let err = resolve(&args(&["--metrics-bind", "127.0.0.1:9100"]), no_env).unwrap_err();
+        assert!(err.0.contains("--metrics"), "{err}");
+        assert!(resolve(&args(&["--metrics", "--metrics-bind"]), no_env).is_err());
+        let err = resolve(
+            &args(&["--metrics", "--bind", "127.0.0.1:7000", "--metrics-bind", "127.0.0.1:7000"]),
+            no_env,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("--bind"), "{err}");
     }
 
     #[test]
@@ -1156,12 +1210,12 @@ mod tests {
         // A bare switch: the next argument is parsed as a flag of its own.
         let config =
             expect_config(resolve(&args(&["--metrics", "--bind", "b"]), no_env).expect("resolve"));
-        assert!(config.metrics);
+        assert!(config.metrics.is_some());
         assert_eq!(config.bind, "b");
 
-        for name in ["IGNIS_METRICS", "IGNIS_PROMETHEUS"] {
-            let env = move |key: &str| (key == name).then(|| "true".to_owned());
-            assert!(!expect_config(resolve(&[], env).expect("resolve")).metrics, "{name}");
+        for name in ["IGNIS_METRICS", "IGNIS_PROMETHEUS", "IGNIS_METRICS_BIND"] {
+            let env = move |key: &str| (key == name).then(|| "127.0.0.1:9100".to_owned());
+            assert_eq!(expect_config(resolve(&[], env).expect("resolve")).metrics, None, "{name}");
         }
         for alias in ["-M", "--prometheus", "--metrics=true"] {
             assert!(resolve(&args(&[alias]), no_env).is_err(), "`{alias}` is not a metrics alias");
@@ -1169,12 +1223,12 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_the_metrics_flag() {
+    fn help_lists_the_metrics_flags() {
         let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
         else {
             panic!("expected Help");
         };
-        assert!(text.contains("--metrics"), "{text}");
+        assert!(text.contains("--metrics ") && text.contains("--metrics-bind"), "{text}");
     }
 
     // ── the API key ──────────────────────────────────────────────────────

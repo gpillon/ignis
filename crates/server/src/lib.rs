@@ -67,7 +67,7 @@ pub struct Server {
     /// 0026); `None` leaves the `/ui` routes out of the router entirely.
     pub playground: Option<playground::Assets>,
     /// The Prometheus projection when `--metrics` is on (GitHub #89, ADR
-    /// 0017); `None` installs neither the projection nor `GET /metrics`.
+    /// 0017); `None` installs neither the projection nor any route to it.
     pub metrics: Option<std::sync::Arc<metrics::Metrics>>,
     /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
     /// `None` leaves the API open.
@@ -134,10 +134,11 @@ impl Server {
         self
     }
 
-    /// Serve Prometheus metrics at `GET /metrics` (`main` calls this when
-    /// `--metrics` is set): installs the projection into the engine's
-    /// telemetry consumer, which alone keeps it up to date from the facts it
-    /// already receives.
+    /// Turn Prometheus metrics on (`main` calls this when `--metrics` is
+    /// set): installs the projection into the engine's telemetry consumer,
+    /// which alone keeps it up to date from the facts it already receives.
+    /// It is served by [`Server::metrics_app`] and, with the Playground, at
+    /// `/ui/metrics`.
     pub fn with_metrics(mut self) -> Self {
         let metrics = std::sync::Arc::new(metrics::Metrics::new());
         self.engine.install_metrics(std::sync::Arc::clone(&metrics));
@@ -159,6 +160,16 @@ impl Server {
         api::router(state)
     }
 
+    /// The metrics listener's app (`--metrics-bind`, GitHub #89, ADR 0017):
+    /// `GET /metrics` and nothing else, with no API key — it is kept private
+    /// by its bind address, and `--expose` never tunnels it. `None` unless
+    /// [`Server::with_metrics`] turned metrics on.
+    pub fn metrics_app(&self) -> Option<Router> {
+        self.metrics
+            .as_ref()
+            .map(|metrics| metrics::router("/metrics", std::sync::Arc::clone(metrics)))
+    }
+
     /// Bind `addr` and serve. The engine's model thread (GitHub #69) was
     /// already spawned when it was constructed — nothing to start here.
     /// Runs until [`shutdown_signal`] resolves (Ctrl+C, or SIGTERM on
@@ -174,7 +185,7 @@ impl Server {
     /// [`Server::serve`] on a listener the caller already bound — `main`
     /// binds first when `--expose` needs the bound port before serving.
     pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-        self.serve_on_until(listener, shutdown_signal()).await
+        self.serve_on_with_metrics(listener, None).await
     }
 
     /// [`Server::serve_on`], stopping gracefully when `shutdown` resolves
@@ -184,8 +195,52 @@ impl Server {
         listener: tokio::net::TcpListener,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
+        self.serve_on_with_metrics_until(listener, None, shutdown).await
+    }
+
+    /// [`Server::serve_on`], plus [`Server::metrics_app`] on
+    /// `metrics_listener` when given (`--metrics`, GitHub #89): one process
+    /// signal stops both.
+    pub async fn serve_on_with_metrics(
+        self,
+        listener: tokio::net::TcpListener,
+        metrics_listener: Option<tokio::net::TcpListener>,
+    ) -> std::io::Result<()> {
+        self.serve_on_with_metrics_until(listener, metrics_listener, shutdown_signal())
+            .await
+    }
+
+    /// [`Server::serve_on_with_metrics`], stopping both listeners gracefully
+    /// when `shutdown` resolves (tests). A metrics listener needs metrics on
+    /// ([`Server::with_metrics`]).
+    pub async fn serve_on_with_metrics_until(
+        self,
+        listener: tokio::net::TcpListener,
+        metrics_listener: Option<tokio::net::TcpListener>,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        use std::future::IntoFuture;
+
         let app = self.app();
-        axum::serve(listener, app).with_graceful_shutdown(shutdown).await
+        let Some(metrics_listener) = metrics_listener else {
+            return axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+        };
+        let metrics_app = self
+            .metrics_app()
+            .expect("a metrics listener is only served with metrics on (Server::with_metrics)");
+        // One shutdown, fanned out to both listeners.
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        let signal = async move {
+            shutdown.await;
+            let _ = stop.send(());
+            Ok::<(), std::io::Error>(())
+        };
+        let wait = |mut stopped: tokio::sync::watch::Receiver<()>| async move {
+            let _ = stopped.changed().await;
+        };
+        let api = axum::serve(listener, app).with_graceful_shutdown(wait(stopped.clone()));
+        let metrics = axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(wait(stopped));
+        tokio::try_join!(signal, api.into_future(), metrics.into_future()).map(|_| ())
     }
 }
 

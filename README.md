@@ -142,7 +142,7 @@ make run             # run the last build; fails, naming the changed files, if i
 make mock            # the same on the CPU mock (no GPU, no kernel, no artifact)
 make start / stop    # daemon server (log in .scratch/serve/), waits for /v1/models, survives the terminal
 make dev-ui          # build, then server + Playground hot reload; Ctrl+C stops both
-make metrics         # scrape /metrics from a server started with METRICS=1
+make metrics         # scrape the metrics listener of a server started with METRICS=1
 make watch CUDA=0    # rebuild + restart on every Rust change (cargo-watch)
 make test            # cargo test, workspace-wide
 make gpu-status      # who holds the 5090
@@ -216,7 +216,7 @@ target\x86_64-pc-windows-msvc\release\ignis-server.exe --ui    # http://127.0.0.
 
 A server built without `web/dist` still accepts `--ui` and serves a page with
 these instructions. For frontend work, `npm --prefix web run dev` proxies `/v1`
-and `/metrics` to a running ignis (`IGNIS_URL`, default
+and `/ui/metrics` to a running ignis (`IGNIS_URL`, default
 `http://127.0.0.1:8000`); `npm --prefix web run dev:mock` serves a fake engine
 instead, so no GPU is needed.
 
@@ -299,7 +299,8 @@ full, always-current table.
 | `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | auto (4 GiB) | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context` fails the load by name. |
 | `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
 | — | `--ui` | — | off | Serve the Playground at `/ui/` (flag only, no env var — ADR 0026). |
-| — | `--metrics` | — | off | Serve Prometheus metrics at `/metrics` (flag only, no env var — ADR 0017). |
+| — | `--metrics` | — | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` with `--ui` (flag only, no env var — ADR 0017). |
+| — | `--metrics-bind <addr>` | — | `127.0.0.1:9464` | The metrics listener's address; needs `--metrics`. No API key, never exposed. |
 | — | `--help` | `-h` | — | Print the flag table and exit. |
 | — | `--version` | `-V` | — | Print the crate version and exit. |
 
@@ -322,7 +323,11 @@ a one-line readiness note (`model <id> on http://<bind>`) when ready.
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
 | `/ui/` | GET | The Playground page — only with `--ui`. |
-| `/metrics` | GET | Prometheus text format 0.0.4 — only with `--metrics` (ADR 0017). Needs the API key when one is set, like `/v1`. |
+| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--ui` and `--metrics` (ADR 0017). Needs the API key when one is set, like `/v1`. |
+
+Prometheus scrapes `GET /metrics` on the metrics listener (`--metrics-bind`,
+default `127.0.0.1:9464`), not on the API's address: no key, and never
+reachable through `--expose`.
 
 Errors use OpenAI's `{"error": {message, type, code}}` body with the matching
 status: 400 bad request, 404 unknown model, 413 oversized request, 503 engine
