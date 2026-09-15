@@ -56,6 +56,7 @@ fn failed_prefill_leaves_the_request_retryable() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
@@ -127,6 +128,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
@@ -183,6 +185,7 @@ fn failed_decode_keeps_the_request_running() {
     let id: RequestId = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),

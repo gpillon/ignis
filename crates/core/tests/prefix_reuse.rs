@@ -27,6 +27,7 @@ fn tokens(start: u32, n: u32) -> Vec<u32> {
 /// A request with the given prompt and a `max` generation cap.
 fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
     RequestInput {
+        multimodal: None,
         model: model.into(),
         tokens: prompt,
         params: DecodeParams {

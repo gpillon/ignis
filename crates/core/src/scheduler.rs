@@ -66,6 +66,11 @@ pub struct PrefillJob {
     /// prefix's end, so the publish happens at that boundary and nowhere
     /// else.
     pub publish_prefix_tokens: Option<u32>,
+    /// The request's multimodal part (GitHub #178), whole-prompt: the
+    /// backend reads this job's span of it at `start_position`. The chunk
+    /// holds at most one media item's placeholders
+    /// ([`crate::vision::Multimodal::cap_chunk`]).
+    pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
 }
 
 /// One decode job: a single lane step for a running request.

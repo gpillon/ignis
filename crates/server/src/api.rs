@@ -190,6 +190,7 @@ fn build_request(
     let tokens = server.template.apply_chat_template(messages, thinking, tools);
     let prompt_tokens = tokens.len() as u32;
     let input = RequestInput {
+        multimodal: None,
         model: model.clone(),
         tokens,
         params,

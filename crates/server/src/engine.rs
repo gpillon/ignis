@@ -481,6 +481,7 @@ mod tests {
 
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
+            multimodal: None,
             model: model.into(),
             tokens,
             params: DecodeParams {

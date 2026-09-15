@@ -74,6 +74,7 @@ where
 
 fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
     RequestInput {
+        multimodal: None,
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {

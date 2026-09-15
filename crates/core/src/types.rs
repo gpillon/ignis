@@ -56,6 +56,9 @@ pub struct RequestInput {
     pub tokens: Vec<TokenId>,
     /// Generation parameters.
     pub params: DecodeParams,
+    /// The prompt's positions, `rope_delta` and media items (GitHub #178),
+    /// or `None` for a text-only request — today's path, unchanged.
+    pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
 }
 
 /// Sampling / decoding parameters for a request.

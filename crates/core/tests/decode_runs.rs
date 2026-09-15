@@ -28,6 +28,7 @@ fn submit(sched: &mut ConcreteScheduler, max_tokens: u32) -> RequestId {
     sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "m".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams {

@@ -85,6 +85,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
     let params = DecodeParams { max_tokens: Some(MAX_GENERATED), ..DecodeParams::default() };
     compute
         .prefill_step(&[PrefillJob {
+            multimodal: None,
             request,
             tokens: prompt,
             context_tokens: MAX_CONTEXT,

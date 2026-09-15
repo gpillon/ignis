@@ -27,6 +27,7 @@ use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 /// pages — 1 page for `max ≤ 12`.
 fn input(max: u32) -> RequestInput {
     RequestInput {
+        multimodal: None,
         model: "qwen3.8-27b".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -285,6 +286,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
         sched
             .submit(
                 RequestInput {
+                    multimodal: None,
                     model: "qwen3.8-27b".into(),
                     tokens: (1..=16).collect(),
                     params: DecodeParams {
@@ -305,6 +307,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
     let a = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
                 params: DecodeParams {
@@ -334,6 +337,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
     let b = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),
                 params: DecodeParams {
@@ -446,6 +450,7 @@ fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
     let main = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=16).collect(),
                 params: DecodeParams {
@@ -463,6 +468,7 @@ fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
     let sub = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=16).chain(100..104).collect(),
                 params: DecodeParams {
@@ -541,6 +547,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
         sched
             .submit(
                 RequestInput {
+                    multimodal: None,
                     model: "qwen3.8-27b".into(),
                     tokens: (1..=16).collect(),
                     params: DecodeParams {
@@ -559,6 +566,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
     let interactive_a = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
                 params: DecodeParams {
@@ -575,6 +583,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
     let agent_a2 = sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),
                 params: DecodeParams {

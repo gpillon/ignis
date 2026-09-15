@@ -6,7 +6,10 @@ use ignis_core::{
     N_DECODE_LANES, PrefillJob, RequestClass, RequestInput, Scheduler, SchedulerConfig,
     SpecCounters,
 };
-use ignis_runtime::{DecodeLane, LaneRun, Model, RuntimeCompute, RuntimeStats, StepLeaf};
+use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
+use ignis_runtime::{
+    DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats, StepLeaf,
+};
 
 #[derive(Default)]
 struct Calls {
@@ -29,6 +32,21 @@ struct Calls {
     prefixes_released: u32,
     snapshots_taken: u32,
     restores: u32,
+    /// GitHub #178: the token span begin of each encoded media item, the
+    /// embeddings released (by encode order, from 1), and every multimodal
+    /// prefill span.
+    media_encoded: Vec<u32>,
+    media_released: Vec<u32>,
+    multimodal_spans: Vec<SpanCall>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpanCall {
+    start: u32,
+    positions: Vec<i32>,
+    rope_delta: i32,
+    /// (embedding, first column, scatter indices)
+    media: Option<(u32, u32, Vec<i32>)>,
 }
 
 struct StubLeaf {
@@ -117,9 +135,41 @@ impl StepLeaf for StubLeaf {
     /// was handed the right entry.
     type Prefix = u32;
     type SnapshotBuf = Vec<u8>;
+    /// The embedding's encode order, from 1.
+    type Media = u32;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         Ok(())
+    }
+
+    fn encode_media(&self, _model: &Self::Model, item: &MediaItem) -> Result<Self::Media, i32> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.media_encoded.push(item.token_span.begin as u32);
+        Ok(calls.media_encoded.len() as u32)
+    }
+
+    fn release_media(&self, _model: &Self::Model, media: Self::Media) {
+        self.calls.lock().unwrap().media_released.push(media);
+    }
+
+    fn prefill_multimodal(
+        &self,
+        model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        tokens: &[u32],
+        start_position: u32,
+        params: DecodeParams,
+        span: MultimodalSpan<'_, Self::Media>,
+    ) -> Result<(), i32> {
+        self.calls.lock().unwrap().multimodal_spans.push(SpanCall {
+            start: start_position,
+            positions: span.positions.to_vec(),
+            rope_delta: span.rope_delta,
+            media: span
+                .media
+                .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
+        });
+        self.prefill(model, sequence, tokens, start_position, params)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -308,6 +358,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
     compute
         .prefill_step(&[
             PrefillJob {
+                multimodal: None,
                 request: 1,
                 tokens: vec![4, 5],
                 context_tokens: 9,
@@ -317,6 +368,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 publish_prefix_tokens: None,
             },
             PrefillJob {
+                multimodal: None,
                 request: 2,
                 tokens: vec![4, 5],
                 context_tokens: 9,
@@ -370,6 +422,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
 
 fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
     PrefillJob {
+        multimodal: None,
         request,
         tokens: vec![4, 5],
         context_tokens: 9,
@@ -590,6 +643,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
     scheduler
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "stub".into(),
                 tokens: vec![1, 2],
                 params: DecodeParams {
@@ -621,6 +675,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
     scheduler
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
@@ -657,6 +712,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
         compute,
     );
     let input = |tokens: Vec<u32>| RequestInput {
+        multimodal: None,
         model: "stub".into(),
         tokens,
         params: DecodeParams {
@@ -709,6 +765,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
         compute,
     );
     let input = || RequestInput {
+        multimodal: None,
         model: "stub".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -757,6 +814,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         scheduler
             .submit(
                 RequestInput {
+                    multimodal: None,
                     model: "stub".into(),
                     tokens: vec![token],
                     params: DecodeParams {
@@ -939,4 +997,137 @@ fn an_empty_run_is_refused_without_losing_the_sequence() {
         Err(ComputeError::Kernel(-1))
     );
     assert_eq!(compute.live_sequences(), 1);
+}
+
+// ── GitHub #178: media embeddings across a multimodal prompt's chunks ───────
+
+/// An image of `count` merged tokens at prompt tokens `begin..begin+count`.
+fn image(begin: usize, count: usize) -> MediaItem {
+    MediaItem {
+        grid: Grid { t: 1, h: 2, w: 2 * count as u32 },
+        token_span: TokenSpan { begin, count },
+        patches: Vec::new(),
+        content_digest: [0; 32],
+    }
+}
+
+fn multimodal(tokens: usize, media: Vec<MediaItem>) -> Arc<Multimodal> {
+    let positions = (0..3).flat_map(|axis| (0..tokens as i32).map(move |t| axis * 100 + t)).collect();
+    Arc::new(Multimodal { positions, rope_delta: -2, media })
+}
+
+fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) -> PrefillJob {
+    PrefillJob {
+        request,
+        tokens: (start..start + len).collect(),
+        context_tokens: 64,
+        start_position: start,
+        params: DecodeParams::default(),
+        shared_prefix: None,
+        publish_prefix_tokens: None,
+        multimodal: Some(prompt.clone()),
+    }
+}
+
+fn stub_compute(leaf: StubLeaf) -> (Arc<StubLeaf>, RuntimeCompute<StubLeaf>) {
+    let leaf = Arc::new(leaf);
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    (leaf, RuntimeCompute::new(model, 99))
+}
+
+#[test]
+fn a_media_item_is_encoded_once_and_released_after_its_last_placeholder() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+
+    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
+    assert_eq!(compute.live_media(), 1, "the item spans into the next chunk");
+    compute.prefill_step(&[multimodal_job(1, &prompt, 18, 22)]).unwrap();
+    assert_eq!(compute.live_media(), 0);
+
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.media_encoded, [10], "one encode for the whole item");
+    assert_eq!(calls.media_released, [1]);
+    assert_eq!(
+        calls.multimodal_spans,
+        [
+            SpanCall {
+                start: 0,
+                positions: prompt.span_positions(0, 18),
+                rope_delta: -2,
+                media: Some((1, 0, (10..18).collect())),
+            },
+            SpanCall {
+                start: 18,
+                positions: prompt.span_positions(18, 22),
+                rope_delta: -2,
+                media: Some((1, 8, (0..12).collect())),
+            },
+        ]
+    );
+    assert!(calls.prefill_positions == [0, 18], "the multimodal spans warm the sequence");
+}
+
+#[test]
+fn a_text_chunk_of_a_multimodal_prompt_carries_positions_but_no_media() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(30, 4)]);
+    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 30)]).unwrap();
+    let calls = leaf.calls.lock().unwrap();
+    assert!(calls.media_encoded.is_empty());
+    assert_eq!(calls.multimodal_spans[0].media, None);
+    assert_eq!(calls.multimodal_spans[0].positions, prompt.span_positions(0, 30));
+}
+
+#[test]
+fn a_cancelled_request_releases_its_live_media() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
+    compute.release(1);
+    assert_eq!(compute.live_media(), 0);
+    assert_eq!(compute.live_sequences(), 0);
+    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+}
+
+#[test]
+fn a_failed_multimodal_chunk_releases_the_media_it_encoded() {
+    let (leaf, compute) = stub_compute(StubLeaf::failing_prefill(-3));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    assert!(compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).is_err());
+    assert_eq!(compute.live_media(), 0);
+    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+}
+
+#[test]
+fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = Arc::new(RuntimeCompute::new(model, 99));
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "stub".into(),
+            serving_chunk_tokens: 16,
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    );
+    sched
+        .submit(
+            RequestInput {
+                model: "stub".into(),
+                tokens: (0..40).collect(),
+                params: DecodeParams { max_tokens: Some(2), ..DecodeParams::default() },
+                multimodal: Some(multimodal(40, vec![image(5, 10), image(20, 10)])),
+            },
+            RequestClass::Agent,
+        )
+        .unwrap();
+    while !sched.is_idle() {
+        sched.advance();
+    }
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.media_encoded, [5, 20]);
+    assert_eq!(calls.media_released, [1, 2]);
+    assert_eq!(compute.live_media(), 0);
 }

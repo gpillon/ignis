@@ -220,6 +220,7 @@ impl StepLeaf for CudaLeaf {
     type Sequence = Seq<'static>;
     type Prefix = SeqPrefix<'static>;
     type SnapshotBuf = PinnedBuffer;
+    type Media = ();
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         // P4-04 (GitHub #122): plan the pool before the weights go up. A

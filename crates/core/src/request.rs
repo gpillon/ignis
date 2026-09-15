@@ -419,6 +419,7 @@ mod tests {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
+                multimodal: None,
             },
             AdmissionResources::default(),
             4,

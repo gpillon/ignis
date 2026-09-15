@@ -225,6 +225,7 @@ mod tests {
         type Sequence = ();
         type Prefix = ();
         type SnapshotBuf = Vec<u8>;
+        type Media = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -314,6 +315,7 @@ mod tests {
         scheduler
             .submit(
                 RequestInput {
+                    multimodal: None,
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {
