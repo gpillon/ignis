@@ -189,6 +189,7 @@ async fn the_metrics_listener_serves_only_the_exposition_in_the_text_format() {
         ("ignis_requests_completed_total", "counter"),
         ("ignis_requests_cancelled_total", "counter"),
         ("ignis_generated_tokens_total", "counter"),
+        ("ignis_decoded_tokens_total", "counter"),
         ("ignis_kv_cache_evictions_total", "counter"),
         ("ignis_prefix_reused_tokens_total", "counter"),
         ("ignis_requests_rejected_total", "counter"),
@@ -279,6 +280,8 @@ async fn completed_requests_move_the_counters_and_leave_no_request_in_flight() {
     .await;
     assert_eq!(value(&text, "ignis_requests_accepted_total", None), 2);
     assert_eq!(value(&text, "ignis_generated_tokens_total", None), first + second);
+    // Every token of a completed request was also counted as it was decoded.
+    assert_eq!(value(&text, "ignis_decoded_tokens_total", None), first + second);
     assert_eq!(value(&text, "ignis_requests_cancelled_total", None), 0);
     assert_eq!(value(&text, "ignis_scheduler_requests", Some("waiting")), 0);
 }
@@ -583,6 +586,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_requests_completed_total",
         "ignis_requests_cancelled_total",
         "ignis_generated_tokens_total",
+        "ignis_decoded_tokens_total",
         "ignis_kv_cache_evictions_total",
         "ignis_prefix_reused_tokens_total",
         "ignis_requests_rejected_total",

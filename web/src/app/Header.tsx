@@ -2,16 +2,21 @@ import type { ReactNode } from "react";
 import type { ModelState } from "../api/model.ts";
 import flame from "../brand/flame.webp";
 import wordmark from "../brand/wordmark-light.webp";
+import { MonitorPulse } from "../monitor/MonitorPulse.tsx";
 import { useMemoryNotes } from "../tools/local/memory.ts";
 import { IconSessions, IconSliders } from "../ui/icons.tsx";
 
-/** The kiln bar: brand, model status, and the drawer buttons below `lg`. */
+export type View = "chat" | "monitor";
+
+/** The kiln bar: brand, the Playground/Monitor switch, model status, and the drawer buttons below `lg`. */
 export function Header({
   model,
   busy,
   onOpen,
   onForgetKey,
   onOpenMemory,
+  view = "chat",
+  onView,
 }: {
   model: ModelState;
   busy: boolean;
@@ -19,18 +24,29 @@ export function Header({
   /** Present when an API key is in use: drops it and returns to the key prompt. */
   onForgetKey?: () => void;
   onOpenMemory: () => void;
+  view?: View;
+  /** Present when ignis serves metrics: switches between the chat and the Monitor. */
+  onView?: (view: View) => void;
 }) {
+  const chat = view === "chat";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
       <div className="flex items-center gap-3 px-4 py-3 sm:gap-4 md:px-6">
-        <HeaderButton label="Sessions" onClick={() => onOpen("sessions")}>
-          <IconSessions />
-        </HeaderButton>
+        {chat && (
+          <HeaderButton label="Sessions" onClick={() => onOpen("sessions")}>
+            <IconSessions />
+          </HeaderButton>
+        )}
         <img src={flame} alt="" className="flame h-9 w-auto" data-busy={busy} />
         <img src={wordmark} alt="ignis" className="h-[18px] w-auto" />
         <span className="hidden h-6 w-px bg-kiln-line sm:block" aria-hidden />
-        <span className="hidden font-display text-[15px] font-medium tracking-wide text-[#b9bec4] sm:block">Playground</span>
+        {onView ? (
+          <ViewSwitch view={view} onView={onView} />
+        ) : (
+          <span className="hidden font-display text-[15px] font-medium tracking-wide text-[#b9bec4] sm:block">Playground</span>
+        )}
         <ModelStatus model={model} busy={busy} />
+        {onView && chat && <MonitorPulse onOpen={() => onView("monitor")} />}
         <MemoryButton onOpen={onOpenMemory} />
         {onForgetKey && (
           <button
@@ -42,12 +58,37 @@ export function Header({
             Lock
           </button>
         )}
-        <HeaderButton label="Settings" onClick={() => onOpen("settings")}>
-          <IconSliders />
-        </HeaderButton>
+        {chat && (
+          <HeaderButton label="Settings" onClick={() => onOpen("settings")}>
+            <IconSliders />
+          </HeaderButton>
+        )}
       </div>
       <div className="heat" data-busy={busy} aria-hidden />
     </header>
+  );
+}
+
+function ViewSwitch({ view, onView }: { view: View; onView: (view: View) => void }) {
+  const views: [View, string][] = [
+    ["chat", "Playground"],
+    ["monitor", "Monitor"],
+  ];
+  return (
+    <nav aria-label="View" className="flex items-center gap-1 self-stretch">
+      {views.map(([v, label]) => (
+        <button
+          key={v}
+          type="button"
+          aria-current={view === v ? "page" : undefined}
+          onClick={() => onView(v)}
+          className={`relative px-2 font-display text-[15px] font-medium tracking-wide ${view === v ? "text-white" : "text-[#939ba4] hover:text-white"}`}
+        >
+          {label}
+          {view === v && <span className="absolute inset-x-2 -bottom-3 h-[2px] bg-[#ff5a1f]" aria-hidden />}
+        </button>
+      ))}
+    </nav>
   );
 }
 

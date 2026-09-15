@@ -18,6 +18,12 @@ describe("App", () => {
     expect(html).toContain("Warming up");
   });
 
+  it("offers no Monitor until /ui/metrics has answered", () => {
+    const html = renderToStaticMarkup(<App />);
+    expect(html).not.toContain('aria-label="View"');
+    expect(html).not.toContain('aria-label="Monitor"');
+  });
+
   it("gives every form field an id or a name, as the browser asks", () => {
     const fields = renderToStaticMarkup(<App />).match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(0);

@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Plugin } from "vite";
+import { createMetricsSim } from "./mockMetrics.ts";
 
 // A fake ignis for `npm run dev:mock`: enough of /v1/models, streaming
 // /v1/chat/completions and /ui/metrics to work on the Playground without the
@@ -180,23 +181,11 @@ export function mockIgnis(): Plugin {
         req.on("close", () => clearInterval(timer));
       });
 
+      // A live simulation (mockMetrics.ts), so the Monitor has traffic to draw.
+      const metrics = createMetricsSim();
       server.middlewares.use("/ui/metrics", (_req, res) => {
         res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-        res.end(
-          [
-            "# HELP ignis_build_info Constant build identity",
-            "# TYPE ignis_build_info gauge",
-            'ignis_build_info{version="0.1.0-mock"} 1',
-            "# HELP ignis_scheduler_requests Current requests by scheduler state",
-            "# TYPE ignis_scheduler_requests gauge",
-            'ignis_scheduler_requests{state="waiting"} 0',
-            'ignis_scheduler_requests{state="running"} 1',
-            "# HELP ignis_generated_tokens_total Generated tokens on completed requests",
-            "# TYPE ignis_generated_tokens_total counter",
-            `ignis_generated_tokens_total ${Math.floor(Date.now() / 100) % 100000}`,
-            "",
-          ].join("\n"),
-        );
+        res.end(metrics.render());
       });
     },
   };

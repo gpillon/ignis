@@ -160,6 +160,7 @@ The initial stable metric contract is:
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
 | `ignis_requests_rejected_total` | counter | `reason=full\|unknown_model\|oversized` | Rejected submissions by fixed reason |
 | `ignis_generated_tokens_total` | counter | none | Generated tokens on completed requests |
+| `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
 
