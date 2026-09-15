@@ -226,17 +226,62 @@ pub struct SpecCounters {
     pub drafted: u32,
     /// Draft tokens committed (the run past its anchor).
     pub accepted: u32,
+    /// Rounds that proposed a draft at position `j + 1` (GitHub #160): the
+    /// reference's per-slot acceptance profile (`pos=[...]` on its request
+    /// log line). A block drafter decaying toward the end of its block and
+    /// one that is simply wrong show the same `accepted / drafted`; these
+    /// two tell them apart.
+    pub drafted_at: [u32; DRAFT_POSITIONS],
+    /// Rounds that committed the draft at position `j + 1`.
+    pub accepted_at: [u32; DRAFT_POSITIONS],
 }
+
+/// Draft positions a round can carry: the widest window a load admits
+/// (`MAX_DRAFT_TOKENS`, spec 05).
+pub const DRAFT_POSITIONS: usize = crate::speculation::MAX_DRAFT_TOKENS as usize;
 
 impl SpecCounters {
     /// One verify round that proposed `drafted` tokens and committed
-    /// `accepted` of them.
+    /// `accepted` of them (the first `accepted` of the `drafted`, a run).
     pub fn round(drafted: u32, accepted: u32) -> Self {
+        let mut drafted_at = [0; DRAFT_POSITIONS];
+        let mut accepted_at = [0; DRAFT_POSITIONS];
+        for (j, slot) in drafted_at.iter_mut().enumerate() {
+            *slot = u32::from((j as u32) < drafted);
+        }
+        for (j, slot) in accepted_at.iter_mut().enumerate() {
+            *slot = u32::from((j as u32) < accepted);
+        }
         Self {
             rounds: 1,
             drafted,
             accepted,
+            drafted_at,
+            accepted_at,
         }
+    }
+
+    /// The per-position acceptance as the reference prints it: the
+    /// percentage of rounds that committed position `j + 1` among those that
+    /// proposed it, slot 1 first, `-` for a slot never proposed, trailing
+    /// never-proposed slots dropped (`"94,72,46"` at a window of 3).
+    pub fn acceptance_profile(&self) -> String {
+        let proposed = self
+            .drafted_at
+            .iter()
+            .rposition(|&drafted| drafted > 0)
+            .map_or(0, |last| last + 1);
+        (0..proposed)
+            .map(|j| {
+                if self.drafted_at[j] == 0 {
+                    "-".to_string()
+                } else {
+                    let percent = 100.0 * f64::from(self.accepted_at[j]) / f64::from(self.drafted_at[j]);
+                    format!("{}", percent.round() as u32)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -244,10 +289,20 @@ impl std::ops::Add for SpecCounters {
     type Output = Self;
 
     fn add(self, other: Self) -> Self {
+        let mut drafted_at = self.drafted_at;
+        let mut accepted_at = self.accepted_at;
+        for (mine, theirs) in drafted_at.iter_mut().zip(other.drafted_at) {
+            *mine = mine.saturating_add(theirs);
+        }
+        for (mine, theirs) in accepted_at.iter_mut().zip(other.accepted_at) {
+            *mine = mine.saturating_add(theirs);
+        }
         Self {
             rounds: self.rounds.saturating_add(other.rounds),
             drafted: self.drafted.saturating_add(other.drafted),
             accepted: self.accepted.saturating_add(other.accepted),
+            drafted_at,
+            accepted_at,
         }
     }
 }
@@ -435,5 +490,40 @@ mod tests {
         for class in [RequestClass::Interactive, RequestClass::Agent] {
             assert_eq!(RequestClass::from_extension(class.as_extension_str()), class);
         }
+    }
+
+    #[test]
+    fn a_round_marks_the_positions_it_proposed_and_the_run_it_committed() {
+        // GitHub #160: seven drafts, the first three committed.
+        let round = SpecCounters::round(7, 3);
+        assert_eq!(round.rounds, 1);
+        assert_eq!(round.drafted_at, [1; DRAFT_POSITIONS]);
+        assert_eq!(round.accepted_at, [1, 1, 1, 0, 0, 0, 0]);
+        // A short lane at extent 2, nothing accepted.
+        let short = SpecCounters::round(2, 0);
+        assert_eq!(short.drafted_at, [1, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(short.accepted_at, [0; DRAFT_POSITIONS]);
+        // Extent 0: proposes nothing, so no position is counted.
+        assert_eq!(SpecCounters::round(0, 0).drafted_at, [0; DRAFT_POSITIONS]);
+    }
+
+    #[test]
+    fn rounds_add_per_position_and_print_the_reference_profile() {
+        // GitHub #160: two full rounds committing 7 and 1, one round at
+        // extent 3 committing 2 -- the sum's profile is what the reference's
+        // request log prints as `pos=[...]`, rounded, slot 1 first.
+        let total = SpecCounters::round(7, 7) + SpecCounters::round(7, 1) + SpecCounters::round(3, 2);
+        assert_eq!(total.rounds, 3);
+        assert_eq!(total.drafted, 17);
+        assert_eq!(total.accepted, 10);
+        assert_eq!(total.drafted_at, [3, 3, 3, 2, 2, 2, 2]);
+        assert_eq!(total.accepted_at, [3, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(total.acceptance_profile(), "100,67,33,50,50,50,50");
+        // A window of 3 prints three slots, never the unused tail.
+        let narrow = SpecCounters::round(3, 3) + SpecCounters::round(3, 0);
+        assert_eq!(narrow.acceptance_profile(), "50,50,50");
+        // A request that ran no drafting round has no profile.
+        assert_eq!(SpecCounters::round(0, 0).acceptance_profile(), "");
+        assert_eq!(SpecCounters::default().acceptance_profile(), "");
     }
 }
