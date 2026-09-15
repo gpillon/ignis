@@ -21,6 +21,9 @@ ignis_requests_cancelled_total 3
 # HELP ignis_generated_tokens_total Generated tokens on completed requests.
 # TYPE ignis_generated_tokens_total counter
 ignis_generated_tokens_total 12345
+# HELP ignis_decoded_tokens_total Tokens generated so far, counted as each one is emitted.
+# TYPE ignis_decoded_tokens_total counter
+ignis_decoded_tokens_total 12400
 # HELP ignis_kv_cache_evictions_total Cumulative host-tier evictions.
 # TYPE ignis_kv_cache_evictions_total counter
 ignis_kv_cache_evictions_total 4

@@ -11,7 +11,17 @@ const LANES = 6;
 const QUEUE_LIMIT = 8;
 const STEP_MS = 100;
 
-type Request = { arrivedAt: number; tokens: number; firstAt: number; endAt: number; cancelAt: number | null; sawFirst: boolean };
+type Request = {
+  arrivedAt: number;
+  tokens: number;
+  firstAt: number;
+  endAt: number;
+  cancelAt: number | null;
+  sawFirst: boolean;
+  tokensPerSecond: number;
+  /** Tokens counted as decoded so far. */
+  decoded: number;
+};
 
 class Histogram {
   buckets: number[];
@@ -56,7 +66,7 @@ export function createMetricsSim(start = Date.now()) {
   let nextBurst = start + 15_000;
   const waiting: Request[] = [];
   let running: Request[] = [];
-  const count = { accepted: 0, completed: 0, cancelled: 0, tokens: 0, evictions: 0, prefix: 0 };
+  const count = { accepted: 0, completed: 0, cancelled: 0, tokens: 0, decoded: 0, evictions: 0, prefix: 0 };
   const rejected = { full: 0, unknown_model: 0, oversized: 0 };
   const ttft = new Histogram(TTFT_BOUNDS_MS);
   const duration = new Histogram(DURATION_BOUNDS_MS);
@@ -67,7 +77,7 @@ export function createMetricsSim(start = Date.now()) {
     if (roll < 0.02) return void rejected.oversized++;
     if (waiting.length >= QUEUE_LIMIT) return void rejected.full++;
     count.accepted++;
-    waiting.push({ arrivedAt: t, tokens: Math.max(8, Math.round(logNormal(380, 0.75))), firstAt: 0, endAt: 0, cancelAt: null, sawFirst: false });
+    waiting.push({ arrivedAt: t, tokens: Math.max(8, Math.round(logNormal(380, 0.75))), firstAt: 0, endAt: 0, cancelAt: null, sawFirst: false, tokensPerSecond: 0, decoded: 0 });
   }
 
   function step(t: number) {
@@ -84,13 +94,19 @@ export function createMetricsSim(start = Date.now()) {
       const req = waiting.shift()!;
       if (Math.random() < 0.45) count.prefix += 512 + Math.floor(Math.random() * 5_500);
       req.firstAt = t + logNormal(320 + 60 * running.length, 0.6);
-      const tokensPerSecond = 58 / (1 + 0.1 * running.length);
-      req.endAt = req.firstAt + (req.tokens / tokensPerSecond) * 1000;
+      req.tokensPerSecond = 58 / (1 + 0.1 * running.length);
+      req.endAt = req.firstAt + (req.tokens / req.tokensPerSecond) * 1000;
       req.cancelAt = Math.random() < 0.06 ? t + Math.random() * (req.endAt - t) : null;
       running.push(req);
     }
 
     running = running.filter((req) => {
+      if (t >= req.firstAt) {
+        // Decoded tokens count as they stream, like ignis_decoded_tokens_total.
+        const due = Math.min(req.tokens, Math.floor(((t - req.firstAt) / 1000) * req.tokensPerSecond) + 1);
+        count.decoded += due - req.decoded;
+        req.decoded = due;
+      }
       if (req.cancelAt !== null && t >= req.cancelAt) {
         count.cancelled++;
         return false;
@@ -130,6 +146,7 @@ export function createMetricsSim(start = Date.now()) {
         ["ignis_requests_completed_total", "Completed requests.", count.completed],
         ["ignis_requests_cancelled_total", "Accepted requests cancelled before completion.", count.cancelled],
         ["ignis_generated_tokens_total", "Generated tokens on completed requests.", count.tokens],
+        ["ignis_decoded_tokens_total", "Tokens generated so far, counted as each one is emitted.", count.decoded],
         ["ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", count.evictions],
         ["ignis_prefix_reused_tokens_total", "Cumulative tokens skipped through sibling-prefix reuse.", count.prefix],
       ];

@@ -18,7 +18,10 @@ export type Snapshot = {
   completed: number | null;
   cancelled: number | null;
   rejected: Record<RejectReason, number | null>;
+  /** Tokens on completed requests: moves only when a request ends. */
   generatedTokens: number | null;
+  /** Tokens as each is decoded (GitHub #165): moves while requests run. Null from a server without it. */
+  decodedTokens: number | null;
   kvEvictions: number | null;
   prefixReusedTokens: number | null;
   ttft: Histogram | null;
@@ -31,6 +34,7 @@ const COUNTERS = {
   completed: "ignis_requests_completed_total",
   cancelled: "ignis_requests_cancelled_total",
   generatedTokens: "ignis_generated_tokens_total",
+  decodedTokens: "ignis_decoded_tokens_total",
   kvEvictions: "ignis_kv_cache_evictions_total",
   prefixReusedTokens: "ignis_prefix_reused_tokens_total",
 } as const;
@@ -54,6 +58,7 @@ export function emptySnapshot(): Snapshot {
     cancelled: null,
     rejected: { full: null, unknown_model: null, oversized: null },
     generatedTokens: null,
+    decodedTokens: null,
     kvEvictions: null,
     prefixReusedTokens: null,
     ttft: null,

@@ -131,6 +131,7 @@ pub struct Metrics {
     cancelled: AtomicU64,
     rejected: [AtomicU64; 3],
     generated_tokens: AtomicU64,
+    decoded_tokens: AtomicU64,
     kv_evictions: AtomicU64,
     prefix_reused_tokens: AtomicU64,
     ttft: Histogram,
@@ -154,6 +155,7 @@ impl Metrics {
             cancelled: AtomicU64::new(0),
             rejected: Default::default(),
             generated_tokens: AtomicU64::new(0),
+            decoded_tokens: AtomicU64::new(0),
             kv_evictions: AtomicU64::new(0),
             prefix_reused_tokens: AtomicU64::new(0),
             ttft: Histogram::new(&TTFT_BOUNDS_MS),
@@ -199,6 +201,12 @@ impl Metrics {
         self.generated_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
     }
 
+    /// A request in flight was dealt one generated token (GitHub #165): the
+    /// live counterpart of the tokens `record_completed` adds only at the end.
+    pub(crate) fn record_decoded_token(&self) {
+        self.decoded_tokens.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// An accepted request was cancelled before it completed (its client
     /// went away).
     pub(crate) fn record_cancelled(&self) {
@@ -241,6 +249,11 @@ impl Metrics {
                 "ignis_generated_tokens_total",
                 "Generated tokens on completed requests.",
                 &self.generated_tokens,
+            ),
+            (
+                "ignis_decoded_tokens_total",
+                "Tokens generated so far, counted as each one is emitted.",
+                &self.decoded_tokens,
             ),
             ("ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", &self.kv_evictions),
             (
@@ -329,6 +342,7 @@ mod tests {
             ("ignis_requests_completed_total", "counter"),
             ("ignis_requests_cancelled_total", "counter"),
             ("ignis_generated_tokens_total", "counter"),
+            ("ignis_decoded_tokens_total", "counter"),
             ("ignis_kv_cache_evictions_total", "counter"),
             ("ignis_prefix_reused_tokens_total", "counter"),
             ("ignis_requests_rejected_total", "counter"),
@@ -372,6 +386,7 @@ mod tests {
             "ignis_requests_completed_total",
             "ignis_requests_cancelled_total",
             "ignis_generated_tokens_total",
+            "ignis_decoded_tokens_total",
             "ignis_kv_cache_evictions_total",
             "ignis_prefix_reused_tokens_total",
         ] {
@@ -410,6 +425,8 @@ mod tests {
         metrics.record_completed(7);
         metrics.record_completed(5);
         metrics.record_cancelled();
+        metrics.record_decoded_token();
+        metrics.record_decoded_token();
         metrics.set_scheduler_requests(3, 4);
         metrics.set_scheduler_requests(1, 2);
 
@@ -418,6 +435,8 @@ mod tests {
         assert_eq!(value(&text, "ignis_requests_completed_total", ""), "2");
         assert_eq!(value(&text, "ignis_requests_cancelled_total", ""), "1");
         assert_eq!(value(&text, "ignis_generated_tokens_total", ""), "12");
+        // Decoded tokens are their own series, not derived from completions.
+        assert_eq!(value(&text, "ignis_decoded_tokens_total", ""), "2");
         // Gauges are the latest state, not a sum.
         assert_eq!(value(&text, "ignis_scheduler_requests", "state=\"waiting\""), "1");
         assert_eq!(value(&text, "ignis_scheduler_requests", "state=\"running\""), "2");

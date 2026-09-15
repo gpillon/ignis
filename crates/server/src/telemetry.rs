@@ -290,6 +290,9 @@ impl Telemetry {
                 Some(rt) => rt,
                 None => return,
             };
+            if let Some(metrics) = &self.metrics {
+                metrics.record_decoded_token();
+            }
             if !rt.ttft {
                 rt.ttft = true;
                 rt.last_token_ms = Some(now);
@@ -1036,6 +1039,37 @@ mod tests {
         has("ignis_generated_tokens_total 5");
         has("ignis_scheduler_requests{state=\"waiting\"} 1");
         has("ignis_scheduler_requests{state=\"running\"} 0");
+    }
+
+    /// GitHub #165: decoded tokens count as each one arrives, so a long
+    /// request's work shows while it runs — not only when it completes, as
+    /// `ignis_generated_tokens_total` does. A token for a request no longer in
+    /// flight (cancelled, routed late) is not counted.
+    #[test]
+    fn decoded_tokens_count_as_they_arrive_not_when_the_request_completes() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        let has = |line: &str| {
+            let text = metrics.render();
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        };
+
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.on_admitted(1, 0);
+        telemetry.on_token(1);
+        telemetry.on_token(1);
+        telemetry.on_token(1);
+        has("ignis_decoded_tokens_total 3");
+        has("ignis_generated_tokens_total 0");
+
+        telemetry.on_done(1, 3, FinishReason::Stop, None);
+        has("ignis_decoded_tokens_total 3");
+        has("ignis_generated_tokens_total 3");
+
+        telemetry.on_token(1); // late, for a request already done
+        telemetry.on_token(9); // never submitted
+        has("ignis_decoded_tokens_total 3");
     }
 
     /// GitHub #89: a cancelled request leaves the in-flight set, and an

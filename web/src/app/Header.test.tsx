@@ -27,16 +27,22 @@ describe("Header", () => {
 });
 
 describe("PulseChip", () => {
-  it("shows the gauges, the queue only when there is one, and says tokens count at completion", () => {
-    const busy = renderToStaticMarkup(<PulseChip running={3} waiting={2} tokensPerSec={96} paused={false} onOpen={() => {}} />);
+  it("shows the gauges, the queue only when there is one, and a live decoded-token rate", () => {
+    const busy = renderToStaticMarkup(<PulseChip running={3} waiting={2} tokensPerSec={96} live paused={false} onOpen={() => {}} />);
     expect(busy).toMatch(/>3<\/b> running/);
     expect(busy).toMatch(/>2<\/b> waiting/);
-    expect(busy).toMatch(/>96<\/b> tok\/s done/);
-    expect(busy).toContain("counted as requests complete");
+    expect(busy).toMatch(/>96<\/b> tok\/s</);
+    expect(busy).toContain("Tokens decoded per second");
     expect(busy).toContain("pulse-dot");
 
-    const quiet = renderToStaticMarkup(<PulseChip running={0} waiting={0} tokensPerSec={null} paused onOpen={() => {}} />);
+    const quiet = renderToStaticMarkup(<PulseChip running={0} waiting={0} tokensPerSec={null} live paused onOpen={() => {}} />);
     expect(quiet).not.toContain("waiting");
     expect(quiet).not.toContain("pulse-dot");
+  });
+
+  it("says tokens count only at completion on a server without decoded tokens", () => {
+    const html = renderToStaticMarkup(<PulseChip running={1} waiting={0} tokensPerSec={40} live={false} paused={false} onOpen={() => {}} />);
+    expect(html).toMatch(/>40<\/b> tok\/s done/);
+    expect(html).toContain("counted as requests complete");
   });
 });

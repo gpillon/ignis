@@ -36,7 +36,23 @@ describe("deriveDashboard", () => {
 
   it("gives the header the latest gauges and token rate", () => {
     const points = [at(0, { generatedTokens: 0, running: 2, waiting: 1 }), at(10_000, { generatedTokens: 500, running: 3, waiting: 0 })];
-    expect(headerPulse(points)).toEqual({ running: 3, waiting: 0, tokensPerSec: 50 });
+    expect(headerPulse(points)).toEqual({ running: 3, waiting: 0, tokensPerSec: 50, live: false });
+    expect(headerPulse([])).toEqual({ running: null, waiting: null, tokensPerSec: null, live: false });
+  });
+
+  it("takes throughput from decoded tokens while a long request runs, and per request from completed ones", () => {
+    // A request decoding for 10 s: decoded tokens climb, nothing has completed yet.
+    const decoding = [
+      at(0, { decodedTokens: 0, generatedTokens: 0, completed: 0 }),
+      at(5_000, { decodedTokens: 250, generatedTokens: 0, completed: 0 }),
+      at(10_000, { decodedTokens: 500, generatedTokens: 0, completed: 0 }),
+    ];
+    const dash = deriveDashboard(decoding, 60_000)!;
+    expect(dash.tokens).toMatchObject({ live: true, spanMs: 10_000, perSec: 50, window: 500, perRequest: null });
+    expect(headerPulse(decoding)).toMatchObject({ tokensPerSec: 50, live: true });
+
+    const done = [...decoding, at(15_000, { decodedTokens: 600, generatedTokens: 600, completed: 2 })];
+    expect(deriveDashboard(done, 60_000)!.tokens.perRequest).toBe(300);
   });
 });
 

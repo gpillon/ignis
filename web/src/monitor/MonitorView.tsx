@@ -282,7 +282,9 @@ function Hero({ dash, chart }: { dash: Dashboard; chart: ChartFrame }) {
         <div className="min-w-0">
           <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
             <h2 className="font-display text-xs font-bold tracking-[0.18em] text-[#939ba4] uppercase">Generated tokens</h2>
-            <span className="text-xs text-[#939ba4]">counted as requests complete · {formatWindow(RATE_SPAN_MS)} rolling</span>
+            <span className="text-xs text-[#939ba4]">
+              {dash.tokens.live ? "counted as they are decoded" : "counted as requests complete"} · {formatWindow(dash.tokens.spanMs)} rolling
+            </span>
           </div>
           <div className="mt-2 flex flex-wrap items-end gap-x-8 gap-y-3">
             <p className="hero-glow font-display text-[60px] leading-[0.9] font-semibold text-white">

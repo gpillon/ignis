@@ -13,6 +13,7 @@ describe("readSnapshot", () => {
     expect(s.completed).toBe(30);
     expect(s.cancelled).toBe(3);
     expect(s.generatedTokens).toBe(12345);
+    expect(s.decodedTokens).toBe(12400);
     expect(s.kvEvictions).toBe(4);
     expect(s.prefixReusedTokens).toBe(8192);
     expect(s.rejected).toEqual({ full: 6, unknown_model: 1, oversized: 0 });
@@ -33,6 +34,7 @@ describe("readSnapshot", () => {
     expect(s.accepted).toBe(3);
     expect(s.version).toBeNull();
     expect(s.running).toBeNull();
+    expect(s.decodedTokens).toBeNull();
     expect(s.rejected).toEqual({ full: null, unknown_model: null, oversized: null });
     expect(s.ttft).toBeNull();
   });

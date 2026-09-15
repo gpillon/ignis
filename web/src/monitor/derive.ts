@@ -9,6 +9,8 @@ import { type Histogram, REJECT_REASONS, type RejectReason, type Snapshot } from
 
 /** Rates are averaged over this span, since counters move in steps. */
 export const RATE_SPAN_MS = 30_000;
+/** Decoded tokens move with every token, so their rate needs only this short span. */
+export const TOKEN_RATE_SPAN_MS = 10_000;
 /** Latency trends are quantiles over this sliding span. */
 export const TREND_SPAN_MS = 60_000;
 
@@ -57,7 +59,11 @@ export type Dashboard = {
   waitingSeries: Values;
   runningPeak: number | null;
   waitingPeak: number | null;
-  tokens: Counter & { perSec: number | null; perSecSeries: Values; perRequest: number | null };
+  /**
+   * Token throughput. `live` when the server counts tokens as they are decoded;
+   * otherwise it only has tokens on completed requests, which move in steps.
+   */
+  tokens: Counter & { live: boolean; spanMs: number; perSec: number | null; perSecSeries: Values; perRequest: number | null };
   accepted: Counter;
   completed: Counter;
   cancelled: Counter;
@@ -127,10 +133,13 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     return seen.length ? Math.max(...seen) : null;
   };
 
-  const tokenRate = rollingRate(points, (s) => s.generatedTokens, RATE_SPAN_MS);
+  const { live, pick: tokenPick, spanMs: tokenSpanMs } = tokenSource(last);
+  const tokenRate = rollingRate(points, tokenPick, tokenSpanMs);
   const prefixRate = rollingRate(points, (s) => s.prefixReusedTokens, RATE_SPAN_MS);
   const completed = counter((s) => s.completed);
-  const tokensCounter = counter((s) => s.generatedTokens);
+  const tokensCounter = counter(tokenPick);
+  // Per request is completed tokens over completed requests, whichever counter drives the rate.
+  const completedTokens = increaseOver(points, (s) => s.generatedTokens, from);
   const runningSeries = points.map((p) => p.snap.running);
   const waitingSeries = points.map((p) => p.snap.waiting);
   const byReason = Object.fromEntries(
@@ -152,9 +161,11 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     waitingPeak: peak(waitingSeries),
     tokens: {
       ...tokensCounter,
+      live,
+      spanMs: tokenSpanMs,
       perSec: tokenRate.at(-1) ?? null,
       perSecSeries: tokenRate,
-      perRequest: tokensCounter.window !== null && completed.window ? tokensCounter.window / completed.window : null,
+      perRequest: completedTokens !== null && completed.window ? completedTokens / completed.window : null,
     },
     accepted: counter((s) => s.accepted),
     completed,
@@ -229,13 +240,23 @@ export function assessHealth(h: HealthInput): Health {
   return { level: "idle", summary: `No requests in the last ${win}`, notes };
 }
 
-/** The header's live figures: the latest gauges and the generated-token rate. */
-export function headerPulse(points: Point[]): { running: number | null; waiting: number | null; tokensPerSec: number | null } {
-  const last = points.at(-1)?.snap;
-  const recent = points.filter((p) => p.at >= (points.at(-1)?.at ?? 0) - RATE_SPAN_MS);
+/** Which token counter drives throughput: decoded tokens when the server has them, else tokens on completed requests. */
+function tokenSource(last: Snapshot): { live: boolean; pick: CounterPick; spanMs: number } {
+  return last.decodedTokens !== null
+    ? { live: true, pick: (s) => s.decodedTokens, spanMs: TOKEN_RATE_SPAN_MS }
+    : { live: false, pick: (s) => s.generatedTokens, spanMs: RATE_SPAN_MS };
+}
+
+/** The header's live figures: the latest gauges and the token rate. */
+export function headerPulse(points: Point[]): { running: number | null; waiting: number | null; tokensPerSec: number | null; live: boolean } {
+  const lastPoint = points.at(-1);
+  if (!lastPoint) return { running: null, waiting: null, tokensPerSec: null, live: false };
+  const { live, pick, spanMs } = tokenSource(lastPoint.snap);
+  const recent = points.filter((p) => p.at >= lastPoint.at - spanMs);
   return {
-    running: last?.running ?? null,
-    waiting: last?.waiting ?? null,
-    tokensPerSec: rollingRate(recent, (s) => s.generatedTokens, RATE_SPAN_MS).at(-1) ?? null,
+    running: lastPoint.snap.running,
+    waiting: lastPoint.snap.waiting,
+    tokensPerSec: rollingRate(recent, pick, spanMs).at(-1) ?? null,
+    live,
   };
 }
