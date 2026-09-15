@@ -4,7 +4,8 @@
 //! ADR 0006).
 //!
 //! A message's `content` is a string or an array of parts. `text` parts
-//! render exactly as the concatenated string would; media parts are
+//! render exactly as the string they join to (the reference's `"\n"`
+//! between adjacent text parts); media parts are
 //! recognised but not served yet, each refused with a 400 carrying the
 //! reference's error code and naming the offending message/part index,
 //! before the request reaches the engine.
@@ -84,15 +85,15 @@ fn assert_refused(status: u16, body: &Value, code: &str, names: &[&str]) {
 // ── text parts render as the string form ────────────────────────────────
 
 #[tokio::test]
-async fn text_parts_produce_the_same_response_as_the_concatenated_string() {
+async fn text_parts_produce_the_same_response_as_the_joined_string() {
     let (string_status, string_body) = chat(json!([
-        { "role": "user", "content": "hello world again" }
+        { "role": "user", "content": "hello world\nagain" }
     ]))
     .await;
     let (parts_status, parts_body) = chat(json!([
         { "role": "user", "content": [
-            { "type": "text", "text": "hello wor" },
-            { "type": "text", "text": "ld again" }
+            { "type": "text", "text": "hello world" },
+            { "type": "text", "text": "again" }
         ] }
     ]))
     .await;
@@ -215,9 +216,21 @@ async fn an_unknown_part_type_is_refused_naming_it() {
     assert_refused(
         status,
         &body,
-        "invalid_request_error",
+        "modality_not_supported",
         &["message 0", "part 0", "input_audio"],
     );
+}
+
+#[tokio::test]
+async fn a_media_refusal_wins_over_an_earlier_unknown_part_type() {
+    let (status, body) = chat(json!([
+        { "role": "user", "content": [{ "type": "input_audio", "input_audio": { "data": "" } }] },
+        { "role": "user", "content": [
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+        ] }
+    ]))
+    .await;
+    assert_refused(status, &body, "vision_disabled", &["message 1", "part 0"]);
 }
 
 #[tokio::test]

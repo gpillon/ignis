@@ -81,14 +81,38 @@ pub enum MessageContent {
 impl MessageContent {
     /// The text the chat template renders for this content once
     /// [`check_content_parts`] has passed it: the string itself, or the
-    /// text parts joined with no separator — what the artifact template's
-    /// `render_content` loop emits for an all-text parts array.
+    /// parts' [`template_text_parts`] joined.
     pub fn text(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
-            Self::Parts(parts) => parts.iter().filter_map(|p| p.text.as_deref()).collect(),
+            Self::Parts(parts) => template_text_parts(parts).concat(),
         }
     }
+}
+
+/// The text runs a parts array hands the chat template, the reference's
+/// way (ninfer `serve/translate.cpp` `to_prompt_input`): each text part in
+/// order, with a `"\n"` inserted before a non-empty text part that directly
+/// follows another text part. So `[{"text":"a"},{"text":"b"}]` renders as
+/// the string `"a\nb"`, not `"ab"`. A non-text part breaks the run (no
+/// newline across it) and contributes nothing here: only text parts
+/// survive [`check_content_parts`] until media is served.
+pub fn template_text_parts(parts: &[ContentPart]) -> Vec<&str> {
+    let mut out = Vec::with_capacity(parts.len());
+    let mut after_text = false;
+    for part in parts {
+        match (part.kind.as_deref(), part.text.as_deref()) {
+            (Some("text"), Some(text)) => {
+                if after_text && !text.is_empty() {
+                    out.push("\n");
+                }
+                out.push(text);
+                after_text = true;
+            }
+            _ => after_text = false,
+        }
+    }
+    out
 }
 
 /// One OpenAI content part, parsed permissively: every field is optional
@@ -145,7 +169,7 @@ impl From<JsonValue> for ContentPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentRejection {
     /// The error `code` (`vision_disabled`, `video_unsupported`,
-    /// `invalid_media` or `invalid_request_error`).
+    /// `invalid_media`, `modality_not_supported` or `invalid_request_error`).
     pub code: &'static str,
     /// The human-readable message.
     pub message: String,
@@ -161,19 +185,22 @@ pub struct ContentRejection {
 ///   without vision.
 /// - `video_url` → `video_unsupported` (images only, spec §Scope).
 /// - `image_url` → `vision_disabled`.
+/// - an unknown part type → `modality_not_supported` (the reference's code
+///   and wording).
 /// - an empty array, a part without a string `type`, a `text` part without
-///   string text, a media part without a string `url`, or an unknown type →
-///   `invalid_request_error`.
+///   string text, or a media part without a string `url` →
+///   `invalid_request_error` (the reference's schema checks; its body leaves
+///   `code` empty, this server's error body always carries one).
 ///
 /// Media parts are recognised on `user`, `assistant` and `tool` messages
 /// alike — unlike the reference's OpenAI schema, which refuses non-text
 /// parts on a tool message: a browser tool's screenshot result must reach
 /// the model the way its text does (spec user story 6).
 ///
-/// Shape errors are checked across the whole conversation before any media
-/// refusal (the reference's order: schema first, then the vision check), so
-/// a malformed request is told it is malformed rather than that vision is
-/// off.
+/// Checked in the reference's order, each pass over the whole conversation:
+/// shape errors (its schema), then media (its vision check), then unknown
+/// types (its prompt translation) — so a malformed request is told it is
+/// malformed rather than that vision is off.
 pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentRejection> {
     let refuse = |code, message: String| Err(ContentRejection { code, message });
     let parts = messages.iter().enumerate().filter_map(|(i, message)| match &message.content {
@@ -203,17 +230,11 @@ pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentReject
                         format!("{at}: {media} must be an object containing a string url"),
                     )
                 }
-                Some("image_url" | "video_url") => {}
-                Some(other) => {
-                    return refuse(
-                        "invalid_request_error",
-                        format!("{at} has unsupported content part type: {other}"),
-                    )
-                }
+                Some(_) => {}
             }
         }
     }
-    for (i, message, parts) in parts {
+    for (i, message, parts) in parts.clone() {
         for (j, part) in parts.iter().enumerate() {
             let at = format!("message {i} content part {j}");
             let video = match part.kind.as_deref() {
@@ -232,6 +253,17 @@ pub fn check_content_parts(messages: &[ChatMessage]) -> Result<(), ContentReject
             } else {
                 refuse("vision_disabled", format!("{at}: vision is disabled for this server"))
             };
+        }
+    }
+    for (i, _, parts) in parts {
+        for (j, part) in parts.iter().enumerate() {
+            let kind = part.kind.as_deref().unwrap_or_default();
+            if !matches!(kind, "text" | "image_url" | "video_url") {
+                return refuse(
+                    "modality_not_supported",
+                    format!("message {i} content part {j}: content type '{kind}' is not supported"),
+                );
+            }
         }
     }
     Ok(())
@@ -484,6 +516,18 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "role": "user", "content": "hi" })).unwrap();
         assert_eq!(plain, ChatMessage::text("user", "hi"));
         assert_eq!(serde_json::to_value(&plain).unwrap()["content"], "hi");
+    }
+
+    #[test]
+    fn text_parts_join_the_references_way() {
+        let t = |s: &str| serde_json::json!({ "type": "text", "text": s });
+        let text = |parts: Vec<JsonValue>| {
+            serde_json::from_value::<MessageContent>(JsonValue::Array(parts)).unwrap().text()
+        };
+        assert_eq!(text(vec![t("a"), t("b")]), "a\nb");
+        assert_eq!(text(vec![t("a"), t(""), t("b")]), "a\nb");
+        assert_eq!(text(vec![t(""), t("b")]), "\nb");
+        assert_eq!(text(vec![t("a"), t("")]), "a");
     }
 
     #[test]

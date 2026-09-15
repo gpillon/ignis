@@ -18,7 +18,7 @@ use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
-use crate::template::{ChatMessage, MessageContent, TemplateProvider};
+use crate::template::{template_text_parts, ChatMessage, MessageContent, TemplateProvider};
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
 /// The [`TemplateProvider`] backed by the artifact's [`FrontendSet`]: the
@@ -184,17 +184,19 @@ impl TokenDecoder for ArtifactTokenDecoder {
 }
 
 /// The template-facing content of a wire message (GitHub #175). A parts
-/// array reaches the template as parts, so the real template's
-/// `render_content` loop renders it — for text parts, exactly as the
-/// concatenated string. Only text parts get here: `check_content_parts`
-/// refuses every other part before a request is templated.
+/// array reaches the template as its `template_text_parts` (the reference's
+/// `"\n"` between adjacent text parts included), so the real template's
+/// `render_content` loop renders it exactly as the string
+/// `MessageContent::text` joins. Only text parts get here:
+/// `check_content_parts` refuses every other part before a request is
+/// templated.
 fn artifact_content(content: &MessageContent) -> ignis_artifact::MessageContent {
     match content {
         MessageContent::Text(text) => ignis_artifact::MessageContent::Text(text.clone()),
         MessageContent::Parts(parts) => ignis_artifact::MessageContent::Parts(
-            parts
-                .iter()
-                .filter_map(|part| part.text.clone().map(ignis_artifact::ContentPart::Text))
+            template_text_parts(parts)
+                .into_iter()
+                .map(|text| ignis_artifact::ContentPart::Text(text.to_owned()))
                 .collect(),
         ),
     }
@@ -318,16 +320,17 @@ mod tests {
         assert!(text.contains("hello"), "{text}");
     }
 
-    /// GitHub #175: a text-parts message renders exactly as its
-    /// concatenated string, through a template shaped like the real one's
+    /// GitHub #175: a text-parts message renders exactly as the string its
+    /// parts join to (`"\n"` between adjacent text parts, the reference's
+    /// rule), through a template shaped like the real one's
     /// `render_content` (string → as-is, parts → each `text` in order).
     #[test]
     fn text_parts_render_the_same_prompt_as_the_concatenated_string() {
         const PARTS_TEMPLATE: &str = "{%- for m in messages -%}{{ m.role }} {% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %} {% endfor -%}";
         let (_fixture, _reader, provider) = build_provider_with(PARTS_TEMPLATE);
-        let string_form = [ChatMessage::text("user", "hello world")];
+        let string_form = [ChatMessage::text("user", "hello\nworld")];
         let parts: MessageContent =
-            serde_json::from_value(json!([{ "type": "text", "text": "hel" }, { "type": "text", "text": "lo world" }]))
+            serde_json::from_value(json!([{ "type": "text", "text": "hello" }, { "type": "text", "text": "world" }]))
                 .expect("parts deserialize");
         let mut parts_form = ChatMessage::text("user", "");
         parts_form.content = parts;
