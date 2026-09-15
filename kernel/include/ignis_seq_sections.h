@@ -348,6 +348,10 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
   seq.position      = image.position;
   seq.pending_token = image.pending_token;
   seq.dflash2_position = image.dflash2_position;
+  // GitHub #157: the carried anchor taps are the handle's, not the image's;
+  // taps left from this handle's previous life belong to another position.
+  seq.dflash2_pending = false;
+  seq.dflash2_pending_features.clear();
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     seq.gqa_positions[i] = image.gqa_positions[i];
   }

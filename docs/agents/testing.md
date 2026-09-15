@@ -284,7 +284,10 @@ sequence pool must be built for that backend too.
 `crates/core/tests/dflash2_round_gpu.rs` proves the real drafter in the round
 (GitHub #155): greedy spec-on against spec-off on the canary prompts at widths
 1, 4 and 8, its graph replay against eager, a lane at extent 0 leaving its
-window untouched, and a mid-generation snapshot/restore. Every stream is cut
+window untouched -- and, continued by a round or by a prefill, writing that
+round's anchor into its window before anything else (GitHub #157, checked
+against a lane that never ran at extent 0) -- and a mid-generation
+snapshot/restore. Every stream is cut
 at the turn's first `<|im_end|>`/`<|endoftext|>`, where the server stops: past
 it the model loops on chat markers and the verify and decode tilings part by
 several logits on text no request emits. It prints acceptance
