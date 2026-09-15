@@ -68,3 +68,19 @@ here so that a change is a decision rather than a drift.
   outliving an `Agent` snapshot in protected.
 - A third request class, if one is ever added, changes two orderings rather than
   one.
+
+## Amendment (2026-09-16) — retained state goes first (ADR 0029)
+
+**Retained state** — prompt checkpoints and retained prefixes, which no live
+request needs — is placed ahead of both orderings.
+
+- **On the device**, retained state is released before any lane is
+  considered. It spills to KV-RAM if the budget can hold it, and is discarded
+  otherwise. It never causes an admission refusal or wait.
+- **In KV-RAM**, a new first key is added: retained entries before evicted
+  live sequences. Request class, probation before protected, and
+  least-recently-used then follow as above. A retained entry carries the
+  class of the request that produced it.
+
+The reason is asymmetry of loss. An evicted live sequence is work that will
+certainly be redone; a retained entry is a bet that it will be needed.

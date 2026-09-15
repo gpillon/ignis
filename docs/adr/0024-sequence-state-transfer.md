@@ -150,3 +150,24 @@ and is not a fifth entry point.
     the device rather than route through the host tier therefore stands on a
     wider margin than the estimate claimed. See
     [Device prefix clone cost](../findings/2026-09-12-device-prefix-clone-cost.md).
+
+## Amendment (2026-09-16) — cross-request reuse (ADR 0029)
+
+- **A snapshot of a sequence holding a shared prefix materializes the shared
+  pages into its blob** instead of being refused. This replaces the
+  consequence "a sequence that holds a shared prefix cannot be snapshotted".
+  The refusal guarded against a blob that passed another request's history
+  off as its own. A materialized copy owns every byte it carries and outlives
+  the prefix. The cost is prefix bytes duplicated per blob. Chained blobs (a
+  reference to a retained prefix plus a tail) are to be revisited with
+  Tier 2, where deduplication matters more.
+- **A prompt checkpoint's publish point is its generation opener**, wherever
+  that falls. Full pages are shared by refcount. The partial tail page is
+  copied at capture, because the live sequence keeps writing into it, and a
+  claimant copies it again. Shared and retained prefixes keep the
+  whole-page publish point.
+- **A claim never consumes.** Retained state is cloned out, so one entry can
+  serve any number of claimants.
+- **A blob's header names its compatibility identity**: the artifact content
+  hash, the KV format, the layout version, and the drafter configuration. A
+  blob taken under another load is refused like a stale layout.

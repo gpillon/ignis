@@ -120,12 +120,42 @@ When output names a domain concept, use the term as defined here.
   never see the section layout; a restore validates the header and refuses a
   stale or foreign one. Whole-sequence only: GDN state cannot be recomputed
   without re-running the prefix a restore exists to avoid (ADR 0024).
-- **KV-RAM** — the host-RAM tier that holds **snapshot blobs** of evicted
-  sequences so they resume instead of re-prefilling. Bounded by a byte budget,
-  two-tier (probation → protected), and written only at a **chunk boundary**.
-  Control plane since v1; it moves real device state from G4.
-- **Prefix reuse** — concurrent requests sharing a prefix skip the redundant
-  prefill: the shared **KV pages** are refcounted and shared in place on the
+- **Residency tier** — where sequence state lives, in three levels: **Tier 0 —
+  device** (VRAM), **Tier 1 — KV-RAM**, **Tier 2 — KV-disk**. State moves down a
+  tier when the one above needs the room, and back up to be served. "Host tier"
+  is not a synonym: say KV-RAM.
+- **KV-RAM** — Tier 1: the host-RAM tier that holds **snapshot blobs** of
+  evicted live sequences (so they resume instead of re-prefilling) and of
+  retained state (**prompt checkpoints**, **retained prefixes**) that left the
+  device. Bounded by a byte budget, two-tier (probation → protected), and
+  written only at a **chunk boundary**. State reaches it lazily — only when the
+  device is about to discard it, never as a copy of what is still resident.
+- **KV-disk** — Tier 2: the disk tier below KV-RAM, meant to outlive a server
+  restart. Prepared, not built: its existence is why a blob's identity must
+  name the model and layout it was taken under rather than a request.
+- **Prompt checkpoint** — the whole-sequence state of a request at its
+  generation opener, the point where the rendered prompt hands over to the
+  model, retained after the request ends so a later request whose prompt
+  extends it (the next turn of a chat or of an agent loop) resumes there
+  instead of re-prefilling. Matched by prompt content, never by a session
+  identifier. Reusing one copies it and does not consume it: a retry, a
+  regenerate or two forks from the same point all hit. A conversation keeps
+  at most two: its latest, and its **turn-opening checkpoint** — the one right
+  after its last real user message, the only one a new user message can
+  still match once history drops the earlier thinking. The point after generation is not one: the next turn re-renders
+  the assistant message differently from how it was generated.
+- **Retained prefix** — a **shared prefix** kept alive with no claimant, so a
+  later, non-concurrent request (the next subagent of a burst) claims it as if
+  it were a sibling. Its boundary is a structural point of the rendered prompt
+  (the end of the system and tools block, floored to whole KV pages), not the
+  publishing request's whole prompt head.
+- **Retained state** — prompt checkpoints and retained prefixes: state no live
+  request needs. It never costs a live request anything — on the device it is
+  always the first thing to go — and in KV-RAM it is discarded before any
+  evicted live sequence.
+- **Prefix reuse** — requests sharing a prefix skip the redundant prefill —
+  concurrent siblings through a **shared prefix**, later requests through
+  **retained state**: the shared **KV pages** are refcounted and shared in place on the
   device, and the mutable **state sections** are cloned device-to-device. It
   never round-trips through host RAM, and sharing pages alone would save
   nothing, since prefill must traverse every layer to produce the mutable
@@ -134,18 +164,24 @@ When output names a domain concept, use the term as defined here.
   physical KV pages of a prompt head plus a device image of the mutable state
   at its end, held by a refcount. Every holder's block-table row addresses the
   same pages, the pool is charged for them once, and they return when the last
-  holder releases. A sequence holding one cannot be snapshotted — its history
-  is not all its own — so it is released and re-prefilled rather than evicted.
-- **Publish point** — the chunk boundary a prefix is published at, always a
-  whole number of KV pages in, and 0 for a request that publishes nothing. It
+  holder releases, unless it becomes a **retained prefix**. A snapshot of a
+  sequence holding one materializes the shared pages into the blob, so the
+  blob owns every byte of its history and outlives the prefix.
+- **Publish point** — the chunk boundary a prefix is published at, and 0 for a
+  request that publishes nothing. A shared or retained prefix's is always a
+  whole number of KV pages in; a **prompt checkpoint**'s is the generation
+  opener wherever it falls, and whoever reuses it copies the partial page
+  rather than sharing it. It
   is a scheduling decision, not a detail of the publish call: what a claimant
   clones is the mutable state at the prefix's *end*, so the publishing
   request's prefill is cut there, and a prompt whose length is not a whole
   page pays one extra chunk for it.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
-  request class, then least-recently-used; leaving the host tier is request
-  class, then probation before protected, then least-recently-used. Protection
+  request class, then least-recently-used; leaving KV-RAM is **retained
+  state** before evicted live sequences, then request class, then probation
+  before protected, then least-recently-used. On the device, retained state
+  goes before any of it. Protection
   outranks class only where something is actively being served (ADR 0023).
 - **Chunked prefill** — prefilling a prompt span through the span+position
   prefill call in **prefill chunks** rather than one token at a time. The
