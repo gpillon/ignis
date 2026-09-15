@@ -237,6 +237,35 @@ fn report_acceptance(label: &str, run: &SpecRun) -> usize {
     accepted
 }
 
+/// The drafter window's geometry, as the snapshot's window section lays one
+/// lane out: every layer's K then V, each `[head_dim, ring, kv_heads]`.
+const DRAFTER_LAYERS: usize = 5;
+const RING: usize = 2048;
+const KV_HEADS: usize = 8;
+const HEAD_DIM: usize = 128;
+
+/// Every layer's K and V for absolute `position` in a window section, decoded.
+fn window_column(window: &[u8], position: usize) -> Vec<f64> {
+    let plane = HEAD_DIM * RING * KV_HEADS * 2;
+    let mut column = Vec::with_capacity(DRAFTER_LAYERS * 2 * KV_HEADS * HEAD_DIM);
+    for layer_role in 0..DRAFTER_LAYERS * 2 {
+        for head in 0..KV_HEADS {
+            for dim in 0..HEAD_DIM {
+                let at = layer_role * plane + (dim + HEAD_DIM * (position % RING + RING * head)) * 2;
+                let bits = u16::from_le_bytes([window[at], window[at + 1]]);
+                column.push(f64::from(f32::from_bits(u32::from(bits) << 16)));
+            }
+        }
+    }
+    column
+}
+
+fn relative_l2(ours: &[f64], reference: &[f64]) -> f64 {
+    let error: f64 = ours.iter().zip(reference).map(|(a, b)| (a - b) * (a - b)).sum();
+    let norm: f64 = reference.iter().map(|b| b * b).sum();
+    error.sqrt() / norm.sqrt().max(1e-30)
+}
+
 /// A sequence's drafter window and its frontier, and its program frontier,
 /// as a snapshot carries them.
 fn window_state(seq: &Seq<'_>) -> (Vec<u8>, u64, u64) {
@@ -399,9 +428,12 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     }
 
     // --- AC 3: a lane at extent 0 leaves its window alone -----------------
+    // ... and (GitHub #157) carries its anchor's taps into whatever continues
+    // it: its next round or a prefill writes the anchor's column before
+    // anything else, so the window has no hole at the anchor's position.
     {
         let model = load_drafter(&reader, &artifact, &handles);
-        let pool = drafter_pool(3);
+        let pool = drafter_pool(6);
         let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
         // Out of budget: its round may commit its anchor and nothing more.
         let mut budgeted = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
@@ -435,6 +467,67 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         let (window, frontier, position) = window_state(&drafting);
         assert!(window != drafting_before.0, "the drafting lane's committed columns never reached its window");
         assert_eq!(frontier, position, "the drafting lane's window stands at its frontier");
+
+        // GitHub #157: the anchor the budgeted lane committed at extent 0.
+        let anchor = budgeted_before.2 as usize;
+        let (window, _, _) = window_state(&budgeted);
+        assert!(window_column(&window, anchor).iter().all(|&x| x == 0.0), "the anchor's ring slot starts unwritten");
+        // The reference: the same prompt, never at extent 0 -- its first
+        // round commits the anchor with drafts and writes its column.
+        let reference = {
+            let mut lane = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+            prefill_all(&model, &pool, std::slice::from_mut(&mut lane), &canaries[..1]);
+            let run = round(&model, &pool, &mut [&mut lane], &[TOTAL as u32], &[]).remove(0);
+            assert_eq!(run.tokens[0], results[0].tokens[0], "the reference commits the same anchor");
+            window_column(&window_state(&lane).0, anchor)
+        };
+        // How far one position's column parts between two routes that both
+        // compute it correctly -- the reference's verify tile against a
+        // prefill of the prompt plus the anchor (~0.11 relative L2 measured
+        // 2026-09-15, the value planes carrying most of it) -- and how far a
+        // neighbouring position's column stands. A continued lane must land
+        // within twice the first, which must itself tell positions apart.
+        let (reference_window, _, _) = {
+            let mut lane = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+            let mut prompt = canaries[0].clone();
+            prompt.push(results[0].tokens[0]);
+            prefill_all(&model, &pool, std::slice::from_mut(&mut lane), &[prompt]);
+            window_state(&lane)
+        };
+        let route_floor = relative_l2(&reference, &window_column(&reference_window, anchor));
+        let neighbour = relative_l2(&reference, &window_column(&reference_window, anchor - 1));
+        let tolerance = 2.0 * route_floor;
+        println!("anchor column: route floor {route_floor:.6}, neighbouring position {neighbour:.6}, tolerance {tolerance:.6}");
+        assert!(neighbour > tolerance, "a neighbouring position's column {neighbour} is within the tolerance {tolerance}");
+        // The frontier check is bookkeeping only: a full round or a tapping
+        // prefill leaves the frontier at the position with or without the
+        // hole. The anchor's column is what tells a hole from a written slot.
+        let check_continued = |label: &str, seq: &Seq<'_>| {
+            let (window, frontier, position) = window_state(seq);
+            assert_eq!(frontier, position, "{label}: the continued lane's window stands at its frontier");
+            let column = window_column(&window, anchor);
+            assert!(column.iter().any(|&x| x != 0.0), "{label}: the anchor's ring slot is a hole in the window");
+            let drift = relative_l2(&column, &reference);
+            println!("{label}: anchor column relative L2 {drift:.6} against the lane never at extent 0");
+            assert!(drift <= tolerance, "{label}: the anchor's column {drift} is not the anchor's context");
+        };
+
+        // Continued by its next round, budget restored.
+        let continued = round(&model, &pool, &mut [&mut budgeted], &[TOTAL as u32], &[]).remove(0);
+        assert_eq!(continued.extent, WINDOW, "the continued lane drafts a full window");
+        check_continued("continued by a round", &budgeted);
+
+        // Continued by a prefill: the next turn's text after the anchor.
+        let mut prefilled = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+        prefill_all(&model, &pool, std::slice::from_mut(&mut prefilled), &canaries[..1]);
+        let ended = round(&model, &pool, &mut [&mut prefilled], &[1], &[]).remove(0);
+        assert_eq!(ended.extent, 0, "the prefilled lane's round runs at extent 0");
+        let (_, frontier, position) = window_state(&prefilled);
+        assert_eq!(frontier + 1, position, "an extent-0 round leaves the frontier at the anchor");
+        let turn = &canaries[1][..8];
+        prefill_program_sampled(&model, &pool, &mut prefilled, turn, position, SamplingParams::greedy(), None)
+            .unwrap_or_else(|e| panic!("continuation prefill: {e}"));
+        check_continued("continued by a prefill", &prefilled);
     }
 
     // --- AC 4: snapshot and restore mid-generation ------------------------

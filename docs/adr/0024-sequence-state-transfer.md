@@ -108,6 +108,17 @@ and is not a fifth entry point.
   pool, one lane per slot. The pool is built for a speculative backend, and
   the program entry points refuse a model loaded for a different one. Spec 05's
   "Model load" paragraph predates this.
+- **One piece of handle state is deliberately not a section.** A verify round
+  at extent 0 leaves the drafter window untouched and keeps its anchor's
+  feature taps on the sequence handle, host-side, for whatever continues the
+  sequence (GitHub #157). Spec 05 says feature taps are never persisted and
+  never a section, and nothing here needs them to be: a snapshot or a clone
+  taken at that point carries the frontier without the taps, and its sequence
+  resumes with a one-position hole in its window — lower acceptance, never a
+  different text. Restore and clone drop whatever taps the target handle held.
+  The scheduler never reaches that case, since extent 0 is a request's last
+  round; if one ever continues such a sequence across a transfer, the taps
+  become a section.
 - **A GPU test may read the blob layout; a production consumer may not.** The
   layout stays out of the ABI. A test that must inspect what snapshot carried
   (`crates/core/tests/dflash2_window_gpu.rs`) spells out the layout for one

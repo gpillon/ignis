@@ -856,7 +856,13 @@ void check_drafter_sections() {
   expect_rc(ignis_seq_alloc(drafter, 128, &target), 0, "drafter: alloc target");
   expect(all_zero(lane_image_of(*drafter->dflash2_window, target->slot)),
          "drafter: the fresh target's window is zero before the restore");
+  // GitHub #157: anchor taps a handle carries from an extent-0 round belong
+  // to its own previous position, never to the restored sequence's.
+  target->dflash2_pending = true;
+  target->dflash2_pending_features.assign(16, 0x5a);
   expect_rc(ignis_seq_restore(drafter, target, blob.data(), blob.size()), 0, "drafter: restore");
+  expect(!target->dflash2_pending && target->dflash2_pending_features.empty(),
+         "drafter: a restore drops the target's carried anchor taps");
   expect(lane_image_of(*drafter->dflash2_window, target->slot) == window,
          "drafter: the restored window is byte-identical");
   expect(lane_image_of(*drafter->dflash2_checkpoint, target->slot) == checkpoint,

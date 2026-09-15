@@ -225,6 +225,18 @@ struct ignis_seq {
   // Decode does not move it yet, so it may trail `position`; that is why it
   // is carried in the progress image rather than derived from `position`.
   std::uint64_t dflash2_position = 0;
+  // GitHub #157: a verify round at extent 0 commits its anchor and leaves
+  // the window untouched (#155 AC 3), so the frontier stays at the anchor.
+  // The anchor's feature taps -- BF16 [5 x hidden], one column -- are kept
+  // here instead (the reference's `pending_features`), and whatever
+  // continues the sequence (its next round, a prefill) appends them at
+  // `dflash2_position` before anything else. Host-only and never a section:
+  // a snapshot or a prefix clone taken here carries the frontier but not
+  // the taps, and its sequence resumes with the hole this closes -- an
+  // acceptance loss, never a different text. The scheduler never snapshots
+  // such a sequence: extent 0 is a request's last round.
+  bool dflash2_pending = false;
+  std::vector<std::uint8_t> dflash2_pending_features;
   // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
   // One reference is held for as long as this handle lives; `shared_pages`
   // restates its page count so every capacity question here can be answered

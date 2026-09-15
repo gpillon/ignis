@@ -417,6 +417,38 @@ void append_dflash2_context(ignis_model *model, ignis_seq_pool *pool,
       {static_cast<std::uint32_t>(count), static_cast<std::uint32_t>(count)});
 }
 
+// GitHub #157: the anchor taps a verify round at extent 0 left on `seq`
+// (`ignis_seq::dflash2_pending`), appended into its window at the anchor's
+// position ahead of whatever continues the sequence. Returns whether it
+// enqueued the append; the caller moves the frontier past the anchor, and
+// drops the taps, only once its synchronize confirms it. `host_scalars` must
+// outlive that synchronize. Allocates from `model->scratch` under the
+// caller's scope.
+bool append_dflash2_pending(ignis_model *model, ignis_seq_pool *pool, const ignis_seq &seq,
+                            std::vector<std::int32_t> &host_scalars) {
+  if (!seq.dflash2_pending) {
+    return false;
+  }
+  const auto hidden = static_cast<std::int32_t>(model->hidden);
+  ninfer::Tensor features = model->scratch->alloc(
+      ninfer::DType::BF16, {static_cast<std::int32_t>(kDflash2TapLayers.size()) * hidden, 1, 1, 1});
+  if (seq.dflash2_pending_features.size() != features.bytes()) {
+    throw std::runtime_error("the carried anchor taps are " +
+                             std::to_string(seq.dflash2_pending_features.size()) +
+                             " bytes, not one feature column");
+  }
+  const cudaError_t err =
+      cudaMemcpyAsync(features.data, seq.dflash2_pending_features.data(), features.bytes(),
+                      cudaMemcpyHostToDevice, model->stream);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemcpyAsync(carried anchor taps) failed: ") +
+                             cudaGetErrorString(err));
+  }
+  host_scalars = {1, seq.slot, static_cast<std::int32_t>(seq.dflash2_position)};
+  append_dflash2_context(model, pool, features, host_scalars.data(), 1);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // GitHub #92, acceptance criterion 1: where per-chunk prefill wall time goes.
 //
@@ -657,6 +689,15 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
   try {
     profiler.record_begin(model->stream);
+    // GitHub #157: a span continuing an extent-0 round writes that round's
+    // anchor first, so a span wider than the ring still overwrites it in
+    // order. Its own scope: none of it outlives the enqueued append.
+    std::vector<std::int32_t> pending_scalars;
+    bool pending_appended = false;
+    if (chunk_offset == 0 && pool->has_dflash2()) {
+      ninfer::DeviceArena::Scope pending_scope = model->scratch->scope();
+      pending_appended = append_dflash2_pending(model, pool, *seq, pending_scalars);
+    }
     ninfer::Tensor ids = model->scratch->alloc(ninfer::DType::I32, {T, 1, 1, 1});
     cudaError_t err =
         cudaMemcpyAsync(ids.data, token_ids, static_cast<std::size_t>(T) * sizeof(int32_t),
@@ -817,6 +858,11 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
         seq->gdn_positions[ignis_gdn_relative_layer(layer)] +=
             static_cast<std::uint32_t>(num_tokens);
       }
+    }
+    if (pending_appended) {
+      seq->dflash2_position += 1;
+      seq->dflash2_pending = false;
+      seq->dflash2_pending_features.clear();
     }
     if (tap_count > 0) {
       seq->dflash2_position = chunk_start + num_tokens;
@@ -1143,6 +1189,19 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       }
     }
 
+    // GitHub #157: each lane's carried anchor taps, into its window before
+    // the drafter reads it inside the pass. A failure below leaves the lane
+    // unmoved, and the append it enqueued rewrites the same slot with the
+    // same bytes when the lane runs again.
+    std::vector<std::vector<std::int32_t>> pending_scalars(batch_size);
+    std::vector<bool> pending_appended(batch_size, false);
+    if (drafter) {
+      ninfer::DeviceArena::Scope pending_scope = model->scratch->scope();
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        pending_appended[i] = append_dflash2_pending(model, pool, *sequences[i], pending_scalars[i]);
+      }
+    }
+
     const auto stage = [&](ninfer::DeviceBuffer &buffer, const void *host, std::size_t bytes,
                            const char *what) -> bool {
       const cudaError_t err =
@@ -1272,6 +1331,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // lane's window -- its whole committed run, or nothing for a lane at
     // extent 0, whose round read its window and leaves it as it was.
     std::vector<std::int32_t> append_counts(batch_size, 0);
+    // GitHub #157: what that lane carries instead -- its anchor column's
+    // taps, read back for the sequence's handle.
+    std::vector<std::vector<std::uint8_t>> carried_taps(batch_size);
     if (drafter) {
       for (uint64_t i = 0; i < batch_size; ++i) {
         append_counts[i] = extents[i] == 0 ? 0 : committed[i];
@@ -1280,6 +1342,23 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         return -1;
       }
       ignis_dflash2_append_round(model, pool, static_cast<std::uint32_t>(batch_size));
+      const std::size_t column_bytes =
+          kDflash2TapLayers.size() * static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        if (extents[i] != 0) {
+          continue;
+        }
+        carried_taps[i].resize(column_bytes);
+        const cudaError_t copied = cudaMemcpyAsync(
+            carried_taps[i].data(),
+            static_cast<const std::uint8_t *>(verify.features->p) + i * lane_columns * column_bytes,
+            column_bytes, cudaMemcpyDeviceToHost, model->stream);
+        if (copied != cudaSuccess) {
+          set_error(std::string("ignis_program_decode: cudaMemcpyAsync(anchor taps) failed: ") +
+                    cudaGetErrorString(copied));
+          return -1;
+        }
+      }
     }
 
     err = cudaStreamSynchronize(model->stream);
@@ -1347,8 +1426,23 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       sequences[i]->pending_token = next_pending[i];
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));
       options.out_committed_counts[i] = committed[i];
+      if (pending_appended[i]) {
+        sequences[i]->dflash2_position += 1;
+      }
       if (append_counts[i] > 0) {
         sequences[i]->dflash2_position = sequences[i]->position;
+      }
+      if (drafter) {
+        // GitHub #157: a lane at extent 0 carries its anchor's taps, but
+        // only while its window stands exactly at that anchor -- the
+        // position the carried column is appended at.
+        ignis_seq &seq = *sequences[i];
+        seq.dflash2_pending = extents[i] == 0 &&
+                              seq.dflash2_position == static_cast<std::uint64_t>(base_positions[i]);
+        seq.dflash2_pending_features.swap(carried_taps[i]);
+        if (!seq.dflash2_pending) {
+          seq.dflash2_pending_features.clear();
+        }
       }
       if (options.out_extents != nullptr) {
         options.out_extents[i] = static_cast<std::uint32_t>(extents[i]);
