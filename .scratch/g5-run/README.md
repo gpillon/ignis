@@ -86,8 +86,10 @@ bench to 0.2% (launch 1: decode 129.6 / 93.0 / 106.5).
 | ignis 1 | 2.59 (314/1371 accepted) | 2.88 (334/1241) | 6.24 (430/568) |
 | ignis 2 | 2.59 (314/1371, identical) | 2.88 (334/1241) | 6.24 (430/568) |
 
-Round cost is level (24K: ignis ~30 ms/round, reference ~32 ms); the gap at
-24K/98K is drafter acceptance on identical prompts.
+Round cost is level (24K: ignis ~30 ms/round, reference ~32 ms). The gap at
+24K/98K was first read as drafter acceptance; corrected 2026-09-15 (#160):
+the two engines generated different text there (see "Reading the depth
+FAILs").
 
 **G4 trace under speculation** (informational, no threshold):
 
@@ -129,8 +131,8 @@ do not.
 
 | cell | result | verdict |
 |---|---|---|
-| committed tok/s @24K | 82.7 vs 129.8, ratio **0.637** | FAIL → #160 |
-| committed tok/s @98K | 69.9 vs 94.2, ratio **0.742** | FAIL → #160 |
+| committed tok/s @24K | 82.7 vs 129.8, ratio **0.637** | FAIL → #160 (closed), #161, #162, #173 |
+| committed tok/s @98K | 69.9 vs 94.2, ratio **0.742** | FAIL → #160 (closed), #161, #162, #173 |
 | committed tok/s @196K | 117.8 vs 110.8, ratio **1.063** | PASS |
 | greedy equivalence | 2/4 canaries diverge (@44, @33) | FAIL → #161 |
 | canary self-consistency | 4/4 | PASS |
@@ -138,10 +140,16 @@ do not.
 
 **Reading the depth FAILs.** Both ignis launches agree to the round (198 /
 178 / 82 rounds, identical accepted counts), so the miss is not launch noise.
-A verify round costs the same on both engines; at 24K and 98K ignis's drafter
-gets roughly half the reference's acceptance on the same prompts, at 196K
-the two match. That is a drafter-state defect to find (#160), not a
-throughput gap.
+A verify round costs the same on both engines; at 24K and 98K ignis commits
+roughly half the reference's tokens per round on the same prompts, at 196K
+the two match. This was recorded as a drafter-state defect (#160). The
+2026-09-15 diagnosis says otherwise: at 24K/98K ignis hq-e8-2b picks a
+different greedy first token, so the engines generate different text and
+acceptance follows the content. ignis bf16 generates the reference's text
+token for token and drafts better on it (4.30 vs 4.09), and over 20
+token-identical real prompts ignis pools 0.965 of the reference's
+tok/round. The FAIL stands; the misses are the hq early-token divergence
+(#161, #173) and the cell accepting mismatched text (#162).
 
 **Reading the equivalence FAIL.** Both divergences are single word choices
 that read like near-ties, the class the owner accepted on 2026-09-14 (#153,
@@ -155,4 +163,4 @@ across-launch spreads themselves are small (ignis 0.5–2.9%, reference
 0.3–4.2%).
 
 **Nothing waived.** Every miss is filed: #159 (instrument, fixed here),
-#160, #161.
+#160 (closed as not the drafter), #161; follow-ups #162, #173.
