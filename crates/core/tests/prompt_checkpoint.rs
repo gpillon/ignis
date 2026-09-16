@@ -663,6 +663,69 @@ fn a_new_user_message_reuses_the_turn_opener_and_retires_the_turn() {
 }
 
 #[test]
+fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
+    // The other claimant #186 refused, and the one #188 runs into on every
+    // real request: a sequence standing on a prefix someone *else* published,
+    // which stops well short of its own generation opener. #186's rule —
+    // "your opener's whole pages must be the prefix you hold" — is satisfied
+    // by publishing a chained head, not by relaxing it, so this path and the
+    // checkpoint-claimant path above are one mechanism rather than two.
+    //
+    // With #188 the prefix below is published at the system-and-tools block
+    // instead of at a previous turn's head. The shape here is the same, and
+    // it is the shape that decides whether a request with a block prefix can
+    // still leave a prompt checkpoint at all.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    // Request A publishes a 2-page head (its own opener floors there).
+    let a = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Request B shares A's published 32-token head and nothing past it — a
+    // burst sibling, not a later turn — and its own opener is two pages
+    // further on.
+    let b = sched
+        .submit(
+            turn([tokens(1, 32), tokens(600, 40)].concat(), 69, 20, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens } if *request == b && *tokens == 32)),
+        "B claimed A's shared prefix, not a checkpoint"
+    );
+    assert!(reuses(&events, b).is_empty(), "and no checkpoint matched it");
+
+    let jobs: Vec<(usize, Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == b)
+        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(32, Some(64), None), (5, None, Some(69)), (3, None, None)],
+        "it chained a head over the one it claimed, then captured at its own opener"
+    );
+    assert_eq!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .map(|e| (e.publisher, e.tokens.len()))
+            .collect::<Vec<_>>(),
+        vec![(a, 37), (b, 69)],
+        "a burst leaves one checkpoint per sibling, not one for the publisher"
+    );
+}
+
+#[test]
 fn an_opener_inside_the_shared_page_captures_without_a_chained_publish() {
     // The other regime, and the reason the lineage rule cannot assume the
     // chained publish happens. While a conversation is still short its next

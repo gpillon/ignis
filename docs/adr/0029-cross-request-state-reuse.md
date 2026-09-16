@@ -101,7 +101,15 @@ correctness oracles.
   prefill is recorded as information, not failure.
 - **Amends ADR 0024.** A prompt checkpoint's publish point is not a page
   boundary, and a snapshot of a sequence holding a shared prefix materializes
-  the shared pages instead of being refused.
+  the shared pages instead of being refused. A shared prefix may also be
+  published *over* another one (#187, a **chained prefix**): a request that
+  resumed from retained state owns only the pages it warmed past it, so the
+  entry it publishes owns those and holds the chain below — taking over the
+  reference the sequence was holding rather than adding one. One reference per
+  link, every page still charged once, and a claimant of the chain shares all
+  of it. Without it a conversation grown past its first KV page could never
+  take a second checkpoint, and "at most two" above would bound something that
+  never grew.
 - **Amends ADR 0023.** Retained state goes first, on the device and in
   KV-RAM.
 - **Vision (#180)** builds its media-aware prefix identity on the match key

@@ -844,12 +844,14 @@ mod tests {
         let first = pool
             .retain(CheckpointCapture { prefix: 42, pages: 6, ..capture(1, &early, None, true) })
             .unwrap();
-        pool.retain(CheckpointCapture {
-            prefix: 42,
-            pages: 6,
-            ..capture(2, &late, Some(first.id), false)
-        })
-        .unwrap();
+        let second = pool
+            .retain(CheckpointCapture {
+                prefix: 42,
+                pages: 6,
+                ..capture(2, &late, Some(first.id), false)
+            })
+            .unwrap();
+        assert!(second.superseded.is_empty(), "the turn opener stays");
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
     }

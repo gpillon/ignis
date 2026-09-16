@@ -24,6 +24,14 @@
 //!     Its divergence from the other two is *recorded, not asserted* — it is
 //!     the chunking effect, and the run prints where it first parts company.
 //!
+//! It then does it again one turn on (GitHub #187). Turn N+1 stands at turn
+//! N's opener with its history shared, so its *own* opener's whole pages are
+//! not the ones it shares and the leaf refuses to capture there — until it
+//! publishes a **chained** prefix at its own opener's page floor, the pages it
+//! warmed itself over the ones it claimed. The same claim then has to hold for
+//! turn N+2 standing on *that*: what it generates is what a cold prefill split
+//! at the same boundaries generates.
+//!
 //! BF16 is asked for by name: it is the oracle format (ADR 0022), and every
 //! correctness check in the profile runs against it.
 //!
@@ -302,6 +310,165 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     drop(reuser);
     drop(control);
     drop(unsplit);
+
+    // ---- GitHub #187: turn N+1 takes a checkpoint of its own ---------------
+    //
+    // The reuser above stands at turn N's opener with `publish_at / PAGE`
+    // pages shared, and its *own* opener is further along — so the whole pages
+    // below it are not the ones it shares, and the leaf refuses to capture
+    // there. It publishes a **chained** prefix at its own opener's page floor
+    // first: the pages it warmed itself, over the ones it claimed. From there
+    // the capture is the same capture as any other.
+    //
+    // What must then be true is the same claim one turn on: turn N+2, standing
+    // on that chained checkpoint, generates exactly what a cold prefill of its
+    // prompt split at the same boundaries generates.
+    let prompt_n_plus_1 = render(&turn_n_plus_1);
+    let opener_2 = encode(
+        &prompt_n_plus_1[..ignis_artifact::ChatTemplate::generation_opener_offset(&prompt_n_plus_1)
+            .expect("turn N+1's render has a generation opener")],
+    )
+    .len() as u32;
+    let publish_at_2 = (opener_2 / PAGE) * PAGE;
+    assert!(
+        publish_at_2 > publish_at,
+        "the fixture must grow past a whole KV page between turns, or the chained publish \
+         this section exists to exercise never happens (turn N+1's opener page floor is \
+         {publish_at_2}, turn N's is {publish_at}) — lengthen the messages"
+    );
+    let mut turn_n_plus_2 = turn_n_plus_1.clone();
+    turn_n_plus_2.push(ignis_artifact::ChatMessage::text(
+        ignis_artifact::Role::Assistant,
+        "The block table is one row per sequence: logical page index in, physical page id \
+         out, read by every attention kernel.",
+    ));
+    turn_n_plus_2.push(ignis_artifact::ChatMessage::text(
+        ignis_artifact::Role::User,
+        "And what happens to that row when two sequences share a prompt head?",
+    ));
+    let prompt3 = encode(&render(&turn_n_plus_2));
+    assert!(
+        prompt3.starts_with(&prompt[..opener_2 as usize]),
+        "turn N+1's head must be a token prefix of turn N+2's prompt"
+    );
+    assert!(
+        prompt3.len() < (MAX_CONTEXT as usize) - GENERATED,
+        "turn N+2's prompt plus its generation must fit the reservation: {} tokens",
+        prompt3.len()
+    );
+    println!(
+        "prompt_checkpoint_gpu: turn N+1 opener {opener_2} (chained publish at {publish_at_2}), \
+         turn N+2 prompt {} tokens",
+        prompt3.len()
+    );
+
+    // Turn N+1, decomposed the way the scheduler decomposes it: claim, prefill
+    // to its own opener's page floor, publish the chain, prefill to the opener,
+    // capture, then the rest.
+    let mut turn2 = pool
+        .alloc_from_checkpoint(MAX_CONTEXT, &checkpoint)
+        .unwrap_or_else(|e| panic!("alloc turn N+1 from checkpoint: {e}"));
+    prefill_program(
+        &model,
+        &pool,
+        &mut turn2,
+        &prompt[opener as usize..publish_at_2 as usize],
+        u64::from(opener),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("turn N+1 prefill to the chained publish point: {e}"));
+    let chained = turn2
+        .publish_prefix(publish_at_2)
+        .unwrap_or_else(|e| panic!("chained publish: {e}"));
+    assert_eq!(
+        chained.stats().pages,
+        (publish_at_2 - publish_at) / PAGE,
+        "the chained entry owns only the pages turn N+1 warmed itself"
+    );
+    assert_eq!(
+        chained.stats().tokens,
+        publish_at_2,
+        "and covers the whole head, its parent's pages included"
+    );
+    prefill_program(
+        &model,
+        &pool,
+        &mut turn2,
+        &prompt[publish_at_2 as usize..opener_2 as usize],
+        u64::from(publish_at_2),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("turn N+1 prefill to its own opener: {e}"));
+    let checkpoint_2 = turn2
+        .capture_checkpoint(opener_2)
+        .unwrap_or_else(|e| panic!("turn N+1 capture (the refusal #187 removed): {e}"));
+    assert_eq!(checkpoint_2.stats().tokens, opener_2);
+    assert_eq!(
+        checkpoint_2.stats().pages,
+        publish_at_2 / PAGE,
+        "the second checkpoint reaches over the whole chain below its opener"
+    );
+    prefill_program(
+        &model,
+        &pool,
+        &mut turn2,
+        &prompt[opener_2 as usize..],
+        u64::from(opener_2),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("turn N+1 tail prefill: {e}"));
+    drop(turn2);
+    assert_eq!(
+        free_at_rest - pool.stats().kv_free_pages,
+        publish_at_2 / PAGE,
+        "two retained checkpoints over one chain hold each page once"
+    );
+
+    // The split control for turn N+2: its prompt, cold, cut at every boundary
+    // the reuse path cut it at.
+    let mut control3 = pool
+        .alloc(MAX_CONTEXT)
+        .unwrap_or_else(|e| panic!("alloc turn N+2 split control: {e}"));
+    for (span, start) in [
+        (&prompt3[..publish_at as usize], 0u64),
+        (&prompt3[publish_at as usize..opener as usize], u64::from(publish_at)),
+        (&prompt3[opener as usize..publish_at_2 as usize], u64::from(opener)),
+        (&prompt3[publish_at_2 as usize..opener_2 as usize], u64::from(publish_at_2)),
+        (&prompt3[opener_2 as usize..], u64::from(opener_2)),
+    ] {
+        prefill_program(&model, &pool, &mut control3, span, start, None)
+            .unwrap_or_else(|e| panic!("turn N+2 split control prefill at {start}: {e}"));
+    }
+    let expected3 = decode_n(&model, &pool, &mut control3, GENERATED, "turn N+2 split control");
+
+    let mut turn3 = pool
+        .alloc_from_checkpoint(MAX_CONTEXT, &checkpoint_2)
+        .unwrap_or_else(|e| panic!("alloc turn N+2 from the chained checkpoint: {e}"));
+    assert_eq!(
+        turn3.stats().position,
+        u64::from(opener_2),
+        "turn N+2 stands at turn N+1's opener before it prefills anything"
+    );
+    prefill_program(
+        &model,
+        &pool,
+        &mut turn3,
+        &prompt3[opener_2 as usize..],
+        u64::from(opener_2),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("turn N+2 tail prefill: {e}"));
+    let reused3 = decode_n(&model, &pool, &mut turn3, GENERATED, "turn N+2 reuser");
+    assert_eq!(
+        reused3, expected3,
+        "a claimant of a chained checkpoint must generate exactly what a cold prefill split \
+         at the same boundaries does"
+    );
+    drop(turn3);
+    drop(control3);
+    drop(checkpoint_2);
+    drop(chained);
+
     drop(checkpoint);
     assert_eq!(
         pool.stats().kv_free_pages,

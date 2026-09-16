@@ -252,25 +252,48 @@ impl Request {
     /// publishing nothing — which is what #186 did — is what stopped a
     /// conversation past its first page from ever taking a second checkpoint.
     ///
-    /// It does so only when the chain buys something: the head must reach past
-    /// what the request already shares, and the request must have a generation
-    /// opener to capture at. Without that gate every concurrent sibling of a
-    /// burst would pay a chunk split for a prefix no one is going to claim —
-    /// the publish point is the *opener's* page floor (#186), which is a
-    /// checkpoint's boundary, not a burst's.
+    /// **This is a sequence, not a number.** A request may publish at more
+    /// than one boundary in its prompt, each as a chained entry over the last,
+    /// and what it publishes *next* is the first boundary past what it already
+    /// shares. #187 supplies one boundary, the generation opener's page floor,
+    /// which is what makes the request's own checkpoint capturable. #188 adds
+    /// the end of the system-and-tools block **before** it — the only head a
+    /// subagent burst can share — and the two compose rather than exclude each
+    /// other: publish the block, chain the opener's page over it, capture
+    /// there. (Merge note: `boundaries` below becomes
+    /// `[self.retained_prefix_point(page_tokens), self.publish_tokens]` and
+    /// `ConcreteScheduler::submit` stops flooring `publish_tokens` to the
+    /// block, which is the whole of the #187 × #188 join.)
+    ///
+    /// A boundary past the first is published only when the request has a
+    /// generation opener to capture at. Without that gate every concurrent
+    /// sibling of a burst would pay a chunk split for a chained prefix nobody
+    /// is going to claim — no subagent's prompt extends its sibling's.
     ///
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
-        if self.prefix_entry.is_none() {
-            return self.publish_tokens;
+        if !self.may_share_prefix() {
+            return 0;
         }
-        let reaches_further = self.publish_tokens > self.shared_pages.saturating_mul(page_tokens);
-        if self.input.opener_tokens.is_some() && reaches_further && self.may_share_prefix() {
-            self.publish_tokens
-        } else {
-            0
+        let shared = self.shared_pages.saturating_mul(page_tokens);
+        // Ascending, and it has to be: "the first boundary past what I already
+        // share" is only the next one if they are in prompt order. They always
+        // are — the system block ends before the last generation opener, and
+        // flooring to pages is monotone.
+        let boundaries = [self.publish_tokens];
+        for at in boundaries {
+            // Already published, or covered by the entry this request claimed.
+            if at <= shared {
+                continue;
+            }
+            // A chained publish has to earn its chunk split.
+            if self.prefix_entry.is_some() && self.input.opener_tokens.is_none() {
+                continue;
+            }
+            return at;
         }
+        0
     }
 
     /// The **capture point** (GitHub #186, ADR 0029): the prefill position at
