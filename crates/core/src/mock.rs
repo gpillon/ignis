@@ -402,4 +402,15 @@ impl Compute for GatedCompute {
     fn discard_snapshot(&self, request: RequestId) {
         self.inner.discard_snapshot(request);
     }
+
+    fn checkpoint_image_bytes(&self) -> u64 {
+        // Forwarded explicitly, like every other method on this decorator: a
+        // silent default of 0 would make a gated test retain nothing at all
+        // and look as though checkpoints simply did not work under latency.
+        self.inner.checkpoint_image_bytes()
+    }
+
+    fn release_checkpoint(&self, publisher: RequestId) {
+        self.inner.release_checkpoint(publisher);
+    }
 }
