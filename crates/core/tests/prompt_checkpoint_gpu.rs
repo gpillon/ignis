@@ -308,80 +308,19 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         free_at_rest,
         "releasing the last holder returns every page"
     );
-}
 
-#[test]
-#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn a_capture_leaves_the_capturing_sequence_generating_what_it_would_have() {
-    // The other half of "a capture is a pure read": the request that pays for
-    // the chunk must be exactly as well off as one that was never asked to
-    // capture. Two identical sequences, one captured against and one not,
-    // decode the same tokens.
-    let path = Path::new(ARTIFACT);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
-        return;
-    }
-    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
-    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
-    let text = "A block table maps a sequence's logical KV pages to physical ones, \
-                which is what lets a paged cache place a long history wherever there \
-                is room. Describe the trade-offs in as much detail as you can manage. "
-        .repeat(3);
-    let prompt: Vec<i32> = frontend
-        .tokenizer()
-        .encode(&text)
-        .unwrap_or_else(|e| panic!("tokenize: {e}"))
-        .into_iter()
-        .map(|id| i32::try_from(id).expect("token id fits i32"))
-        .collect();
-    // An opener 40 tokens into the sequence's own first page: not a page
-    // boundary, which is the case that matters.
-    let publish_at = 2 * PAGE;
-    let opener = publish_at + 40;
-    assert!(prompt.len() > opener as usize + 8, "the prompt must reach past the opener");
-    assert!(prompt.len() < MAX_CONTEXT as usize - GENERATED);
-
-    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
-    let mut device = match CudaDevice::create(0) {
-        Ok(device) => device,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
-    let artifact = match materialize(&reader, &plan, &mut device, None) {
-        Ok(artifact) => artifact,
-        Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
-                return;
-            }
-            unreachable!("skip_or_fail panics under the profile");
-        }
-    };
-    let model = load_qwen38_27b(
-        &reader,
-        &artifact,
-        &handles,
-        MAX_CONTEXT,
-        MAX_CONTEXT,
-        ignis_core::KvFormat::Bf16,
-    )
-    .unwrap_or_else(|e| panic!("load model: {e}"));
-    let pool = SeqPool::create(
-        &ModelConfig::qwen38_27b(),
-        &SeqPoolBudget {
-            kv_format: ignis_core::KvFormat::Bf16,
-            kv_page_group_count: 80,
-            max_context_tokens: MAX_CONTEXT,
-            slot_count: 4,
-        },
-    )
-    .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
-
-    // One sequence publishes, walks to the opener, captures, and finishes its
-    // prompt. The other does exactly the same without the capture.
+    // ---- the other half of "a capture is a pure read" ----------------------
+    //
+    // Everything above is about what a *claimant* receives. This is about what
+    // the capturing request is left with: it paid for the chunk, and being
+    // captured against must cost it nothing — not a page, not a token. Two
+    // identical sequences over the same conversation, one captured against and
+    // one not, must decode the same tokens.
+    //
+    // It shares this test's model and pool deliberately. One `#[test]` per
+    // binary that loads the 27B artifact is not a style choice: two loads in
+    // one process do not fit on the card, and the second fails at
+    // `ignis_model_load` with a scratch reservation it cannot make.
     let run = |capture: bool, label: &str| -> Vec<i32> {
         let mut seq = pool
             .alloc(MAX_CONTEXT)
@@ -400,23 +339,34 @@ fn a_capture_leaves_the_capturing_sequence_generating_what_it_would_have() {
             None,
         )
         .unwrap_or_else(|e| panic!("{label}: opener prefill: {e}"));
-        let checkpoint = capture.then(|| {
+        let taken = capture.then(|| {
             seq.capture_checkpoint(opener)
                 .unwrap_or_else(|e| panic!("{label}: capture: {e}"))
         });
-        prefill_program(&model, &pool, &mut seq, &prompt[opener as usize..], u64::from(opener), None)
-            .unwrap_or_else(|e| panic!("{label}: tail prefill: {e}"));
+        prefill_program(
+            &model,
+            &pool,
+            &mut seq,
+            &prompt[opener as usize..],
+            u64::from(opener),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{label}: tail prefill: {e}"));
         let out = decode_n(&model, &pool, &mut seq, GENERATED, label);
-        drop(checkpoint);
+        drop(taken);
         drop(seq);
         drop(prefix);
         out
     };
-
     let uncaptured = run(false, "uncaptured");
     let captured = run(true, "captured");
     assert_eq!(
         captured, uncaptured,
         "being captured against must cost the capturing request nothing, not even a token"
+    );
+    assert_eq!(
+        pool.stats().kv_free_pages,
+        free_at_rest,
+        "and both twins gave every page back"
     );
 }
