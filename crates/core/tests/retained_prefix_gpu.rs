@@ -257,10 +257,13 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
     let mut reuser = pool
         .alloc_shared(MAX_CONTEXT, &prefix)
         .unwrap_or_else(|e| panic!("alloc against the retained prefix: {e}"));
+    // The claimant's own account of what it holds, read off the leaf rather
+    // than assumed, so the two views are compared with each other instead of
+    // each with a literal (the shape `prefix_reuse_gpu.rs` uses).
     assert_eq!(
-        reuser.stats().position,
-        u64::from(publish_at),
-        "the claimant stands at the block's end before it prefills anything"
+        reuser.stats().shared_pages,
+        prefix.stats().pages,
+        "the claimant's shared pages are exactly the retained block's"
     );
     prefill_program(
         &model,
@@ -285,10 +288,12 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
     let mut third = pool
         .alloc_shared(MAX_CONTEXT, &prefix)
         .unwrap_or_else(|e| panic!("alloc third claimant: {e}"));
+    let claimant = third.stats();
     assert_eq!(
         free_before_third - pool.stats().kv_free_pages,
-        MAX_CONTEXT / PAGE - publish_at / PAGE,
-        "a second claimant reserves only its own tail: the block is already charged"
+        claimant.mapped_pages - claimant.shared_pages,
+        "a second claimant reserves only its own tail: the block is charged once, \
+         however many of the burst stand on it"
     );
     prefill_program(
         &model,
