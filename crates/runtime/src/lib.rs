@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use ignis_core::vision::{MediaItem, Multimodal};
 use ignis_core::{
-    Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason, N_DECODE_LANES,
-    PrefillJob, PrefillOutcome, RequestId, SpecCounters, TokenId,
+    BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestId, SpecCounters, TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -273,6 +273,19 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// Release the adapter's handle on a checkpoint: its images go, and the
     /// pages under it return to the pool once nothing else holds them.
     fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {}
+    /// The compatibility identity of the state this leaf produces (GitHub
+    /// #189, ADR 0029): the artifact it loaded, its KV format, the blob
+    /// layout version its sequence pool writes, and the drafter bound at
+    /// load. Two of the four are the leaf's alone to know — which artifact it
+    /// opened, and what version its own state-section table is at — which is
+    /// why the identity is read from here and never assembled above it.
+    ///
+    /// [`BlobIdentity::UNSET`] from a leaf that retains nothing: it has no
+    /// blobs to hand anybody, and an identity that matches no real load is
+    /// the right answer for one.
+    fn blob_identity(&self) -> BlobIdentity {
+        BlobIdentity::UNSET
+    }
     /// Warm one sequence with a prefill span.
     fn prefill(
         &self,
@@ -760,6 +773,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
     fn checkpoint_image_bytes(&self) -> u64 {
         self.model.leaf.checkpoint_image_bytes(self.model.handle())
+    }
+
+    fn blob_identity(&self) -> BlobIdentity {
+        self.model.leaf.blob_identity()
     }
 
     fn release_checkpoint(&self, publisher: RequestId) {

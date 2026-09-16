@@ -39,6 +39,7 @@ pub mod gdn_layer;
 pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
+pub mod identity;
 pub mod kv;
 pub mod kv_format;
 pub mod mock;
@@ -70,6 +71,10 @@ pub use concrete::{
     resolve_serving_chunk_tokens,
 };
 pub use host::{HostEntry, HostError, HostTier, Tier};
+pub use identity::{
+    ArtifactHash, BlobHeader, BlobIdentity, IdentityField, IdentityMismatch, MATCH_KEY_VERSION,
+    MatchKey, MatchKeyChain, MediaKey, PromptContent,
+};
 pub use kv_format::{
     DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,

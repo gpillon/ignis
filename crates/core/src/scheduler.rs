@@ -354,6 +354,25 @@ pub trait Compute: Send + Sync {
         0
     }
 
+    /// The compatibility identity of the state this backend produces
+    /// (GitHub #189, ADR 0029): the artifact it loaded, the KV format its
+    /// pages are written in, the blob layout version its sequence pool
+    /// writes, and the drafter bound at load.
+    ///
+    /// Read from the backend rather than assembled here, because only the
+    /// backend knows two of the four. The blob layout version in particular
+    /// belongs to the leaf — its state-section table is internal by design
+    /// (ADR 0024), so a version this crate held its own copy of would not
+    /// move when the table did, and a stale blob would restore garbage
+    /// instead of being refused.
+    ///
+    /// The default is [`BlobIdentity::UNSET`]: a backend that retains nothing
+    /// has no blobs to hand anybody, and an identity that matches no real
+    /// load is the right answer for one.
+    fn blob_identity(&self) -> crate::identity::BlobIdentity {
+        crate::identity::BlobIdentity::UNSET
+    }
+
     /// Release the device image `publisher`'s prompt checkpoint left behind,
     /// and the backend's own hold on the KV pages under it.
     ///

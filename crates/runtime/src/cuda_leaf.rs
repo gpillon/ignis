@@ -23,11 +23,13 @@
 
 use ignis_artifact::{CudaDevice, Device, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
-use ignis_core::seq::{PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix};
+use ignis_core::seq::{
+    PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix, snapshot_format_version,
+};
 use ignis_core::step;
 use ignis_core::{
-    DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, SpecCounters,
-    TokenId, plan_kv_pool_for_context,
+    ArtifactHash, BlobIdentity, DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig,
+    N_DECODE_LANES, SpecCounters, TokenId, plan_kv_pool_for_context,
 };
 
 use ignis_core::vision::MediaItem;
@@ -498,6 +500,29 @@ impl StepLeaf for CudaLeaf {
     fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {
         // `SeqCheckpoint`'s own `Drop` frees the images and lets go of the
         // prefix under it (`ignis_seq_checkpoint_release`).
+    }
+
+    /// GitHub #189: the four facts that decide whether retained state may be
+    /// written into a sequence of this load, read from the load itself.
+    ///
+    /// Two of them exist nowhere else: the artifact's content hash comes from
+    /// the container this leaf opened, and the blob layout version comes from
+    /// the leaf's own state-section table (ADR 0024 keeps that table
+    /// internal, so a version restated in Rust would not move when the table
+    /// did). The other two are this load's options, taken from the config
+    /// they were fixed in rather than re-derived.
+    ///
+    /// Nothing about how *much* is retained reaches it: the pool budget, the
+    /// chunk width, the slot count and `--prompt-reuse` are all absent, which
+    /// is what keeps a derived-from-free-VRAM budget from refusing yesterday's
+    /// blobs after a reboot.
+    fn blob_identity(&self) -> BlobIdentity {
+        BlobIdentity::of_load(
+            ArtifactHash::from_bytes(self.reader.content_hash()),
+            self.config.kv_format,
+            self.config.speculation,
+            snapshot_format_version(),
+        )
     }
 
     fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {

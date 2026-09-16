@@ -119,7 +119,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::checkpoint::{CheckpointEntry, CheckpointPool, ReuseSource};
+use crate::checkpoint::{CheckpointCapture, CheckpointEntry, CheckpointPool, ReuseSource};
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
     ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
@@ -127,6 +127,7 @@ use crate::admission::{
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
 use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
+use crate::identity::{MediaKey, PromptContent};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
@@ -220,6 +221,22 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 /// spins the model thread. The attempt that reaches this ends the request
 /// with [`FinishReason::Error`].
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
+
+/// The media identity of `input`'s prompt, for the content match key
+/// (GitHub #189; #193 is what makes this reachable).
+///
+/// Empty — and allocation-free — for the text-only request that is every
+/// request today: a multimodal one never reaches the reuse path at all
+/// (`Request::may_share_prefix`). It is wired here rather than in #193
+/// because the key's media slot is decided by *what* is mixed in, and taking
+/// exactly the processor's per-item content digest and grid out of the items
+/// is that decision. #193 opens the gate; it does not get to change the key.
+fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
+    match &input.multimodal {
+        None => Vec::new(),
+        Some(multimodal) => multimodal.media.iter().map(MediaKey::from).collect(),
+    }
+}
 
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
@@ -401,16 +418,22 @@ impl ConcreteScheduler {
             host: HostTier::new(config.host_capacity_bytes),
             tick: 0,
             prefix: PrefixCache::new(config.kv_page_tokens),
-            checkpoints: CheckpointPool::new(if config.prompt_reuse {
-                config.retained_pool_bytes
-            } else {
-                // `--prompt-reuse off` is not a budget of zero that something
-                // might later grow: it is a pool that never exists. Building
-                // it empty makes every read of it — `admits`, `best_match`,
-                // `retained_pages` — answer correctly without a second flag
-                // check at each site.
-                0
-            }),
+            // GitHub #189: the pool holds what this backend's state was
+            // produced under, so an entry it could not write into a sequence
+            // is never offered to one.
+            checkpoints: CheckpointPool::with_identity(
+                if config.prompt_reuse {
+                    config.retained_pool_bytes
+                } else {
+                    // `--prompt-reuse off` is not a budget of zero that
+                    // something might later grow: it is a pool that never
+                    // exists. Building it empty makes every read of it —
+                    // `admits`, `best_match`, `retained_pages` — answer
+                    // correctly without a second flag check at each site.
+                    0
+                },
+                compute.blob_identity(),
+            ),
             config,
             compute,
             next_id: 0,
@@ -564,7 +587,7 @@ impl ConcreteScheduler {
     /// after this point keeps its checkpoint without a single extra rule
     /// (spec §Cancellation).
     fn retain_checkpoint(&mut self, idx: usize, at: u32) {
-        let (publisher, prefix, tokens, gdn) = {
+        let (publisher, prefix, key, gdn) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
                 // The leaf published a prefix and captured against it, and
@@ -575,21 +598,27 @@ impl ConcreteScheduler {
                 self.compute.release_checkpoint(r.id);
                 return;
             };
+            let media = media_keys(&r.input);
             (
                 r.id,
                 prefix,
-                r.input.tokens[..at as usize].to_vec(),
+                PromptContent::new(&r.input.tokens, &media).key_at(at),
                 r.gdn.clone(),
             )
         };
-        let pages = self.prefix.pages_of(prefix);
-        let bytes = self.compute.checkpoint_image_bytes();
-        let tick = self.tick;
-        match self
-            .checkpoints
-            .retain(publisher, tokens, prefix, pages, bytes, gdn, tick)
-        {
-            Some(_) => {
+        let capture = CheckpointCapture {
+            publisher,
+            key,
+            tokens: at,
+            prefix,
+            pages: self.prefix.pages_of(prefix),
+            bytes: self.compute.checkpoint_image_bytes(),
+            gdn,
+            identity: self.checkpoints.identity(),
+            tier: ReuseSource::Device,
+        };
+        match self.checkpoints.retain(capture, self.tick) {
+            Ok(_) => {
                 self.requests[idx].checkpoint_captured = true;
                 self.prefix.retain(prefix);
             }
@@ -597,8 +626,10 @@ impl ConcreteScheduler {
             // in one call both cleared it before either had retained. The
             // image the backend took is real but nothing can now reach it, so
             // it is released here rather than left to outlive every ledger
-            // that knows it exists.
-            None => self.compute.release_checkpoint(publisher),
+            // that knows it exists. (An identity refusal cannot happen on this
+            // path: the capture carries the pool's own identity, because this
+            // load's backend is what produced it.)
+            Err(_) => self.compute.release_checkpoint(publisher),
         }
     }
 
@@ -1703,9 +1734,11 @@ impl Scheduler for ConcreteScheduler {
                     // beat, because claiming a prefix is not free — it pins
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
-                    let retained = self
-                        .checkpoints
-                        .best_match(&self.requests[i].input.tokens);
+                    let media = media_keys(&self.requests[i].input);
+                    let retained = self.checkpoints.best_match(&PromptContent::new(
+                        &self.requests[i].input.tokens,
+                        &media,
+                    ));
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
@@ -1892,7 +1925,11 @@ impl Scheduler for ConcreteScheduler {
                     if at == 0 || !admits {
                         return 0;
                     }
-                    let head = &r.input.tokens[..at as usize];
+                    // GitHub #189: what makes two capture points the same is
+                    // their content, so the duplicate check is over the key —
+                    // and the key is what the entry will carry anyway.
+                    let media = media_keys(&r.input);
+                    let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
                     if self.checkpoints.holds(head) { 0 } else { at }
                 })
                 .collect()
