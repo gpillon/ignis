@@ -215,3 +215,18 @@ What building Tier 1 decided that the Decision left open.
   a tier), spill, discard and restore (landed) are emitted by the core, one
   per event, per tier, identically with metrics on or off (ADR 0017 as
   amended by #190).
+
+## Amendment (2026-09-16) — multimodal prompts (#193)
+
+- **Prefix identity is the match key everywhere.** Sibling shared prefixes,
+  retained prefixes, their KV-RAM copies and prompt checkpoints are all matched
+  by token ids *and* media items; a publish point never ends inside a media
+  item's placeholders.
+- **A multimodal claim always leaves one prompt token to prefill** (owner
+  decision). A claimant is built from cloned pages and mutable state, neither
+  of which carries the sequence's `rope_delta`; only a prefill span hands it to
+  the leaf. So neither a shared prefix nor a prompt checkpoint reaching a
+  multimodal prompt's last token is offered — a claimant's prompt can end
+  exactly at another request's opener. It costs one re-prefilled token in that
+  rare case. Lifting it means carrying `rope_delta` with the reused state
+  (#201).
