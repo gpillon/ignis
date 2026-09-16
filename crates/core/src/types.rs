@@ -74,6 +74,24 @@ pub struct RequestInput {
     /// whoever rendered it and not recoverable from token ids. #188 adds the
     /// end of the system-and-tools block beside it for the same reason.
     pub opener_tokens: Option<u32>,
+    /// The **system block boundary** (GitHub #188, ADR 0029): how many leading
+    /// prompt tokens end the rendered prompt's first
+    /// `<|im_start|>system … <|im_end|>\n` — the reasoning instructions, the
+    /// tools and the system message, which the template renders as one block.
+    ///
+    /// The mirror of [`Self::opener_tokens`], and the point a **retained
+    /// prefix** is published at. The opener is the last position a
+    /// conversation's own later turns share; this is the first position two
+    /// *unrelated* requests share, which is all a burst of subagents has: no
+    /// subagent's prompt extends its sibling's, so no prompt checkpoint can
+    /// ever match between them.
+    ///
+    /// `None` when the frontend could not report one — a render that does not
+    /// open with a system block, or a boundary whose byte offset does not
+    /// tokenize to an exact token prefix of the prompt. Then nothing is
+    /// published there, rather than a prefix published at a point the
+    /// tokenizer disagrees about.
+    pub system_block_tokens: Option<u32>,
 }
 
 /// Sampling / decoding parameters for a request.

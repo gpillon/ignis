@@ -53,6 +53,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
         opener_tokens: None,
+        system_block_tokens: None,
         model: "test-model".into(),
         tokens,
         params: DecodeParams {
