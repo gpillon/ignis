@@ -133,7 +133,7 @@ use crate::host::{
     DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase, RetainedBlob,
     RetainedKvRamEntry, Tier,
 };
-use crate::identity::{MediaKey, PromptContent};
+use crate::identity::{MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
 use crate::request::Request;
 use crate::scheduler::{
@@ -241,14 +241,13 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
 
 /// The media identity of `input`'s prompt, for the content match key
-/// (GitHub #189; #193 is what makes this reachable).
+/// (GitHub #189, #193).
 ///
-/// Empty — and allocation-free — for the text-only request that is every
-/// request today: a multimodal one never reaches the reuse path at all
-/// (`Request::may_share_prefix`). It is wired here rather than in #193
-/// because the key's media slot is decided by *what* is mixed in, and taking
-/// exactly the processor's per-item content digest and grid out of the items
-/// is that decision. #193 opens the gate; it does not get to change the key.
+/// Empty — and allocation-free — for a text-only request. The key's media
+/// slot is decided by *what* is mixed in, and taking exactly the processor's
+/// per-item content digest and grid out of the items is that decision: two
+/// encodes of one image name the same item, the same bytes resized to another
+/// grid do not.
 fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
     match &input.multimodal {
         None => Vec::new(),
@@ -788,6 +787,32 @@ impl ConcreteScheduler {
         true
     }
 
+    /// Request `i`'s prompt keyed at every length retained state and shared
+    /// prefixes hold (GitHub #193): the one forward pass a claimant's lookups
+    /// share, rather than one per pool.
+    ///
+    /// Its tokens and media — minus the last token for a multimodal request.
+    /// A claim reaching the prompt's very end leaves nothing to prefill, and
+    /// for a multimodal request the prefill is the only thing that hands the
+    /// leaf its `rope_delta`: a claimant is cloned from a publisher's mutable
+    /// state and pages, or from a checkpoint's image, and none of them carries
+    /// it (`step.cu` sets `seq->rope_delta` from the span options). Without one
+    /// tail token its every decode round would rotate at `position + 0`. A
+    /// checkpoint is held to it too: its own capture leaves a tail, but a
+    /// *claimant's* prompt can end exactly at another request's opener.
+    fn reuse_keys(&self, i: usize) -> PromptKeys {
+        let input = &self.requests[i].input;
+        let media = media_keys(input);
+        let prompt = PromptContent::new(&input.tokens, &media);
+        let reach = match input.multimodal {
+            Some(_) => prompt.tokens().saturating_sub(1),
+            None => prompt.tokens(),
+        };
+        prompt
+            .head(reach)
+            .keys_for(self.checkpoints.match_lengths().chain(self.prefix.match_lengths()))
+    }
+
     /// Bring spilled prefix `id` back onto the device as a retained prefix
     /// (GitHub #190, owner decision): one restore across the bus, after which
     /// the request that matched it — and every later member of its burst —
@@ -823,10 +848,7 @@ impl ConcreteScheduler {
         if !fits {
             return false;
         }
-        let Some((entry, own_pages)) =
-            self.prefix
-                .register(spilled.publisher, &spilled.tokens, &spilled.gdn, None)
-        else {
+        let Some((entry, own_pages)) = self.prefix.register_returned(&spilled) else {
             self.compute
                 .release_prefix(spilled.publisher, spilled.length_tokens);
             return false;
@@ -2039,66 +2061,68 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        // GitHub #178: a multimodal request publishes nothing (see
-        // `Request::may_share_prefix`).
-        let publish_tokens = match input.multimodal {
-            Some(_) => 0,
-            None => {
-                let head = self.prefix.shareable_head_tokens(input.tokens.len());
-                // GitHub #186 (ADR 0029): with cross-request reuse on, the
-                // head is floored to the **opener's** page rather than the
-                // prompt's. That is what puts the generation opener inside
-                // the request's own first KV page — the page a later claimant
-                // *copies*, since it is still being written — while every
-                // page before it is a whole page the claimant *shares*.
-                // Without this the two boundaries drift apart whenever the
-                // last two or three prompt tokens happen to cross a page, and
-                // no checkpoint could be taken on those prompts at all.
-                // It never raises the head, so a concurrent sibling loses at
-                // most one page of shared prefix.
-                //
-                // GitHub #188 (ADR 0029): and floored again to the **system
-                // block's** page when the frontend reported one of at least a
-                // page. That is the retained-prefix boundary, and it is the
-                // only head a *burst* can ever share — no subagent's prompt
-                // extends its sibling's, so a prefix cut any further in
-                // matches nobody but its own conversation. A prompt whose
-                // block is under one page, or that has none, keeps #186's
-                // opener page and its prompt checkpoint with it.
-                //
-                // One head is published, not two: the leaf allows one prefix
-                // per sequence (`seq_prefix.cu:129`, "already claims a shared
-                // prefix"), and a checkpoint demands its whole pages *be* that
-                // prefix (`seq_checkpoint.cu:125`). So the extra chunk split
-                // the spec asks for is **moved**, not added.
-                //
-                // The two boundaries share that head when they fall in the
-                // same page — a short first turn leaves a retained prefix
-                // *and* a checkpoint — and compete for it when they do not,
-                // which is every prompt carrying tools.
-                //
-                // The competition is temporary, and GitHub #187 ends it by
-                // **chaining** the publish rather than by weakening the
-                // capture. `seq_checkpoint.cu:125`'s
-                // `below != seq->shared_pages` stays, and must: a checkpoint
-                // holds exactly one copied tail page and its capture takes
-                // `seq->kv.page_ids()[0]`, so with the opener pages above the
-                // block the copied page would not be the opener's at all and
-                // the pages between would have no holder — which is the
-                // defect #186 fixed in `565d634`. What #187 removes instead is
-                // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
-                // sequence standing on the block publishes a *second* prefix
-                // over the head it warmed itself, taking over the reference it
-                // held. The intermediate pages get their holder from that
-                // chained link, and `below == shared_pages` becomes true
-                // rather than relaxed.
-                let opener_page = |at: u32| (at / self.config.kv_page_tokens) * self.config.kv_page_tokens;
-                match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
-                    Some(opener) => head.min(opener_page(opener)),
-                    None => head,
-                }
-            }
+        let head = self.prefix.shareable_head_tokens(input.tokens.len());
+        // GitHub #186 (ADR 0029): with cross-request reuse on, the
+        // head is floored to the **opener's** page rather than the
+        // prompt's. That is what puts the generation opener inside
+        // the request's own first KV page — the page a later claimant
+        // *copies*, since it is still being written — while every
+        // page before it is a whole page the claimant *shares*.
+        // Without this the two boundaries drift apart whenever the
+        // last two or three prompt tokens happen to cross a page, and
+        // no checkpoint could be taken on those prompts at all.
+        // It never raises the head, so a concurrent sibling loses at
+        // most one page of shared prefix.
+        //
+        // GitHub #188 (ADR 0029): and floored again to the **system
+        // block's** page when the frontend reported one of at least a
+        // page. That is the retained-prefix boundary, and it is the
+        // only head a *burst* can ever share — no subagent's prompt
+        // extends its sibling's, so a prefix cut any further in
+        // matches nobody but its own conversation. A prompt whose
+        // block is under one page, or that has none, keeps #186's
+        // opener page and its prompt checkpoint with it.
+        //
+        // One head is published, not two: the leaf allows one prefix
+        // per sequence (`seq_prefix.cu:129`, "already claims a shared
+        // prefix"), and a checkpoint demands its whole pages *be* that
+        // prefix (`seq_checkpoint.cu:125`). So the extra chunk split
+        // the spec asks for is **moved**, not added.
+        //
+        // The two boundaries share that head when they fall in the
+        // same page — a short first turn leaves a retained prefix
+        // *and* a checkpoint — and compete for it when they do not,
+        // which is every prompt carrying tools.
+        //
+        // The competition is temporary, and GitHub #187 ends it by
+        // **chaining** the publish rather than by weakening the
+        // capture. `seq_checkpoint.cu:125`'s
+        // `below != seq->shared_pages` stays, and must: a checkpoint
+        // holds exactly one copied tail page and its capture takes
+        // `seq->kv.page_ids()[0]`, so with the opener pages above the
+        // block the copied page would not be the opener's at all and
+        // the pages between would have no holder — which is the
+        // defect #186 fixed in `565d634`. What #187 removes instead is
+        // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
+        // sequence standing on the block publishes a *second* prefix
+        // over the head it warmed itself, taking over the reference it
+        // held. The intermediate pages get their holder from that
+        // chained link, and `below == shared_pages` becomes true
+        // rather than relaxed.
+        let opener_page = |at: u32| (at / self.config.kv_page_tokens) * self.config.kv_page_tokens;
+        let publish_tokens = match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
+            Some(opener) => head.min(opener_page(opener)),
+            None => head,
         };
+        // GitHub #193: a multimodal request publishes at that head too — its
+        // prefixes are keyed by their images as well as their token ids, so a
+        // sibling sending another picture never matches past it. What it must
+        // never do is end *inside* an image: the head walks back to the page
+        // holding the item's first placeholder. When that page is below the
+        // opener's, the checkpoint is lost for this turn (its whole pages are
+        // no longer the prefix, `Request::checkpoint_point`), which is the
+        // price of an image ending within a page of the generation opener.
+        let publish_tokens = input.prefix_floor(publish_tokens, self.config.kv_page_tokens);
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         // GitHub #187 × #188: the two boundaries **compose** rather than
         // exclude each other. #188 floored this to the system block, because
@@ -2189,12 +2213,10 @@ impl Scheduler for ConcreteScheduler {
                     // refcount and the `sibling_prefix_reused_tok` counter,
                     // and pin the entry forever (the release happens once,
                     // at completion).
-                    // GitHub #178: nor does a multimodal request claim one.
                     // GitHub #190: a KV-RAM claimant holds no prefix, so the
                     // checkpoint claim is what says it already chose.
                     if self.requests[i].prefix_entry.is_some()
                         || self.requests[i].checkpoint_publisher.is_some()
-                        || !self.requests[i].may_share_prefix()
                     {
                         continue;
                     }
@@ -2206,18 +2228,16 @@ impl Scheduler for ConcreteScheduler {
                     // beat, because claiming a prefix is not free — it pins
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
-                    let media = media_keys(&self.requests[i].input);
-                    let lookup = self.checkpoints.lookup(&PromptContent::new(
-                        &self.requests[i].input.tokens,
-                        &media,
-                    ));
+                    // One walk of the prompt answers all four questions below.
+                    let keys = self.reuse_keys(i);
+                    let lookup = self.checkpoints.lookup(&keys);
                     self.requests[i].pending_retained_misses =
                         lookup.misses(self.checkpoints.tiers());
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
                     let mut device_prefix = self
                         .prefix
-                        .longest_match_tokens(&self.requests[i].input.tokens);
+                        .longest_match_tokens(&keys);
                     let mut retained = self.checkpoints.select(&lookup, device_prefix);
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
@@ -2225,7 +2245,7 @@ impl Scheduler for ConcreteScheduler {
                     // outright — and from then on the burst shares it there.
                     if let Some((spilled, length)) = self
                         .prefix
-                        .longest_spilled_match(&self.requests[i].input.tokens)
+                        .longest_spilled_match(&keys)
                         .map(|s| (s.id, s.length_tokens))
                     {
                         let device_checkpoint =
@@ -2246,7 +2266,7 @@ impl Scheduler for ConcreteScheduler {
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
-                        .claim_longer_than(&self.requests[i].input.tokens, floor);
+                        .claim_longer_than(&keys, floor);
                     if let Some(claim) = claimed {
                         // GitHub #188: a claim moves a *retained* prefix to
                         // the back of the LRU order (a no-op on a live
@@ -2415,15 +2435,33 @@ impl Scheduler for ConcreteScheduler {
         // candidate in the batch takes the head; the rest prefill it
         // themselves this tick (there is nothing warm to claim yet) and a
         // later sibling claims the one entry that did register.
+        //
+        // GitHub #193: "the same head" is the same *content* — token ids and
+        // the images inside them. Two siblings sending same-size pictures
+        // have identical ids, and each is the only publisher of its own head.
+        // The key is walked only for a request whose point collides with an
+        // earlier one's, which is rare, rather than for every request on
+        // every tick its point is nonzero.
         let publish_points: Vec<u32> = {
+            let head_key = |i: usize, at: u32| {
+                let media = media_keys(&self.requests[i].input);
+                PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
+            };
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
                 let at = self.requests[i].publish_point(self.config.kv_page_tokens);
-                let head = &self.requests[i].input.tokens[..at as usize];
-                let taken = batch[..n].iter().enumerate().any(|(m, &j)| {
-                    points[m] == at && self.requests[j].input.tokens[..at as usize] == *head
-                });
-                points.push(if at > 0 && taken { 0 } else { at });
+                let taken = at > 0 && {
+                    let mut earlier = batch[..n]
+                        .iter()
+                        .enumerate()
+                        .filter(|&(m, _)| points[m] == at)
+                        .peekable();
+                    earlier.peek().is_some() && {
+                        let head = head_key(i, at);
+                        earlier.any(|(_, &j)| head_key(j, at) == head)
+                    }
+                };
+                points.push(if taken { 0 } else { at });
             }
             points
         };
@@ -2460,8 +2498,7 @@ impl Scheduler for ConcreteScheduler {
                             // returns 0 for a request not publishing at all.
                             let rides_the_publish = publish_at > 0
                                 && r.input.opener_tokens == Some(publish_at)
-                                && !r.checkpoint_captured
-                                && r.may_share_prefix();
+                                && !r.checkpoint_captured;
                             if rides_the_publish { publish_at } else { 0 }
                         }
                         at => at,
@@ -2662,7 +2699,11 @@ impl Scheduler for ConcreteScheduler {
                             // more warm history than the leaf's prefix
                             // actually holds, and a claimant would skip
                             // prefill for tokens nothing warmed.
-                            let head = &self.requests[i].input.tokens[..published as usize];
+                            // GitHub #193: with the images inside it, so a
+                            // sibling sending another picture never matches.
+                            let media = media_keys(&self.requests[i].input);
+                            let head = PromptContent::new(&self.requests[i].input.tokens, &media)
+                                .head(published);
                             // GitHub #187: a request that resumed from
                             // retained state publishes a **chained** entry —
                             // the pages it warmed past what it claimed, over

@@ -292,9 +292,6 @@ impl Request {
     /// One function so that the chunk decomposition (where to cut) and the
     /// registration (when to publish) cannot disagree about it.
     pub fn publish_point(&self, page_tokens: u32) -> u32 {
-        if !self.may_share_prefix() {
-            return 0;
-        }
         // Pages already shared, or restored as the request's own from a
         // materialized blob: a boundary inside either is behind it.
         let shared = self
@@ -336,8 +333,11 @@ impl Request {
     /// - **the block is under one page** — a shared prefix is whole KV pages,
     ///   so there is nothing to publish there. The request falls back to
     ///   #186's opener page and takes its prompt checkpoint as before;
-    /// - **a multimodal prompt** — its identity is not token ids alone until
-    ///   #193, so it shares nothing (GitHub #178).
+    /// - **an image starts in the block's first page** — the boundary never
+    ///   ends inside a media item's placeholders (GitHub #193), so it walks
+    ///   back to the page holding the item's first one, and that can be
+    ///   page 0. A system block carries no images today; this is the rule
+    ///   holding if one ever does.
     ///
     /// Unlike [`Request::publish_point`] this is a property of the *prompt*,
     /// not of what the request is currently holding, so it stays answerable
@@ -345,12 +345,12 @@ impl Request {
     /// I just published the retained one?" instead of re-deriving a condition
     /// that could disagree with the one the chunk was cut at.
     pub fn retained_prefix_point(&self, page_tokens: u32) -> u32 {
-        if page_tokens == 0 || !self.may_share_prefix() {
+        if page_tokens == 0 {
             return 0;
         }
         self.input
             .system_block_tokens
-            .map_or(0, |block| (block / page_tokens) * page_tokens)
+            .map_or(0, |block| self.input.prefix_floor(block, page_tokens))
     }
 
     /// The **capture point** (GitHub #186, ADR 0029): the prefill position at
@@ -388,7 +388,7 @@ impl Request {
     /// capture (when to take it) cannot disagree about it, exactly as
     /// [`Request::publish_point`] is one function.
     pub fn checkpoint_point(&self, page_tokens: u32) -> u32 {
-        if self.checkpoint_captured || !self.may_share_prefix() || page_tokens == 0 {
+        if self.checkpoint_captured || page_tokens == 0 {
             return 0;
         }
         let Some(opener) = self.input.opener_tokens else {
@@ -602,18 +602,10 @@ impl Request {
         &self.input.tokens
     }
 
-    /// Whether this request may publish or claim a shared prefix (GitHub
-    /// #178): a multimodal one may not, because prefix identity is token ids
-    /// alone until it learns about media — two same-size images would
-    /// otherwise share one head. Lifted by GitHub #180.
-    pub fn may_share_prefix(&self) -> bool {
-        self.input.multimodal.is_none()
-    }
-
     /// Whether this request's device state can be snapshotted to the KV-RAM
     /// tier (GitHub #178): a multimodal one cannot, because the snapshot blob
     /// does not record its `rope_delta` yet — it is released and re-prefilled
-    /// instead. Lifted by GitHub #180.
+    /// instead. Lifted by GitHub #194.
     pub fn can_snapshot(&self) -> bool {
         self.input.multimodal.is_none()
     }

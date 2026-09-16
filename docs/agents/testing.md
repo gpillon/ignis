@@ -359,6 +359,14 @@ same load's own plain decode rounds, and the acceptance on the text after an
 image against the 3.4–5.75 band. The verify round's rope staging exists only
 when vision is loaded, so a text-only speculative load allocates nothing new.
 
+Since GitHub #193 multimodal requests share prefixes under a media-aware
+identity (the match key, ADR 0029). `crates/server/tests/vision_prefix_reuse_gpu.rs`
+is its check on the real model: siblings over one system prompt sending
+same-size flat swatches — identical token ids — where the other colour shares
+only the system block and still names its own colour, and the same colour
+reuses past the image, through a retained checkpoint with prompt reuse on and
+through the sibling prefix cache alone with it off.
+
 **The verify round's rope delta is a deliberate departure from the reference.**
 The reference's DFlash2 round passes its proposal positions for both the cache
 and the rotation and carries no rope delta in its decode ingress at all, while

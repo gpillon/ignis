@@ -215,25 +215,18 @@ fn request_input(
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| server.engine.model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
-    // GitHub #186: a prompt carrying images never reuses retained state — a
-    // prefix's identity is token ids alone until the media-aware match key
-    // lands (#189 defines the key, #193 fills its media slot), so two prompts
-    // differing only in their images would share a checkpoint. The opener is
-    // therefore reported on the text-only path only, and so — GitHub #188 —
-    // is the system block boundary: a retained prefix published across a
-    // media placeholder would be claimed by a request that sent another
-    // picture.
-    let text_only = multimodal.is_none();
+    // GitHub #193: a prompt carrying images reports its boundaries like any
+    // other. Retained state is keyed by the images inside it as well as the
+    // token ids (the #189 match key), so a request that sent another picture
+    // never matches past the first placeholder they differ at.
     let input = RequestInput {
         multimodal: multimodal.map(Arc::new),
         model: model.clone(),
         tokens: rendered.tokens,
         params,
-        opener_tokens: rendered.opener_tokens.filter(|_| text_only),
-        // GitHub #187: the turn boundary rides along, filtered for the same
-        // reason — a prompt that takes no checkpoint has no lineage to place.
-        user_turn_tokens: rendered.user_turn_tokens.filter(|_| text_only),
-        system_block_tokens: rendered.system_block_tokens.filter(|_| text_only),
+        opener_tokens: rendered.opener_tokens,
+        user_turn_tokens: rendered.user_turn_tokens,
+        system_block_tokens: rendered.system_block_tokens,
     };
     (input, model, prompt_tokens)
 }
@@ -258,11 +251,11 @@ async fn prepare_request(
     };
     let deadline = std::time::Instant::now() + server.request_timeout;
     let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
-    let (tokens, multimodal) = server
+    let (rendered, multimodal) = server
         .template
         .prepare_multimodal(messages, thinking, tools, acquired.media)
         .map_err(content_rejection)?;
-    let (input, model, prompt_tokens) = request_input(server, model, tokens.into(), params, Some(multimodal));
+    let (input, model, prompt_tokens) = request_input(server, model, rendered, params, Some(multimodal));
     Ok((input, model, prompt_tokens, Some(acquired.stats)))
 }
 

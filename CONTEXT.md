@@ -184,10 +184,13 @@ When output names a domain concept, use the term as defined here.
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
   evicted live sequence.
-- **Match key** — what a piece of **retained state** is addressed by: a hash
+- **Match key** — what a piece of **retained state**, and every **shared
+  prefix**, is addressed by: a hash
   chain over the prompt tokens it covers, with each media item's identity (its
   content digest and grid) mixed in at that item's **first** placeholder, so a
-  prefix covering one placeholder has committed to the whole image. A chain
+  prefix covering one placeholder has committed to the whole image. Token ids
+  alone are not enough: two same-size images expand to identical placeholder
+  ids. A chain
   rather than a digest of the whole, because a claimant asks about every prefix
   length of its prompt at once, and because it lets a blob name its content in
   sixteen bytes instead of carrying sixty thousand token ids to another tier.
@@ -214,7 +217,8 @@ When output names a domain concept, use the term as defined here.
   start of the prompt, not from what the publisher already shares; a **prompt
   checkpoint**'s is the generation
   opener wherever it falls, and whoever reuses it copies the partial page
-  rather than sharing it. It
+  rather than sharing it. A prefix's never ends inside a **media item**'s
+  placeholders: it walks back to the page holding the item's first one. It
   is a scheduling decision, not a detail of the publish call: what a claimant
   clones is the mutable state at the prefix's *end*, so the publishing
   request's prefill is cut there, and a prompt whose length is not a whole
