@@ -369,6 +369,17 @@ only the system block and still names its own colour, and the same colour
 reuses past the image, through a retained checkpoint with prompt reuse on and
 through the sibling prefix cache alone with it off.
 
+`crates/server/tests/vision_mixed_load_gpu.rs` (GitHub #181) is all of the
+above at once, in the serving shape: one load behind the HTTP router with
+`--vision`, `--spec dflash2`, prompt reuse on, a 128-token prefill chunk, and
+every image fetched by URL from a loopback server. Three text lanes decode
+while an image request prefills between their rounds; same-size swatch
+siblings each name their own colour; and with the KV pool sized to exactly one
+4,096-token context, an Interactive request reserving all of it evicts the one
+Agent image request to KV-RAM, which is restored and still describes its image.
+The request log it prints names the evicted and restored request id and each
+request's `spec.*` counters.
+
 **The verify round's rope delta is a deliberate departure from the reference.**
 The reference's DFlash2 round passes its proposal positions for both the cache
 and the rotation and carries no rope delta in its decode ingress at all, while
@@ -388,6 +399,55 @@ in a test that drives the leaf directly. A test that inherits the default
 runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
+
+## The multimodal TTFT cell (GitHub #181)
+
+`ignis-bench ttft --image <png>` adds one cell to a TTFT record: a fixed image
+plus a short question (`--image-question`, default "Describe what this
+screenshot shows in one sentence."), sent as content parts — the text first,
+then the image as a `data:` URI. An error detector for the whole vision path,
+not a gate. With `--image`, `--cells` may be omitted.
+
+The committed image is `crates/bench/tests/fixtures/vision_ttft/screenshot.png`,
+a 1280x800 editor screenshot drawn by `tools/vision-ttft/screenshot.py`
+(deterministic; re-running it is a no-op). It sits on the 32-pixel grid, so it
+expands to 1,000 vision tokens and the cell is 1,027 tokens with the default
+question — `crates/bench/tests/ttft_image_real_frontend.rs` pins that against
+the real frontend, and the reference counts it the same.
+
+Cold in everything, like a text cell: each prompt (the warmup's too) starts
+with its own nonce, and its image is the fixture with the top-left pixel
+changed, so neither a prefix cache nor either engine's digest-keyed
+preprocessing cache can serve it; the size, and so the length, is unchanged.
+The record names the image (SHA-256, size, question), and `g2` refuses to pair
+cells of one length over different images, or an image cell with a text cell.
+
+A record carrying the image cell cannot be compared with one that has none, so
+measure it as its own record. One session, three engine starts, each
+waited on at `/v1/models` and killed before the next (the script used for the
+first measurement is `.scratch/vision-kv-reuse-run/181/ttft-session.sh`):
+
+```powershell
+$Session = "vision-ttft-$(Get-Date -Format yyyyMMddTHHmmssZ)"
+$Image = "crates/bench/tests/fixtures/vision_ttft/screenshot.png"
+# 1. The reference with --vision (the owner's hq-e8-2b-262k preset): the text
+#    cells, then the image cell, each into its own record.
+ignis-bench ttft --endpoint http://127.0.0.1:8080 --artifact $Artifact --cells 1024,8192,32768 `
+  --corpus $Corpus --label reference --session $Session --out ref-text.json
+ignis-bench ttft --endpoint http://127.0.0.1:8080 --artifact $Artifact --image $Image `
+  --label reference --session $Session --out ref-image.json
+# 2. ignis with --vision: the same two records. 3. ignis without it: text only.
+# Then: g2 image vs image, text vs text, and ignis --vision text vs ignis text.
+```
+
+**Watch the card's headroom.** Both ignis loads land at ~29.8 GiB of their own
+at 262,144 context with DFlash2 — the retained pool is derived from the VRAM
+free after load — which leaves well under a gigabyte once the desktop's own
+~2 GiB is counted. The first session of 2026-09-16 ran its `--vision` leg with
+the desktop holding 3.1 GiB: the card went past its 32.6 GiB and every cell
+came back 2-5x slower and erratic (one 32K sample took 41 s), where the rerun
+with 2.0 GiB held measured the same flags at parity. Sample `nvidia-smi` beside
+each leg (the script does) and distrust a leg whose peak reaches the total.
 
 ## The KV-format A/B: 2x2 over engine and format (GitHub #139)
 
