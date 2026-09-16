@@ -74,6 +74,7 @@ fn a_ttft_cell_against_a_live_ignis_server_is_all_cold() {
         artifact: ARTIFACT.into(),
         session: "smoke".into(),
         corpus: None,
+        image: None,
     };
     let record = ttft::measure(&ep, &server.frontend, MODEL.into(), server.url.clone(), &cfg);
 

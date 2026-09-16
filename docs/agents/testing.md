@@ -369,6 +369,17 @@ only the system block and still names its own colour, and the same colour
 reuses past the image, through a retained checkpoint with prompt reuse on and
 through the sibling prefix cache alone with it off.
 
+`crates/server/tests/vision_mixed_load_gpu.rs` (GitHub #181) is all of the
+above at once, in the serving shape: one load behind the HTTP router with
+`--vision`, `--spec dflash2`, prompt reuse on, a 128-token prefill chunk, and
+every image fetched by URL from a loopback server. Three text lanes decode
+while an image request prefills between their rounds; same-size swatch
+siblings each name their own colour; and with the KV pool sized to exactly one
+4,096-token context, an Interactive request reserving all of it evicts the one
+Agent image request to KV-RAM, which is restored and still describes its image.
+The request log it prints names the evicted and restored request id and each
+request's `spec.*` counters.
+
 **The verify round's rope delta is a deliberate departure from the reference.**
 The reference's DFlash2 round passes its proposal positions for both the cache
 and the rotation and carries no rope delta in its decode ingress at all, while
@@ -388,6 +399,53 @@ in a test that drives the leaf directly. A test that inherits the default
 runs hq, which is right for the serving-shape checks (the HTTP surface, the
 TTFT instrument, the `CudaLeaf` smoke test) and wrong for anything carrying
 a derived tolerance.
+
+## The multimodal TTFT cell (GitHub #181)
+
+`ignis-bench ttft --image <png>` adds one cell to a TTFT record: a fixed image
+plus a short question (`--image-question`, default "Describe what this
+screenshot shows in one sentence."), sent as content parts — the text first,
+then the image as a `data:` URI. An error detector for the whole vision path,
+not a gate. With `--image`, `--cells` may be omitted.
+
+The committed image is `crates/bench/tests/fixtures/vision_ttft/screenshot.png`,
+a 1280x800 editor screenshot drawn by `tools/vision-ttft/screenshot.py`
+(deterministic; re-running it is a no-op). It sits on the 32-pixel grid, so it
+expands to 1,000 vision tokens and the cell is 1,027 tokens with the default
+question — `crates/bench/tests/ttft_image_real_frontend.rs` pins that against
+the real frontend, and the reference counts it the same.
+
+Cold in everything, like a text cell: each prompt (the warmup's too) starts
+with its own nonce, and its image is the fixture with the top-left pixel
+changed, so neither a prefix cache nor either engine's digest-keyed
+preprocessing cache can serve it; the size, and so the length, is unchanged.
+The record names the image (SHA-256, size, question), and `g2` refuses to pair
+cells of one length over different images, or an image cell with a text cell.
+
+A record carrying the image cell cannot be compared with one that has none, so
+the image cell is measured as its own record. The session is
+`scripts/vision-ttft-session.sh <out-dir>`, run from the repository root on a
+free card after a release build: the reference with `--vision` (the owner's
+hq-e8-2b-262k preset), ignis with `--vision`, and ignis without it, **each
+launched twice** (ADR 0021). Every launch writes a text record (1024, 8192 and
+32768 tokens, cut from the ninfer corpus) and, with vision, an image record;
+`scripts/ttft-pool.py` pools each engine's two launches into one record, and
+`g2` compares the pooled records: image against image, text against text, and
+ignis's text with `--vision` against without. The 1.5 threshold `g2` prints is
+G2's own; for this cell the ratios are error detectors.
+
+**Measure a launch once.** The prompts are fixed — the same nonces, the same
+changed pixels — so a second `ttft` run against a live engine is served from
+its prefix and media caches, and ignis reports no cached tokens for the void
+rule to catch it. Restart the engine instead.
+
+**Watch the card's headroom.** Both ignis loads at 262,144 context with
+DFlash2 take ~29.8 GiB of their own (the retained pool is derived from what is
+free after load), so the desktop's own VRAM decides whether the card
+oversubscribes; when it does, every cell comes back slower and erratic rather
+than failing. The script samples `nvidia-smi` beside every launch — distrust
+one whose peak reaches the total
+([finding](../findings/2026-09-16-vision-ttft-live-live.md)).
 
 ## The KV-format A/B: 2x2 over engine and format (GitHub #139)
 

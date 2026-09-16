@@ -380,7 +380,26 @@ When output names a domain concept, use the term as defined here.
 - **MTP** — the model's native multi-token-prediction head, the alternative
   drafter (draft window 1..7 chosen at load, verification width chosen per
   round). Deferred behind **DFlash2** at G5.
-- **Vision** — multimodal (image/video) input.
+- **Vision** — multimodal input: images today, video refused until its own
+  spec. A load option (`--vision`): without it nothing of the tower is bound
+  or reserved and text serving is unchanged. With it, a chat message's
+  content parts may carry images by `data:` URI or HTTP(S) URL; the server
+  **acquires** and prepares each one before admission, the template expands
+  its placeholder into its **vision tokens**, and from there a multimodal
+  request is an ordinary request — chunked and interleaved with decode lanes,
+  speculated by **DFlash2**, sharing prefixes under its **match key**, evicted to and
+  restored from **KV-RAM** — whose prefill additionally runs a **media
+  encode** per item and whose rounds rotate at its **rope delta**.
+- **Media acquisition** — turning a request's image parts into prepared
+  **media items** before it is admitted: decoding a `data:` URI or fetching a
+  URL under the media policy (private addresses refused unless
+  `--media-allow-private-network`, byte cap, deadline), then preprocessing,
+  memoized by content digest. A refused image refuses its request before
+  admission; nothing reaches the scheduler.
+- **Media encode** — the prefill step that runs the **vision encoder** over
+  one **media item** and leaves its **media embedding** on the device, in the
+  first chunk that reaches the item. Its wall time is reported on the
+  request, apart from the prefill's.
 - **Media item** — one image in a prompt: its patch grid, the run of
   placeholder tokens it expands to, its BF16 patch rows and the digest of the
   bytes it came from. The unit the processor prepares, the encoder encodes and
@@ -398,7 +417,11 @@ When output names a domain concept, use the term as defined here.
   whose three-axis positions advance more slowly than its tokens. Every decode
   round after such a prompt rotates at `position + rope_delta`; the position
   itself stays the KV index and the sampler's key. Part of a sequence's
-  progress, so a snapshot blob carries it.
+  progress, so a snapshot blob carries it — but a clone does not: a
+  **shared prefix** or **prompt checkpoint** captures it as zero, since a
+  text claimant may stand on a multimodal publisher's head. A claimant learns
+  its own delta only from a prefill span, which is why a multimodal claim
+  always leaves at least one prompt token to prefill (ADR 0029).
 
 ## Observability
 
