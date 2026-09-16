@@ -45,8 +45,8 @@
 
 #![cfg(feature = "cuda")]
 
-#[path = "support/vision_canary.rs"]
-mod vision_canary;
+#[path = "support/mod.rs"]
+mod support;
 
 use std::path::Path;
 
@@ -70,7 +70,7 @@ use ignis_core::step::{
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend, Vision};
 
-use vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
+use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 2048;
@@ -440,9 +440,17 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
                     off.len()
                 ),
                 Some(d) => {
+                    // A length-only divergence is not a near-tie and the probe
+                    // cannot adjudicate one: there is no pair of candidates to
+                    // weigh. It is also not reachable through the model -- both
+                    // streams share the stop set and the same TOTAL budget, so
+                    // equal prefixes end at equal lengths. Reaching it means the
+                    // round bookkeeping is wrong, which is a failure outright.
                     assert!(
                         d < off.len() && d < on.emitted.len(),
-                        "{label}: one stream ended early at {d} (decode rounds {} tokens, verify rounds {})",
+                        "{label}: the two streams agree on every token but end at different lengths \
+                         (decode rounds {} tokens, verify rounds {}) -- with one stop set and one budget \
+                         that cannot happen, so the round accounting is wrong",
                         off.len(),
                         on.emitted.len()
                     );
@@ -473,14 +481,25 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         overall * 100.0,
         G1_AGREEMENT_FLOOR * 100.0
     );
-    let mean = committed_full as f64 / full_rounds.max(1) as f64;
-    eprintln!(
-        "vision+dflash2: {mean:.2} committed tokens per full-window round over {full_rounds} rounds \
-         (reference band {:.2}-{:.2} at draft {WINDOW})",
-        REFERENCE_BAND.0, REFERENCE_BAND.1
-    );
-    if full_rounds > 0 && mean < REFERENCE_BAND.0 {
-        eprintln!("vision+dflash2: FINDING -- acceptance on the text after an image is below the reference's band");
+    // AC 4 is a report, so it must never read as a measurement it did not
+    // make: no full-window round is no data, not an acceptance of zero.
+    if full_rounds == 0 {
+        eprintln!(
+            "vision+dflash2: NOT MEASURED -- no round reached the full {WINDOW}-token window, so \
+             there is no acceptance to compare with the reference's band"
+        );
+    } else {
+        let mean = committed_full as f64 / full_rounds as f64;
+        eprintln!(
+            "vision+dflash2: {mean:.2} committed tokens per full-window round over {full_rounds} rounds \
+             (reference band {:.2}-{:.2} at draft {WINDOW})",
+            REFERENCE_BAND.0, REFERENCE_BAND.1
+        );
+        if mean < REFERENCE_BAND.0 {
+            eprintln!(
+                "vision+dflash2: FINDING -- acceptance on the text after an image is below the reference's band"
+            );
+        }
     }
 
     drop(pool);
@@ -488,6 +507,14 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
     let _ = artifact.release_arena(&mut device);
 
     assert!(compared > 0, "the fixture must contribute scored positions");
+    // A generation budgeted to TOTAL tokens opens at extent `WINDOW`, so no
+    // full-window round at all means the rounds never ran as this test
+    // intends and AC 4 went unmeasured -- which must fail, not pass quietly.
+    assert!(
+        full_rounds > 0,
+        "no round reached the full {WINDOW}-token window: the acceptance on the text after an \
+         image was never measured"
+    );
     assert!(
         meets_g1_floor(overall),
         "vision canary on a DFlash2 load: teacher-forced agreement {agree}/{compared} = {:.1}% < {:.0}%",

@@ -359,6 +359,18 @@ same load's own plain decode rounds, and the acceptance on the text after an
 image against the 3.4–5.75 band. The verify round's rope staging exists only
 when vision is loaded, so a text-only speculative load allocates nothing new.
 
+**The verify round's rope delta is a deliberate departure from the reference.**
+The reference's DFlash2 round passes its proposal positions for both the cache
+and the rotation and carries no rope delta in its decode ingress at all, while
+its ordinary decode batch and its MTP round both add the sequence's — so on the
+reference a multimodal sequence's verify columns and its decode rounds
+disagree. The spec (`.scratch/vision/specs/01-image-input.md`, §Compute seam)
+asks for `rope_position = position + rope_delta` on *every* decode and verify
+round, and ignis follows the spec. Expect a live/live comparison against the
+reference with `--vision --spec dflash2` to show the reference's own
+divergence, not ours; the vision canary fixture was recorded without
+speculation, so it stays the right oracle either way.
+
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`

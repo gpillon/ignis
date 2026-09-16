@@ -225,6 +225,18 @@ codes, the image's tokens counted in `usage.prompt_tokens`.
   the reference passes its context append on a multimodal span (the
   implementer checks the reference's DFlash2 multimodal prefill sink). No
   vision-specific drafter state.
+  - *Checked, #195.* The reference's prefill sink captures the span's
+    **cache** positions (`tap.capture_positions(positions, ...)`,
+    `impl/runtime/text_context_impl.h`), not its rope positions, so the
+    drafter needs nothing vision-specific — as above. The verify round is a
+    **deliberate departure**: the reference's DFlash2 round passes its
+    proposal positions for both the cache and the rotation
+    (`impl/runtime/dflash2_impl.h`'s `TargetVerifyFrameView`), and its
+    `DFlashDecodeIngress` carries no rope delta at all, while its ordinary
+    decode batch adds `sequence.rope_delta` and its MTP round carries one
+    per lane. ignis applies the delta on every round, as the sequence-handle
+    bullet above requires; that consistency is also what makes greedy
+    spec-on equal spec-off on the text after an image.
 
 ### Prefix reuse, KV-RAM, snapshots
 

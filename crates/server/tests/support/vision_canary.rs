@@ -1,15 +1,14 @@
 //! The vision canary fixture and the multimodal prefill both GPU canary
-//! binaries drive it through (GitHub #178, GitHub #195).
+//! binaries drive it through (GitHub #178, GitHub #195) -- a `support`
+//! submodule, reached as `support::vision_canary` like every other one.
 //!
 //! `tests/fixtures/vision_canary` is the reference's greedy answers to four
 //! fixed images (`tools/vision-canary/record.py`, `--vision`, thinking off).
-//! `vision_canary_gpu.rs` scores a vision load against it; `vision_dflash2_gpu.rs`
-//! scores a load that also carries the DFlash2 drafter. Included by `#[path]`
-//! from both, so a change to the fixture's shape lands in one place.
-
-// Each binary uses a subset, so "never used" here means "not used by *this*
-// binary" (the convention `support/mod.rs` already states).
-#![allow(dead_code)]
+//! `vision_canary_gpu.rs` scores a vision load against it;
+//! `vision_dflash2_gpu.rs` scores a load that also carries the DFlash2
+//! drafter. One copy, so a change to the fixture's shape lands in one place.
+//! (`support/mod.rs`'s own `#![allow(dead_code)]` covers this module too:
+//! each binary uses a subset.)
 
 use std::path::PathBuf;
 

@@ -27,8 +27,8 @@
 
 #![cfg(feature = "cuda")]
 
-#[path = "support/vision_canary.rs"]
-mod vision_canary;
+#[path = "support/mod.rs"]
+mod support;
 
 use std::path::Path;
 
@@ -48,7 +48,7 @@ use ignis_core::step;
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{KvFormat, Vision};
 
-use vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
+use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 2048;
