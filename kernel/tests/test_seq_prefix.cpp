@@ -346,6 +346,7 @@ void check_a_claimant_receives_the_mutable_state() {
   ignis_seq *publisher = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "clone: alloc publisher");
   give_history(*pool, *publisher, kPrefix, 0x37u);
+  publisher->rope_delta = -55; // a multimodal publisher (GitHub #194)
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, publisher->slot);
 
   ignis_seq_prefix *prefix = nullptr;
@@ -371,6 +372,11 @@ void check_a_claimant_receives_the_mutable_state() {
   expect(claimant->position == kPrefix, "clone: a claimant stands where the prefix ends");
   expect(claimant->pending_token == publisher->pending_token,
          "clone: a claimant carries the pending token the prefix ended on");
+  // GitHub #194: a snapshot carries the rope delta, a clone does not -- the
+  // publisher's is its whole prompt's, and a claimant's comes from its own
+  // prefill span.
+  expect(publisher->rope_delta != 0 && claimant->rope_delta == 0,
+         "clone: a claimant does not inherit the publisher's rope delta");
   expect(ignis_seq_at_chunk_boundary(*claimant),
          "clone: every layer's frontier is the prefix's end");
 
@@ -796,6 +802,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
   ignis_seq *publisher = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "spill: alloc publisher");
   give_history(*pool, *publisher, kPrefix, 0x91u);
+  publisher->rope_delta = -77; // a multimodal publisher (GitHub #194)
   ignis_seq_prefix *prefix = nullptr;
   expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "spill: publish");
 
@@ -808,7 +815,27 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
   std::vector<unsigned char> own(static_cast<std::size_t>(publisher_bytes));
   expect_rc(ignis_seq_snapshot(pool, publisher, own.data(), publisher_bytes), 0,
             "spill: publisher snapshot");
-  expect(own == blob, "spill: the prefix's blob is its publisher's, standing on it");
+  // GitHub #194: the one word the two differ in is the rope delta, which a
+  // prefix does not carry -- its publisher's is the whole prompt's.
+  if (own.size() == blob.size()) {
+    ignis_seq_snapshot_header header{};
+    std::memcpy(&header, own.data(), sizeof(header));
+    std::uint64_t at = 0;
+    for (const ignis_seq_section &section : ignis_seq_section_table(*pool, header.kv_page_count)) {
+      if (section.kind == IGNIS_SEQ_SECTION_PROGRESS) {
+        at = section.offset + offsetof(ignis_seq_progress_image, rope_delta);
+      }
+    }
+    std::int32_t own_delta  = 0;
+    std::int32_t blob_delta = 0;
+    std::memcpy(&own_delta, own.data() + at, sizeof(own_delta));
+    std::memcpy(&blob_delta, blob.data() + at, sizeof(blob_delta));
+    expect(own_delta == -77 && blob_delta == 0,
+           "spill: the publisher's blob carries its rope delta, the prefix's does not");
+    std::memset(own.data() + at, 0, sizeof(own_delta));
+  }
+  expect(own == blob,
+         "spill: the prefix's blob is its publisher's, standing on it, but for the rope delta");
 
   // Every device holder goes: nothing of the prefix is left on the card.
   ignis_seq_release(pool, publisher);

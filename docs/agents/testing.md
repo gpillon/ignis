@@ -244,7 +244,9 @@ python tools/vision-canary/record.py crates/server/tests/fixtures/vision_canary
 `crates/runtime/tests/cuda_leaf_vision_gpu.rs` is the same load's serving-shape
 check: an image prompt chunked at 64 tokens while three text lanes decode, each
 lane still answering its own question, and 100 image requests leaving no media
-embedding live and the leaf's footprint where it was.
+embedding live and the leaf's footprint where it was. Its second test evicts an
+image request to KV-RAM mid-decode and checks the restored one continues with
+the never-evicted tokens (GitHub #194).
 
 ## The G2 measurement instrument (P2-05, GitHub #87)
 

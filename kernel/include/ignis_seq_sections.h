@@ -45,8 +45,11 @@
  * not reinterpreted (ADR 0024). */
 /* 2 (P5-03, GitHub #152): the drafter's window and checkpoint sections, the
  * drafter frontier in the progress image, and the drafter's lane size in the
- * geometry. */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 2;
+ * geometry.
+ * 3 (GitHub #194): the progress image's reserved word is the sequence's
+ * multimodal `rope_delta`. Same size, new meaning: a version-2 blob has 0
+ * there, so it is refused rather than restored at a delta it never recorded. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 3;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
@@ -134,7 +137,16 @@ inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
 struct ignis_seq_progress_image {
   std::uint64_t position;
   std::int32_t pending_token;
-  std::int32_t reserved;
+  /* GitHub #194: the multimodal rope delta (`ignis_seq::rope_delta`); 0 for
+   * a text sequence. Consistent with the scalars around it at a completed
+   * chunk boundary -- the one point a snapshot is taken: `step.cu` assigns
+   * it once a prefill span's chunks have run and synchronized, beside the
+   * frontier advance, and every span of a multimodal prompt assigns the
+   * same prompt-wide value, so a sequence evicted between its chunks
+   * already holds the delta its later chunks would set. A clone's capture
+   * zeroes it (`ignis_seq_state_transfer`): a claimant takes its delta from
+   * its own prefill span. */
+  std::int32_t rope_delta;
   /* The drafter window's frontier (`ignis_seq::dflash2_position`); 0 on a
    * pool without the drafter. */
   std::uint64_t dflash2_position;
@@ -334,6 +346,7 @@ inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
   ignis_seq_progress_image image{};
   image.position      = seq.position;
   image.pending_token = seq.pending_token;
+  image.rope_delta    = seq.rope_delta;
   image.dflash2_position = seq.dflash2_position;
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGqaLayerCount); ++i) {
     image.gqa_positions[i] = seq.gqa_positions[i];
@@ -347,6 +360,7 @@ inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
 inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_image &image) {
   seq.position      = image.position;
   seq.pending_token = image.pending_token;
+  seq.rope_delta    = image.rope_delta;
   seq.dflash2_position = image.dflash2_position;
   // GitHub #157: the carried anchor taps are the handle's, not the image's;
   // taps left from this handle's previous life belong to another position.

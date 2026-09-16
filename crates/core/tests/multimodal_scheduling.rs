@@ -1,7 +1,7 @@
 //! GitHub #178 — how the scheduler carries a multimodal request, on a CPU
 //! (`MockCompute`, ADR 0006): its prefill chunks hold at most one media
-//! item's placeholders, and an eviction releases and re-prefills it instead
-//! of snapshotting it to KV-RAM.
+//! item's placeholders. An eviction snapshots it to KV-RAM like a text
+//! request (GitHub #194: the blob carries its `rope_delta`).
 //!
 //! GitHub #193 — it publishes and claims shared prefixes like a text request,
 //! under an identity that is its token ids **and** its images: a sibling
@@ -251,7 +251,7 @@ fn a_multimodal_prefix_is_never_published_inside_an_image() {
 }
 
 #[test]
-fn an_evicted_multimodal_request_is_released_and_reprefilled_not_snapshotted() {
+fn an_evicted_multimodal_request_is_snapshotted_and_restored_not_reprefilled() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(
         compute.clone(),
@@ -281,26 +281,27 @@ fn an_evicted_multimodal_request_is_released_and_reprefilled_not_snapshotted() {
     assert_eq!(evicted.len(), 1, "{events:?}");
     let victim = evicted[0];
     assert!(fillers.contains(&victim));
-    assert!(
-        events.iter().any(|e| matches!(e, SchedEvent::Requeued { request } if *request == victim)),
-        "the victim goes back to the queue: {events:?}"
-    );
-    assert_eq!(sched.host_tier().used_bytes(), 0, "nothing was snapshotted");
-    assert!(compute.released_requests().contains(&victim), "its device state was released");
+    assert!(sched.host_tier().used_bytes() > 0, "the victim's blob went to KV-RAM");
+    assert!(!compute.released_requests().contains(&victim), "its state was snapshotted, not dropped");
     assert!(
         events.iter().any(|e| matches!(e, SchedEvent::Admitted { request, .. } if *request == head)),
         "{events:?}"
     );
 
-    // It re-prefills from the start and finishes like everyone else.
+    // It comes back from its blob and never re-prefills.
     let before = compute.prefill_calls().len();
     let rest = run_to_idle(&mut sched);
     assert!(
-        compute.prefill_calls()[before..]
-            .iter()
-            .flatten()
-            .any(|job| job.request == victim && job.start_position == 0),
-        "the victim re-prefills its whole prompt"
+        rest.iter().any(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == victim)),
+        "{rest:?}"
+    );
+    assert!(
+        !events.iter().chain(&rest).any(|e| matches!(e, SchedEvent::Requeued { .. })),
+        "nothing is requeued"
+    );
+    assert!(
+        !compute.prefill_calls()[before..].iter().flatten().any(|job| job.request == victim),
+        "the victim is not prefilled again"
     );
     let done = rest.iter().filter(|e| matches!(e, SchedEvent::Done { .. })).count();
     assert_eq!(done, 9, "{rest:?}");

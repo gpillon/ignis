@@ -233,6 +233,7 @@ ignis_seq *publisher_at_opener(ignis_seq_pool *pool, ignis_seq_prefix **out_pref
   expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, out_prefix), 0, label);
   set_frontier(*seq, kOpener);
   seq->pending_token = 4242;
+  seq->rope_delta    = -42;
   dirty_state(*pool, *seq, 1, 0x57u);
   // Note what is NOT done here: the penalty-count row is left exactly as the
   // sequence's own life left it. `ignis_seq_alloc` zeroed it and nothing has
@@ -326,6 +327,8 @@ void check_claim_reproduces_the_state_at_the_opener(int32_t kv_format) {
 
   expect(claimant->position == kOpener, "claim: the claimant stands at the opener");
   expect(claimant->pending_token == 4242, "claim: with the capture's pending token");
+  expect(claimant->rope_delta == 0,
+         "claim: without the capturing sequence's rope delta (GitHub #194)");
   expect(claimant->shared_pages == 2, "claim: sharing the two whole pages below it");
   expect(mutable_image_of(*pool, claimant->slot) == state_at_opener,
          "claim: its mutable state is the capture's, byte for byte");
