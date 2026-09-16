@@ -1662,11 +1662,23 @@ impl Scheduler for ConcreteScheduler {
                 // The two boundaries share that head when they fall in the
                 // same page — a short first turn leaves a retained prefix
                 // *and* a checkpoint — and compete for it when they do not,
-                // which is every prompt carrying tools. The competition is
-                // temporary: GitHub #187 relaxes
-                // `seq_checkpoint.cu`'s `below != seq->shared_pages`, after
-                // which a claimant of the block captures at its own opener and
-                // this floor costs a checkpoint no longer.
+                // which is every prompt carrying tools.
+                //
+                // The competition is temporary, and GitHub #187 ends it by
+                // **chaining** the publish rather than by weakening the
+                // capture. `seq_checkpoint.cu:125`'s
+                // `below != seq->shared_pages` stays, and must: a checkpoint
+                // holds exactly one copied tail page and its capture takes
+                // `seq->kv.page_ids()[0]`, so with the opener pages above the
+                // block the copied page would not be the opener's at all and
+                // the pages between would have no holder — which is the
+                // defect #186 fixed in `565d634`. What #187 removes instead is
+                // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
+                // sequence standing on the block publishes a *second* prefix
+                // over the head it warmed itself, taking over the reference it
+                // held. The intermediate pages get their holder from that
+                // chained link, and `below == shared_pages` becomes true
+                // rather than relaxed.
                 let opener_page = |at: u32| (at / self.config.kv_page_tokens) * self.config.kv_page_tokens;
                 match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
                     Some(opener) => head.min(opener_page(opener)),

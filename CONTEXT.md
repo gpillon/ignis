@@ -180,10 +180,12 @@ When output names a domain concept, use the term as defined here.
   compete for it when they do not: a short first turn leaves both a
   **retained prefix** and a **prompt checkpoint**, while a prompt with tools
   — a block several pages long — leaves the block alone. That competition is
-  a limit of today's leaf rather than a rule of the domain (a sequence may
-  hold one prefix, and a capture demands the opener's whole pages be it);
-  GitHub #187 relaxes it so a claimant of the block captures at its own
-  opener.
+  a limit of today's leaf rather than a rule of the domain: a sequence may
+  hold one prefix, and a capture demands the opener's whole pages be it.
+  GitHub #187 lifts the first and satisfies the second rather than waiving
+  it — a request may publish a second prefix over the head it warmed itself,
+  so the pages below its opener become its own chained prefix and it keeps
+  both the block and its checkpoint.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained

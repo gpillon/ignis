@@ -136,12 +136,17 @@ Three reasons, in the order they decide it:
 
 This is a policy the accepted Decision did not fix, recorded here rather than
 left in a comment. The owner may reverse it, and reversing it means two places
-rather than one: the order of the two arms in
-`ConcreteScheduler::reclaim_retained`, and the order
-`ConcreteScheduler::reclaimable_prefixes` builds its union in — checkpoint-held
-prefixes first, then the bare retained ones. The third reason above rests on
-that union listing both kinds, so a reversal touching only the first would
-still terminate but would no longer be justified by it.
+rather than one:
+
+- the order of the two arms in `ConcreteScheduler::reclaim_retained`, which is
+  the ordering itself;
+- `ConcreteScheduler::reclaimable_prefixes`, which must go on listing **both**
+  kinds — checkpoint-held prefixes and bare retained ones — in one set. The
+  third reason above rests on that *membership*, not on the order the union
+  happens to be built in: a prefix carrying both is reclaimable only because
+  both kinds appear in the set, and narrowing it would strand that prefix
+  whichever arm ran first.
+
 `crates/core/tests/retained_prefix.rs`'s
 `the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
 that changes with it; it is written to fail when the order is flipped.

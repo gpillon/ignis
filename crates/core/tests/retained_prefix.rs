@@ -23,7 +23,8 @@
 //! a sequence that already holds one (`kernel/src/seq_prefix.cu:129`), and a
 //! prompt checkpoint demands that the whole pages below its opener *be* that
 //! prefix (`kernel/src/seq_checkpoint.cu:125`, whose own message names #187 as
-//! the extension point). So a request publishes **one** head, and the two
+//! the ticket that makes such a request qualify). So a request publishes
+//! **one** head, and the two
 //! boundaries compete for it whenever they fall in different KV pages: the
 //! extra chunk split the spec asks for is moved, not added.
 //!
@@ -33,10 +34,20 @@
 //! `a_block_and_an_opener_in_one_page_leave_both_a_retained_prefix_and_a_checkpoint`
 //! below, and what #186's live GPU check observed.
 //!
-//! **This is a state that ends.** #187 owns relaxing
-//! `seq_checkpoint.cu`'s `below != seq->shared_pages`, after which a claimant
-//! of the block prefix captures at its own opener and the two compose instead
-//! of competing. Until then a prompt with tools — every qwen-code request —
+//! **This is a state that ends, and not by weakening the capture.** #187
+//! chains the *publish*: it removes `seq_prefix.cu:129`'s
+//! `seq->prefix != nullptr`, so a sequence standing on the block publishes a
+//! second prefix over the head it warmed itself, taking over the reference it
+//! held — which is what gives the pages between the block and the opener a
+//! holder. `seq_checkpoint.cu:125`'s `below != seq->shared_pages` stays, and
+//! must: a checkpoint holds exactly one copied tail page, taken from
+//! `seq->kv.page_ids()[0]`, so relaxing it would copy a page that is not the
+//! opener's and hand a claimant intermediate pages nothing warmed — the defect
+//! #186 fixed in `565d634`. After #187 `below == shared_pages` becomes *true*
+//! for such a request rather than waived, and the two compose instead of
+//! competing.
+//!
+//! Until then a prompt with tools — every qwen-code request —
 //! leaves the block and no checkpoint, which is what
 //! `the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener` pins.
 //! A prompt whose block is under one page keeps #186's behaviour unchanged,
@@ -302,15 +313,17 @@ fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
         "exactly the chunk that ends on the block publishes it"
     );
     // **#187 flips this assertion.** Today the leaf allows one prefix per
-    // sequence and a capture demands the opener's whole pages *be* it
-    // (`seq_checkpoint.cu:125`), so publishing the block is publishing
-    // instead of the opener's page. Once #187 relaxes that, this request
-    // keeps its checkpoint too and the expected count here becomes 1 — a
-    // composition, not a regression.
+    // sequence, so publishing the block is publishing *instead of* the
+    // opener's page and the capture's `below == shared_pages` cannot hold.
+    // #187 chains the publish — a second prefix over the head this request
+    // warmed itself — which makes that equality true and leaves it a
+    // checkpoint as well: the count here becomes 1, a composition and not a
+    // regression. The capture's own precondition is not weakened to get
+    // there, and must not be (see this file's header).
     assert_eq!(
         sched.checkpoint_pool().entry_count(),
         0,
-        "no prompt checkpoint while the leaf allows one prefix per sequence (#187)"
+        "no prompt checkpoint while a sequence may publish only one prefix (#187)"
     );
 }
 
