@@ -483,9 +483,18 @@ impl ChatTemplate {
     /// [`Self::last_user_query_offset`] cannot simply look for it.
     pub const USER_QUERY_OPENER: &'static str = "<|im_start|>user\n";
 
-    /// What a tool result's content starts with, and the only thing that
-    /// tells it from the human speaking.
+    /// What a tool result's content is wrapped in, and the only thing that
+    /// tells it from the human speaking. **Both ends**, exactly as the
+    /// template tests it (`content.startswith(…) and content.endswith(…)`):
+    /// a human message that merely *opens* with the literal is still the human
+    /// speaking, and reading it as a tool result would cost the next turn its
+    /// reuse.
     pub const TOOL_RESPONSE_OPENER: &'static str = "<tool_response>";
+    /// See [`Self::TOOL_RESPONSE_OPENER`].
+    pub const TOOL_RESPONSE_CLOSER: &'static str = "</tool_response>";
+
+    /// The marker every rendered message ends with.
+    pub const MESSAGE_CLOSER: &'static str = "<|im_end|>";
 
     /// The byte offset where `rendered`'s **last real user query** begins —
     /// the last `<|im_start|>user\n` that is not a tool result — or `None` for
@@ -512,11 +521,23 @@ impl ChatTemplate {
         rendered
             .match_indices(Self::USER_QUERY_OPENER)
             .map(|(at, _)| at)
-            .filter(|&at| {
-                !rendered[at + Self::USER_QUERY_OPENER.len()..]
-                    .starts_with(Self::TOOL_RESPONSE_OPENER)
-            })
+            .filter(|&at| !Self::is_tool_result(rendered, at))
             .last()
+    }
+
+    /// Whether the user message beginning at `at` is a tool result rather than
+    /// the human speaking — the template's own test, both ends of it.
+    ///
+    /// The rendered content is the span between the message's opener and its
+    /// `<|im_end|>`, which is exactly the trimmed content the template applied
+    /// `startswith`/`endswith` to. A message with no closer runs to the end of
+    /// the render; the same test applies to it, so a truncated render can only
+    /// misread a message that looks like a tool result all the way down.
+    fn is_tool_result(rendered: &str, at: usize) -> bool {
+        let rest = &rendered[at + Self::USER_QUERY_OPENER.len()..];
+        let content = rest.find(Self::MESSAGE_CLOSER).map_or(rest, |end| &rest[..end]);
+        content.starts_with(Self::TOOL_RESPONSE_OPENER)
+            && content.ends_with(Self::TOOL_RESPONSE_CLOSER)
     }
 
     /// Render an OpenAI-style conversation through the template.

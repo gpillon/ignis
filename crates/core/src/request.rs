@@ -316,47 +316,20 @@ impl Request {
     /// - **the opener's pages are not the shared ones** — the request is
     ///   standing on a prefix that stops somewhere other than its own
     ///   opener's page, so its own first page is not the opener's. Two real
-    ///   cases fall here, and both are deferred rather than half-done: a
-    ///   conversation's *second* turn, which resumed from an earlier
-    ///   checkpoint and prefilled past it (#187's lineage work — supersede C
-    ///   by C'), and every **concurrent sibling** that claimed another
-    ///   request's shared prefix and whose own opener lies further on (a
-    ///   subagent burst therefore leaves one checkpoint, the publisher's, not
-    ///   one per sibling). Until #187 the chain stops here, and what keeps
-    ///   that honest is that the *earlier* entry still matches: a third turn
-    ///   reuses the first turn's checkpoint rather than nothing.
+    ///   cases used to end here, and #187 removed both: a conversation's
+    ///   *second* turn, which resumed from an earlier checkpoint and prefilled
+    ///   past it, and every **concurrent sibling** that claimed another
+    ///   request's shared prefix and whose own opener lies further on. Neither
+    ///   is refused now — each publishes a **chained** prefix at its own
+    ///   opener's page floor first ([`Request::publish_point`]), which makes
+    ///   this condition true rather than weakening it. What still lands here
+    ///   is a request whose claim already reaches *past* its own opener's
+    ///   page, which has nothing of its own to cut at.
     /// - **already captured** — one checkpoint per request.
     ///
     /// One function, so that the chunk decomposition (where to cut) and the
     /// capture (when to take it) cannot disagree about it, exactly as
     /// [`Request::publish_point`] is one function.
-    /// Whether the checkpoint this request is about to capture **opens a new
-    /// turn** of its conversation (GitHub #187, ADR 0029) — whether a real
-    /// user message lies between the entry it resumed from and its own
-    /// generation opener.
-    ///
-    /// A request that resumed from nothing is the start of a conversation as
-    /// far as anything here can tell, so its checkpoint opens that
-    /// conversation's first turn. Otherwise the frontend's last-real-user-query
-    /// offset decides it: past the claimed entry's opener means the human
-    /// spoke again and this is a new turn; at or before it means the prompt
-    /// grew by an assistant message and a tool result, which is one more
-    /// iteration of the same turn.
-    ///
-    /// A frontend that could not report the offset answers **false**. A wrong
-    /// `false` costs a superseded entry that would have been kept; a wrong
-    /// `true` retires the turn-opening entry the next user message was going
-    /// to match, which is the reuse this whole slice exists to protect.
-    pub fn opens_a_turn(&self) -> bool {
-        match self.checkpoint_entry {
-            None => true,
-            Some(_) => self
-                .input
-                .user_turn_tokens
-                .is_some_and(|user| user >= self.checkpoint_tokens),
-        }
-    }
-
     pub fn checkpoint_point(&self, page_tokens: u32) -> u32 {
         if self.checkpoint_captured || !self.may_share_prefix() || page_tokens == 0 {
             return 0;
@@ -382,6 +355,35 @@ impl Request {
             return 0;
         }
         opener
+    }
+
+    /// Whether the checkpoint this request is about to capture **opens a new
+    /// turn** of its conversation (GitHub #187, ADR 0029) — whether a real
+    /// user message lies past the entry it resumed from.
+    ///
+    /// A request that resumed from nothing is the start of a conversation as
+    /// far as anything here can tell, so its checkpoint opens that
+    /// conversation's first turn. Otherwise the frontend's
+    /// last-real-user-query offset decides it, against the claimed entry's
+    /// reach: **at or past** it means the human spoke again and this is a new
+    /// turn; before it means the prompt grew by an assistant message and a
+    /// tool result, which is one more iteration of the same turn. At or past,
+    /// not strictly past, because the offset is where the user message
+    /// *begins* — one beginning exactly where the claimed entry ends is
+    /// history that entry never covered.
+    ///
+    /// A frontend that could not report the offset answers **false**. A wrong
+    /// `false` costs a superseded entry that would have been kept; a wrong
+    /// `true` retires the turn-opening entry the next user message was going
+    /// to match, which is the reuse this whole slice exists to protect.
+    pub fn opens_a_turn(&self) -> bool {
+        match self.checkpoint_entry {
+            None => true,
+            Some(_) => self
+                .input
+                .user_turn_tokens
+                .is_some_and(|user| user >= self.checkpoint_tokens),
+        }
     }
 
     /// Whether this request has finished prefill: every prompt token has

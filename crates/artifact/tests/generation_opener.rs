@@ -160,6 +160,30 @@ fn the_last_user_query_is_the_last_user_message_that_is_not_a_tool_result() {
 }
 
 #[test]
+fn a_user_message_that_only_opens_like_a_tool_result_is_still_the_human_speaking() {
+    // The template tests both ends — `content.startswith('<tool_response>')`
+    // **and** `content.endswith('</tool_response>')` — and this has to test
+    // what the template tests. A one-sided check reads a human who pastes a
+    // tool response and then asks about it as a tool result, which answers
+    // "no new turn" and costs that conversation the reuse the feature exists
+    // for. Wrong in the cheap direction, but on exactly the workload.
+    let pasted = "<|im_start|>user\nfirst<|im_end|>\n\
+                  <|im_start|>user\n<tool_response>\nok\n</tool_response> — what does this mean?<|im_end|>\n\
+                  <|im_start|>assistant\n";
+    let at = ChatTemplate::last_user_query_offset(pasted).expect("a real user query");
+    assert!(
+        pasted[at..].starts_with("<|im_start|>user\n<tool_response>"),
+        "the pasted-response question is the last real query, not the turn before it"
+    );
+    // And a genuine tool result — wrapped at both ends — is still skipped.
+    let genuine = "<|im_start|>user\nfirst<|im_end|>\n\
+                   <|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n\
+                   <|im_start|>assistant\n";
+    let then = ChatTemplate::last_user_query_offset(genuine).expect("a real user query");
+    assert!(genuine[then..].starts_with("<|im_start|>user\nfirst"));
+}
+
+#[test]
 fn a_prompt_with_no_user_message_has_no_last_user_query() {
     assert_eq!(ChatTemplate::last_user_query_offset("plain text"), None);
     assert_eq!(ChatTemplate::last_user_query_offset(""), None);
