@@ -873,13 +873,13 @@ impl ConcreteScheduler {
         // GitHub #187: a chained entry holds its parent's reference, so one
         // release can drop a whole run of the chain — every link that drops
         // returns its own pages and its own backend handle.
-        for (freed, publisher) in self.prefix.release(entry) {
+        for (freed, publisher, tokens) in self.prefix.release(entry) {
             self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
             // P4-10 (GitHub #126): the entry is gone from this cache, so the
             // backend's own handle on the leaf's prefix goes too. The leaf's
             // pages come back when its last *sequence* holder is released,
             // which is why this is a handle drop and not a free.
-            self.compute.release_prefix(publisher);
+            self.compute.release_prefix(publisher, tokens);
         }
     }
 
@@ -2549,7 +2549,7 @@ impl Scheduler for ConcreteScheduler {
                                 // only until the publishing sequence itself
                                 // is released, which is the same lifetime
                                 // they would have had unshared.
-                                None => self.compute.release_prefix(publisher),
+                                None => self.compute.release_prefix(publisher, published),
                             }
                         }
                         // GitHub #186 — the prompt checkpoint, driven by the

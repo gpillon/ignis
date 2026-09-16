@@ -90,8 +90,8 @@ impl Compute for EncodingCompute {
         self.inner.release(request);
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
-        self.inner.release_prefix(publisher);
+    fn release_prefix(&self, publisher: RequestId, tokens: u32) {
+        self.inner.release_prefix(publisher, tokens);
     }
 
     fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {

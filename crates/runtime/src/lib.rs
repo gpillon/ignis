@@ -444,7 +444,11 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// prefill published each. Separate from `sequences` on purpose: a
     /// prefix outlives its publisher, so its handle cannot hang off the
     /// publisher's sequence.
-    prefixes: Mutex<HashMap<RequestId, L::Prefix>>,
+    ///
+    /// Keyed by the head's length too: one request may publish its system
+    /// block and then a chained head over it (#187 x #188), and a claimant of
+    /// the block must be handed the block.
+    prefixes: Mutex<HashMap<(RequestId, u32), L::Prefix>>,
     /// Retained prompt checkpoints (GitHub #186, ADR 0029), keyed by the
     /// request that captured each. That request is long finished; its id is
     /// never reused, so it stays a valid name for the bytes it left behind —
@@ -629,7 +633,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 let unpublished: Vec<_> = jobs
                     .iter()
                     .filter(|job| job.publish_prefix_tokens.is_some())
-                    .filter_map(|job| prefixes.remove(&job.request))
+                    .filter_map(|job| {
+                        job.publish_prefix_tokens
+                            .and_then(|tokens| prefixes.remove(&(job.request, tokens)))
+                    })
                     .collect();
                 // GitHub #178: the retry re-encodes whatever it needs.
                 let unencoded: Vec<_> = jobs
@@ -712,7 +719,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         }
                         None => Err(-1),
                     },
-                    (None, Some(claim)) => match prefixes.get(&claim.publisher) {
+                    (None, Some(claim)) => match prefixes.get(&(claim.publisher, claim.tokens)) {
                         Some(prefix) => self.model.leaf.allocate_sequence_shared(
                             self.model.handle(),
                             job.context_tokens,
@@ -794,7 +801,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .publish_prefix(self.model.handle(), &mut sequence.handle, prefix_tokens)
             {
                 Ok(prefix) => {
-                    prefixes.insert(request, prefix);
+                    prefixes.insert((request, prefix_tokens), prefix);
                 }
                 Err(code) => unwind!(RuntimeError::Leaf(code).into()),
             }
@@ -1017,11 +1024,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         }
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
+    fn release_prefix(&self, publisher: RequestId, tokens: u32) {
         // Only this adapter's handle. The leaf's pages come back when every
         // sequence still holding the prefix has been released too, which is
         // what lets a publisher finish while its claimants keep serving.
-        let prefix = self.prefixes.lock().unwrap().remove(&publisher);
+        let prefix = self.prefixes.lock().unwrap().remove(&(publisher, tokens));
         if let Some(prefix) = prefix {
             self.release_prefix_handle(prefix);
         }

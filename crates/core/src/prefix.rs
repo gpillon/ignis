@@ -458,14 +458,16 @@ impl PrefixCache {
     /// re-queued). When the last reference drops, the entry (and its own
     /// pages) is released.
     ///
-    /// Returns every entry that dropped as a result — the pages each freed
-    /// **and the request that published them**, so the caller can drop the
-    /// backend's handle on the leaf's prefix too (P4-10) — innermost first,
+    /// Returns every entry that dropped as a result — the pages each freed,
+    /// **the request that published them and the head's length**, so the
+    /// caller can drop the backend's handle on that leaf prefix too (P4-10;
+    /// one request may publish two heads, #187 x #188, so the publisher alone
+    /// does not name one) — innermost first,
     /// and empty while the entry is still pinned by other claimants. It is a
     /// list rather than one entry because a chained entry (GitHub #187) holds
     /// its parent's reference: letting go of the child may let go of the
     /// parent, and of its parent in turn.
-    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId)> {
+    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId, u32)> {
         let mut dropped = Vec::new();
         let mut at = Some(entry);
         while let Some(id) = at {
@@ -477,7 +479,7 @@ impl PrefixCache {
                 break;
             }
             let entry = self.entries.remove(pos);
-            dropped.push((entry.pages, entry.publisher));
+            dropped.push((entry.pages, entry.publisher, entry.length_tokens));
             at = entry.parent;
         }
         dropped
@@ -678,7 +680,7 @@ mod tests {
         // The last release drops the entry, frees its pages and names the
         // request that published them (P4-10: the backend's own handle on
         // the leaf's prefix is dropped by that id).
-        assert_eq!(cache.release(id), vec![(4, 7)]);
+        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
         // A dropped entry cannot be claimed or released again.
@@ -751,7 +753,7 @@ mod tests {
         );
         assert_eq!(cache.release(id), vec![]);
         // The checkpoint is discarded last: now the pages come back.
-        assert_eq!(cache.release(id), vec![(4, 7)]);
+        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.retain(id), "a dropped entry cannot be retained");
         assert_eq!(cache.pages_of(id), 0);
@@ -799,7 +801,7 @@ mod tests {
         assert_eq!(cache.pinned_pages(), 6);
         // Request 8 completes, releasing the child: both entries drop, and
         // each names the request whose leaf prefix the backend must let go of.
-        assert_eq!(cache.release(child), vec![(2, 8), (4, 7)]);
+        assert_eq!(cache.release(child), vec![(2, 8, 96), (4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
     }
@@ -880,7 +882,7 @@ mod tests {
         assert!(cache.unretain(id), "the caller now owes one release");
         assert!(!cache.is_retained(id));
         assert!(!cache.unretain(id), "and owes it exactly once");
-        assert_eq!(cache.release(id), vec![(4, 7)], "that release frees the pages");
+        assert_eq!(cache.release(id), vec![(4, 7, 64)], "that release frees the pages");
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.unretain(id), "a dropped entry is not retained");
         assert!(!cache.retain_published(id, 3), "nor can it be retained again");

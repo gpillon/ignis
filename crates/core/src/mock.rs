@@ -231,7 +231,7 @@ impl Compute for MockCompute {
             .collect())
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
+    fn release_prefix(&self, publisher: RequestId, _tokens: u32) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
     }
 

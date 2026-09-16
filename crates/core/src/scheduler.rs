@@ -272,12 +272,14 @@ pub trait Compute: Send + Sync {
     /// CPU-only compute implementations need no lifecycle bookkeeping.
     fn release(&self, _request: RequestId) {}
 
-    /// Release the backend's own handle on the shared prefix `publisher`
-    /// published (P4-10, GitHub #126), once the scheduler's last claimant has
-    /// gone. The leaf's pages return to the pool when every sequence holding
-    /// them has been released too, so this is a handle drop and not a free.
+    /// Release the backend's own handle on the `tokens`-long shared prefix
+    /// `publisher` published (P4-10, GitHub #126), once the scheduler's last
+    /// claimant has gone. The leaf's pages return to the pool when every
+    /// sequence holding them has been released too, so this is a handle drop
+    /// and not a free. A head is named by both: one request may publish its
+    /// system block and then a chained head over it (#187 x #188).
     /// CPU-only compute implementations hold no such handle.
-    fn release_prefix(&self, _publisher: RequestId) {}
+    fn release_prefix(&self, _publisher: RequestId, _tokens: u32) {}
 
     // ── core-06: the KV-RAM host tier (P4-07, GitHub #125, ADR 0024) ────
     //
