@@ -363,8 +363,8 @@ impl CheckpointPool {
     }
 
     /// Checkpoints taken, checkpoints the byte budget refused, and
-    /// checkpoints discarded — the three counters #190's Prometheus tier
-    /// metrics are built from.
+    /// checkpoints discarded — the three counters #190's per-tier
+    /// hit / miss / spill / discard reporting is built from.
     pub fn counters(&self) -> CheckpointCounters {
         CheckpointCounters {
             captures: self.captures,
@@ -382,8 +382,10 @@ impl CheckpointPool {
     }
 }
 
-/// The retained pool's lifetime counters (telemetry; #190 maps them onto
-/// ADR 0017's per-tier hit / miss / spill / discard contract).
+/// The retained pool's lifetime counters. #190 maps them onto ADR 0017's
+/// per-tier hit / miss / spill / discard contract, which happens wholly on
+/// the asynchronous telemetry side: nothing on the inference path knows
+/// these are projected anywhere.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckpointCounters {
     /// Checkpoints captured and retained.

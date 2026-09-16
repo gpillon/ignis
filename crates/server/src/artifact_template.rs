@@ -14,14 +14,15 @@
 use std::sync::Arc;
 
 use ignis_artifact::vision::{PreparedMedia, VisionProcessor};
-use ignis_artifact::{ChatRenderOptions, DecodeStreamState, FrontendSet, Role};
+use ignis_artifact::{ChatRenderOptions, ChatTemplate, DecodeStreamState, FrontendSet, Role};
 use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
 use crate::template::{
-    processor_rejection, ChatMessage, ContentRejection, MessageContent, TemplateProvider,
+    processor_rejection, ChatMessage, ContentRejection, MessageContent, RenderedPrompt,
+    TemplateProvider,
 };
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
@@ -64,6 +65,23 @@ impl ArtifactTemplateProvider {
     pub fn with_vision(mut self, processor: VisionProcessor) -> Self {
         self.vision = Some(processor);
         self
+    }
+
+    /// How many leading tokens of `tokens` end at `prompt`'s generation
+    /// opener (GitHub #186, ADR 0029), or `None` when that cannot be said
+    /// exactly.
+    ///
+    /// The head is tokenized **separately** and required to be a real token
+    /// prefix of the whole prompt. That is not paranoia about the tokenizer:
+    /// a BPE merge that spans the boundary would make the head's ids differ
+    /// from the prompt's own leading ids, and a checkpoint taken at a
+    /// position the two disagree about would hand a later request state for
+    /// history it does not have. When they disagree the answer is `None` —
+    /// no checkpoint, rather than a wrong one.
+    fn opener_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        let at = ChatTemplate::generation_opener_offset(prompt)?;
+        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
+        (!head.is_empty() && tokens.starts_with(&head)).then(|| head.len() as u32)
     }
 
     /// The chat template's text for `messages`, image parts rendered as
@@ -112,20 +130,25 @@ impl TemplateProvider for ArtifactTemplateProvider {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         let prompt = match self.render(messages, options, tools) {
             Ok(prompt) => prompt,
             Err(err) => {
                 eprintln!("ignis-server: chat template render failed: {err}");
-                return Vec::new();
+                return RenderedPrompt::default();
             }
         };
-        match self.set.tokenizer().encode(&prompt) {
+        let tokens = match self.set.tokenizer().encode(&prompt) {
             Ok(ids) => ids,
             Err(err) => {
                 eprintln!("ignis-server: tokenizer encode failed: {err}");
-                Vec::new()
+                return RenderedPrompt::default();
             }
+        };
+        let opener_tokens = self.opener_tokens(&prompt, &tokens);
+        RenderedPrompt {
+            tokens,
+            opener_tokens,
         }
     }
 
@@ -440,14 +463,14 @@ mod tests {
             ChatMessage::text("user", "hello world"),
             ChatMessage::text("assistant", "hi there"),
         ];
-        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
-        assert!(!tokens.is_empty(), "the rendered prompt must tokenize");
+        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        assert!(!rendered.tokens.is_empty(), "the rendered prompt must tokenize");
         // Determinism: the same conversation templates identically (the
         // trait's contract).
-        assert_eq!(tokens, provider.apply_chat_template(&messages, &opts(), no_tools()));
+        assert_eq!(rendered, provider.apply_chat_template(&messages, &opts(), no_tools()));
         // Property assertion (not an exact string): the templated prompt
         // contains the user's message text, decoded by the same tokenizer.
-        let text = provider.render_tokens(&tokens);
+        let text = provider.render_tokens(&rendered.tokens);
         assert!(text.contains("hello world"), "{text}");
     }
 
@@ -465,7 +488,7 @@ mod tests {
         let messages = [ChatMessage::text("bogus", "hello")];
         // The foreign role must not panic: it templates as `user` (the
         // documented v1 fallback), and the prompt still renders.
-        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools()).tokens;
         assert!(!tokens.is_empty());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("hello"), "{text}");
@@ -485,8 +508,8 @@ mod tests {
                 .expect("parts deserialize");
         let mut parts_form = ChatMessage::text("user", "");
         parts_form.content = parts;
-        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools());
-        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools());
+        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools()).tokens;
+        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools()).tokens;
         assert_eq!(parts_tokens, string_tokens);
         assert!(provider.render_tokens(&parts_tokens).contains("hello world"));
     }
@@ -549,7 +572,7 @@ mod tests {
             preserve_thinking: false,
         };
         let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("true"), "{text}");
         assert!(text.contains("low"), "{text}");
@@ -567,7 +590,7 @@ mod tests {
             preserve_thinking: false,
         };
         let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
         assert!(tokens.is_empty(), "a raising render must degrade to no tokens");
     }
 
@@ -590,7 +613,7 @@ mod tests {
         message.reasoning_content = Some("scratch work".to_owned());
 
         for options in [opts(), ThinkingOptions { preserve_thinking: true, ..opts() }] {
-            let tokens = provider.apply_chat_template(&[message.clone()], &options, no_tools());
+            let tokens = provider.apply_chat_template(&[message.clone()], &options, no_tools()).tokens;
             let text = provider.render_tokens(&tokens);
             assert!(
                 text.contains("scratch") && text.contains("work"),
@@ -813,7 +836,7 @@ mod tests {
         // Must not panic; `TEMPLATE` has no `tool_calls` branch of its own,
         // so this only proves the degrade happens before the render call —
         // the real dialect is exercised in the round-trip test above.
-        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools());
+        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools()).tokens;
         assert!(!tokens.is_empty(), "the render must still complete");
     }
 }

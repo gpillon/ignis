@@ -377,6 +377,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::Restored { request, .. }
         | SchedEvent::Requeued { request }
         | SchedEvent::PrefixReused { request, .. }
+        | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. } => Some(*request),
         SchedEvent::Protected { .. } => None,
     }
@@ -426,6 +427,16 @@ async fn telemetry_task(
                     ..
                 } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros),
                 SchedEvent::PrefixReused { tokens, .. } => telemetry.on_prefix_reused(tokens),
+                // GitHub #186: unlike `PrefixReused`, this one keeps its
+                // request id — `reuse_source`, `reused_prompt_tokens` and
+                // `restore_ms` are per-request fields of the request log,
+                // not a server-wide counter.
+                SchedEvent::StateReused {
+                    request,
+                    source,
+                    tokens,
+                    restore_micros,
+                } => telemetry.on_state_reused(request, source, tokens, restore_micros),
                 _ => {}
             },
             TelemetryFact::Tick => {
@@ -501,6 +512,7 @@ mod tests {
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
             multimodal: None,
+            opener_tokens: None,
             model: model.into(),
             tokens,
             params: DecodeParams {

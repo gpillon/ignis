@@ -447,6 +447,36 @@ impl ChatTemplate {
         )
     }
 
+    /// The **generation opener** (GitHub #186, ADR 0029): the marker a
+    /// rendered prompt ends its history with and hands over to the model at.
+    ///
+    /// It is the last position a conversation's later turns provably share.
+    /// Everything after it — the `<think>` block, the assistant's text, its
+    /// tool calls — is re-rendered on the next turn differently from how it
+    /// was generated (thinking dropped or emptied, a `\n` after `<|im_end|>`,
+    /// tool arguments re-serialized), so the state *after* generation never
+    /// matches while the state at the opener always does.
+    pub const GENERATION_OPENER: &'static str = "<|im_start|>assistant\n";
+
+    /// The byte offset just past `rendered`'s **last** generation opener, or
+    /// `None` for a prompt that has none.
+    ///
+    /// The last, not the first: a conversation renders one opener per
+    /// assistant turn, and the one that matters is the one the prompt ends
+    /// on, where generation begins. The earlier ones are history, and what
+    /// follows them in *this* render is not what followed them when they were
+    /// generated.
+    ///
+    /// A byte offset rather than a token count, because a byte offset is all
+    /// the renderer knows. Turning it into a token count means tokenizing the
+    /// head and checking that it really is a token prefix of the whole prompt
+    /// (ADR 0029) — the tokenizer's job, not this function's.
+    pub fn generation_opener_offset(rendered: &str) -> Option<usize> {
+        rendered
+            .rfind(Self::GENERATION_OPENER)
+            .map(|at| at + Self::GENERATION_OPENER.len())
+    }
+
     /// Render an OpenAI-style conversation through the template.
     ///
     /// `add_generation_prompt` is set to `true` (the standard completion

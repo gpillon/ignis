@@ -316,6 +316,7 @@ mod tests {
             .submit(
                 RequestInput {
                     multimodal: None,
+                    opener_tokens: None,
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {

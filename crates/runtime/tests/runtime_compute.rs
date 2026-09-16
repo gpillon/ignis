@@ -358,6 +358,8 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
     compute
         .prefill_step(&[
             PrefillJob {
+                checkpoint: None,
+                capture_checkpoint_tokens: None,
                 multimodal: None,
                 request: 1,
                 tokens: vec![4, 5],
@@ -368,6 +370,8 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 publish_prefix_tokens: None,
             },
             PrefillJob {
+                checkpoint: None,
+                capture_checkpoint_tokens: None,
                 multimodal: None,
                 request: 2,
                 tokens: vec![4, 5],
@@ -422,6 +426,8 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
 
 fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
     PrefillJob {
+        checkpoint: None,
+        capture_checkpoint_tokens: None,
         multimodal: None,
         request,
         tokens: vec![4, 5],
@@ -644,6 +650,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
         .submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2],
                 params: DecodeParams {
@@ -676,6 +683,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
         .submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
@@ -713,6 +721,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
     );
     let input = |tokens: Vec<u32>| RequestInput {
         multimodal: None,
+        opener_tokens: None,
         model: "stub".into(),
         tokens,
         params: DecodeParams {
@@ -766,6 +775,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
     );
     let input = || RequestInput {
         multimodal: None,
+        opener_tokens: None,
         model: "stub".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -815,6 +825,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
             .submit(
                 RequestInput {
                     multimodal: None,
+                    opener_tokens: None,
                     model: "stub".into(),
                     tokens: vec![token],
                     params: DecodeParams {
@@ -1025,6 +1036,8 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         params: DecodeParams::default(),
         shared_prefix: None,
         publish_prefix_tokens: None,
+        checkpoint: None,
+        capture_checkpoint_tokens: None,
         multimodal: Some(prompt.clone()),
     }
 }
@@ -1126,6 +1139,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 tokens: (0..40).collect(),
                 params: DecodeParams { max_tokens: Some(2), ..DecodeParams::default() },
                 multimodal: Some(multimodal(40, vec![image(5, 10), image(20, 10)])),
+                opener_tokens: None,
             },
             RequestClass::Agent,
         )

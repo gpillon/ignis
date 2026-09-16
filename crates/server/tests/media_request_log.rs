@@ -75,6 +75,7 @@ impl Compute for EncodingCompute {
             .iter()
             .map(|job| PrefillOutcome {
                 encode_micros: if job.multimodal.is_some() { self.micros } else { 0 },
+                ..PrefillOutcome::default()
             })
             .collect())
     }
