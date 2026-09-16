@@ -575,8 +575,13 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
 // the vendored planner (`plan_gdn_replay_records`) lays the four planes out;
 // the fold only admits its registered all-layer geometries, so a wrong
 // count here fails at the first round, by name, not silently.
+//
+// GitHub #195: `vision` adds the round's rope-position staging, so a
+// multimodal sequence's verify columns rotate at `position + rope_delta` the
+// way its decode rounds do. A load without vision allocates nothing for it
+// and every round rotates at `positions` itself, exactly as before.
 std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology,
-                                                     uint32_t window) {
+                                                     uint32_t window, bool vision) {
   auto verify = std::make_unique<IgnisVerifyRound>();
   verify->window = window;
   const auto k = static_cast<std::int32_t>(window);
@@ -607,13 +612,19 @@ std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topol
   verify->accepted = i32(lanes);
   verify->selectors = i32(lanes);
   verify->selected_hidden = bf16(hidden * lanes);
+  if (vision) {
+    verify->rope_positions = i32(static_cast<std::int64_t>(columns) * lanes);
+  }
   // The staging a capture reads before any round refreshed it must still be
   // a legal input (a valid extent, a real slot): zero is one. A lane's
   // anchor column is always valid -- the drafter's query block (P5-05)
   // admits no fewer than one -- so the valid-column count starts at 1.
   for (auto *buffer : {verify->anchors.get(), verify->drafts.get(), verify->base_positions.get(),
-                       verify->extents.get(), verify->lengths.get()}) {
-    buffer->fill(0);
+                       verify->extents.get(), verify->lengths.get(),
+                       verify->rope_positions.get()}) {
+    if (buffer != nullptr) {
+      buffer->fill(0);
+    }
   }
   const std::vector<std::int32_t> anchor_only(static_cast<std::size_t>(lanes), 1);
   verify->valid_columns->copy_from_host(anchor_only.data(), anchor_only.size() * sizeof(std::int32_t));
@@ -876,13 +887,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
               " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
     return -1;
   }
-  // GitHub #178: a fence until the drafter's context append and the verify
-  // round learn multimodal positions (a later ticket lifts it).
-  if (vision_max_tokens > 0 && speculative_backend != IGNIS_SPECULATIVE_NONE) {
-    set_error("ignis_model_load: vision with a speculative backend is not supported yet; "
-              "load with one of them");
-    return -1;
-  }
+  // GitHub #195: vision and a speculative backend are two independent load
+  // options. #178's fence stood until the verify round learned the sequence's
+  // `rope_delta` (`IgnisVerifyRound::rope_positions`, staged per round); the
+  // drafter's context append needed nothing, because it consumes the span's
+  // KV positions, which is what the reference's own prefill sink captures on
+  // a multimodal span too.
 
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {
@@ -1104,7 +1114,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // backend.
   if (draft_tokens > 0) {
     try {
-      model->verify = build_verify_round(*topology, draft_tokens);
+      model->verify = build_verify_round(*topology, draft_tokens, vision_max_tokens > 0);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: verify round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);

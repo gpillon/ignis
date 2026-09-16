@@ -349,6 +349,28 @@ bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
 default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the
 envelope check and the leaf's vision schema host-side.
 
+Since GitHub #195 `--vision` combines with `--spec dflash2`: both scopes bind
+in one load, the drafter's context append takes the span's KV positions (what
+the reference's own prefill sink captures on a multimodal span), and the verify
+round rotates its columns at `position + rope_delta` from its own staging, the
+way a decode round already did. `crates/server/tests/vision_dflash2_gpu.rs` is
+that load's check — the canary floor on it, greedy verify rounds against the
+same load's own plain decode rounds, and the acceptance on the text after an
+image against the 3.4–5.75 band. The verify round's rope staging exists only
+when vision is loaded, so a text-only speculative load allocates nothing new.
+
+**The verify round's rope delta is a deliberate departure from the reference.**
+The reference's DFlash2 round passes its proposal positions for both the cache
+and the rotation and carries no rope delta in its decode ingress at all, while
+its ordinary decode batch and its MTP round both add the sequence's — so on the
+reference a multimodal sequence's verify columns and its decode rounds
+disagree. The spec (`.scratch/vision/specs/01-image-input.md`, §Compute seam)
+asks for `rope_position = position + rope_delta` on *every* decode and verify
+round, and ignis follows the spec. Expect a live/live comparison against the
+reference with `--vision --spec dflash2` to show the reference's own
+divergence, not ours; the vision canary fixture was recorded without
+speculation, so it stays the right oracle either way.
+
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`

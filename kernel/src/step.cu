@@ -1273,6 +1273,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
   std::vector<std::int32_t> extents(batch_size, 0);
   std::vector<std::int32_t> valid_columns(batch_size, 1);
   std::vector<std::int32_t> slots(batch_size, 0);
+  // GitHub #195: on a vision load, the columns' rotation positions -- the
+  // same `base + min(j, extent)` the traversal derives, plus the lane's own
+  // `rope_delta`. Empty (and unstaged) on every other load.
+  std::vector<std::int32_t> rope_positions(
+      verify.rope_positions == nullptr ? 0 : static_cast<std::size_t>(lane_columns) * batch_size, 0);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
   try {
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -1313,6 +1318,16 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       for (uint64_t j = 0; j < extent && !drafter; ++j) {
         drafts[i * k + j] = options.drafts[i * k + j];
       }
+      // The lane's rotation positions: the traversal's own column rule with
+      // the sequence's delta added. A text sequence's delta is 0, so the two
+      // matrices are equal and nothing about a text round changes.
+      if (!rope_positions.empty()) {
+        for (std::uint32_t j = 0; j < lane_columns; ++j) {
+          rope_positions[i * lane_columns + j] =
+              base_positions[i] + std::min<std::int32_t>(static_cast<std::int32_t>(j), extents[i]) +
+              seq->rope_delta;
+        }
+      }
     }
 
     // GitHub #157: each lane's carried anchor taps, into its window before
@@ -1350,6 +1365,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         // The accept RNG's position base is the lane's frontier, the same
         // logical position today's sampler keys its draw by.
         !stage(*verify.lengths, base_positions.data(), lane_bytes, "verify lengths") ||
+        // GitHub #195: a vision load's rotation positions, at the address its
+        // verify graphs read.
+        (!rope_positions.empty() &&
+         !stage(*verify.rope_positions, rope_positions.data(),
+                rope_positions.size() * sizeof(std::int32_t), "verify rope positions")) ||
         !stage(*model->decode_graph_slots, slots.data(), lane_bytes, "verify slots") ||
         !stage(*model->sampling_decode_configs, configs.data(),
                batch_size * sizeof(ninfer::ops::SamplingConfig), "verify sampling configs")) {
