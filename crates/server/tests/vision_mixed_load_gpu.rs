@@ -25,6 +25,10 @@
 //!    KV-RAM, restored once the intruder is done, and still describes its
 //!    image.
 //!
+//! What HTTP cannot show is read off the request log (`ignis.request.*`),
+//! recorded by a tracing layer: that the evicted and the restored request
+//! are that Agent request, not a re-prefill, and that the drafter drafted.
+//!
 //! Sane, not token-identical: a decode round's width is part of its
 //! numerics (`cuda_leaf_vision_gpu.rs`'s module doc). hq-e8-2b, the serving
 //! default, since nothing here carries a derived tolerance.
@@ -45,6 +49,11 @@ use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::gpu_profile;
@@ -189,6 +198,56 @@ async fn image_server() -> String {
     let address = listener.local_addr().expect("its address");
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve images") });
     format!("http://{address}")
+}
+
+// ── the request log ─────────────────────────────────────────────────────────
+
+/// One `ignis.request.*` event, with the fields this test reads.
+#[derive(Debug, Clone, Default)]
+struct Logged {
+    name: &'static str,
+    request_id: Option<u64>,
+    class: Option<String>,
+    drafted: Option<u64>,
+}
+
+impl Visit for Logged {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "request_id" => self.request_id = Some(value),
+            "spec.drafted" => self.drafted = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "class" {
+            self.class = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
+
+/// Records every `ignis.request.*` event the server emits.
+#[derive(Clone, Default)]
+struct RequestLog(Arc<Mutex<Vec<Logged>>>);
+
+impl<S: tracing::Subscriber> Layer<S> for RequestLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+        let name = event.metadata().name();
+        if name.starts_with("ignis.request.") {
+            let mut logged = Logged { name, ..Logged::default() };
+            event.record(&mut logged);
+            self.0.lock().unwrap().push(logged);
+        }
+    }
+}
+
+impl RequestLog {
+    fn named(&self, name: &str) -> Vec<Logged> {
+        self.0.lock().unwrap().iter().filter(|e| e.name == name).cloned().collect()
+    }
 }
 
 // ── requests ────────────────────────────────────────────────────────────────
@@ -365,9 +424,15 @@ async fn metric(metrics: &Router, name: &str) -> f64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
-    // The request log (`ignis.request.*`): which request was evicted and
-    // restored, and each request's speculation, read off the profile's output.
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    // The request log, printed for the profile's output and recorded for the
+    // assertions below.
+    let log = RequestLog::default();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer())
+        .with(log.clone())
+        .try_init()
+        .expect("this test binary installs the only subscriber");
     let Some(h) = harness() else { return };
     let images = image_server().await;
     let number = format!("{images}/number.png");
@@ -438,4 +503,17 @@ async fn an_agentic_load_with_images_by_url_keeps_every_lane_sane() {
     assert!(intruder.text.contains('4'), "{:?}", intruder.text);
     assert!(agent.tokens > 4, "the restored image request kept decoding");
     assert!(agent.text.contains("47"), "restored, it still describes its image: {:?}", agent.text);
+
+    // The request log: the one Agent request is the one evicted and restored,
+    // and speculation drafted — for it, and across the load.
+    let done = log.named("ignis.request.done");
+    let agents: Vec<u64> =
+        done.iter().filter(|e| e.class.as_deref() == Some("agent")).filter_map(|e| e.request_id).collect();
+    assert_eq!(agents.len(), 1, "one Agent request: {done:?}");
+    let ids = |name| log.named(name).iter().filter_map(|e| e.request_id).collect::<Vec<_>>();
+    assert_eq!(ids("ignis.request.evicted"), agents, "the Agent image request is the one evicted");
+    assert_eq!(ids("ignis.request.restored"), agents, "and restored from its blob, not re-prefilled");
+    let agent_drafted = done.iter().find(|e| e.request_id == Some(agents[0])).and_then(|e| e.drafted);
+    assert!(agent_drafted.is_some_and(|n| n > 0), "DFlash2 drafted for the restored request: {agent_drafted:?}");
+    assert!(done.iter().all(|e| e.drafted.is_some()), "every request ran speculative rounds: {done:?}");
 }
