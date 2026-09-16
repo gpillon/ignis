@@ -350,10 +350,7 @@ impl Request {
         }
         self.input
             .system_block_tokens
-            .map_or(0, |block| match &self.input.multimodal {
-                Some(multimodal) => multimodal.floor_outside_media(block, page_tokens),
-                None => (block / page_tokens) * page_tokens,
-            })
+            .map_or(0, |block| self.input.prefix_floor(block, page_tokens))
     }
 
     /// The **capture point** (GitHub #186, ADR 0029): the prefill position at

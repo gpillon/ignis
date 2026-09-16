@@ -2115,10 +2115,7 @@ impl Scheduler for ConcreteScheduler {
         // opener's, the checkpoint is lost for this turn (its whole pages are
         // no longer the prefix, `Request::checkpoint_point`), which is the
         // price of an image ending within a page of the generation opener.
-        let publish_tokens = match &input.multimodal {
-            Some(multimodal) => multimodal.floor_outside_media(publish_tokens, self.config.kv_page_tokens),
-            None => publish_tokens,
-        };
+        let publish_tokens = input.prefix_floor(publish_tokens, self.config.kv_page_tokens);
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         // GitHub #187 × #188: the two boundaries **compose** rather than
         // exclude each other. #188 floored this to the system block, because
@@ -2433,15 +2430,33 @@ impl Scheduler for ConcreteScheduler {
         // candidate in the batch takes the head; the rest prefill it
         // themselves this tick (there is nothing warm to claim yet) and a
         // later sibling claims the one entry that did register.
+        //
+        // GitHub #193: "the same head" is the same *content* — token ids and
+        // the images inside them. Two siblings sending same-size pictures
+        // have identical ids, and each is the only publisher of its own head.
+        // The key is walked only for a request whose point collides with an
+        // earlier one's, which is rare, rather than for every request on
+        // every tick its point is nonzero.
         let publish_points: Vec<u32> = {
+            let head_key = |i: usize, at: u32| {
+                let media = media_keys(&self.requests[i].input);
+                PromptContent::new(&self.requests[i].input.tokens, &media).key_at(at)
+            };
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
                 let at = self.requests[i].publish_point(self.config.kv_page_tokens);
-                let head = &self.requests[i].input.tokens[..at as usize];
-                let taken = batch[..n].iter().enumerate().any(|(m, &j)| {
-                    points[m] == at && self.requests[j].input.tokens[..at as usize] == *head
-                });
-                points.push(if at > 0 && taken { 0 } else { at });
+                let taken = at > 0 && {
+                    let mut earlier = batch[..n]
+                        .iter()
+                        .enumerate()
+                        .filter(|&(m, _)| points[m] == at)
+                        .peekable();
+                    earlier.peek().is_some() && {
+                        let head = head_key(i, at);
+                        earlier.any(|(_, &j)| head_key(j, at) == head)
+                    }
+                };
+                points.push(if taken { 0 } else { at });
             }
             points
         };

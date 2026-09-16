@@ -252,10 +252,11 @@ impl TemplateProvider for ArtifactTemplateProvider {
         // across the placeholder expansion by the processor, which checks each
         // for an exact token prefix of the expanded prompt the way
         // `exact_token_prefix` does for a text one.
+        let user_query = ChatTemplate::last_user_query_offset(&rendered);
         let offsets = [
             ChatTemplate::generation_opener_offset(&rendered),
             ChatTemplate::system_block_offset(&rendered),
-            ChatTemplate::last_user_query_offset(&rendered),
+            user_query,
         ];
         let boundaries: Vec<usize> = offsets.iter().flatten().copied().collect();
         let mut prompt = processor
@@ -271,7 +272,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
             // The processor refuses an empty head, as `exact_token_prefix`
             // does; the user turn alone accepts one (`Self::user_turn_tokens`):
             // a conversation opening on the user's message has its query at 0.
-            user_turn_tokens: user_turn_tokens.or(offsets[2].filter(|&at| at == 0).map(|_| 0)),
+            user_turn_tokens: user_turn_tokens.or(user_query.filter(|&at| at == 0).map(|_| 0)),
             system_block_tokens,
         };
         Ok((rendered, multimodal))

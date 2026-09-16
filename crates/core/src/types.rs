@@ -112,6 +112,20 @@ pub struct RequestInput {
     pub system_block_tokens: Option<u32>,
 }
 
+impl RequestInput {
+    /// The last whole-page boundary at or before `at` that a prefix of this
+    /// prompt may end at: the plain page floor, walked back out of any media
+    /// item it would land inside (GitHub #193,
+    /// [`crate::vision::Multimodal::floor_outside_media`]).
+    pub fn prefix_floor(&self, at: u32, page_tokens: u32) -> u32 {
+        match &self.multimodal {
+            Some(multimodal) => multimodal.floor_outside_media(at, page_tokens),
+            None if page_tokens == 0 => 0,
+            None => (at / page_tokens) * page_tokens,
+        }
+    }
+}
+
 /// Sampling / decoding parameters for a request.
 ///
 /// The default remains **greedy + fixed seed** (ADR 0007). Positive

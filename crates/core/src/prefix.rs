@@ -228,8 +228,8 @@ impl PrefixCache {
     /// also refused when the page floor lands **inside** a media item: half an
     /// image's placeholders would be shared, and a claimant's prefill would
     /// start in the middle of an item whose encode it never runs. The
-    /// scheduler never publishes there (`Request::publish_point`); this is the
-    /// ledger refusing to record it if it ever did.
+    /// scheduler never publishes there (`RequestInput::prefix_floor`); this is
+    /// the ledger refusing to record it if it ever did.
     pub fn register<'a>(
         &mut self,
         publisher: RequestId,
@@ -370,28 +370,8 @@ impl PrefixCache {
     /// answers a length past the end with the whole prompt's key, which must
     /// never stand in for a longer entry's.
     fn longest_match(&self, prompt: PromptContent<'_>, floor: u32) -> Option<&PrefixEntry> {
-        let candidates: Vec<&PrefixEntry> = self
-            .entries
-            .iter()
-            .filter(|e| e.length_tokens <= prompt.tokens() && e.length_tokens > floor)
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let lengths: Vec<u32> = candidates.iter().map(|e| e.length_tokens).collect();
-        let keys = prompt.keys_at(&lengths);
-        let mut best: Option<&PrefixEntry> = None;
-        for (entry, key) in candidates.into_iter().zip(keys) {
-            if entry.key != key {
-                continue;
-            }
-            // The longest match wins (a cached prefix of a cached prefix
-            // is a shorter match).
-            if best.is_none_or(|b| entry.length_tokens > b.length_tokens) {
-                best = Some(entry);
-            }
-        }
-        best
+        let candidates = self.entries.iter().filter(|e| e.length_tokens > floor);
+        longest_keyed(prompt, candidates, |e| (e.key, e.length_tokens))
     }
 
     /// Take one more reference to `entry` on behalf of something that is not
@@ -634,23 +614,8 @@ impl PrefixCache {
         &self,
         prompt: impl Into<PromptContent<'a>>,
     ) -> Option<&SpilledPrefix> {
-        let prompt = prompt.into();
-        let candidates: Vec<&SpilledPrefix> = self
-            .spilled
-            .iter()
-            .filter(|s| s.on_device.is_none() && s.length_tokens <= prompt.tokens())
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let lengths: Vec<u32> = candidates.iter().map(|s| s.length_tokens).collect();
-        let keys = prompt.keys_at(&lengths);
-        candidates
-            .into_iter()
-            .zip(keys)
-            .filter(|(s, key)| s.key == *key)
-            .map(|(s, _)| s)
-            .max_by_key(|s| s.length_tokens)
+        let candidates = self.spilled.iter().filter(|s| s.on_device.is_none());
+        longest_keyed(prompt.into(), candidates, |s| (s.key, s.length_tokens))
     }
 
     /// The spilled prefix `id`, if its blob is still held.
@@ -727,6 +692,32 @@ impl PrefixCache {
             .iter()
             .find(|e| e.key == key && e.length_tokens == length)
     }
+}
+
+/// The longest of `candidates` that is a prefix of `prompt` by content —
+/// whose key equals the prompt's key at its length (GitHub #193). The longest
+/// match wins: a cached prefix of a cached prefix is a shorter match.
+///
+/// Only candidates no longer than the prompt are asked about: `keys_at`
+/// answers a length past the end with the whole prompt's key, which must
+/// never stand in for a longer entry's.
+fn longest_keyed<'e, T>(
+    prompt: PromptContent<'_>,
+    candidates: impl Iterator<Item = &'e T>,
+    name: impl Fn(&T) -> (MatchKey, u32),
+) -> Option<&'e T> {
+    let candidates: Vec<&T> = candidates.filter(|c| name(c).1 <= prompt.tokens()).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let lengths: Vec<u32> = candidates.iter().map(|c| name(c).1).collect();
+    let keys = prompt.keys_at(&lengths);
+    candidates
+        .into_iter()
+        .zip(keys)
+        .filter(|(c, key)| name(c).0 == *key)
+        .map(|(c, _)| c)
+        .max_by_key(|c| name(c).1)
 }
 
 #[cfg(test)]

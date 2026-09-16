@@ -795,10 +795,10 @@ fn prompt_reuse_off_retains_no_prefix() {
     assert_eq!(chunk_widths(&compute, later).iter().sum::<usize>(), 60);
 }
 
-/// [`subagent`] with a four-placeholder picture of content `digest` in its
+/// [`subagent`] with a four-placeholder image of content `digest` in its
 /// question, at prompt tokens 38..42 — past the block, inside the page the
 /// opener's head ends on.
-fn subagent_with_picture(query: u32, digest: u8) -> RequestInput {
+fn subagent_with_image(query: u32, digest: u8) -> RequestInput {
     let mut input = subagent(query);
     let count = input.tokens.len();
     input.multimodal = Some(Arc::new(Multimodal {
@@ -815,7 +815,7 @@ fn subagent_with_picture(query: u32, digest: u8) -> RequestInput {
 }
 
 #[test]
-fn a_multimodal_burst_shares_the_block_whatever_picture_each_subagent_sends() {
+fn a_multimodal_burst_shares_the_block_whatever_image_each_subagent_sends() {
     // GitHub #193: a prompt carrying an image publishes its retained prefix
     // like any other, because the prefix is keyed by its images too. The
     // block holds no image, so a subagent sending another picture still skips
@@ -823,7 +823,7 @@ fn a_multimodal_burst_shares_the_block_whatever_picture_each_subagent_sends() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
     sched
-        .submit(subagent_with_picture(500, 0xAA), RequestClass::Agent)
+        .submit(subagent_with_image(500, 0xAA), RequestClass::Agent)
         .unwrap();
     run_to_idle(&mut sched);
     assert_eq!(
@@ -833,7 +833,7 @@ fn a_multimodal_burst_shares_the_block_whatever_picture_each_subagent_sends() {
     );
 
     let other = sched
-        .submit(subagent_with_picture(500, 0xBB), RequestClass::Agent)
+        .submit(subagent_with_image(500, 0xBB), RequestClass::Agent)
         .unwrap();
     let events = run_to_idle(&mut sched);
     assert_eq!(
@@ -846,7 +846,7 @@ fn a_multimodal_burst_shares_the_block_whatever_picture_each_subagent_sends() {
     // The same picture and question is the first subagent's own history, all
     // the way to its generation opener.
     let same = sched
-        .submit(subagent_with_picture(500, 0xAA), RequestClass::Agent)
+        .submit(subagent_with_image(500, 0xAA), RequestClass::Agent)
         .unwrap();
     let events = run_to_idle(&mut sched);
     assert_eq!(

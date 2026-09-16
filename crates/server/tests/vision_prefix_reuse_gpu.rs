@@ -14,10 +14,17 @@
 //! - the second red sibling reuses past the image, and still answers "red";
 //! - the reused-token counter moves.
 //!
-//! Each answer is also taken alone first, on a scheduler with prompt reuse
-//! off, so the check is "the same answer as without reuse", not only a
-//! keyword. The keyword is asserted too: a model that called both images red
-//! would make the first check vacuous.
+//! Twice: with prompt reuse off, where the only door is the sibling prefix
+//! cache — the path that matched raw token ids before #193 — and the sibling
+//! counter has to move by exactly the second red's claim, since the blue one
+//! has nothing it may claim at all; then with it on, where the second red
+//! resumes from the first's retained checkpoint at its generation opener. Off
+//! first: a scheduler leaves its retained state behind in the leaf, and a
+//! later scheduler's request ids start over.
+//!
+//! Each answer is also taken alone first, reusing nothing, to show the model
+//! tells the two swatches apart at all — otherwise "blue" after reuse would
+//! prove nothing.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a skip; under the profile, a hard failure.
@@ -103,8 +110,10 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
 struct Run {
     ids: Vec<RequestId>,
     tokens: HashMap<RequestId, Vec<TokenId>>,
-    /// Leading prompt tokens each request skipped, prefix or checkpoint.
-    reused: HashMap<RequestId, u32>,
+    /// Leading prompt tokens each request skipped through a shared prefix.
+    prefix_reused: HashMap<RequestId, u32>,
+    /// Leading prompt tokens each request skipped through a checkpoint.
+    state_reused: HashMap<RequestId, u32>,
     sibling_reused_tok: u64,
 }
 
@@ -120,15 +129,17 @@ fn run(
     let mut ids: Vec<RequestId> =
         first.into_iter().map(|input| sched.submit(input, RequestClass::Agent).expect("submit")).collect();
     let mut tokens: HashMap<RequestId, Vec<TokenId>> = HashMap::new();
-    let mut reused: HashMap<RequestId, u32> = HashMap::new();
+    let mut prefix_reused: HashMap<RequestId, u32> = HashMap::new();
+    let mut state_reused: HashMap<RequestId, u32> = HashMap::new();
     let mut collect = |events: Vec<SchedEvent>| {
         for event in events {
             match event {
                 SchedEvent::Token { request, token } => tokens.entry(request).or_default().push(token),
-                SchedEvent::PrefixReused { request, tokens: skipped, .. }
-                | SchedEvent::StateReused { request, tokens: skipped, .. } => {
-                    let entry = reused.entry(request).or_default();
-                    *entry = (*entry).max(skipped);
+                SchedEvent::PrefixReused { request, tokens: skipped, .. } => {
+                    prefix_reused.insert(request, skipped);
+                }
+                SchedEvent::StateReused { request, tokens: skipped, .. } => {
+                    state_reused.insert(request, skipped);
                 }
                 _ => {}
             }
@@ -144,7 +155,15 @@ fn run(
         assert!(sched.last_error().is_none(), "compute error: {:?}", sched.last_error());
         collect(events);
     }
-    Run { ids, tokens, reused, sibling_reused_tok: sched.sibling_prefix_reused_tok() }
+    Run { ids, tokens, prefix_reused, state_reused, sibling_reused_tok: sched.sibling_prefix_reused_tok() }
+}
+
+impl Run {
+    /// The most `request` skipped, through either kind of reuse.
+    fn reused(&self, request: RequestId) -> u32 {
+        let prefix = self.prefix_reused.get(&request).copied().unwrap_or(0);
+        prefix.max(self.state_reused.get(&request).copied().unwrap_or(0))
+    }
 }
 
 #[test]
@@ -228,39 +247,66 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
     let alone = run(&compute, config(false), vec![red_input.clone(), blue_input.clone()], 0, Vec::new());
     let (red_alone, blue_alone) = (&alone.tokens[&alone.ids[0]], &alone.tokens[&alone.ids[1]]);
     eprintln!("alone: red {:?}, blue {:?}", text(red_alone), text(blue_alone));
-    assert!(alone.reused.is_empty(), "nothing is reused with prompt reuse off");
+    assert!(
+        alone.prefix_reused.is_empty() && alone.state_reused.is_empty(),
+        "two requests in one batch have nothing warm to claim"
+    );
     assert!(text(red_alone).to_lowercase().contains("red"), "{:?}", text(red_alone));
     assert!(text(blue_alone).to_lowercase().contains("blue"), "{:?}", text(blue_alone));
 
-    // The siblings: red publishes, then blue and red again arrive while it
-    // is still decoding.
-    let siblings = run(&compute, config(true), vec![red_input.clone()], 3, vec![blue_input, red_input]);
-    let (first, other, same) = (siblings.ids[0], siblings.ids[1], siblings.ids[2]);
-    let answer = |id: RequestId| text(&siblings.tokens[&id]);
-    eprintln!(
-        "siblings: red {:?}, blue {:?} (reused {:?}), red again {:?} (reused {:?}); sibling counter {}",
-        answer(first),
-        answer(other),
-        siblings.reused.get(&other),
-        answer(same),
-        siblings.reused.get(&same),
-        siblings.sibling_reused_tok
-    );
-    let blue_reused = siblings.reused.get(&other).copied().unwrap_or(0);
-    assert!(blue_reused > 0, "the blue sibling shares the system block");
-    assert!(
-        blue_reused as usize <= item.begin,
-        "and nothing of the red image: reused {blue_reused}, image begins at {}",
-        item.begin
-    );
-    let same_reused = siblings.reused.get(&same).copied().unwrap_or(0);
-    assert!(
-        same_reused as usize >= item.begin + item.count,
-        "the red sibling reuses past its image: reused {same_reused}"
-    );
-    assert!(siblings.sibling_reused_tok > 0, "the reused-token counter moves");
-    assert!(answer(other).to_lowercase().contains("blue"), "{:?}", answer(other));
-    assert!(answer(same).to_lowercase().contains("red"), "{:?}", answer(same));
-    assert!(answer(first).to_lowercase().contains("red"), "{:?}", answer(first));
-    assert_eq!(compute.live_media(), 0);
+    for prompt_reuse in [false, true] {
+        // The siblings: red publishes, then blue and red again arrive. With
+        // prompt reuse off nothing outlives the first red, and a one-word
+        // answer is a single decode run, so they arrive the advance after its
+        // first chunk published the whole-page head. With it on, the head is
+        // cut at the block, then the opener's page, then the checkpoint is
+        // captured at the opener: three chunks, and whatever is retained
+        // stays for them.
+        let lead = if prompt_reuse { 3 } else { 1 };
+        let siblings = run(
+            &compute,
+            config(prompt_reuse),
+            vec![red_input.clone()],
+            lead,
+            vec![blue_input.clone(), red_input.clone()],
+        );
+        let (first, other, same) = (siblings.ids[0], siblings.ids[1], siblings.ids[2]);
+        let answer = |id: RequestId| text(&siblings.tokens[&id]);
+        eprintln!(
+            "siblings (prompt reuse {prompt_reuse}): red {:?}, blue {:?} (reused {}), red again {:?} \
+             (prefix {:?}, checkpoint {:?}); sibling counter {}",
+            answer(first),
+            answer(other),
+            siblings.reused(other),
+            answer(same),
+            siblings.prefix_reused.get(&same),
+            siblings.state_reused.get(&same),
+            siblings.sibling_reused_tok
+        );
+        let (blue_reused, same_reused) = (siblings.reused(other), siblings.reused(same));
+        assert!(
+            blue_reused as usize <= item.begin,
+            "the blue sibling shares nothing of the red image: reused {blue_reused}, image begins at {}",
+            item.begin
+        );
+        assert!(
+            same_reused as usize >= item.begin + item.count,
+            "the red sibling reuses past its image: reused {same_reused}"
+        );
+        if prompt_reuse {
+            assert!(blue_reused > 0, "the blue sibling shares the system block");
+        } else {
+            // No block, no checkpoint: the whole-prompt head covers the image,
+            // so the blue sibling claims nothing, and the counter is the red
+            // sibling's claim alone.
+            assert_eq!(blue_reused, 0);
+            assert_eq!(siblings.prefix_reused.get(&same).copied(), Some(same_reused));
+            assert_eq!(siblings.sibling_reused_tok, u64::from(same_reused), "the counter moves by it");
+        }
+        assert!(siblings.sibling_reused_tok > 0, "the reused-token counter moves");
+        assert!(answer(other).to_lowercase().contains("blue"), "{:?}", answer(other));
+        assert!(answer(same).to_lowercase().contains("red"), "{:?}", answer(same));
+        assert!(answer(first).to_lowercase().contains("red"), "{:?}", answer(first));
+        assert_eq!(compute.live_media(), 0);
+    }
 }

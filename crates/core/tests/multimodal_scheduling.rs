@@ -18,12 +18,12 @@ const MODEL: &str = "qwen3.8-27b";
 
 /// An image of `count` merged tokens at prompt tokens `begin..begin+count`.
 fn image(begin: usize, count: usize) -> MediaItem {
-    picture(begin, count, begin as u8)
+    image_with_digest(begin, count, begin as u8)
 }
 
 /// [`image`] with content `digest`: two of these differing only in `digest`
-/// are two pictures of the same size, expanding to the same placeholder ids.
-fn picture(begin: usize, count: usize, digest: u8) -> MediaItem {
+/// are two images of the same size, expanding to the same placeholder ids.
+fn image_with_digest(begin: usize, count: usize, digest: u8) -> MediaItem {
     MediaItem {
         grid: Grid { t: 1, h: 2, w: 2 * count as u32 },
         token_span: TokenSpan { begin, count },
@@ -143,7 +143,7 @@ fn a_sibling_sending_the_same_image_claims_the_prefix_and_another_image_never_do
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     // Four whole pages with an image inside them, then a sibling's own tail.
     let prompt = |digest: u8, tail: usize| {
-        let mut input = multimodal_input(64 + tail, vec![picture(20, 16, digest)], 4);
+        let mut input = multimodal_input(64 + tail, vec![image_with_digest(20, 16, digest)], 4);
         input.tokens.truncate(64);
         input.tokens.extend((0..tail as u32).map(|t| 1000 + t));
         input
@@ -166,13 +166,44 @@ fn a_sibling_sending_the_same_image_claims_the_prefix_and_another_image_never_do
 }
 
 #[test]
+fn siblings_in_one_batch_with_different_images_each_publish_their_own_head() {
+    // Two requests arriving together see an empty cache, and only one of two
+    // *identical* heads is published. Same-size images make the token ids
+    // identical, but not the heads: each publishes, and a later sibling
+    // sending either image claims that one.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
+    let prompt = |digest: u8| multimodal_input(72, vec![image_with_digest(20, 16, digest)], 4);
+    let a = sched.submit(prompt(0xAA), RequestClass::Agent).unwrap();
+    let b = sched.submit(prompt(0xBB), RequestClass::Agent).unwrap();
+    let twin = sched.submit(prompt(0xAA), RequestClass::Agent).unwrap();
+    sched.advance();
+    let published = |request: u64| -> Vec<u32> {
+        compute
+            .prefill_calls()
+            .iter()
+            .flatten()
+            .filter(|job| job.request == request)
+            .filter_map(|job| job.publish_prefix_tokens)
+            .collect()
+    };
+    assert_eq!(published(a), [64]);
+    assert_eq!(published(b), [64], "another image is another head");
+    assert!(published(twin).is_empty(), "the same image is the same head");
+
+    let later = sched.submit(prompt(0xBB), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(prefix_reuses(&events, later), [64], "{events:?}");
+}
+
+#[test]
 fn a_multimodal_claim_always_leaves_a_tail_to_prefill() {
     // A claim reaching the prompt's end would prefill nothing, and nothing
     // else hands the leaf the request's rope_delta: the identical prompt is
     // not given the whole-prompt head.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
-    let prompt = || multimodal_input(64, vec![picture(20, 16, 0xAA)], 4);
+    let prompt = || multimodal_input(64, vec![image_with_digest(20, 16, 0xAA)], 4);
     sched.submit(prompt(), RequestClass::Agent).unwrap();
     sched.advance();
     let twin = sched.submit(prompt(), RequestClass::Agent).unwrap();
@@ -195,7 +226,7 @@ fn a_multimodal_prefix_is_never_published_inside_an_image() {
     let mut sched = scheduler(compute.clone(), SchedulerConfig::default());
     // 72 tokens floor to a 64-token head, which is inside the image at
     // 40..70: the head walks back to the page holding its first placeholder.
-    let prompt = |digest: u8| multimodal_input(72, vec![picture(40, 30, digest)], 4);
+    let prompt = |digest: u8| multimodal_input(72, vec![image_with_digest(40, 30, digest)], 4);
     let main = sched.submit(prompt(0xAA), RequestClass::Agent).unwrap();
     sched.advance();
     let published: Vec<u32> = compute
