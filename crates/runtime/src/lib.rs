@@ -492,7 +492,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
 
 impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
-        let mut outcomes = PrefillOutcome::none(jobs.len());
+        let mut outcomes = PrefillOutcome::nothing_encoded(jobs.len());
         let mut sequences = self.sequences.lock().unwrap();
         let mut prefixes = self.prefixes.lock().unwrap();
         let mut media = self.media.lock().unwrap();

@@ -83,8 +83,30 @@ impl Compute for EncodingCompute {
         self.inner.decode_step(jobs)
     }
 
+    // Everything else is the mock's, which overrides these too: a partial
+    // delegation would answer from the trait's defaults instead.
     fn release(&self, request: RequestId) {
         self.inner.release(request);
+    }
+
+    fn release_prefix(&self, publisher: RequestId) {
+        self.inner.release_prefix(publisher);
+    }
+
+    fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {
+        self.inner.snapshot_size(request)
+    }
+
+    fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
+        self.inner.evict(request)
+    }
+
+    fn restore(&self, request: RequestId, context_tokens: u32) -> Result<(), ComputeError> {
+        self.inner.restore(request, context_tokens)
+    }
+
+    fn discard_snapshot(&self, request: RequestId) {
+        self.inner.discard_snapshot(request);
     }
 }
 
@@ -169,40 +191,16 @@ async fn the_same_image_sent_twice_is_a_cache_hit_on_the_admitted_event() {
         tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
     );
     let preparer = counting();
-    let scheduler = ConcreteScheduler::with_config(
-        SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
-        Arc::new(MockCompute::new()),
-    );
-    let acquirer = MediaAcquirer::new(preparer.clone(), limits(), MediaPolicy::new(false, 1 << 20));
-    let app = Server::new(Engine::new(Box::new(scheduler)), Box::new(SimpleTemplateProvider))
-        .with_request_timeout(Duration::from_secs(10))
-        .with_media(Arc::new(acquirer))
-        .app();
+    let app = app(Arc::new(MockCompute::new()), preparer.clone());
     let image = data_uri(&png(64, 64));
-    let body = json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": [
-        {"type": "text", "text": "what is this"},
-        {"type": "image_url", "image_url": {"url": image}},
-    ]}]});
     for _ in 0..2 {
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(image_request(&image)).await.unwrap();
         assert_eq!(response.status().as_u16(), 200);
         let _ = to_bytes(response.into_body(), usize::MAX).await;
     }
     nudge().await;
 
-    let admitted: Vec<Value> = sink
-        .lines()
-        .iter()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|e| e["event_name"] == "ignis.request.admitted")
-        .map(|e| e["attributes"].clone())
-        .collect();
+    let admitted = admitted_attributes(&sink);
     assert_eq!(admitted.len(), 2, "{admitted:?}");
     let cache = |a: &Value| (a["media.cache_hits"].clone(), a["media.cache_misses"].clone());
     assert_eq!(cache(&admitted[0]), (json!(0), json!(1)), "{:?}", admitted[0]);

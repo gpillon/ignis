@@ -265,6 +265,12 @@ When output names a domain concept, use the term as defined here.
   a sequence never stands past the text it emitted. It crosses the compute
   seam whole (`DecodeOutcome`, P5-06), and the server streams it one token at
   a time; today's round is a run of one.
+- **Prefill outcome** — what one prefill chunk cost beyond warming its KV
+  (`PrefillOutcome`, GitHub #192): today the microseconds the leaf spent
+  encoding a media item, which is 0 on a text chunk and on one that reuses
+  an embedding an earlier chunk of the same item encoded. One per job, in
+  order, the way a committed run crosses the seam per lane; the request log
+  sums them into `media.encode_seconds`.
 - **ReplaySSM record and fold** — how the GDN layers speculate without
   advancing: the verify traversal records each column's conv input, key,
   value and gates (the **records**), and after accept the **fold** replays

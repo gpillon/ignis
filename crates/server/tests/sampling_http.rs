@@ -29,7 +29,7 @@ struct SamplingEchoCompute {
 
 impl Compute for SamplingEchoCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
-        Ok(PrefillOutcome::none(jobs.len()))
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

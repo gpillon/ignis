@@ -148,7 +148,7 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
         }
         g.prefill_batches.push(jobs.to_vec());
-        Ok(PrefillOutcome::none(jobs.len()))
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
     }
 
     fn release_prefix(&self, publisher: RequestId) {

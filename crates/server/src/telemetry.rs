@@ -107,6 +107,16 @@ pub trait IntervalStatsProvider: Send + Sync {
 
 // ── the telemetry state ─────────────────────────────────────────────────────
 
+/// What a request's media cost, as the `admitted` line reports it: what
+/// acquiring them cost (GitHub #179) and what encoding them cost during
+/// prefill (GitHub #192), which the two halves of the pipeline measure in
+/// different places and only meet here.
+#[derive(Debug, Clone, Copy)]
+struct MediaSummary {
+    stats: MediaStats,
+    encode_micros: u64,
+}
+
 /// Per-request telemetry state (just enough for the request lines + the
 /// event-derived interval counters).
 #[derive(Debug, Default)]
@@ -249,7 +259,7 @@ impl Telemetry {
                         rt.prefill_chunks,
                         rt.prefilled_tokens,
                         rt.class,
-                        rt.media.map(|media| (media, rt.encode_micros)),
+                        rt.media.map(|stats| MediaSummary { stats, encode_micros: rt.encode_micros }),
                     )
                 }
                 // Not in flight — typically cancelled before this admission
@@ -505,11 +515,13 @@ impl Telemetry {
     /// alongside the lane dealt, how long the request queued, and its
     /// admission `class` (GitHub #120: the request log's per-class
     /// attribution). See [`Telemetry::emit_done`] for why this runs on the
-    /// telemetry consumer task rather than inline. `media.*` (GitHub #179)
-    /// is the request's media acquisition — items, vision tokens, acquired
-    /// bytes, preprocessing seconds, cache hits and misses — and absent on a
-    /// request without media, so a slow multimodal TTFT is attributable
-    /// from this one line.
+    /// telemetry consumer task rather than inline. `media.*` is the
+    /// request's media: what acquiring them cost (GitHub #179 — items,
+    /// vision tokens, acquired bytes, preprocessing seconds, cache hits and
+    /// misses) and what encoding them cost in prefill (GitHub #192 —
+    /// `media.encode_seconds`). Every one of them is absent on a request
+    /// without media, so a slow multimodal TTFT is attributable from this
+    /// one line, and a text request's line is untouched.
     #[allow(clippy::too_many_arguments)]
     fn emit_admitted(
         &self,
@@ -520,11 +532,11 @@ impl Telemetry {
         prefill_chunks_consumed: u32,
         prefilled_tokens: u32,
         class: RequestClass,
-        media: Option<(MediaStats, u64)>,
+        summary: Option<MediaSummary>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
-        let encode_seconds = media.map(|(_, micros)| micros as f64 / 1e6);
-        let media = media.map(|(media, _)| media);
+        let encode_seconds = summary.map(|s| s.encode_micros as f64 / 1e6);
+        let media = summary.map(|s| s.stats);
         tracing::info!(
             name: "ignis.request.admitted",
             request_id = id,
@@ -849,29 +861,49 @@ mod tests {
         assert!(text.keys().all(|k| !k.starts_with("media.")), "{text:?}");
     }
 
+    /// The `media.encode_seconds` of the one `admitted` event `f` produced.
+    fn admitted_encode_seconds(events: &[serde_json::Value]) -> serde_json::Value {
+        events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.admitted")
+            .expect("an admitted event")["attributes"]["media.encode_seconds"]
+            .clone()
+    }
+
     #[test]
-    fn encode_seconds_sum_across_the_chunks_and_reset_on_a_requeue() {
+    fn encode_seconds_sum_over_the_requests_media_items() {
+        let mut telemetry = telemetry();
+        let media = MediaStats { items: 2, vision_tokens: 8, ..MediaStats::default() };
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 40, RequestClass::Agent);
+            telemetry.note_media(1, media);
+            // Two images, each encoded on the chunk that first covers it,
+            // with a chunk that reuses a live embedding between them.
+            telemetry.on_prefill_chunk(1, 8, 300_000);
+            telemetry.on_prefill_chunk(1, 20, 0);
+            telemetry.on_prefill_chunk(1, 32, 200_000);
+            telemetry.on_prefill_chunk(1, 40, 0);
+            telemetry.on_admitted(1, 0);
+        });
+        assert_eq!(admitted_encode_seconds(&events), 0.5);
+    }
+
+    #[test]
+    fn a_requeue_resets_the_encode_seconds_of_the_discarded_attempt() {
         let mut telemetry = telemetry();
         let media = MediaStats { items: 1, vision_tokens: 4, ..MediaStats::default() };
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
-            // The encoding chunk, then one that reuses the live embedding.
             telemetry.on_prefill_chunk(1, 8, 250_000);
-            telemetry.on_prefill_chunk(1, 20, 0);
-            // A discarded attempt's encode is not this prefill's: the
-            // multimodal request re-encodes after a requeue.
+            // The attempt is discarded: a multimodal request is released and
+            // re-prefilled, so it encodes its item again.
             telemetry.on_requeued(1);
             telemetry.on_prefill_chunk(1, 8, 125_000);
             telemetry.on_prefill_chunk(1, 20, 0);
             telemetry.on_admitted(1, 0);
         });
-        let admitted = events
-            .iter()
-            .find(|e| e["event_name"] == "ignis.request.admitted")
-            .expect("an admitted event");
-        assert_eq!(admitted["attributes"]["media.encode_seconds"], 0.125);
-        assert_eq!(admitted["attributes"]["media.items"], 1);
+        assert_eq!(admitted_encode_seconds(&events), 0.125);
     }
 
     #[test]

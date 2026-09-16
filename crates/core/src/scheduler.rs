@@ -97,10 +97,16 @@ pub struct DecodeJob {
 /// `encode_micros` is the wall time the leaf's media encode took for this
 /// chunk, and is 0 on every chunk that encoded nothing: a text chunk, a
 /// chunk that reuses the embedding an earlier chunk of the same item
-/// encoded, and a full-prefix match that warms nothing at all. A request
-/// whose prefill failed and was retried (`MAX_PREFILL_ATTEMPTS`) re-encodes
-/// its item, and the retry's microseconds are reported too — the sum is the
-/// GPU time the request actually cost, not the cost of one image.
+/// encoded, and a full-prefix match that warms nothing at all.
+///
+/// A failed prefill batch reports nothing at all — it emits no chunk event,
+/// so an encode the failure discarded is never counted. Its retry
+/// (`MAX_PREFILL_ATTEMPTS`) re-encodes whatever the batch dropped, and
+/// *that* encode is counted. So a request whose second chunk failed carries
+/// its item's encode twice: once from the chunk that reported before the
+/// failure, once from the retry. What a request's total answers is "how
+/// much encode work did this request cause", not "what did this image cost
+/// to encode".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrefillOutcome {
     /// Wall time this chunk spent encoding a media item, in microseconds.
@@ -110,7 +116,7 @@ pub struct PrefillOutcome {
 impl PrefillOutcome {
     /// One outcome per job, none of which encoded anything — what every
     /// text-only backend returns.
-    pub fn none(jobs: usize) -> Vec<Self> {
+    pub fn nothing_encoded(jobs: usize) -> Vec<Self> {
         vec![Self::default(); jobs]
     }
 }
