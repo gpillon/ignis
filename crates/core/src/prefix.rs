@@ -184,9 +184,22 @@ impl PrefixCache {
     /// GDN state to resume from), or `None` when nothing cached matches
     /// the prompt head.
     pub fn claim(&mut self, tokens: &[TokenId]) -> Option<PrefixClaim> {
+        self.claim_longer_than(tokens, 0)
+    }
+
+    /// [`PrefixCache::claim`], restricted to entries covering **more** than
+    /// `floor` tokens.
+    ///
+    /// GitHub #186: a request may also match a retained prompt checkpoint,
+    /// which reaches further into its prompt than any page-aligned prefix of
+    /// the same head. Longest reuse wins (ADR 0029), so the checkpoint's span
+    /// is the floor this has to beat — and it has to be a floor rather than a
+    /// comparison made afterwards, because claiming here is not free: it pins
+    /// the entry and counts the skip.
+    pub fn claim_longer_than(&mut self, tokens: &[TokenId], floor: u32) -> Option<PrefixClaim> {
         let mut best: Option<&PrefixEntry> = None;
         for entry in &self.entries {
-            if entry.tokens.len() > tokens.len() {
+            if entry.tokens.len() > tokens.len() || entry.length_tokens <= floor {
                 continue;
             }
             if !tokens.starts_with(&entry.tokens) {
@@ -216,6 +229,35 @@ impl PrefixCache {
         }
         self.reused_tok += u64::from(claim.tokens);
         Some(claim)
+    }
+
+    /// Take one more reference to `entry` on behalf of something that is not
+    /// a live request (GitHub #186): a retained prompt checkpoint holds the
+    /// whole KV pages under its opener through the very prefix the capturing
+    /// request published, so the pages outlive every live claimant without
+    /// being charged to the pool a second time.
+    ///
+    /// Unlike [`PrefixCache::claim`] this counts no skipped tokens — nothing
+    /// was prefilled or skipped, the reference is pure retention — and it
+    /// matches no prompt: the caller already knows which entry it means.
+    /// Returns `false` when the entry is gone.
+    pub fn retain(&mut self, entry: PrefixId) -> bool {
+        match self.entries.iter_mut().find(|e| e.id == entry) {
+            Some(e) => {
+                e.refcount += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The entry `id`'s pages, or 0 when it is gone (GitHub #186: what a
+    /// retained checkpoint records as the pages it holds).
+    pub fn pages_of(&self, entry: PrefixId) -> u32 {
+        self.entries
+            .iter()
+            .find(|e| e.id == entry)
+            .map_or(0, |e| e.pages)
     }
 
     /// Release one reference to `entry` (the claimant completed or was
@@ -465,6 +507,48 @@ mod tests {
             0,
             "a sub-page prompt shares nothing"
         );
+    }
+
+    #[test]
+    fn a_claim_floor_skips_entries_that_reach_no_further() {
+        // GitHub #186: a request whose retained prompt checkpoint already
+        // covers 64 tokens gains nothing from a 64-token prefix, and claiming
+        // it would pin an entry and count a skip that never happened.
+        let mut cache = PrefixCache::new(16);
+        cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        cache.register(8, &prompt96(), &gdn_boundary(0)).unwrap();
+        assert!(
+            cache.claim_longer_than(&prompt96(), 96).is_none(),
+            "nothing reaches past the floor"
+        );
+        assert_eq!(cache.reused_tok(), 0, "a refused claim counts no skip");
+        let claim = cache.claim_longer_than(&prompt96(), 64).unwrap();
+        assert_eq!(claim.tokens, 96, "only the entry past the floor is taken");
+    }
+
+    #[test]
+    fn a_retention_reference_outlives_the_last_live_claimant() {
+        // GitHub #186: a retained prompt checkpoint holds the pages under its
+        // opener through this very entry, so the entry survives the request
+        // that published it — and its pages are still charged exactly once.
+        let mut cache = PrefixCache::new(16);
+        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        assert_eq!(pages, 4);
+        assert!(cache.retain(id), "the checkpoint takes a reference");
+        assert_eq!(cache.pages_of(id), 4);
+        // The publisher completes: its own reference goes, the entry stays.
+        assert_eq!(cache.release(id), None, "the checkpoint still holds it");
+        assert_eq!(cache.pinned_pages(), 4);
+        assert!(
+            cache.claim(&prompt64()).is_some(),
+            "a later sibling can still claim it"
+        );
+        assert_eq!(cache.release(id), None);
+        // The checkpoint is discarded last: now the pages come back.
+        assert_eq!(cache.release(id), Some((4, 7)));
+        assert_eq!(cache.pinned_pages(), 0);
+        assert!(!cache.retain(id), "a dropped entry cannot be retained");
+        assert_eq!(cache.pages_of(id), 0);
     }
 
     #[test]

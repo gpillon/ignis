@@ -49,6 +49,15 @@ struct Inner {
     prefixes_released: Vec<RequestId>,
     /// Requests whose device state the scheduler released, in order.
     released: Vec<RequestId>,
+    /// Retained prompt checkpoints the scheduler told the backend to let go
+    /// of (GitHub #186), in order: the capturing request of each. A retained
+    /// entry the scheduler drops without this call is a device image nothing
+    /// will ever free.
+    checkpoints_released: Vec<RequestId>,
+    /// Requests whose next asked-for checkpoint capture the backend will
+    /// decline (`refuse_capture`) — a leaf with no room in its own image
+    /// pool, or a sequence it will not capture.
+    capture_refusals: std::collections::HashSet<RequestId>,
 }
 
 /// A deterministic, recording [`Compute`] implementation for tests.
@@ -118,6 +127,19 @@ impl MockCompute {
         self.inner.lock().unwrap().released.clone()
     }
 
+    /// The capturing requests whose retained prompt checkpoint the scheduler
+    /// released (GitHub #186), in order.
+    pub fn released_checkpoints(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().checkpoints_released.clone()
+    }
+
+    /// Make the backend decline `request`'s next checkpoint capture (GitHub
+    /// #186): the chunk lands normally and reports that nothing was captured,
+    /// which is how a real leaf refuses a bet it cannot afford.
+    pub fn refuse_capture(&self, request: RequestId) {
+        self.inner.lock().unwrap().capture_refusals.insert(request);
+    }
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -148,11 +170,45 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
         }
         g.prefill_batches.push(jobs.to_vec());
-        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
+        Ok(jobs
+            .iter()
+            .map(|job| PrefillOutcome {
+                encode_micros: 0,
+                // GitHub #186: a nominal, deterministic restore cost on the
+                // job that claimed a checkpoint, so the request log's
+                // `restore_ms` is observable on CPU without inventing a
+                // clock. 0 on every other job, as a real backend reports.
+                restore_micros: if job.checkpoint.is_some() { 1 } else { 0 },
+                // The mock holds no device image, but it *does* answer the
+                // question the scheduler is really asking — "did the capture
+                // you asked for happen?" — so the retained ledger is
+                // exercisable. `capture_failures` makes a backend that
+                // declines the bet testable too.
+                checkpoint_captured: job.capture_checkpoint_tokens.is_some()
+                    && !g.capture_refusals.remove(&job.request),
+            })
+            .collect())
     }
 
     fn release_prefix(&self, publisher: RequestId) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
+    }
+
+    // GitHub #186: the mock holds no device image, but the retained pool's
+    // byte budget has to be exercisable without one — the same reasoning
+    // `snapshot_size` below records. One nominal byte per checkpoint image,
+    // uniform across requests, so a test drives exhaustion by setting
+    // `retained_pool_bytes` to the number of checkpoints it wants to fit.
+    fn checkpoint_image_bytes(&self) -> u64 {
+        1
+    }
+
+    fn release_checkpoint(&self, publisher: RequestId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .checkpoints_released
+            .push(publisher);
     }
 
     fn release(&self, request: RequestId) {

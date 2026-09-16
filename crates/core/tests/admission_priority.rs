@@ -14,6 +14,7 @@ use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
     RequestInput {
         multimodal: None,
+        opener_tokens: None,
         model: model.into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
