@@ -481,30 +481,35 @@ impl ChatTemplate {
         preserve_thinking: Option<bool>,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
-        let mut context = serde_json::Map::new();
-        context.insert(
-            "messages".to_owned(),
-            json!(messages.iter().map(message_to_json).collect::<Vec<_>>()),
-        );
-        context.insert("add_generation_prompt".to_owned(), json!(true));
+        let mut context: Vec<(&'static str, Value)> = vec![
+            (
+                "messages",
+                Value::from_iter(messages.iter().map(message_to_value)),
+            ),
+            ("add_generation_prompt", Value::from(true)),
+        ];
         if let Some((enable_thinking, effort)) = thinking {
-            context.insert("enable_thinking".to_owned(), json!(enable_thinking));
+            context.push(("enable_thinking", Value::from(enable_thinking)));
             if let Some(effort) = effort {
-                context.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
+                context.push(("reasoning_effort", Value::from(effort.as_str())));
             }
         }
         if let Some(preserve_thinking) = preserve_thinking {
-            context.insert("preserve_thinking".to_owned(), json!(preserve_thinking));
+            context.push(("preserve_thinking", Value::from(preserve_thinking)));
         }
         if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-            context.insert("tools".to_owned(), json!(tools));
+            // The client's `tools` array, opaque JSON, bound as-is: it
+            // arrives as `serde_json` and so is already key-sorted, which
+            // is exactly what the reference renders (its request JSON is
+            // an `nlohmann::json`, dumped sorted into `tool_jsons`).
+            context.push(("tools", Value::from_serialize(tools)));
         }
         let template = self
             .env
             .get_template(self.name)
             .map_err(|e| fail(format!("render chat template: {e}")))?;
         template
-            .render(&JsonValue::Object(context))
+            .render(Value::from_iter(context))
             .map_err(|e| fail(format!("render chat template: {e}")))
     }
 
@@ -759,41 +764,82 @@ pub struct ToolCall {
     pub id: Option<String>,
     /// The tool (function) name.
     pub name: String,
-    /// The tool arguments (a JSON object, or a JSON-encoded string).
-    pub arguments: JsonValue,
+    /// The tool arguments, held as the JSON-encoded object string the
+    /// OpenAI wire carries — never re-serialized on the way in, so the
+    /// key order the model emitted is still there when the template walks
+    /// `arguments|items` (GitHub #184; the reference's own
+    /// `ToolCall::arguments_json`, parsed with `nlohmann::ordered_json`).
+    /// A string that is not a JSON object renders as no parameters.
+    pub arguments: String,
 }
 
 // ---------------------------------------------------------------------------
-// Message → template context (Jinja sees plain JSON, OpenAI wire shape)
+// Message → template context (Jinja sees the OpenAI wire shape)
 // ---------------------------------------------------------------------------
 
-/// The JSON a [`ChatMessage`] presents to the template (OpenAI wire
-/// shape: `role`, `content`, `reasoning_content`, `tool_calls`).
-fn message_to_json(message: &ChatMessage) -> JsonValue {
-    let mut object = serde_json::Map::new();
-    object.insert("role".to_owned(), json!(message.role.name()));
-    object.insert("content".to_owned(), content_to_json(&message.content));
+/// What a [`ChatMessage`] presents to the template (OpenAI wire shape:
+/// `role`, `content`, `reasoning_content`, `tool_calls`).
+///
+/// A minijinja value rather than a `serde_json` one for a single reason:
+/// `serde_json::Map` is a `BTreeMap`, so every object that passes through
+/// it comes out key-sorted, and a tool call's `arguments` must reach the
+/// template in the order the model emitted (GitHub #184). Only `arguments`
+/// is order-sensitive — it is the one object the template walks with
+/// `|items` — but the whole message is built here so the ordered value
+/// never has to pass back through `serde_json` on its way in.
+fn message_to_value(message: &ChatMessage) -> Value {
+    let mut fields: Vec<(&'static str, Value)> = vec![
+        ("role", Value::from(message.role.name())),
+        (
+            "content",
+            Value::from_serialize(content_to_json(&message.content)),
+        ),
+    ];
     if let Some(reasoning) = &message.reasoning_content {
-        object.insert("reasoning_content".to_owned(), json!(reasoning));
+        fields.push(("reasoning_content", Value::from(reasoning.as_str())));
     }
     if !message.tool_calls.is_empty() {
-        let calls: Vec<JsonValue> = message
-            .tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    },
-                })
-            })
-            .collect();
-        object.insert("tool_calls".to_owned(), json!(calls));
+        fields.push((
+            "tool_calls",
+            Value::from_iter(message.tool_calls.iter().map(tool_call_to_value)),
+        ));
     }
-    JsonValue::Object(object)
+    Value::from_iter(fields)
+}
+
+/// One tool call in the OpenAI wire shape the template matches against
+/// (`id` / `type` / `function.name` / `function.arguments`).
+fn tool_call_to_value(call: &ToolCall) -> Value {
+    Value::from_iter([
+        (
+            "id",
+            call.id.as_deref().map_or_else(|| Value::from(()), Value::from),
+        ),
+        ("type", Value::from("function")),
+        (
+            "function",
+            Value::from_iter([
+                ("name", Value::from(call.name.as_str())),
+                ("arguments", tool_arguments_to_value(&call.arguments)),
+            ]),
+        ),
+    ])
+}
+
+/// A tool call's wire `arguments` as the parameter map the template walks:
+/// the JSON-encoded object string parsed straight into a minijinja value,
+/// whose map keeps the document's own key order (GitHub #184, the
+/// reference's `nlohmann::ordered_json` parse in `render_tool_call`).
+///
+/// A string that does not parse as a JSON *object* — the empty string an
+/// argument-less call carries, or a malformed one — becomes an empty map,
+/// which renders as no parameters at all rather than failing the whole
+/// conversation (the "never panic, degrade" posture of GitHub #132).
+fn tool_arguments_to_value(arguments: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) if value.kind() == ValueKind::Map => value,
+        _ => Value::from_iter(std::iter::empty::<(Value, Value)>()),
+    }
 }
 
 /// The JSON of a message's [`MessageContent`] (plain text, or the
@@ -1048,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn message_to_json_carries_tool_calls_in_the_openai_shape() {
+    fn message_to_value_carries_tool_calls_in_the_openai_shape() {
         let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
         let messages = [ChatMessage {
             role: Role::Assistant,
@@ -1056,7 +1102,7 @@ mod tests {
             tool_calls: vec![ToolCall {
                 id: Some("call_0".to_owned()),
                 name: "read_file".to_owned(),
-                arguments: json!({"path": "a.txt"}),
+                arguments: r#"{"path": "a.txt"}"#.to_owned(),
             }],
             reasoning_content: None,
         }];
@@ -1122,27 +1168,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tojson_renders_history_tool_call_arguments_as_the_reference_does() {
-        // The real template walks `arguments|items` and renders non-string
-        // values with `tojson`.
-        let template = ChatTemplate::from_source(
-            "{%- for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments|items %}\
-             <{{ k }}>{{ v if v is string else v | tojson }}{% endfor %}{% endfor %}{% endfor %}",
-        )
-        .expect("compile");
-        let messages = [ChatMessage {
+    /// Walks `arguments|items` the way the real template does, rendering
+    /// non-string values with `tojson` — the smallest source that shows a
+    /// tool call's parameter order.
+    const ARGUMENT_ITEMS_TEMPLATE: &str =
+        "{%- for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments|items %}\
+         <{{ k }}>{{ v if v is string else v | tojson }}{% endfor %}{% endfor %}{% endfor %}";
+
+    /// One assistant history message carrying a single tool call whose
+    /// `arguments` is the wire string `arguments`.
+    fn history_tool_call(arguments: &str) -> [ChatMessage; 1] {
+        [ChatMessage {
             role: Role::Assistant,
             content: MessageContent::Text(String::new()),
             tool_calls: vec![ToolCall {
                 id: None,
                 name: "edit".to_owned(),
-                arguments: json!({"path": "b.rs", "edits": [{"old": "x", "new": "y"}], "all": true}),
+                arguments: arguments.to_owned(),
             }],
             reasoning_content: None,
-        }];
-        let prompt = template.render(&messages).expect("render");
-        assert_eq!(prompt, r#"<all>true<edits>[{"new": "y", "old": "x"}]<path>b.rs"#);
+        }]
+    }
+
+    #[test]
+    fn tojson_renders_history_tool_call_arguments_as_the_reference_does() {
+        // The real template walks `arguments|items` and renders non-string
+        // values with `tojson`.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        let prompt = template
+            .render(&history_tool_call(r#"{"path": "b.rs", "edits": [{"old": "x", "new": "y"}], "all": true}"#))
+            .expect("render");
+        assert_eq!(prompt, r#"<path>b.rs<edits>[{"old": "x", "new": "y"}]<all>true"#);
+    }
+
+    #[test]
+    fn history_tool_call_arguments_keep_the_models_key_order() {
+        // GitHub #184: the reference parses a resent call's `arguments`
+        // with `nlohmann::ordered_json` (`chat_template.cpp`
+        // `render_tool_call`), so the model's emitted order survives a
+        // re-render. Sorting them — what a `serde_json::Map` would do —
+        // turns every tool-loop turn into a prompt-content mismatch.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        let prompt = template
+            .render(&history_tool_call(r#"{"z": 1, "a": 2, "m": 3}"#))
+            .expect("render");
+        assert_eq!(prompt, "<z>1<a>2<m>3");
+    }
+
+    #[test]
+    fn history_tool_call_arguments_that_are_not_a_json_object_degrade_to_an_empty_one() {
+        // The provider's posture since GitHub #132: a call whose wire
+        // string does not parse as a JSON object renders no parameters
+        // rather than failing the whole request.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        for arguments in ["", "not json", "[1, 2]", "\"a\"", "null"] {
+            let prompt = template.render(&history_tool_call(arguments)).expect("render");
+            assert_eq!(prompt, "", "{arguments} must render no parameters");
+        }
     }
 
     #[test]

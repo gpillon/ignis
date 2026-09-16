@@ -1,0 +1,30 @@
+{
+  "case": {
+    "name": "tool_call_empty_arguments",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What time is it?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_0",
+            "name": "now",
+            "arguments": "{}"
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_0",
+        "content": "12:00"
+      }
+    ]
+  },
+  "expected": {
+    "text": "<|im_start|>user\nWhat time is it?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=now>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+}
