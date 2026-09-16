@@ -128,10 +128,35 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
   const auto page_size          = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   const std::uint32_t below     = opener_tokens / page_size;
   if (below != seq->shared_pages) {
-    // Not a formality: what a claimant shares is the prefix's whole pages
-    // and what it copies is the one page below the opener that the capturing
-    // sequence owns. If the opener's whole pages are not exactly the shared
-    // ones, the page it ends inside is not a page this sequence owns alone.
+    // Not a formality, and **do not relax this condition**: two separate
+    // things break if you do, and the first breaks silently.
+    //
+    //   1. **The captured image would be corrupt.** The capture below copies
+    //      `seq->kv.page_ids()[0]` as the partial tail page -- the sequence's
+    //      own first page, which is the opener's page only while `below ==
+    //      shared_pages`. With the opener further up, index 0 is some earlier
+    //      page of the sequence's own tail, so the checkpoint would carry the
+    //      wrong page of history and every claimant would resume from it.
+    //      Nothing reports that: it is answered, not refused.
+    //   2. **The pages between would have no holder.** A checkpoint holds one
+    //      prefix reference, one mutable image and exactly one tail page, and
+    //      ignis_seq_alloc_from_checkpoint hands a claimant the prefix chain's
+    //      whole pages plus that single copied page. Pages above the chain and
+    //      below the opener are the *capturing sequence's own*: they go back
+    //      to the pool when that request ends, and the checkpoint would point
+    //      a later claimant at history somebody else is now writing. That
+    //      breaks the discipline GitHub #186 (565d634) built the checkpoint
+    //      on: every page a checkpoint promises is held by something that
+    //      outlives the request that warmed it.
+    //
+    // The right move is the one GitHub #187 took, and it makes this condition
+    // true instead of weakening it: the sequence publishes a **chained**
+    // prefix at its own opener's page floor first (ignis_seq_prefix_publish),
+    // which hands those in-between pages to an entry that outlives the
+    // request and moves `shared_pages` up to `below`. Then what a claimant
+    // shares is the whole chain and what it copies is the one page below the
+    // opener that this sequence owns alone -- which is what the capture is
+    // built on.
     ignis_seq_set_last_error(
         "ignis_seq_checkpoint_capture: the " + std::to_string(opener_tokens) +
         "-token opener covers " + std::to_string(below) + " whole pages, but sequence slot " +
