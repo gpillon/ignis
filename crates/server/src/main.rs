@@ -223,6 +223,8 @@ async fn main() {
         kv_format: _,
         kv_pool_bytes: _,
         host_pool_bytes: _,
+        prompt_reuse: _,
+        retained_pool_bytes: _,
         speculation: _,
         vision,
         media,

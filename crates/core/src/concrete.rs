@@ -119,6 +119,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::checkpoint::{CheckpointEntry, CheckpointPool, ReuseSource};
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
     ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
@@ -129,7 +130,8 @@ use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
-    Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler, SharedPrefixClaim,
+    CheckpointClaim, Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler,
+    SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
@@ -187,6 +189,20 @@ pub struct SchedulerConfig {
     /// the load width. No adaptive policy: fixed for the scheduler's
     /// lifetime.
     pub serving_chunk_tokens: u32,
+    /// Cross-request state reuse (GitHub #186, ADR 0029; the operator's
+    /// `--prompt-reuse`). On by default. Off means exactly nothing happens:
+    /// no request captures a prompt checkpoint and none claims one, so a cold
+    /// bench measures a cold engine and a correctness oracle prefills every
+    /// prompt it is given.
+    pub prompt_reuse: bool,
+    /// The byte budget of the device pool of retained checkpoint images
+    /// (GitHub #186; the operator's `--retained-pool-bytes`). A byte budget
+    /// rather than an entry count, for the reason `host_capacity_bytes` is
+    /// one: an image is dominated by a fixed state floor a short conversation
+    /// pays exactly as a long one does. When it is full a capture is skipped,
+    /// never made room for. Production derives its default from the VRAM left
+    /// after load; tests pass small values to drive exhaustion.
+    pub retained_pool_bytes: u64,
 }
 
 /// The serving prefill chunk width's default, in tokens (ADR 0018): the
@@ -268,6 +284,13 @@ impl Default for SchedulerConfig {
             // byte flag rather than this default.
             host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
+            // GitHub #186: on by default (ADR 0029), with the same generous
+            // CPU-test headroom the host tier's default carries —
+            // `MockCompute` reports a nominal 1-byte checkpoint image, so a
+            // test that wants exhaustion asks for it by setting a small
+            // budget here.
+            prompt_reuse: true,
+            retained_pool_bytes: N_DECODE_LANES as u64,
         }
     }
 }
@@ -319,6 +342,11 @@ pub struct ConcreteScheduler {
     /// heads (whole pages, refcounted); concurrent requests sharing a
     /// prefix skip the redundant prefill.
     prefix: PrefixCache,
+    // ── GitHub #186: cross-request state reuse (ADR 0029) ───────────────
+    /// The byte-budgeted device pool of retained **prompt checkpoints**: the
+    /// state of finished requests at their generation opener, which a later
+    /// request whose prompt extends one resumes from instead of re-prefilling.
+    checkpoints: CheckpointPool,
 }
 
 impl ConcreteScheduler {
@@ -373,6 +401,16 @@ impl ConcreteScheduler {
             host: HostTier::new(config.host_capacity_bytes),
             tick: 0,
             prefix: PrefixCache::new(config.kv_page_tokens),
+            checkpoints: CheckpointPool::new(if config.prompt_reuse {
+                config.retained_pool_bytes
+            } else {
+                // `--prompt-reuse off` is not a budget of zero that something
+                // might later grow: it is a pool that never exists. Building
+                // it empty makes every read of it — `admits`, `best_match`,
+                // `retained_pages` — answer correctly without a second flag
+                // check at each site.
+                0
+            }),
             config,
             compute,
             next_id: 0,
@@ -449,15 +487,146 @@ impl ConcreteScheduler {
     /// cache's charge in `kv_used_pages`). A cache that pins too many
     /// pages cannot starve the machine: an entry drops as soon as its last
     /// claimant is gone (the cache never pins pages no live request needs).
+    /// The KV-RAM device pool of retained prompt checkpoints (GitHub #186):
+    /// what is retained, what it costs, what it has saved (telemetry / tests).
+    pub fn checkpoint_pool(&self) -> &CheckpointPool {
+        &self.checkpoints
+    }
+
     fn available_capacity(&self) -> AdmissionResources {
         AdmissionResources {
             lanes: self.capacity.lanes,
-            kv_pages: self
-                .capacity
-                .kv_pages
-                .saturating_sub(self.prefix.pinned_pages()),
+            kv_pages: self.capacity.kv_pages.saturating_sub(
+                self.prefix
+                    .pinned_pages()
+                    // GitHub #186: pages held *only* by retained checkpoints
+                    // are not occupied as far as this arithmetic is
+                    // concerned. They come back the instant a live request
+                    // needs them (`Self::reclaim_retained`), so counting them
+                    // here would let retained state open a protection — that
+                    // is, make a live request *wait* for a bet that has
+                    // already been given up. ADR 0029: retained state never
+                    // delays or refuses an admission.
+                    //
+                    // Only the pages that would *actually* come back, though.
+                    // A prefix a live claimant is also standing on is
+                    // genuinely occupied, and promising it here would be the
+                    // mirror of the mistake `reclaim_retained` used to make.
+                    .saturating_sub(self.reclaimable_retained_pages()),
+            ),
             backend_pages: self.capacity.backend_pages,
             resident_slots: self.capacity.resident_slots,
+        }
+    }
+
+    /// The shared prefixes whose pages would come back if every retained
+    /// entry standing on them were discarded: the ones no *live* request
+    /// holds.
+    ///
+    /// A prefix's pages return at refcount zero, and its holders are live
+    /// requests plus retained checkpoints. So "nothing live is standing on
+    /// it" is exactly "its refcount is the number of retained entries on it"
+    /// — which is why the two ledgers are compared rather than either being
+    /// read alone.
+    fn reclaimable_prefixes(&self) -> Vec<PrefixId> {
+        self.checkpoints
+            .retained_prefixes()
+            .into_iter()
+            .filter(|&p| self.prefix.refcount_of(p) == self.checkpoints.retained_holders(p))
+            .collect()
+    }
+
+    /// KV pages the first-victim path could actually give back right now.
+    fn reclaimable_retained_pages(&self) -> u32 {
+        self.reclaimable_prefixes()
+            .into_iter()
+            .map(|p| self.prefix.pages_of(p))
+            .sum()
+    }
+
+    /// Discard a retained checkpoint: release the backend's device image and
+    /// let go of the checkpoint's hold on the shared pages under it (which
+    /// return to the pool if nothing else is holding them).
+    fn discard_checkpoint(&mut self, entry: CheckpointEntry) {
+        self.compute.release_checkpoint(entry.publisher);
+        self.release_prefix_claim(Some(entry.prefix));
+    }
+
+    /// Record the prompt checkpoint the backend just captured for request
+    /// `idx` at `at` tokens (GitHub #186, ADR 0029).
+    ///
+    /// The entry takes a holder's reference on the shared prefix under the
+    /// opener, which is what lets the pages outlive the request that warmed
+    /// them without ever being charged to the pool twice. Retention starts
+    /// here, at the capture, rather than at the request's end: a checkpoint
+    /// is immutable history plus an immutable image, so a claimant may stand
+    /// on it while its publisher is still decoding — and a request cancelled
+    /// after this point keeps its checkpoint without a single extra rule
+    /// (spec §Cancellation).
+    fn retain_checkpoint(&mut self, idx: usize, at: u32) {
+        let (publisher, prefix, tokens, gdn) = {
+            let r = &self.requests[idx];
+            let Some(prefix) = r.prefix_entry else {
+                // The leaf published a prefix and captured against it, and
+                // *this* cache then declined to register the head — another
+                // request in the same batch took it. Nothing here can name
+                // the image, so it is released rather than left to outlive
+                // every ledger that knows it exists.
+                self.compute.release_checkpoint(r.id);
+                return;
+            };
+            (
+                r.id,
+                prefix,
+                r.input.tokens[..at as usize].to_vec(),
+                r.gdn.clone(),
+            )
+        };
+        let pages = self.prefix.pages_of(prefix);
+        let bytes = self.compute.checkpoint_image_bytes();
+        let tick = self.tick;
+        match self
+            .checkpoints
+            .retain(publisher, tokens, prefix, pages, bytes, gdn, tick)
+        {
+            Some(_) => {
+                self.requests[idx].checkpoint_captured = true;
+                self.prefix.retain(prefix);
+            }
+            // The budget went while this batch was in flight — two requests
+            // in one call both cleared it before either had retained. The
+            // image the backend took is real but nothing can now reach it, so
+            // it is released here rather than left to outlive every ledger
+            // that knows it exists.
+            None => self.compute.release_checkpoint(publisher),
+        }
+    }
+
+    /// Take retained pages back until `idx` can materialize, or until nothing
+    /// is retained (GitHub #186, ADR 0029/0023 as amended).
+    ///
+    /// This is the **first victim** rule, and it runs *before* the eviction
+    /// machinery is asked for anything: a bet is given up before any certain
+    /// work is disturbed, so a retained entry can never cause a live request
+    /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
+    fn reclaim_retained(&mut self, idx: usize) -> bool {
+        loop {
+            if self.fits_for_materialization(&self.requests[idx]) {
+                return true;
+            }
+            // Only entries whose pages would genuinely come back are given
+            // up. In the steady state this feature exists for, turn N's
+            // prefix is held by its retained entry *and* by the live turn
+            // N+1 standing on it — discarding the entry there frees not one
+            // page, and a loop that did not know that would give up every
+            // checkpoint in the pool and still not fit. When nothing
+            // qualifies the answer is "retained state cannot help", and the
+            // caller goes to the eviction machinery with the pool intact.
+            let reclaimable = self.reclaimable_prefixes();
+            let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) else {
+                return false;
+            };
+            self.discard_checkpoint(victim);
         }
     }
 
@@ -1426,7 +1595,26 @@ impl Scheduler for ConcreteScheduler {
         // `Request::may_share_prefix`).
         let publish_tokens = match input.multimodal {
             Some(_) => 0,
-            None => self.prefix.shareable_head_tokens(input.tokens.len()),
+            None => {
+                let head = self.prefix.shareable_head_tokens(input.tokens.len());
+                // GitHub #186 (ADR 0029): with cross-request reuse on, the
+                // head is floored to the **opener's** page rather than the
+                // prompt's. That is what puts the generation opener inside
+                // the request's own first KV page — the page a later claimant
+                // *copies*, since it is still being written — while every
+                // page before it is a whole page the claimant *shares*.
+                // Without this the two boundaries drift apart whenever the
+                // last two or three prompt tokens happen to cross a page, and
+                // no checkpoint could be taken on those prompts at all.
+                // It never raises the head, so a concurrent sibling loses at
+                // most one page of shared prefix.
+                match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
+                    Some(opener) => head.min(
+                        (opener / self.config.kv_page_tokens) * self.config.kv_page_tokens,
+                    ),
+                    None => head,
+                }
+            }
         };
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         request.publish_tokens = publish_tokens;
@@ -1507,12 +1695,27 @@ impl Scheduler for ConcreteScheduler {
                     {
                         continue;
                     }
-                    let claimed = self.prefix.claim(&self.requests[i].input.tokens);
+                    // GitHub #186 (ADR 0029) — longest reuse wins. A retained
+                    // prompt checkpoint reaches all the way to a finished
+                    // conversation's generation opener; a sibling prefix
+                    // stops at a page boundary. The checkpoint is *peeked*
+                    // first and used as the floor the prefix claim has to
+                    // beat, because claiming a prefix is not free — it pins
+                    // the entry and counts a skip — so a prefix that reaches
+                    // no further must never be claimed at all.
+                    let retained = self
+                        .checkpoints
+                        .best_match(&self.requests[i].input.tokens);
+                    let floor = retained.as_ref().map_or(0, |m| m.tokens);
+                    let claimed = self
+                        .prefix
+                        .claim_longer_than(&self.requests[i].input.tokens, floor);
                     if let Some(claim) = claimed {
                         let r = &mut self.requests[i];
                         r.prefix_entry = Some(claim.id);
                         r.prefix_publisher = Some(claim.publisher);
                         r.shared_prefix_tokens = claim.tokens;
+                        r.shared_pages = claim.pages;
                         r.prefill_progress = claim.tokens; // the shared head is already warm
                         r.gdn = claim.gdn; // core-02: resume at the shared boundary
                         // Shrink the claimant's own reservation by the
@@ -1526,6 +1729,29 @@ impl Scheduler for ConcreteScheduler {
                             request: r.id,
                             tokens: claim.tokens,
                         });
+                    } else if let Some(m) = retained {
+                        // Resume from an *earlier, finished* request's state.
+                        // The claimant takes a holder's reference on the
+                        // shared pages under the checkpoint exactly as a
+                        // sibling would, so those pages are charged to the
+                        // pool once however many live requests and retained
+                        // entries stand on them. It does **not** set
+                        // `prefix_publisher`: what its first job carries is
+                        // the checkpoint, which the backend claims by copying
+                        // the mutable image and the partial tail page on top
+                        // of the shared pages — a prefix claim would stop a
+                        // whole page short and lose the opener.
+                        self.checkpoints.record_claim(m.id, self.tick);
+                        self.prefix.retain(m.prefix);
+                        let r = &mut self.requests[i];
+                        r.prefix_entry = Some(m.prefix);
+                        r.checkpoint_publisher = Some(m.publisher);
+                        r.checkpoint_tokens = m.tokens;
+                        r.reuse_source = Some(m.source);
+                        r.shared_pages = m.pages;
+                        r.prefill_progress = m.tokens; // warm all the way to the opener
+                        r.gdn = m.gdn;
+                        r.resources.kv_pages = r.resources.kv_pages.saturating_sub(m.pages);
                     }
                 }
 
@@ -1579,6 +1805,13 @@ impl Scheduler for ConcreteScheduler {
                 // earlier chunk's failure unmaterialized it.
                 let mut admitted = Vec::with_capacity(b.len());
                 for i in b {
+                    // GitHub #186 (ADR 0023 as amended by 0029): retained
+                    // state is the first victim, so it goes back *before*
+                    // anything else is considered. A live request never waits
+                    // for a bet and is never refused because of one.
+                    if !self.fits_for_materialization(&self.requests[i]) {
+                        self.reclaim_retained(i);
+                    }
                     if !self.fits_for_materialization(&self.requests[i]) {
                         let needed = AdmissionResources {
                             lanes: 0,
@@ -1621,6 +1854,49 @@ impl Scheduler for ConcreteScheduler {
             }
             points
         };
+        // GitHub #186 — where each request's prefill is cut for its own
+        // prompt checkpoint, and 0 for one that takes none.
+        //
+        // A capture is a **bet**: it is offered only out of budget that is
+        // already spare, and never over state something identical is already
+        // retained at. Declining costs the request nothing at all — the cut
+        // simply is not made, and the chunk runs its full width.
+        let capture_points: Vec<u32> = {
+            let image_bytes = self.compute.checkpoint_image_bytes();
+            let admits = self.checkpoints.admits(image_bytes);
+            batch
+                .iter()
+                .enumerate()
+                .map(|(n, &i)| {
+                    let r = &self.requests[i];
+                    let at = match r.checkpoint_point(self.config.kv_page_tokens) {
+                        // A **page-aligned** opener falls exactly on the
+                        // publish point, and this is the chunk that creates
+                        // the prefix — so `checkpoint_point` cannot see one
+                        // yet and would refuse a capture that is in fact
+                        // perfectly placed. One prompt in sixty-four lands
+                        // here; the capture rides the publish chunk instead,
+                        // and the backend publishes then captures in the one
+                        // call.
+                        0 => {
+                            let publish_at = publish_points[n];
+                            let rides_the_publish = publish_at > 0
+                                && r.input.opener_tokens == Some(publish_at)
+                                && r.prefix_entry.is_none()
+                                && !r.checkpoint_captured
+                                && r.may_share_prefix();
+                            if rides_the_publish { publish_at } else { 0 }
+                        }
+                        at => at,
+                    };
+                    if at == 0 || !admits {
+                        return 0;
+                    }
+                    let head = &r.input.tokens[..at as usize];
+                    if self.checkpoints.holds(head) { 0 } else { at }
+                })
+                .collect()
+        };
         // Each job carries at most `serving_chunk_tokens` tokens starting
         // at the request's own prefill progress (0 for a fresh request
         // with no shared prefix, `shared_prefix_tokens` for a claimant,
@@ -1642,6 +1918,16 @@ impl Scheduler for ConcreteScheduler {
                 let publish_at = publish_points[n];
                 if publish_at > start && take > publish_at - start {
                     take = publish_at - start;
+                }
+                // GitHub #186: and cut again at the generation opener, for
+                // the same reason — the state a claimant of the checkpoint
+                // receives is the state *there*. The opener is at most a page
+                // past the publish point, so this second cut costs one short
+                // chunk (typically a few dozen tokens) and only on the tick
+                // that actually takes the checkpoint.
+                let capture_at = capture_points[n];
+                if capture_at > start && take > capture_at - start {
+                    take = capture_at - start;
                 }
                 let tokens = r.input.tokens[start as usize..(start + take) as usize].to_vec();
                 // A stochastic prefill samples and updates the sequence's
@@ -1678,6 +1964,21 @@ impl Scheduler for ConcreteScheduler {
                     // for a request that has one".
                     publish_prefix_tokens: (publish_at > 0 && start + take == publish_at)
                         .then_some(publish_at),
+                    // GitHub #186. Carried on the request's *first* job, the
+                    // one that starts where the checkpoint ends — the job the
+                    // backend builds the sequence on.
+                    checkpoint: r
+                        .checkpoint_publisher
+                        .filter(|_| start == r.checkpoint_tokens)
+                        .map(|publisher| CheckpointClaim {
+                            publisher,
+                            tokens: r.checkpoint_tokens,
+                        }),
+                    // 0 for a request that captures nothing, so this is
+                    // exactly "the chunk that lands on the opener, for a
+                    // request that takes a checkpoint".
+                    capture_checkpoint_tokens: (capture_at > 0 && start + take == capture_at)
+                        .then_some(capture_at),
                     multimodal: r.input.multimodal.clone(),
                 }
             })
@@ -1758,18 +2059,34 @@ impl Scheduler for ConcreteScheduler {
                         // residual, and the entry's own release
                         // (`Self::release_prefix_claim`) subtracts the
                         // rest when its last claimant is gone.
-                        if job.publish_prefix_tokens.is_some() {
+                        if let Some(published) = job.publish_prefix_tokens {
                             let publisher = self.requests[i].id;
-                            let registered = self.prefix.register(
-                                publisher,
-                                &self.requests[i].input.tokens,
-                                &self.requests[i].gdn,
-                            );
+                            // Registered over exactly the head the *leaf*
+                            // published, not over the whole prompt. The two
+                            // were the same number until GitHub #186 floored
+                            // the publish point to the generation opener's
+                            // page rather than the prompt's; registering the
+                            // prompt's head now would cache an entry claiming
+                            // more warm history than the leaf's prefix
+                            // actually holds, and a claimant would skip
+                            // prefill for tokens nothing warmed.
+                            let head = &self.requests[i].input.tokens[..published as usize];
+                            let registered =
+                                self.prefix
+                                    .register(publisher, head, &self.requests[i].gdn);
                             match registered {
                                 Some((entry, pages)) => {
                                     let r = &mut self.requests[i];
                                     r.prefix_entry = Some(entry);
                                     r.prefix_publisher = Some(publisher);
+                                    // GitHub #186: from here the publisher's
+                                    // own first KV page is page `pages`, so
+                                    // its generation opener — which the
+                                    // publish point was floored to — falls
+                                    // inside a page it alone writes. That is
+                                    // what makes a checkpoint capturable at
+                                    // all (`Request::checkpoint_point`).
+                                    r.shared_pages = pages;
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
                                 }
@@ -1785,6 +2102,31 @@ impl Scheduler for ConcreteScheduler {
                                 // they would have had unshared.
                                 None => self.compute.release_prefix(publisher),
                             }
+                        }
+                        // GitHub #186 — the prompt checkpoint, driven by the
+                        // job that actually captured one, for the same reason
+                        // the publish above is: reading the job rather than
+                        // re-deriving the condition is what keeps the two
+                        // sides of one act from disagreeing. `false` here is
+                        // a backend that declined the bet; nothing is
+                        // recorded and the request is none the wiser.
+                        if job.capture_checkpoint_tokens.is_some() && outcome.checkpoint_captured {
+                            self.retain_checkpoint(i, job.capture_checkpoint_tokens.unwrap());
+                        }
+                        // The reuse this request's prefill actually landed
+                        // (GitHub #186): reported here rather than where the
+                        // claim was decided, so a claim whose batch failed is
+                        // reported when its retry succeeds and never twice,
+                        // and so the restore's measured cost can ride along.
+                        if let Some(claim) = job.checkpoint {
+                            events.push(SchedEvent::StateReused {
+                                request: request_id,
+                                source: self.requests[i]
+                                    .reuse_source
+                                    .unwrap_or(ReuseSource::Device),
+                                tokens: claim.tokens,
+                                restore_micros: outcome.restore_micros,
+                            });
                         }
                     }
                 }

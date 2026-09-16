@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use ignis_core::TokenId;
 use ignis_server::decoder::TokenDecoder;
-use ignis_server::template::{ChatMessage, TemplateProvider};
+use ignis_server::template::{ChatMessage, RenderedPrompt, TemplateProvider};
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
 
 /// A few deterministic scheduling turns (never a sleep — ADR 0006) to let a
@@ -56,7 +56,7 @@ impl<T: TemplateProvider> TemplateProvider for SharedTemplate<T> {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[serde_json::Value],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         self.0.apply_chat_template(messages, options, tools)
     }
 

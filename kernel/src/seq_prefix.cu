@@ -28,6 +28,7 @@
 //     head it does not own.
 
 #include "ignis_seq.h"
+#include "ignis_seq_checkpoint_internal.h"
 #include "ignis_seq_internal.h"
 #include "ignis_seq_prefix_internal.h"
 #include "ignis_seq_sections.h"
@@ -216,40 +217,47 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
   }
 }
 
-extern "C" int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t context_tokens,
-                                           struct ignis_seq_prefix *prefix,
-                                           struct ignis_seq **out_seq) {
+/* `ignis_seq_alloc_shared`, with the prefix's own mutable-state clone made
+ * optional (GitHub #186) -- see ignis_seq_checkpoint_internal.h for why a
+ * prompt checkpoint's claim skips it. The error messages name the entry
+ * point the caller actually used, so a refusal reads the way it always did.
+ */
+int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t context_tokens,
+                                       struct ignis_seq_prefix *prefix, bool clone_prefix_state,
+                                       struct ignis_seq **out_seq) {
+  const char *const who =
+      clone_prefix_state ? "ignis_seq_alloc_shared" : "ignis_seq_alloc_from_checkpoint";
   if (out_seq != nullptr) {
     *out_seq = nullptr;
   }
   if (pool == nullptr || prefix == nullptr || out_seq == nullptr) {
-    ignis_seq_set_last_error("ignis_seq_alloc_shared: null argument");
+    ignis_seq_set_last_error(std::string(who) + ": null argument");
     return -1;
   }
   if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
-    ignis_seq_set_last_error("ignis_seq_alloc_shared: the prefix was not published from this pool");
+    ignis_seq_set_last_error(std::string(who) + ": the prefix was not published from this pool");
     return -1;
   }
   if (context_tokens == 0) {
-    ignis_seq_set_last_error("ignis_seq_alloc_shared: context_tokens must be positive");
+    ignis_seq_set_last_error(std::string(who) + ": context_tokens must be positive");
     return -1;
   }
   const std::uint32_t total  = ninfer::pages_for_tokens(context_tokens);
   const std::uint32_t shared = prefix->kv.mapped_page_count();
   if (total <= shared) {
     ignis_seq_set_last_error(
-        "ignis_seq_alloc_shared: a reservation of " + std::to_string(context_tokens) +
-        " tokens is " + std::to_string(total) + " pages, which the " + std::to_string(shared) +
+        std::string(who) + ": a reservation of " + std::to_string(context_tokens) + " tokens is " +
+        std::to_string(total) + " pages, which the " + std::to_string(shared) +
         "-page prefix leaves no page of its own");
     return -1;
   }
   const std::uint32_t tail = total - shared;
   if (pool->free_slots.empty()) {
-    ignis_seq_set_last_error("ignis_seq_alloc_shared: sequence pool exhausted (no free slot)");
+    ignis_seq_set_last_error(std::string(who) + ": sequence pool exhausted (no free slot)");
     return -1;
   }
   if (!pool->kv_pool.can_reserve(tail)) {
-    ignis_seq_set_last_error("ignis_seq_alloc_shared: sequence pool exhausted (KV pages)");
+    ignis_seq_set_last_error(std::string(who) + ": sequence pool exhausted (KV pages)");
     return -1;
   }
 
@@ -274,17 +282,30 @@ extern "C" int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t 
     // The GDN slot, the conv taps and the penalty counts, device to device.
     // No zeroing first and no cudaMemset of the count row either: the clone
     // writes every byte of each, and a fresh zero would only be overwritten.
-    prefix->last_clone_micros = timed_transfer(*pool, *prefix, *seq, IGNIS_SEQ_PREFIX_CLONE);
-    ++prefix->clone_count;
+    //
+    // GitHub #186: a prompt checkpoint's claimant skips this. Its own image
+    // stands further along -- at the generation opener rather than at this
+    // prefix's page boundary -- and is written over the slot the moment this
+    // returns, so cloning the prefix's first would be bytes nothing reads.
+    if (clone_prefix_state) {
+      prefix->last_clone_micros = timed_transfer(*pool, *prefix, *seq, IGNIS_SEQ_PREFIX_CLONE);
+      ++prefix->clone_count;
+    }
 
     ++prefix->refcount;
     pool->free_slots.pop_back();
     *out_seq = seq.release();
     return 0;
   } catch (const std::exception &e) {
-    ignis_seq_set_last_error(std::string("ignis_seq_alloc_shared: ") + e.what());
+    ignis_seq_set_last_error(std::string(who) + ": " + e.what());
     return -1;
   }
+}
+
+extern "C" int32_t ignis_seq_alloc_shared(struct ignis_seq_pool *pool, uint32_t context_tokens,
+                                           struct ignis_seq_prefix *prefix,
+                                           struct ignis_seq **out_seq) {
+  return ignis_seq_alloc_against_prefix(pool, context_tokens, prefix, true, out_seq);
 }
 
 extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,

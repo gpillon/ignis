@@ -94,6 +94,12 @@ pub struct RuntimeStats {
     pub kernel_count: u64,
     /// CUDA graph launches by the most recent leaf step.
     pub graph_launches: u64,
+    /// Device bytes still free (GitHub #186): what `cudaMemGetInfo` reports
+    /// once the model, its KV pool and every other reservation have landed.
+    /// `0` when the backend cannot say — a CPU-only leaf, or a device query
+    /// that failed — which the retained pool's derived default reads as
+    /// "retain nothing" rather than as "retain everything".
+    pub free_vram_bytes: u64,
 }
 
 impl From<RuntimeError> for ComputeError {
@@ -184,6 +190,11 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// device-resident encoder output, live from its encode until the item's
     /// last placeholder is prefilled.
     type Media: Send + 'static;
+    /// Opaque retained **prompt checkpoint** (GitHub #186, ADR 0029): one
+    /// finished request's whole state at its generation opener, which a later
+    /// request whose prompt extends it stands up on. Outlives the request
+    /// that captured it — that is the point.
+    type Checkpoint: Send + 'static;
 
     /// Load a model handle.
     fn load_model(&self) -> Result<Self::Model, i32>;
@@ -222,6 +233,46 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// Release the adapter's own handle on a prefix. Its pages return to the
     /// pool once every sequence holding it has gone too.
     fn release_prefix(&self, model: &Self::Model, prefix: Self::Prefix);
+
+    // ── prompt checkpoints (GitHub #186, ADR 0029) ───────────────────────
+
+    /// Device bytes one prompt checkpoint of this load would occupy. A cheap
+    /// query: nothing allocated, nothing moved, constant for the load's life.
+    /// `0` from a leaf that retains nothing, which is what keeps a stub
+    /// behaving exactly as it did before checkpoints existed.
+    fn checkpoint_image_bytes(&self, _model: &Self::Model) -> u64 {
+        0
+    }
+    /// Capture `sequence`'s state at `opener_tokens` as a prompt checkpoint.
+    /// Called on the chunk boundary that lands on the generation opener, for
+    /// the same reason [`StepLeaf::publish_prefix`] is called on its own: what
+    /// a claimant receives is the state *there*. `sequence` is read and left
+    /// exactly as it was, including on failure — a capture is a bet, and a
+    /// lost bet costs the request nothing.
+    fn capture_checkpoint(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        _opener_tokens: u32,
+    ) -> Result<Self::Checkpoint, i32> {
+        Err(-1)
+    }
+    /// Allocate one sequence that **claims `checkpoint`**: the whole pages
+    /// below the opener are shared in place, the mutable state and the
+    /// partial tail page are copied device-to-device, and the sequence stands
+    /// at the opener. Never consumes the checkpoint. Returns the wall time the
+    /// copies took, in microseconds — the `restore_ms` of the request log.
+    fn allocate_sequence_from_checkpoint(
+        &self,
+        _model: &Self::Model,
+        _context_tokens: u32,
+        _checkpoint: &Self::Checkpoint,
+    ) -> Result<(Self::Sequence, u64), i32> {
+        Err(-1)
+    }
+    /// Release the adapter's handle on a checkpoint: its images go, and the
+    /// pages under it return to the pool once nothing else holds them.
+    fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {}
     /// Warm one sequence with a prefill span.
     fn prefill(
         &self,
@@ -363,6 +414,13 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// prefix outlives its publisher, so its handle cannot hang off the
     /// publisher's sequence.
     prefixes: Mutex<HashMap<RequestId, L::Prefix>>,
+    /// Retained prompt checkpoints (GitHub #186, ADR 0029), keyed by the
+    /// request that captured each. That request is long finished; its id is
+    /// never reused, so it stays a valid name for the bytes it left behind —
+    /// the same identity `prefixes` above is keyed by, and for the same
+    /// reason: the scheduler has to be able to name a device-resident thing
+    /// in a job.
+    checkpoints: Mutex<HashMap<RequestId, L::Checkpoint>>,
     /// Requests currently suspended in the host tier (P4-07, GitHub #125):
     /// their snapshot blob, held here until [`Compute::restore`] or
     /// [`Compute::discard_snapshot`] consumes it.
@@ -382,6 +440,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             eos,
             sequences: Mutex::new(HashMap::new()),
             prefixes: Mutex::new(HashMap::new()),
+            checkpoints: Mutex::new(HashMap::new()),
             evicted: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
         }
@@ -473,6 +532,13 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         self.prefixes.lock().unwrap().len()
     }
 
+    /// Number of retained prompt checkpoints this adapter holds a handle on
+    /// (GitHub #186) — the CPU-stub observation point for checkpoint
+    /// lifetime, and the count a leaked device image would show up in.
+    pub fn live_checkpoints(&self) -> usize {
+        self.checkpoints.lock().unwrap().len()
+    }
+
     /// Number of requests currently suspended in the host tier (the
     /// CPU-stub observation point for eviction round trips).
     pub fn evicted_sequences(&self) -> usize {
@@ -495,6 +561,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         let mut outcomes = PrefillOutcome::nothing_encoded(jobs.len());
         let mut sequences = self.sequences.lock().unwrap();
         let mut prefixes = self.prefixes.lock().unwrap();
+        let mut checkpoints = self.checkpoints.lock().unwrap();
         let mut media = self.media.lock().unwrap();
         // Requests whose chunk lands on the prefix they publish. Collected
         // here and published after every job has warmed, so a later job's
@@ -503,6 +570,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // job only ever touches its own sequence: nothing else in this batch
         // can move the publisher's state off the boundary.
         let mut to_publish: Vec<(RequestId, u32)> = Vec::new();
+        // GitHub #186: and the ones whose chunk lands on their generation
+        // opener. Deferred for the same reason, and taken *after* the
+        // publishes: a checkpoint stands on the shared prefix below it, which
+        // for a page-aligned opener is published in this very call.
+        let mut to_capture: Vec<(RequestId, u32, usize)> = Vec::new();
         // Core retries a failed *batch*, not only the job that failed, so any
         // failure below returns every sequence in the batch to zero state --
         // otherwise the retry would prefill an already-warmed span twice.
@@ -545,8 +617,30 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // #126). Allocating it normally and then prefilling from
                 // `start_position` would leave those leading pages zeroed —
                 // the sequence would attend over history it does not have.
-                let allocated = match &job.shared_prefix {
-                    Some(claim) => match prefixes.get(&claim.publisher) {
+                // GitHub #186: a checkpoint claimant is the same idea one
+                // step further — the whole pages below the generation opener
+                // shared in place, the mutable state *and* the partial page
+                // the opener ends inside copied, so the sequence stands at
+                // the opener rather than at a page boundary.
+                let allocated = match (&job.checkpoint, &job.shared_prefix) {
+                    (Some(claim), _) => match checkpoints.get(&claim.publisher) {
+                        Some(checkpoint) => self
+                            .model
+                            .leaf
+                            .allocate_sequence_from_checkpoint(
+                                self.model.handle(),
+                                job.context_tokens,
+                                checkpoint,
+                            )
+                            .map(|(handle, micros)| {
+                                outcomes[index].restore_micros = micros;
+                                handle
+                            }),
+                        // As below: the scheduler holds a claim on an entry
+                        // this adapter has no handle for.
+                        None => Err(-1),
+                    },
+                    (None, Some(claim)) => match prefixes.get(&claim.publisher) {
                         Some(prefix) => self.model.leaf.allocate_sequence_shared(
                             self.model.handle(),
                             job.context_tokens,
@@ -558,7 +652,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         // would answer from a hole, so it fails loudly.
                         None => Err(-1),
                     },
-                    None => self
+                    (None, None) => self
                         .model
                         .leaf
                         .allocate_sequence(self.model.handle(), job.context_tokens),
@@ -580,7 +674,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .expect("sequence was inserted or already existed");
             // A full-prompt match carries no tail: the claim already put the
             // sequence where its prompt ends, with the pending token the
-            // publisher computed, so there is nothing left to warm.
+            // entry carried, so there is nothing left to warm. True of a
+            // shared prefix, whose image is the publisher's state at the
+            // prefix's end, and of a prompt checkpoint (GitHub #186), whose
+            // progress section carries the pending token the capturing
+            // sequence had at its opener.
             if !job.tokens.is_empty() {
                 let warmed = match &job.multimodal {
                     None => self
@@ -606,6 +704,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             if let Some(prefix_tokens) = job.publish_prefix_tokens {
                 to_publish.push((job.request, prefix_tokens));
             }
+            if let Some(opener_tokens) = job.capture_checkpoint_tokens {
+                to_capture.push((job.request, opener_tokens, index));
+            }
         }
         // The publisher stands exactly on its prefix now, and the next chunk
         // it is dealt would move it off -- which is why the boundary is the
@@ -626,7 +727,48 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 Err(code) => unwind!(RuntimeError::Leaf(code).into()),
             }
         }
+        // GitHub #186 — the prompt checkpoints, last of all, and **never a
+        // reason to fail the batch**. A capture is a bet on a request that
+        // may never come; the request that paid for the chunk gets its chunk
+        // either way, and the scheduler is told what actually happened so its
+        // ledger and the device cannot disagree about what exists. The leaf
+        // leaves the sequence untouched on a refusal, so there is nothing to
+        // unwind.
+        for (request, opener_tokens, index) in to_capture {
+            let sequence = sequences
+                .get_mut(&request)
+                .expect("the capturing request's sequence was built above");
+            match self.model.leaf.capture_checkpoint(
+                self.model.handle(),
+                &mut sequence.handle,
+                opener_tokens,
+            ) {
+                Ok(checkpoint) => {
+                    outcomes[index].checkpoint_captured = true;
+                    if let Some(stale) = checkpoints.insert(request, checkpoint) {
+                        // Unreachable: the scheduler captures at most one
+                        // checkpoint per request. Released rather than
+                        // dropped silently if that ever stops being true.
+                        drop(stale);
+                    }
+                }
+                Err(_) => outcomes[index].checkpoint_captured = false,
+            }
+        }
         Ok(outcomes)
+    }
+
+    fn checkpoint_image_bytes(&self) -> u64 {
+        self.model.leaf.checkpoint_image_bytes(self.model.handle())
+    }
+
+    fn release_checkpoint(&self, publisher: RequestId) {
+        let checkpoint = self.checkpoints.lock().unwrap().remove(&publisher);
+        if let Some(checkpoint) = checkpoint {
+            self.model
+                .leaf
+                .release_checkpoint(self.model.handle(), checkpoint);
+        }
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
@@ -890,6 +1032,20 @@ impl<L: StepLeaf> Drop for RuntimeCompute<L> {
         );
         for (_, sequence) in sequences {
             self.release_sequence(sequence.handle);
+        }
+        // Checkpoints before prefixes, for the same reason prefixes come
+        // after sequences: a checkpoint holds one reference to the prefix
+        // under it (GitHub #186), so releasing it first leaves the prefix
+        // loop below to drop the last holder rather than a middle one.
+        let checkpoints = std::mem::take(
+            self.checkpoints
+                .get_mut()
+                .expect("RuntimeCompute is not dropped while its checkpoint lock is held"),
+        );
+        for (_, checkpoint) in checkpoints {
+            self.model
+                .leaf
+                .release_checkpoint(self.model.handle(), checkpoint);
         }
         // Prefixes after sequences: a prefix's pages are released by its last
         // holder, and a live sequence is one.

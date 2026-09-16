@@ -85,6 +85,31 @@ pub struct Request {
     /// Leading prompt tokens reused from the shared prefix (core-07; 0 = a
     /// full prefill, nothing skipped).
     pub shared_prefix_tokens: u32,
+    /// Whole KV pages of this request's history that belong to a shared
+    /// prefix rather than to the request itself (GitHub #186) — whether it
+    /// published that prefix, claimed it as a concurrent sibling, or arrived
+    /// at it through a retained prompt checkpoint. One fact, three ways in,
+    /// because what the checkpoint machinery needs to know is the same in all
+    /// three: where the request's *own* first KV page begins, and therefore
+    /// whether its generation opener falls inside it.
+    pub shared_pages: u32,
+    /// The retained prompt checkpoint this request claimed (GitHub #186, ADR
+    /// 0029), named by the request that captured it — what the prefill job
+    /// carries so the backend can find the device image. `None` for a request
+    /// that reused no retained state.
+    pub checkpoint_publisher: Option<RequestId>,
+    /// Leading prompt tokens reused from a retained prompt checkpoint (GitHub
+    /// #186): everything up to that checkpoint's generation opener, which is
+    /// **not** a whole number of pages. 0 = nothing reused.
+    pub checkpoint_tokens: u32,
+    /// The residency tier [`Request::checkpoint_tokens`] came from, for the
+    /// request log's `reuse_source`.
+    pub reuse_source: Option<crate::checkpoint::ReuseSource>,
+    /// Whether this request has already had its own prompt checkpoint
+    /// captured (GitHub #186). A request captures at most one: the opener is
+    /// a single point in its prompt, and a second capture would be a second
+    /// image of state that has since moved on.
+    pub checkpoint_captured: bool,
     /// The whole KV pages of this request's own prompt — what it *could*
     /// publish as a shared prefix (P4-10, GitHub #126), or 0 for a prompt
     /// shorter than one page.
@@ -145,6 +170,11 @@ impl Request {
             prefix_entry: None,
             prefix_publisher: None,
             shared_prefix_tokens: 0,
+            shared_pages: 0,
+            checkpoint_publisher: None,
+            checkpoint_tokens: 0,
+            reuse_source: None,
+            checkpoint_captured: false,
             publish_tokens: 0,
             prefill_progress: 0,
             cancelled: false,
@@ -217,6 +247,67 @@ impl Request {
             return 0;
         }
         self.publish_tokens
+    }
+
+    /// The **capture point** (GitHub #186, ADR 0029): the prefill position at
+    /// which this request's state is captured as a prompt checkpoint, or 0 for
+    /// a request that captures none.
+    ///
+    /// It is the generation opener the frontend reported, and it is offered
+    /// only when the opener falls inside the request's **own first KV page**
+    /// — that is, when the whole pages under it are exactly the shared prefix
+    /// the request already holds. That is not a formality: what a later
+    /// claimant shares is those whole pages, and what it copies is the partial
+    /// tail page, which has to be a page the publisher owns rather than one
+    /// other holders are also writing.
+    ///
+    /// The three ways that condition fails, and what each means:
+    ///
+    /// - **no shared prefix** (`prefix_entry` is `None`) — a prompt head
+    ///   shorter than one page, or a head another request in the same batch
+    ///   already took. There is nothing to hang the checkpoint's history on.
+    /// - **the opener's pages are not the shared ones** — the request is
+    ///   standing on a prefix that stops somewhere other than its own
+    ///   opener's page, so its own first page is not the opener's. Two real
+    ///   cases fall here, and both are deferred rather than half-done: a
+    ///   conversation's *second* turn, which resumed from an earlier
+    ///   checkpoint and prefilled past it (#187's lineage work — supersede C
+    ///   by C'), and every **concurrent sibling** that claimed another
+    ///   request's shared prefix and whose own opener lies further on (a
+    ///   subagent burst therefore leaves one checkpoint, the publisher's, not
+    ///   one per sibling). Until #187 the chain stops here, and what keeps
+    ///   that honest is that the *earlier* entry still matches: a third turn
+    ///   reuses the first turn's checkpoint rather than nothing.
+    /// - **already captured** — one checkpoint per request.
+    ///
+    /// One function, so that the chunk decomposition (where to cut) and the
+    /// capture (when to take it) cannot disagree about it, exactly as
+    /// [`Request::publish_point`] is one function.
+    pub fn checkpoint_point(&self, page_tokens: u32) -> u32 {
+        if self.checkpoint_captured || !self.may_share_prefix() || page_tokens == 0 {
+            return 0;
+        }
+        let Some(opener) = self.input.opener_tokens else {
+            return 0;
+        };
+        // The opener must leave at least one prompt token after it, and not
+        // only because a checkpoint at the prompt's end would be useless to
+        // the next turn. It is what makes the acceptance criterion "the
+        // penalty-count row at the opener is zero" true *by construction*
+        // rather than by luck: only the chunk that **ends** the prompt is
+        // dealt the request's real sampling parameters (see
+        // `ConcreteScheduler::advance`), so an opener strictly inside the
+        // prompt guarantees the capturing chunk is an intermediate one,
+        // therefore greedy, therefore has sampled nothing and has left the
+        // count row alone. An opener at the very end would be captured from
+        // a chunk that had just sampled.
+        if opener == 0 || opener as usize >= self.input.tokens.len() {
+            return 0;
+        }
+        if self.prefix_entry.is_none() || opener / page_tokens != self.shared_pages {
+            return 0;
+        }
+        opener
     }
 
     /// Whether this request has finished prefill: every prompt token has
@@ -340,6 +431,15 @@ impl Request {
         self.prefix_entry = None;
         self.prefix_publisher = None;
         self.shared_prefix_tokens = 0;
+        self.shared_pages = 0;
+        // GitHub #186: so is the retained-checkpoint claim, and for the same
+        // reason — the pages and the image it resumed from were released with
+        // the entry the caller let go of. `checkpoint_captured` is *not*
+        // reset: whatever this request already retained is a real entry in
+        // the pool, which a re-prefill must not duplicate.
+        self.checkpoint_publisher = None;
+        self.checkpoint_tokens = 0;
+        self.reuse_source = None;
         // `publish_tokens` is untouched: it is a property of the prompt, not
         // of a run. With the claim gone the re-prefill is free to publish
         // that head again (P4-10, GitHub #126) — the pages it had went back
@@ -436,6 +536,7 @@ mod tests {
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
                 multimodal: None,
+                opener_tokens: None,
             },
             AdmissionResources::default(),
             4,

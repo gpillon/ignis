@@ -29,6 +29,7 @@
 //! reuse) are implemented on top of this contract.
 
 pub mod admission;
+pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod gdn;
@@ -57,6 +58,11 @@ pub mod vision;
 pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
     ProtectionPhase, RetainedLaneCandidate,
+};
+pub use checkpoint::{
+    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool,
+    MAX_AUTO_RETAINED_POOL_BYTES, RETAINED_POOL_RESERVE_BYTES, ReuseSource,
+    auto_retained_pool_bytes,
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{

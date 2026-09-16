@@ -59,6 +59,21 @@ pub struct RequestInput {
     /// The prompt's positions, `rope_delta` and media items (GitHub #178),
     /// or `None` for a text-only request — today's path, unchanged.
     pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
+    /// The **generation opener** (GitHub #186, ADR 0029): how many leading
+    /// prompt tokens end at the rendered prompt's last
+    /// `<|im_start|>assistant\n`, the point where the prompt hands over to the
+    /// model, and the last position every later turn of the conversation
+    /// provably shares.
+    ///
+    /// `None` when the frontend could not report one — a prompt with no
+    /// opener, or an opener whose byte offset does not tokenize to an exact
+    /// token prefix of the prompt. In that case no checkpoint is taken at all,
+    /// rather than one taken at a point the tokenizer disagrees about.
+    ///
+    /// It is a *structural* fact about the rendered prompt, known only to
+    /// whoever rendered it and not recoverable from token ids. #188 adds the
+    /// end of the system-and-tools block beside it for the same reason.
+    pub opener_tokens: Option<u32>,
 }
 
 /// Sampling / decoding parameters for a request.
@@ -381,6 +396,28 @@ pub enum SchedEvent {
     /// these into the `sibling_prefix_reused_tok` counter (design §5,
     /// `server-02`).
     PrefixReused { request: RequestId, tokens: u32 },
+    /// A request's prefill resumed from **retained state** left by an earlier,
+    /// already-finished request (GitHub #186, ADR 0029): the `tokens` leading
+    /// prompt tokens — everything up to that state's generation opener — were
+    /// not prefilled at all.
+    ///
+    /// Emitted once per request, on the chunk that actually landed the claim,
+    /// so a claim whose prefill batch failed and was retried is reported when
+    /// it succeeds and never twice. This is where the request log's
+    /// `reuse_source`, `reused_prompt_tokens` and `restore_ms` come from; a
+    /// request that reused nothing emits none of it, which is what "source
+    /// `none`" means.
+    StateReused {
+        request: RequestId,
+        /// The residency tier the state came from (`device`; #190 adds
+        /// `kv_ram`).
+        source: crate::checkpoint::ReuseSource,
+        /// Leading prompt tokens skipped.
+        tokens: u32,
+        /// What the restore itself cost — the device-to-device clone of the
+        /// checkpoint into this request's slot, measured by the backend.
+        restore_micros: u64,
+    },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
     /// P3-06 request log): `chunk_tokens` is this chunk's width,
     /// `prefilled_tokens` the cumulative prompt tokens sent to the compute

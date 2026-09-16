@@ -30,6 +30,14 @@ struct Calls {
     prefixes_published: Vec<u32>,
     shared_allocations: Vec<u32>,
     prefixes_released: u32,
+    /// GitHub #186: the prompt checkpoints captured (their opener token
+    /// counts), the claims served (each claimant's reservation), and the
+    /// releases — so a test can see that a claimant was stood up *on a
+    /// checkpoint* rather than allocated normally and prefilled from a hole,
+    /// and that no device image outlives the ledger that names it.
+    checkpoints_captured: Vec<u32>,
+    checkpoint_allocations: Vec<u32>,
+    checkpoints_released: u32,
     snapshots_taken: u32,
     restores: u32,
     /// GitHub #178: the token span begin of each encoded media item, the
@@ -58,6 +66,11 @@ struct StubLeaf {
     prefill_error: Option<i32>,
     prefill_error_on_call: Option<(usize, i32)>,
     decode_error: Option<i32>,
+    /// GitHub #186: the leaf refuses the next checkpoint capture with this
+    /// code. A capture is a bet the leaf may decline — no room in its image
+    /// pool, a sequence it will not capture — and declining must leave the
+    /// batch alone.
+    capture_error: Option<i32>,
 }
 
 impl StubLeaf {
@@ -70,6 +83,7 @@ impl StubLeaf {
             prefill_error: None,
             prefill_error_on_call: None,
             decode_error: None,
+            capture_error: None,
         }
     }
 
@@ -88,6 +102,7 @@ impl StubLeaf {
             prefill_error: Some(code),
             prefill_error_on_call: None,
             decode_error: None,
+            capture_error: None,
         }
     }
 
@@ -100,6 +115,7 @@ impl StubLeaf {
             prefill_error: None,
             prefill_error_on_call: None,
             decode_error: None,
+            capture_error: None,
         }
     }
 
@@ -112,6 +128,7 @@ impl StubLeaf {
             prefill_error: None,
             prefill_error_on_call: Some((2, code)),
             decode_error: None,
+            capture_error: None,
         }
     }
 
@@ -124,6 +141,7 @@ impl StubLeaf {
             prefill_error: None,
             prefill_error_on_call: None,
             decode_error: Some(code),
+            capture_error: None,
         }
     }
 }
@@ -137,6 +155,9 @@ impl StepLeaf for StubLeaf {
     type SnapshotBuf = Vec<u8>;
     /// The embedding's encode order, from 1.
     type Media = u32;
+    /// The opener the checkpoint was captured at (GitHub #186) — enough for
+    /// a stub to prove a claimant was handed the right entry.
+    type Checkpoint = u32;
 
     fn load_model(&self) -> Result<Self::Model, i32> {
         Ok(())
@@ -186,6 +207,7 @@ impl StepLeaf for StubLeaf {
             last_step_micros: 13,
             kernel_count: 7,
             graph_launches: 0,
+            free_vram_bytes: 0,
         })
     }
 
@@ -236,6 +258,50 @@ impl StepLeaf for StubLeaf {
 
     fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {
         self.calls.lock().unwrap().prefixes_released += 1;
+    }
+
+    fn checkpoint_image_bytes(&self, _model: &Self::Model) -> u64 {
+        // One nominal byte, the way `MockCompute` prices a snapshot: enough
+        // for a byte budget to be exercisable without a device.
+        1
+    }
+
+    fn capture_checkpoint(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        opener_tokens: u32,
+    ) -> Result<Self::Checkpoint, i32> {
+        if let Some(code) = self.capture_error {
+            return Err(code);
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .checkpoints_captured
+            .push(opener_tokens);
+        Ok(opener_tokens)
+    }
+
+    fn allocate_sequence_from_checkpoint(
+        &self,
+        _model: &Self::Model,
+        context_tokens: u32,
+        _checkpoint: &Self::Checkpoint,
+    ) -> Result<(Self::Sequence, u64), i32> {
+        if let Some(code) = self.allocation_error {
+            return Err(code);
+        }
+        let mut calls = self.calls.lock().unwrap();
+        calls.sequences_allocated.push(context_tokens);
+        calls.checkpoint_allocations.push(context_tokens);
+        // A nominal, deterministic restore cost, so `restore_micros` is
+        // observable without a clock.
+        Ok(((), 7))
+    }
+
+    fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {
+        self.calls.lock().unwrap().checkpoints_released += 1;
     }
 
     fn prefill(
@@ -358,6 +424,8 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
     compute
         .prefill_step(&[
             PrefillJob {
+                checkpoint: None,
+                capture_checkpoint_tokens: None,
                 multimodal: None,
                 request: 1,
                 tokens: vec![4, 5],
@@ -368,6 +436,8 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 publish_prefix_tokens: None,
             },
             PrefillJob {
+                checkpoint: None,
+                capture_checkpoint_tokens: None,
                 multimodal: None,
                 request: 2,
                 tokens: vec![4, 5],
@@ -422,6 +492,8 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
 
 fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
     PrefillJob {
+        checkpoint: None,
+        capture_checkpoint_tokens: None,
         multimodal: None,
         request,
         tokens: vec![4, 5],
@@ -644,6 +716,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
         .submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2],
                 params: DecodeParams {
@@ -676,6 +749,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
         .submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
@@ -713,6 +787,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
     );
     let input = |tokens: Vec<u32>| RequestInput {
         multimodal: None,
+        opener_tokens: None,
         model: "stub".into(),
         tokens,
         params: DecodeParams {
@@ -766,6 +841,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
     );
     let input = || RequestInput {
         multimodal: None,
+        opener_tokens: None,
         model: "stub".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -796,6 +872,188 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
     assert_eq!(calls.sequences_allocated.len(), 2, "two sequences in all");
 }
 
+// ── GitHub #186: prompt checkpoints through the adapter ────────────────
+
+/// A scheduler over `leaf` with 4-token KV pages, so a short prompt still
+/// has a whole page under its opener.
+fn checkpoint_scheduler(leaf: Arc<StubLeaf>) -> ConcreteScheduler {
+    let model = Arc::new(Model::load(leaf).unwrap());
+    let compute = Arc::new(RuntimeCompute::new(model, 99));
+    ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "stub".into(),
+            kv_page_tokens: 4,
+            ..SchedulerConfig::default()
+        },
+        compute,
+    )
+}
+
+/// An 8-token prompt whose generation opener ends at 6 — two whole pages
+/// below it, and two tokens past it, the shape a rendered chat prompt has.
+fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
+    RequestInput {
+        multimodal: None,
+        opener_tokens: opener,
+        model: "stub".into(),
+        tokens,
+        params: DecodeParams {
+            max_tokens: Some(3),
+            ..DecodeParams::default()
+        },
+    }
+}
+
+#[test]
+fn a_later_request_is_allocated_against_the_checkpoint_the_first_one_left() {
+    // The whole seam, through the adapter rather than the mock: the capture
+    // lands on the chunk that ends on the opener, and the next request's
+    // sequence is built *on the checkpoint* — not allocated fresh and
+    // prefilled from a hole, which is what it would be if the claim were
+    // dropped anywhere between the scheduler and the leaf.
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let mut scheduler = checkpoint_scheduler(leaf.clone());
+    scheduler
+        .submit(
+            checkpoint_input(vec![1, 2, 3, 4, 5, 6, 7, 8], Some(6)),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    while !scheduler.is_idle() {
+        scheduler.advance();
+    }
+    assert_eq!(
+        leaf.calls.lock().unwrap().checkpoints_captured,
+        vec![6],
+        "captured at the opener, not at the page boundary below it"
+    );
+    assert_eq!(
+        leaf.calls.lock().unwrap().prefixes_published,
+        vec![4],
+        "on the shared prefix holding the whole pages under it"
+    );
+
+    // The next turn: the same history up to the opener, then new text.
+    scheduler
+        .submit(
+            checkpoint_input(vec![1, 2, 3, 4, 5, 6, 90, 91, 92, 93], Some(9)),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    while !scheduler.is_idle() {
+        scheduler.advance();
+    }
+
+    let (from_checkpoint, shared, positions) = {
+        let calls = leaf.calls.lock().unwrap();
+        (
+            calls.checkpoint_allocations.len(),
+            calls.shared_allocations.len(),
+            calls.prefill_positions.clone(),
+        )
+    };
+    assert_eq!(from_checkpoint, 1, "the later request stood up on the checkpoint");
+    assert_eq!(
+        shared, 0,
+        "and not on a plain sibling prefix, which would stop a page short of the opener"
+    );
+    assert!(
+        positions.contains(&6),
+        "its prefill resumes at the opener: {positions:?}"
+    );
+}
+
+#[test]
+fn a_declined_capture_leaves_the_batch_and_the_request_alone() {
+    // A capture is a bet. A leaf that will not take it — no room in its own
+    // image pool, a sequence it refuses — must not cost the request that was
+    // only trying to prefill its prompt.
+    let leaf = Arc::new(StubLeaf {
+        capture_error: Some(-1),
+        ..StubLeaf::with_tokens([])
+    });
+    let mut scheduler = checkpoint_scheduler(leaf.clone());
+    let request = scheduler
+        .submit(
+            checkpoint_input(vec![1, 2, 3, 4, 5, 6, 7, 8], Some(6)),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let mut done = false;
+    while !scheduler.is_idle() {
+        for event in scheduler.advance() {
+            if let ignis_core::SchedEvent::Done { request: r, reason, .. } = event {
+                assert_eq!(r, request);
+                assert_ne!(
+                    reason,
+                    ignis_core::FinishReason::Error,
+                    "a refused capture must not fail the request"
+                );
+                done = true;
+            }
+        }
+    }
+    assert!(done, "the request completed");
+    let (captured, positions) = {
+        let calls = leaf.calls.lock().unwrap();
+        (calls.checkpoints_captured.clone(), calls.prefill_positions.clone())
+    };
+    assert!(captured.is_empty(), "nothing was captured");
+    assert_eq!(
+        positions,
+        vec![0, 4, 6],
+        "and its prompt was prefilled in full, cuts and all"
+    );
+}
+
+#[test]
+fn a_discarded_checkpoint_releases_the_leaf_handle() {
+    // The scheduler discarding a retained entry must reach the leaf: an
+    // image nothing releases is device memory nothing will ever free.
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = Arc::new(RuntimeCompute::new(model, 99));
+    let observe = compute.clone();
+    // A pool with room for exactly one sequence's worth of pages, so the
+    // second request has to take the first's retained pages back.
+    let mut scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: "stub".into(),
+            kv_page_tokens: 4,
+            max_sequence_tokens: 16,
+            kv_capacity_pages: 4,
+            ..SchedulerConfig::default()
+        },
+        compute,
+    );
+    scheduler
+        .submit(
+            checkpoint_input(vec![1, 2, 3, 4, 5, 6, 7, 8], Some(6)),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    while !scheduler.is_idle() {
+        scheduler.advance();
+    }
+    assert_eq!(observe.live_checkpoints(), 1, "one image is held");
+
+    scheduler
+        .submit(
+            checkpoint_input((100..113).collect(), None),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    while !scheduler.is_idle() {
+        scheduler.advance();
+    }
+    assert_eq!(
+        leaf.calls.lock().unwrap().checkpoints_released,
+        1,
+        "the reclaimed entry's image went back to the leaf"
+    );
+    assert_eq!(observe.live_checkpoints(), 0, "and the adapter holds none");
+}
+
 #[test]
 fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
     let leaf = Arc::new(StubLeaf::with_tokens([]));
@@ -815,6 +1073,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
             .submit(
                 RequestInput {
                     multimodal: None,
+                    opener_tokens: None,
                     model: "stub".into(),
                     tokens: vec![token],
                     params: DecodeParams {
@@ -1025,6 +1284,8 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         params: DecodeParams::default(),
         shared_prefix: None,
         publish_prefix_tokens: None,
+        checkpoint: None,
+        capture_checkpoint_tokens: None,
         multimodal: Some(prompt.clone()),
     }
 }
@@ -1126,6 +1387,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 tokens: (0..40).collect(),
                 params: DecodeParams { max_tokens: Some(2), ..DecodeParams::default() },
                 multimodal: Some(multimodal(40, vec![image(5, 10), image(20, 10)])),
+                opener_tokens: None,
             },
             RequestClass::Agent,
         )

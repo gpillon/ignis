@@ -30,6 +30,7 @@ fn multimodal_input(tokens: usize, media: Vec<MediaItem>, max: u32) -> RequestIn
         tokens: (0..tokens as u32).collect(),
         params: DecodeParams { max_tokens: Some(max), ..DecodeParams::default() },
         multimodal: Some(Arc::new(Multimodal { positions, rope_delta: -2, media })),
+        opener_tokens: None,
     }
 }
 

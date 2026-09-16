@@ -432,3 +432,19 @@ add_test(NAME ignis_kernel_hq_route_agreement_test COMMAND ignis_kernel_hq_route
 add_executable(ignis_kernel_seq_prefix_test test_seq_prefix.cpp)
 target_link_libraries(ignis_kernel_seq_prefix_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_prefix_test COMMAND ignis_kernel_seq_prefix_test)
+
+# GitHub #186 (ADR 0029): OURS, not vendored -- prompt checkpoints. The
+# shared-prefix test above proves what a prefix does; this proves the three
+# things a checkpoint adds, and none of them is visible through the flat ABI:
+# that the state is captured at the *generation opener* rather than at the
+# page boundary below it, that the partial page the opener ends inside is
+# copied while every whole page below stays shared, and that a capture reads
+# the live sequence without perturbing a byte of it. It also asserts the
+# acceptance criterion that only the ABI can check -- the penalty-count row a
+# claimant receives is all zeros, because nothing has been sampled at the
+# opener. All three need ignis_seq_internal.h / ignis_seq_checkpoint_internal.h
+# to set a frontier and read a slot back, so none can live in Rust. Same
+# no-SKIP_RETURN_CODE rule as every other GPU test here (ADR 0006).
+add_executable(ignis_kernel_seq_checkpoint_test test_seq_checkpoint.cpp)
+target_link_libraries(ignis_kernel_seq_checkpoint_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_seq_checkpoint_test COMMAND ignis_kernel_seq_checkpoint_test)

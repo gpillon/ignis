@@ -40,6 +40,16 @@
  * a sequence that holds a prefix cannot take that path at all
  * (IGNIS_SEQ_ERR_SHARED_PREFIX).
  *
+ * A *later* request whose prompt extends an earlier one's resumes from a
+ * **prompt checkpoint** rather than re-prefilling it (GitHub #186, ADR
+ * 0029): `ignis_seq_checkpoint_capture` reads a live sequence's whole state
+ * at its generation opener into a device image that outlives it, and
+ * `ignis_seq_alloc_from_checkpoint` stands a new sequence up on it. It is
+ * the shared-prefix mechanism plus the one thing that mechanism cannot
+ * carry: the opener does not fall on a page boundary, so the partial page it
+ * ends inside is *copied* rather than shared, while every whole page below
+ * it is the shared prefix's and is shared as always.
+ *
  * Rust bindings: crates/core/src/seq.rs (keep 1:1).
  */
 #ifndef IGNIS_SEQ_H
@@ -96,6 +106,13 @@ struct ignis_seq;
  * ignis_seq_prefix_publish, claimed by ignis_seq_alloc_shared, released by
  * ignis_seq_prefix_release. */
 struct ignis_seq_prefix;
+
+/* Opaque prompt checkpoint: one reference to the shared prefix below a
+ * generation opener, plus device images of the mutable state at the opener
+ * and of the partial page the opener ends inside (GitHub #186, ADR 0029).
+ * Captured from a live sequence by ignis_seq_checkpoint_capture, claimed by
+ * ignis_seq_alloc_from_checkpoint, released by ignis_seq_checkpoint_release. */
+struct ignis_seq_checkpoint;
 
 /* The KV cache storage format a pool stores its rows in (ADR 0022, GitHub
  * #122). Fixed for the life of a model load: it decides the pool's planes,
@@ -415,6 +432,118 @@ void ignis_seq_prefix_release(struct ignis_seq_pool *pool, struct ignis_seq_pref
  * success, -1 on a null argument. */
 int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
                                 struct ignis_seq_prefix_stats *out_stats);
+
+/* --- prompt checkpoints (GitHub #186, ADR 0029) ---------------------------
+ *
+ * A **prompt checkpoint** is a finished request's whole state at its
+ * generation opener, kept so a later request whose prompt extends it resumes
+ * there instead of prefilling the conversation again. It is made of three
+ * things, and each is there because the other two cannot carry it:
+ *
+ *   - the **whole KV pages** below the opener, which are the shared prefix
+ *     the capturing sequence published: read-only history, shared in place,
+ *     charged to the pool once. The checkpoint holds one reference to that
+ *     prefix, which is what keeps the pages alive after every live request
+ *     has gone.
+ *   - the **mutable sections** at the opener -- the GDN recurrent state, the
+ *     conv taps, the penalty-count row, the drafter's window and checkpoint
+ *     on a DFlash2 pool -- in a device image of their own. The prefix's own
+ *     image stands at the page boundary, which is up to 63 tokens short.
+ *   - a copy of the **partial tail page**: the physical page the opener ends
+ *     inside. It is still being written by the capturing sequence, so it can
+ *     never be shared; a claimant receives it into the first page it owns.
+ *
+ * Capture is a pure read of a live sequence. It perturbs nothing -- no
+ * allocation of the sequence's moves, no reservation changes, no row rebind
+ * -- so the capturing request goes on prefilling and decoding as if it had
+ * not been asked, and a request cancelled after it keeps its checkpoint.
+ */
+
+struct ignis_seq_checkpoint_stats {
+  /* Tokens of history the checkpoint covers: the generation opener, wherever
+   * it falls. NOT a whole number of KV pages -- that is the point. */
+  uint32_t tokens;
+  /* Whole KV pages below the opener, owned by the shared prefix underneath
+   * and charged to the pool once. */
+  uint32_t pages;
+  /* Device bytes this checkpoint holds of its own: the mutable-state image
+   * plus the copy of the partial tail page. What a byte-budgeted pool of
+   * checkpoints is bounded by. */
+  uint64_t image_bytes;
+  /* Claims served (ignis_seq_alloc_from_checkpoint calls), and the wall time
+   * the most recent one took, in microseconds -- the device-to-device cost
+   * ADR 0024 asks to be measured rather than assumed. 0 until the first. */
+  uint64_t claim_count;
+  double last_claim_micros;
+};
+
+/* Device bytes one checkpoint of `pool` would occupy: the mutable-state
+ * image plus one KV page's copy. Constant for the life of a pool (it is the
+ * pool's geometry), so a caller may ask once and budget against the answer.
+ * Allocates nothing and moves nothing. Returns 0 on success, -1 on a null
+ * argument. */
+int32_t ignis_seq_checkpoint_image_bytes(const struct ignis_seq_pool *pool, uint64_t *out_bytes);
+
+/* Capture `seq`'s state at `opener_tokens` as a prompt checkpoint.
+ *
+ * `seq` must already hold a shared prefix whose pages are exactly the whole
+ * pages below `opener_tokens` -- that is what puts the opener inside a page
+ * `seq` alone writes, and it is why the caller publishes the prefix at
+ * `floor(opener / page) * page` and captures here. `opener_tokens` must be
+ * exactly where `seq` stands, at a chunk boundary, for the same reason a
+ * prefix is published where the publisher stands: what a claimant receives
+ * is the state *there*.
+ *
+ * `seq` is left completely unchanged, including its reservation and its
+ * block-table row. The checkpoint takes one reference to the prefix under
+ * it, so it outlives `seq`.
+ *
+ * Returns 0 and a handle in `*out_checkpoint`, released with
+ * ignis_seq_checkpoint_release. Returns -1 (see ignis_seq_last_error) on a
+ * null argument, a sequence that is not `pool`'s, a sequence holding no
+ * shared prefix, an `opener_tokens` whose whole pages are not that prefix's,
+ * or a device allocation failure; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq`
+ * is mid-chunk or its frontier is not `opener_tokens`. Nothing is allocated
+ * or changed on any failure -- a refused capture costs the caller nothing,
+ * which is what lets a caller treat it as a bet it may lose. */
+int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, struct ignis_seq *seq,
+                                      uint32_t opener_tokens,
+                                      struct ignis_seq_checkpoint **out_checkpoint);
+
+/* Allocate a sequence that claims `checkpoint`: the whole pages below the
+ * opener are the shared prefix's own physical pages, the rest is a fresh
+ * zeroed reservation, the mutable state is a device-to-device clone of the
+ * checkpoint's image, and the partial page the opener ends inside is copied
+ * into the first page the new sequence owns.
+ *
+ * The returned sequence stands exactly where the capturing one stood at its
+ * opener: same frontier, same pending token, same GDN state, same penalty
+ * counts. It prefills from `opener_tokens` onwards.
+ *
+ * A claim never consumes the checkpoint: N claimants all succeed, which is
+ * what makes a retry, a regenerate and two forks of one history all hit.
+ *
+ * `context_tokens` is the whole reservation, the shared pages included, and
+ * must leave room for at least one page of its own. Returns 0 and a handle
+ * in `*out_seq`; returns -1 (see ignis_seq_last_error, nothing allocated) on
+ * a null argument, a checkpoint that is not `pool`'s, a `context_tokens`
+ * that leaves no page of its own, or pool exhaustion. */
+int32_t ignis_seq_alloc_from_checkpoint(struct ignis_seq_pool *pool, uint32_t context_tokens,
+                                         struct ignis_seq_checkpoint *checkpoint,
+                                         struct ignis_seq **out_seq);
+
+/* Release `checkpoint`: free its device image and let go of its reference to
+ * the shared prefix underneath (whose pages return to the pool when the last
+ * holder releases). Sequences already claimed from it are unaffected -- they
+ * hold their own reference to that prefix and their own copy of everything
+ * else. A NULL `checkpoint` is a no-op. */
+void ignis_seq_checkpoint_release(struct ignis_seq_pool *pool,
+                                   struct ignis_seq_checkpoint *checkpoint);
+
+/* A live checkpoint's size, cost and claims served. Returns 0 on success,
+ * -1 on a null argument. */
+int32_t ignis_seq_checkpoint_stats(const struct ignis_seq_checkpoint *checkpoint,
+                                    struct ignis_seq_checkpoint_stats *out_stats);
 
 /* --- pinned host memory (P4-07, GitHub #125) ------------------------------
  *

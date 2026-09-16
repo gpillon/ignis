@@ -62,6 +62,7 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
         tokens: frontend.tokenizer().encode(&rendered).expect("tokenize"),
         params: params(),
         multimodal: None,
+        opener_tokens: None,
     }
 }
 
@@ -78,7 +79,13 @@ fn image_input(frontend: &FrontendSet, image: &[u8]) -> RequestInput {
     }];
     let prepared = frontend.prepare_prompt(&processor, &messages, &[image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).expect("prepare");
     let (tokens, multimodal) = Multimodal::from_prepared(prepared);
-    RequestInput { model: MODEL.into(), tokens, params: params(), multimodal: Some(Arc::new(multimodal)) }
+    RequestInput {
+        model: MODEL.into(),
+        tokens,
+        params: params(),
+        multimodal: Some(Arc::new(multimodal)),
+        opener_tokens: None,
+    }
 }
 
 /// Run `inputs` (submitted in order, the first ones given `lead` advances to

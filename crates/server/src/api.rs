@@ -41,7 +41,9 @@ use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Engine, EventStream, collect_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
-use crate::template::{check_content_parts, ChatMessage, ContentRejection, TemplateProvider};
+use crate::template::{
+    check_content_parts, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
+};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
@@ -197,27 +199,34 @@ fn build_request(
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let tokens = server.template.apply_chat_template(messages, thinking, tools);
-    request_input(server, model, tokens, params, None)
+    let rendered = server.template.apply_chat_template(messages, thinking, tools);
+    request_input(server, model, rendered, params, None)
 }
 
 /// The submitted request over already-templated `tokens`.
 fn request_input(
     server: &Server,
     model: Option<String>,
-    tokens: Vec<ignis_core::TokenId>,
+    rendered: RenderedPrompt,
     params: DecodeParams,
     multimodal: Option<ignis_core::vision::Multimodal>,
 ) -> (RequestInput, String, u32) {
     let model = model
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| server.engine.model_id());
-    let prompt_tokens = tokens.len() as u32;
+    let prompt_tokens = rendered.tokens.len() as u32;
+    // GitHub #186: a prompt carrying images never reuses retained state — a
+    // prefix's identity is token ids alone until the media-aware match key
+    // lands (#189 defines the key, #193 fills its media slot), so two prompts
+    // differing only in their images would share a checkpoint. The opener is
+    // therefore reported on the text-only path only.
+    let text_only = multimodal.is_none();
     let input = RequestInput {
         multimodal: multimodal.map(Arc::new),
         model: model.clone(),
-        tokens,
+        tokens: rendered.tokens,
         params,
+        opener_tokens: rendered.opener_tokens.filter(|_| text_only),
     };
     (input, model, prompt_tokens)
 }
@@ -246,7 +255,7 @@ async fn prepare_request(
         .template
         .prepare_multimodal(messages, thinking, tools, acquired.media)
         .map_err(content_rejection)?;
-    let (input, model, prompt_tokens) = request_input(server, model, tokens, params, Some(multimodal));
+    let (input, model, prompt_tokens) = request_input(server, model, tokens.into(), params, Some(multimodal));
     Ok((input, model, prompt_tokens, Some(acquired.stats)))
 }
 

@@ -42,6 +42,13 @@ pub struct EngineShape {
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
+    /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
+    pub prompt_reuse: bool,
+    /// The retained checkpoint pool's device budget, in bytes
+    /// (`--retained-pool-bytes`, GitHub #186). `None` derives it from the
+    /// VRAM left once the model and its pools have landed, which only the
+    /// loaded leaf can report.
+    pub retained_pool_bytes: Option<u64>,
     /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
     /// `None` binds nothing of the drafter.
     pub speculation: Option<ignis_core::Speculation>,
@@ -64,6 +71,8 @@ impl Default for EngineShape {
                 ignis_runtime::DEFAULT_MAX_CONTEXT,
             ),
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
+            retained_pool_bytes: None,
             speculation: None,
             vision: None,
         }
@@ -78,6 +87,8 @@ impl From<&crate::config::Config> for EngineShape {
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
             host_pool_bytes: config.host_pool_bytes,
+            prompt_reuse: config.prompt_reuse,
+            retained_pool_bytes: config.retained_pool_bytes,
             speculation: config.speculation,
             vision: config.vision,
         }
@@ -90,6 +101,7 @@ fn scheduler_config_for_shape(
     shape: EngineShape,
     kv_page_tokens: u32,
     capacity_pages: u32,
+    retained_pool_bytes: u64,
 ) -> SchedulerConfig {
     SchedulerConfig {
         model,
@@ -98,6 +110,8 @@ fn scheduler_config_for_shape(
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
+        prompt_reuse: shape.prompt_reuse,
+        retained_pool_bytes,
         ..SchedulerConfig::default()
     }
 }
@@ -176,8 +190,39 @@ pub fn cuda_scheduler(
     .map_err(|e| e.to_string())?;
     let capacity_pages = kv_pool.block_count() as u32;
 
+    // GitHub #186 (ADR 0029): the retained pool's budget. The operator's own
+    // number wins; absent one it is derived from what the device says is
+    // *actually* free now that the weights, the KV pool and every other
+    // reservation are down — measured, not guessed from `total - weights`,
+    // which is the guess that OOM'd when the KV pool was sized that way
+    // (`cuda_leaf.rs`'s module doc).
+    let retained_pool_bytes = match (shape.prompt_reuse, shape.retained_pool_bytes) {
+        (false, _) => 0,
+        (true, Some(bytes)) => bytes,
+        (true, None) => ignis_core::auto_retained_pool_bytes(stats.free_vram_bytes),
+    };
+    // The startup capacity report for the retained tier, beside
+    // `ignis.runtime.kv_pool`: what was free, what the budget is, and
+    // whether the operator chose it. Read the budget off this line rather
+    // than computing it from a flag.
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.retained_pool",
+        prompt_reuse = shape.prompt_reuse,
+        budget_bytes = retained_pool_bytes,
+        derived = shape.retained_pool_bytes.is_none(),
+        free_vram_bytes = stats.free_vram_bytes,
+        "retained pool"
+    );
+
     Ok(scheduler(
-        scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
+        scheduler_config_for_shape(
+            model_id,
+            shape,
+            KV_PAGE_TOKENS,
+            capacity_pages,
+            retained_pool_bytes,
+        ),
         model,
         eos,
     ))
@@ -209,13 +254,31 @@ mod tests {
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: 8 * 1024 * 1024 * 1024,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            prompt_reuse: true,
+            retained_pool_bytes: None,
             speculation: None,
             vision: None,
         };
 
-        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 4_096);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // GitHub #186: the reuse knobs reach the scheduler too — the budget
+        // as the number the caller resolved (the operator's, or the one
+        // derived from free VRAM), never re-derived here.
+        assert!(config.prompt_reuse);
+        assert_eq!(config.retained_pool_bytes, 4_096);
+    }
+
+    #[test]
+    fn prompt_reuse_off_reaches_the_scheduler_config() {
+        let shape = EngineShape {
+            prompt_reuse: false,
+            ..EngineShape::default()
+        };
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 0);
+        assert!(!config.prompt_reuse);
+        assert_eq!(config.retained_pool_bytes, 0);
     }
 
     struct StubLeaf;
@@ -226,6 +289,7 @@ mod tests {
         type Prefix = ();
         type SnapshotBuf = Vec<u8>;
         type Media = ();
+        type Checkpoint = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -316,6 +380,7 @@ mod tests {
             .submit(
                 RequestInput {
                     multimodal: None,
+                    opener_tokens: None,
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {

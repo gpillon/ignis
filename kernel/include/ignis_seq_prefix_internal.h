@@ -124,8 +124,15 @@ enum ignis_seq_prefix_direction {
   IGNIS_SEQ_PREFIX_CLONE = 1
 };
 
-/* Move every mutable state section between `seq`'s slot and `prefix`'s
- * device image, in `direction`.
+/* Move every mutable state section between `seq`'s slot and a device
+ * `image` laid out by `ignis_seq_prefix_clone_layout`, in `direction`, and
+ * the host-side progress scalars with it.
+ *
+ * The image is a plain pointer rather than a shared prefix because a prompt
+ * checkpoint (GitHub #186, ADR 0029) captures the same sections into an
+ * image of its own, at the generation opener rather than at the prefix's
+ * page boundary. One function, so the two cannot drift apart about what a
+ * sequence is made of.
  *
  * Both directions are device-to-device for the device-resident sections:
  * nothing here touches pinned host memory or crosses PCIe, which is the
@@ -136,10 +143,10 @@ enum ignis_seq_prefix_direction {
  * Throws `std::logic_error` for a CLONE section with no case below -- the
  * same loud failure ignis_seq_snapshot and ignis_seq_restore make, so that a
  * section added to the table is carried by all three or by none. */
-inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix,
-                                      ignis_seq &seq, ignis_seq_prefix_direction direction) {
+inline void ignis_seq_state_transfer(ignis_seq_pool &pool, unsigned char *image,
+                                     ignis_seq_progress_image &progress, ignis_seq &seq,
+                                     ignis_seq_prefix_direction direction) {
   const bool capture = direction == IGNIS_SEQ_PREFIX_CAPTURE;
-  auto *image        = static_cast<unsigned char *>(prefix.clone_image.p);
   const auto copy    = [&](void *device_state, void *image_at, std::size_t bytes,
                         const char *what) {
     if (bytes == 0) {
@@ -244,10 +251,19 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
   /* The progress scalars, whichever way we are going. They are host state,
    * so they are the one section this function moves with an assignment. */
   if (capture) {
-    prefix.progress = ignis_seq_progress_of(seq);
+    progress = ignis_seq_progress_of(seq);
   } else {
-    ignis_seq_apply_progress(seq, prefix.progress);
+    ignis_seq_apply_progress(seq, progress);
   }
+}
+
+/* [`ignis_seq_state_transfer`] against a shared prefix's own image and
+ * progress -- the original call, kept so every prefix call site reads
+ * exactly as it did before a second consumer existed. */
+inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix,
+                                      ignis_seq &seq, ignis_seq_prefix_direction direction) {
+  ignis_seq_state_transfer(pool, static_cast<unsigned char *>(prefix.clone_image.p),
+                           prefix.progress, seq, direction);
 }
 
 /* Drop one reference to `prefix`, destroying it -- and returning its pages to

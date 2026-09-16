@@ -30,6 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use ignis_core::checkpoint::ReuseSource;
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
@@ -157,6 +158,13 @@ struct RequestTelemetry {
     /// Microseconds this request's prefill chunks spent encoding media
     /// (GitHub #192), summed as the chunks land.
     encode_micros: u64,
+    /// The retained state this request's prefill resumed from (GitHub #186,
+    /// ADR 0029): the residency tier, the prompt tokens it skipped, and what
+    /// the restore itself cost. `None` for a request that reused nothing,
+    /// which is how the request log says `reuse_source: none` — by saying
+    /// nothing at all, exactly as it does for `spec.*` on a load with no
+    /// drafter.
+    reuse: Option<(ReuseSource, u32, u64)>,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -367,7 +375,7 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
-        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
+        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
                 rt.lane,
@@ -375,8 +383,17 @@ impl Telemetry {
                 rt.itl_sum_ms,
                 rt.itl_max_ms,
                 rt.class,
+                rt.reuse,
             ),
-            None => (self.clock.now_ms(), 0, 0, 0, 0, RequestClass::default()),
+            None => (
+                self.clock.now_ms(),
+                0,
+                0,
+                0,
+                0,
+                RequestClass::default(),
+                None,
+            ),
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
         // Only a request this consumer saw submitted has a real span; one
@@ -403,6 +420,7 @@ impl Telemetry {
             itl_count,
             class,
             spec,
+            reuse,
         );
     }
 
@@ -424,6 +442,32 @@ impl Telemetry {
     pub fn on_prefix_reused(&mut self, tokens: u32) {
         if let Some(metrics) = &self.metrics {
             metrics.record_prefix_reused(tokens);
+        }
+    }
+
+    /// A request's prefill resumed from retained state left by an earlier,
+    /// already-finished request (GitHub #186, ADR 0029). Unlike a sibling
+    /// prefix this is a *per-request* fact — which tier served it, how much
+    /// prefill it skipped, what the restore cost — so it is stashed and
+    /// reported on the request's own `done` line rather than only summed
+    /// into a server-wide counter.
+    /// Nothing is projected from here. `ignis_prefix_reused_tokens_total`
+    /// counts **sibling-prefix** reuse — that is what its help text says and
+    /// what ADR 0017's table row says — and folding a second, different kind
+    /// of reuse into it would redefine a documented counter without saying
+    /// so. #190 owns the per-tier hit / miss / spill / restore counters and
+    /// the ADR amendment that declares them; until then checkpoint reuse is
+    /// reported where this ticket says it is, on the request's own `done`
+    /// line.
+    pub fn on_state_reused(
+        &mut self,
+        id: RequestId,
+        source: ReuseSource,
+        tokens: u32,
+        restore_micros: u64,
+    ) {
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.reuse = Some((source, tokens, restore_micros));
         }
     }
 
@@ -634,6 +678,7 @@ impl Telemetry {
         itl_samples: u64,
         class: RequestClass,
         spec: Option<SpecCounters>,
+        reuse: Option<(ReuseSource, u32, u64)>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -655,6 +700,14 @@ impl Telemetry {
             spec.drafted = spec.map(|s| s.drafted),
             spec.accepted = spec.map(|s| s.accepted),
             spec.pos = spec_pos.as_deref(),
+            // GitHub #186 (ADR 0029). Absent on a request that reused
+            // nothing: `reuse_source: none` *is* the absence of the field,
+            // the way `spec.*` is absent on a load with no drafter, so the
+            // log never reports a placeholder for something that never
+            // happened.
+            reuse_source = reuse.map(|(source, _, _)| source.as_str()),
+            reused_prompt_tokens = reuse.map(|(_, tokens, _)| tokens),
+            restore_ms = reuse.map(|(_, _, micros)| micros as f64 / 1000.0),
             "request done"
         );
     }
