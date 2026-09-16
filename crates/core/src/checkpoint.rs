@@ -294,14 +294,19 @@ impl CheckpointPool {
         &self.entries
     }
 
-    /// The KV pages the retained entries hold through their shared prefixes.
-    ///
-    /// Counted once per **prefix**, not once per entry: two checkpoints taken
-    /// at different openers inside the same prompt head hold the same shared
+    /// The KV pages of history the retained entries cover, counted once per
+    /// **prefix** rather than once per entry: two checkpoints taken at
+    /// different openers inside the same prompt head hold the same shared
     /// prefix, and its pages are charged to the KV pool exactly once
-    /// ([`crate::prefix::PrefixCache`] is what carries that charge). Summing
-    /// per entry would tell the admission machine that more of the pool is
-    /// reclaimable than actually is.
+    /// ([`crate::prefix::PrefixCache`] is what carries that charge).
+    ///
+    /// **Diagnostic, not the admission machine's number.** Since #187 an entry
+    /// may stand on a *chained* prefix, whose reach includes its ancestors' —
+    /// so two entries on two links of one chain count the shared links twice
+    /// here. What the admission path reads instead is
+    /// `ConcreteScheduler::reclaimable_retained_pages`, which sums each
+    /// prefix's **own** pages and only for prefixes no live request holds:
+    /// pages that would genuinely come back, never a promise that would not.
     pub fn retained_pages(&self) -> u32 {
         let mut counted: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
         let mut pages = 0;
