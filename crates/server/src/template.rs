@@ -38,8 +38,10 @@ pub struct ChatMessage {
     pub role: String,
     /// The message content.
     pub content: MessageContent,
-    /// A prior assistant turn's thinking trace (GitHub #68). Dropped before
-    /// rendering unless the request sets `preserve_thinking: true`.
+    /// A prior assistant turn's thinking trace (GitHub #68). Handed to the
+    /// chat template whole (GitHub #185), which keeps it on turns after the
+    /// last real user query — or on all of them when the request sets
+    /// `preserve_thinking: true` — and strips the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// A prior assistant turn's tool calls (GitHub #132) — the OpenAI wire

@@ -36,9 +36,14 @@ re-record after regenerating images, since the fixtures pin the image bytes.
 
 ## Notes
 
-- A multi-turn conversation is not in the set: ignis renders history
-  assistant turns with an empty `<think></think>` block where the reference
-  does not, a text-path divergence independent of vision (GitHub #182).
+- The set also holds text-only multi-turn cases (`chat_history`,
+  `chat_history_preserved`, `tool_loop`, `new_turn_after_tool_loop`, #185), each
+  with history reasoning and recorded with `preserve_thinking` both ways.
+  They carry no image, so only the token ids, positions and the rewrite
+  checkpoint are meaningful — which is the point: how history renders is what
+  decides whether two turns can share a prefill (ADR 0029). Until #185 they
+  were absent because ignis rendered every history assistant turn with an
+  empty `<think></think>` block where the reference renders none (#182).
 - The JPEG cases cover the path the processor ports exactly (8-bit YCbCr
   4:2:0/4:2:2, even height, baseline/progressive/restart intervals). Other
   JPEG layouts and lossy WebP decode best-effort; see `crates/artifact/src/vision/jpeg.rs`

@@ -90,9 +90,14 @@ fi::ChatRenderOptions options_of(const Json& casus) {
     if (casus.contains("reasoning_effort")) {
         options.reasoning_effort = effort_of(casus.at("reasoning_effort").get<std::string>());
     }
-    if (casus.contains("preserve_thinking")) {
-        options.preserve_thinking = casus.at("preserve_thinking").get<bool>();
-    }
+    // Always engaged, the way a request leaves it (GitHub #185). The serving
+    // path fills `PromptOptions::preserve_thinking`, a plain bool defaulting
+    // to false, and `frontend.cpp`'s `render_options()` engages the optional
+    // from it — so nullopt is a state no request can produce, and here it
+    // would mean the opposite of the default: `chat_template.cpp:359` reads
+    // `value_or(effort_template)`, and this artifact's template is the
+    // reasoning-effort one, so an unset option renders as *preserve*.
+    options.preserve_thinking = casus.value("preserve_thinking", false);
     if (casus.contains("tools")) {
         for (const Json& tool : casus.at("tools")) {
             // A tool definition reaches the template through the request's

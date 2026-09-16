@@ -39,9 +39,19 @@ artifact's template hashes to the reference's `kReasoningEffortTemplateDigest`
 
 ## Notes
 
-- `enable_thinking` is false in every recorded case. A thinking-on multi-turn
-  render still diverges on the history think block (GitHub #182), which is
-  #185's subject — `preserve_thinking` does not reach the template yet.
+- `preserve_thinking` is recorded the way a request leaves it, not the way the
+  library defaults it (GitHub #185): the serving path fills
+  `PromptOptions::preserve_thinking`, a plain bool defaulting to false, and
+  `frontend.cpp`'s `render_options()` engages the optional from it. Left
+  nullopt the recorder would get the *opposite* default — `chat_template.cpp`
+  reads `value_or(effort_template)` and this artifact's template is the
+  reasoning-effort one — which is why `plain_chat` first recorded with a think
+  block on its history turn that no reference request produces.
+- `history_thinking_stripped` / `history_thinking_preserved` are the same
+  thinking-on conversation recorded both ways: the first drops the history
+  turn's think block entirely, the second keeps its reasoning. They are the
+  byte-exact half of #185; `crates/artifact/tests/fixtures/vision/expected/`
+  carries the token-id half.
 - The reference takes tool definitions as JSON strings that the request's own
   `nlohmann::json` already dumped with sorted keys, so the recorder re-parses
   each case's tool as a plain (sorted) `nlohmann::json` before dumping it.

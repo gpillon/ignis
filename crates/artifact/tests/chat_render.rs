@@ -1,8 +1,9 @@
-//! The rendering prerequisite of cross-request state reuse (GitHub #184,
-//! spec 01 §Rendering prerequisites, ADR 0029): ignis's minijinja render of
-//! the real artifact's chat template equals the reference's render of the
-//! same messages, byte for byte — tool-call parameters included, in the
-//! order the model emitted them.
+//! The rendering prerequisites of cross-request state reuse (GitHub #184 and
+//! #185, spec 01 §Rendering prerequisites, ADR 0029): ignis's minijinja
+//! render of the real artifact's chat template equals the reference's render
+//! of the same messages, byte for byte — tool-call parameters in the order
+//! the model emitted them, and history thinking kept or stripped exactly
+//! where the reference keeps or strips it.
 //!
 //! Fixtures (`tests/fixtures/chat_render/*.json`) were recorded from the
 //! reference by `tools/chat-render-fixtures` (see its README). CPU-only;
@@ -11,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ignis_artifact::{ChatMessage, FrontendSet, MessageContent, Reader, Role, ToolCall};
+use ignis_artifact::{
+    ChatMessage, ChatRenderOptions, FrontendSet, MessageContent, Reader, Role, ToolCall,
+};
 use serde_json::Value;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -53,9 +56,9 @@ fn messages(case: &Value) -> Vec<ChatMessage> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            // `preserve_thinking` does not reach the template yet (#185);
-            // no recorded case carries reasoning content.
-            reasoning_content: None,
+            // Handed over whole; the template decides what survives
+            // (GitHub #185).
+            reasoning_content: m["reasoning_content"].as_str().map(str::to_owned),
         })
         .collect()
 }
@@ -68,7 +71,7 @@ fn rendered_prompts_match_the_reference_fixtures() {
         .map(|e| e.unwrap().path())
         .collect();
     dir.sort();
-    assert_eq!(dir.len(), 5, "every recorded fixture is present");
+    assert_eq!(dir.len(), 7, "every recorded fixture is present");
     // Every case is checked and every mismatch reported, so one divergence
     // does not hide another.
     let failures: Vec<String> = dir
@@ -90,9 +93,16 @@ fn check_fixture(frontend: &FrontendSet, path: &Path) -> Result<(), String> {
     let name = case["name"].as_str().unwrap();
     let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
     let thinking = case["enable_thinking"].as_bool().unwrap_or(false);
+    // Defaulted the way a request leaves it, which is also the way the
+    // recorder engages the reference's option (GitHub #185).
+    let preserve = case["preserve_thinking"].as_bool().unwrap_or(false);
     let rendered = frontend
         .chat_template()
-        .render_with_thinking_and_tools(&messages(case), thinking, None, Some(&tools))
+        .render_with_thinking_and_tools(
+            &messages(case),
+            ChatRenderOptions { enable_thinking: thinking, preserve_thinking: preserve, ..Default::default() },
+            Some(&tools),
+        )
         .map_err(|err| format!("{name}: render failed: {err}"))?;
     let expected = fixture["expected"]["text"].as_str().unwrap();
     if rendered == expected {

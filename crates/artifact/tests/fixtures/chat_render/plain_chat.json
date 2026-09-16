@@ -21,7 +21,7 @@
     ]
   },
   "expected": {
-    "text": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nHello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHi there.<|im_end|>\n<|im_start|>user\nAnd again.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "text": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nHello.<|im_end|>\n<|im_start|>assistant\nHi there.<|im_end|>\n<|im_start|>user\nAnd again.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
     "shared_prefix_offset": 58
   }
 }
