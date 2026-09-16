@@ -865,14 +865,12 @@ impl CheckpointPool {
     /// over [`CheckpointPool::match_lengths`] and
     /// [`crate::prefix::PrefixCache::match_lengths`].
     pub fn lookup(&self, prompt: &PromptKeys) -> CheckpointLookup {
-        let length = prompt.tokens();
-        // An entry longer than the prompt cannot be a prefix of it, and one
-        // this load would refuse to write must never be offered.
-        let candidates: Vec<&CheckpointEntry> = self
+        // An entry this load would refuse to write must never be offered. One
+        // longer than the prompt needs no filter: `prompt` has no key there.
+        let candidates = self
             .entries
             .iter()
-            .filter(|e| e.tokens <= length && self.identity.accepts(&e.identity).is_ok())
-            .collect();
+            .filter(|e| self.identity.accepts(&e.identity).is_ok());
         let mut lookup = CheckpointLookup::default();
         for entry in candidates {
             if self.tiers.rank(entry.tier).is_none() || !prompt.matches(entry.tokens, entry.key) {
@@ -930,14 +928,21 @@ impl CheckpointPool {
     /// [`CheckpointPool::lookup`] and [`CheckpointPool::select`] with no
     /// device prefix to weigh — a pure query that decides nothing and changes
     /// nothing.
-    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
-        self.select(&self.lookup(&prompt.keys_for(self.match_lengths())), 0)
+    pub fn best_match(&self, prompt: &PromptKeys) -> Option<CheckpointMatch> {
+        self.select(&self.lookup(prompt), 0)
     }
 
     /// Every length a retained entry covers — what a prompt has to be keyed at
     /// before [`CheckpointPool::lookup`] can answer it.
     pub fn match_lengths(&self) -> impl Iterator<Item = u32> + '_ {
         self.entries.iter().map(|e| e.tokens)
+    }
+
+    /// `prompt` keyed at [`CheckpointPool::match_lengths`], for a caller asking
+    /// this pool alone. The scheduler asks the prefix cache too, and keys both
+    /// in one walk.
+    pub fn keys<'a>(&self, prompt: impl Into<PromptContent<'a>>) -> PromptKeys {
+        prompt.into().keys_for(self.match_lengths())
     }
 
     /// Record that `id` was claimed: refresh its LRU tick and count the
@@ -960,7 +965,7 @@ impl CheckpointPool {
     /// the match against.
     pub fn claim(
         &mut self,
-        prompt: &PromptContent<'_>,
+        prompt: &PromptKeys,
         use_tick: u64,
         used_at: Instant,
     ) -> Option<CheckpointMatch> {
@@ -1212,7 +1217,7 @@ mod tests {
         tokens: &[TokenId],
         tick: u64,
     ) -> Option<CheckpointMatch> {
-        pool.claim(&PromptContent::text(tokens), tick, Instant::now())
+        pool.claim(&pool.keys(PromptContent::text(tokens)), tick, Instant::now())
     }
 
     #[test]
@@ -1374,7 +1379,7 @@ mod tests {
         retain(&mut pool, 2, &newer, 1, 5).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
         let peek = pool
-            .best_match(&PromptContent::text(&prompt))
+            .best_match(&pool.keys(PromptContent::text(&prompt)))
             .expect("a match");
         assert_eq!(peek.tokens, 100);
         assert_eq!(pool.reused_tok(), 0, "peeking is not reuse");
@@ -1523,7 +1528,7 @@ mod tests {
         // The same bytes, re-labelled as another load's.
         pool.entries[0].identity = load(2);
         assert!(
-            pool.best_match(&PromptContent::text(&prompt)).is_none(),
+            pool.best_match(&pool.keys(PromptContent::text(&prompt))).is_none(),
             "a foreign entry is not a candidate"
         );
     }
@@ -1583,15 +1588,15 @@ mod tests {
         let _ = pool.retain(capture, 1).unwrap();
         let longer: Vec<TokenId> = (1..=140).collect();
         assert!(
-            pool.claim(&PromptContent::new(&longer, &yours), 2, Instant::now()).is_none(),
+            pool.claim(&pool.keys(PromptContent::new(&longer, &yours)), 2, Instant::now()).is_none(),
             "another image is another conversation"
         );
         assert!(
-            pool.claim(&PromptContent::text(&longer), 3, Instant::now()).is_none(),
+            pool.claim(&pool.keys(PromptContent::text(&longer)), 3, Instant::now()).is_none(),
             "and no image at all is a third one"
         );
         assert!(
-            pool.claim(&PromptContent::new(&longer, &mine), 4, Instant::now()).is_some(),
+            pool.claim(&pool.keys(PromptContent::new(&longer, &mine)), 4, Instant::now()).is_some(),
             "the same image still matches"
         );
     }
@@ -1805,7 +1810,7 @@ mod tests {
         assert_eq!(entry.bytes, IMAGE * 8, "the lower tier charges the materialized blob");
         assert_eq!(entry.use_tick, 1, "a move is not a use");
         assert_eq!(
-            pool.best_match(&PromptContent::text(&prompt)).unwrap().source,
+            pool.best_match(&pool.keys(PromptContent::text(&prompt))).unwrap().source,
             ReuseSource::KvRam,
             "the metadata remains matchable after the device image is gone"
         );
@@ -1820,7 +1825,7 @@ mod tests {
         let prompt: Vec<TokenId> = (1..=4_000).collect();
         let spilled = retain(&mut pool, 1, &prompt[..2_100], 1, 1).unwrap();
         pool.move_to_tier(spilled, ReuseSource::KvRam, IMAGE).unwrap();
-        let lookup = pool.lookup(&PromptContent::text(&prompt).keys_for(pool.match_lengths()));
+        let lookup = pool.lookup(&pool.keys(PromptContent::text(&prompt)));
 
         assert_eq!(
             pool.select(&lookup, 0).map(|m| m.source),
@@ -1840,7 +1845,7 @@ mod tests {
         // With a device checkpoint too, the KV-RAM entry that loses to the
         // prefix leaves the device checkpoint standing.
         retain(&mut pool, 2, &prompt[..1_500], 1, 2).unwrap();
-        let lookup = pool.lookup(&PromptContent::text(&prompt).keys_for(pool.match_lengths()));
+        let lookup = pool.lookup(&pool.keys(PromptContent::text(&prompt)));
         let chosen = pool.select(&lookup, 1_200).unwrap();
         assert_eq!((chosen.source, chosen.tokens), (ReuseSource::Device, 1_500));
         assert_eq!(

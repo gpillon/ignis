@@ -476,7 +476,7 @@ impl<'a> PromptContent<'a> {
         out
     }
 
-    /// This prompt's content keys at every one of `lengths` a prefix of it
+    /// This prompt's match keys at every one of `lengths` a prefix of it
     /// could have, in **one** forward pass (GitHub #193).
     ///
     /// What a claimant hands to every pool it asks: the checkpoint pool, the
@@ -512,7 +512,7 @@ impl<'a> PromptContent<'a> {
     }
 }
 
-/// A prompt's content keys at a fixed set of lengths
+/// A prompt's match keys at a fixed set of lengths
 /// ([`PromptContent::keys_for`]): everything a lookup needs to know about the
 /// prompt, computed before any pool is asked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

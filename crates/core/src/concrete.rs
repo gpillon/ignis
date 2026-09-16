@@ -255,31 +255,6 @@ fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
     }
 }
 
-/// `input`'s prompt keyed at every length retained state and shared prefixes
-/// hold (GitHub #193): the one forward pass a claimant's lookups share, rather
-/// than one per pool.
-///
-/// Its tokens and media — minus the last token for a multimodal request. A
-/// claim reaching the prompt's very end leaves nothing to prefill, and for a
-/// multimodal request the prefill is the only thing that hands the leaf its
-/// `rope_delta`: a claimant is cloned from a publisher's mutable state and
-/// pages, or from a checkpoint's image, and none of them carries it (`step.cu`
-/// sets `seq->rope_delta` from the span options). Without one tail token its
-/// every decode round would rotate at `position + 0`. A checkpoint is held to
-/// it too: its own capture leaves a tail, but a *claimant's* prompt can end
-/// exactly at another request's opener.
-fn reuse_keys(input: &RequestInput, checkpoints: &CheckpointPool, prefix: &PrefixCache) -> PromptKeys {
-    let media = media_keys(input);
-    let prompt = PromptContent::new(&input.tokens, &media);
-    let reach = match input.multimodal {
-        Some(_) => prompt.tokens().saturating_sub(1),
-        None => prompt.tokens(),
-    };
-    prompt
-        .head(reach)
-        .keys_for(checkpoints.match_lengths().chain(prefix.match_lengths()))
-}
-
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
 /// (GitHub #178: one media item per chunk).
@@ -810,6 +785,32 @@ impl ConcreteScheduler {
             source: ReuseSource::KvRam,
         });
         true
+    }
+
+    /// Request `i`'s prompt keyed at every length retained state and shared
+    /// prefixes hold (GitHub #193): the one forward pass a claimant's lookups
+    /// share, rather than one per pool.
+    ///
+    /// Its tokens and media — minus the last token for a multimodal request.
+    /// A claim reaching the prompt's very end leaves nothing to prefill, and
+    /// for a multimodal request the prefill is the only thing that hands the
+    /// leaf its `rope_delta`: a claimant is cloned from a publisher's mutable
+    /// state and pages, or from a checkpoint's image, and none of them carries
+    /// it (`step.cu` sets `seq->rope_delta` from the span options). Without one
+    /// tail token its every decode round would rotate at `position + 0`. A
+    /// checkpoint is held to it too: its own capture leaves a tail, but a
+    /// *claimant's* prompt can end exactly at another request's opener.
+    fn reuse_keys(&self, i: usize) -> PromptKeys {
+        let input = &self.requests[i].input;
+        let media = media_keys(input);
+        let prompt = PromptContent::new(&input.tokens, &media);
+        let reach = match input.multimodal {
+            Some(_) => prompt.tokens().saturating_sub(1),
+            None => prompt.tokens(),
+        };
+        prompt
+            .head(reach)
+            .keys_for(self.checkpoints.match_lengths().chain(self.prefix.match_lengths()))
     }
 
     /// Bring spilled prefix `id` back onto the device as a retained prefix
@@ -2228,7 +2229,7 @@ impl Scheduler for ConcreteScheduler {
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
                     // One walk of the prompt answers all four questions below.
-                    let keys = reuse_keys(&self.requests[i].input, &self.checkpoints, &self.prefix);
+                    let keys = self.reuse_keys(i);
                     let lookup = self.checkpoints.lookup(&keys);
                     self.requests[i].pending_retained_misses =
                         lookup.misses(self.checkpoints.tiers());
