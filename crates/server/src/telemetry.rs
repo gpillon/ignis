@@ -505,8 +505,8 @@ impl Telemetry {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
             rt.prefilled_tokens = 0;
-            // GitHub #192: a requeued multimodal request is released and
-            // re-prefilled (#178's fence), so it encodes its items again —
+            // GitHub #192: a requeued multimodal request re-prefills from
+            // the start, so it encodes its items again —
             // the encode seconds of the discarded attempt are not this
             // prefill's, for the same reason its chunks are not.
             rt.encode_micros = 0;
@@ -965,8 +965,8 @@ mod tests {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 8, 250_000);
-            // The attempt is discarded: a multimodal request is released and
-            // re-prefilled, so it encodes its item again.
+            // The attempt is discarded: the request re-prefills from the
+            // start, so it encodes its item again.
             telemetry.on_requeued(1);
             telemetry.on_prefill_chunk(1, 8, 125_000);
             telemetry.on_prefill_chunk(1, 20, 0);

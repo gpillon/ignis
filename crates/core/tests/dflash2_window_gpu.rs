@@ -21,7 +21,7 @@
 //!
 //! The window is read out of a snapshot blob of the prefilled sequence, so
 //! the test also reads what snapshot carries. That blob layout is leaf
-//! internal (ADR 0024) and is spelled out below for version 2 only: a format
+//! internal (ADR 0024) and is spelled out below for version 3 only: a format
 //! change fails the version assertion rather than misreading bytes.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
@@ -364,7 +364,7 @@ fn the_drafter_window_holds_the_projected_context_of_the_prompt() {
     let long = repeated(&sentence, LONG_PROMPT_TOKENS);
     assert!(short.len() > PREFILL_CHUNK as usize && short.len() < WINDOW, "{}", short.len());
     assert!(long.len() > WINDOW && long.len() <= MAX_CONTEXT as usize, "{}", long.len());
-    assert_eq!(snapshot_format_version(), 2, "this test reads the version-2 blob layout");
+    assert_eq!(snapshot_format_version(), 3, "this test reads the version-3 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));

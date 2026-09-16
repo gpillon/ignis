@@ -225,7 +225,8 @@ What building Tier 1 decided that the Decision left open.
 - **A multimodal claim always leaves one prompt token to prefill** (owner
   decision). A claimant is built from cloned pages and mutable state, neither
   of which carries the sequence's `rope_delta`; only a prefill span hands it to
-  the leaf. So neither a shared prefix nor a prompt checkpoint reaching a
+  the leaf. (Since #194 the clone carries the *publisher's* delta, which is its
+  whole prompt's, not the claimed head's: the rule still stands.) So neither a shared prefix nor a prompt checkpoint reaching a
   multimodal prompt's last token is offered — a claimant's prompt can end
   exactly at another request's opener. It costs one re-prefilled token in that
   rare case. Lifting it means carrying `rope_delta` with the reused state

@@ -6,6 +6,11 @@
 //! itself; and 100 image requests in a row leave no media embedding live and
 //! the leaf's footprint where it was.
 //!
+//! GitHub #194: an image request evicted to KV-RAM mid-decode and restored
+//! continues with the same greedy tokens as one never evicted — the blob
+//! carries its `rope_delta`, and nothing vision-related is live after its
+//! image is prefilled.
+//!
 //! "Sane", not "token-identical": a decode round is one batch-wide traversal,
 //! so the round's width is part of its numerics, and no test in this engine
 //! claims a lane's tokens are independent of who shares its round. What must
@@ -69,12 +74,16 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
 }
 
 fn image_input(frontend: &FrontendSet, image: &[u8]) -> RequestInput {
+    image_question(frontend, image, "What number is shown in the image?")
+}
+
+fn image_question(frontend: &FrontendSet, image: &[u8], question: &str) -> RequestInput {
     let processor = frontend.vision_processor().expect("vision processor");
     let messages = [ChatMessage {
         role: Role::User,
         content: MessageContent::Parts(vec![
             ContentPart::Image { url: None },
-            ContentPart::Text("What number is shown in the image?".into()),
+            ContentPart::Text(question.into()),
         ]),
         tool_calls: Vec::new(),
         reasoning_content: None,
@@ -90,6 +99,17 @@ fn image_input(frontend: &FrontendSet, image: &[u8]) -> RequestInput {
         user_turn_tokens: None,
         system_block_tokens: None,
     }
+}
+
+/// Request `id`'s generated tokens among `events`.
+fn generated(events: &[SchedEvent], id: RequestId) -> Vec<TokenId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SchedEvent::Token { request, token } if *request == id => Some(*token),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Run `inputs` (submitted in order, the first ones given `lead` advances to
@@ -227,4 +247,64 @@ fn an_image_prefill_interleaved_with_text_lanes_leaves_them_as_they_run_alone() 
         assert_eq!(compute.live_sequences(), 0, "round {round}");
     }
     assert_eq!(model.stats().expect("stats").vram_bytes, before);
+
+    // GitHub #194: one resident sequence, so an interactive text request
+    // arriving while the image request decodes can only run by snapshotting
+    // it to KV-RAM. Both runs decode the image request alone, before and
+    // after, so its greedy tokens must not move.
+    let evictable = |with_intruder: bool| -> (Vec<TokenId>, Vec<SchedEvent>, RequestId) {
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: MODEL.into(),
+                max_sequence_tokens: MAX_CONTEXT,
+                serving_chunk_tokens: SERVING_CHUNK,
+                kv_page_tokens: ignis_runtime::KV_PAGE_TOKENS,
+                kv_capacity_pages: pages,
+                resident_slot_capacity: 1,
+                host_capacity_bytes: 4 << 30,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        // A long answer, so the intruder arrives while it is still decoding.
+        let question = "Describe this image in detail: the digits, their colour, the background.";
+        let input = RequestInput {
+            params: DecodeParams { max_tokens: Some(48), ..DecodeParams::default() },
+            ..image_question(&frontend, &image, question)
+        };
+        let victim = sched.submit(input, RequestClass::Agent).expect("submit");
+        let mut events = Vec::new();
+        while generated(&events, victim).len() < 2 {
+            events.extend(sched.advance());
+            assert!(sched.last_error().is_none(), "compute error: {:?}", sched.last_error());
+            assert!(!sched.is_idle(), "the image request finished before it could be evicted");
+        }
+        if with_intruder {
+            let intruder = text_input(&frontend, "What is 2 + 2? Answer with a number only.");
+            sched.submit(intruder, RequestClass::Interactive).expect("submit");
+        }
+        while !sched.is_idle() {
+            events.extend(sched.advance());
+            assert!(sched.last_error().is_none(), "compute error: {:?}", sched.last_error());
+        }
+        (generated(&events, victim), events, victim)
+    };
+    let (expected, _, _) = evictable(false);
+    assert!(expected.len() > 8, "the control decoded well past the point the intruder arrives");
+    let (actual, events, victim) = evictable(true);
+    assert!(
+        events.iter().any(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == victim)),
+        "the image request was snapshotted: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == victim)),
+        "and restored from its blob"
+    );
+    assert!(!events.iter().any(|e| matches!(e, SchedEvent::Requeued { .. })), "never re-prefilled");
+    eprintln!(
+        "evicted image answer: {:?}",
+        frontend.tokenizer().decode(&actual).expect("decode")
+    );
+    assert_eq!(actual, expected, "an image request restored from KV-RAM must continue exactly");
+    assert_eq!(compute.live_media(), 0);
 }

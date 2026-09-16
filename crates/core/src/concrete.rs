@@ -795,9 +795,10 @@ impl ConcreteScheduler {
     /// A claim reaching the prompt's very end leaves nothing to prefill, and
     /// for a multimodal request the prefill is the only thing that hands the
     /// leaf its `rope_delta`: a claimant is cloned from a publisher's mutable
-    /// state and pages, or from a checkpoint's image, and none of them carries
-    /// it (`step.cu` sets `seq->rope_delta` from the span options). Without one
-    /// tail token its every decode round would rotate at `position + 0`. A
+    /// state and pages, or from a checkpoint's image, and what they carry is
+    /// the publisher's delta (GitHub #194) — its whole prompt's, not the
+    /// claimed head's (`step.cu` sets `seq->rope_delta` from the span options).
+    /// Without one tail token its decode rounds would rotate at that delta. A
     /// checkpoint is held to it too: its own capture leaves a tail, but a
     /// *claimant's* prompt can end exactly at another request's opener.
     fn reuse_keys(&self, i: usize) -> PromptKeys {
@@ -1679,13 +1680,6 @@ impl ConcreteScheduler {
         lane: Option<LaneId>,
         events: &mut Vec<SchedEvent>,
     ) -> bool {
-        // GitHub #178: a sequence the blob cannot describe (a multimodal
-        // one, whose `rope_delta` it does not record yet) is released and
-        // re-prefilled instead.
-        if !self.requests[v_idx].can_snapshot() {
-            self.release_and_requeue(v_idx, resume_phase, lane, events);
-            return true;
-        }
         let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn, v_prefix) = {
             let v = &self.requests[v_idx];
             (
@@ -1810,44 +1804,6 @@ impl ConcreteScheduler {
             snapshot_micros,
         });
         true
-    }
-
-    /// The eviction of a victim that cannot be snapshotted (GitHub #178, a
-    /// multimodal request): its device state is released outright and it
-    /// goes back to `Admitted`, to re-prefill from the start -- the same end
-    /// a snapshot discarded by the host tier comes to, without the tier.
-    fn release_and_requeue(
-        &mut self,
-        v_idx: usize,
-        resume_phase: ResumePhase,
-        lane: Option<LaneId>,
-        events: &mut Vec<SchedEvent>,
-    ) {
-        let v_id = self.requests[v_idx].id;
-        self.compute.release(v_id);
-        match resume_phase {
-            ResumePhase::Running => {
-                self.requests[v_idx].evict();
-            }
-            ResumePhase::Prefilling => {
-                self.requests[v_idx].evict_prefilling();
-            }
-        }
-        if let Some(lane) = lane {
-            self.free_lanes.push(lane);
-        }
-        self.unmaterialize(v_idx);
-        if self.protection.as_ref().map(|p| p.head_request_id) == Some(v_id) {
-            self.protection = None;
-        }
-        // 0 microseconds because no snapshot was taken at all: the
-        // `Requeued` this same call emits next is what tells the two
-        // eviction shapes apart.
-        events.push(SchedEvent::Evicted {
-            request: v_id,
-            snapshot_micros: 0,
-        });
-        self.requeue_request(v_idx, events);
     }
 
     /// Evict the single lowest-value eligible victim (core-06, GitHub

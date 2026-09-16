@@ -127,6 +127,7 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
                   std::uint32_t seed) {
   set_frontier(seq, tokens);
   seq.pending_token = static_cast<std::int32_t>(1000 + seed);
+  seq.rope_delta    = -static_cast<std::int32_t>(seed % 251) - 1;
 
   std::uint32_t salt = seed;
   const std::uint32_t written = ninfer::pages_for_tokens(static_cast<std::uint32_t>(tokens));
@@ -371,6 +372,11 @@ void check_a_claimant_receives_the_mutable_state() {
   expect(claimant->position == kPrefix, "clone: a claimant stands where the prefix ends");
   expect(claimant->pending_token == publisher->pending_token,
          "clone: a claimant carries the pending token the prefix ended on");
+  // GitHub #194: the rope delta is a progress scalar like the pending token,
+  // so a clone carries it as a snapshot does; a claimant's own prefill span
+  // then sets its prompt's.
+  expect(claimant->rope_delta == publisher->rope_delta && claimant->rope_delta != 0,
+         "clone: a claimant carries the publisher's rope delta");
   expect(ignis_seq_at_chunk_boundary(*claimant),
          "clone: every layer's frontier is the prefix's end");
 

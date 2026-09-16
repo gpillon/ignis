@@ -1515,6 +1515,31 @@ fn a_cancelled_request_releases_its_live_media() {
 }
 
 #[test]
+fn an_evicted_request_releases_its_live_media_and_re_encodes_it_after_restore() {
+    // GitHub #194: a request evicted mid-item keeps no vision state while it
+    // sits in KV-RAM — the embedding would hold the load's one media
+    // reservation for a request that is not running. Its restored
+    // continuation encodes the item again (the encode is a pure function of
+    // the item) and carries on at the same columns.
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
+    assert_eq!(compute.live_media(), 1);
+
+    compute.evict(1).unwrap();
+    assert_eq!(compute.live_media(), 0, "an evicted request holds no embedding");
+    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+
+    compute.restore(1, 64).unwrap();
+    compute.prefill_step(&[multimodal_job(1, &prompt, 18, 22)]).unwrap();
+    assert_eq!(compute.live_media(), 0);
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.media_encoded, [10, 10], "the continuation encodes the item again");
+    assert_eq!(calls.media_released, [1, 2]);
+    assert_eq!(calls.multimodal_spans[1].media, Some((2, 8, (0..12).collect())));
+}
+
+#[test]
 fn a_failed_multimodal_chunk_releases_the_media_it_encoded() {
     let (leaf, compute) = stub_compute(StubLeaf::failing_prefill(-3));
     let prompt = multimodal(40, vec![image(10, 20)]);

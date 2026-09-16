@@ -191,3 +191,26 @@ and is not a fifth entry point.
   sequence and publishing there (`ignis_seq_prefix_publish`); the kernel test
   pins that the returned prefix, and a claimant of it, are byte-identical to
   the original's.
+
+## Amendment (2026-09-16) — the multimodal rope delta (#194)
+
+- **A sequence's `rope_delta` is a progress scalar**, in the progress
+  section's former reserved word, so snapshot, restore and clone carry it
+  with the pending token. It re-earns the snapshot-point permission at the
+  same completed chunk boundary: a prefill span assigns it after its chunks
+  have run and synchronized, and every span of a multimodal prompt assigns
+  the same prompt-wide value, so a sequence evicted between chunks already
+  holds it. Format version 3; a version-2 blob is refused by version, since
+  its reserved word would restore every multimodal sequence at delta 0.
+- **A text span resets it to 0.** A clone now hands a claimant its
+  publisher's delta, and a text request may claim a multimodal publisher's
+  text-only head; its own prefill span is what says it rotates at
+  `position`. Every span of a multimodal prompt carries positions, so this
+  never clears a multimodal sequence's delta.
+- **A clone's delta is the publisher's prompt's, not the prefix's.** A
+  prefix ending before the publisher's images has no delta of its own, so a
+  multimodal claimant still gets its delta from its own tail span (ADR 0029's
+  one-token tail rule, #201).
+- **Vision state is not a section.** A request evicted part-way through a
+  media item releases the item's embedding with its sequence; the chunk that
+  continues it after restore encodes the item again.

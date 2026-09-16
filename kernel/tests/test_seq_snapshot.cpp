@@ -136,6 +136,9 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
                   std::uint32_t seed) {
   set_frontier(seq, tokens);
   seq.pending_token = static_cast<std::int32_t>(1000 + seed);
+  // GitHub #194: a multimodal prompt's rope delta, never 0 here, so every
+  // blob below carries one and a restore that dropped it would show.
+  seq.rope_delta = -static_cast<std::int32_t>(seed % 251) - 1;
 
   std::uint32_t salt = seed;
   for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
@@ -319,6 +322,8 @@ void check_section_table() {
   expect(progress.position == 100, "table: the progress section carries the frontier");
   expect(progress.pending_token == seq->pending_token,
         "table: the progress section carries the pending token");
+  expect(progress.rope_delta == seq->rope_delta && progress.rope_delta != 0,
+        "table: the progress section carries the multimodal rope delta");
   expect(progress.gqa_positions[0] == 100,
         "table: the progress section carries every GQA frontier");
   expect(progress.gdn_positions[kIgnisGdnLayerCount - 1] == 100,
@@ -354,6 +359,7 @@ void check_round_trip(const ignis_seq_pool_spec &spec, std::uint32_t context_tok
   give_history(*pool, *source, history_tokens, 0xA5u);
   const std::vector<unsigned char> blob = snapshot_of(*pool, *source, "round trip: snapshot");
   const std::int32_t pending            = source->pending_token;
+  const std::int32_t rope_delta         = source->rope_delta;
 
   // Release the source: its slot and pages go back to the pool, and the
   // next allocation gets them zeroed. Nothing of the sequence survives on
@@ -362,13 +368,15 @@ void check_round_trip(const ignis_seq_pool_spec &spec, std::uint32_t context_tok
 
   ignis_seq *target = nullptr;
   expect_rc(ignis_seq_alloc(pool, context_tokens, &target), 0, "round trip: alloc target");
-  expect(target->position == 0 && target->pending_token == -1,
+  expect(target->position == 0 && target->pending_token == -1 && target->rope_delta == 0,
         "round trip: a fresh sequence starts at zero");
 
   expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size()), 0,
            "round trip: restore");
   expect(target->position == history_tokens, "round trip: the frontier is restored");
   expect(target->pending_token == pending, "round trip: the pending token is restored");
+  expect(rope_delta != 0 && target->rope_delta == rope_delta,
+        "round trip: the multimodal rope delta is restored");
   for (std::uint32_t frontier : target->gqa_positions) {
     expect(static_cast<std::uint64_t>(frontier) == history_tokens,
           "round trip: every GQA frontier is restored");
@@ -428,6 +436,22 @@ void check_refusals() {
     header.format_version += 1;
     reseal(stale, header);
     expect_refused(pool, target, stale, stale.size(), "refusals: a stale format version");
+  }
+
+  // GitHub #194: a blob written before the progress section carried the
+  // rope delta (version 2) would restore a multimodal sequence at wrong
+  // positions, so it is refused -- by a message naming both versions.
+  {
+    std::vector<unsigned char> pre_vision = blob;
+    ignis_seq_snapshot_header header      = header_of(pre_vision);
+    header.format_version                 = 2;
+    reseal(pre_vision, header);
+    expect_refused(pool, target, pre_vision, pre_vision.size(),
+                   "refusals: a pre-rope-delta (version 2) blob");
+    const std::string message = ignis_seq_last_error();
+    expect(message.find("format version 2") != std::string::npos &&
+               message.find("accepts 3") != std::string::npos,
+           "refusals: a pre-rope-delta blob's refusal names both versions");
   }
 
   // A buffer that is not a snapshot at all.

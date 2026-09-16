@@ -1153,6 +1153,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         }
         drop(sequences);
         self.release_sequence(live.handle);
+        // GitHub #194: vision state is not part of the blob. An item evicted
+        // part-way gives its embedding back — the load reserves room for
+        // one — and the chunk that continues it after restore encodes it
+        // again.
+        let media = self.media.lock().unwrap().remove(&request);
+        if let Some(media) = media {
+            self.release_media_handle(media.handle);
+        }
         self.evicted.lock().unwrap().insert(
             request,
             EvictedSequence {

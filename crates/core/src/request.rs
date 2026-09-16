@@ -601,14 +601,6 @@ impl Request {
     pub fn prompt_tokens(&self) -> &[TokenId] {
         &self.input.tokens
     }
-
-    /// Whether this request's device state can be snapshotted to the KV-RAM
-    /// tier (GitHub #178): a multimodal one cannot, because the snapshot blob
-    /// does not record its `rope_delta` yet — it is released and re-prefilled
-    /// instead. Lifted by GitHub #194.
-    pub fn can_snapshot(&self) -> bool {
-        self.input.multimodal.is_none()
-    }
 }
 
 /// **Basic admission** (core-03): assign free decode lanes to `Prefilling`

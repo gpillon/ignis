@@ -397,7 +397,8 @@ When output names a domain concept, use the term as defined here.
 - **Rope delta** — `max_position + 1 - prompt_length` for a multimodal prompt,
   whose three-axis positions advance more slowly than its tokens. Every decode
   round after such a prompt rotates at `position + rope_delta`; the position
-  itself stays the KV index and the sampler's key.
+  itself stays the KV index and the sampler's key. Part of a sequence's
+  progress, so a snapshot blob carries it.
 
 ## Observability
 
