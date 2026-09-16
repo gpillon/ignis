@@ -249,6 +249,36 @@ impl Request {
         self.publish_tokens
     }
 
+    /// The **retained-prefix boundary** (GitHub #188, ADR 0029): the end of
+    /// this prompt's first system-and-tools block floored to whole KV pages,
+    /// or 0 for a request that publishes no retained prefix.
+    ///
+    /// 0 has one meaning with three ways in, and each is a real case:
+    ///
+    /// - **the frontend reported none** — a render that does not open with a
+    ///   system block, or one whose boundary does not tokenize to an exact
+    ///   token prefix (three of the seven reference-recorded renders carry
+    ///   neither a system message nor tools);
+    /// - **the block is under one page** — a shared prefix is whole KV pages,
+    ///   so there is nothing to publish there. The request falls back to
+    ///   #186's opener page and takes its prompt checkpoint as before;
+    /// - **a multimodal prompt** — its identity is not token ids alone until
+    ///   #193, so it shares nothing (GitHub #178).
+    ///
+    /// Unlike [`Request::publish_point`] this is a property of the *prompt*,
+    /// not of what the request is currently holding, so it stays answerable
+    /// after a claim. That is what lets the registration site ask "is the head
+    /// I just published the retained one?" instead of re-deriving a condition
+    /// that could disagree with the one the chunk was cut at.
+    pub fn retained_prefix_point(&self, page_tokens: u32) -> u32 {
+        if page_tokens == 0 || !self.may_share_prefix() {
+            return 0;
+        }
+        self.input
+            .system_block_tokens
+            .map_or(0, |block| (block / page_tokens) * page_tokens)
+    }
+
     /// The **capture point** (GitHub #186, ADR 0029): the prefill position at
     /// which this request's state is captured as a prompt checkpoint, or 0 for
     /// a request that captures none.
@@ -537,6 +567,7 @@ mod tests {
                 params: DecodeParams::default(),
                 multimodal: None,
                 opener_tokens: None,
+                system_block_tokens: None,
             },
             AdmissionResources::default(),
             4,

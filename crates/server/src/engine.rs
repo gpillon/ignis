@@ -513,6 +513,7 @@ mod tests {
         RequestInput {
             multimodal: None,
             opener_tokens: None,
+            system_block_tokens: None,
             model: model.into(),
             tokens,
             params: DecodeParams {

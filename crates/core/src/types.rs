@@ -74,6 +74,24 @@ pub struct RequestInput {
     /// whoever rendered it and not recoverable from token ids. #188 adds the
     /// end of the system-and-tools block beside it for the same reason.
     pub opener_tokens: Option<u32>,
+    /// The **system block boundary** (GitHub #188, ADR 0029): how many leading
+    /// prompt tokens end the rendered prompt's first
+    /// `<|im_start|>system … <|im_end|>\n` — the reasoning instructions, the
+    /// tools and the system message, which the template renders as one block.
+    ///
+    /// The mirror of [`Self::opener_tokens`], and the point a **retained
+    /// prefix** is published at. The opener is the last position a
+    /// conversation's own later turns share; this is the first position two
+    /// *unrelated* requests share, which is all a burst of subagents has: no
+    /// subagent's prompt extends its sibling's, so no prompt checkpoint can
+    /// ever match between them.
+    ///
+    /// `None` when the frontend could not report one — a render that does not
+    /// open with a system block, or a boundary whose byte offset does not
+    /// tokenize to an exact token prefix of the prompt. Then nothing is
+    /// published there, rather than a prefix published at a point the
+    /// tokenizer disagrees about.
+    pub system_block_tokens: Option<u32>,
 }
 
 /// Sampling / decoding parameters for a request.
@@ -390,11 +408,18 @@ pub enum SchedEvent {
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.
     Requeued { request: RequestId },
-    /// A request's prefill reused a cached sibling prefix (core-07): the
-    /// `tokens` leading prompt tokens were skipped — the shared KV prefix
-    /// is already warm, so no redundant prefill. Telemetry accumulates
-    /// these into the `sibling_prefix_reused_tok` counter (design §5,
-    /// `server-02`).
+    /// A request's prefill reused a cached prefix (core-07): the `tokens`
+    /// leading prompt tokens were skipped — the shared KV prefix is already
+    /// warm, so no redundant prefill. Telemetry accumulates these into the
+    /// `sibling_prefix_reused_tok` counter (design §5, `server-02`).
+    ///
+    /// Since GitHub #188 the entry may be a **retained prefix**, whose
+    /// publisher has already finished, rather than a live sibling's, and this
+    /// event does not distinguish them: the claim is the same act on the same
+    /// object, so it is deliberately the same event. What that costs is that
+    /// `ignis_prefix_reused_tokens_total` now sums both kinds — a declared
+    /// departure, resolved by #190's per-tier counters. See
+    /// `ignis_server::telemetry`'s `on_prefix_reused`.
     PrefixReused { request: RequestId, tokens: u32 },
     /// A request's prefill resumed from **retained state** left by an earlier,
     /// already-finished request (GitHub #186, ADR 0029): the `tokens` leading

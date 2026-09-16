@@ -321,6 +321,22 @@ pub struct RenderedPrompt {
     /// — in which case no checkpoint is taken at all, rather than one taken
     /// at a point the tokenizer disagrees about.
     pub opener_tokens: Option<u32>,
+    /// How many leading tokens end the rendered prompt's **first system
+    /// block** — reasoning instructions, tools and the system message, which
+    /// this template renders into one `<|im_start|>system … <|im_end|>\n`
+    /// (GitHub #188, ADR 0029).
+    ///
+    /// The mirror of [`Self::opener_tokens`]: the opener is the last point a
+    /// conversation's own later turns share, this is the first point two
+    /// *unrelated* requests share, and it is what a burst of subagents
+    /// publishes a **retained prefix** at.
+    ///
+    /// `None`, and no prefix is retained, when the render does not open with a
+    /// system block, or when the block's byte offset does not tokenize to an
+    /// exact token prefix of the whole prompt — a boundary the tokenizer
+    /// disagrees about would hand a later request KV pages for history it does
+    /// not have.
+    pub system_block_tokens: Option<u32>,
 }
 
 impl From<Vec<TokenId>> for RenderedPrompt {
@@ -331,6 +347,7 @@ impl From<Vec<TokenId>> for RenderedPrompt {
         Self {
             tokens,
             opener_tokens: None,
+            system_block_tokens: None,
         }
     }
 }
