@@ -48,7 +48,8 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &weight, ninfer::DType dtype,
 
 int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       uint32_t layer, void *in_residual, void *out_residual,
-                      uint32_t gqa_layer, uint64_t num_tokens, LinearPolicyMode mode) {
+                      uint32_t gqa_layer, uint64_t num_tokens, LinearPolicyMode mode,
+                      const void *rope_positions) {
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
@@ -99,6 +100,17 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // The future full prefill/decode step supplies the same offset to every
     // GQA layer for a token, so positions advance per token, never per layer.
     ninfer::ops::fill_i32_positions(positions, start_position, stream);
+    // GitHub #178: what the span rotates at -- a multimodal chunk's three
+    // axes, a multimodal sequence's positions shifted by its rope delta, or
+    // (every text sequence) the cache positions above, as before.
+    ninfer::Tensor rotation_positions = positions;
+    if (rope_positions != nullptr) {
+      rotation_positions = ninfer::Tensor(const_cast<void *>(rope_positions), ninfer::DType::I32,
+                                          {tokens, 3, 1, 1});
+    } else if (seq->rope_delta != 0) {
+      rotation_positions = model->scratch->alloc(ninfer::DType::I32, {tokens, 1, 1, 1});
+      ninfer::ops::fill_i32_positions(rotation_positions, start_position + seq->rope_delta, stream);
+    }
     const ninfer::Tensor q_norm =
         weight_tensor(weights.query_norm, ninfer::DType::BF16, {kHeadDim, 1, 1, 1});
     const ninfer::Tensor k_norm =
@@ -110,7 +122,8 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, tokens, 1});
     ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, tokens, 1});
     ninfer::ops::qk_norm_rope(query_heads, key_heads, q_norm, k_norm, model->rms_norm_eps,
-                              positions, rope, rotated_query_heads, rotated_key_heads, stream);
+                              rotation_positions, rope, rotated_query_heads, rotated_key_heads,
+                              stream);
 
     // P2-04 (GitHub #86): the fused append-and-attend entry point (A1)
     // replaces the two-pass A2 (gqa_kv_append) + A3 (gqa_attention_cached)
@@ -273,6 +286,7 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 // the `lane_tokens == 1` case with the dense (empty) mask, unchanged.
 int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, std::int32_t lane_tokens, const void *positions_ptr,
+                            const void *rope_positions_ptr,
                             const void *valid_columns_ptr, void *in_residual, void *out_residual,
                             uint32_t gqa_layer, LinearPolicyMode mode, const char *op) {
   constexpr std::int32_t kHeadDim = 256;
@@ -337,6 +351,11 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                    {columns, 1, 1, 1});
     const ninfer::Tensor positions_rows(const_cast<void *>(positions_ptr), ninfer::DType::I32,
                                         {lane_tokens, batch, 1, 1});
+    // GitHub #178: what the columns rotate at, staged at its own stable
+    // address on a vision load (`position + rope_delta`); the positions
+    // above otherwise.
+    const ninfer::Tensor rotation_positions(const_cast<void *>(rope_positions_ptr),
+                                            ninfer::DType::I32, {columns, 1, 1, 1});
     // The masked form (P5-04): each lane's valid prefix, or the dense form
     // (an empty tensor) for the decode round.
     const ninfer::Tensor valid_columns =
@@ -362,7 +381,8 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     ninfer::Tensor rotated_query_tokens = rotated_query.view({kHeadDim, kQHeads, columns, 1});
     ninfer::Tensor rotated_key_tokens = rotated_key.view({kHeadDim, kKvHeads, columns, 1});
     ninfer::ops::qk_norm_rope(query_tokens, key_tokens, q_norm, k_norm, model->rms_norm_eps,
-                              positions, rope, rotated_query_tokens, rotated_key_tokens, stream);
+                              rotation_positions, rope, rotated_query_tokens, rotated_key_tokens,
+                              stream);
     ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, lane_tokens, batch});
     ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, lane_tokens, batch});
 
@@ -454,7 +474,11 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                             uint32_t width, void *in_residual, void *out_residual,
                             uint32_t gqa_layer, LinearPolicyMode mode) {
   return run_gqa_layer_batch(model, pool, layer, width, /*lane_tokens=*/1,
-                             model->sampling_decode_positions->p, /*valid_columns_ptr=*/nullptr,
+                             model->sampling_decode_positions->p,
+                             model->decode_rope_positions != nullptr
+                                 ? model->decode_rope_positions->p
+                                 : model->sampling_decode_positions->p,
+                             /*valid_columns_ptr=*/nullptr,
                              in_residual, out_residual, gqa_layer, mode, "ignis_gqa_layer_graph");
 }
 
@@ -488,7 +512,8 @@ bool gqa_format_matches_load(ignis_model *model, ignis_seq_pool *pool, const cha
 // body is dispatched under the policy `ignis_policy_for` resolves for it.
 int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                  uint32_t layer, const void *in_residual, void *out_residual,
-                                 uint64_t num_tokens, LinearPolicyMode mode) {
+                                 uint64_t num_tokens, LinearPolicyMode mode,
+                                 const void *rope_positions) {
   // Errors here are prefixed `ignis_gqa_layer` (not `..._step`): this body
   // is now dispatched both by `ignis_gqa_layer_step` and directly by a
   // chunk loop (kernel/src/step.cu), so a message naming the ABI wrapper
@@ -521,7 +546,7 @@ int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
     return -1;
   }
   return run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual), out_residual,
-                       gqa_layer, num_tokens, mode);
+                       gqa_layer, num_tokens, mode, rope_positions);
 }
 
 // P2-03 (GitHub #85): `ignis_gqa_layer_step`'s synchronous contract (body +
@@ -621,7 +646,7 @@ int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
   const IgnisVerifyRound &verify = *model->verify;
   return run_gqa_layer_batch(model, pool, layer, width, static_cast<std::int32_t>(verify.window + 1),
-                             verify.positions->p, verify.valid_columns->p,
+                             verify.positions->p, verify.positions->p, verify.valid_columns->p,
                              const_cast<void *>(in_residual), out_residual, gqa_layer, mode,
                              "ignis_gqa_layer_verify");
 }

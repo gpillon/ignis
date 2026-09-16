@@ -134,11 +134,72 @@ enum ignis_prefill_compute_policy {
  * production defaults (chunked route, engine default policy). A future
  * phase (G3 sampling, G4 snapshot controls) appends fields and bumps a new
  * recognized size -- it never adds a parameter or a `_ex` entry point. */
+struct ignis_media_embedding;
+
 struct ignis_prefill_options {
   uint32_t size;           /* sizeof(struct ignis_prefill_options) */
   int32_t route;           /* enum ignis_prefill_route */
   int32_t compute_policy;  /* enum ignis_prefill_compute_policy */
+  /* GitHub #178: a span of a multimodal prompt (fields appended and the size
+   * bumped -- one recognized size, ADR 0016: no compatibility wrapper is
+   * kept). NULL `mrope_positions` is a text span, whose media fields must be
+   * empty. Non-NULL -- a load with vision, the
+   * chunked route -- it is the span's axis-major [3, num_tokens] positions,
+   * which its GQA layers rotate at (MRoPE: pair i on axis i mod 3), and
+   * `rope_delta` becomes the sequence's: every later decode round rotates at
+   * `position + rope_delta`, while the position stays the KV index and the
+   * sampler's key. `media` (or NULL) is an embedding from ignis_media_encode:
+   * its columns `media_first_column ..` replace the embedded rows at the
+   * `media_column_count` span-relative, strictly increasing
+   * `media_scatter_indices`. */
+  const int32_t *mrope_positions;
+  int32_t rope_delta;
+  uint32_t media_column_count;
+  const struct ignis_media_embedding *media;
+  const int32_t *media_scatter_indices;
+  uint32_t media_first_column;
 };
+
+/* The media encode step (GitHub #178): one media item's BF16 patch rows plus
+ * its grid and host-computed encoder control, in; an opaque, leaf-owned,
+ * device-resident embedding of `[hidden, patches / 4]` merged columns, out --
+ * the 27-block vision encoder and 2x2 merger, run once per item. Host inputs
+ * only, like token ids: every array is caller-owned and read during the call.
+ *
+ * `patches` is row-major `[t*h*w][3*2*16*16]` BF16 bits in 2x2 merge-block
+ * order; `position_ids` `[2*P]` (every patch's row, then every patch's
+ * column); `cu_seqlens` `[t+1]` segment bounds; `position_table_indices` /
+ * `_weights` `[4*P]`, four bilinear corners per patch. `h` and `w` are even.
+ *
+ * The load's vision reservation holds one embedding at a time: an encode
+ * while one is live is refused (release it first), and so is an item wider
+ * than the load's envelope. Returns 0 and the handle, or -1 (see
+ * ignis_media_last_error) on a load without vision or any invalid input. */
+struct ignis_media_encode_input {
+  uint32_t size; /* sizeof(struct ignis_media_encode_input) */
+  uint32_t grid_t;
+  uint32_t grid_h;
+  uint32_t grid_w;
+  const uint16_t *patches;
+  const int32_t *position_ids;
+  const int32_t *cu_seqlens;
+  const int32_t *position_table_indices;
+  const float *position_table_weights;
+};
+
+int32_t ignis_media_encode(struct ignis_model *model, const struct ignis_media_encode_input *input,
+                           struct ignis_media_embedding **out_embedding);
+
+/* The embedding's merged columns. 0 for NULL. */
+uint32_t ignis_media_embedding_columns(const struct ignis_media_embedding *embedding);
+
+/* Release an embedding, freeing the load's reservation for the next item.
+ * NULL is a no-op; the model must still be live. */
+void ignis_media_embedding_release(struct ignis_media_embedding *embedding);
+
+/* The message from the most recent failing ignis_media_encode on this thread.
+ * Never NULL. */
+const char *ignis_media_last_error(void);
 
 /* Prefill a token span for one sequence starting at `start_position`
  * (unread while `skip_layers` is set -- no RoPE/KV runs in the degenerate

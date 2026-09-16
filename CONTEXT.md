@@ -301,6 +301,12 @@ When output names a domain concept, use the term as defined here.
   a sequence never stands past the text it emitted. It crosses the compute
   seam whole (`DecodeOutcome`, P5-06), and the server streams it one token at
   a time; today's round is a run of one.
+- **Prefill outcome** — what one prefill chunk cost beyond warming its KV
+  (`PrefillOutcome`, GitHub #192): today the microseconds the leaf spent
+  encoding a media item, which is 0 on a text chunk and on one that reuses
+  an embedding an earlier chunk of the same item encoded. One per job, in
+  order, the way a committed run crosses the seam per lane; the request log
+  sums them into `media.encode_seconds`.
 - **ReplaySSM record and fold** — how the GDN layers speculate without
   advancing: the verify traversal records each column's conv input, key,
   value and gates (the **records**), and after accept the **fold** replays
@@ -316,6 +322,23 @@ When output names a domain concept, use the term as defined here.
   drafter (draft window 1..7 chosen at load, verification width chosen per
   round). Deferred behind **DFlash2** at G5.
 - **Vision** — multimodal (image/video) input.
+- **Media item** — one image in a prompt: its patch grid, the run of
+  placeholder tokens it expands to, its BF16 patch rows and the digest of the
+  bytes it came from. The unit the processor prepares, the encoder encodes and
+  a prefill chunk carries at most one of.
+- **Vision tokens** — a media item's *merged* tokens, one per 2x2 block of
+  patches: the placeholder run's length, and what the per-request envelope
+  (`--vision-max-tokens`) is counted in.
+- **Media embedding** — a media item's encoder output, `[hidden, vision
+  tokens]`, device-resident and leaf-owned. Live from its encode until the
+  item's last placeholder is prefilled; the load reserves room for one.
+- **Vision encoder** — the 27-block tower plus the 2x2 merger that turns patch
+  rows into a media embedding. Run once per item by the **media encode** step,
+  never per chunk.
+- **Rope delta** — `max_position + 1 - prompt_length` for a multimodal prompt,
+  whose three-axis positions advance more slowly than its tokens. Every decode
+  round after such a prompt rotates at `position + rope_delta`; the position
+  itself stays the KV index and the sampler's key.
 
 ## Observability
 

@@ -36,8 +36,8 @@ use tower::ServiceExt;
 
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_bench::canary::{CANARIES, evaluate};
-use ignis_core::KvFormat;
 use ignis_core::gpu_profile;
+use ignis_core::{KvFormat, Vision};
 use ignis_server::Server;
 use ignis_server::engine::Engine;
 use ignis_server::runtime::{EngineShape, cuda_scheduler};
@@ -76,7 +76,7 @@ impl Drop for Harness {
     }
 }
 
-fn harness() -> Option<Harness> {
+fn harness(vision: Option<Vision>) -> Option<Harness> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -90,12 +90,13 @@ fn harness() -> Option<Harness> {
     let shape = EngineShape {
         kv_format: KvFormat::HqE8_2b,
         kv_pool_bytes: KV_POOL_BYTES,
+        vision,
         ..EngineShape::default()
     };
     let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
         Ok(scheduler) => scheduler,
         Err(e) => {
-            if gpu_profile::skip_or_fail(&format!("cuda_scheduler (hq-e8-2b): {e}")) {
+            if gpu_profile::skip_or_fail(&format!("cuda_scheduler (hq-e8-2b, vision {vision:?}): {e}")) {
                 return None;
             }
             unreachable!("skip_or_fail panics under the profile");
@@ -145,8 +146,21 @@ async fn complete(app: &axum::Router, prompt: &str) -> String {
 #[tokio::test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn the_canary_suite_is_sane_and_deterministic_under_hq_kv() {
-    let Some(h) = harness() else { return };
+    let Some(h) = harness(None) else { return };
+    assert_canaries_sane(&h, "under hq-e8-2b KV").await;
+}
 
+/// GitHub #177: with the vision tower loaded and its workspace reserved, the
+/// text canaries still answer sanely and deterministically -- a `--vision`
+/// load must not disturb text serving.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn the_canary_suite_stays_sane_with_vision_loaded() {
+    let Some(h) = harness(Some(Vision::default())) else { return };
+    assert_canaries_sane(&h, "under hq-e8-2b KV with --vision loaded").await;
+}
+
+async fn assert_canaries_sane(h: &Harness, context: &str) {
     let mut failures = Vec::new();
     for canary in CANARIES {
         let first = complete(h.app(), canary.prompt).await;
@@ -174,7 +188,7 @@ async fn the_canary_suite_is_sane_and_deterministic_under_hq_kv() {
     }
     assert!(
         failures.is_empty(),
-        "the canary suite must stay coherent and deterministic under hq-e8-2b KV \
+        "the canary suite must stay coherent and deterministic {context} \
          (a sanity floor, not an agreement score — ADR 0022): {}",
         failures.join("; ")
     );

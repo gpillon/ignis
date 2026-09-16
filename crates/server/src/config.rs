@@ -43,6 +43,7 @@ pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUN
 
 pub use ignis_core::KvFormat;
 pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
 
 /// The fully-resolved config `main` needs to start the server — one field
 /// per env var, each independently resolved as flag → env → default.
@@ -80,6 +81,12 @@ pub struct Config {
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
     /// GitHub #150). `None` loads nothing of the drafter.
     pub speculation: Option<Speculation>,
+    /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
+    /// `None` binds and reserves nothing of the vision tower.
+    pub vision: Option<Vision>,
+    /// Media acquisition (`--media-allow-private-network`,
+    /// `--media-cache-mib`, GitHub #179). Only nameable with vision on.
+    pub media: MediaOptions,
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
@@ -101,6 +108,31 @@ pub struct Config {
 }
 
 pub use crate::expose::Expose;
+
+/// `--media-cache-mib`'s default (the reference's 1 GiB).
+pub const DEFAULT_MEDIA_CACHE_MIB: u32 = 1024;
+
+/// The largest `--media-cache-mib` accepted: a ceiling against a
+/// fat-fingered value (64 GiB of host memory for prepared patches).
+pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
+
+/// How image parts are acquired (GitHub #179).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaOptions {
+    /// Fetch image URLs that resolve to private, loopback, link-local,
+    /// multicast or CGNAT addresses. Off by default, so an `--expose`d
+    /// server cannot be used to probe the operator's LAN.
+    pub allow_private_network: bool,
+    /// Host memory for prepared image patches kept for reuse, in bytes
+    /// (0 retains nothing).
+    pub cache_bytes: u64,
+}
+
+impl Default for MediaOptions {
+    fn default() -> Self {
+        Self { allow_private_network: false, cache_bytes: (DEFAULT_MEDIA_CACHE_MIB as u64) << 20 }
+    }
+}
 
 /// What `--api-key` asked for: a key the operator chose, or `auto` — one
 /// `main` generates at start and prints, the only time a key is printed.
@@ -207,6 +239,10 @@ pub fn resolve(
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
+    let mut vision = false;
+    let mut vision_max_tokens = None;
+    let mut media_allow_private_network = false;
+    let mut media_cache_mib = None;
     let mut ui = false;
     let mut metrics_on = false;
     let mut metrics_bind = None;
@@ -230,6 +266,10 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--vision" => vision = true,
+            "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
+            "--media-allow-private-network" => media_allow_private_network = true,
+            "--media-cache-mib" => media_cache_mib = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = true,
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
@@ -274,6 +314,17 @@ pub fn resolve(
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
+    let vision = resolve_vision(vision, vision_max_tokens, &env)?;
+    // GitHub #178: DFlash2's drafter does not follow a multimodal prompt yet,
+    // so the two load options are refused together here, before any load
+    // work, as the reference refuses `--spec dflash` with `--vision`.
+    if vision.is_some() && speculation.is_some_and(|s| s.backend() == SpeculativeBackend::Dflash2) {
+        return Err(ConfigError(
+            "`--vision` cannot be combined with `--spec dflash2` yet (speculative decoding does not follow image prompts)"
+                .to_owned(),
+        ));
+    }
+    let media = resolve_media(vision.is_some(), media_allow_private_network, media_cache_mib, &env)?;
     // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
     // address without turning metrics on is refused rather than ignored, and
     // it can never share the API's.
@@ -317,12 +368,120 @@ pub fn resolve(
         kv_pool_bytes,
         host_pool_bytes,
         speculation,
+        vision,
+        media,
         request_timeout_secs,
         ui,
         metrics,
         api_key,
         expose,
     }))
+}
+
+/// `--vision` / `IGNIS_VISION` and `--vision-max-tokens` /
+/// `IGNIS_VISION_MAX_TOKENS` (GitHub #177). Vision is off unless asked for;
+/// an envelope with vision off has nothing to size, so naming one alone is
+/// refused rather than ignored. With vision on, the envelope defaults to
+/// [`DEFAULT_VISION_MAX_TOKENS`].
+fn resolve_vision(
+    flag: bool,
+    max_tokens: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Vision>, ConfigError> {
+    let on = if flag {
+        true
+    } else {
+        match non_empty(env("IGNIS_VISION")) {
+            None => false,
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "`IGNIS_VISION` must be true or false, got `{raw}`"
+                    )));
+                }
+            },
+        }
+    };
+    let max_tokens = max_tokens.or_else(|| non_empty(env("IGNIS_VISION_MAX_TOKENS")));
+    if !on {
+        return match max_tokens {
+            Some(raw) => Err(ConfigError(format!(
+                "`--vision-max-tokens {raw}` requires `--vision` (vision is off without it)"
+            ))),
+            None => Ok(None),
+        };
+    }
+    let Some(raw) = max_tokens else {
+        return Ok(Some(Vision::default()));
+    };
+    let out_of_range = || {
+        ConfigError(format!(
+            "`--vision-max-tokens` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got `{raw}`"
+        ))
+    };
+    let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
+    Vision::new(n).map(Some).map_err(|_| out_of_range())
+}
+
+/// `--media-allow-private-network` / `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` and
+/// `--media-cache-mib` / `IGNIS_MEDIA_CACHE_MIB` (GitHub #179). Without
+/// vision there is no media to acquire, so naming either is refused rather
+/// than ignored, as `--vision-max-tokens` is.
+fn resolve_media(
+    vision: bool,
+    allow_private_network_flag: bool,
+    cache_mib: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<MediaOptions, ConfigError> {
+    let allow_private_network = if allow_private_network_flag {
+        Some(true)
+    } else {
+        match non_empty(env("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK")) {
+            None => None,
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => Some(true),
+                "0" | "false" | "off" => Some(false),
+                _ => {
+                    return Err(ConfigError(format!(
+                        "`IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` must be true or false, got `{raw}`"
+                    )));
+                }
+            },
+        }
+    };
+    let cache_mib = cache_mib.or_else(|| non_empty(env("IGNIS_MEDIA_CACHE_MIB")));
+    if !vision {
+        if allow_private_network == Some(true) {
+            return Err(ConfigError(
+                "`--media-allow-private-network` requires `--vision` (vision is off without it)".to_owned(),
+            ));
+        }
+        if let Some(raw) = cache_mib {
+            return Err(ConfigError(format!(
+                "`--media-cache-mib {raw}` requires `--vision` (vision is off without it)"
+            )));
+        }
+        return Ok(MediaOptions::default());
+    }
+    let cache_mib = match cache_mib {
+        None => DEFAULT_MEDIA_CACHE_MIB,
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&mib| mib <= MEDIA_CACHE_MIB_LIMIT)
+            .ok_or_else(|| {
+                ConfigError(format!(
+                    "`--media-cache-mib` must be in 0..={MEDIA_CACHE_MIB_LIMIT}, got `{raw}`"
+                ))
+            })?,
+    };
+    Ok(MediaOptions {
+        allow_private_network: allow_private_network.unwrap_or(false),
+        cache_bytes: (cache_mib as u64) << 20,
+    })
 }
 
 /// `--spec` / `IGNIS_SPEC` and `--draft-tokens` / `IGNIS_DRAFT_TOKENS`
@@ -552,6 +711,10 @@ fn help_text() -> String {
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
+         \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
+         \x20       --media-allow-private-network env: IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK (default: off; needs --vision; fetch image URLs on private, loopback and link-local addresses)\n\
+         \x20       --media-cache-mib <n>     env: IGNIS_MEDIA_CACHE_MIB (default: {DEFAULT_MEDIA_CACHE_MIB} with --vision; prepared images kept for reuse, 0 disables, max {MEDIA_CACHE_MIB_LIMIT})\n\
          \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
          \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics with --ui (default: off; flag only)\n\
          \x20       --metrics-bind <addr>     the metrics listener (default: {DEFAULT_METRICS_BIND}; flag only; needs --metrics; no API key, never exposed)\n\
@@ -1130,6 +1293,137 @@ mod tests {
         let config =
             expect_config(resolve(&args(&["--draft-tokens", "7"]), env).expect("resolve"));
         assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7), "flag must win over env");
+    }
+
+    // ── vision as a load option (GitHub #177) ─────────────────────────────
+
+    #[test]
+    fn vision_is_off_by_default() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.vision, None);
+    }
+
+    #[test]
+    fn the_vision_flag_loads_the_default_envelope() {
+        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        assert_eq!(config.vision, Some(Vision::default()));
+        assert_eq!(config.vision.unwrap().max_tokens(), DEFAULT_VISION_MAX_TOKENS);
+    }
+
+    #[test]
+    fn the_vision_envelope_can_be_lowered() {
+        let a = args(&["--vision", "--vision-max-tokens", "8192"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(8192));
+    }
+
+    #[test]
+    fn a_vision_envelope_without_vision_is_refused_rather_than_ignored() {
+        let err = resolve(&args(&["--vision-max-tokens", "8192"]), no_env).expect_err("no vision");
+        assert!(err.0.contains("--vision"), "{}", err.0);
+        let env = env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")]);
+        assert!(resolve(&[], env).is_err(), "the env form too");
+    }
+
+    #[test]
+    fn a_vision_envelope_outside_the_range_is_refused_naming_it() {
+        for raw in ["0", "1048577", "-1", "lots"] {
+            let a = args(&["--vision", "--vision-max-tokens", raw]);
+            let err = resolve(&a, no_env).expect_err("out of range");
+            assert!(err.0.contains("--vision-max-tokens"), "{}", err.0);
+            assert!(err.0.contains("1048576"), "{}", err.0);
+            assert!(err.0.contains(raw), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn the_vision_env_vars_apply_and_the_flags_win_over_them() {
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(4096));
+
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_VISION_MAX_TOKENS", "4096")]);
+        let a = args(&["--vision-max-tokens", "2048"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.vision.map(|v| v.max_tokens()), Some(2048), "flag must win over env");
+
+        let env = env_map(&[("IGNIS_VISION", "false")]);
+        assert_eq!(expect_config(resolve(&[], env).expect("resolve")).vision, None);
+
+        let env = env_map(&[("IGNIS_VISION", "maybe")]);
+        let err = resolve(&[], env).expect_err("bad bool");
+        assert!(err.0.contains("IGNIS_VISION") && err.0.contains("maybe"), "{}", err.0);
+    }
+
+    #[test]
+    fn help_lists_the_vision_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
+    }
+
+    #[test]
+    fn vision_with_dflash2_is_refused_naming_both() {
+        let a = args(&["--vision", "--spec", "dflash2", "--draft-tokens", "4"]);
+        let err = resolve(&a, no_env).expect_err("vision + dflash2");
+        assert!(err.0.contains("--vision") && err.0.contains("dflash2"), "{}", err.0);
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "4")]);
+        assert!(resolve(&[], env).is_err(), "the env form too");
+        // Each alone still loads.
+        assert!(resolve(&args(&["--vision"]), no_env).is_ok());
+        assert!(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).is_ok());
+    }
+
+    // ── media acquisition (GitHub #179) ──────────────────────────────────
+
+    #[test]
+    fn media_defaults_to_no_private_network_and_a_one_gib_cache() {
+        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        assert_eq!(config.media, MediaOptions { allow_private_network: false, cache_bytes: 1024 << 20 });
+        assert_eq!(expect_config(resolve(&[], no_env).expect("resolve")).media, MediaOptions::default());
+    }
+
+    #[test]
+    fn media_flags_set_the_private_network_opt_in_and_the_cache() {
+        let a = args(&["--vision", "--media-allow-private-network", "--media-cache-mib", "0"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(config.media, MediaOptions { allow_private_network: true, cache_bytes: 0 });
+
+        let env = env_map(&[
+            ("IGNIS_VISION", "true"),
+            ("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK", "true"),
+            ("IGNIS_MEDIA_CACHE_MIB", "64"),
+        ]);
+        let config = expect_config(resolve(&args(&["--media-cache-mib", "128"]), env).expect("resolve"));
+        assert_eq!(config.media, MediaOptions { allow_private_network: true, cache_bytes: 128 << 20 });
+    }
+
+    #[test]
+    fn media_flags_without_vision_are_refused_rather_than_ignored() {
+        for a in [&["--media-allow-private-network"][..], &["--media-cache-mib", "10"]] {
+            let err = resolve(&args(a), no_env).expect_err("no vision");
+            assert!(err.0.contains(a[0]) && err.0.contains("--vision"), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn a_media_cache_outside_the_range_is_refused_naming_it() {
+        for raw in ["65537", "-1", "lots"] {
+            let err = resolve(&args(&["--vision", "--media-cache-mib", raw]), no_env).expect_err("range");
+            assert!(err.0.contains("--media-cache-mib") && err.0.contains(raw), "{}", err.0);
+        }
+        let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK", "maybe")]);
+        assert!(resolve(&[], env).expect_err("bad bool").0.contains("maybe"));
+    }
+
+    #[test]
+    fn help_lists_the_media_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve") else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--media-allow-private-network") && text.contains("--media-cache-mib"), "{text}");
     }
 
     #[test]

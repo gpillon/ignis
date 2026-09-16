@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{ComputeError, DecodeParams, RequestClass, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
@@ -27,6 +27,7 @@ fn tokens(start: u32, n: u32) -> Vec<u32> {
 /// A request with the given prompt and a `max` generation cap.
 fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
     RequestInput {
+        multimodal: None,
         model: model.into(),
         tokens: prompt,
         params: DecodeParams {
@@ -289,7 +290,7 @@ struct PrefillFailsOn {
 }
 
 impl Compute for PrefillFailsOn {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let n = *self.call.lock().unwrap();
         *self.call.lock().unwrap() += 1;
         if n == self.fail_on {

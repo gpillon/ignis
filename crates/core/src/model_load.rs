@@ -22,13 +22,14 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
 use ignis_artifact::{
-    model_scope_27b, DraftModule, MaterializedArtifact, NumericFormat, ObjectHandle, Reader,
-    StorageLayout,
+    model_scope_27b_with, DraftModule, MaterializedArtifact, ModelScope, NumericFormat,
+    ObjectHandle, Reader, StorageLayout,
 };
 
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
 use crate::speculation::{SpeculativeBackend, Speculation};
+use crate::vision::Vision;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
@@ -84,10 +85,13 @@ pub(crate) mod ffi {
 
     /// 1:1 with `struct ignis_model_load_options` (ADR 0016: `size` first).
     #[repr(C)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct IgnisModelLoadOptions {
         pub size: u32,
         pub speculative_backend: i32,
         pub draft_tokens: u32,
+        /// GitHub #177: the vision envelope, 0 = no vision.
+        pub vision_max_tokens: u32,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -96,6 +100,8 @@ pub(crate) mod ffi {
     pub struct IgnisModelStats {
         pub vram_bytes: u64,
         pub bound_tensor_count: u64,
+        /// GitHub #177: the encoder workspace plus the output transient.
+        pub vision_reserved_bytes: u64,
     }
 
     unsafe extern "C" {
@@ -239,6 +245,32 @@ pub fn draft_module(speculation: Option<Speculation>) -> Option<DraftModule> {
     })
 }
 
+/// Every module a load with these options binds (GitHub #177): one mapping,
+/// shared by the server's binder call and this load, so the handles and the
+/// descriptors cannot name different scopes.
+pub fn model_scope(speculation: Option<Speculation>, vision: Option<Vision>) -> ModelScope {
+    ModelScope {
+        draft: draft_module(speculation),
+        vision: vision.is_some(),
+    }
+}
+
+/// The options struct a load crosses the ABI with: `None` (a NULL pointer,
+/// ADR 0016's production defaults) when the load selects neither speculation
+/// nor vision, so such a load is exactly what it was before either existed.
+fn load_options(
+    speculation: Option<Speculation>,
+    vision: Option<Vision>,
+) -> Option<ffi::IgnisModelLoadOptions> {
+    (speculation.is_some() || vision.is_some()).then(|| ffi::IgnisModelLoadOptions {
+        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+        // IGNIS_SPECULATIVE_NONE
+        speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
+        draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
+        vision_max_tokens: vision.map_or(0, |v| v.max_tokens()),
+    })
+}
+
 /// Read the NVFP4 blockscale layout's trailing FP32 weight divisor
 /// directly from the container (host-side, via the mapping -- the same
 /// bytes the device upload copied, ADR 0002).
@@ -275,8 +307,8 @@ fn read_input_scale_divisor(reader: &Reader, name: &str) -> Result<f32, String> 
 }
 
 /// Build the bound-tensor descriptors for every tensor
-/// [`ignis_artifact::bind_model_scope_27b`] placed on the device for `draft`,
-/// in [`model_scope_27b`] order.
+/// [`ignis_artifact::bind_model_scope_27b_with`] placed on the device for
+/// `scope`, in [`model_scope_27b_with`] order.
 ///
 /// Returns the descriptors alongside the [`CString`] names they point
 /// into: the caller must keep both alive across the `ignis_model_load`
@@ -285,12 +317,12 @@ fn build_bound_tensors(
     reader: &Reader,
     artifact: &MaterializedArtifact,
     handles: &[ObjectHandle],
-    draft: Option<DraftModule>,
+    scope: ModelScope,
 ) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
-    let entries = model_scope_27b(draft);
+    let entries = model_scope_27b_with(scope);
     if entries.len() != handles.len() {
         return Err(format!(
-            "model-scope handle count ({}) does not match the inventory ({}, drafter: {draft:?})",
+            "model-scope handle count ({}) does not match the inventory ({}, scope: {scope:?})",
             handles.len(),
             entries.len()
         ));
@@ -465,16 +497,42 @@ pub fn load_qwen38_27b_with_speculation(
     kv_format: KvFormat,
     speculation: Option<Speculation>,
 ) -> Result<Model, String> {
+    load_qwen38_27b_with_options(
+        reader,
+        artifact,
+        handles,
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        speculation,
+        None,
+    )
+}
+
+/// [`load_qwen38_27b_with_speculation`] with vision chosen at load too
+/// (GitHub #177). With `Some`, `handles` must be the handles
+/// [`ignis_artifact::bind_model_scope_27b_with`] returned for [`model_scope`]
+/// of the same options: the leaf binds every `vision/*` weight from them and
+/// reserves the encoder workspace and output transient for the envelope,
+/// reported as [`IgnisModelStats::vision_reserved_bytes`]. With neither
+/// option the options pointer crosses as NULL and the load is exactly today's.
+#[allow(clippy::too_many_arguments)]
+pub fn load_qwen38_27b_with_options(
+    reader: &Reader,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    speculation: Option<Speculation>,
+    vision: Option<Vision>,
+) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) =
-        build_bound_tensors(reader, artifact, handles, draft_module(speculation))?;
+        build_bound_tensors(reader, artifact, handles, model_scope(speculation, vision))?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
-    let options = speculation.map(|s| ffi::IgnisModelLoadOptions {
-        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
-        speculative_backend: s.backend().abi_code(),
-        draft_tokens: s.draft_tokens(),
-    });
+    let options = load_options(speculation, vision);
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -590,6 +648,45 @@ mod tests {
         assert_eq!(draft_module(None), None);
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(draft_module(Some(spec)), Some(DraftModule::Dflash2));
+    }
+
+    #[test]
+    fn the_model_scope_names_vision_only_when_the_load_asks_for_it() {
+        assert_eq!(model_scope(None, None), ModelScope::default());
+        let vision = Vision::default();
+        assert_eq!(model_scope(None, Some(vision)), ModelScope { draft: None, vision: true });
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap();
+        assert_eq!(
+            model_scope(Some(spec), Some(vision)),
+            ModelScope { draft: Some(DraftModule::Dflash2), vision: true }
+        );
+    }
+
+    #[test]
+    fn a_load_with_neither_option_crosses_a_null_options_pointer() {
+        assert_eq!(load_options(None, None), None, "today's load, byte for byte");
+    }
+
+    #[test]
+    fn a_vision_only_load_crosses_the_envelope_with_no_speculation() {
+        let options = load_options(None, Some(Vision::new(8192).unwrap())).expect("options");
+        assert_eq!(options.size as usize, std::mem::size_of::<ffi::IgnisModelLoadOptions>());
+        assert_eq!(options.speculative_backend, 0);
+        assert_eq!(options.draft_tokens, 0);
+        assert_eq!(options.vision_max_tokens, 8192);
+
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
+        let without_vision = load_options(Some(spec), None).expect("options");
+        assert_eq!(without_vision.vision_max_tokens, 0);
+        assert_eq!(without_vision.draft_tokens, 7);
+    }
+
+    #[test]
+    fn the_options_mirror_is_the_leaf_structs_size() {
+        // uint32 size, int32 backend, uint32 draft_tokens, uint32 vision_max_tokens.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 16);
+        // uint64 x 3.
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 24);
     }
 
     #[test]

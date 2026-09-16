@@ -25,6 +25,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
 #include "core/arena.h"
@@ -649,6 +650,59 @@ private:
   uint32_t span_chunk_width_ = 0;
 };
 
+// GitHub #178: one prefill span's multimodal inputs, read off its options.
+// The default value is a text span.
+struct SpanMultimodal {
+  const int32_t *positions = nullptr; // axis-major [3, span_tokens]
+  uint64_t span_tokens = 0;
+  int32_t rope_delta = 0;
+  const ignis_media_embedding *media = nullptr;
+  const int32_t *scatter = nullptr; // span-relative, strictly increasing
+  uint32_t count = 0;
+  uint32_t first_column = 0;
+};
+
+bool validate_span_multimodal(const ignis_model *model, int32_t route, const SpanMultimodal &span) {
+  const auto refuse = [](const std::string &why) {
+    set_error("ignis_program_prefill: " + why);
+    return false;
+  };
+  if (span.positions == nullptr) {
+    return (span.media == nullptr && span.count == 0) ||
+           refuse("media columns need the span's multimodal positions");
+  }
+  if (model->vision_workspace == nullptr) {
+    return refuse("a multimodal span on a model loaded without vision");
+  }
+  if (route != IGNIS_PREFILL_ROUTE_CHUNKED) {
+    return refuse("the per-token route has no multimodal form");
+  }
+  if (span.media == nullptr) {
+    return span.count == 0 || refuse("scatter indices without a media embedding");
+  }
+  if (span.media->model != model) {
+    return refuse("the media embedding was encoded by another model");
+  }
+  if (span.count == 0 || span.scatter == nullptr) {
+    return refuse("a media embedding needs at least one scatter index");
+  }
+  if (static_cast<uint64_t>(span.first_column) + span.count >
+      static_cast<uint64_t>(span.media->columns)) {
+    return refuse("columns " + std::to_string(span.first_column) + "+" +
+                  std::to_string(span.count) + " exceed the embedding's " +
+                  std::to_string(span.media->columns));
+  }
+  for (uint32_t i = 0; i < span.count; ++i) {
+    const int32_t index = span.scatter[i];
+    if (index < 0 || static_cast<uint64_t>(index) >= span.span_tokens ||
+        (i > 0 && index <= span.scatter[i - 1])) {
+      return refuse("scatter index " + std::to_string(i) + " (" + std::to_string(index) +
+                    ") is out of order or outside the span");
+    }
+  }
+  return true;
+}
+
 // P2-02 (GitHub #84): runs one prefill chunk -- embedding for the whole
 // chunk, every decoder layer's body dispatched once over the chunk's
 // `num_tokens` tokens with no per-layer synchronization, then (only when
@@ -671,7 +725,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           const int32_t *token_ids, uint64_t num_tokens, uint64_t chunk_offset,
                           uint64_t dflash2_tap_from, bool compute_output,
                           const ignis_sampling_params &sampling, int32_t *out_token_id,
-                          float *out_logits, LinearPolicyMode mode) {
+                          float *out_logits, LinearPolicyMode mode,
+                          const SpanMultimodal &multimodal) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -711,6 +766,61 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor right = model->scratch->alloc(ninfer::DType::BF16, {hidden, T, 1, 1});
     ninfer::ops::embedding(ids, model->token_embedding, left, model->stream);
 
+    // GitHub #178: a multimodal chunk rotates at its slice of the span's
+    // three axes, and its placeholder rows take the media item's columns.
+    // Both host staging vectors outlive the chunk's synchronize below.
+    const void *rope_positions = nullptr;
+    std::vector<std::int32_t> rope_positions_host;
+    std::vector<std::int32_t> scatter_host;
+    if (multimodal.positions != nullptr) {
+      rope_positions_host.resize(3 * static_cast<std::size_t>(T));
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(multimodal.positions + axis * multimodal.span_tokens + chunk_offset, T,
+                    rope_positions_host.data() + axis * static_cast<std::size_t>(T));
+      }
+      ninfer::Tensor rotation = model->scratch->alloc(ninfer::DType::I32, {T, 3, 1, 1});
+      err = cudaMemcpyAsync(rotation.data, rope_positions_host.data(),
+                            rope_positions_host.size() * sizeof(std::int32_t),
+                            cudaMemcpyHostToDevice, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(rope positions) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+      rope_positions = rotation.data;
+    }
+    if (multimodal.media != nullptr) {
+      const int32_t *const scatter_end = multimodal.scatter + multimodal.count;
+      const int32_t *const first = std::lower_bound(
+          multimodal.scatter, scatter_end, static_cast<std::int32_t>(chunk_offset));
+      const int32_t *const last =
+          std::lower_bound(first, scatter_end, static_cast<std::int32_t>(chunk_offset + T));
+      const auto count = static_cast<std::int32_t>(last - first);
+      if (count > 0) {
+        scatter_host.resize(static_cast<std::size_t>(count));
+        for (std::int32_t i = 0; i < count; ++i) {
+          scatter_host[static_cast<std::size_t>(i)] =
+              first[i] - static_cast<std::int32_t>(chunk_offset);
+        }
+        ninfer::Tensor indices = model->scratch->alloc(ninfer::DType::I32, {count, 1, 1, 1});
+        err = cudaMemcpyAsync(indices.data, scatter_host.data(),
+                              scatter_host.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                              model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(scatter indices) failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+        const std::size_t column =
+            multimodal.first_column + static_cast<std::size_t>(first - multimodal.scatter);
+        const ninfer::Tensor columns(static_cast<std::uint8_t *>(model->vision_output->p) +
+                                         column * static_cast<std::size_t>(hidden) *
+                                             sizeof(std::uint16_t),
+                                     ninfer::DType::BF16, {hidden, count, 1, 1});
+        ninfer::ops::scatter(columns, indices, left, model->stream);
+      }
+    }
+
     // P5-03 (GitHub #152): the feature taps, never persisted and never a
     // section -- the scratch scope above frees them with the chunk.
     ninfer::Tensor features;
@@ -732,7 +842,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       profiler.record_layer_begin(layer, model->stream);
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
           ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
-                                     mode)
+                                     mode, rope_positions)
           : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
                                      mode);
       if (rc != 0) {
@@ -889,7 +999,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
-                                    LinearPolicyMode mode) {
+                                    LinearPolicyMode mode, const SpanMultimodal &multimodal) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
@@ -900,7 +1010,7 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
-                          is_last_chunk, sampling, &successor, slot_logits, mode) != 0) {
+                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1015,6 +1125,19 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
                ? LinearPolicyMode::kA16Only
                : LinearPolicyMode::kEngineDefault;
   }
+  SpanMultimodal multimodal;
+  if (options != nullptr) {
+    multimodal.positions = options->mrope_positions;
+    multimodal.span_tokens = num_tokens;
+    multimodal.rope_delta = options->rope_delta;
+    multimodal.media = options->media;
+    multimodal.scatter = options->media_scatter_indices;
+    multimodal.count = options->media_column_count;
+    multimodal.first_column = options->media_first_column;
+  }
+  if (!validate_span_multimodal(model, route, multimodal)) {
+    return -1;
+  }
 
   const auto began = std::chrono::steady_clock::now();
   int32_t rc = 0;
@@ -1038,10 +1161,13 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     }
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
-                                     out_logits, mode);
+                                     out_logits, mode, multimodal);
   }
   if (rc != 0) {
     return rc;
+  }
+  if (multimodal.positions != nullptr) {
+    seq->rope_delta = multimodal.rope_delta;
   }
   // P5-05 (GitHub #155): the rewrite checkpoint is the window as the latest
   // prefill span leaves it. The reference saves it during prefill, at its chat
@@ -1524,6 +1650,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
   const auto batch = static_cast<std::int32_t>(batch_size);
   std::vector<int32_t> emitted(batch_size, -1);
   std::vector<std::int32_t> positions(batch_size, 0);
+  std::vector<std::int32_t> rope_positions(batch_size, 0);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
 
   try {
@@ -1539,6 +1666,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       }
       emitted[i] = seq->pending_token;
       positions[i] = static_cast<std::int32_t>(seq->position);
+      rope_positions[i] = positions[i] + seq->rope_delta;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
     }
 
@@ -1569,6 +1697,18 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           std::string("ignis_program_decode: cudaMemcpyAsync(sampling positions) failed: ") +
           cudaGetErrorString(err));
       return -1;
+    }
+    // GitHub #178: a vision load's rounds rotate at `position + rope_delta`,
+    // staged at the address its graphs read.
+    if (model->decode_rope_positions != nullptr) {
+      err = cudaMemcpyAsync(model->decode_rope_positions->p, rope_positions.data(),
+                            batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(rope positions) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
 
     // GitHub #111: the round's per-lane token ids and physical pool
@@ -1706,6 +1846,9 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
       model->sampling_decode_logits->bytes + model->sampling_workspace->capacity() +
       model->decode_graph_scratch->capacity() + model->decode_graph_token_ids->bytes +
       model->decode_graph_slots->bytes;
+  if (model->decode_rope_positions != nullptr) {
+    out_stats->vram_bytes += model->decode_rope_positions->bytes;
+  }
   // P5-02 (GitHub #150) / P5-03 (GitHub #152): the drafter's window and its
   // checkpoint, one lane per slot of a pool built with the drafter -- its
   // weights are already in `model->vram_bytes`.
@@ -1718,6 +1861,9 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->verify != nullptr) {
     out_stats->vram_bytes += model->verify->device_bytes();
   }
+  // GitHub #177: the vision encoder workspace and output transient (its
+  // weights are already in `model->vram_bytes`).
+  out_stats->vram_bytes += model->vision_reserved_bytes();
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;

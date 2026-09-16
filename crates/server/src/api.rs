@@ -40,11 +40,16 @@ use ignis_core::{
 use crate::Server;
 use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Engine, EventStream, collect_tokens};
-use crate::template::{ChatMessage, TemplateProvider};
+use crate::media::{has_media, MediaRejection, MediaStats};
+use crate::template::{check_content_parts, ChatMessage, ContentRejection, TemplateProvider};
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
 };
 use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
+
+/// The request body limit of a `--vision` load, in bytes (the reference's
+/// `--max-request-mib` default).
+pub const MEDIA_REQUEST_BODY_LIMIT: usize = 384 << 20;
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 ///
@@ -67,6 +72,14 @@ pub fn router(state: Arc<Server>) -> Router {
         // Only the `/v1` routes above: the Playground's static pages stay
         // reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
+    // A `--vision` load takes images inline as base64 data URIs (GitHub
+    // #179), far past axum's 2 MiB default body limit: the reference's
+    // 384 MiB request cap, enforced before JSON parsing, admits a full
+    // 256 MiB media budget once base64-encoded. A text-only load keeps the
+    // default it has always served with.
+    if state.media.is_some() {
+        router = router.layer(axum::extract::DefaultBodyLimit::max(MEDIA_REQUEST_BODY_LIMIT));
+    }
     // The Playground (GitHub #163): present only when `--ui` gave it assets.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
@@ -181,20 +194,68 @@ fn build_request(
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
     // rejected at submit with a 404 (OpenAI's `model_not_found`).
-    let model = model
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| server.engine.model_id());
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
     let tokens = server.template.apply_chat_template(messages, thinking, tools);
+    request_input(server, model, tokens, params, None)
+}
+
+/// The submitted request over already-templated `tokens`.
+fn request_input(
+    server: &Server,
+    model: Option<String>,
+    tokens: Vec<ignis_core::TokenId>,
+    params: DecodeParams,
+    multimodal: Option<ignis_core::vision::Multimodal>,
+) -> (RequestInput, String, u32) {
+    let model = model
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| server.engine.model_id());
     let prompt_tokens = tokens.len() as u32;
     let input = RequestInput {
+        multimodal: multimodal.map(Arc::new),
         model: model.clone(),
         tokens,
         params,
     };
     (input, model, prompt_tokens)
+}
+
+/// [`build_request`] for any conversation: one carrying image parts on a
+/// `--vision` load (GitHub #179) first has its media acquired and prepared
+/// — a refusal is the error response, and dropping this future (a client
+/// disconnect) stops that work before anything is submitted — then its
+/// placeholders expanded, so `prompt_tokens` counts the image tokens. The
+/// fourth value is the acquisition summary the request's events carry.
+async fn prepare_request(
+    server: &Server,
+    model: Option<String>,
+    messages: &[ChatMessage],
+    params: DecodeParams,
+    thinking: &ThinkingOptions,
+    tools: &[JsonValue],
+) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
+    let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
+        let (input, model, prompt_tokens) = build_request(server, model, messages, params, thinking, tools);
+        return Ok((input, model, prompt_tokens, None));
+    };
+    let deadline = std::time::Instant::now() + server.request_timeout;
+    let acquired = acquirer.acquire(messages, deadline).await.map_err(media_rejection)?;
+    let (tokens, multimodal) = server
+        .template
+        .prepare_multimodal(messages, thinking, tools, acquired.media)
+        .map_err(content_rejection)?;
+    let (input, model, prompt_tokens) = request_input(server, model, tokens, params, Some(multimodal));
+    Ok((input, model, prompt_tokens, Some(acquired.stats)))
+}
+
+/// The response for refused media (GitHub #179): a 400 with the media
+/// code, or the handler's own 504 when the request deadline passed.
+fn media_rejection(rejection: MediaRejection) -> Response {
+    let status = StatusCode::from_u16(rejection.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let type_ = if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { rejection.code };
+    error_response(status, type_, rejection.code, rejection.message)
 }
 
 /// Split an optional `model` into its base id and any Lane tag (`CONTEXT.md`:
@@ -603,6 +664,17 @@ fn bad_request(message: &str) -> Response {
     )
 }
 
+/// The 400 for refused content parts (GitHub #175): the rejection's own
+/// code, raised before the request reaches the engine.
+fn content_rejection(rejection: ContentRejection) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        rejection.code,
+        rejection.message,
+    )
+}
+
 /// The OpenAI error body (`{"error": {message, type, code}}`).
 fn error_response(
     status: StatusCode,
@@ -805,6 +877,9 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
     }
+    if let Err(rejection) = check_content_parts(&req.messages, server.media.is_some()) {
+        return content_rejection(rejection);
+    }
     let params = match req.sampling.resolve(req.max_tokens, req.ignore_eos) {
         Ok(params) => params,
         Err(message) => return invalid_sampling_parameter(message),
@@ -829,9 +904,12 @@ async fn chat_completions(
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let (input, model, prompt_tokens) =
-        build_request(&server, model, &req.messages, params, &thinking, &tools);
-    let (request_id, mut stream) = match server.engine.submit(input, class).await {
+    let (input, model, prompt_tokens, media) =
+        match prepare_request(&server, model, &req.messages, params, &thinking, &tools).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+    let (request_id, mut stream) = match server.engine.submit_with_media(input, class, media).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -1400,6 +1478,9 @@ async fn responses_api(
     if messages.is_empty() {
         return bad_request("input must not be empty");
     }
+    if let Err(rejection) = check_content_parts(&messages, server.media.is_some()) {
+        return content_rejection(rejection);
+    }
     let thinking = match resolve_thinking(
         &server,
         ThinkingRequestFields {
@@ -1416,7 +1497,7 @@ async fn responses_api(
         Ok(x) => x,
         Err(message) => return bad_request(&message),
     };
-    let (input, model, prompt_tokens) = build_request(
+    let prepared = prepare_request(
         &server,
         model,
         &messages,
@@ -1431,8 +1512,13 @@ async fn responses_api(
         // `/v1/chat/completions` gets tool-calling support, matching the
         // scope this endpoint already keeps for reasoning/tool_calls).
         &[],
-    );
-    let (id, mut stream) = match server.engine.submit(input, class).await {
+    )
+    .await;
+    let (input, model, prompt_tokens, media) = match prepared {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (id, mut stream) = match server.engine.submit_with_media(input, class, media).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };

@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{
     ComputeError, DecodeParams, RequestClass, RequestInput, RequestState, SchedEvent,
 };
@@ -21,6 +21,7 @@ use ignis_core::{
 
 fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
     RequestInput {
+        multimodal: None,
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
@@ -104,6 +105,7 @@ fn advance_emits_a_prefill_chunk_event_per_chunk_with_cumulative_progress() {
                 request,
                 chunk_tokens,
                 prefilled_tokens,
+                ..
             } = event
                 && request == id
             {
@@ -135,6 +137,7 @@ fn only_the_final_prefill_chunk_receives_stochastic_sampling_params() {
     sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=10).collect(),
                 params: sampling,
@@ -273,7 +276,7 @@ struct PrefillFailsOnce {
 }
 
 impl Compute for PrefillFailsOnce {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut n = self.call.lock().unwrap();
         let this_call = *n;
         *n += 1;

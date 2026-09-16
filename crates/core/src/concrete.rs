@@ -129,7 +129,7 @@ use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
-    Compute, DecodeJob, DecodeOutcome, PrefillJob, Scheduler, SharedPrefixClaim,
+    Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
@@ -204,6 +204,18 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 /// spins the model thread. The attempt that reaches this ends the request
 /// with [`FinishReason::Error`].
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
+
+/// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
+/// to `serving_chunk` tokens, cut where a second media item would begin
+/// (GitHub #178: one media item per chunk).
+fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
+    let start = r.prefill_progress;
+    let take = (r.input.tokens.len() as u32 - start).min(serving_chunk);
+    match &r.input.multimodal {
+        Some(multimodal) => multimodal.cap_chunk(start, take),
+        None => take,
+    }
+}
 
 /// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
 /// absent that — whatever the per-sequence limit leaves after the prompt.
@@ -1053,6 +1065,13 @@ impl ConcreteScheduler {
         lane: Option<LaneId>,
         events: &mut Vec<SchedEvent>,
     ) -> bool {
+        // GitHub #178: a sequence the blob cannot describe (a multimodal
+        // one, whose `rope_delta` it does not record yet) is released and
+        // re-prefilled instead.
+        if !self.requests[v_idx].can_snapshot() {
+            self.release_and_requeue(v_idx, resume_phase, lane, events);
+            return true;
+        }
         let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn) = {
             let v = &self.requests[v_idx];
             (
@@ -1152,6 +1171,44 @@ impl ConcreteScheduler {
             snapshot_micros,
         });
         true
+    }
+
+    /// The eviction of a victim that cannot be snapshotted (GitHub #178, a
+    /// multimodal request): its device state is released outright and it
+    /// goes back to `Admitted`, to re-prefill from the start -- the same end
+    /// a snapshot discarded by the host tier comes to, without the tier.
+    fn release_and_requeue(
+        &mut self,
+        v_idx: usize,
+        resume_phase: ResumePhase,
+        lane: Option<LaneId>,
+        events: &mut Vec<SchedEvent>,
+    ) {
+        let v_id = self.requests[v_idx].id;
+        self.compute.release(v_id);
+        match resume_phase {
+            ResumePhase::Running => {
+                self.requests[v_idx].evict();
+            }
+            ResumePhase::Prefilling => {
+                self.requests[v_idx].evict_prefilling();
+            }
+        }
+        if let Some(lane) = lane {
+            self.free_lanes.push(lane);
+        }
+        self.unmaterialize(v_idx);
+        if self.protection.as_ref().map(|p| p.head_request_id) == Some(v_id) {
+            self.protection = None;
+        }
+        // 0 microseconds because no snapshot was taken at all: the
+        // `Requeued` this same call emits next is what tells the two
+        // eviction shapes apart.
+        events.push(SchedEvent::Evicted {
+            request: v_id,
+            snapshot_micros: 0,
+        });
+        self.requeue_request(v_idx, events);
     }
 
     /// Evict the single lowest-value eligible victim (core-06, GitHub
@@ -1365,7 +1422,12 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        let publish_tokens = self.prefix.shareable_head_tokens(input.tokens.len());
+        // GitHub #178: a multimodal request publishes nothing (see
+        // `Request::may_share_prefix`).
+        let publish_tokens = match input.multimodal {
+            Some(_) => 0,
+            None => self.prefix.shareable_head_tokens(input.tokens.len()),
+        };
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
         request.publish_tokens = publish_tokens;
         self.requests.push(request);
@@ -1439,7 +1501,10 @@ impl Scheduler for ConcreteScheduler {
                     // refcount and the `sibling_prefix_reused_tok` counter,
                     // and pin the entry forever (the release happens once,
                     // at completion).
-                    if self.requests[i].prefix_entry.is_some() {
+                    // GitHub #178: nor does a multimodal request claim one.
+                    if self.requests[i].prefix_entry.is_some()
+                        || !self.requests[i].may_share_prefix()
+                    {
                         continue;
                     }
                     let claimed = self.prefix.claim(&self.requests[i].input.tokens);
@@ -1475,10 +1540,13 @@ impl Scheduler for ConcreteScheduler {
                 // before the gating loop, for the same reason the claim
                 // loop is: a candidate cut here is never materialized this
                 // tick at all.
+                // GitHub #178: "exceeds" is decided by the chunk the request
+                // would actually be dealt, which a second media item can cut
+                // short of the serving width.
                 if let Some(cut) = b.iter().position(|&i| {
                     let r = &self.requests[i];
-                    (r.input.tokens.len() as u32 - r.prefill_progress)
-                        > self.config.serving_chunk_tokens
+                    chunk_take(r, self.config.serving_chunk_tokens)
+                        < r.input.tokens.len() as u32 - r.prefill_progress
                 }) {
                     b.truncate(cut + 1);
                 }
@@ -1564,7 +1632,7 @@ impl Scheduler for ConcreteScheduler {
                 let r = &self.requests[i];
                 let start = r.prefill_progress;
                 let remaining = r.input.tokens.len() as u32 - start;
-                let mut take = remaining.min(self.config.serving_chunk_tokens);
+                let mut take = chunk_take(r, self.config.serving_chunk_tokens);
                 // P4-10 (GitHub #126): a request that will publish a prefix
                 // is cut at its publish point, even mid-prompt. The leaf
                 // hands a claimant the mutable state at the prefix's *end*,
@@ -1610,13 +1678,20 @@ impl Scheduler for ConcreteScheduler {
                     // for a request that has one".
                     publish_prefix_tokens: (publish_at > 0 && start + take == publish_at)
                         .then_some(publish_at),
+                    multimodal: r.input.multimodal.clone(),
                 }
             })
             .collect();
         if !jobs.is_empty() {
             match self.compute.prefill_step(&jobs) {
-                Ok(()) => {
-                    for (&i, job) in batch.iter().zip(&jobs) {
+                Ok(outcomes) => {
+                    // One outcome per job, in order (GitHub #192). A backend
+                    // that returns fewer would have its chunks misattributed
+                    // by the zip below rather than caught.
+                    debug_assert_eq!(outcomes.len(), jobs.len(), "one prefill outcome per job");
+                    for ((&i, job), outcome) in batch.iter().zip(&jobs).zip(
+                        outcomes.iter().copied().chain(std::iter::repeat(PrefillOutcome::default())),
+                    ) {
                         // GitHub #81 / ADR 0012: the prefill span — one per
                         // request per `prefill_step` call (the chunked-
                         // prefill call boundary), opened here rather than
@@ -1657,6 +1732,7 @@ impl Scheduler for ConcreteScheduler {
                             request: request_id,
                             chunk_tokens: job.tokens.len() as u32,
                             prefilled_tokens: r.prefill_progress,
+                            encode_micros: outcome.encode_micros,
                         });
                         // core-07 — registration, driven by the job that
                         // actually published (P4-10, GitHub #126). The leaf

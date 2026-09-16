@@ -16,8 +16,8 @@ use tower::ServiceExt;
 
 use ignis_core::mock::{GateController, GatedCompute, MockCompute};
 use ignis_core::{
-    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, RequestId,
-    SchedulerConfig,
+    Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome,
+    RequestId, SchedulerConfig,
 };
 use ignis_server::engine::Engine;
 use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
@@ -90,7 +90,7 @@ struct ReleaseObservedCompute {
 }
 
 impl Compute for ReleaseObservedCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         self.inner.prefill_step(jobs)
     }
 

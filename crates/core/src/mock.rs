@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
 /// Recording handle onto the mock's call history (shared through the
@@ -47,6 +47,8 @@ struct Inner {
     /// adapter drops its leaf handle here, so a test that never sees the
     /// call is looking at a prefix the engine would have pinned forever.
     prefixes_released: Vec<RequestId>,
+    /// Requests whose device state the scheduler released, in order.
+    released: Vec<RequestId>,
 }
 
 /// A deterministic, recording [`Compute`] implementation for tests.
@@ -110,6 +112,12 @@ impl MockCompute {
         self.inner.lock().unwrap().prefixes_released.clone()
     }
 
+    /// The requests the scheduler released through [`Compute::release`], in
+    /// order.
+    pub fn released_requests(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().released.clone()
+    }
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -132,7 +140,7 @@ impl Default for MockCompute {
 }
 
 impl Compute for MockCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         for job in jobs {
             // Learn the request's limits / seed from its params.
@@ -140,11 +148,15 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
         }
         g.prefill_batches.push(jobs.to_vec());
-        Ok(())
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
     }
 
     fn release_prefix(&self, publisher: RequestId) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
+    }
+
+    fn release(&self, request: RequestId) {
+        self.inner.lock().unwrap().released.push(request);
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
@@ -300,7 +312,7 @@ impl GatedCompute {
 }
 
 impl Compute for GatedCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         self.inner.prefill_step(jobs)
     }
 

@@ -94,6 +94,49 @@ struct Dflash2Weights {
   ninfer::Weight selector_successor;
 };
 
+// GitHub #177: the vision tower's geometry (the reference's
+// `VisionBackboneConfig`, `targets/qwen3_6/export/.../vision.h`) and its
+// weights, named after the artifact's `vision/*` objects.
+inline constexpr std::int32_t kVisionLayers = 27;
+inline constexpr std::int32_t kVisionHidden = 1152;
+inline constexpr std::int32_t kVisionIntermediate = 4304;
+inline constexpr std::int32_t kVisionHeads = 16;
+inline constexpr std::int32_t kVisionPatchDim = 3 * 2 * 16 * 16;
+inline constexpr std::int32_t kVisionMergeUnit = 4;
+inline constexpr std::int32_t kVisionMergerHidden = kVisionHidden * kVisionMergeUnit;
+inline constexpr std::int32_t kVisionPositionEmbeddings = 48 * 48;
+// The frontend's per-request segment bound the workspace is sized for (the
+// reference's `kFrontendSegmentLimit`, 768 / 2).
+inline constexpr std::int32_t kVisionMaxSegments = 768 / 2;
+
+struct VisionLayerWeights {
+  ninfer::Weight qkv;
+  ninfer::Weight qkv_bias;
+  ninfer::Weight output;
+  ninfer::Weight output_bias;
+  ninfer::Weight fc1;
+  ninfer::Weight fc1_bias;
+  ninfer::Weight fc2;
+  ninfer::Weight fc2_bias;
+  ninfer::Weight norm1_weight;
+  ninfer::Weight norm1_bias;
+  ninfer::Weight norm2_weight;
+  ninfer::Weight norm2_bias;
+};
+
+struct VisionWeights {
+  ninfer::Weight patch_embedding;
+  ninfer::Weight patch_embedding_bias;
+  ninfer::Weight position_embedding;
+  std::array<VisionLayerWeights, kVisionLayers> layers{};
+  ninfer::Weight merger_fc1;
+  ninfer::Weight merger_fc1_bias;
+  ninfer::Weight merger_fc2;
+  ninfer::Weight merger_fc2_bias;
+  ninfer::Weight merger_norm_weight;
+  ninfer::Weight merger_norm_bias;
+};
+
 struct LayerWeights {
   ignis_layer_kind kind = IGNIS_LAYER_GDN;
   GqaLayerWeights gqa{};
@@ -296,8 +339,43 @@ struct ignis_model {
   uint32_t draft_tokens = 0;
   Dflash2Weights dflash2{};
 
+  // GitHub #177: the vision tower, bound in its stored formats when the load
+  // names a vision envelope (`vision_max_tokens > 0`), and its fixed device
+  // reservation -- the encoder workspace and one item's output transient,
+  // sized once for the envelope. Nothing runs on them yet (#178).
+  uint32_t vision_max_tokens = 0;
+  VisionWeights vision{};
+  std::unique_ptr<ninfer::DeviceArena> vision_workspace;
+  std::unique_ptr<ninfer::DeviceBuffer> vision_output;
+  // GitHub #178: whether `vision_output` holds a live media embedding. One
+  // item at a time, like the reference's single output transient.
+  bool vision_output_live = false;
+  // GitHub #178: the decode round's per-lane rope positions (I32 x
+  // IGNIS_DECODE_MAX_BATCH), `position + rope_delta`, staged beside
+  // `sampling_decode_positions` and read by the graphs from this stable
+  // address. Only a vision load has one: a text load's rounds rotate at the
+  // positions themselves, exactly as before.
+  std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
+  uint64_t vision_reserved_bytes() const {
+    return (vision_workspace ? vision_workspace->capacity() : 0) +
+           (vision_output ? vision_output->bytes : 0);
+  }
+
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
   // `draft_tokens > 0`. Its traversal runs out of `decode_graph_scratch`,
   // which a windowed load sizes for `k+1` columns per lane instead of one.
   std::unique_ptr<IgnisVerifyRound> verify;
 };
+
+// GitHub #178: a media embedding -- the `[hidden, columns]` BF16 encoder
+// output in its model's `vision_output`, live until released.
+struct ignis_media_embedding {
+  ignis_model *model = nullptr;
+  std::int32_t columns = 0;
+};
+
+// GitHub #178: the encoder workspace for `tokens` merged tokens over
+// `segments` segments -- the reference's `build_workspace_layout`, shared by
+// the load's reservation (kernel/src/model.cu) and the encode that runs out
+// of it (kernel/src/vision_encode.cu), so the two cannot drift.
+std::size_t ignis_vision_workspace_bytes(std::int32_t tokens, std::int32_t segments);

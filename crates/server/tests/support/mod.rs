@@ -13,6 +13,9 @@
 #[cfg(feature = "cuda")]
 pub mod live_server;
 
+/// Media fixtures for the image-input tests (GitHub #179).
+pub mod media;
+
 use std::sync::Arc;
 
 use ignis_core::TokenId;

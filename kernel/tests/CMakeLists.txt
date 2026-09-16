@@ -63,6 +63,13 @@ set(ignis_vendored_op_tests
   swa
   prepare_masked_block
   cast
+  # GitHub #177: the vision encoder's ops and the placeholder scatter.
+  layer_norm
+  gelu
+  add_bias
+  vision_pos_embed
+  vision_attention
+  scatter
 )
 foreach(op IN LISTS ignis_vendored_op_tests)
   set(target ignis_${op}_test)
@@ -113,6 +120,20 @@ add_executable(ignis_kernel_w8_linear_tests
 target_include_directories(ignis_kernel_w8_linear_tests PRIVATE ${IGNIS_VENDOR_DIR}/tests)
 target_link_libraries(ignis_kernel_w8_linear_tests PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_w8_linear_tests COMMAND ignis_kernel_w8_linear_tests)
+
+# GitHub #177: the Q4/Q5/Q6 row-split linear families the vision tower is
+# stored in, through the leaf's own ops::linear dispatch like the w8 test
+# above (same no-SKIP_RETURN_CODE rule, ADR 0006).
+foreach(q IN ITEMS q4 q5 q6)
+  set(target ignis_kernel_${q}_linear_tests)
+  add_executable(${target}
+    ${IGNIS_VENDOR_DIR}/tests/ops/linear/test_${q}_a16.cpp
+    ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+  )
+  target_include_directories(${target} PRIVATE ${IGNIS_VENDOR_DIR}/tests)
+  target_link_libraries(${target} PRIVATE ignis_kernel ignis_vendor)
+  add_test(NAME ${target} COMMAND ${target})
+endforeach()
 
 # P2-03 (GitHub #85): the reference's own NVFP4 W4A4 linear test, run
 # unmodified -- the activation-quantized route (CallForm::Policy AllowA4) at
@@ -363,6 +384,17 @@ target_link_libraries(ignis_kernel_model_load_speculative_options_test
                       PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_model_load_speculative_options_test
          COMMAND ignis_kernel_model_load_speculative_options_test)
+
+# GitHub #177: OURS -- `ignis_model_load`'s vision envelope. The envelope is
+# range-checked before binding, and with it each of the 333 `vision/*` tensors
+# is required, named when missing or mis-shaped, and an extra without it.
+# Host-only, the same way as the speculative options test above.
+add_executable(ignis_kernel_model_load_vision_options_test
+               test_model_load_vision_options.cpp)
+target_link_libraries(ignis_kernel_model_load_vision_options_test
+                      PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_model_load_vision_options_test
+         COMMAND ignis_kernel_model_load_vision_options_test)
 
 # P4-05 (GitHub #123): OURS, not vendored -- the hq attention routes against
 # ignis's own BF16 route on identical keys and values (ADR 0022's in-house

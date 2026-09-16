@@ -13,8 +13,11 @@
 
 use std::ffi::CStr;
 
+use std::marker::PhantomData;
+
 use crate::model_load::Model;
 use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
+use crate::vision::{Grid, VisionItemControl};
 
 mod ffi {
     use std::os::raw::c_char;
@@ -70,6 +73,35 @@ mod ffi {
         pub size: u32,
         pub route: i32,
         pub compute_policy: i32,
+        /// GitHub #178: the span's axis-major `[3, T]` positions, or null
+        /// for a text span (whose media fields are then empty).
+        pub mrope_positions: *const i32,
+        pub rope_delta: i32,
+        pub media_column_count: u32,
+        pub media: *const IgnisMediaEmbedding,
+        pub media_scatter_indices: *const i32,
+        pub media_first_column: u32,
+    }
+
+    /// Opaque `struct ignis_media_embedding` (GitHub #178).
+    #[repr(C)]
+    pub struct IgnisMediaEmbedding {
+        _private: [u8; 0],
+    }
+
+    /// 1:1 with `struct ignis_media_encode_input` (GitHub #178).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IgnisMediaEncodeInput {
+        pub size: u32,
+        pub grid_t: u32,
+        pub grid_h: u32,
+        pub grid_w: u32,
+        pub patches: *const u16,
+        pub position_ids: *const i32,
+        pub cu_seqlens: *const i32,
+        pub position_table_indices: *const i32,
+        pub position_table_weights: *const f32,
     }
 
     /// `enum ignis_prefill_route`.
@@ -162,6 +194,18 @@ mod ffi {
         ) -> i32;
 
         pub fn ignis_decode_graph_last_error() -> *const c_char;
+
+        pub fn ignis_media_encode(
+            model: *mut IgnisModel,
+            input: *const IgnisMediaEncodeInput,
+            out_embedding: *mut *mut IgnisMediaEmbedding,
+        ) -> i32;
+
+        pub fn ignis_media_embedding_columns(embedding: *const IgnisMediaEmbedding) -> u32;
+
+        pub fn ignis_media_embedding_release(embedding: *mut IgnisMediaEmbedding);
+
+        pub fn ignis_media_last_error() -> *const c_char;
     }
 }
 
@@ -461,6 +505,12 @@ impl PrefillRoute {
             size: std::mem::size_of::<ffi::IgnisPrefillOptions>() as u32,
             route,
             compute_policy,
+            mrope_positions: std::ptr::null(),
+            rope_delta: 0,
+            media_column_count: 0,
+            media: std::ptr::null(),
+            media_scatter_indices: std::ptr::null(),
+            media_first_column: 0,
         }
     }
 }
@@ -817,6 +867,186 @@ pub fn decode_program_verify_runs(
             }
         })
         .collect())
+}
+
+/// A media item's device-resident encoder output (GitHub #178): the
+/// `[hidden, columns]` merged columns the media encode step wrote into the
+/// load's vision reservation. The reservation holds one at a time, so an
+/// embedding is dropped (released) as soon as its last placeholder column is
+/// prefilled.
+pub struct MediaEmbedding<'m> {
+    handle: *mut ffi::IgnisMediaEmbedding,
+    _model: PhantomData<&'m Model>,
+}
+
+// The handle is a plain leaf-owned record; like `Seq`, it is driven from the
+// single scheduler thread.
+unsafe impl Send for MediaEmbedding<'_> {}
+
+impl MediaEmbedding<'_> {
+    /// The embedding's merged columns.
+    pub fn columns(&self) -> u32 {
+        unsafe { ffi::ignis_media_embedding_columns(self.handle) }
+    }
+
+    /// Detach the embedding from its model's borrow.
+    ///
+    /// # Safety
+    ///
+    /// The model must outlive the returned embedding.
+    pub unsafe fn into_static(self) -> MediaEmbedding<'static> {
+        let handle = self.handle;
+        std::mem::forget(self);
+        MediaEmbedding {
+            handle,
+            _model: PhantomData,
+        }
+    }
+}
+
+impl Drop for MediaEmbedding<'_> {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_media_embedding_release(self.handle) }
+    }
+}
+
+fn media_last_error() -> String {
+    let message = unsafe { CStr::from_ptr(ffi::ignis_media_last_error()) };
+    message.to_string_lossy().into_owned()
+}
+
+/// Run the media encode step (GitHub #178) over one item: its row-major BF16
+/// patch rows on `grid` and the encoder control
+/// ([`crate::vision::vision_item_control`]) computed for that grid.
+pub fn encode_media<'m>(
+    model: &'m Model,
+    grid: Grid,
+    patches: &[u16],
+    control: &VisionItemControl,
+) -> Result<MediaEmbedding<'m>, String> {
+    let raw = grid.raw_patches() as usize;
+    if patches.len() != raw * ignis_artifact::vision::PATCH_FEATURES {
+        return Err(format!(
+            "encode_media: {} patch values for a {}x{}x{} grid",
+            patches.len(),
+            grid.t,
+            grid.h,
+            grid.w
+        ));
+    }
+    if control.patches as usize != raw
+        || control.position_ids.len() != 2 * raw
+        || control.position_table_indices.len() != 4 * raw
+        || control.position_table_weights.len() != 4 * raw
+        || control.cu_seqlens.len() != grid.t as usize + 1
+    {
+        return Err("encode_media: the control does not describe the grid".to_string());
+    }
+    let input = ffi::IgnisMediaEncodeInput {
+        size: std::mem::size_of::<ffi::IgnisMediaEncodeInput>() as u32,
+        grid_t: grid.t,
+        grid_h: grid.h,
+        grid_w: grid.w,
+        patches: patches.as_ptr(),
+        position_ids: control.position_ids.as_ptr(),
+        cu_seqlens: control.cu_seqlens.as_ptr(),
+        position_table_indices: control.position_table_indices.as_ptr(),
+        position_table_weights: control.position_table_weights.as_ptr(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let rc = unsafe { ffi::ignis_media_encode(model.handle(), &input, &mut handle) };
+    if rc != 0 {
+        return Err(media_last_error());
+    }
+    Ok(MediaEmbedding {
+        handle,
+        _model: PhantomData,
+    })
+}
+
+/// One span of a multimodal prompt for [`prefill_program_multimodal`]
+/// (GitHub #178).
+#[derive(Clone, Copy)]
+pub struct MultimodalPrefill<'a> {
+    /// Axis-major `[3, tokens]` positions the span rotates at.
+    pub positions: &'a [i32],
+    /// The prompt's rope delta, which every later decode round applies.
+    pub rope_delta: i32,
+    /// The media columns the span's placeholders take, if it covers any.
+    pub media: Option<SpanMediaColumns<'a>>,
+}
+
+/// A media item's columns placed over a span's placeholder rows.
+#[derive(Clone, Copy)]
+pub struct SpanMediaColumns<'a> {
+    pub embedding: &'a MediaEmbedding<'a>,
+    /// The embedding column of the first placeholder.
+    pub first_column: u32,
+    /// Span-relative placeholder positions, strictly increasing.
+    pub scatter_indices: &'a [i32],
+}
+
+/// [`prefill_program_sampled`] over a span of a multimodal prompt (GitHub
+/// #178): the chunked route, rotated at the span's three-axis positions, with
+/// the media columns scattered over its placeholder rows. The sequence keeps
+/// the span's rope delta for every later decode round.
+pub fn prefill_program_multimodal(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    span: MultimodalPrefill<'_>,
+    out_logits: Option<&mut [f32]>,
+) -> Result<(), String> {
+    if span.positions.len() != 3 * token_ids.len() {
+        return Err(format!(
+            "prefill_program_multimodal: {} positions for {} tokens",
+            span.positions.len(),
+            token_ids.len()
+        ));
+    }
+    let (media, scatter, count, first_column) = match span.media {
+        Some(columns) => (
+            columns.embedding.handle as *const ffi::IgnisMediaEmbedding,
+            columns.scatter_indices.as_ptr(),
+            columns.scatter_indices.len() as u32,
+            columns.first_column,
+        ),
+        None => (std::ptr::null(), std::ptr::null(), 0, 0),
+    };
+    let options = ffi::IgnisPrefillOptions {
+        mrope_positions: span.positions.as_ptr(),
+        rope_delta: span.rope_delta,
+        media_column_count: count,
+        media,
+        media_scatter_indices: scatter,
+        media_first_column: first_column,
+        ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
+    };
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let params = sampling.to_ffi();
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            &options,
+            logits_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(())
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.

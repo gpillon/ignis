@@ -150,6 +150,10 @@ fn cuda_scheduler(
                     || "off".to_owned(),
                     |s| format!("{} draft_tokens={}", s.backend().as_str(), s.draft_tokens())
                 ),
+                vision = %shape.vision.map_or_else(
+                    || "off".to_owned(),
+                    |v| format!("max_tokens={}", v.max_tokens())
+                ),
                 "model loaded on the GPU"
             );
             Box::new(scheduler)
@@ -215,11 +219,13 @@ async fn main() {
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         prefill_chunk: _,
-        max_context: _,
+        max_context,
         kv_format: _,
         kv_pool_bytes: _,
         host_pool_bytes: _,
         speculation: _,
+        vision,
+        media,
         request_timeout_secs,
         ui,
         metrics,
@@ -296,8 +302,30 @@ async fn main() {
             mock_scheduler(&model)
         };
 
+        // GitHub #179: a `--vision` load prepares images with the artifact's
+        // processor and acquires them before admission. A tokenizer whose
+        // placeholder ids are not the model contract's is a refused start.
+        let processor = match vision.map(|v| ignis_server::media::load_processor(&frontend, v, max_context)) {
+            None => None,
+            Some(Ok(processor)) => Some(processor),
+            Some(Err(err)) => {
+                tracing::error!(name: "ignis.vision.processor_invalid", error = %err, "refusing to start");
+                exit_after_flush(&logging_handle, 1);
+            }
+        };
         let engine = Engine::with_clock(scheduler, Arc::new(SystemClock));
-        Server::with_artifact_template(engine, frontend)
+        let provider = ignis_server::artifact_template::ArtifactTemplateProvider::new(frontend);
+        match processor {
+            None => Server::new(engine, Box::new(provider)),
+            Some(processor) => {
+                let acquirer = ignis_server::media::MediaAcquirer::new(
+                    Arc::new(processor.clone()),
+                    processor.options().clone(),
+                    ignis_server::media::MediaPolicy::new(media.allow_private_network, media.cache_bytes),
+                );
+                Server::new(engine, Box::new(provider.with_vision(processor))).with_media(Arc::new(acquirer))
+            }
+        }
     } else {
         tracing::warn!(
             name: "ignis.model.placeholder_template",

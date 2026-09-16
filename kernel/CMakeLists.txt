@@ -207,6 +207,38 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/prepare_masked_block.cpp
   ${IGNIS_VENDOR_DIR}/src/ops/launcher/cast.cu
   ${IGNIS_VENDOR_DIR}/src/ops/wrapper/cast.cpp
+  # GitHub #177: the vision encoder's ops (LayerNorm, GELU tanh/exact, bias
+  # add, the bilinear position-table add, segmented vision attention), the
+  # placeholder scatter, and prepare_ragged_prefix (the reference's
+  # scatter test drives it), plus the Q4/Q5/Q6 row-split linear families
+  # the vision tower is stored in. Vision RoPE frequencies come from the
+  # already-vendored rope.cpp.
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/layer_norm.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/layer_norm.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gelu.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/gelu.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/add_bias.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/add_bias.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/vision_pos_embed.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/vision_pos_embed.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/vision_attention.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/vision_attention.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/scatter.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/scatter.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/prepare_ragged_prefix.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/wrapper/prepare_ragged_prefix.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q4/q4_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q4/q4_rowsplit_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q4/q4_small_t_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q5/q5_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q5/q5_rowsplit_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q5/q5_rowsplit_gemm_simt.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q5/q5_rowsplit_gemv.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q6/q6_dispatch.cpp
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q6/q6_rowsplit_gemm_mma.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/q6/q6_rowsplit_gemm_simt.cu
   # P1-13 (GitHub #49): the fused MLP gate_up projection with the SiLU-mul
   # epilogue, NVFP4 arm only. The large-T W4A4/TMA sources compile here but
   # are verified only at G2, same as P1-09's own W4A4/TMA route.

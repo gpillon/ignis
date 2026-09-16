@@ -13,12 +13,16 @@
 
 use std::sync::Arc;
 
+use ignis_artifact::vision::{PreparedMedia, VisionProcessor};
 use ignis_artifact::{DecodeStreamState, FrontendSet, Role};
+use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
-use crate::template::{ChatMessage, TemplateProvider};
+use crate::template::{
+    processor_rejection, ChatMessage, ContentRejection, MessageContent, TemplateProvider,
+};
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
 /// The [`TemplateProvider`] backed by the artifact's [`FrontendSet`]: the
@@ -39,6 +43,9 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 #[derive(Debug)]
 pub struct ArtifactTemplateProvider {
     set: Arc<FrontendSet>,
+    /// The vision processor on a `--vision` load (GitHub #179); `None`
+    /// renders no images.
+    vision: Option<VisionProcessor>,
 }
 
 impl ArtifactTemplateProvider {
@@ -49,23 +56,30 @@ impl ArtifactTemplateProvider {
     pub fn new(frontend: FrontendSet) -> Self {
         Self {
             set: Arc::new(frontend),
+            vision: None,
         }
     }
-}
 
-impl TemplateProvider for ArtifactTemplateProvider {
-    fn apply_chat_template(
+    /// Render image prompts with `processor` (a `--vision` load).
+    pub fn with_vision(mut self, processor: VisionProcessor) -> Self {
+        self.vision = Some(processor);
+        self
+    }
+
+    /// The chat template's text for `messages`, image parts rendered as
+    /// their placeholders.
+    fn render(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> Vec<TokenId> {
+    ) -> Result<String, String> {
         let templated: Vec<ignis_artifact::ChatMessage> = messages
             .iter()
             .map(|message| {
                 let role = Role::parse(&message.role).unwrap_or(Role::User);
-                let mut templated =
-                    ignis_artifact::ChatMessage::text(role, message.content.clone());
+                let mut templated = ignis_artifact::ChatMessage::text(role, "");
+                templated.content = artifact_content(&message.content);
                 // Prior assistant reasoning rides into the prompt only when
                 // the request opted in (GitHub #68) — dropped by default so
                 // a long conversation does not silently accumulate traces.
@@ -99,12 +113,21 @@ impl TemplateProvider for ArtifactTemplateProvider {
                 templated
             })
             .collect();
-        let prompt = match self.set.chat_template().render_with_thinking_and_tools(
-            &templated,
-            options.enable_thinking,
-            options.reasoning_effort,
-            Some(tools),
-        ) {
+        self.set
+            .chat_template()
+            .render_with_thinking_and_tools(&templated, options.enable_thinking, options.reasoning_effort, Some(tools))
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl TemplateProvider for ArtifactTemplateProvider {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Vec<TokenId> {
+        let prompt = match self.render(messages, options, tools) {
             Ok(prompt) => prompt,
             Err(err) => {
                 eprintln!("ignis-server: chat template render failed: {err}");
@@ -149,6 +172,31 @@ impl TemplateProvider for ArtifactTemplateProvider {
             state: DecodeStreamState::default(),
         })
     }
+
+    /// Render with each image part as the template's placeholder, then lay
+    /// the prepared media out exactly as the reference processor does.
+    fn prepare_multimodal(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+        media: Vec<PreparedMedia>,
+    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+        let Some(processor) = &self.vision else {
+            return Err(ContentRejection {
+                code: "vision_disabled",
+                message: "vision is disabled for this server".to_owned(),
+            });
+        };
+        let rendered = self.render(messages, options, tools).map_err(|err| ContentRejection {
+            code: "invalid_media",
+            message: format!("chat template render failed: {err}"),
+        })?;
+        let prompt = processor
+            .prepare_prompt(self.set.tokenizer(), &rendered, media, &[])
+            .map_err(processor_rejection)?;
+        Ok(Multimodal::from_prepared(prompt))
+    }
 }
 
 /// The real tokenizer's incremental decoder (GitHub #68): wraps the
@@ -183,9 +231,82 @@ impl TokenDecoder for ArtifactTokenDecoder {
     }
 }
 
+/// The template-facing content of a wire message (GitHub #175). A parts
+/// array reaches the template as its text parts (the reference's `"\n"`
+/// between adjacent text parts included, as `template_text_parts` places
+/// it), so the real template's `render_content` loop renders it exactly as
+/// the string `MessageContent::text` joins. An image part (GitHub #179,
+/// only past `check_content_parts` on a `--vision` load) stays in place as
+/// the template's image item and breaks the text run; every other part was
+/// refused before a request is templated.
+fn artifact_content(content: &MessageContent) -> ignis_artifact::MessageContent {
+    use ignis_artifact::ContentPart as Part;
+    match content {
+        MessageContent::Text(text) => ignis_artifact::MessageContent::Text(text.clone()),
+        MessageContent::Parts(parts) => {
+            let mut out = Vec::with_capacity(parts.len());
+            let mut after_text = false;
+            for part in parts {
+                match (part.kind.as_deref(), part.text.as_deref()) {
+                    (Some("text"), Some(text)) => {
+                        if after_text && !text.is_empty() {
+                            out.push(Part::Text("\n".to_owned()));
+                        }
+                        out.push(Part::Text(text.to_owned()));
+                        after_text = true;
+                    }
+                    (Some("image_url"), _) => {
+                        out.push(Part::Image { url: part.url.clone() });
+                        after_text = false;
+                    }
+                    _ => after_text = false,
+                }
+            }
+            ignis_artifact::MessageContent::Parts(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_part_stays_in_place_and_breaks_the_text_run() {
+        let part = |kind: &str, text: Option<&str>, url: Option<&str>| crate::template::ContentPart {
+            kind: Some(kind.to_owned()),
+            text: text.map(str::to_owned),
+            url: url.map(str::to_owned),
+        };
+        let content = MessageContent::Parts(vec![
+            part("text", Some("a"), None),
+            part("text", Some("b"), None),
+            part("image_url", None, Some("data:x")),
+            part("text", Some("c"), None),
+        ]);
+        let ignis_artifact::MessageContent::Parts(parts) = artifact_content(&content) else {
+            panic!("parts stay parts");
+        };
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|p| match p {
+                ignis_artifact::ContentPart::Text(text) => format!("text:{text}"),
+                ignis_artifact::ContentPart::Image { url } => format!("image:{}", url.as_deref().unwrap_or("")),
+                ignis_artifact::ContentPart::Video { .. } => "video".to_owned(),
+            })
+            .collect();
+        // "\n" joins adjacent text parts only; no newline across the image.
+        assert_eq!(shape, ["text:a", "text:\n", "text:b", "image:data:x", "text:c"]);
+    }
+
+    #[test]
+    fn a_provider_without_vision_refuses_to_render_images() {
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE);
+        let rejection = provider
+            .prepare_multimodal(&[ChatMessage::text("user", "hi")], &ThinkingOptions::default(), &[], Vec::new())
+            .unwrap_err();
+        assert_eq!(rejection.code, "vision_disabled");
+    }
     use ignis_artifact::fixture::{self, FixtureObject};
     use ignis_artifact::Reader;
     use ignis_artifact::{
@@ -299,6 +420,26 @@ mod tests {
         assert!(!tokens.is_empty());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("hello"), "{text}");
+    }
+
+    /// GitHub #175: a text-parts message renders exactly as the string its
+    /// parts join to (`"\n"` between adjacent text parts, the reference's
+    /// rule), through a template shaped like the real one's
+    /// `render_content` (string → as-is, parts → each `text` in order).
+    #[test]
+    fn text_parts_render_the_same_prompt_as_the_concatenated_string() {
+        const PARTS_TEMPLATE: &str = "{%- for m in messages -%}{{ m.role }} {% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{{ p.text }}{% endfor %}{% endif %} {% endfor -%}";
+        let (_fixture, _reader, provider) = build_provider_with(PARTS_TEMPLATE);
+        let string_form = [ChatMessage::text("user", "hello\nworld")];
+        let parts: MessageContent =
+            serde_json::from_value(json!([{ "type": "text", "text": "hello" }, { "type": "text", "text": "world" }]))
+                .expect("parts deserialize");
+        let mut parts_form = ChatMessage::text("user", "");
+        parts_form.content = parts;
+        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools());
+        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools());
+        assert_eq!(parts_tokens, string_tokens);
+        assert!(provider.render_tokens(&parts_tokens).contains("hello world"));
     }
 
     // -- thinking controls (GitHub #68) --------------------------------------

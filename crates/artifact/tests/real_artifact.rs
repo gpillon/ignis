@@ -12,9 +12,10 @@
 use std::path::Path;
 
 use ignis_artifact::{
-    bind_model_scope_27b, bind_text_scope_27b, dflash2_scope_27b, materialize, text_scope_27b,
-    Binder, CpuDevice, DraftModule, MaterializationPlan, NumericFormat, Object,
-    OUT_OF_SCOPE_TEXT_NAMES, Reader, StorageLayout,
+    bind_model_scope_27b, bind_model_scope_27b_with, bind_text_scope_27b, dflash2_scope_27b,
+    materialize, text_scope_27b, vision_scope_27b, Binder, CpuDevice, DraftModule,
+    MaterializationPlan, ModelScope, NumericFormat, Object, OUT_OF_SCOPE_TEXT_NAMES, Reader,
+    StorageLayout,
 };
 #[cfg(feature = "cuda")]
 use ignis_artifact::CudaDevice;
@@ -259,6 +260,79 @@ fn real_nvfp4full_dflash2_plan_extends_the_text_plan() {
         .filter(|n| n.starts_with("dflash2/"))
         .collect();
     assert_eq!(drafter_names, every_dflash2, "every dflash2/* object, and nothing else");
+}
+
+/// The vision tower's table (`inventory::vision_scope_27b`, GitHub #177)
+/// matches the container's `vision/*` objects: the same 333 names, formats,
+/// layouts and shapes. Tier 1.
+#[test]
+fn real_nvfp4full_vision_inventory_matches() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+    let mut actual: Vec<(String, NumericFormat, StorageLayout, Vec<u64>)> = reader
+        .objects()
+        .iter()
+        .filter_map(|o| match o {
+            Object::Tensor(t) if t.name.starts_with("vision/") => {
+                Some((t.name.clone(), t.format, t.layout, t.shape.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    actual.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected: Vec<(String, NumericFormat, StorageLayout, Vec<u64>)> = vision_scope_27b()
+        .iter()
+        .map(|e| (e.name.to_string(), e.format, e.layout, e.shape.to_vec()))
+        .collect();
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(expected, actual, "the vision table is the container's (ADR 0002)");
+}
+
+/// With vision selected, the plan consumes every `vision/*` object (none left
+/// unconsumed) and moves no text or drafter placement; without it, no vision
+/// object is in the plan (GitHub #177). Tier 1: binding plans placements.
+#[test]
+fn real_nvfp4full_vision_plan_extends_the_model_plan() {
+    let reader = match open_or_skip() {
+        Some(r) => r,
+        None => return,
+    };
+    let name_of = |plan: &MaterializationPlan, from: usize| -> std::collections::BTreeSet<String> {
+        plan.device_objects[from..]
+            .iter()
+            .map(|p| reader.objects()[p.handle.index].name().to_owned())
+            .collect()
+    };
+    let every_vision: std::collections::BTreeSet<String> = reader
+        .objects()
+        .iter()
+        .map(|o| o.name().to_owned())
+        .filter(|n| n.starts_with("vision/"))
+        .collect();
+
+    for draft in [None, Some(DraftModule::Dflash2)] {
+        let (base_plan, base_handles) = bind_model_scope_27b(&reader, draft).expect("bind, no vision");
+        assert!(
+            name_of(&base_plan, 0).iter().all(|n| !n.starts_with("vision/")),
+            "no vision object without the option ({draft:?})"
+        );
+        let (plan, handles) =
+            bind_model_scope_27b_with(&reader, ModelScope { draft, vision: true }).expect("bind with vision");
+        assert_eq!(plan.object_count, base_plan.object_count + vision_scope_27b().len());
+        assert_eq!(&handles[..base_handles.len()], base_handles.as_slice());
+        assert_eq!(
+            &plan.device_objects[..base_plan.device_objects.len()],
+            base_plan.device_objects.as_slice(),
+            "every text (and drafter) placement keeps its offset ({draft:?})"
+        );
+        assert_eq!(
+            name_of(&plan, base_plan.device_objects.len()),
+            every_vision,
+            "every vision/* object, and nothing else ({draft:?})"
+        );
+    }
 }
 
 /// Full `CpuDevice` materialization of the whole artifact. Gated: it

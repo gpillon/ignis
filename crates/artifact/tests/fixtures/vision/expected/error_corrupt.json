@@ -1,0 +1,1 @@
+{"case":{"name":"error_corrupt","messages":[{"role":"user","content":[{"type":"image","file":"corrupt.png"}]}]},"decoded":[{"file":"corrupt.png","error":"failed to submit media packet: Invalid data found when processing input"}],"error":"failed to submit media packet: Invalid data found when processing input"}

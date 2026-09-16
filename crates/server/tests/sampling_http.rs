@@ -12,7 +12,7 @@ use axum::body::Body;
 use http_body_util::BodyExt;
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    PrefillJob, RequestId, SchedulerConfig,
+    PrefillJob, PrefillOutcome, RequestId, SchedulerConfig,
 };
 use ignis_server::Server;
 use ignis_server::engine::Engine;
@@ -28,8 +28,8 @@ struct SamplingEchoCompute {
 }
 
 impl Compute for SamplingEchoCompute {
-    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<(), ComputeError> {
-        Ok(())
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

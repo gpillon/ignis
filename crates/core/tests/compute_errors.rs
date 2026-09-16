@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob};
+use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome};
 use ignis_core::types::{ComputeError, FinishReason, RequestId, SchedEvent};
 use ignis_core::{ConcreteScheduler, MAX_PREFILL_ATTEMPTS, MockCompute, Scheduler};
 
@@ -33,7 +33,7 @@ impl FailingCompute {
 }
 
 impl Compute for FailingCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut first = self.failed_once.lock().unwrap();
         if *first {
             drop(first);
@@ -56,6 +56,7 @@ fn failed_prefill_leaves_the_request_retryable() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
@@ -105,7 +106,7 @@ struct AlwaysFailingPrefill {
 }
 
 impl Compute for AlwaysFailingPrefill {
-    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         *self.faults.lock().unwrap() += 1;
         Err(ComputeError::Kernel(-1))
     }
@@ -127,6 +128,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
@@ -165,7 +167,7 @@ struct DecodeFaultCompute {
 }
 
 impl Compute for DecodeFaultCompute {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         self.inner.prefill_step(jobs)
     }
 
@@ -183,6 +185,7 @@ fn failed_decode_keeps_the_request_running() {
     let id: RequestId = sched
         .submit(
             ignis_core::types::RequestInput {
+                multimodal: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),

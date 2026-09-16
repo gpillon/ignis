@@ -45,6 +45,9 @@ pub struct EngineShape {
     /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
     /// `None` binds nothing of the drafter.
     pub speculation: Option<ignis_core::Speculation>,
+    /// Vision (`--vision`/`--vision-max-tokens`, GitHub #177): `None` binds
+    /// and reserves nothing of the vision tower.
+    pub vision: Option<ignis_core::Vision>,
 }
 
 impl Default for EngineShape {
@@ -62,6 +65,7 @@ impl Default for EngineShape {
             ),
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             speculation: None,
+            vision: None,
         }
     }
 }
@@ -75,6 +79,7 @@ impl From<&crate::config::Config> for EngineShape {
             kv_pool_bytes: config.kv_pool_bytes,
             host_pool_bytes: config.host_pool_bytes,
             speculation: config.speculation,
+            vision: config.vision,
         }
     }
 }
@@ -111,16 +116,16 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
-    use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b, materialize};
+    use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
     use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
-    // P5-02 (GitHub #150): the drafter's objects are bound and uploaded only
-    // when the operator asked for speculation; otherwise the plan is the text
-    // scope's alone, as before.
-    let draft = ignis_core::model_load::draft_module(shape.speculation);
+    // P5-02 (GitHub #150) / GitHub #177: the drafter's and the vision tower's
+    // objects are bound and uploaded only when the operator asked for them;
+    // otherwise the plan is the text scope's alone, as before.
+    let scope = ignis_core::model_load::model_scope(shape.speculation, shape.vision);
     let (plan, handles) =
-        bind_model_scope_27b(&reader, draft).map_err(|e| format!("bind model scope: {e}"))?;
+        bind_model_scope_27b_with(&reader, scope).map_err(|e| format!("bind model scope: {e}"))?;
     let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
@@ -131,6 +136,7 @@ pub fn cuda_scheduler(
         kv_pool_bytes: shape.kv_pool_bytes,
         prefill_chunk_tokens: shape.prefill_chunk,
         speculation: shape.speculation,
+        vision: shape.vision,
         ..CudaLeafConfig::default()
     };
 
@@ -204,6 +210,7 @@ mod tests {
             kv_pool_bytes: 8 * 1024 * 1024 * 1024,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             speculation: None,
+            vision: None,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
@@ -218,6 +225,7 @@ mod tests {
         type Sequence = ();
         type Prefix = ();
         type SnapshotBuf = Vec<u8>;
+        type Media = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -307,6 +315,7 @@ mod tests {
         scheduler
             .submit(
                 RequestInput {
+                    multimodal: None,
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {

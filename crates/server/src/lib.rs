@@ -26,6 +26,7 @@ pub mod decoder;
 pub mod engine;
 pub mod expose;
 pub mod loader;
+pub mod media;
 pub mod metrics;
 pub mod playground;
 pub mod runtime;
@@ -72,6 +73,9 @@ pub struct Server {
     /// The key `/v1` requests must present (`--api-key` / `IGNIS_API_KEY`);
     /// `None` leaves the API open.
     pub api_key: Option<crate::config::ApiKey>,
+    /// Acquires and prepares a request's images before admission (GitHub
+    /// #179); `None` on a load without `--vision`.
+    pub media: Option<std::sync::Arc<media::MediaAcquirer>>,
 }
 
 impl Server {
@@ -86,6 +90,7 @@ impl Server {
             playground: None,
             metrics: None,
             api_key: None,
+            media: None,
         }
     }
 
@@ -150,6 +155,12 @@ impl Server {
     /// (`main` wires this to `--api-key` / `IGNIS_API_KEY`).
     pub fn with_api_key(mut self, key: crate::config::ApiKey) -> Self {
         self.api_key = Some(key);
+        self
+    }
+
+    /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
+    pub fn with_media(mut self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
+        self.media = Some(acquirer);
         self
     }
 

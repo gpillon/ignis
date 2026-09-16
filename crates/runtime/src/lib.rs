@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use ignis_core::vision::{MediaItem, Multimodal};
 use ignis_core::{
     Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason, N_DECODE_LANES,
-    PrefillJob, RequestId, SpecCounters, TokenId,
+    PrefillJob, PrefillOutcome, RequestId, SpecCounters, TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -135,6 +136,30 @@ impl LaneRun {
     }
 }
 
+/// One prefill span's multimodal inputs (GitHub #178).
+#[derive(Debug, Clone, Copy)]
+pub struct MultimodalSpan<'a, M> {
+    /// Axis-major `[3, tokens]` rope positions of the span.
+    pub positions: &'a [i32],
+    /// The sequence's rope delta: every decode round after the prompt
+    /// rotates at `position + rope_delta`.
+    pub rope_delta: i32,
+    /// The media embedding the span's placeholder columns take, if the span
+    /// covers any.
+    pub media: Option<SpanMedia<'a, M>>,
+}
+
+/// The placeholder columns of one media item a prefill span covers.
+#[derive(Debug, Clone, Copy)]
+pub struct SpanMedia<'a, M> {
+    /// The item's device-resident encoder output.
+    pub embedding: &'a M,
+    /// The embedding column the first covered placeholder takes.
+    pub first_column: u32,
+    /// Span-relative positions of the covered placeholders, ascending.
+    pub scatter_indices: &'a [i32],
+}
+
 /// The replaceable step-ABI leaf seam.
 ///
 /// The FFI implementation will map these calls to ADR 0009. Its opaque
@@ -155,6 +180,10 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// makes the D2H/H2D crossing fast) and a plain `Vec<u8>` in a CPU-only
     /// stub, which never touches a real PCIe bus.
     type SnapshotBuf: AsRef<[u8]> + AsMut<[u8]> + Send + 'static;
+    /// Opaque leaf-owned media embedding (GitHub #178): one media item's
+    /// device-resident encoder output, live from its encode until the item's
+    /// last placeholder is prefilled.
+    type Media: Send + 'static;
 
     /// Load a model handle.
     fn load_model(&self) -> Result<Self::Model, i32>;
@@ -202,6 +231,27 @@ pub trait StepLeaf: Send + Sync + 'static {
         start_position: u32,
         params: DecodeParams,
     ) -> Result<(), i32>;
+    /// Encode one media item's patch rows into a device-resident embedding
+    /// (the media encode step, GitHub #178). A leaf without vision refuses.
+    fn encode_media(&self, _model: &Self::Model, _item: &MediaItem) -> Result<Self::Media, i32> {
+        Err(-1)
+    }
+    /// Release a media embedding.
+    fn release_media(&self, _model: &Self::Model, _media: Self::Media) {}
+    /// [`StepLeaf::prefill`] over a span of a multimodal prompt: rotated at
+    /// the span's three-axis positions, its placeholder columns taking the
+    /// embedding's columns. A leaf without vision refuses.
+    fn prefill_multimodal(
+        &self,
+        _model: &Self::Model,
+        _sequence: &mut Self::Sequence,
+        _tokens: &[TokenId],
+        _start_position: u32,
+        _params: DecodeParams,
+        _span: MultimodalSpan<'_, Self::Media>,
+    ) -> Result<(), i32> {
+        Err(-1)
+    }
     /// Decode one round over a batch of warmed sequences, `lanes` parallel
     /// to `sequences`. Returns each lane's committed run (P5-06, GitHub
     /// #154): at least one token, never more than its `remaining_tokens`,
@@ -285,6 +335,12 @@ struct LiveSequence<S> {
     generated: u32,
 }
 
+/// A request's live media embedding (GitHub #178): the item it encodes.
+struct LiveMedia<M> {
+    item: usize,
+    handle: M,
+}
+
 /// A request evicted to the host tier (P4-07, GitHub #125): its snapshot
 /// blob and the decode progress it resumes from, held here (not in
 /// `ignis_core::host::HostTier`, which is pure CPU bookkeeping) because
@@ -311,6 +367,10 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// their snapshot blob, held here until [`Compute::restore`] or
     /// [`Compute::discard_snapshot`] consumes it.
     evicted: Mutex<HashMap<RequestId, EvictedSequence<L::SnapshotBuf>>>,
+    /// Media embeddings still needed by a request's next chunk (GitHub
+    /// #178): at most one per request, held from its item's first covered
+    /// chunk until its last placeholder is prefilled.
+    media: Mutex<HashMap<RequestId, LiveMedia<L::Media>>>,
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
@@ -323,7 +383,83 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             sequences: Mutex::new(HashMap::new()),
             prefixes: Mutex::new(HashMap::new()),
             evicted: Mutex::new(HashMap::new()),
+            media: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Number of live media embeddings (the CPU-stub observation point for
+    /// their lifetime, GitHub #178).
+    pub fn live_media(&self) -> usize {
+        self.media.lock().unwrap().len()
+    }
+
+    fn release_media_handle(&self, media: L::Media) {
+        self.model.leaf.release_media(self.model.handle(), media);
+    }
+
+    /// One chunk of a multimodal prompt (GitHub #178): encode the media item
+    /// the chunk covers unless its embedding is already live, prefill the
+    /// span at its three-axis positions with the item's columns, and release
+    /// the embedding once the chunk covered its last placeholder.
+    ///
+    /// Returns the microseconds the encode took (GitHub #192), 0 when this
+    /// chunk encoded nothing — the same clock read `ConcreteScheduler` takes
+    /// around `evict`, and taken unconditionally, so this path never varies
+    /// with what an operator turned on.
+    fn prefill_multimodal_job(
+        &self,
+        sequence: &mut L::Sequence,
+        media: &mut HashMap<RequestId, LiveMedia<L::Media>>,
+        job: &PrefillJob,
+        multimodal: &Multimodal,
+    ) -> Result<u64, i32> {
+        let (start, len) = (job.start_position, job.tokens.len() as u32);
+        let chunk = multimodal.chunk_media(start, len);
+        let mut encode_micros = 0;
+        if let Some(chunk) = &chunk {
+            if media.get(&job.request).is_some_and(|live| live.item != chunk.item) {
+                let stale = media.remove(&job.request).expect("checked above");
+                self.release_media_handle(stale.handle);
+            }
+            if !media.contains_key(&job.request) {
+                let item = &multimodal.media[chunk.item];
+                let _span = tracing::debug_span!(
+                    "ignis.media.encode",
+                    request_id = job.request,
+                    item = chunk.item,
+                    vision_tokens = item.grid.vision_tokens(),
+                )
+                .entered();
+                let started = std::time::Instant::now();
+                let handle = self.model.leaf.encode_media(self.model.handle(), item)?;
+                encode_micros = started.elapsed().as_micros() as u64;
+                media.insert(job.request, LiveMedia { item: chunk.item, handle });
+            }
+        }
+        let positions = multimodal.span_positions(start as usize, len as usize);
+        let span_media = chunk.as_ref().map(|chunk| SpanMedia {
+            embedding: &media[&job.request].handle,
+            first_column: chunk.first_column,
+            scatter_indices: &chunk.scatter_indices,
+        });
+        self.model.leaf.prefill_multimodal(
+            self.model.handle(),
+            sequence,
+            &job.tokens,
+            start,
+            job.params,
+            MultimodalSpan {
+                positions: &positions,
+                rope_delta: multimodal.rope_delta,
+                media: span_media,
+            },
+        )?;
+        if chunk.is_some_and(|chunk| chunk.completes_item)
+            && let Some(done) = media.remove(&job.request)
+        {
+            self.release_media_handle(done.handle);
+        }
+        Ok(encode_micros)
     }
 
     /// Number of live leaf sequences (the CPU-stub observation point).
@@ -355,9 +491,11 @@ impl<L: StepLeaf> RuntimeCompute<L> {
 }
 
 impl<L: StepLeaf> Compute for RuntimeCompute<L> {
-    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<(), ComputeError> {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        let mut outcomes = PrefillOutcome::nothing_encoded(jobs.len());
         let mut sequences = self.sequences.lock().unwrap();
         let mut prefixes = self.prefixes.lock().unwrap();
+        let mut media = self.media.lock().unwrap();
         // Requests whose chunk lands on the prefix they publish. Collected
         // here and published after every job has warmed, so a later job's
         // failure cannot leave a published prefix behind with no sequence
@@ -379,8 +517,17 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .filter(|job| job.publish_prefix_tokens.is_some())
                     .filter_map(|job| prefixes.remove(&job.request))
                     .collect();
+                // GitHub #178: the retry re-encodes whatever it needs.
+                let unencoded: Vec<_> = jobs
+                    .iter()
+                    .filter_map(|job| media.remove(&job.request))
+                    .collect();
+                drop(media);
                 drop(prefixes);
                 drop(sequences);
+                for live in unencoded {
+                    self.release_media_handle(live.handle);
+                }
                 for sequence in released {
                     self.release_sequence(sequence.handle);
                 }
@@ -390,7 +537,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 return Err($err);
             }};
         }
-        for job in jobs {
+        for (index, job) in jobs.iter().enumerate() {
             if !sequences.contains_key(&job.request) {
                 // A claimant is allocated *against* the prefix: its leading
                 // KV pages are the publisher's own, shared in place, and its
@@ -434,16 +581,27 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // A full-prompt match carries no tail: the claim already put the
             // sequence where its prompt ends, with the pending token the
             // publisher computed, so there is nothing left to warm.
-            if !job.tokens.is_empty()
-                && let Err(code) = self.model.leaf.prefill(
-                    self.model.handle(),
-                    &mut sequence.handle,
-                    &job.tokens,
-                    job.start_position,
-                    job.params,
-                )
-            {
-                unwind!(RuntimeError::Leaf(code).into());
+            if !job.tokens.is_empty() {
+                let warmed = match &job.multimodal {
+                    None => self
+                        .model
+                        .leaf
+                        .prefill(
+                            self.model.handle(),
+                            &mut sequence.handle,
+                            &job.tokens,
+                            job.start_position,
+                            job.params,
+                        )
+                        .map(|()| 0),
+                    Some(multimodal) => {
+                        self.prefill_multimodal_job(&mut sequence.handle, &mut media, job, multimodal)
+                    }
+                };
+                match warmed {
+                    Ok(encode_micros) => outcomes[index].encode_micros = encode_micros,
+                    Err(code) => unwind!(RuntimeError::Leaf(code).into()),
+                }
             }
             if let Some(prefix_tokens) = job.publish_prefix_tokens {
                 to_publish.push((job.request, prefix_tokens));
@@ -468,7 +626,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 Err(code) => unwind!(RuntimeError::Leaf(code).into()),
             }
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
@@ -598,6 +756,12 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     }
 
     fn release(&self, request: RequestId) {
+        // GitHub #178: a request completed or cancelled mid-item releases
+        // the item's embedding with its sequence.
+        let media = self.media.lock().unwrap().remove(&request);
+        if let Some(media) = media {
+            self.release_media_handle(media.handle);
+        }
         let sequence = self.sequences.lock().unwrap().remove(&request);
         if let Some(sequence) = sequence {
             self.release_sequence(sequence.handle);
@@ -711,6 +875,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
     fn drop(&mut self) {
+        let media = std::mem::take(
+            self.media
+                .get_mut()
+                .expect("RuntimeCompute is not dropped while its media lock is held"),
+        );
+        for (_, media) in media {
+            self.release_media_handle(media.handle);
+        }
         let sequences = std::mem::take(
             self.sequences
                 .get_mut()

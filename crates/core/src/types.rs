@@ -56,6 +56,9 @@ pub struct RequestInput {
     pub tokens: Vec<TokenId>,
     /// Generation parameters.
     pub params: DecodeParams,
+    /// The prompt's positions, `rope_delta` and media items (GitHub #178),
+    /// or `None` for a text-only request — today's path, unchanged.
+    pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
 }
 
 /// Sampling / decoding parameters for a request.
@@ -388,6 +391,12 @@ pub enum SchedEvent {
         request: RequestId,
         chunk_tokens: u32,
         prefilled_tokens: u32,
+        /// Wall time this chunk spent encoding a media item (GitHub #192),
+        /// in microseconds — 0 on a text chunk and on one that reuses a
+        /// live embedding. Telemetry sums it per request, so a slow
+        /// multimodal TTFT is attributable to the encode and not only to
+        /// preprocessing.
+        encode_micros: u64,
     },
 }
 

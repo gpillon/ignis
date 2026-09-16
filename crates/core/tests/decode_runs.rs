@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams,
-    FinishReason, MockCompute, PrefillJob, RequestClass, RequestId, RequestInput, SchedEvent,
+    FinishReason, MockCompute, PrefillJob, PrefillOutcome, RequestClass, RequestId, RequestInput, SchedEvent,
     Scheduler, SchedulerConfig, SpecCounters, TokenId,
 };
 
@@ -28,6 +28,7 @@ fn submit(sched: &mut ConcreteScheduler, max_tokens: u32) -> RequestId {
     sched
         .submit(
             RequestInput {
+                multimodal: None,
                 model: "m".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams {
@@ -132,8 +133,8 @@ fn a_run_that_reaches_max_tokens_mid_run_finishes_with_length() {
 struct OvershootingCompute;
 
 impl Compute for OvershootingCompute {
-    fn prefill_step(&self, _jobs: &[PrefillJob]) -> Result<(), ComputeError> {
-        Ok(())
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

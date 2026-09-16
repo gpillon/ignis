@@ -37,6 +37,7 @@ use ignis_core::{
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use crate::media::MediaStats;
 use crate::metrics::Metrics;
 use crate::telemetry::{
     IntervalCounters, IntervalStatsProvider, SystemClock, Telemetry, TelemetryClock,
@@ -60,6 +61,9 @@ enum Command {
     Submit {
         input: RequestInput,
         class: RequestClass,
+        /// The request's media acquisition summary (GitHub #179), carried
+        /// with the submission so it reaches telemetry before `Admitted`.
+        media: Option<MediaStats>,
         reply: oneshot::Sender<Result<(RequestId, EventStream), SubmitError>>,
     },
     /// Abort an in-flight request (its HTTP client disconnected). No
@@ -81,7 +85,7 @@ enum Command {
 /// [`Engine::install_metrics`] to reach the already-running consumer without
 /// ever sharing a lock with the model thread.
 enum TelemetryFact {
-    Submitted(RequestId, u32, RequestClass),
+    Submitted(RequestId, u32, RequestClass, Option<MediaStats>),
     Routed(SchedEvent),
     Tick,
     Cancelled(RequestId),
@@ -230,9 +234,20 @@ impl Engine {
         input: RequestInput,
         class: RequestClass,
     ) -> Result<(RequestId, EventStream), SubmitError> {
+        self.submit_with_media(input, class, None).await
+    }
+
+    /// [`Engine::submit`] for a request whose media were acquired first
+    /// (GitHub #179): `media` rides on its `ignis.request.admitted` event.
+    pub async fn submit_with_media(
+        &self,
+        input: RequestInput,
+        class: RequestClass,
+        media: Option<MediaStats>,
+    ) -> Result<(RequestId, EventStream), SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
         self.commands
-            .send(Command::Submit { input, class, reply })
+            .send(Command::Submit { input, class, media, reply })
             .expect("the model thread outlives every Engine handle");
         reply_rx
             .await
@@ -300,7 +315,7 @@ fn handle_command(
     facts: &UnboundedSender<TelemetryFact>,
 ) {
     match command {
-        Command::Submit { input, class, reply } => {
+        Command::Submit { input, class, media, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
             // before `input` moves into `submit` — the scheduler's own
             // `Request` is not reachable from the telemetry consumer.
@@ -308,7 +323,7 @@ fn handle_command(
             let result = scheduler.submit(input, class).map(|id| {
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
-                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class));
+                let _ = facts.send(TelemetryFact::Submitted(id, prompt_tokens, class, media));
                 (id, stream)
             });
             // A dropped receiver (the caller gave up) is not an error here.
@@ -379,8 +394,11 @@ async fn telemetry_task(
 ) {
     while let Some(fact) = facts.recv().await {
         match fact {
-            TelemetryFact::Submitted(id, prompt_tokens, class) => {
-                telemetry.note_submit(id, prompt_tokens, class)
+            TelemetryFact::Submitted(id, prompt_tokens, class, media) => {
+                telemetry.note_submit(id, prompt_tokens, class);
+                if let Some(media) = media {
+                    telemetry.note_media(id, media);
+                }
             }
             TelemetryFact::Routed(event) => match event {
                 SchedEvent::Admitted { request, lane, .. } => telemetry.on_admitted(request, lane),
@@ -404,8 +422,9 @@ async fn telemetry_task(
                 SchedEvent::PrefillChunk {
                     request,
                     prefilled_tokens,
+                    encode_micros,
                     ..
-                } => telemetry.on_prefill_chunk(request, prefilled_tokens),
+                } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros),
                 SchedEvent::PrefixReused { tokens, .. } => telemetry.on_prefix_reused(tokens),
                 _ => {}
             },
@@ -481,6 +500,7 @@ mod tests {
 
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
+            multimodal: None,
             model: model.into(),
             tokens,
             params: DecodeParams {
@@ -820,8 +840,8 @@ mod tests {
     /// A fact as the model thread sent it, in comparable form.
     fn describe_fact(fact: &TelemetryFact) -> String {
         match fact {
-            TelemetryFact::Submitted(id, prompt_tokens, class) => {
-                format!("submitted {id} {prompt_tokens} {class:?}")
+            TelemetryFact::Submitted(id, prompt_tokens, class, media) => {
+                format!("submitted {id} {prompt_tokens} {class:?} {media:?}")
             }
             TelemetryFact::Routed(event) => format!("routed {event:?}"),
             TelemetryFact::Tick => "tick".to_owned(),
