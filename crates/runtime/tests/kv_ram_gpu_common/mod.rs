@@ -279,7 +279,12 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
         prompt
     };
     let burst_first = question("Name one Rust crate for HTTP clients.");
-    let claimant_prompt = question("Name one Rust crate for parsing command-line arguments.");
+    // A long answer: a drafting load lands several tokens a round, and the
+    // intruder has to arrive while the claimant is still decoding.
+    let claimant_prompt = question(
+        "List ten Rust crates for parsing command-line arguments, one per line, each with a \
+         sentence on what sets it apart.",
+    );
     let intruder = RequestInput {
         system_block_tokens: None,
         ..loaded.request(loaded.tokens("Count from one to five."), None, 0, 8)
@@ -298,12 +303,12 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
         run_to_idle(&mut sched);
         let claimant = sched
             .submit(
-                loaded.request(claimant_prompt.clone(), None, block_tokens, GENERATED),
+                loaded.request(claimant_prompt.clone(), None, block_tokens, 96),
                 RequestClass::Agent,
             )
             .unwrap();
         let mut events = Vec::new();
-        while generated(&events, claimant).len() < 6 {
+        while generated(&events, claimant).len() < 2 {
             events.extend(sched.advance());
             assert!(!sched.is_idle(), "the claimant finished before it could be evicted");
         }
@@ -322,7 +327,7 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
         )),
         "the claimant stands on the retained block"
     );
-    assert!(expected.len() > 6, "the control decoded past the point the intruder arrives");
+    assert!(expected.len() > 16, "the control decoded well past the point the intruder arrives");
 
     let (actual, events, claimant) = run(true);
     assert!(
