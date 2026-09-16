@@ -367,10 +367,10 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
 inline std::uint32_t ignis_seq_snapshot_page_count(const ignis_seq &seq) {
   const std::uint64_t tokens = seq.position;
   if (tokens > static_cast<std::uint64_t>(UINT32_MAX)) {
-    return seq.kv.mapped_page_count();
+    return ignis_seq_logical_page_count(seq);
   }
   const std::uint32_t pages = ninfer::pages_for_tokens(static_cast<std::uint32_t>(tokens));
-  return pages < seq.kv.mapped_page_count() ? pages : seq.kv.mapped_page_count();
+  return pages < ignis_seq_logical_page_count(seq) ? pages : ignis_seq_logical_page_count(seq);
 }
 
 /* The state-section table of a sequence of `pool`'s geometry holding

@@ -54,6 +54,14 @@ struct Inner {
     /// entry the scheduler drops without this call is a device image nothing
     /// will ever free.
     checkpoints_released: Vec<RequestId>,
+    /// Retained checkpoints the scheduler moved to KV-RAM (GitHub #190), in
+    /// order — each one a device-to-host copy. Kept apart from
+    /// `checkpoints_released` so a test can tell a spill from a discard.
+    checkpoints_spilled: Vec<RequestId>,
+    /// Requests whose next checkpoint spill the backend will fail.
+    spill_failures: std::collections::HashSet<RequestId>,
+    /// Requests whose next prefill batch the backend will fail (GitHub #190).
+    prefill_failures: std::collections::HashSet<RequestId>,
     /// Requests whose next asked-for checkpoint capture the backend will
     /// decline (`refuse_capture`) — a leaf with no room in its own image
     /// pool, or a sequence it will not capture.
@@ -145,6 +153,24 @@ impl MockCompute {
         self.inner.lock().unwrap().checkpoints_released.clone()
     }
 
+    /// The capturing requests whose retained checkpoint the scheduler spilled
+    /// to KV-RAM (GitHub #190), in order.
+    pub fn spilled_checkpoints(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().checkpoints_spilled.clone()
+    }
+
+    /// Make the backend fail the next spill of `publisher`'s checkpoint, the
+    /// way a leaf that could not write the blob does (GitHub #190).
+    pub fn fail_spill(&self, publisher: RequestId) {
+        self.inner.lock().unwrap().spill_failures.insert(publisher);
+    }
+
+    /// Fail the next prefill batch carrying a job for `request`, the way a
+    /// leaf error fails the whole call (GitHub #190).
+    pub fn fail_prefill(&self, request: RequestId) {
+        self.inner.lock().unwrap().prefill_failures.insert(request);
+    }
+
     /// Make the backend decline `request`'s next checkpoint capture (GitHub
     /// #186): the chunk lands normally and reports that nothing was captured,
     /// which is how a real leaf refuses a bet it cannot afford.
@@ -176,6 +202,9 @@ impl Default for MockCompute {
 impl Compute for MockCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
+        if jobs.iter().any(|job| g.prefill_failures.remove(&job.request)) {
+            return Err(ComputeError::Kernel(-1));
+        }
         for job in jobs {
             // Learn the request's limits / seed from its params.
             g.limits.insert(job.request, job.params.max_tokens);
@@ -225,6 +254,22 @@ impl Compute for MockCompute {
             .unwrap()
             .checkpoints_released
             .push(publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Ok(self.checkpoint_image_bytes())
+    }
+
+    // GitHub #190: the materialized blob is priced like the image — one
+    // nominal byte — so `host_capacity_bytes` counts how many spilled
+    // checkpoints KV-RAM holds.
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        let mut g = self.inner.lock().unwrap();
+        if g.spill_failures.remove(&publisher) {
+            return Err(ComputeError::Kernel(-1));
+        }
+        g.checkpoints_spilled.push(publisher);
+        Ok(1)
     }
 
     fn release(&self, request: RequestId) {
@@ -428,5 +473,13 @@ impl Compute for GatedCompute {
 
     fn release_checkpoint(&self, publisher: RequestId) {
         self.inner.release_checkpoint(publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.checkpoint_snapshot_size(publisher)
+    }
+
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.spill_checkpoint(publisher)
     }
 }

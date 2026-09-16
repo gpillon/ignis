@@ -244,6 +244,35 @@ impl PrefixCache {
     /// comparison made afterwards, because claiming here is not free: it pins
     /// the entry and counts the skip.
     pub fn claim_longer_than(&mut self, tokens: &[TokenId], floor: u32) -> Option<PrefixClaim> {
+        let match_entry = self.longest_match(tokens, floor)?;
+        let id = match_entry.id;
+        let claim = PrefixClaim {
+            id,
+            publisher: match_entry.publisher,
+            tokens: match_entry.length_tokens,
+            // The whole head, chain included (GitHub #187): what the claimant
+            // shares is every page below its own first, whichever entry of
+            // the chain happens to own each one.
+            pages: self.total_pages_of(id),
+            gdn: match_entry.gdn.clone(),
+        };
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.refcount += 1;
+        }
+        self.reused_tok += u64::from(claim.tokens);
+        Some(claim)
+    }
+
+    /// The leading tokens of `tokens` the longest registered prefix would let
+    /// a claimant skip, or 0 — without claiming it (GitHub #190). What a
+    /// KV-RAM checkpoint has to beat by its restore floor before a restore
+    /// across the bus is worth more than sharing pages already on the device.
+    pub fn longest_match_tokens(&self, tokens: &[TokenId]) -> u32 {
+        self.longest_match(tokens, 0).map_or(0, |e| e.length_tokens)
+    }
+
+    /// The longest registered prefix of `tokens` reaching past `floor`.
+    fn longest_match(&self, tokens: &[TokenId], floor: u32) -> Option<&PrefixEntry> {
         let mut best: Option<&PrefixEntry> = None;
         for entry in &self.entries {
             if entry.tokens.len() > tokens.len() || entry.length_tokens <= floor {
@@ -262,23 +291,7 @@ impl PrefixCache {
                 best = Some(entry);
             }
         }
-        let match_entry = best?;
-        let id = match_entry.id;
-        let claim = PrefixClaim {
-            id,
-            publisher: match_entry.publisher,
-            tokens: match_entry.length_tokens,
-            // The whole head, chain included (GitHub #187): what the claimant
-            // shares is every page below its own first, whichever entry of
-            // the chain happens to own each one.
-            pages: self.total_pages_of(id),
-            gdn: match_entry.gdn.clone(),
-        };
-        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
-            e.refcount += 1;
-        }
-        self.reused_tok += u64::from(claim.tokens);
-        Some(claim)
+        best
     }
 
     /// Take one more reference to `entry` on behalf of something that is not
@@ -921,5 +934,18 @@ mod tests {
         cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         let claim = cache.claim(&prompt64()).unwrap();
         assert!(claim.gdn.is_valid_snapshot_point(claim.gdn.position()));
+    }
+
+    #[test]
+    fn peeking_at_the_longest_match_claims_nothing() {
+        // GitHub #190: what a KV-RAM checkpoint has to beat is read without
+        // pinning the entry or counting a skip it may never take.
+        let mut cache = PrefixCache::new(16);
+        cache.register(7, &prompt64(), &gdn_boundary(64), None).unwrap();
+        assert_eq!(cache.longest_match_tokens(&prompt96()), 64);
+        assert_eq!(cache.longest_match_tokens(&(500..600).collect::<Vec<_>>()), 0);
+        let entry = cache.claim(&prompt96()).unwrap().id;
+        assert_eq!(cache.refcount_of(entry), 2, "the publisher and this one claim, not the peeks");
+        assert_eq!(cache.reused_tok(), 64);
     }
 }

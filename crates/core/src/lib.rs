@@ -67,10 +67,10 @@ pub use checkpoint::{
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{
-    ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
+    Clock, ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
     resolve_serving_chunk_tokens,
 };
-pub use host::{HostEntry, HostError, HostTier, Tier};
+pub use host::{HostEntry, HostError, HostTier, KvRamVictim, RetainedKvRamEntry, Tier};
 pub use identity::{
     ArtifactHash, BlobHeader, BlobIdentity, IdentityField, IdentityMismatch, MATCH_KEY_VERSION,
     MatchKey, MatchKeyChain, MediaKey, PromptContent,

@@ -117,16 +117,22 @@
 //! `tracing`'s own parent-child span graph. See the design doc for why.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::checkpoint::{CheckpointCapture, CheckpointEntry, CheckpointPool, ReuseSource};
+use crate::checkpoint::{
+    CheckpointCapture, CheckpointEntry, CheckpointPool, RetainedStateOperation, ReuseSource,
+    TierList,
+};
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
     ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
     choose_resident_candidate_victim, choose_retained_lane_victim, make_admission_protection,
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
-use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
+use crate::host::{
+    DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase,
+    RetainedKvRamEntry, Tier,
+};
 use crate::identity::{MediaKey, PromptContent};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
@@ -204,7 +210,19 @@ pub struct SchedulerConfig {
     /// never made room for. Production derives its default from the VRAM left
     /// after load; tests pass small values to drive exhaustion.
     pub retained_pool_bytes: u64,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority after its conversation last used it (GitHub #190; the
+    /// operator's `--retained-interactive-ttl`). Past it the entry ranks as
+    /// an Agent's would, so conversations nobody is coming back to cannot
+    /// hold KV-RAM against every subagent.
+    pub retained_interactive_ttl: Duration,
 }
+
+/// The wall clock the scheduler reads (GitHub #190): `Instant::now` in
+/// production, a hand-driven one in the tests that need idle time to pass.
+/// Nothing else in scheduling reads it — ticks order, this only measures how
+/// long retained state has sat unused.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// The serving prefill chunk width's default, in tokens (ADR 0018): the
 /// measured 1,024-token chunk from the G2 gate run (`.scratch/ROADMAP.md`).
@@ -308,6 +326,7 @@ impl Default for SchedulerConfig {
             // budget here.
             prompt_reuse: true,
             retained_pool_bytes: N_DECODE_LANES as u64,
+            retained_interactive_ttl: DEFAULT_RETAINED_INTERACTIVE_TTL,
         }
     }
 }
@@ -364,6 +383,8 @@ pub struct ConcreteScheduler {
     /// state of finished requests at their generation opener, which a later
     /// request whose prompt extends one resumes from instead of re-prefilling.
     checkpoints: CheckpointPool,
+    /// Wall time, for retained state's idle age (GitHub #190).
+    clock: Clock,
 }
 
 impl ConcreteScheduler {
@@ -415,13 +436,17 @@ impl ConcreteScheduler {
             resident_slots_used: 0,
             protection: None,
             protection_epoch: 1,
-            host: HostTier::new(config.host_capacity_bytes),
+            host: {
+                let mut host = HostTier::new(config.host_capacity_bytes);
+                host.set_retained_interactive_ttl(config.retained_interactive_ttl);
+                host
+            },
             tick: 0,
             prefix: PrefixCache::new(config.kv_page_tokens),
             // GitHub #189: the pool holds what this backend's state was
             // produced under, so an entry it could not write into a sequence
             // is never offered to one.
-            checkpoints: CheckpointPool::with_identity(
+            checkpoints: CheckpointPool::with_tiers(
                 if config.prompt_reuse {
                     config.retained_pool_bytes
                 } else {
@@ -433,6 +458,11 @@ impl ConcreteScheduler {
                     0
                 },
                 compute.blob_identity(),
+                if config.prompt_reuse && config.host_capacity_bytes > 0 {
+                    TierList::device_and_kv_ram()
+                } else {
+                    TierList::device_only()
+                },
             ),
             config,
             compute,
@@ -440,7 +470,33 @@ impl ConcreteScheduler {
             requests: Vec::new(),
             free_lanes: (0..N_DECODE_LANES).collect(),
             last_error: None,
+            clock: Arc::new(Instant::now),
         }
+    }
+
+    /// Read wall time from `clock` instead of `Instant::now` (tests that need
+    /// retained state to sit idle for minutes without waiting for them).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    /// The KV-RAM tier, for observation.
+    pub fn host(&self) -> &HostTier {
+        &self.host
+    }
+
+    /// Whether `request` is still being served — what separates a sibling's
+    /// prefix from a retained one (GitHub #190): the publisher of a retained
+    /// prefix has finished.
+    fn is_live(&self, request: RequestId) -> bool {
+        self.requests
+            .iter()
+            .any(|r| r.id == request && r.state != RequestState::Done)
     }
 
     /// Requests currently in flight (Admitted + Prefilling + Running).
@@ -584,12 +640,94 @@ impl ConcreteScheduler {
             .sum()
     }
 
-    /// Discard a retained checkpoint: release the backend's device image and
-    /// let go of the checkpoint's hold on the shared pages under it (which
-    /// return to the pool if nothing else is holding them).
-    fn discard_checkpoint(&mut self, entry: CheckpointEntry) {
-        self.compute.release_checkpoint(entry.publisher);
+    /// Discard a retained checkpoint, wherever it lives: release the
+    /// backend's handle on it, and let go of what it was holding — the shared
+    /// pages under a device image, or the KV-RAM budget a blob was charged to.
+    ///
+    /// A KV-RAM blob a request has chosen but not yet restored from outlives
+    /// the discard: the entry is already out of the pool, so nothing new can
+    /// choose it, and its bytes go when that restore lands or is abandoned
+    /// ([`Self::release_kv_ram_claim`]).
+    fn discard_checkpoint(&mut self, entry: CheckpointEntry, events: &mut Vec<SchedEvent>) {
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Discard,
+            source: entry.tier,
+        });
+        match entry.tier {
+            ReuseSource::Device => {
+                self.compute.release_checkpoint(entry.publisher);
+                self.release_prefix_claim(Some(entry.prefix));
+            }
+            ReuseSource::KvRam => {
+                if let Some(blob) = self.host.discard_retained(entry.id) {
+                    self.compute.release_checkpoint(blob.publisher);
+                }
+            }
+        }
+    }
+
+    /// Let go of `idx`'s claim on a KV-RAM blob, if it holds one. `restored`
+    /// says whether the restore landed, which is what promotes the entry.
+    fn release_kv_ram_claim(&mut self, idx: usize, restored: bool) {
+        let Some(checkpoint) = self.requests[idx].kv_ram_claim.take() else {
+            return;
+        };
+        let restored_at = restored.then(|| self.now());
+        if let Some(blob) = self.host.release_retained_claim(checkpoint, restored_at) {
+            self.compute.release_checkpoint(blob.publisher);
+        }
+    }
+
+    /// Move a device checkpoint the first-victim path is giving up into KV-RAM
+    /// (GitHub #190), or report that it cannot go there and has to be
+    /// discarded.
+    ///
+    /// Room is planned before a byte moves: only retained entries ranking
+    /// below this one may be given up for it (`HostTier::plan_retained_room`),
+    /// and if even all of those are not enough, nothing is given up at all.
+    /// The one way a spill costs another entry for nothing is a leaf failure
+    /// after the room was made.
+    fn spill_checkpoint(&mut self, entry: &CheckpointEntry, events: &mut Vec<SchedEvent>) -> bool {
+        if self.checkpoints.tiers().below(ReuseSource::Device) != Some(ReuseSource::KvRam) {
+            return false;
+        }
+        let Ok(bytes) = self.compute.checkpoint_snapshot_size(entry.publisher) else {
+            return false;
+        };
+        let now = self.now();
+        let Some(victims) = self
+            .host
+            .plan_retained_room(bytes, entry.class, entry.used_at, now)
+        else {
+            return false;
+        };
+        for victim in victims {
+            if let Some(discarded) = self.checkpoints.discard(victim) {
+                self.discard_checkpoint(discarded, events);
+            }
+        }
+        let Ok(bytes) = self.compute.spill_checkpoint(entry.publisher) else {
+            return false;
+        };
+        let blob =
+            RetainedKvRamEntry::new(entry.id, entry.publisher, entry.class, bytes, entry.used_at);
+        if self.host.capture_retained(blob).is_err()
+            || self
+                .checkpoints
+                .move_to_tier(entry.id, ReuseSource::KvRam, bytes)
+                .is_err()
+        {
+            // The leaf wrote a blob of a size other than the one it priced.
+            // Its device image is already gone, so the caller's discard is
+            // what releases the blob as well.
+            return false;
+        }
         self.release_prefix_claim(Some(entry.prefix));
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Spill,
+            source: ReuseSource::KvRam,
+        });
+        true
     }
 
     /// Record the prompt checkpoint the backend just captured for request
@@ -603,8 +741,8 @@ impl ConcreteScheduler {
     /// on it while its publisher is still decoding — and a request cancelled
     /// after this point keeps its checkpoint without a single extra rule
     /// (spec §Cancellation).
-    fn retain_checkpoint(&mut self, idx: usize, at: u32) {
-        let (publisher, prefix, key, gdn, claimed, turn_opening) = {
+    fn retain_checkpoint(&mut self, idx: usize, at: u32, events: &mut Vec<SchedEvent>) {
+        let (publisher, prefix, key, gdn, claimed, turn_opening, class) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
                 // The leaf published a prefix and captured against it, and
@@ -623,6 +761,7 @@ impl ConcreteScheduler {
                 r.gdn.clone(),
                 r.checkpoint_entry,
                 r.opens_a_turn(),
+                r.class,
             )
         };
         let capture = CheckpointCapture {
@@ -640,6 +779,8 @@ impl ConcreteScheduler {
             tier: ReuseSource::Device,
             claimed,
             turn_opening,
+            class,
+            captured_at: self.now(),
         };
         match self.checkpoints.retain(capture, self.tick) {
             Ok(retained) => {
@@ -651,7 +792,7 @@ impl ConcreteScheduler {
                 // scheduler's to give back: the pool moved the ledger, and
                 // nothing else in the engine knows the device still has them.
                 for entry in retained.superseded {
-                    self.discard_checkpoint(entry);
+                    self.discard_checkpoint(entry, events);
                 }
             }
             // The budget went while this batch was in flight — two requests
@@ -672,7 +813,7 @@ impl ConcreteScheduler {
     /// machinery is asked for anything: a bet is given up before any certain
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
-    fn reclaim_retained(&mut self, idx: usize) -> bool {
+    fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
         loop {
             if self.fits_for_materialization(&self.requests[idx]) {
                 return true;
@@ -686,8 +827,17 @@ impl ConcreteScheduler {
             // qualifies the answer is "retained state cannot help", and the
             // caller goes to the eviction machinery with the pool intact.
             let reclaimable = self.reclaimable_prefixes();
-            if let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) {
-                self.discard_checkpoint(victim);
+            if let Some(victim) = self
+                .checkpoints
+                .victim_in(ReuseSource::Device, Some(&reclaimable))
+            {
+                if !self.spill_checkpoint(&victim, events) {
+                    let victim = self
+                        .checkpoints
+                        .discard(victim.id)
+                        .expect("the peeked device victim is still retained");
+                    self.discard_checkpoint(victim, events);
+                }
                 continue;
             }
             // GitHub #188: then the retained prefixes. Checkpoints go first,
@@ -1057,6 +1207,7 @@ impl ConcreteScheduler {
         };
         self.requests[idx].abort();
         self.compute.release(request_id);
+        self.release_kv_ram_claim(idx, false);
         if let Some(lane) = lane {
             self.free_lanes.push(lane);
         }
@@ -1164,11 +1315,9 @@ impl ConcreteScheduler {
     /// running request's lane, excluding the protection's donors (donors
     /// are never evicted while the protection is open), reserved lanes (a
     /// lane whose shared prefix is claimed by an earlier-queued interactive
-    /// request — core-07), and any request holding (or holding open) a
-    /// shared prefix at all (P4-10, GitHub #126): its sequence cannot be
-    /// snapshotted (`IGNIS_SEQ_ERR_SHARED_PREFIX`) since its leading pages
-    /// are not its own — excluded here, upstream of victim selection,
-    /// rather than picked and then failed at snapshot time.
+    /// request — core-07). A request holding a shared prefix is a candidate
+    /// like any other since GitHub #190: its snapshot materializes the shared
+    /// pages, so it resumes as a sequence that owns its whole history.
     fn retained_lane_candidates(&self) -> Vec<RetainedLaneCandidate> {
         let donors: std::collections::HashSet<RequestId> = self
             .protection
@@ -1179,7 +1328,6 @@ impl ConcreteScheduler {
             .iter()
             .filter(|r| r.state == RequestState::Running)
             .filter(|r| !donors.contains(&r.id))
-            .filter(|r| r.prefix_entry.is_none())
             .map(|r| RetainedLaneCandidate {
                 lane: r.lane.expect("a running request holds a lane"),
                 owner: r.class,
@@ -1194,9 +1342,7 @@ impl ConcreteScheduler {
     /// 0023, GitHub #127): device-resident (holds real KV pages, a GDN
     /// slot and conv taps) but holding no decode lane at all — whether it
     /// is the sole half-prefilled request still chunking, or a
-    /// fully-prefilled one still queued for a lane deal. Excludes a
-    /// request holding (or holding open) a shared prefix, for the same
-    /// reason [`Self::retained_lane_candidates`] does, and `exclude` (a
+    /// fully-prefilled one still queued for a lane deal. Excludes `exclude` (a
     /// request index this call must never pick — the blocked head itself,
     /// when called from [`Self::try_evict_for_head`]: without this, a
     /// `Prefilling`-complete head queued for a lane matches this method's
@@ -1218,7 +1364,6 @@ impl ConcreteScheduler {
                 Some(*i) != exclude
                     && r.state == RequestState::Prefilling
                     && r.resident
-                    && r.prefix_entry.is_none()
             })
             .map(|(_, r)| ResidentCandidate { request_id: r.id, owner: r.class })
             .collect();
@@ -1252,6 +1397,9 @@ impl ConcreteScheduler {
     /// goes back to `Admitted` (re-prefills from the start — its warmed KV
     /// is gone) and its service-work counters are reset.
     fn requeue_request(&mut self, idx: usize, events: &mut Vec<SchedEvent>) {
+        // GitHub #190: a KV-RAM blob it never restored from is not its to hold
+        // across a fresh prefill.
+        self.release_kv_ram_claim(idx, false);
         let r = &mut self.requests[idx];
         // core-07: capture the shared-prefix claim (the `requeue()` below
         // resets it; a re-queued request re-prefills from the start and
@@ -1284,11 +1432,21 @@ impl ConcreteScheduler {
     /// tier can hold `bytes` (there is room, or it was made).
     fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
         while self.host.used_bytes() + bytes > self.host.capacity_bytes() {
-            match self.host.evict_one() {
-                Some(discarded) => {
+            let now = self.now();
+            match self.host.evict_for_live(now) {
+                Some(KvRamVictim::Retained(discarded)) => {
+                    // Already out of the tier's budget; out of the pool too,
+                    // and its blob released. Reported as the discard it is.
+                    self.checkpoints.discard(discarded.checkpoint);
+                    self.compute.release_checkpoint(discarded.publisher);
+                    events.push(SchedEvent::RetainedState {
+                        operation: RetainedStateOperation::Discard,
+                        source: ReuseSource::KvRam,
+                    });
+                }
+                Some(KvRamVictim::Live(discarded)) => {
                     self.compute.discard_snapshot(discarded.request);
-                    if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request)
-                    {
+                    if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request) {
                         self.requeue_request(idx, events);
                     }
                 }
@@ -1324,7 +1482,7 @@ impl ConcreteScheduler {
             self.release_and_requeue(v_idx, resume_phase, lane, events);
             return true;
         }
-        let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn) = {
+        let (v_id, v_class, v_pages, v_tokens, v_progress, v_work, v_gdn, v_prefix) = {
             let v = &self.requests[v_idx];
             (
                 v.id,
@@ -1334,7 +1492,18 @@ impl ConcreteScheduler {
                 v.prefill_progress,
                 v.remaining_work,
                 v.gdn.clone(),
+                v.prefix_entry,
             )
+        };
+        // GitHub #190: a request holding a shared prefix is snapshotted with
+        // the prefix's pages materialized into its blob, so it comes back as a
+        // sequence owning every page of its history — and needs a reservation
+        // for all of them, not the tail its claim shrank it to.
+        let restore_pages = if v_prefix.is_some() {
+            sequence_tokens(&self.config, &self.requests[v_idx].input)
+                .div_ceil(self.config.kv_page_tokens)
+        } else {
+            v_pages
         };
         // core-02: only a chunk-boundary-consistent sequence may be
         // snapshotted. A `Running` candidate is always past its last
@@ -1374,7 +1543,7 @@ impl ConcreteScheduler {
             resume_phase,
             lane,
             owner: v_class,
-            pages: v_pages,
+            pages: restore_pages,
             bytes,
             tokens: v_tokens,
             prefill_progress: v_progress,
@@ -1403,6 +1572,20 @@ impl ConcreteScheduler {
         // P4-07, GitHub #125: releases the resident-slot + KV-page charge —
         // the leaf just released exactly that state above.
         self.unmaterialize(v_idx);
+        // GitHub #190: the leaf dropped the sequence's hold on its prefix with
+        // the sequence; this is the ledger's half. What comes back is a
+        // standalone sequence, so it holds no claim and owns every page up to
+        // where it stopped — no publish point below that is reachable again.
+        if v_prefix.is_some() {
+            self.release_prefix_claim(v_prefix);
+            let r = &mut self.requests[v_idx];
+            r.prefix_entry = None;
+            r.prefix_publisher = None;
+            r.shared_prefix_tokens = 0;
+            r.shared_pages = 0;
+            r.resources.kv_pages = restore_pages;
+            r.standalone_tokens = v_progress;
+        }
         // A `Prefilling`-phase eviction (GitHub #125) can target the
         // *protected head itself* — a request that was blocked purely on
         // lanes, with no eligible `Running` victim, falls through to
@@ -1825,7 +2008,10 @@ impl Scheduler for ConcreteScheduler {
                     // and pin the entry forever (the release happens once,
                     // at completion).
                     // GitHub #178: nor does a multimodal request claim one.
+                    // GitHub #190: a KV-RAM claimant holds no prefix, so the
+                    // checkpoint claim is what says it already chose.
                     if self.requests[i].prefix_entry.is_some()
+                        || self.requests[i].checkpoint_publisher.is_some()
                         || !self.requests[i].may_share_prefix()
                     {
                         continue;
@@ -1839,10 +2025,18 @@ impl Scheduler for ConcreteScheduler {
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
                     let media = media_keys(&self.requests[i].input);
-                    let retained = self.checkpoints.best_match(&PromptContent::new(
+                    let lookup = self.checkpoints.lookup(&PromptContent::new(
                         &self.requests[i].input.tokens,
                         &media,
                     ));
+                    self.requests[i].pending_retained_misses =
+                        lookup.misses(self.checkpoints.tiers());
+                    // A KV-RAM checkpoint has to beat every device reuse by
+                    // its restore floor, a prefix's included (GitHub #190).
+                    let device_prefix = self
+                        .prefix
+                        .longest_match_tokens(&self.requests[i].input.tokens);
+                    let retained = self.checkpoints.select(&lookup, device_prefix);
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
@@ -1868,9 +2062,11 @@ impl Scheduler for ConcreteScheduler {
                         // max) / pt)`: the shared head is page-aligned, so
                         // subtracting its whole pages is exact.
                         r.resources.kv_pages = r.resources.kv_pages.saturating_sub(claim.pages);
+                        let request = r.id;
                         events.push(SchedEvent::PrefixReused {
-                            request: r.id,
+                            request,
                             tokens: claim.tokens,
+                            retained: !self.is_live(claim.publisher),
                         });
                     } else if let Some(m) = retained {
                         // Resume from an *earlier, finished* request's state.
@@ -1884,10 +2080,27 @@ impl Scheduler for ConcreteScheduler {
                         // the mutable image and the partial tail page on top
                         // of the shared pages — a prefix claim would stop a
                         // whole page short and lose the opener.
-                        self.checkpoints.record_claim(m.id, self.tick);
-                        self.prefix.retain(m.prefix);
+                        let now = self.now();
+                        self.checkpoints.record_claim(m.id, self.tick, now);
+                        let on_device = m.source == ReuseSource::Device;
+                        if on_device {
+                            self.prefix.retain(m.prefix);
+                        } else {
+                            // GitHub #190: held until the restore lands, so
+                            // nothing discards the only copy in between.
+                            let held = self.host.claim_retained(m.id);
+                            debug_assert!(held, "a KV-RAM match is a held KV-RAM blob");
+                        }
+                        events.push(SchedEvent::RetainedState {
+                            operation: RetainedStateOperation::Hit,
+                            source: m.source,
+                        });
                         let r = &mut self.requests[i];
-                        r.prefix_entry = Some(m.prefix);
+                        r.prefix_entry = on_device.then_some(m.prefix);
+                        if !on_device {
+                            r.kv_ram_claim = Some(m.id);
+                            r.standalone_tokens = m.tokens;
+                        }
                         r.checkpoint_publisher = Some(m.publisher);
                         // GitHub #187 — the claim edge, kept so this request's
                         // own capture knows which conversation it continues
@@ -1895,10 +2108,16 @@ impl Scheduler for ConcreteScheduler {
                         r.checkpoint_entry = Some(m.id);
                         r.checkpoint_tokens = m.tokens;
                         r.reuse_source = Some(m.source);
-                        r.shared_pages = m.pages;
+                        r.shared_pages = if on_device { m.pages } else { 0 };
                         r.prefill_progress = m.tokens; // warm all the way to the opener
                         r.gdn = m.gdn;
-                        r.resources.kv_pages = r.resources.kv_pages.saturating_sub(m.pages);
+                        // A device claimant shares the checkpoint's whole
+                        // prefix pages and subtracts their existing charge.
+                        // KV-RAM restores a standalone materialized blob into
+                        // fresh pages, so it keeps the full reservation.
+                        if on_device {
+                            r.resources.kv_pages = r.resources.kv_pages.saturating_sub(m.pages);
+                        }
                     }
                 }
 
@@ -1957,7 +2176,7 @@ impl Scheduler for ConcreteScheduler {
                     // anything else is considered. A live request never waits
                     // for a bet and is never refused because of one.
                     if !self.fits_for_materialization(&self.requests[i]) {
-                        self.reclaim_retained(i);
+                        self.reclaim_retained(i, &mut events);
                     }
                     if !self.fits_for_materialization(&self.requests[i]) {
                         let needed = AdmissionResources {
@@ -2138,6 +2357,7 @@ impl Scheduler for ConcreteScheduler {
                         .map(|publisher| CheckpointClaim {
                             publisher,
                             tokens: r.checkpoint_tokens,
+                            source: r.reuse_source.unwrap_or(ReuseSource::Device),
                         }),
                     // 0 for a request that captures nothing, so this is
                     // exactly "the chunk that lands on the opener, for a
@@ -2340,7 +2560,11 @@ impl Scheduler for ConcreteScheduler {
                         // a backend that declined the bet; nothing is
                         // recorded and the request is none the wiser.
                         if job.capture_checkpoint_tokens.is_some() && outcome.checkpoint_captured {
-                            self.retain_checkpoint(i, job.capture_checkpoint_tokens.unwrap());
+                            self.retain_checkpoint(
+                                i,
+                                job.capture_checkpoint_tokens.unwrap(),
+                                &mut events,
+                            );
                         }
                         // The reuse this request's prefill actually landed
                         // (GitHub #186): reported here rather than where the
@@ -2350,11 +2574,21 @@ impl Scheduler for ConcreteScheduler {
                         if let Some(claim) = job.checkpoint {
                             events.push(SchedEvent::StateReused {
                                 request: request_id,
-                                source: self.requests[i]
-                                    .reuse_source
-                                    .unwrap_or(ReuseSource::Device),
+                                source: claim.source,
                                 tokens: claim.tokens,
                                 restore_micros: outcome.restore_micros,
+                            });
+                            events.push(SchedEvent::RetainedState {
+                                operation: RetainedStateOperation::Restore,
+                                source: claim.source,
+                            });
+                            self.release_kv_ram_claim(i, true);
+                        }
+                        let misses = std::mem::take(&mut self.requests[i].pending_retained_misses);
+                        for source in misses.iter() {
+                            events.push(SchedEvent::RetainedState {
+                                operation: RetainedStateOperation::Miss,
+                                source,
                             });
                         }
                     }

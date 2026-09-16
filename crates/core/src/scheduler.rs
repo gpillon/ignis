@@ -50,6 +50,9 @@ pub struct CheckpointClaim {
     /// The leading prompt tokens the checkpoint covers — always equal to this
     /// job's `start_position`.
     pub tokens: u32,
+    /// Where the retained bytes live. Device claims clone an image and share
+    /// pages; KV-RAM claims restore one materialized blob into a fresh slot.
+    pub source: crate::checkpoint::ReuseSource,
 }
 
 /// One prefill job handed to the compute backend (batched prefill groups
@@ -383,6 +386,17 @@ pub trait Compute: Send + Sync {
     /// handle drop and not a free, exactly like
     /// [`Compute::release_prefix`].
     fn release_checkpoint(&self, _publisher: RequestId) {}
+
+    /// Bytes a materialized KV-RAM blob of a retained checkpoint needs.
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Lazily materialize a retained checkpoint into pinned host memory and
+    /// release its device image. Returns the host allocation's byte size.
+    fn spill_checkpoint(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
 }
 
 /// The engine's scheduling interface — what the server drives.

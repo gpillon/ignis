@@ -118,6 +118,22 @@ pub struct Request {
     /// a single point in its prompt, and a second capture would be a second
     /// image of state that has since moved on.
     pub checkpoint_captured: bool,
+    /// The tiers this request's retained-state lookup found nothing in (GitHub
+    /// #190), reported when its first chunk lands. A request waiting for room
+    /// looks again on every tick, so the lookup is not the place to count it.
+    pub pending_retained_misses: crate::checkpoint::TierSet,
+    /// The KV-RAM checkpoint this request chose and has not yet restored from
+    /// (GitHub #190). While set, the blob is claimed in KV-RAM and nothing
+    /// discards it: it is the only copy of the state the request's first job
+    /// is about to be built on.
+    pub kv_ram_claim: Option<crate::checkpoint::CheckpointId>,
+    /// Leading prompt tokens this request's sequence holds as its own pages
+    /// because they were restored from a **materialized** blob rather than
+    /// prefilled or shared (GitHub #190): a KV-RAM checkpoint, or a snapshot
+    /// taken while it held a shared prefix. No publish point at or below it
+    /// can be reached any more — the prefill that would have stopped there is
+    /// already behind the sequence — so [`Request::publish_point`] skips them.
+    pub standalone_tokens: u32,
     /// The whole KV pages of this request's own prompt — what it *could*
     /// publish as a shared prefix (P4-10, GitHub #126), or 0 for a prompt
     /// shorter than one page.
@@ -184,6 +200,9 @@ impl Request {
             checkpoint_tokens: 0,
             reuse_source: None,
             checkpoint_captured: false,
+            pending_retained_misses: crate::checkpoint::TierSet::default(),
+            kv_ram_claim: None,
+            standalone_tokens: 0,
             publish_tokens: 0,
             prefill_progress: 0,
             cancelled: false,
@@ -276,7 +295,12 @@ impl Request {
         if !self.may_share_prefix() {
             return 0;
         }
-        let shared = self.shared_pages.saturating_mul(page_tokens);
+        // Pages already shared, or restored as the request's own from a
+        // materialized blob: a boundary inside either is behind it.
+        let shared = self
+            .shared_pages
+            .saturating_mul(page_tokens)
+            .max(self.standalone_tokens);
         // Ascending, and it has to be: "the first boundary past what I already
         // share" is only the next one if they are in prompt order. They always
         // are — the system block ends before the last generation opener, and
@@ -287,8 +311,11 @@ impl Request {
             if at <= shared {
                 continue;
             }
-            // A chained publish has to earn its chunk split.
-            if self.prefix_entry.is_some() && self.input.opener_tokens.is_none() {
+            // A chained publish has to earn its chunk split — and so does a
+            // head published over history restored from a materialized blob
+            // (GitHub #190), which is a resumed request's publish too.
+            let resumed = self.prefix_entry.is_some() || self.standalone_tokens > 0;
+            if resumed && self.input.opener_tokens.is_none() {
                 continue;
             }
             return at;
@@ -547,6 +574,10 @@ impl Request {
         self.checkpoint_entry = None;
         self.checkpoint_tokens = 0;
         self.reuse_source = None;
+        // GitHub #190: so is whatever a materialized blob restored — the
+        // caller released the KV-RAM claim, and the sequence is gone.
+        self.kv_ram_claim = None;
+        self.standalone_tokens = 0;
         // `publish_tokens` is untouched: it is a property of the prompt, not
         // of a run. With the claim gone the re-prefill is free to publish
         // that head again (P4-10, GitHub #126) — the pages it had went back

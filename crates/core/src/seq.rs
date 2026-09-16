@@ -234,6 +234,19 @@ pub(crate) mod ffi {
             out_stats: *mut IgnisSeqCheckpointStats,
         ) -> i32;
 
+        pub fn ignis_seq_checkpoint_snapshot_size(
+            pool: *const IgnisSeqPool,
+            checkpoint: *const IgnisSeqCheckpoint,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_snapshot(
+            pool: *const IgnisSeqPool,
+            checkpoint: *const IgnisSeqCheckpoint,
+            dst: *mut c_void,
+            dst_bytes: u64,
+        ) -> i32;
+
         pub fn ignis_seq_last_error() -> *const c_char;
 
         /// Pinned (page-locked) host memory (P4-07, GitHub #125): the host
@@ -287,10 +300,10 @@ pub const NOT_IMPLEMENTED: i32 = -2;
 /// completes, which is what an evicting scheduler waits for.
 pub const NOT_AT_BOUNDARY: i32 = -3;
 
-/// `IGNIS_SEQ_ERR_SHARED_PREFIX`: the sequence claims a shared prefix
-/// ([`SeqPrefix`]), so its KV history is not all its own and there is no
-/// whole-sequence blob to write or write back. Releasing the sequence drops
-/// the claim; the way off the GPU is a re-prefill, not a snapshot.
+/// `IGNIS_SEQ_ERR_SHARED_PREFIX`: a restore target claims a shared prefix
+/// ([`SeqPrefix`]), so writing a standalone blob into it would overwrite
+/// pages owned by the prefix. Snapshotting such a sequence is allowed since
+/// #190: the shared pages are materialized into the blob.
 pub const SHARED_PREFIX: i32 = -5;
 
 /// `IGNIS_SEQ_ERR_BAD_SNAPSHOT`: the blob is not one this leaf can restore
@@ -333,8 +346,8 @@ impl SeqTransferError {
         self.code == BAD_SNAPSHOT
     }
 
-    /// The sequence claims a shared prefix, so it cannot be moved as one
-    /// blob: release it and re-prefill instead of evicting it.
+    /// The restore target claims a shared prefix, so a standalone blob cannot
+    /// overwrite it. Snapshotting a claimant itself is supported.
     pub fn is_shared_prefix(&self) -> bool {
         self.code == SHARED_PREFIX
     }
@@ -580,6 +593,29 @@ impl SeqCheckpoint<'_> {
         stats
     }
 
+    /// Bytes the checkpoint needs as a materialized whole-sequence blob in
+    /// KV-RAM: shared prefix pages included, not referenced.
+    pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
+        let mut bytes = 0;
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_snapshot_size(self.pool, self.handle, &mut bytes)
+        };
+        if rc == 0 { Ok(bytes) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Materialize this checkpoint into a host blob without consuming it.
+    pub fn snapshot_into(&self, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_snapshot(
+                self.pool,
+                self.handle,
+                dst.as_mut_ptr().cast(),
+                dst.len() as u64,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
     /// Detach the compile-time borrow tying this checkpoint to its pool,
     /// exactly as [`Seq::into_static`] and [`SeqPrefix::into_static`] do and
     /// for the same reason: a checkpoint outlives the stack frame — and the
@@ -719,10 +755,9 @@ impl<'a> Seq<'a> {
     /// Write this sequence's whole device state into `dst` as an opaque
     /// blob, which must be at least [`Seq::snapshot_bytes`] long.
     ///
-    /// A sequence that claims a shared prefix is refused with
-    /// [`SHARED_PREFIX`](SeqTransferError::is_shared_prefix): its leading
-    /// pages belong to the prefix, so there is no whole-sequence blob to
-    /// write.
+    /// A sequence that claims a shared prefix materializes those leading
+    /// pages into the blob. The host image is self-contained and restores
+    /// without the prefix handle (GitHub #190).
     ///
     /// Synchronous: it returns with every byte already in `dst`. Pinned
     /// host memory is faster and is what the host tier uses (GitHub #125),

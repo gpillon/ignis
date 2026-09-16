@@ -36,9 +36,9 @@
  * `ignis_seq_prefix_publish` hands a sequence's leading pages to a leaf-owned
  * refcount, and `ignis_seq_alloc_shared` gives a claimant those same physical
  * pages plus a device-to-device clone of the mutable state. Neither direction
- * crosses PCIe, which is what separates it from the snapshot path above -- and
- * a sequence that holds a prefix cannot take that path at all
- * (IGNIS_SEQ_ERR_SHARED_PREFIX).
+ * crosses PCIe, which is what separates it from the snapshot path above.
+ * Snapshotting a claimant materializes those shared pages into its standalone
+ * host blob; restoring into a claimant is still refused.
  *
  * A *later* request whose prompt extends an earlier one's resumes from a
  * **prompt checkpoint** rather than re-prefilling it (GitHub #186, ADR
@@ -81,14 +81,11 @@ extern "C" {
  * call. */
 #define IGNIS_SEQ_ERR_BAD_SNAPSHOT (-4)
 
-/* The state-transfer calls (ignis_seq_snapshot_size, ignis_seq_snapshot,
- * ignis_seq_restore): the sequence holds a shared prefix (P4-10, GitHub
- * #126), so its KV history is not all its own and there is no
- * whole-sequence blob to size, to write, or to write back. The claim is
- * released with the sequence; a caller that needs this sequence off the GPU
- * releases it and re-prefills instead. Distinct from -1 because the call is
- * well formed -- it is the sequence, not the arguments, that cannot be
- * transferred. */
+/* ignis_seq_restore only: the target sequence holds a shared prefix (P4-10,
+ * GitHub #126), whose pages cannot be overwritten by a standalone blob.
+ * Snapshot size/write materialize shared pages since GitHub #190. Distinct
+ * from -1 because the call is well formed -- it is the restore target, not
+ * the arguments, that cannot accept the transfer. */
 #define IGNIS_SEQ_ERR_SHARED_PREFIX (-5)
 
 /* Opaque device-resident pool of sequence state (never dereferenced across
@@ -289,10 +286,9 @@ uint32_t ignis_seq_snapshot_format_version(void);
  * rather than once per pool.
  *
  * Returns 0 and the size in `*out_bytes`. Returns -1 on a null argument or
- * a sequence that is not `pool`'s (see ignis_seq_last_error);
- * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY if `seq` is mid-chunk, and
- * IGNIS_SEQ_ERR_SHARED_PREFIX if it claims a shared prefix -- for the same
- * reasons the snapshot itself is refused in each case. */
+ * a sequence that is not `pool`'s (see ignis_seq_last_error), and
+ * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY if `seq` is mid-chunk. A sequence holding a
+ * shared prefix is materialized: the blob contains those shared pages too. */
 int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                                  uint64_t *out_bytes);
 
@@ -313,9 +309,9 @@ int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool, const struct 
  * argument, a sequence that is not `pool`'s, a `dst_bytes` below the
  * reported size, or a failed device copy. `seq` is never modified.
  *
- * A sequence that claims a shared prefix is refused with
- * IGNIS_SEQ_ERR_SHARED_PREFIX: its leading pages belong to the prefix, so
- * there is no whole-sequence blob to write (P4-10, GitHub #126). */
+ * A sequence that claims a shared prefix is materialized into one standalone
+ * blob: its leading shared pages are copied alongside its own written pages
+ * (GitHub #190). */
 int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool, const struct ignis_seq *seq,
                             void *dst, uint64_t dst_bytes);
 
@@ -553,6 +549,16 @@ void ignis_seq_checkpoint_release(struct ignis_seq_pool *pool,
  * -1 on a null argument. */
 int32_t ignis_seq_checkpoint_stats(const struct ignis_seq_checkpoint *checkpoint,
                                     struct ignis_seq_checkpoint_stats *out_stats);
+
+/* Materialize a retained checkpoint as the same opaque whole-sequence blob
+ * ignis_seq_snapshot writes. Shared-prefix pages are copied into the blob;
+ * the checkpoint is read-only and remains claimable after either call. */
+int32_t ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
+                                            const struct ignis_seq_checkpoint *checkpoint,
+                                            uint64_t *out_bytes);
+int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
+                                       const struct ignis_seq_checkpoint *checkpoint, void *dst,
+                                       uint64_t dst_bytes);
 
 /* --- pinned host memory (P4-07, GitHub #125) ------------------------------
  *

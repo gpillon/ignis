@@ -171,3 +171,16 @@ and is not a fifth entry point.
 - **A blob's header names its compatibility identity**: the artifact content
   hash, the KV format, the layout version, and the drafter configuration. A
   blob taken under another load is refused like a stale layout.
+
+## Amendment (2026-09-16) — the materialized checkpoint (#190)
+
+- **A retained prompt checkpoint is spilled as the blob its capturing sequence
+  would have written** (`ignis_seq_checkpoint_snapshot`): the prefix chain's
+  pages in block-table order, then the copied tail page, then its image. One
+  layout, written by one packer in `kernel/src/seq.cu`, so a spilled checkpoint
+  restores through `ignis_seq_restore` like any other blob.
+- **Restoring into a sequence that holds a shared prefix is still refused**
+  (`IGNIS_SEQ_ERR_SHARED_PREFIX`): its pages are other claimants' history. A
+  blob is restored into a fresh sequence.
+- **A sequence that owns its history keeps the vendored pack**; only a
+  materialized one goes through the page-run packer.

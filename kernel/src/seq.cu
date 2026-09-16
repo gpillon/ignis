@@ -120,59 +120,20 @@ void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
 
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
 
-// Why `seq` cannot be moved as one blob, or nullptr if it can.
+// Why a restore target cannot already hold shared history, or nullptr if it
+// can.
 //
-// A sequence that claims a shared prefix (P4-10, GitHub #126) does not own
-// its leading KV pages: they are the prefix's, refcounted and addressed by
-// every claimant's block-table row. A snapshot of it would either copy
-// another request's history into this request's blob, or leave a hole a
-// restore would read as zeroed attention -- so the transfer is refused
-// rather than approximated. Releasing the sequence drops the claim, and a
-// re-prefill is the way back on.
+// A snapshot of a sequence holding a shared prefix materializes the prefix's
+// pages into the blob (GitHub #190), so taking one needs no refusal. Writing
+// a blob back is different: the target's leading pages would be the prefix's,
+// refcounted and read by every other claimant, and a restore would overwrite
+// their history. The way back on for such a sequence is a fresh one.
 const char *shared_prefix_refusal(const ignis_seq &seq) {
   if (seq.prefix == nullptr) {
     return nullptr;
   }
-  return "the sequence claims a shared prefix, so its KV history is not all "
-         "its own; release it and re-prefill instead";
-}
-
-// The offset of `kind` in `sections`. The table always carries every kind
-// (ignis_seq_section_table builds it unconditionally), so a miss is a
-// programming error in this file rather than a caller's.
-std::uint64_t section_offset(const std::vector<ignis_seq_section> &sections, int32_t kind) {
-  for (const ignis_seq_section &section : sections) {
-    if (section.kind == kind) {
-      return section.offset;
-    }
-  }
-  throw std::logic_error(std::string("state-section table has no ") +
-                         ignis_seq_section_name(kind) + " section");
-}
-
-
-// Zero the bytes of `dst` that no section's payload covers: the gap after
-// the header and records, and each section's alignment padding.
-//
-// Only a few hundred bytes in total, but they are part of the blob's extent,
-// so a blob written into a reused buffer would otherwise carry whatever the
-// previous occupant left in its gaps. Two snapshots of the same sequence
-// have to be the same bytes -- the leaf's own round-trip test says so by
-// comparing them -- and that has to be true of a recycled host region as
-// much as of a fresh one.
-void zero_blob_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
-                    std::uint64_t total_bytes) {
-  std::uint64_t cursor = sizeof(ignis_seq_snapshot_header) +
-                         sections.size() * sizeof(ignis_seq_section);
-  for (const ignis_seq_section &section : sections) {
-    if (section.offset > cursor) {
-      std::memset(base + cursor, 0, static_cast<std::size_t>(section.offset - cursor));
-    }
-    cursor = section.offset + section.bytes;
-  }
-  if (total_bytes > cursor) {
-    std::memset(base + cursor, 0, static_cast<std::size_t>(total_bytes - cursor));
-  }
+  return "the target sequence claims a shared prefix, whose pages a restore would "
+         "overwrite for every other claimant; restore into a fresh sequence";
 }
 
 // One host<->device copy on the default stream, as a checked error rather
@@ -188,6 +149,126 @@ void checked_memcpy_async(void *dst, const void *src, std::size_t bytes, cudaMem
                              ") failed: " + cudaGetErrorString(err));
   }
 }
+
+// The KV_PAGES payload of a snapshot of `seq`: its first `count` logical
+// pages.
+//
+// A sequence that owns its whole history keeps the vendored pack, exactly as
+// before GitHub #190. One holding a shared prefix is materialized: the
+// prefix chain's pages first, then its own, in block-table order -- the same
+// bytes the vendored pack would have written had the sequence owned them.
+void pack_logical_pages(const ignis_seq_pool &pool, const ignis_seq &seq, std::uint32_t count,
+                        void *dst) {
+  if (seq.prefix == nullptr) {
+    ninfer::pack_paged_kv_allocation_to_host(seq.kv, pool.kv_pool, count, dst, nullptr);
+    return;
+  }
+  std::vector<std::int32_t> pages = ignis_seq_prefix_chain_page_ids(seq.prefix);
+  const auto own = seq.kv.page_ids();
+  pages.insert(pages.end(), own.begin(), own.end());
+  if (count > pages.size()) {
+    throw std::logic_error("snapshot extent exceeds the sequence's logical pages");
+  }
+  pages.resize(count);
+  ignis_seq_pack_pages_to_host(pool, pages, nullptr, dst);
+}
+
+} // namespace
+
+// Not in the anonymous namespace: kernel/src/seq_checkpoint.cu materializes
+// a checkpoint into the same blob layout (GitHub #190), and one definition of
+// that layout is what keeps a spilled checkpoint restorable by
+// ignis_seq_restore.
+
+std::uint64_t ignis_seq_section_offset(const std::vector<ignis_seq_section> &sections,
+                                       int32_t kind) {
+  for (const ignis_seq_section &section : sections) {
+    if (section.kind == kind) {
+      return section.offset;
+    }
+  }
+  throw std::logic_error(std::string("state-section table has no ") +
+                         ignis_seq_section_name(kind) + " section");
+}
+
+// Zero the bytes of `dst` that no section's payload covers: the gap after
+// the header and records, and each section's alignment padding.
+//
+// Only a few hundred bytes in total, but they are part of the blob's extent,
+// so a blob written into a reused buffer would otherwise carry whatever the
+// previous occupant left in its gaps. Two snapshots of the same sequence
+// have to be the same bytes -- the leaf's own round-trip test says so by
+// comparing them -- and that has to be true of a recycled host region as
+// much as of a fresh one.
+void ignis_seq_zero_blob_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
+                              std::uint64_t total_bytes) {
+  std::uint64_t cursor = sizeof(ignis_seq_snapshot_header) +
+                         sections.size() * sizeof(ignis_seq_section);
+  for (const ignis_seq_section &section : sections) {
+    if (section.offset > cursor) {
+      std::memset(base + cursor, 0, static_cast<std::size_t>(section.offset - cursor));
+    }
+    cursor = section.offset + section.bytes;
+  }
+  if (total_bytes > cursor) {
+    std::memset(base + cursor, 0, static_cast<std::size_t>(total_bytes - cursor));
+  }
+}
+
+void ignis_seq_copy_to_host(void *dst, const void *src, std::size_t bytes, const char *what) {
+  checked_memcpy_async(dst, src, bytes, cudaMemcpyDeviceToHost, what);
+}
+
+std::vector<std::int32_t> ignis_seq_prefix_chain_page_ids(const ignis_seq_prefix *head) {
+  std::vector<const ignis_seq_prefix *> chain;
+  for (const ignis_seq_prefix *at = head; at != nullptr; at = at->parent) {
+    chain.push_back(at);
+  }
+  std::vector<std::int32_t> pages;
+  for (auto at = chain.rbegin(); at != chain.rend(); ++at) {
+    const auto ids = (*at)->kv.page_ids();
+    pages.insert(pages.end(), ids.begin(), ids.end());
+  }
+  return pages;
+}
+
+void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
+                                  const std::vector<std::int32_t> &pages, const void *tail_page,
+                                  void *dst) {
+  if (pool.kv_pool.plane_order() != ninfer::PagedKVPlaneOrder::PageMajor) {
+    throw std::logic_error("materialized snapshots require a PageMajor KV pool");
+  }
+  auto *out = static_cast<unsigned char *>(dst);
+  std::size_t tail_offset = 0;
+  for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+    const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+    const std::size_t bytes     = static_cast<std::size_t>(plane.nb[3]);
+    const auto *base            = static_cast<const unsigned char *>(plane.data);
+    // One copy per run of consecutive pages, the way the vendored pack
+    // coalesces them: a chain and a sequence's own allocation are each
+    // usually one run, so a materialized blob costs a handful of copies per
+    // plane rather than one per page.
+    std::size_t begin = 0;
+    while (begin < pages.size()) {
+      std::size_t end = begin + 1;
+      while (end < pages.size() && pages[end] == pages[end - 1] + 1) {
+        ++end;
+      }
+      checked_memcpy_async(out, base + static_cast<std::int64_t>(pages[begin]) * plane.nb[3],
+                           (end - begin) * bytes, cudaMemcpyDeviceToHost, "materialized KV pages");
+      out += (end - begin) * bytes;
+      begin = end;
+    }
+    if (tail_page != nullptr) {
+      checked_memcpy_async(out, static_cast<const unsigned char *>(tail_page) + tail_offset, bytes,
+                           cudaMemcpyDeviceToHost, "checkpoint tail page");
+      out += bytes;
+    }
+    tail_offset += bytes;
+  }
+}
+
+namespace {
 
 // Why `header` cannot be restored into `seq` of `pool`, or an empty string
 // if it can.
@@ -540,10 +621,6 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
     return -1;
   }
-  if (const char *refusal = shared_prefix_refusal(*seq)) {
-    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
-    return IGNIS_SEQ_ERR_SHARED_PREFIX;
-  }
   if (seq->rope_delta != 0) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
               " carries a multimodal rope delta, which the snapshot blob does not record yet");
@@ -575,10 +652,6 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
     return -1;
-  }
-  if (const char *refusal = shared_prefix_refusal(*seq)) {
-    set_error(std::string("ignis_seq_snapshot: ") + refusal);
-    return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
   if (seq->rope_delta != 0) {
     set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
@@ -612,14 +685,14 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
     std::memcpy(base, &header, sizeof(header));
     std::memcpy(base + sizeof(header), sections.data(),
                 sections.size() * sizeof(ignis_seq_section));
-    zero_blob_gaps(base, sections, header.total_bytes);
-    const std::uint64_t recurrent_at = section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT);
+    ignis_seq_zero_blob_gaps(base, sections, header.total_bytes);
+    const std::uint64_t recurrent_at = ignis_seq_section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT);
 
     for (const ignis_seq_section &section : sections) {
       unsigned char *at = base + section.offset;
       switch (section.kind) {
       case IGNIS_SEQ_SECTION_KV_PAGES:
-        ninfer::pack_paged_kv_allocation_to_host(seq->kv, pool->kv_pool, pages, at, nullptr);
+        pack_logical_pages(*pool, *seq, pages, at);
         break;
       case IGNIS_SEQ_SECTION_GDN_CONV:
         // The vendored state pool moves a slot's conv taps and recurrent
@@ -723,7 +796,7 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
       return IGNIS_SEQ_ERR_BAD_SNAPSHOT;
     }
 
-    const std::uint64_t recurrent_at = section_offset(records, IGNIS_SEQ_SECTION_GDN_RECURRENT);
+    const std::uint64_t recurrent_at = ignis_seq_section_offset(records, IGNIS_SEQ_SECTION_GDN_RECURRENT);
     ignis_seq_progress_image image{};
     for (const ignis_seq_section &section : records) {
       const unsigned char *at = base + section.offset;

@@ -62,10 +62,12 @@
 //! tiers in order with each one's restore floor. None of those need the shape
 //! here to change.
 
+use std::time::Instant;
+
 use crate::gdn::GdnState;
 use crate::identity::{BlobHeader, BlobIdentity, IdentityMismatch, MatchKey, PromptContent};
 use crate::prefix::PrefixId;
-use crate::types::RequestId;
+use crate::types::{RequestClass, RequestId};
 
 /// An opaque handle to a retained prompt checkpoint.
 pub type CheckpointId = u64;
@@ -98,6 +100,11 @@ pub enum ReuseSource {
 }
 
 impl ReuseSource {
+    /// Every tier ignis can name, cheapest first — the order
+    /// [`ReuseSource::index`] numbers them in, so a per-tier table is an
+    /// array rather than a branch at every site that reads it.
+    pub const ALL: [ReuseSource; 2] = [ReuseSource::Device, ReuseSource::KvRam];
+
     /// The request log's wire spelling (`device` / `kv_ram`). The gate spec
     /// maps these onto ninfer's `vram_resident` / `host_ram`.
     pub fn as_str(self) -> &'static str {
@@ -106,7 +113,66 @@ impl ReuseSource {
             ReuseSource::KvRam => "kv_ram",
         }
     }
+
+    /// This tier's position in [`ReuseSource::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            ReuseSource::Device => 0,
+            ReuseSource::KvRam => 1,
+        }
+    }
 }
+
+/// A set of [`ReuseSource`]s: which tiers a lookup found nothing in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TierSet(u8);
+
+impl TierSet {
+    pub fn insert(&mut self, source: ReuseSource) {
+        self.0 |= 1 << source.index();
+    }
+
+    pub fn contains(self, source: ReuseSource) -> bool {
+        self.0 & (1 << source.index()) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The members, cheapest tier first.
+    pub fn iter(self) -> impl Iterator<Item = ReuseSource> {
+        ReuseSource::ALL.into_iter().filter(move |&source| self.contains(source))
+    }
+}
+
+/// What happened to retained state in one residency tier (GitHub #190) — the
+/// lifecycle facts the scheduler reports, each a count of one:
+///
+/// - **Hit**: a request chose a retained checkpoint in this tier to resume
+///   from. Chosen, not yet restored: its prefill has not run.
+/// - **Miss**: a request's first chunk landed with nothing in this tier
+///   matching its prompt. Counted at the chunk rather than at the lookup,
+///   because a request waiting for room looks again on every tick.
+/// - **Spill**: a checkpoint the device gave up was written into this tier.
+/// - **Discard**: a checkpoint left this tier for nowhere.
+/// - **Restore**: a claimant's prefill landed on a checkpoint from this tier.
+///   A hit whose prefill never lands is a hit without a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedStateOperation {
+    Hit,
+    Miss,
+    Spill,
+    Discard,
+    Restore,
+}
+
+/// KV-RAM's **restore floor** (ADR 0029): a checkpoint in KV-RAM is used only
+/// when it reuses at least one prefill chunk more than the best reuse still
+/// on the device. A fixed starting value, not a derived one — the crossing
+/// costs a host-to-device restore the device path does not pay, and this is
+/// the guess at its price until a trace replay measures it.
+pub const KV_RAM_RESTORE_FLOOR_TOKENS: u32 = 1024;
 
 /// One residency tier in the ordered list retained state lives across
 /// (CONTEXT.md, "Residency tier"; GitHub #189).
@@ -155,6 +221,21 @@ impl TierList {
             source: ReuseSource::Device,
             restore_floor_tokens: 0,
         }])
+    }
+
+    /// The two tiers built by ADR 0029: device, then KV-RAM, which has to beat
+    /// the device by [`KV_RAM_RESTORE_FLOOR_TOKENS`].
+    pub fn device_and_kv_ram() -> Self {
+        Self::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: KV_RAM_RESTORE_FLOOR_TOKENS,
+            },
+        ])
     }
 
     /// An explicit ordered list, cheapest tier first.
@@ -228,7 +309,7 @@ impl TierList {
             return false;
         };
         let Some((best_source, best_tokens)) = best else {
-            return true;
+            return rank == 0 || tokens >= self.0[rank].restore_floor_tokens;
         };
         match self.rank(best_source) {
             None => true,
@@ -313,6 +394,15 @@ pub struct CheckpointEntry {
     /// The scheduling tick this entry was last captured or claimed at — the
     /// LRU order [`CheckpointPool::discard_victim`] discards in.
     pub use_tick: u64,
+    /// When this entry was last captured or claimed, in wall time. The tick
+    /// orders entries; this says how long the conversation has been idle,
+    /// which a tick cannot — nothing ticks while the engine is idle. KV-RAM
+    /// reads it to expire an Interactive entry's priority (GitHub #190).
+    pub used_at: Instant,
+    /// The class of the request that captured the entry: the priority it
+    /// keeps once it is a bet rather than a request (ADR 0023's class order,
+    /// carried because the request itself is long gone when KV-RAM ranks it).
+    pub class: RequestClass,
 }
 
 impl CheckpointEntry {
@@ -369,6 +459,10 @@ pub struct CheckpointCapture {
     /// wrong `true` retires a lineage's turn opener and sends the next user
     /// message cold.
     pub turn_opening: bool,
+    /// The capturing request's class.
+    pub class: RequestClass,
+    /// When the capture was taken.
+    pub captured_at: Instant,
 }
 
 /// What [`CheckpointPool::retain`] did: the new entry, and the entries of its
@@ -440,6 +534,36 @@ pub struct CheckpointMatch {
     pub pages: u32,
     /// The GDN state to resume from.
     pub gdn: GdnState,
+}
+
+/// What one prompt matches in each residency tier — the longest matching
+/// entry per tier, before any tier is weighed against another.
+///
+/// Kept per tier rather than collapsed to one answer because the scheduler has
+/// a device match this pool cannot see: a sibling or retained **prefix**. A
+/// KV-RAM checkpoint has to beat *that* by its restore floor too, and only the
+/// scheduler can put the two side by side ([`CheckpointPool::select`]).
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointLookup {
+    longest: [Option<CheckpointMatch>; ReuseSource::ALL.len()],
+}
+
+impl CheckpointLookup {
+    /// The longest match in `source`, or `None`.
+    pub fn longest_in(&self, source: ReuseSource) -> Option<&CheckpointMatch> {
+        self.longest[source.index()].as_ref()
+    }
+
+    /// The tiers of `tiers` in which nothing matched.
+    pub fn misses(&self, tiers: &TierList) -> TierSet {
+        let mut missed = TierSet::default();
+        for tier in tiers.tiers() {
+            if self.longest_in(tier.source).is_none() {
+                missed.insert(tier.source);
+            }
+        }
+        missed
+    }
 }
 
 /// The byte-budgeted device pool of retained prompt checkpoints (ADR 0029,
@@ -553,7 +677,7 @@ impl CheckpointPool {
     pub fn retained_pages(&self) -> u32 {
         let mut counted: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
         let mut pages = 0;
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|entry| entry.tier == ReuseSource::Device) {
             if counted.contains(&entry.prefix) {
                 continue;
             }
@@ -566,7 +690,7 @@ impl CheckpointPool {
     /// The distinct shared prefixes the retained entries stand on.
     pub fn retained_prefixes(&self) -> Vec<PrefixId> {
         let mut out: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|entry| entry.tier == ReuseSource::Device) {
             if !out.contains(&entry.prefix) {
                 out.push(entry.prefix);
             }
@@ -580,7 +704,10 @@ impl CheckpointPool {
     /// caller asking "would giving these up return the pages" has to compare
     /// this against the prefix's own refcount rather than assume one holder.
     pub fn retained_holders(&self, prefix: PrefixId) -> u32 {
-        self.entries.iter().filter(|e| e.prefix == prefix).count() as u32
+        self.entries
+            .iter()
+            .filter(|e| e.tier == ReuseSource::Device && e.prefix == prefix)
+            .count() as u32
     }
 
     /// Whether a checkpoint over exactly the content `key` names is already
@@ -635,7 +762,7 @@ impl CheckpointPool {
             self.refused_blobs += 1;
             return Err(RetainRefused::UnknownTier(capture.tier));
         }
-        if !self.admits(capture.bytes) {
+        if capture.tier == ReuseSource::Device && !self.admits(capture.bytes) {
             self.skipped_captures += 1;
             return Err(RetainRefused::Budget);
         }
@@ -658,7 +785,9 @@ impl CheckpointPool {
         };
         let id = self.next_id;
         self.next_id += 1;
-        self.used_bytes += capture.bytes;
+        if capture.tier == ReuseSource::Device {
+            self.used_bytes += capture.bytes;
+        }
         self.captures += 1;
         self.entries.push(CheckpointEntry {
             id,
@@ -674,6 +803,8 @@ impl CheckpointPool {
             lineage,
             turn_opening: capture.turn_opening,
             use_tick,
+            used_at: capture.captured_at,
+            class: capture.class,
         });
         Ok(Retained {
             id,
@@ -725,7 +856,7 @@ impl CheckpointPool {
     /// scheduler has to weigh this match against a *sibling prefix* match
     /// before it takes either — longest reuse wins, and a losing match must
     /// leave no trace in the LRU order or the reuse counter.
-    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
+    pub fn lookup(&self, prompt: &PromptContent<'_>) -> CheckpointLookup {
         let length = prompt.tokens();
         // An entry longer than the prompt cannot be a prefix of it, and one
         // this load would refuse to write must never be offered.
@@ -735,33 +866,71 @@ impl CheckpointPool {
             .filter(|e| e.tokens <= length && self.identity.accepts(&e.identity).is_ok())
             .collect();
         if candidates.is_empty() {
-            return None;
+            return CheckpointLookup::default();
         }
         // One forward pass over the prompt answers every candidate's length —
         // the reason the key is a chain rather than a digest of the whole.
         let lengths: Vec<u32> = candidates.iter().map(|e| e.tokens).collect();
         let keys = prompt.keys_at(&lengths);
-        let mut best: Option<&CheckpointEntry> = None;
-        for tier in self.tiers.tiers() {
-            for (n, entry) in candidates.iter().enumerate() {
-                if entry.tier != tier.source || entry.key != keys[n] {
-                    continue;
-                }
-                let standing = best.map(|b| (b.tier, b.tokens));
-                if self.tiers.replaces(tier.source, entry.tokens, standing) {
-                    best = Some(entry);
-                }
+        let mut lookup = CheckpointLookup::default();
+        for (n, entry) in candidates.iter().enumerate() {
+            if self.tiers.rank(entry.tier).is_none() || entry.key != keys[n] {
+                continue;
+            }
+            let longest = &mut lookup.longest[entry.tier.index()];
+            if longest.as_ref().is_none_or(|m| entry.tokens > m.tokens) {
+                *longest = Some(CheckpointMatch {
+                    id: entry.id,
+                    publisher: entry.publisher,
+                    source: entry.tier,
+                    prefix: entry.prefix,
+                    tokens: entry.tokens,
+                    pages: entry.pages,
+                    gdn: entry.gdn.clone(),
+                });
             }
         }
-        best.map(|best| CheckpointMatch {
-            id: best.id,
-            publisher: best.publisher,
-            source: best.tier,
-            prefix: best.prefix,
-            tokens: best.tokens,
-            pages: best.pages,
-            gdn: best.gdn.clone(),
-        })
+        lookup
+    }
+
+    /// The checkpoint `lookup` should resume from, given that a **prefix** of
+    /// `device_prefix_tokens` is also available on the device, or `None`.
+    ///
+    /// "Best" is the [`TierList`]'s answer: longest reuse wins inside a tier,
+    /// a tier above wins a tie, and a tier below has to clear its own restore
+    /// floor over the best reuse above it — the prefix included, because a
+    /// KV-RAM restore that beats a device checkpoint but not a device prefix
+    /// by a chunk pays the crossing for nothing. The prefix is not weighed
+    /// against a *device* checkpoint here: the scheduler already claims a
+    /// prefix only when it reaches strictly further than the checkpoint.
+    pub fn select(
+        &self,
+        lookup: &CheckpointLookup,
+        device_prefix_tokens: u32,
+    ) -> Option<CheckpointMatch> {
+        let device_prefix = (device_prefix_tokens > 0)
+            .then_some((ReuseSource::Device, device_prefix_tokens));
+        let mut best: Option<&CheckpointMatch> = None;
+        for tier in self.tiers.tiers() {
+            let Some(candidate) = lookup.longest_in(tier.source) else {
+                continue;
+            };
+            let standing = best.map(|b| (b.source, b.tokens));
+            let beats_prefix = tier.source == ReuseSource::Device
+                || device_prefix.is_none()
+                || self.tiers.replaces(tier.source, candidate.tokens, device_prefix);
+            if beats_prefix && self.tiers.replaces(tier.source, candidate.tokens, standing) {
+                best = Some(candidate);
+            }
+        }
+        best.cloned()
+    }
+
+    /// [`CheckpointPool::lookup`] and [`CheckpointPool::select`] with no
+    /// device prefix to weigh — a pure query that decides nothing and changes
+    /// nothing.
+    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
+        self.select(&self.lookup(prompt), 0)
     }
 
     /// Record that `id` was claimed: refresh its LRU tick and count the
@@ -770,20 +939,26 @@ impl CheckpointPool {
     /// **Non-consuming**: the entry stays. N claimants of one checkpoint all
     /// hit (ADR 0029) — which is what makes regenerate, retry and two forks
     /// of one history free rather than a race.
-    pub fn record_claim(&mut self, id: CheckpointId, use_tick: u64) {
+    pub fn record_claim(&mut self, id: CheckpointId, use_tick: u64, used_at: Instant) {
         let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) else {
             return;
         };
         entry.use_tick = use_tick;
+        entry.used_at = used_at;
         self.reused_tok += u64::from(entry.tokens);
     }
 
     /// [`CheckpointPool::best_match`] followed by
     /// [`CheckpointPool::record_claim`], for a caller with nothing to weigh
     /// the match against.
-    pub fn claim(&mut self, prompt: &PromptContent<'_>, use_tick: u64) -> Option<CheckpointMatch> {
+    pub fn claim(
+        &mut self,
+        prompt: &PromptContent<'_>,
+        use_tick: u64,
+        used_at: Instant,
+    ) -> Option<CheckpointMatch> {
         let matched = self.best_match(prompt)?;
-        self.record_claim(matched.id, use_tick);
+        self.record_claim(matched.id, use_tick, used_at);
         Some(matched)
     }
 
@@ -824,21 +999,58 @@ impl CheckpointPool {
         tier: ReuseSource,
         prefixes: Option<&[PrefixId]>,
     ) -> Option<CheckpointEntry> {
-        let pos = self
+        let id = self.victim_in(tier, prefixes)?.id;
+        self.discard(id)
+    }
+
+    /// Peek at the least-recently-used entry in one tier without changing
+    /// accounting. The scheduler prices and attempts a spill before deciding
+    /// whether that entry is demoted or discarded.
+    pub fn victim_in(
+        &self,
+        tier: ReuseSource,
+        prefixes: Option<&[PrefixId]>,
+    ) -> Option<CheckpointEntry> {
+        self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| e.tier == tier)
-            .filter(|(_, e)| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
-            .min_by_key(|(_, e)| (e.use_tick, e.id))
-            .map(|(i, _)| i)?;
-        Some(self.remove_at(pos))
+            .filter(|e| e.tier == tier)
+            .filter(|e| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
+            .min_by_key(|e| (e.use_tick, e.id))
+            .cloned()
     }
 
     /// Discard the entry `id`, if it is still retained.
     pub fn discard(&mut self, id: CheckpointId) -> Option<CheckpointEntry> {
         let pos = self.entries.iter().position(|e| e.id == id)?;
         Some(self.remove_at(pos))
+    }
+
+    /// Move an existing entry down the configured residency order.
+    ///
+    /// The metadata stays in this pool so content matching and lineage do not
+    /// change when the bytes move. Device accounting is returned immediately;
+    /// the lower tier owns and budgets the materialized blob separately. A
+    /// move is not a use: the entry's LRU tick and idle time stay what its
+    /// last capture or claim made them.
+    pub fn move_to_tier(
+        &mut self,
+        id: CheckpointId,
+        tier: ReuseSource,
+        bytes: u64,
+    ) -> Result<(), RetainRefused> {
+        if self.tiers.rank(tier).is_none() {
+            return Err(RetainRefused::UnknownTier(tier));
+        }
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return Ok(());
+        };
+        if entry.tier == ReuseSource::Device {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
+        entry.tier = tier;
+        entry.bytes = bytes;
+        Ok(())
     }
 
     /// Cumulative prompt tokens claimants skipped through a retained
@@ -863,7 +1075,9 @@ impl CheckpointPool {
 
     fn remove_at(&mut self, pos: usize) -> CheckpointEntry {
         let entry = self.entries.remove(pos);
-        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        if entry.tier == ReuseSource::Device {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
         self.discards += 1;
         entry
     }
@@ -979,6 +1193,8 @@ mod tests {
             tier: ReuseSource::Device,
             claimed: None,
             turn_opening: true,
+            class: RequestClass::Interactive,
+            captured_at: Instant::now(),
         };
         pool.retain(capture, tick).map(|retained| retained.id)
     }
@@ -989,7 +1205,7 @@ mod tests {
         tokens: &[TokenId],
         tick: u64,
     ) -> Option<CheckpointMatch> {
-        pool.claim(&PromptContent::text(tokens), tick)
+        pool.claim(&PromptContent::text(tokens), tick, Instant::now())
     }
 
     #[test]
@@ -1193,6 +1409,8 @@ mod tests {
                 tier: ReuseSource::Device,
                 claimed: None,
                 turn_opening: true,
+                class: RequestClass::Interactive,
+                captured_at: Instant::now(),
             };
             let _ = pool.retain(capture, publisher).unwrap();
         }
@@ -1260,6 +1478,8 @@ mod tests {
             tier: ReuseSource::Device,
             claimed: None,
             turn_opening: true,
+            class: RequestClass::Interactive,
+            captured_at: Instant::now(),
         };
         let refused = pool.retain(foreign, 1).expect_err("another artifact");
         assert_eq!(
@@ -1350,19 +1570,21 @@ mod tests {
             tier: ReuseSource::Device,
             claimed: None,
             turn_opening: true,
+            class: RequestClass::Interactive,
+            captured_at: Instant::now(),
         };
         let _ = pool.retain(capture, 1).unwrap();
         let longer: Vec<TokenId> = (1..=140).collect();
         assert!(
-            pool.claim(&PromptContent::new(&longer, &yours), 2).is_none(),
+            pool.claim(&PromptContent::new(&longer, &yours), 2, Instant::now()).is_none(),
             "another image is another conversation"
         );
         assert!(
-            pool.claim(&PromptContent::text(&longer), 3).is_none(),
+            pool.claim(&PromptContent::text(&longer), 3, Instant::now()).is_none(),
             "and no image at all is a third one"
         );
         assert!(
-            pool.claim(&PromptContent::new(&longer, &mine), 4).is_some(),
+            pool.claim(&PromptContent::new(&longer, &mine), 4, Instant::now()).is_some(),
             "the same image still matches"
         );
     }
@@ -1414,6 +1636,11 @@ mod tests {
             },
         ]);
         let device_best = Some((ReuseSource::Device, 4_000));
+        assert!(
+            !tiers.replaces(ReuseSource::KvRam, 1_023, None),
+            "without a device match the lower tier still has to pay its crossing cost"
+        );
+        assert!(tiers.replaces(ReuseSource::KvRam, 1_024, None));
         assert!(
             !tiers.replaces(ReuseSource::KvRam, 4_000, device_best),
             "a tie goes to the device"
@@ -1492,6 +1719,8 @@ mod tests {
                 tier,
                 claimed: None,
                 turn_opening: true,
+                class: RequestClass::Interactive,
+                captured_at: Instant::now(),
             };
             let _ = pool.retain(capture, publisher).unwrap();
         }
@@ -1525,6 +1754,8 @@ mod tests {
             tier: ReuseSource::KvRam,
             claimed: None,
             turn_opening: true,
+            class: RequestClass::Interactive,
+            captured_at: Instant::now(),
         };
         assert_eq!(
             pool.retain(capture, 1).err(),
@@ -1550,5 +1781,65 @@ mod tests {
             ..header
         };
         assert!(pool.accepts(&stale).is_err());
+    }
+
+    #[test]
+    fn spilling_an_entry_returns_its_device_budget_without_forgetting_it() {
+        let mut pool = CheckpointPool::with_tiers(IMAGE, load(1), TierList::device_and_kv_ram());
+        let prompt: Vec<TokenId> = (1..=2048).collect();
+        let id = retain(&mut pool, 1, &prompt, 1, 1).unwrap();
+
+        pool.move_to_tier(id, ReuseSource::KvRam, IMAGE * 8)
+            .expect("KV-RAM is in this pool's tier list");
+
+        assert_eq!(pool.used_bytes(), 0, "the image left the device");
+        let entry = pool.entries().iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(entry.tier, ReuseSource::KvRam);
+        assert_eq!(entry.bytes, IMAGE * 8, "the lower tier charges the materialized blob");
+        assert_eq!(entry.use_tick, 1, "a move is not a use");
+        assert_eq!(
+            pool.best_match(&PromptContent::text(&prompt)).unwrap().source,
+            ReuseSource::KvRam,
+            "the metadata remains matchable after the device image is gone"
+        );
+    }
+
+    #[test]
+    fn a_kv_ram_checkpoint_has_to_beat_every_device_reuse_by_its_floor_a_prefix_included() {
+        // GitHub #190: the floor is the price of the bus crossing, and a
+        // device *prefix* saves that crossing as surely as a device
+        // checkpoint does.
+        let mut pool = CheckpointPool::with_tiers(IMAGE * 4, load(1), TierList::device_and_kv_ram());
+        let prompt: Vec<TokenId> = (1..=4_000).collect();
+        let spilled = retain(&mut pool, 1, &prompt[..2_100], 1, 1).unwrap();
+        pool.move_to_tier(spilled, ReuseSource::KvRam, IMAGE).unwrap();
+        let lookup = pool.lookup(&PromptContent::text(&prompt));
+
+        assert_eq!(
+            pool.select(&lookup, 0).map(|m| m.source),
+            Some(ReuseSource::KvRam),
+            "nothing on the device: 2100 tokens clear the floor on their own"
+        );
+        assert_eq!(
+            pool.select(&lookup, 1_076).map(|m| m.source),
+            Some(ReuseSource::KvRam),
+            "2100 is exactly the floor past a 1076-token prefix"
+        );
+        assert!(
+            pool.select(&lookup, 1_077).is_none(),
+            "one token more on the device and the prefix is the better reuse"
+        );
+
+        // With a device checkpoint too, the KV-RAM entry that loses to the
+        // prefix leaves the device checkpoint standing.
+        retain(&mut pool, 2, &prompt[..1_500], 1, 2).unwrap();
+        let lookup = pool.lookup(&PromptContent::text(&prompt));
+        let chosen = pool.select(&lookup, 1_200).unwrap();
+        assert_eq!((chosen.source, chosen.tokens), (ReuseSource::Device, 1_500));
+        assert_eq!(
+            lookup.misses(pool.tiers()),
+            TierSet::default(),
+            "both tiers matched something"
+        );
     }
 }

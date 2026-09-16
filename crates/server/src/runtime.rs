@@ -49,6 +49,9 @@ pub struct EngineShape {
     /// VRAM left once the model and its pools have landed, which only the
     /// loaded leaf can report.
     pub retained_pool_bytes: Option<u64>,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority (`--retained-interactive-ttl`, GitHub #190).
+    pub retained_interactive_ttl: std::time::Duration,
     /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
     /// `None` binds nothing of the drafter.
     pub speculation: Option<ignis_core::Speculation>,
@@ -73,6 +76,7 @@ impl Default for EngineShape {
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
             retained_pool_bytes: None,
+            retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
         }
@@ -89,6 +93,9 @@ impl From<&crate::config::Config> for EngineShape {
             host_pool_bytes: config.host_pool_bytes,
             prompt_reuse: config.prompt_reuse,
             retained_pool_bytes: config.retained_pool_bytes,
+            retained_interactive_ttl: std::time::Duration::from_secs(u64::from(
+                config.retained_interactive_ttl_secs,
+            )),
             speculation: config.speculation,
             vision: config.vision,
         }
@@ -112,6 +119,7 @@ fn scheduler_config_for_shape(
         serving_chunk_tokens: shape.prefill_chunk,
         prompt_reuse: shape.prompt_reuse,
         retained_pool_bytes,
+        retained_interactive_ttl: shape.retained_interactive_ttl,
         ..SchedulerConfig::default()
     }
 }
@@ -379,6 +387,7 @@ mod tests {
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: true,
             retained_pool_bytes: None,
+            retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,
         };
@@ -391,6 +400,8 @@ mod tests {
         // derived from free VRAM), never re-derived here.
         assert!(config.prompt_reuse);
         assert_eq!(config.retained_pool_bytes, 4_096);
+        // GitHub #190: and so does the Interactive TTL.
+        assert_eq!(config.retained_interactive_ttl, std::time::Duration::from_secs(60));
     }
 
     #[test]

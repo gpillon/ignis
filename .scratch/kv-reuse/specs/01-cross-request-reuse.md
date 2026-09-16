@@ -180,18 +180,24 @@ this today (verified 2026-09-15):
 ### Retained state in KV-RAM (slice 4)
 
 - **Spill.** When the device releases retained state (first-victim path),
-  it is snapshotted into KV-RAM if the byte budget can take it, and discarded
-  otherwise. There is no eager copy.
+  it is snapshotted into KV-RAM if the byte budget can take it — discarding,
+  for it, only retained entries that rank strictly below it, planned before
+  anything goes — and discarded otherwise. There is no eager copy. (#190, owner
+  decision 2026-09-16; ADR 0023 amendment. Only prompt checkpoints spill so
+  far: a retained prefix the device gives up is still discarded.)
 - **Materialized blobs.** A snapshot of a sequence or checkpoint holding a
   shared prefix materializes the shared pages (ADR 0024 amendment). The leaf
   refusal code for that case goes away.
 - **Discard ordering** (ADR 0023 amendment): retained entries before evicted
   live sequences; then class, probation/protected, LRU. A retained entry
   carries its producer's class. A restore promotes the entry to protected,
-  as today.
+  as today, once it lands. An Interactive entry idle past
+  `--retained-interactive-ttl` (default 300 s) ranks as an Agent's probation
+  entry; a structured retention score is #199.
 - **Restore floor.** A KV-RAM match is used only if it reuses at least one
-  prefill chunk (1024 tokens) more than the best device match. This is a
-  fixed starting value, tuned by measurement, not derived.
+  prefill chunk (1024 tokens) more than the best device match — a device
+  prefix included. This is a fixed starting value, tuned by measurement, not
+  derived.
 - **Lifecycle.** A restored retained entry stays in KV-RAM (non-consuming,
   like the device). Rust never interprets the blob; it keeps
   one host allocation per entry.

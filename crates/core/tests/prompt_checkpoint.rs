@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::checkpoint::ReuseSource;
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute, Scheduler,
@@ -700,7 +700,7 @@ fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens } if *request == b && *tokens == 32)),
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens, .. } if *request == b && *tokens == 32)),
         "B claimed A's shared prefix, not a checkpoint"
     );
     assert!(reuses(&events, b).is_empty(), "and no checkpoint matched it");
@@ -1060,9 +1060,9 @@ fn a_retained_entry_never_causes_an_admission_refusal_or_wait() {
         "the control itself must be an uncontended baseline"
     );
     assert_eq!(
-        compute.released_checkpoints().len(),
+        compute.spilled_checkpoints().len(),
         1,
-        "the retained entry was given up — and it is the backend's image that went"
+        "the retained entry was given up by the device — its image went to KV-RAM"
     );
 }
 
@@ -1117,8 +1117,9 @@ fn a_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
     // Once turn N+1 is gone the entry *is* reclaimable, and the first-victim
     // path takes it — the deferral above was about liveness, not a refusal.
     run_to_idle(&mut sched);
-    assert_eq!(compute.released_checkpoints(), vec![0]);
-    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+    assert_eq!(compute.spilled_checkpoints(), vec![0], "off the device, into KV-RAM");
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
 }
 
 // ── GitHub #189: the identity the retained pool holds ───────────────────
@@ -1188,7 +1189,7 @@ fn the_retained_pool_holds_the_identity_the_backend_reports() {
 }
 
 #[test]
-fn a_reclaimed_checkpoint_returns_its_pages_to_the_pool() {
+fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), tight_pool(true));
     let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
@@ -1205,10 +1206,20 @@ fn a_reclaimed_checkpoint_returns_its_pages_to_the_pool() {
     sched
         .submit(input(tokens(2000, 120), None, 8), RequestClass::Interactive)
         .unwrap();
-    run_to_idle(&mut sched);
-    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "reclaimed");
+    let events = run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "retained below the device");
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
+    assert_eq!(sched.checkpoint_pool().used_bytes(), 0, "no device image remains");
     assert_eq!(sched.kv_used_pages(), 0, "and its pages came back");
-    assert_eq!(compute.released_checkpoints(), vec![n]);
+    assert_eq!(compute.spilled_checkpoints(), vec![n], "spilled");
+    assert!(compute.released_checkpoints().is_empty(), "not discarded");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Spill,
+            source: ReuseSource::KvRam,
+        }
+    )));
     assert_eq!(
         compute
             .released_prefixes()
@@ -1219,4 +1230,45 @@ fn a_reclaimed_checkpoint_returns_its_pages_to_the_pool() {
         "the shared pages under it were let go exactly once — the retained \
          entry was the last holder, not a second, uncounted one"
     );
+}
+
+#[test]
+fn a_kv_ram_match_clearing_the_floor_restores_without_shared_page_accounting() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute,
+        SchedulerConfig {
+            model: MODEL.into(),
+            max_sequence_tokens: 1280,
+            kv_capacity_pages: 80,
+            kv_page_tokens: PAGE,
+            ..SchedulerConfig::default()
+        },
+    );
+    let history = tokens(1, 1100);
+    sched
+        .submit(input(history.clone(), Some(1050), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Occupying the entire device pool takes the retained pages back and
+    // spills the 1050-token checkpoint, which clears KV-RAM's 1024-token
+    // restore floor even when there is no device match.
+    sched
+        .submit(input(tokens(5000, 1272), None, 8), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
+
+    let restored = sched
+        .submit(input(history, None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, restored), vec![(ReuseSource::KvRam, 1050, 1)]);
+    assert_eq!(
+        sched.kv_used_pages(),
+        0,
+        "the restored standalone sequence released its fresh pages; the host blob consumes none"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "the KV-RAM restore is non-consuming");
 }

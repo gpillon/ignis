@@ -228,6 +228,18 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     let checkpoint = publisher
         .capture_checkpoint(opener)
         .unwrap_or_else(|e| panic!("capture: {e}"));
+    let mut kv_ram_blob = vec![
+        0u8;
+        usize::try_from(
+            checkpoint
+                .snapshot_bytes()
+                .unwrap_or_else(|e| panic!("checkpoint snapshot size: {e}"))
+        )
+        .expect("snapshot size fits usize")
+    ];
+    checkpoint
+        .snapshot_into(&mut kv_ram_blob)
+        .unwrap_or_else(|e| panic!("checkpoint snapshot: {e}"));
     let stats = checkpoint.stats();
     assert_eq!(stats.tokens, opener, "the checkpoint reaches the opener");
     assert_eq!(stats.pages, publish_at / PAGE, "over the pages below it");
@@ -286,6 +298,33 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         checkpoint.stats().claim_count,
         checkpoint.stats().last_claim_micros / 1000.0
     );
+
+    // ---- KV-RAM: restore the materialized host blob after all it shares
+    //      was copied into it, then take exactly the same tail as the device
+    //      checkpoint claim. It must be the same state, not merely a prompt
+    //      that happens to produce plausible text.
+    let mut host_restored = pool
+        .alloc(MAX_CONTEXT)
+        .unwrap_or_else(|e| panic!("alloc KV-RAM restore target: {e}"));
+    host_restored
+        .restore(&kv_ram_blob)
+        .unwrap_or_else(|e| panic!("restore materialized checkpoint: {e}"));
+    assert_eq!(host_restored.stats().position, u64::from(opener));
+    prefill_program(
+        &model,
+        &pool,
+        &mut host_restored,
+        &prompt[opener as usize..],
+        u64::from(opener),
+        None,
+    )
+    .unwrap_or_else(|e| panic!("KV-RAM reuser tail prefill: {e}"));
+    let host_reused = decode_n(&model, &pool, &mut host_restored, GENERATED, "KV-RAM reuser");
+    assert_eq!(
+        host_reused, expected,
+        "KV-RAM restore must generate exactly what the device checkpoint and split-cold control do"
+    );
+    drop(host_restored);
 
     // ---- the unsplit control: information, not a verdict (ADR 0029).
     let mut unsplit = pool

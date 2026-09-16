@@ -129,7 +129,9 @@ fn prefix_reuses(events: &[SchedEvent], request: RequestId) -> Vec<u32> {
     events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::PrefixReused { request: r, tokens } if *r == request => Some(*tokens),
+            SchedEvent::PrefixReused {
+                request: r, tokens, ..
+            } if *r == request => Some(*tokens),
             _ => None,
         })
         .collect()
@@ -685,10 +687,21 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
         !events.iter().any(|e| matches!(e, SchedEvent::Evicted { .. })),
         "and nothing live was evicted for it"
     );
+    // Went from the *device*, which is the ordering under test. With a
+    // KV-RAM tier below it (GitHub #190) the checkpoint is spilled there
+    // rather than lost, so it is still in the pool — just not on the card.
     assert_eq!(
-        sched.checkpoint_pool().entry_count(),
-        0,
+        compute.spilled_checkpoints().len(),
+        1,
         "the narrow bet went"
+    );
+    assert!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .all(|e| e.tier == ignis_core::checkpoint::ReuseSource::KvRam),
+        "no checkpoint is left on the device"
     );
     assert_eq!(
         sched.prefix_pinned_pages(),
