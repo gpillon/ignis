@@ -127,6 +127,18 @@ inline void ignis_seq_checkpoint_page_transfer(ignis_seq_pool &pool, std::int32_
     }
     packed += bytes;
   }
+  // The sizing function and this loop must agree about what a page costs, or
+  // a capture writes past the buffer it was given. They agree today by
+  // construction -- both read the PageMajor page stride off each plane -- so
+  // this is here for the day one of them stops: a refused capture is a bet
+  // not taken, an overrun is someone else's memory.
+  const std::uint64_t moved    = static_cast<std::uint64_t>(packed - image);
+  const std::uint64_t expected = ignis_seq_checkpoint_page_bytes(pool);
+  if (moved != expected) {
+    throw std::logic_error("prompt checkpoint tail page: moved " + std::to_string(moved) +
+                           " bytes for a page the pool prices at " + std::to_string(expected) +
+                           "; the page layout and its sizing have drifted apart");
+  }
 }
 
 /* Allocate a sequence against `prefix`, cloning the prefix's own mutable

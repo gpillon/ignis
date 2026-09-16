@@ -176,11 +176,17 @@ struct ignis_seq_checkpoint_stats stats_of(const ignis_seq_checkpoint *checkpoin
   return stats;
 }
 
-ignis_seq_pool_spec small_spec() {
+// A small pool in `kv_format`. The head geometry follows the format: hq-e8-2b
+// stores fixed-budget rows at the codec's own 256-wide head (the engine's real
+// one), and it lays a page out over *four* planes per GQA layer against BF16's
+// two -- which is exactly why the claim check below runs against both. A tail
+// page that is copied plane by plane is where a plane set can be got wrong.
+ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
+  const bool hq            = kv_format == IGNIS_KV_FORMAT_HQ_E8_2B;
   ignis_seq_pool_spec spec{};
-  spec.num_kv_heads        = 2;
-  spec.head_dim            = 8;
-  spec.kv_format           = IGNIS_KV_FORMAT_BF16;
+  spec.num_kv_heads        = hq ? 4 : 2;
+  spec.head_dim            = hq ? 256 : 8;
+  spec.kv_format           = kv_format;
   spec.kv_page_group_count = 32;
   spec.max_context_tokens  = 384; // pages_for_tokens(384) == 6
   spec.slot_count          = 4;
@@ -277,8 +283,8 @@ void check_capture_perturbs_nothing() {
 
 // ---- 2. a claimant stands exactly where the capture stood ----------------
 
-void check_claim_reproduces_the_state_at_the_opener() {
-  const ignis_seq_pool_spec spec = small_spec();
+void check_claim_reproduces_the_state_at_the_opener(int32_t kv_format) {
+  const ignis_seq_pool_spec spec = small_spec(kv_format);
   ignis_seq_pool *pool           = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "claim: pool create");
 
@@ -295,8 +301,10 @@ void check_claim_reproduces_the_state_at_the_opener() {
   expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
             "claim: capture");
 
-  // The capturing request goes on and moves its state on, which is exactly
-  // why the checkpoint had to be captured rather than read later.
+  // The capturing request goes on and moves its state on -- including
+  // rewriting the very physical page the checkpoint copied from, which is
+  // exactly why that page has to be *copied* and not shared, and why the
+  // capture had to happen at the opener rather than be read back later.
   set_frontier(*publisher, kOpener + 17);
   dirty_state(*pool, *publisher, 1, 0x99u);
 
@@ -486,7 +494,11 @@ int main() {
     return 1;
   }
   check_capture_perturbs_nothing();
-  check_claim_reproduces_the_state_at_the_opener();
+  // Both KV formats: BF16 is the oracle (ADR 0022), hq-e8-2b is what the
+  // owner actually serves, and only hq exercises the four-plane page layout
+  // the tail-page copy walks.
+  check_claim_reproduces_the_state_at_the_opener(IGNIS_KV_FORMAT_BF16);
+  check_claim_reproduces_the_state_at_the_opener(IGNIS_KV_FORMAT_HQ_E8_2B);
   check_penalty_counts_are_zero_at_the_opener();
   check_lifetime();
   check_refusals();
