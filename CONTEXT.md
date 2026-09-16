@@ -382,22 +382,20 @@ When output names a domain concept, use the term as defined here.
   round). Deferred behind **DFlash2** at G5.
 - **Vision** — multimodal input: images today, video refused until its own
   spec. A load option (`--vision`): without it nothing of the tower is bound
-  or reserved, text serving is unchanged, and a request carrying an image is
-  refused `vision_disabled`. With it, a chat message's content parts may
-  carry images by `data:` URI or HTTP(S) URL; the server **acquires** and
-  prepares each one before admission, the template expands its placeholder
-  into its **vision tokens**, and from there a multimodal request is an
-  ordinary request — chunked and interleaved with decode lanes, speculated by
-  **DFlash2**, sharing prefixes under its **match key**, evicted to and
+  or reserved and text serving is unchanged. With it, a chat message's
+  content parts may carry images by `data:` URI or HTTP(S) URL; the server
+  **acquires** and prepares each one before admission, the template expands
+  its placeholder into its **vision tokens**, and from there a multimodal
+  request is an ordinary request — chunked and interleaved with decode lanes,
+  speculated by **DFlash2**, sharing prefixes under its **match key**, evicted to and
   restored from **KV-RAM** — whose prefill additionally runs a **media
-  encode** per item and whose rounds rotate at its **rope delta**. The
-  reference's wire contract, error codes and preprocessing, byte for byte.
+  encode** per item and whose rounds rotate at its **rope delta**.
 - **Media acquisition** — turning a request's image parts into prepared
   **media items** before it is admitted: decoding a `data:` URI or fetching a
   URL under the media policy (private addresses refused unless
   `--media-allow-private-network`, byte cap, deadline), then preprocessing,
-  memoized by content digest. A refusal (a 400 naming the message and part)
-  is answered before admission; nothing reaches the scheduler.
+  memoized by content digest. A refused image refuses its request before
+  admission; nothing reaches the scheduler.
 - **Media encode** — the prefill step that runs the **vision encoder** over
   one **media item** and leaves its **media embedding** on the device, in the
   first chunk that reaches the item. Its wall time is reported on the

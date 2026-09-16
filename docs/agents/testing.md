@@ -423,31 +423,29 @@ The record names the image (SHA-256, size, question), and `g2` refuses to pair
 cells of one length over different images, or an image cell with a text cell.
 
 A record carrying the image cell cannot be compared with one that has none, so
-measure it as its own record. One session, three engine starts, each
-waited on at `/v1/models` and killed before the next (the script used for the
-first measurement is `.scratch/vision-kv-reuse-run/181/ttft-session.sh`):
+the image cell is measured as its own record. The session is
+`scripts/vision-ttft-session.sh <out-dir>`, run from the repository root on a
+free card after a release build: the reference with `--vision` (the owner's
+hq-e8-2b-262k preset), ignis with `--vision`, and ignis without it, **each
+launched twice** (ADR 0021). Every launch writes a text record (1024, 8192 and
+32768 tokens, cut from the ninfer corpus) and, with vision, an image record;
+`scripts/ttft-pool.py` pools each engine's two launches into one record, and
+`g2` compares the pooled records: image against image, text against text, and
+ignis's text with `--vision` against without. The 1.5 threshold `g2` prints is
+G2's own; for this cell the ratios are error detectors.
 
-```powershell
-$Session = "vision-ttft-$(Get-Date -Format yyyyMMddTHHmmssZ)"
-$Image = "crates/bench/tests/fixtures/vision_ttft/screenshot.png"
-# 1. The reference with --vision (the owner's hq-e8-2b-262k preset): the text
-#    cells, then the image cell, each into its own record.
-ignis-bench ttft --endpoint http://127.0.0.1:8080 --artifact $Artifact --cells 1024,8192,32768 `
-  --corpus $Corpus --label reference --session $Session --out ref-text.json
-ignis-bench ttft --endpoint http://127.0.0.1:8080 --artifact $Artifact --image $Image `
-  --label reference --session $Session --out ref-image.json
-# 2. ignis with --vision: the same two records. 3. ignis without it: text only.
-# Then: g2 image vs image, text vs text, and ignis --vision text vs ignis text.
-```
+**Measure a launch once.** The prompts are fixed — the same nonces, the same
+changed pixels — so a second `ttft` run against a live engine is served from
+its prefix and media caches, and ignis reports no cached tokens for the void
+rule to catch it. Restart the engine instead.
 
-**Watch the card's headroom.** Both ignis loads land at ~29.8 GiB of their own
-at 262,144 context with DFlash2 — the retained pool is derived from the VRAM
-free after load — which leaves well under a gigabyte once the desktop's own
-~2 GiB is counted. The first session of 2026-09-16 ran its `--vision` leg with
-the desktop holding 3.1 GiB: the card went past its 32.6 GiB and every cell
-came back 2-5x slower and erratic (one 32K sample took 41 s), where the rerun
-with 2.0 GiB held measured the same flags at parity. Sample `nvidia-smi` beside
-each leg (the script does) and distrust a leg whose peak reaches the total.
+**Watch the card's headroom.** Both ignis loads at 262,144 context with
+DFlash2 take ~29.8 GiB of their own (the retained pool is derived from what is
+free after load), so the desktop's own VRAM decides whether the card
+oversubscribes; when it does, every cell comes back slower and erratic rather
+than failing. The script samples `nvidia-smi` beside every launch — distrust
+one whose peak reaches the total
+([finding](../findings/2026-09-16-vision-ttft-live-live.md)).
 
 ## The KV-format A/B: 2x2 over engine and format (GitHub #139)
 
