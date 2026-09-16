@@ -170,6 +170,14 @@ this today (verified 2026-09-15):
   presence and draft window. Operator knobs that do not change state are
   excluded (bind, prefill chunk, concurrency, budgets). A mismatch is refused
   before any byte is written into a sequence.
+  - **Departure as built (#189).** The artifact content hash is a digest of
+    the container's *directory* — identity, size, payload start, and every
+    object's name, kind, numeric format, storage layout, shape, offset and
+    length — not of its payload: the v2 container carries no per-tensor
+    digest, and hashing ~19 GB at every startup is not a price this check may
+    charge. It misses only an in-place re-quantization that preserved the
+    whole directory. See ADR 0029 §Consequences; the owner decides whether the
+    proxy stands or the container starts carrying a payload digest.
 - **Match key**: a hash chain over token ids, with media identity (the
   per-item content digest from the vision processor, #176) mixed in at the
   placeholder spans. It is text-only until vision lands, but the key's shape

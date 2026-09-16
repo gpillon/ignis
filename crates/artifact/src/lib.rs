@@ -19,6 +19,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub mod binding;
 pub mod binder;
@@ -987,6 +988,67 @@ impl Reader {
         &self.identity
     }
 
+    /// A content hash of this artifact: the digest retained state names the
+    /// model it was produced by (GitHub #189, ADR 0029).
+    ///
+    /// **Structural, not a hash of the weights.** The v2 container carries no
+    /// per-tensor digest on purpose ([`crate::checksum`]'s module doc), and
+    /// hashing nineteen gigabytes of payload at every startup is not a price
+    /// a compatibility check may charge. What is hashed instead is everything
+    /// the container *declares*: its identity, its size, where its payload
+    /// starts, and every object's name, kind, numeric format, storage layout,
+    /// shape, offset and length — the whole directory, in order.
+    ///
+    /// So it answers "is this the same container", not "are these the same
+    /// weights". A re-quantization that rewrote payload bytes while keeping
+    /// every name, format, shape and offset identical would pass it. That is
+    /// the known limit of this proxy, and it is why the value is a hash of the
+    /// directory rather than the claimed label alone: `model_id` and
+    /// `weights_id` are strings a producer can repeat by accident, while a
+    /// directory that differs anywhere gives a different hash.
+    ///
+    /// Stable across processes, machines and reboots — it reads nothing but
+    /// the directory — which is what makes it usable by a tier meant to
+    /// outlive a server restart.
+    pub fn content_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        // Domain tag: bump it and every old blob becomes a miss, never a
+        // wrong hit.
+        hasher.update(b"ignis-artifact-directory-v1\0");
+        hasher.update(self.identity.model_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.identity.weights_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.file_bytes.to_le_bytes());
+        hasher.update(self.payload_start.to_le_bytes());
+        hasher.update((self.objects.len() as u64).to_le_bytes());
+        for object in &self.objects {
+            hasher.update(object.name().as_bytes());
+            hasher.update([0]);
+            hasher.update(object.kind().as_bytes());
+            hasher.update([0]);
+            hasher.update(object.offset().to_le_bytes());
+            hasher.update(object.bytes().to_le_bytes());
+            match object {
+                Object::Tensor(tensor) => {
+                    hasher.update(tensor.format.name().as_bytes());
+                    hasher.update([0]);
+                    hasher.update(tensor.layout.name().as_bytes());
+                    hasher.update([0]);
+                    hasher.update((tensor.shape.len() as u64).to_le_bytes());
+                    for dim in &tensor.shape {
+                        hasher.update(dim.to_le_bytes());
+                    }
+                }
+                Object::Resource(resource) => {
+                    hasher.update(resource.encoding.name().as_bytes());
+                    hasher.update([0]);
+                }
+            }
+        }
+        hasher.finalize().into()
+    }
+
     /// All directory objects, in physical-offset order.
     pub fn objects(&self) -> &[Object] {
         &self.objects
@@ -1136,6 +1198,94 @@ mod tests {
         payload.extend(vec![0x5Au8; 4096]);
         let file = build_artifact(&directory, &payload);
         (file, vec![0xA5u8; 64], vec![0x5Au8; 4096])
+    }
+
+    // -- content hash (GitHub #189) ------------------------------------------
+
+    /// The content hash of an artifact built from `objects_inner` and
+    /// `payload`.
+    fn hash_of(name: &str, objects_inner: &str, payload: &[u8]) -> [u8; 32] {
+        let file = build_artifact(&dir_with(objects_inner), payload);
+        let mut hash = [0u8; 32];
+        with_artifact_file(name, &file, |path| {
+            hash = Reader::open(path).unwrap().content_hash();
+        });
+        hash
+    }
+
+    /// The two-object directory `valid_two_object_file` builds, as an inner
+    /// string a test can perturb exactly one field of. Every combination the
+    /// tests below use describes the same 64-byte BF16 tensor, so a hash that
+    /// differs differs because the *directory* did.
+    fn two_objects(tensor: &str, shape: &str, offset: u64) -> String {
+        format!(
+            r#"{{ "name":"{tensor}","kind":"tensor","shape":{shape},"format":"BF16",
+                  "layout":"contiguous-le-v1","offset":0,"bytes":64}},
+               {{ "name":"frontend/r","kind":"resource","encoding":"raw-bytes-v1",
+                  "offset":{offset},"bytes":4096 }}"#
+        )
+    }
+
+    #[test]
+    fn the_content_hash_is_the_same_artifact_every_time() {
+        // Retained state produced before a restart has to name the same
+        // artifact after it, or every checkpoint is refused for nothing.
+        let objects = two_objects("t/x", "[4,8]", 64);
+        let mut payload = vec![0xA5u8; 64];
+        payload.extend(vec![0x5Au8; 4096]);
+        let once = hash_of("hash-stable-a", &objects, &payload);
+        let twice = hash_of("hash-stable-b", &objects, &payload);
+        assert_eq!(once, twice, "the directory decides, not the file's name");
+        assert_ne!(once, [0u8; 32], "and it is a real digest");
+    }
+
+    #[test]
+    fn a_different_directory_is_a_different_artifact() {
+        let mut payload = vec![0xA5u8; 64];
+        payload.extend(vec![0x5Au8; 4096]);
+        let baseline = hash_of("hash-base", &two_objects("t/x", "[4,8]", 64), &payload);
+        // A tensor under another name: the binder would place it somewhere
+        // else, so state produced by one load is not state the other's would
+        // have produced.
+        assert_ne!(
+            baseline,
+            hash_of("hash-name", &two_objects("t/y", "[4,8]", 64), &payload),
+            "an object's name is part of the hash"
+        );
+        // The same 64 bytes, a transposed shape — the one perturbation that
+        // changes nothing but the geometry the kernels read.
+        assert_ne!(
+            baseline,
+            hash_of("hash-shape", &two_objects("t/x", "[8,4]", 64), &payload),
+            "a tensor's shape is part of the hash"
+        );
+        // A resource moved: every name, format and size is the same and the
+        // container is laid out differently.
+        let mut moved = vec![0xA5u8; 256];
+        moved.extend(vec![0x5Au8; 4096]);
+        assert_ne!(
+            baseline,
+            hash_of("hash-offset", &two_objects("t/x", "[4,8]", 256), &moved),
+            "an object's offset is part of the hash"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_payload_alone_is_the_proxys_known_limit() {
+        // Documented, not desired: the hash is over the *declared* structure,
+        // so a container whose payload bytes changed while its directory did
+        // not is indistinguishable. Recorded as a test so the limit is a fact
+        // in the suite rather than a sentence in a doc comment.
+        let objects = two_objects("t/x", "[4,8]", 64);
+        let mut original = vec![0xA5u8; 64];
+        original.extend(vec![0x5Au8; 4096]);
+        let mut requantized = vec![0x11u8; 64];
+        requantized.extend(vec![0x22u8; 4096]);
+        assert_eq!(
+            hash_of("hash-payload-a", &objects, &original),
+            hash_of("hash-payload-b", &objects, &requantized),
+            "the directory is what is hashed"
+        );
     }
 
     // -- geometry ------------------------------------------------------------

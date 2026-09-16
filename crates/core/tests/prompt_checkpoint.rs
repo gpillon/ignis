@@ -23,7 +23,10 @@ use std::sync::Arc;
 
 use ignis_core::checkpoint::ReuseSource;
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
-use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
+use ignis_core::{
+    ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute, Scheduler,
+    SchedulerConfig, Speculation, SpeculativeBackend,
+};
 
 const MODEL: &str = "qwen3.8-27b";
 /// The default scheduler's KV page, in tokens.
@@ -883,6 +886,72 @@ fn a_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
     run_to_idle(&mut sched);
     assert_eq!(compute.released_checkpoints(), vec![0]);
     assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+}
+
+// ── GitHub #189: the identity the retained pool holds ───────────────────
+
+#[test]
+fn the_retained_pool_holds_the_identity_the_backend_reports() {
+    // The seam, end to end: the compatibility identity is read from the
+    // backend — only it knows which artifact it loaded and what version its
+    // own blob layout is at — and every entry a capture leaves carries it. A
+    // pool that took its identity from anywhere else could hand a claimant
+    // state this load's kernels never produced.
+    let loaded = BlobIdentity::of_load(
+        ArtifactHash::from_bytes([7; 32]),
+        KvFormat::Bf16,
+        Some(Speculation::new(SpeculativeBackend::Dflash2, 4).unwrap()),
+        2,
+    );
+    let mut sched = scheduler(
+        Arc::new(MockCompute::with_blob_identity(loaded)),
+        config(),
+    );
+    assert_eq!(sched.checkpoint_pool().identity(), loaded);
+
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    let header = sched
+        .checkpoint_pool()
+        .entries()
+        .first()
+        .expect("turn N left a checkpoint")
+        .header();
+    assert_eq!(header.identity, loaded, "the entry names its own load");
+    assert_eq!(
+        sched.checkpoint_pool().accepts(&header),
+        Ok(()),
+        "and this load accepts what it produced"
+    );
+
+    // The same conversation, the same tokens, under a load that binds no
+    // drafter: its per-slot sections are not the ones those bytes were
+    // written for, so the blob is refused rather than restored — and a turn
+    // N+1 there re-prefills its whole prompt, standing on nothing.
+    let elsewhere = BlobIdentity {
+        drafter: None,
+        ..loaded
+    };
+    let other_compute = Arc::new(MockCompute::with_blob_identity(elsewhere));
+    let mut other = scheduler(other_compute.clone(), config());
+    assert_eq!(
+        other
+            .checkpoint_pool()
+            .accepts(&header)
+            .expect_err("another drafter configuration")
+            .field,
+        IdentityField::Drafter
+    );
+    let later = other
+        .submit(turn_n_plus_1(), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut other);
+    assert!(reuses(&events, later).is_empty(), "nothing to stand on");
+    assert_eq!(
+        chunk_widths(&other_compute, later).iter().sum::<usize>(),
+        60,
+        "every token of the prompt was prefilled, not one skipped"
+    );
 }
 
 #[test]
