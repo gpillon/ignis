@@ -32,6 +32,47 @@ use crate::{fail, Object, Reader, Result};
 // per-template capability set a chat template supports.
 // ---------------------------------------------------------------------------
 
+/// The thinking controls a request resolves before a render — the
+/// reference's `ChatRenderOptions` (`chat_template.h`) minus the fields ignis
+/// does not vary.
+///
+/// A struct rather than three positional arguments because two of them are
+/// `bool` and they mean nearly opposite things: `enable_thinking` asks the
+/// model to think *now*, `preserve_thinking` keeps what it thought *before*.
+/// Passed positionally they sat one argument apart, and a swap both compiled
+/// and rendered a plausible prompt — the render would simply have been the
+/// wrong one, on a path whose whole job is that two turns render identically
+/// (GitHub #185, ADR 0029).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatRenderOptions {
+    /// Bound to the template's `enable_thinking`: whether this turn's
+    /// generation prompt opens a think block or a pre-closed empty one.
+    pub enable_thinking: bool,
+    /// Bound to `reasoning_effort` only when `Some` — `None` means "let the
+    /// template's own default apply".
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Bound to `preserve_thinking`: `true` keeps every history assistant
+    /// turn's reasoning, `false` leaves the template's own rule in force,
+    /// which keeps the turns after the last real user query and strips the
+    /// rest. Never left unbound — see
+    /// [`ChatTemplate::render_with_thinking_and_tools`].
+    pub preserve_thinking: bool,
+}
+
+impl Default for ChatRenderOptions {
+    /// Thinking on, the template's own default effort, history reasoning left
+    /// to the template's rule — the server's resolved default
+    /// (`ThinkingOptions::default`), which is the default the reference
+    /// serves too.
+    fn default() -> Self {
+        Self {
+            enable_thinking: true,
+            reasoning_effort: None,
+            preserve_thinking: false,
+        }
+    }
+}
+
 /// The protocol's full `reasoning_effort` vocabulary (the reference's wire
 /// contract). Not every value is supported by every template — see
 /// [`ThinkingCapabilities`].
@@ -428,6 +469,20 @@ impl ChatTemplate {
     /// "which default won" ambiguity. `reasoning_effort` is bound only when
     /// `effort` is `Some` — an unresolved effort means "let the template's
     /// own default apply".
+    ///
+    /// **Single-turn only.** This variant leaves `preserve_thinking`
+    /// undefined, and undefined is not a neutral default: the Qwen 3.8
+    /// template's assistant branch reads `preserve_thinking is undefined or
+    /// preserve_thinking is true or …`, so a conversation rendered here keeps
+    /// a think block on *every* history assistant turn — which is the defect
+    /// GitHub #182 reported. Its callers are the capability probe below and
+    /// `ignis-bench`'s TTFT cell, both of which render one user message, where
+    /// the variable cannot matter;
+    /// `render_and_render_with_thinking_leave_preserve_thinking_to_the_template`
+    /// pins that state deliberately. A multi-turn caller wants
+    /// [`Self::render_with_thinking_and_tools`] instead — and if one ever
+    /// needs this signature, the fix is to bind the variable here too, not to
+    /// keep the test.
     pub fn render_with_thinking(
         &self,
         messages: &[ChatMessage],
@@ -439,7 +494,9 @@ impl ChatTemplate {
 
     /// [`Self::render_with_thinking`] plus history thinking (GitHub #185) and
     /// tool definitions (GitHub #132) — the variant the request path uses,
-    /// which binds every control a request can resolve.
+    /// which binds every control a request can resolve. The controls arrive
+    /// as a [`ChatRenderOptions`] rather than positionally: see that type for
+    /// why.
     ///
     /// `preserve_thinking` is always bound (never left undefined), for the
     /// same reason `enable_thinking` is: the Qwen 3.8 template's assistant
@@ -461,15 +518,13 @@ impl ChatTemplate {
     pub fn render_with_thinking_and_tools(
         &self,
         messages: &[ChatMessage],
-        enable_thinking: bool,
-        effort: Option<ReasoningEffort>,
-        preserve_thinking: bool,
+        options: ChatRenderOptions,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
         self.render_context(
             messages,
-            Some((enable_thinking, effort)),
-            Some(preserve_thinking),
+            Some((options.enable_thinking, options.reasoning_effort)),
+            Some(options.preserve_thinking),
             tools,
         )
     }
@@ -1068,9 +1123,7 @@ mod tests {
         let prompt = template
             .render_with_thinking_and_tools(
                 &[ChatMessage::text(Role::User, "hi")],
-                true,
-                None,
-                false,
+                ChatRenderOptions::default(),
                 Some(&tools),
             )
             .expect("render");
@@ -1083,12 +1136,12 @@ mod tests {
         let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
         let messages = [ChatMessage::text(Role::User, "hi")];
         let without = template
-            .render_with_thinking_and_tools(&messages, true, None, false, None)
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), None)
             .expect("render");
         assert!(!without.contains("TOOLS="), "{without}");
         let empty: [JsonValue; 0] = [];
         let with_empty = template
-            .render_with_thinking_and_tools(&messages, true, None, false, Some(&empty))
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), Some(&empty))
             .expect("render");
         assert!(!with_empty.contains("TOOLS="), "{with_empty}");
     }
@@ -1158,7 +1211,7 @@ mod tests {
             }
         })];
         let prompt = template
-            .render_with_thinking_and_tools(&[], true, None, false, Some(&tools))
+            .render_with_thinking_and_tools(&[], ChatRenderOptions::default(), Some(&tools))
             .expect("render");
         assert_eq!(
             prompt,
@@ -1356,13 +1409,13 @@ enable_thinking={{ enable_thinking }};done"#;
         let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
         assert_eq!(
             template
-                .render_with_thinking_and_tools(&[], true, None, false, None)
+                .render_with_thinking_and_tools(&[], ChatRenderOptions::default(), None)
                 .expect("render"),
             "FALSE"
         );
         assert_eq!(
             template
-                .render_with_thinking_and_tools(&[], true, None, true, None)
+                .render_with_thinking_and_tools(&[], ChatRenderOptions { preserve_thinking: true, ..Default::default() }, None)
                 .expect("render"),
             "TRUE"
         );
@@ -1374,6 +1427,13 @@ enable_thinking={{ enable_thinking }};done"#;
         // `render` is the "I do not care" delegation, and the capability
         // probe renders a single user message, where the variable cannot
         // matter. Both leave the template's own default in force.
+        //
+        // This pins a limitation, not a guarantee. Undefined is the state
+        // that keeps a think block on every history assistant turn (#182), so
+        // if a multi-turn caller ever reaches one of these, the fix is to
+        // bind the variable there and change this test — not to route the
+        // caller around it. `render_with_thinking`'s doc comment says the
+        // same, where a caller will actually read it.
         let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
         assert_eq!(template.render(&[]).expect("render"), "UNDEF");
         assert_eq!(
@@ -1445,7 +1505,7 @@ enable_thinking={{ enable_thinking }};done"#;
         // (#182).
         let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
         let prompt = template
-            .render_with_thinking_and_tools(&history_conversation(), true, None, false, None)
+            .render_with_thinking_and_tools(&history_conversation(), ChatRenderOptions::default(), None)
             .expect("render");
         assert_eq!(
             prompt,
@@ -1462,7 +1522,7 @@ enable_thinking={{ enable_thinking }};done"#;
         // keeps its reasoning, exactly as the reference keeps it.
         let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
         let prompt = template
-            .render_with_thinking_and_tools(&history_conversation(), true, None, true, None)
+            .render_with_thinking_and_tools(&history_conversation(), ChatRenderOptions { preserve_thinking: true, ..Default::default() }, None)
             .expect("render");
         assert_eq!(
             prompt,
@@ -1490,7 +1550,7 @@ enable_thinking={{ enable_thinking }};done"#;
             ChatMessage::text(Role::User, "<tool_response>\nok\n</tool_response>"),
         ];
         let prompt = template
-            .render_with_thinking_and_tools(&messages, true, None, false, None)
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), None)
             .expect("render");
         assert!(
             prompt.contains("<think>\nI should read it.\n</think>\n\nReading the file."),

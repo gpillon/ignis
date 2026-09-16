@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use ignis_artifact::vision::{PreparedMedia, VisionProcessor};
-use ignis_artifact::{DecodeStreamState, FrontendSet, Role};
+use ignis_artifact::{ChatRenderOptions, DecodeStreamState, FrontendSet, Role};
 use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
@@ -101,13 +101,7 @@ impl ArtifactTemplateProvider {
             .collect();
         self.set
             .chat_template()
-            .render_with_thinking_and_tools(
-                &templated,
-                options.enable_thinking,
-                options.reasoning_effort,
-                options.preserve_thinking,
-                Some(tools),
-            )
+            .render_with_thinking_and_tools(&templated, render_options(options), Some(tools))
             .map_err(|err| err.to_string())
     }
 }
@@ -220,6 +214,18 @@ impl TokenDecoder for ArtifactTokenDecoder {
                 String::new()
             }
         }
+    }
+}
+
+/// What the request resolved, in the shape the template seam takes it
+/// (GitHub #185). The two types carry the same three controls — the server's
+/// is the one the wire resolves into, the artifact's the one the render is
+/// driven by — and this is the single place they are matched up, by name.
+fn render_options(options: &ThinkingOptions) -> ChatRenderOptions {
+    ChatRenderOptions {
+        enable_thinking: options.enable_thinking,
+        reasoning_effort: options.reasoning_effort,
+        preserve_thinking: options.preserve_thinking,
     }
 }
 
@@ -655,9 +661,7 @@ mod tests {
         let prompt = template
             .render_with_thinking_and_tools(
                 &[ArtifactMessage::text(Role::User, "hi")],
-                true,
-                None,
-                false,
+                ChatRenderOptions::default(),
                 Some(&tools),
             )
             .expect("render");
@@ -685,7 +689,7 @@ mod tests {
             }}),
         ];
         let prompt = template
-            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], true, None, false, Some(&tools))
+            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], ChatRenderOptions::default(), Some(&tools))
             .expect("render");
         let expected = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n\
 {\"function\": {\"description\": \"Read <path> & print it's text\", \"name\": \"read_file\", \

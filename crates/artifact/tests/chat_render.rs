@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ignis_artifact::{ChatMessage, FrontendSet, MessageContent, Reader, Role, ToolCall};
+use ignis_artifact::{
+    ChatMessage, ChatRenderOptions, FrontendSet, MessageContent, Reader, Role, ToolCall,
+};
 use serde_json::Value;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
@@ -96,7 +98,11 @@ fn check_fixture(frontend: &FrontendSet, path: &Path) -> Result<(), String> {
     let preserve = case["preserve_thinking"].as_bool().unwrap_or(false);
     let rendered = frontend
         .chat_template()
-        .render_with_thinking_and_tools(&messages(case), thinking, None, preserve, Some(&tools))
+        .render_with_thinking_and_tools(
+            &messages(case),
+            ChatRenderOptions { enable_thinking: thinking, preserve_thinking: preserve, ..Default::default() },
+            Some(&tools),
+        )
         .map_err(|err| format!("{name}: render failed: {err}"))?;
     let expected = fixture["expected"]["text"].as_str().unwrap();
     if rendered == expected {

@@ -55,7 +55,8 @@ pub use device::CudaDevice;
 #[cfg(feature = "cuda")]
 pub use kv_budget::{paged_kv_page_budget, PagedKvBudget, PagedKvPlane};
 pub use frontend::{
-    ChatMessage, ChatTemplate, ContentPart, DecodeStreamState, FRONTEND_RESOURCES, FrontendSet,
+    ChatMessage, ChatRenderOptions, ChatTemplate, ContentPart, DecodeStreamState,
+    FRONTEND_RESOURCES, FrontendSet,
     MessageContent, ReasoningEffort, Role, ThinkingCapabilities, ToolCall, Tokenizer,
 };
 pub use materializer::{materialize, MaterializationStats, MaterializedArtifact, TensorView};

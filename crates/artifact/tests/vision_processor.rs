@@ -17,7 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use ignis_artifact::vision::{layout, ProcessorError};
-use ignis_artifact::{ChatMessage, ContentPart, FrontendSet, MessageContent, Reader, Role, ToolCall};
+use ignis_artifact::{
+    ChatMessage, ChatRenderOptions, ContentPart, FrontendSet, MessageContent, Reader, Role, ToolCall,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -155,7 +157,11 @@ fn check_fixture(
     let preserve = case["preserve_thinking"].as_bool().unwrap_or(false);
     let rendered = frontend
         .chat_template()
-        .render_with_thinking_and_tools(&messages, thinking, None, preserve, None)
+        .render_with_thinking_and_tools(
+            &messages,
+            ChatRenderOptions { enable_thinking: thinking, preserve_thinking: preserve, ..Default::default() },
+            None,
+        )
         .expect("render");
     let refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
     let (kind, boundary) = checkpoint_offset(&rendered, preserve);
@@ -246,12 +252,12 @@ fn messages_with_more_image_parts_than_images_are_a_placeholder_mismatch() {
         tool_calls: Vec::new(),
         reasoning_content: None,
     }];
-    let error = frontend.prepare_prompt(&processor, &messages, &[&image], false, None, false, None).unwrap_err();
+    let error = frontend.prepare_prompt(&processor, &messages, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap_err();
     assert!(matches!(error, ProcessorError::PlaceholderMismatch(_)), "{error}");
     assert_eq!(error.code(), "invalid_media");
     // One image for one part prepares.
     let one = [ChatMessage { content: MessageContent::Parts(vec![ContentPart::Image { url: None }]), ..messages[0].clone() }];
-    let prompt = frontend.prepare_prompt(&processor, &one, &[&image], false, None, false, None).unwrap();
+    let prompt = frontend.prepare_prompt(&processor, &one, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap();
     assert_eq!(prompt.vision_tokens(), 300);
 }
 
@@ -269,7 +275,7 @@ fn an_image_in_a_system_message_is_refused_by_the_template() {
         },
         ChatMessage::text(Role::User, "hi"),
     ];
-    let error = frontend.prepare_prompt(&processor, &messages, &[&image], false, None, false, None).unwrap_err();
+    let error = frontend.prepare_prompt(&processor, &messages, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap_err();
     assert!(matches!(error, ProcessorError::Render(_)), "{error}");
 }
 
