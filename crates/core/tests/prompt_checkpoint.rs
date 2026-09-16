@@ -470,7 +470,7 @@ fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
     assert_eq!(
         sched.kv_used_pages(),
         1,
-        "and the pool is charged for exactly that page once every live \n         request is gone"
+        "and the pool is charged for exactly that page once every live request is gone"
     );
 
     // A later request sharing the whole 40-token head resumes at the
