@@ -342,15 +342,10 @@ pub fn resolve(
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
-    // GitHub #178: DFlash2's drafter does not follow a multimodal prompt yet,
-    // so the two load options are refused together here, before any load
-    // work, as the reference refuses `--spec dflash` with `--vision`.
-    if vision.is_some() && speculation.is_some_and(|s| s.backend() == SpeculativeBackend::Dflash2) {
-        return Err(ConfigError(
-            "`--vision` cannot be combined with `--spec dflash2` yet (speculative decoding does not follow image prompts)"
-                .to_owned(),
-        ));
-    }
+    // GitHub #195 lifted #178's refusal of the two together: the drafter
+    // follows a multimodal prompt now (its context append takes the span's KV
+    // positions, and the verify round rotates at `position + rope_delta`), so
+    // they are two independent load options again.
     let media = resolve_media(vision.is_some(), media_allow_private_network, media_cache_mib, &env)?;
     // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
     // address without turning metrics on is refused rather than ignored, and
@@ -1504,16 +1499,23 @@ mod tests {
         assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
     }
 
+    /// GitHub #195: the two are independent load options again.
     #[test]
-    fn vision_with_dflash2_is_refused_naming_both() {
+    fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
         let a = args(&["--vision", "--spec", "dflash2", "--draft-tokens", "4"]);
-        let err = resolve(&a, no_env).expect_err("vision + dflash2");
-        assert!(err.0.contains("--vision") && err.0.contains("dflash2"), "{}", err.0);
+        let config = expect_config(resolve(&a, no_env).expect("vision + dflash2"));
+        assert_eq!(config.vision, Some(Vision::default()));
+        assert_eq!(config.speculation, Speculation::new(SpeculativeBackend::Dflash2, 4).ok());
         let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "4")]);
-        assert!(resolve(&[], env).is_err(), "the env form too");
-        // Each alone still loads.
-        assert!(resolve(&args(&["--vision"]), no_env).is_ok());
-        assert!(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).is_ok());
+        let from_env = expect_config(resolve(&[], env).expect("the env form too"));
+        assert_eq!(from_env.vision, config.vision);
+        assert_eq!(from_env.speculation, config.speculation);
+        // Each alone still resolves, and neither one turns the other on.
+        let vision_only = expect_config(resolve(&args(&["--vision"]), no_env).expect("vision alone"));
+        assert_eq!((vision_only.vision, vision_only.speculation), (config.vision, None));
+        let spec_only =
+            expect_config(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).expect("spec alone"));
+        assert_eq!((spec_only.vision, spec_only.speculation), (None, config.speculation));
     }
 
     // ── media acquisition (GitHub #179) ──────────────────────────────────

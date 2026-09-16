@@ -165,6 +165,14 @@ struct IgnisVerifyRound {
   std::unique_ptr<ninfer::DeviceBuffer> extents;        // I32 [B]: draft columns this round
   std::unique_ptr<ninfer::DeviceBuffer> valid_columns;  // I32 [B]: extent + 1
   std::unique_ptr<ninfer::DeviceBuffer> lengths;        // I32 [B]: the accept RNG's position base
+  // GitHub #195: a vision load's verify columns rotate at `position +
+  // rope_delta`, the way its decode rounds do (`decode_rope_positions`).
+  // Present only on a load with vision; null everywhere else, where the
+  // round rotates at `positions` itself. I32 [k+1, B], staged whole by the
+  // round -- `base + min(j, extent) + rope_delta` per lane -- rather than
+  // derived on the device, because the delta is per lane and the vendored
+  // `offset_i32_positions` takes one scalar for the whole matrix.
+  std::unique_ptr<ninfer::DeviceBuffer> rope_positions;
 
   // Written by the traversal (device-only).
   std::unique_ptr<ninfer::DeviceBuffer> verify_ids;      // I32 [k+1, B]
@@ -212,10 +220,10 @@ struct IgnisVerifyRound {
     std::size_t bytes = 0;
     for (const auto *buffer :
          {anchors.get(), drafts.get(), base_positions.get(), extents.get(), valid_columns.get(),
-          lengths.get(), verify_ids.get(), positions.get(), target_tokens.get(), logits.get(),
-          hidden.get(), licensed_tokens.get(), licensed_counts.get(), accepted.get(),
-          selectors.get(), selected_hidden.get(), records_backing.get(), features.get(),
-          append_counts.get()}) {
+          lengths.get(), rope_positions.get(), verify_ids.get(), positions.get(),
+          target_tokens.get(), logits.get(), hidden.get(), licensed_tokens.get(),
+          licensed_counts.get(), accepted.get(), selectors.get(), selected_hidden.get(),
+          records_backing.get(), features.get(), append_counts.get()}) {
       if (buffer != nullptr) {
         bytes += buffer->bytes;
       }

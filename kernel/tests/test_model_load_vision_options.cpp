@@ -7,6 +7,9 @@
 // 2. The leaf's vision schema: with an envelope every one of the 333
 //    `vision/*` tensors is asked for, and a missing or mis-shaped one fails the
 //    load naming it; without it the same tensors are extras.
+// 3. GitHub #195: the envelope and a speculative backend are independent
+//    options -- a load asking for both reaches the binding and asks for both
+//    scopes, where #178 refused it outright.
 //
 // Host-only by construction, the same way as
 // test_model_load_speculative_options.cpp: a topology with no decoder layers
@@ -207,16 +210,26 @@ int main() {
           "with a zero envelope the vision tensors are extras: " + m0);
   }
 
-  // --- 3. vision with speculation (GitHub #178) -------------------------------
-  // A fence until the drafter learns multimodal positions: refused before
-  // binding, whichever windowed backend asks.
-  for (const int32_t backend : {IGNIS_SPECULATIVE_DFLASH2, IGNIS_SPECULATIVE_VERIFY_ONLY}) {
+  // --- 3. vision with speculation (GitHub #195) -------------------------------
+  // #178 fenced the two options apart until the verify round learned the
+  // sequence's rope delta. They are two independent scopes again: neither
+  // backend is refused ahead of binding, DFlash2's load asks for the drafter
+  // beside the tower, and a windowed load still asks for the whole tower.
+  {
     ignis_model_load_options both = vision(32768);
-    both.speculative_backend = backend;
+    both.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
     both.draft_tokens = 4;
     const std::string m = load_error(concat(text, tower), &both);
-    check(contains(m, "vision") && contains(m, "speculative") && !contains(m, "bound tensor"),
-          "vision with speculative backend " + std::to_string(backend) + " is refused: " + m);
+    check(contains(m, "missing bound tensor: dflash2/"),
+          "vision with DFlash2 binds the drafter beside the tower: " + m);
+  }
+  {
+    ignis_model_load_options both = vision(32768);
+    both.speculative_backend = IGNIS_SPECULATIVE_VERIFY_ONLY;
+    both.draft_tokens = 4;
+    const std::string m = load_error(text, &both);
+    check(contains(m, "missing bound tensor: vision/patch_embedding"),
+          "vision with the verify-only backend still asks for the tower: " + m);
   }
 
   if (g_failed != 0) {

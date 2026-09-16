@@ -144,7 +144,10 @@ struct ignis_model_load_options {
    * load, the encoder workspace and the per-item `[5120, V]` output
    * transient for V = min(max_context_tokens, vision_max_tokens) -- before
    * the caller builds its sequence pool. At most
-   * IGNIS_VISION_MAX_TOKENS_LIMIT. */
+   * IGNIS_VISION_MAX_TOKENS_LIMIT. Independent of the backend above
+   * (GitHub #195): a load may ask for both, and then the verify round
+   * rotates its columns at `position + rope_delta` the way a decode round
+   * already does. */
   uint32_t vision_max_tokens;
 };
 

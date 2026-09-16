@@ -16,6 +16,13 @@ pub mod live_server;
 /// Media fixtures for the image-input tests (GitHub #179).
 pub mod media;
 
+/// The vision canary fixture, and the multimodal prefill the GPU canary
+/// binaries drive it through (GitHub #178, GitHub #195). Behind the same
+/// feature gate as `live_server`: only a `cuda` binary has a model to
+/// prefill.
+#[cfg(feature = "cuda")]
+pub mod vision_canary;
+
 use std::sync::Arc;
 
 use ignis_core::TokenId;

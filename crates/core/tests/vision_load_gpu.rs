@@ -2,6 +2,8 @@
 //! envelope binds every `vision/*` object and reports, beside its weights,
 //! the encoder workspace and output transient it reserved — and a load
 //! without it binds and reserves nothing of vision, reporting today's figure.
+//! Its device footprint is those two plus the decode round's rope staging
+//! (`DECODE_ROPE_STAGING_BYTES`, GitHub #178) and nothing else.
 //!
 //! One upload of the vision-bearing plan serves every load: the text scope is
 //! its first handles (`bind_model_scope_27b_with` places the vision tensors
@@ -24,6 +26,20 @@ use ignis_core::step::program_stats;
 use ignis_core::{KvFormat, Vision, VISION_OBJECTS};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
+
+/// GitHub #178: beside the reservation, a vision load stages its decode
+/// rounds' rotation positions (`position + rope_delta`) in a model-owned
+/// buffer at a stable address, so the decode graphs read them at replay.
+/// `ignis_program_stats` counts that buffer; `vision_reserved_bytes` does
+/// not, and should not — that number is the encoder workspace plus the
+/// per-item output transient, which is what the startup capacity line
+/// reports. One I32 per lane over the leaf's `IGNIS_DECODE_MAX_BATCH`
+/// (8, `ignis_step.h`).
+///
+/// #177 wrote this test before #178 added the buffer, and no GPU profile ran
+/// on a branch carrying both until #195 — which is why the delta below is 32
+/// bytes wider than the weights and the reservation alone.
+const DECODE_ROPE_STAGING_BYTES: u64 = 4 * 8;
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
@@ -103,8 +119,8 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     );
     assert_eq!(
         vision_vram - plain_vram,
-        vision_weight_bytes + vision_reserved,
-        "vision adds its weights and its reservation, nothing else"
+        vision_weight_bytes + vision_reserved + DECODE_ROPE_STAGING_BYTES,
+        "vision adds its weights, its reservation and the decode round's rope staging, nothing else"
     );
 
     // The default envelope, uncapped (the serving context): the number the
