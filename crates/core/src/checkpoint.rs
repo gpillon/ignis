@@ -398,6 +398,44 @@ pub struct CheckpointCounters {
     pub reused_tok: u64,
 }
 
+/// Device bytes held back from the retained pool's derived default: what
+/// the leaf must still be able to allocate at serving time (GitHub #186).
+///
+/// Retention is a bet, and a bet must never be the reason certain work
+/// fails. The leaf allocates out of the same free device memory while it
+/// serves — a media encode transient, a graph capture, the scratch a wider
+/// chunk needs — so the derived budget starts by giving that back.
+pub const RETAINED_POOL_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The most the retained pool's default ever claims (GitHub #186).
+///
+/// Past a few dozen checkpoints the marginal one buys little — a
+/// conversation keeps at most two (ADR 0029) and a burst shares one prefix —
+/// while the headroom it costs buys a lot. An operator who wants more says
+/// so with `--retained-pool-bytes`.
+pub const MAX_AUTO_RETAINED_POOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The retained pool's default byte budget, derived from the device memory
+/// still free once the model, its KV pool and every other reservation have
+/// landed (GitHub #186, ADR 0029; the operator's `--retained-pool-bytes`
+/// overrides it).
+///
+/// Half of what is left after [`RETAINED_POOL_RESERVE_BYTES`], capped at
+/// [`MAX_AUTO_RETAINED_POOL_BYTES`]. Half rather than all, because "free"
+/// is measured once, at startup, and the number it returns is not a promise
+/// about the rest of the run.
+///
+/// A caller that cannot measure free memory passes 0 and gets 0: nothing is
+/// retained, which is the same engine that existed before checkpoints did.
+/// That is deliberate — an earlier attempt at sizing the *KV* pool from a
+/// naive free-VRAM guess OOM'd on the real artifact
+/// (`crates/runtime/src/cuda_leaf.rs`'s module doc), and the lesson taken
+/// from it is that a derived device budget guesses downwards or not at all.
+pub fn auto_retained_pool_bytes(free_device_bytes: u64) -> u64 {
+    (free_device_bytes.saturating_sub(RETAINED_POOL_RESERVE_BYTES) / 2)
+        .min(MAX_AUTO_RETAINED_POOL_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +658,38 @@ mod tests {
         pool.retain(2, late, 42, 6, IMAGE, gdn_at(120), 2).unwrap();
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
+    }
+
+    #[test]
+    fn the_derived_budget_gives_back_the_reserve_and_halves_the_rest() {
+        // The shape of a real load: a 32 GiB card with the 27B artifact,
+        // its KV pool and its reservations already down leaves single-digit
+        // gigabytes. 5 GiB free holds 1 GiB back for the leaf's own
+        // serving-time allocations and retains half of the remaining 4.
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(auto_retained_pool_bytes(5 * GIB), 2 * GIB);
+        // At ~150 MiB an image (the 27B geometry's mutable sections plus one
+        // KV page), that is a few dozen live conversations.
+        assert!(auto_retained_pool_bytes(5 * GIB) / (150 * 1024 * 1024) >= 10);
+    }
+
+    #[test]
+    fn the_derived_budget_is_capped_and_never_negative() {
+        // A card with room to spare does not get a proportionally huge bet:
+        // the cap binds well before half of it.
+        assert_eq!(
+            auto_retained_pool_bytes(u64::MAX),
+            MAX_AUTO_RETAINED_POOL_BYTES
+        );
+        assert_eq!(
+            auto_retained_pool_bytes(64 * 1024 * 1024 * 1024),
+            MAX_AUTO_RETAINED_POOL_BYTES
+        );
+        // Less free than the reserve, or a backend that cannot measure free
+        // memory at all: retain nothing, which is the engine that existed
+        // before checkpoints did.
+        assert_eq!(auto_retained_pool_bytes(RETAINED_POOL_RESERVE_BYTES), 0);
+        assert_eq!(auto_retained_pool_bytes(0), 0);
     }
 
     #[test]

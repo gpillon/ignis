@@ -94,6 +94,12 @@ pub struct RuntimeStats {
     pub kernel_count: u64,
     /// CUDA graph launches by the most recent leaf step.
     pub graph_launches: u64,
+    /// Device bytes still free (GitHub #186): what `cudaMemGetInfo` reports
+    /// once the model, its KV pool and every other reservation have landed.
+    /// `0` when the backend cannot say — a CPU-only leaf, or a device query
+    /// that failed — which the retained pool's derived default reads as
+    /// "retain nothing" rather than as "retain everything".
+    pub free_vram_bytes: u64,
 }
 
 impl From<RuntimeError> for ComputeError {

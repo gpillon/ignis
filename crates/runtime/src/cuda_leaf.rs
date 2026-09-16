@@ -21,7 +21,7 @@
 
 #![cfg(feature = "cuda")]
 
-use ignis_artifact::{CudaDevice, MaterializedArtifact, ObjectHandle, Reader};
+use ignis_artifact::{CudaDevice, Device, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{PinnedBuffer, Seq, SeqPool, SeqPoolBudget, SeqPrefix};
 use ignis_core::step;
@@ -112,11 +112,10 @@ impl Default for CudaLeafConfig {
 /// materialized artifact, and the bound-tensor handles `ignis_model_load`
 /// reads on every (re)load.
 pub struct CudaLeaf {
-    // Never read directly (no more live free-VRAM query — see the module
-    // doc): held purely so the device context outlives `artifact` and
-    // every loaded model, since dropping it would invalidate their device
+    // Read only for `RuntimeStats::free_vram_bytes` (GitHub #186), never
+    // to size the KV pool — see the module doc; otherwise held purely so
+    // the device context outlives `artifact` and every loaded model, since dropping it would invalidate their device
     // memory.
-    #[allow(dead_code)]
     device: CudaDevice,
     reader: Reader,
     artifact: MaterializedArtifact,
@@ -398,6 +397,12 @@ impl StepLeaf for CudaLeaf {
             // round replayed a captured graph, 0 for every prefill step and
             // for a decode round whose exact width has no ready graph.
             graph_launches: program.graph_launches,
+            // GitHub #186: what the device says is free right now. Read
+            // rather than derived — the module doc above records what a
+            // `total - weights` guess cost the last time one was made — and
+            // 0 when the query fails, which sizes the retained pool at
+            // nothing rather than at a number nobody measured.
+            free_vram_bytes: self.device.free_bytes().unwrap_or(0),
         })
     }
 

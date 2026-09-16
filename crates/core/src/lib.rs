@@ -60,7 +60,9 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use checkpoint::{
-    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool, ReuseSource,
+    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool,
+    MAX_AUTO_RETAINED_POOL_BYTES, RETAINED_POOL_RESERVE_BYTES, ReuseSource,
+    auto_retained_pool_bytes,
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{

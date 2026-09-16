@@ -456,6 +456,51 @@ mod tests {
         &[]
     }
 
+    /// A template that ends its render the way the real one does — history,
+    /// then the generation opener, then the primed `<think>` (GitHub #186).
+    const TEMPLATE_WITH_OPENER: &str = "{%- for m in messages -%}{{ m.role }} {{ m.content }}          {% endfor %}<|im_start|>assistant
+<think>";
+
+    #[test]
+    fn a_render_with_no_generation_opener_reports_none() {
+        // The placeholder template writes no chat markers, so there is no
+        // point in its prompt that a later turn provably shares — and the
+        // scheduler is told so rather than being given a guess.
+        let (_fixture, _reader, provider) = build_provider();
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(!rendered.tokens.is_empty());
+        assert_eq!(rendered.opener_tokens, None);
+    }
+
+    #[test]
+    fn the_generation_opener_is_reported_as_an_exact_token_prefix() {
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_OPENER);
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        let opener = rendered.opener_tokens.expect("the render has an opener");
+        assert!(opener > 0);
+        assert!(
+            (opener as usize) < rendered.tokens.len(),
+            "the prompt continues past the opener — that tail is what the              next turn re-renders away"
+        );
+        // What was promised: the first `opener` ids really are the head's own
+        // ids, not a count someone hoped lined up.
+        let prompt = provider
+            .render(&[ChatMessage::text("user", "hello world")], &opts(), no_tools())
+            .expect("render");
+        let at = ChatTemplate::generation_opener_offset(&prompt).expect("offset");
+        let head = provider.set.tokenizer().encode(&prompt[..at]).expect("encode");
+        assert_eq!(head.len(), opener as usize);
+        assert_eq!(&rendered.tokens[..opener as usize], head.as_slice());
+    }
+
     #[test]
     fn apply_chat_template_uses_the_real_template_and_tokenizer() {
         let (_fixture, _reader, provider) = build_provider();

@@ -186,6 +186,7 @@ impl StepLeaf for StubLeaf {
             last_step_micros: 13,
             kernel_count: 7,
             graph_launches: 0,
+            free_vram_bytes: 0,
         })
     }
 
