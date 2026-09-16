@@ -237,7 +237,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let Some(processor) = &self.vision else {
             return Err(ContentRejection {
                 code: "vision_disabled",
@@ -248,10 +248,33 @@ impl TemplateProvider for ArtifactTemplateProvider {
             code: "invalid_media",
             message: format!("chat template render failed: {err}"),
         })?;
-        let prompt = processor
-            .prepare_prompt(self.set.tokenizer(), &rendered, media, &[])
+        // GitHub #193: the boundaries cross-request reuse is cut at, carried
+        // across the placeholder expansion by the processor, which checks each
+        // for an exact token prefix of the expanded prompt the way
+        // `exact_token_prefix` does for a text one.
+        let offsets = [
+            ChatTemplate::generation_opener_offset(&rendered),
+            ChatTemplate::system_block_offset(&rendered),
+            ChatTemplate::last_user_query_offset(&rendered),
+        ];
+        let boundaries: Vec<usize> = offsets.iter().flatten().copied().collect();
+        let mut prompt = processor
+            .prepare_prompt(self.set.tokenizer(), &rendered, media, &boundaries)
             .map_err(processor_rejection)?;
-        Ok(Multimodal::from_prepared(prompt))
+        let mut frontiers = std::mem::take(&mut prompt.frontiers).into_iter();
+        let [opener_tokens, system_block_tokens, user_turn_tokens] =
+            offsets.map(|offset| offset.and_then(|_| frontiers.next().flatten()));
+        let (tokens, multimodal) = Multimodal::from_prepared(prompt);
+        let rendered = RenderedPrompt {
+            tokens,
+            opener_tokens,
+            // The processor refuses an empty head, as `exact_token_prefix`
+            // does; the user turn alone accepts one (`Self::user_turn_tokens`):
+            // a conversation opening on the user's message has its query at 0.
+            user_turn_tokens: user_turn_tokens.or(offsets[2].filter(|&at| at == 0).map(|_| 0)),
+            system_block_tokens,
+        };
+        Ok((rendered, multimodal))
     }
 }
 

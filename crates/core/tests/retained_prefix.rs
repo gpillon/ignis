@@ -795,31 +795,64 @@ fn prompt_reuse_off_retains_no_prefix() {
     assert_eq!(chunk_widths(&compute, later).iter().sum::<usize>(), 60);
 }
 
-#[test]
-fn a_multimodal_prompt_publishes_no_retained_prefix() {
-    // GitHub #178: a prompt carrying images shares nothing until its identity
-    // is media-aware (#193). The boundary is refused at the frontend seam too
-    // (`api.rs`), and refused again here, because two prompts differing only
-    // in their pictures must never share a page.
-    let compute = Arc::new(MockCompute::new());
-    let mut sched = scheduler(compute.clone(), config());
-    let mut with_media = subagent(500);
-    let count = with_media.tokens.len();
-    with_media.multimodal = Some(Arc::new(Multimodal {
+/// [`subagent`] with a four-placeholder picture of content `digest` in its
+/// question, at prompt tokens 38..42 — past the block, inside the page the
+/// opener's head ends on.
+fn subagent_with_picture(query: u32, digest: u8) -> RequestInput {
+    let mut input = subagent(query);
+    let count = input.tokens.len();
+    input.multimodal = Some(Arc::new(Multimodal {
         positions: (0..3).flat_map(|_| 0..count as i32).collect(),
         rope_delta: -2,
         media: vec![MediaItem {
             grid: Grid { t: 1, h: 2, w: 8 },
-            token_span: TokenSpan { begin: 4, count: 4 },
+            token_span: TokenSpan { begin: 38, count: 4 },
             patches: vec![0; 4 * 4 * 1536],
-            content_digest: [7u8; 32],
+            content_digest: [digest; 32],
         }],
     }));
-    sched.submit(with_media, RequestClass::Agent).unwrap();
+    input
+}
+
+#[test]
+fn a_multimodal_burst_shares_the_block_whatever_picture_each_subagent_sends() {
+    // GitHub #193: a prompt carrying an image publishes its retained prefix
+    // like any other, because the prefix is keyed by its images too. The
+    // block holds no image, so a subagent sending another picture still skips
+    // it — and nothing past it, where the pictures differ.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched
+        .submit(subagent_with_picture(500, 0xAA), RequestClass::Agent)
+        .unwrap();
     run_to_idle(&mut sched);
     assert_eq!(
         sched.prefix_pinned_pages(),
-        0,
-        "a multimodal request retains nothing"
+        BLOCK / PAGE + 1,
+        "the block, plus the opener's page chained over it (#187)"
     );
+
+    let other = sched
+        .submit(subagent_with_picture(500, 0xBB), RequestClass::Agent)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        prefix_reuses(&events, other),
+        [BLOCK / PAGE * PAGE],
+        "the block and no further: the chained head holds the other picture"
+    );
+    assert!(state_reuses(&events, other).is_empty(), "nor its checkpoint: {events:?}");
+
+    // The same picture and question is the first subagent's own history, all
+    // the way to its generation opener.
+    let same = sched
+        .submit(subagent_with_picture(500, 0xAA), RequestClass::Agent)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        state_reuses(&events, same),
+        [(ReuseSource::Device, 57)],
+        "{events:?}"
+    );
+    assert_eq!(first_job(&compute, same).start_position, 57);
 }

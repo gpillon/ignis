@@ -431,13 +431,17 @@ pub trait TemplateProvider: Send + Sync {
     /// the prompt comes back with its three-axis positions, `rope_delta` and
     /// media items. A provider that cannot render images refuses with
     /// `vision_disabled`.
+    ///
+    /// The rendered prompt carries the same structural boundaries a text
+    /// render does (GitHub #193), counted over the **expanded** tokens: an
+    /// image before a boundary moves it by its placeholder run.
     fn prepare_multimodal(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let _ = (messages, options, tools, media);
         Err(ContentRejection {
             code: "vision_disabled",
@@ -524,7 +528,7 @@ impl TemplateProvider for SimpleTemplateProvider {
         _options: &ThinkingOptions,
         _tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let mut tokens = Vec::new();
         let mut images = media.iter();
         for message in messages {
@@ -568,7 +572,8 @@ impl TemplateProvider for SimpleTemplateProvider {
                 content_digest: m.content_digest,
             })
             .collect();
-        Ok((tokens, Multimodal { positions, rope_delta, media }))
+        // No chat markers, so no boundaries — as on its text path.
+        Ok((tokens.into(), Multimodal { positions, rope_delta, media }))
     }
 }
 

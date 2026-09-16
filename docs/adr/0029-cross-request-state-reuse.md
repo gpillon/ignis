@@ -130,7 +130,9 @@ correctness oracles.
   feature. **Open for the owner** — whether the proxy is enough, or whether
   the v2 container should start carrying a payload digest.
 - **Vision (#180)** builds its media-aware prefix identity on the match key
-  defined here, instead of adding its own.
+  defined here, instead of adding its own. Landed as #193, which keys the
+  sibling shared prefixes by it too: a prefix cache matching raw token ids
+  would have let a sibling sending another picture share one.
 - **Rendering must be stable.** The chat template has to render history the
   way the reference does (tool-argument order, `preserve_thinking`); a
   rendering drift silently turns every match into a miss.

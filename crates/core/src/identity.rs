@@ -380,6 +380,18 @@ pub struct PromptContent<'a> {
     media: &'a [MediaKey],
 }
 
+impl<'a> From<&'a [TokenId]> for PromptContent<'a> {
+    fn from(tokens: &'a [TokenId]) -> Self {
+        Self::text(tokens)
+    }
+}
+
+impl<'a> From<&'a Vec<TokenId>> for PromptContent<'a> {
+    fn from(tokens: &'a Vec<TokenId>) -> Self {
+        Self::text(tokens)
+    }
+}
+
 impl<'a> PromptContent<'a> {
     /// A text-only prompt — today's every request.
     pub fn text(tokens: &'a [TokenId]) -> Self {
@@ -394,6 +406,22 @@ impl<'a> PromptContent<'a> {
     /// The prompt's length in tokens.
     pub fn tokens(&self) -> u32 {
         self.tokens.len() as u32
+    }
+
+    /// The prompt's first `at` tokens and the media items beginning inside
+    /// them (GitHub #193) — what a prefix of this prompt is keyed over.
+    ///
+    /// An item that begins inside the head but runs past its end is **kept**,
+    /// so [`PromptContent::splits_media`] on the head still names the cut for
+    /// what it is. That is the one place the type's invariant bends, and it
+    /// bends harmlessly: the key never reads past the head's tokens.
+    pub fn head(&self, at: u32) -> PromptContent<'a> {
+        let at = at.min(self.tokens());
+        let items = self.media.partition_point(|m| m.begin < at);
+        PromptContent {
+            tokens: &self.tokens[..at as usize],
+            media: &self.media[..items],
+        }
     }
 
     /// The content key of this prompt's first `at` tokens.
@@ -431,6 +459,14 @@ impl<'a> PromptContent<'a> {
             while next < order.len() && lengths[order[next]] == at + 1 {
                 out[order[next]] = chain.key();
                 next += 1;
+            }
+            // Every length asked about is answered: the rest of the prompt
+            // is nobody's business. A claimant asks about entries a system
+            // block long, and walking its whole conversation to answer them
+            // is the cost GitHub #193 would otherwise add to every prefix
+            // lookup.
+            if next == order.len() {
+                return out;
             }
         }
         let whole = chain.key();
@@ -711,6 +747,34 @@ mod tests {
         assert!(prompt.splits_media(25));
         assert!(!prompt.splits_media(26), "the token after the last patch");
         assert!(!PromptContent::text(&tokens).splits_media(11));
+    }
+
+    #[test]
+    fn a_head_keeps_the_media_that_begins_inside_it() {
+        // GitHub #193: a prefix is keyed over its own tokens and the items
+        // that begin in them, so a head's key is the whole prompt's key at
+        // that length — and an item cut in two by the head is still named.
+        let tokens: Vec<TokenId> = (1..=40).collect();
+        let items = [media(5, 8, 0xAA), media(20, 8, 0xBB)];
+        let prompt = PromptContent::new(&tokens, &items);
+        for at in [0, 5, 6, 13, 20, 24, 28, 40] {
+            assert_eq!(prompt.head(at).key_at(at), prompt.key_at(at), "at {at}");
+            assert_eq!(prompt.head(at).tokens(), at);
+        }
+        assert!(prompt.head(24).splits_media(24), "the second image is cut");
+        assert!(!prompt.head(28).splits_media(28));
+        assert_eq!(prompt.head(99).tokens(), 40, "a head never outgrows its prompt");
+    }
+
+    #[test]
+    fn keys_at_answers_short_lengths_without_the_rest_of_the_prompt() {
+        // The early stop must not change an answer, least of all the
+        // past-the-end fallback, which is only ever reached by walking it all.
+        let tokens: Vec<TokenId> = (1..=300).collect();
+        let prompt = PromptContent::text(&tokens);
+        let keys = prompt.keys_at(&[16, 32]);
+        assert_eq!(keys, [prompt.head(16).key_at(16), prompt.head(32).key_at(32)]);
+        assert_eq!(prompt.keys_at(&[16, 999])[1], prompt.key_at(300));
     }
 
     #[test]

@@ -36,7 +36,8 @@
 use std::time::Instant;
 
 use crate::gdn::GdnState;
-use crate::types::{RequestClass, RequestId, TokenId};
+use crate::identity::{MatchKey, PromptContent};
+use crate::types::{RequestClass, RequestId};
 
 /// An opaque handle to a cached prefix entry (a claimant's reference to a
 /// shared prefix).
@@ -68,7 +69,8 @@ pub struct SpilledPrefix {
     /// — the name the prefix it came from was published under, and the one it
     /// is published under again.
     pub publisher: RequestId,
-    pub tokens: Vec<TokenId>,
+    /// What the prefix is: the content key of its head (GitHub #193).
+    pub key: MatchKey,
     pub length_tokens: u32,
     pub gdn: GdnState,
     pub class: RequestClass,
@@ -90,8 +92,12 @@ pub struct PrefixEntry {
     /// keys the *leaf's* prefix — the one that actually owns the pages — by
     /// this id (P4-10, GitHub #126), so a claim has to carry it through.
     pub publisher: RequestId,
-    /// The cached prefix tokens (the shared prompt head, page-aligned).
-    pub tokens: Vec<TokenId>,
+    /// What the cached prefix *is*: the content key of the shared prompt head
+    /// (page-aligned) — its token ids and the media items inside it (GitHub
+    /// #193, the #189 key). Token ids alone would let two prompts differing
+    /// only in their pictures share one head, since every placeholder of
+    /// every image is the same token.
+    pub key: MatchKey,
     /// Tokens in the cached prefix (= `total_pages * page_tokens`).
     pub length_tokens: u32,
     /// The KV pages this entry itself holds in the pool — charged exactly
@@ -217,21 +223,58 @@ impl PrefixCache {
     /// the chain is held by exactly one reference per link and the pages
     /// under it are still charged once. It is refused when it would cover
     /// nothing its parent does not.
-    pub fn register(
+    ///
+    /// `head` is the published head with its media (GitHub #193), and it is
+    /// also refused when the page floor lands **inside** a media item: half an
+    /// image's placeholders would be shared, and a claimant's prefill would
+    /// start in the middle of an item whose encode it never runs. The
+    /// scheduler never publishes there (`Request::publish_point`); this is the
+    /// ledger refusing to record it if it ever did.
+    pub fn register<'a>(
         &mut self,
         publisher: RequestId,
-        tokens: &[TokenId],
+        head: impl Into<PromptContent<'a>>,
         gdn: &GdnState,
         parent: Option<PrefixId>,
     ) -> Option<(PrefixId, u32)> {
-        let length = (tokens.len() / self.page_tokens as usize) * self.page_tokens as usize;
-        if length == 0 {
+        let head = head.into();
+        let length = (head.tokens() / self.page_tokens) * self.page_tokens;
+        if length == 0 || head.splits_media(length) {
+            return None; // fewer than one page, or an image cut in two
+        }
+        self.insert(publisher, head.key_at(length), length, gdn, parent)
+    }
+
+    /// Register a retained prefix brought back from KV-RAM (GitHub #190) under
+    /// the key and length it was spilled with. It has no parent: a blob is a
+    /// whole head.
+    pub fn register_returned(&mut self, spilled: &SpilledPrefix) -> Option<(PrefixId, u32)> {
+        self.insert(
+            spilled.publisher,
+            spilled.key,
+            spilled.length_tokens,
+            &spilled.gdn,
+            None,
+        )
+    }
+
+    /// [`PrefixCache::register`] once the head is named: `length` whole pages
+    /// of content `key`.
+    fn insert(
+        &mut self,
+        publisher: RequestId,
+        key: MatchKey,
+        length: u32,
+        gdn: &GdnState,
+        parent: Option<PrefixId>,
+    ) -> Option<(PrefixId, u32)> {
+        if length == 0 || length % self.page_tokens != 0 {
             return None; // fewer than one page: nothing shareable
         }
         let below = match parent {
             Some(parent) => {
                 let pages = self.total_pages_of(parent);
-                if !self.contains(parent) || pages * self.page_tokens >= length as u32 {
+                if !self.contains(parent) || pages * self.page_tokens >= length {
                     return None;
                 }
                 pages
@@ -246,15 +289,15 @@ impl PrefixCache {
         // A duplicate prompt (the same truncated prefix is already
         // cached): the caller claims the existing entry — no second set
         // of pages.
-        if self.find(&tokens[..length]).is_some() {
+        if self.find(key, length).is_some() {
             return None;
         }
         let entry = PrefixEntry {
             id: self.next_id,
             publisher,
-            tokens: tokens[..length].to_vec(),
-            length_tokens: length as u32,
-            pages: (length / self.page_tokens as usize) as u32 - below,
+            key,
+            length_tokens: length,
+            pages: length / self.page_tokens - below,
             parent,
             gdn: gdn.clone(),
             refcount: 1, // the registrant is the first claimant
@@ -273,8 +316,8 @@ impl PrefixCache {
     /// entry's id, the matched token count, the entry's pages, and the
     /// GDN state to resume from), or `None` when nothing cached matches
     /// the prompt head.
-    pub fn claim(&mut self, tokens: &[TokenId]) -> Option<PrefixClaim> {
-        self.claim_longer_than(tokens, 0)
+    pub fn claim<'a>(&mut self, prompt: impl Into<PromptContent<'a>>) -> Option<PrefixClaim> {
+        self.claim_longer_than(prompt, 0)
     }
 
     /// [`PrefixCache::claim`], restricted to entries covering **more** than
@@ -286,8 +329,12 @@ impl PrefixCache {
     /// is the floor this has to beat — and it has to be a floor rather than a
     /// comparison made afterwards, because claiming here is not free: it pins
     /// the entry and counts the skip.
-    pub fn claim_longer_than(&mut self, tokens: &[TokenId], floor: u32) -> Option<PrefixClaim> {
-        let match_entry = self.longest_match(tokens, floor)?;
+    pub fn claim_longer_than<'a>(
+        &mut self,
+        prompt: impl Into<PromptContent<'a>>,
+        floor: u32,
+    ) -> Option<PrefixClaim> {
+        let match_entry = self.longest_match(prompt.into(), floor)?;
         let id = match_entry.id;
         let claim = PrefixClaim {
             id,
@@ -310,27 +357,37 @@ impl PrefixCache {
     /// a claimant skip, or 0 — without claiming it (GitHub #190). What a
     /// KV-RAM checkpoint has to beat by its restore floor before a restore
     /// across the bus is worth more than sharing pages already on the device.
-    pub fn longest_match_tokens(&self, tokens: &[TokenId]) -> u32 {
-        self.longest_match(tokens, 0).map_or(0, |e| e.length_tokens)
+    pub fn longest_match_tokens<'a>(&self, prompt: impl Into<PromptContent<'a>>) -> u32 {
+        self.longest_match(prompt.into(), 0)
+            .map_or(0, |e| e.length_tokens)
     }
 
-    /// The longest registered prefix of `tokens` reaching past `floor`.
-    fn longest_match(&self, tokens: &[TokenId], floor: u32) -> Option<&PrefixEntry> {
+    /// The longest registered prefix of `prompt` reaching past `floor`.
+    ///
+    /// What matches is the entry's **content key** at its length (GitHub
+    /// #193): the prompt's token ids *and* the media items inside that head.
+    /// Only entries no longer than the prompt are asked about — `keys_at`
+    /// answers a length past the end with the whole prompt's key, which must
+    /// never stand in for a longer entry's.
+    fn longest_match(&self, prompt: PromptContent<'_>, floor: u32) -> Option<&PrefixEntry> {
+        let candidates: Vec<&PrefixEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.length_tokens <= prompt.tokens() && e.length_tokens > floor)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let lengths: Vec<u32> = candidates.iter().map(|e| e.length_tokens).collect();
+        let keys = prompt.keys_at(&lengths);
         let mut best: Option<&PrefixEntry> = None;
-        for entry in &self.entries {
-            if entry.tokens.len() > tokens.len() || entry.length_tokens <= floor {
-                continue;
-            }
-            if !tokens.starts_with(&entry.tokens) {
+        for (entry, key) in candidates.into_iter().zip(keys) {
+            if entry.key != key {
                 continue;
             }
             // The longest match wins (a cached prefix of a cached prefix
             // is a shorter match).
-            let better = match best {
-                Some(b) => entry.tokens.len() > b.tokens.len(),
-                None => true,
-            };
-            if better {
+            if best.is_none_or(|b| entry.length_tokens > b.length_tokens) {
                 best = Some(entry);
             }
         }
@@ -553,7 +610,7 @@ impl PrefixCache {
         self.spilled.push(SpilledPrefix {
             id,
             publisher: e.publisher,
-            tokens: e.tokens.clone(),
+            key: e.key,
             length_tokens: e.length_tokens,
             gdn: e.gdn.clone(),
             class: retention.class,
@@ -570,13 +627,29 @@ impl PrefixCache {
             .map(|s| s.id)
     }
 
-    /// The longest prefix of `tokens` held **only** in KV-RAM — one still on
-    /// the device is matched there — or `None`.
-    pub fn longest_spilled_match(&self, tokens: &[TokenId]) -> Option<&SpilledPrefix> {
-        self.spilled
+    /// The longest prefix of `prompt` held **only** in KV-RAM — one still on
+    /// the device is matched there — or `None`. Matched by content key, as
+    /// the device entries are (GitHub #193).
+    pub fn longest_spilled_match<'a>(
+        &self,
+        prompt: impl Into<PromptContent<'a>>,
+    ) -> Option<&SpilledPrefix> {
+        let prompt = prompt.into();
+        let candidates: Vec<&SpilledPrefix> = self
+            .spilled
             .iter()
-            .filter(|s| s.on_device.is_none())
-            .filter(|s| s.tokens.len() <= tokens.len() && tokens.starts_with(&s.tokens))
+            .filter(|s| s.on_device.is_none() && s.length_tokens <= prompt.tokens())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let lengths: Vec<u32> = candidates.iter().map(|s| s.length_tokens).collect();
+        let keys = prompt.keys_at(&lengths);
+        candidates
+            .into_iter()
+            .zip(keys)
+            .filter(|(s, key)| s.key == *key)
+            .map(|(s, _)| s)
             .max_by_key(|s| s.length_tokens)
     }
 
@@ -647,10 +720,12 @@ impl PrefixCache {
         ((prompt_tokens / self.page_tokens as usize) * self.page_tokens as usize) as u32
     }
 
-    /// The cached prefix `key` (an exact, page-aligned match) already in
-    /// the cache, or `None`.
-    fn find(&self, key: &[TokenId]) -> Option<&PrefixEntry> {
-        self.entries.iter().find(|e| e.tokens == key)
+    /// The cached prefix with content `key` at `length` tokens (an exact,
+    /// page-aligned match) already in the cache, or `None`.
+    fn find(&self, key: MatchKey, length: u32) -> Option<&PrefixEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.key == key && e.length_tokens == length)
     }
 }
 
@@ -658,6 +733,8 @@ impl PrefixCache {
 mod tests {
     use super::*;
     use crate::gdn::GdnState;
+    use crate::identity::MediaKey;
+    use crate::types::TokenId;
 
     fn retention(at: u64) -> Retention {
         Retention {
@@ -1105,5 +1182,109 @@ mod tests {
         assert!(cache.longest_spilled_match(&prompt96()).is_none());
         assert_eq!(cache.forget_spilled(spilled).map(|s| s.id), Some(spilled));
         assert_eq!(cache.spilled_count(), 0);
+    }
+
+    // ── media-aware identity (GitHub #193) ───────────────────────────────
+
+    /// An image of `count` placeholders at `begin`, content `digest`, in an
+    /// `[1, 8, 8]` grid — two of these differing only in `digest` are the
+    /// same size and expand to the same placeholder ids.
+    fn image(begin: u32, count: u32, digest: u8) -> MediaKey {
+        MediaKey {
+            begin,
+            count,
+            digest: [digest; 32],
+            grid: [1, 8, 8],
+        }
+    }
+
+    #[test]
+    fn equal_token_ids_with_different_images_never_match() {
+        // Two same-size images: the token ids are identical, placeholders
+        // included, and only the digests differ.
+        let mut cache = PrefixCache::new(16);
+        let tokens = prompt96();
+        let mine = [image(20, 16, 0xAA)];
+        let yours = [image(20, 16, 0xBB)];
+        cache
+            .register(7, PromptContent::new(&tokens, &mine), &gdn_boundary(0), None)
+            .unwrap();
+        let theirs = PromptContent::new(&tokens, &yours);
+        assert_eq!(cache.longest_match_tokens(theirs), 0);
+        assert!(cache.claim(theirs).is_none(), "another picture never matches");
+        assert!(cache.claim(&tokens).is_none(), "nor does no picture at all");
+        let claim = cache.claim(PromptContent::new(&tokens, &mine)).unwrap();
+        assert_eq!(claim.tokens, 96, "the same picture does");
+    }
+
+    #[test]
+    fn a_head_before_the_image_is_shared_by_any_picture() {
+        // The history before an item's first placeholder is the same history
+        // whatever the picture: a system block is shared by a burst sending
+        // different images.
+        let mut cache = PrefixCache::new(16);
+        let tokens = prompt96();
+        let mine = [image(40, 16, 0xAA)];
+        let yours = [image(40, 16, 0xBB)];
+        let mine = PromptContent::new(&tokens, &mine);
+        cache.register(7, mine.head(32), &gdn_boundary(0), None).unwrap();
+        cache.register(7, mine, &gdn_boundary(0), None).unwrap();
+        let claim = cache.claim(PromptContent::new(&tokens, &yours)).unwrap();
+        assert_eq!(claim.tokens, 32, "only the head before the image");
+    }
+
+    #[test]
+    fn the_same_ids_with_different_images_are_two_entries_not_a_duplicate() {
+        // Two siblings in one batch, each publishing its own picture: the
+        // second is not "the prompt already cached" — it would be handed the
+        // first one's pages.
+        let mut cache = PrefixCache::new(16);
+        let tokens = prompt64();
+        let (a, b) = ([image(4, 16, 0xAA)], [image(4, 16, 0xBB)]);
+        assert!(cache.register(7, PromptContent::new(&tokens, &a), &gdn_boundary(0), None).is_some());
+        assert!(cache.register(8, PromptContent::new(&tokens, &b), &gdn_boundary(0), None).is_some());
+        assert!(cache.register(9, PromptContent::new(&tokens, &b), &gdn_boundary(0), None).is_none());
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.claim(PromptContent::new(&tokens, &b)).unwrap().publisher, 8);
+    }
+
+    #[test]
+    fn a_prefix_never_ends_inside_an_image() {
+        // A 70-token head floors to 64, which is inside the image at 50..80:
+        // refused, rather than sharing half of a picture's placeholders.
+        let mut cache = PrefixCache::new(16);
+        let tokens = prompt96();
+        let items = [image(50, 30, 0xAA)];
+        let prompt = PromptContent::new(&tokens, &items);
+        assert!(cache.register(7, prompt.head(70), &gdn_boundary(0), None).is_none());
+        assert_eq!(cache.entry_count(), 0);
+        // Ending exactly where the image begins is a legal head, and so is
+        // ending past it.
+        assert!(cache.register(7, prompt.head(48), &gdn_boundary(0), None).is_some());
+        assert!(cache.register(7, prompt, &gdn_boundary(0), None).is_some());
+    }
+
+    #[test]
+    fn a_spilled_prefix_is_matched_by_its_images_too() {
+        let mut cache = PrefixCache::new(16);
+        let tokens = prompt64();
+        let (mine, yours) = ([image(8, 16, 0xAA)], [image(8, 16, 0xBB)]);
+        let (id, _) = cache
+            .register(7, PromptContent::new(&tokens, &mine), &gdn_boundary(0), None)
+            .unwrap();
+        cache.retain_published(id, retention(1));
+        cache.record_spill(id).unwrap();
+        cache.release(id);
+        assert!(cache.unretain(id));
+        cache.release(id);
+        assert!(cache.longest_spilled_match(PromptContent::new(&tokens, &yours)).is_none());
+        let spilled = cache
+            .longest_spilled_match(PromptContent::new(&tokens, &mine))
+            .cloned()
+            .expect("the same picture matches in KV-RAM");
+        // And it comes back under the same name.
+        let (back, _) = cache.register_returned(&spilled).unwrap();
+        assert!(cache.claim(PromptContent::new(&tokens, &yours)).is_none());
+        assert_eq!(cache.claim(PromptContent::new(&tokens, &mine)).unwrap().id, back);
     }
 }
