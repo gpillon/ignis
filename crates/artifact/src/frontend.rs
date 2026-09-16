@@ -493,8 +493,19 @@ impl ChatTemplate {
     /// See [`Self::TOOL_RESPONSE_OPENER`].
     pub const TOOL_RESPONSE_CLOSER: &'static str = "</tool_response>";
 
-    /// The marker every rendered message ends with.
+    /// The marker every rendered message's *content* ends at. Not
+    /// [`Self::BLOCK_CLOSER`], which carries the line break after it too: one
+    /// bounds the content a tool result is recognized by, the other bounds a
+    /// whole rendered block, which is where the system block's boundary falls.
     pub const MESSAGE_CLOSER: &'static str = "<|im_end|>";
+
+    /// The marker a rendered prompt opens its **system block** with (GitHub
+    /// #188, ADR 0029).
+    pub const SYSTEM_BLOCK_OPENER: &'static str = "<|im_start|>system\n";
+
+    /// The marker every rendered block ends with.
+    pub const BLOCK_CLOSER: &'static str = "<|im_end|>\n";
+
 
     /// The byte offset where `rendered`'s **last real user query** begins —
     /// the last `<|im_start|>user\n` that is not a tool result — or `None` for
@@ -538,6 +549,36 @@ impl ChatTemplate {
         let content = rest.find(Self::MESSAGE_CLOSER).map_or(rest, |end| &rest[..end]);
         content.starts_with(Self::TOOL_RESPONSE_OPENER)
             && content.ends_with(Self::TOOL_RESPONSE_CLOSER)
+    }
+
+    /// The byte offset just past the end of `rendered`'s **first** system
+    /// block — reasoning instructions, tools and the system message, all of
+    /// which this template renders into one `<|im_start|>system … <|im_end|>\n`
+    /// — or `None` for a render that does not open with one (GitHub #188, ADR
+    /// 0029).
+    ///
+    /// This is the **retained prefix**'s boundary, and it is the mirror of
+    /// [`Self::generation_opener_offset`]. The opener is the *last* point a
+    /// conversation's own later turns share; this is the *first* point two
+    /// unrelated requests share. A burst of subagents spawned from one parent
+    /// sends one prompt per question, and no prompt extends another's — so no
+    /// prompt checkpoint can ever match between them, and the system and tools
+    /// block is the whole of what they have in common.
+    ///
+    /// The *first* block, and only when the render opens with it: a system
+    /// message that arrives later in the conversation is not a point two
+    /// different requests provably share from their first byte, and a
+    /// boundary inside a prompt's history is what the checkpoint is for.
+    ///
+    /// A byte offset rather than a token count, for the reason
+    /// [`Self::generation_opener_offset`] is one: turning it into a token
+    /// count means tokenizing the head and checking that it really is a token
+    /// prefix of the whole prompt (ADR 0029) — the tokenizer's job, not this
+    /// function's. Flooring it to whole KV pages is the scheduler's.
+    pub fn system_block_offset(rendered: &str) -> Option<usize> {
+        let body = rendered.strip_prefix(Self::SYSTEM_BLOCK_OPENER)?;
+        let at = body.find(Self::BLOCK_CLOSER)?;
+        Some(Self::SYSTEM_BLOCK_OPENER.len() + at + Self::BLOCK_CLOSER.len())
     }
 
     /// Render an OpenAI-style conversation through the template.

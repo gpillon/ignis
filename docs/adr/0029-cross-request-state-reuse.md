@@ -112,8 +112,66 @@ correctness oracles.
   never grew.
 - **Amends ADR 0023.** Retained state goes first, on the device and in
   KV-RAM.
+- **Departure (#189): the "artifact content hash" above is a hash of the
+  container's *directory*, not of its payload.** The v2 container carries no
+  per-tensor digest by design (`ignis_artifact::checksum`'s module doc), and
+  hashing ~19 GB of weights at every startup is not a price a compatibility
+  check may charge. `Reader::content_hash` therefore digests everything the
+  container *declares*: its identity, its byte size, its payload start, and
+  every object's name, kind, numeric format, storage layout, shape, offset and
+  length. That catches a different model, a re-export, a re-layout, a renamed
+  or added object, and a format change. It does **not** catch an *in-place
+  re-quantization* that rewrote payload bytes while preserving every name,
+  format, shape and offset — a different model this identity would accept
+  blobs from, and the one hole left in user story 16. Recorded as a test
+  rather than a comment (`a_rewritten_payload_alone_is_the_proxys_known_limit`
+  in `crates/artifact/src/lib.rs`). Closing it needs a digest the *producer*
+  writes into the container: a change to the artifact format, not to this
+  feature. **Open for the owner** — whether the proxy is enough, or whether
+  the v2 container should start carrying a payload digest.
 - **Vision (#180)** builds its media-aware prefix identity on the match key
   defined here, instead of adding its own.
 - **Rendering must be stable.** The chat template has to render history the
   way the reference does (tool-argument order, `preserve_thinking`); a
   rendering drift silently turns every match into a miss.
+
+## Amendment (2026-09-16) — which retained object goes first (#188)
+
+The Decision says retained state is "always the first victim" on the device
+but not which of the two kinds goes first. #188 makes both kinds real at the
+same time, so the device's first-victim path needs the order.
+
+**Retained prompt checkpoints are given up before retained prefixes; least
+recently used within each kind.**
+
+Three reasons, in the order they decide it:
+
+- **Width of the bet.** A checkpoint serves one conversation's next turn. A
+  retained prefix serves every future request that opens with that system and
+  tools block, including ones belonging to no conversation seen so far. Between
+  two bets, the narrower one is given up first.
+- **Pages returned per discard.** A checkpoint's prefix reaches past the block
+  its conversation opened with, so discarding one frees at least as many pages
+  as discarding a prefix does. Fewer discards, less reuse lost.
+- **Termination where a prefix carries both.** When the block and the opener
+  fall in the same KV page, one prefix is both the burst's retained block and
+  the pages a checkpoint stands on. Its pages come back only when *every*
+  holder lets go, so the checkpoints on it must go before its retention — any
+  other order gives up the wide bet and still returns no page.
+
+This is a policy the accepted Decision did not fix, recorded here rather than
+left in a comment. The owner may reverse it, and reversing it means two places
+rather than one:
+
+- the order of the two arms in `ConcreteScheduler::reclaim_retained`, which is
+  the ordering itself;
+- `ConcreteScheduler::reclaimable_prefixes`, which must go on listing **both**
+  kinds — checkpoint-held prefixes and bare retained ones — in one set. The
+  third reason above rests on that *membership*, not on the order the union
+  happens to be built in: a prefix carrying both is reclaimable only because
+  both kinds appear in the set, and narrowing it would strand that prefix
+  whichever arm ran first.
+
+`crates/core/tests/retained_prefix.rs`'s
+`the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
+that changes with it; it is written to fail when the order is flipped.

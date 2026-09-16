@@ -79,7 +79,34 @@ impl ArtifactTemplateProvider {
     /// history it does not have. When they disagree the answer is `None` —
     /// no checkpoint, rather than a wrong one.
     fn opener_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
-        let at = ChatTemplate::generation_opener_offset(prompt)?;
+        self.exact_token_prefix(prompt, ChatTemplate::generation_opener_offset(prompt)?, tokens)
+    }
+
+    /// How many leading tokens of `tokens` end `prompt`'s first system block
+    /// (GitHub #188, ADR 0029), or `None` when that cannot be said exactly.
+    ///
+    /// Checked the same way, and refused the same way, as the generation
+    /// opener above — and for a sharper reason. A checkpoint taken at a
+    /// position the two tokenizations disagree about would serve one
+    /// conversation its own near-miss; a *retained prefix* is claimed by
+    /// requests that have nothing else in common, so the same slip would hand
+    /// a subagent KV pages warmed from a block that is not the one it sent.
+    fn system_block_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        self.exact_token_prefix(prompt, ChatTemplate::system_block_offset(prompt)?, tokens)
+    }
+
+    /// How many leading tokens of `tokens` end at `prompt`'s byte offset `at`,
+    /// or `None` when the head does not tokenize to an exact token prefix of
+    /// the whole prompt.
+    ///
+    /// The head is tokenized **separately** and required to be a real token
+    /// prefix. That is not paranoia about the tokenizer: a BPE merge that
+    /// spans the boundary would make the head's ids differ from the prompt's
+    /// own leading ids, and state reused at a position the two disagree about
+    /// would be handed to a request whose history is not the one it was built
+    /// from. When they disagree the answer is `None` — no reuse, rather than
+    /// wrong reuse.
+    fn exact_token_prefix(&self, prompt: &str, at: usize, tokens: &[TokenId]) -> Option<u32> {
         let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
         (!head.is_empty() && tokens.starts_with(&head)).then(|| head.len() as u32)
     }
@@ -163,10 +190,12 @@ impl TemplateProvider for ArtifactTemplateProvider {
         };
         let opener_tokens = self.opener_tokens(&prompt, &tokens);
         let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
+        let system_block_tokens = self.system_block_tokens(&prompt, &tokens);
         RenderedPrompt {
             tokens,
             opener_tokens,
             user_turn_tokens,
+            system_block_tokens,
         }
     }
 
@@ -517,6 +546,90 @@ mod tests {
         let head = provider.set.tokenizer().encode(&prompt[..at]).expect("encode");
         assert_eq!(head.len(), opener as usize);
         assert_eq!(&rendered.tokens[..opener as usize], head.as_slice());
+    }
+
+    /// A template that opens the way the real one does — one system block
+    /// holding the instructions and the tools — then the conversation and the
+    /// generation opener (GitHub #188).
+    /// The newline after `<|im_end|>` is deliberately *not* trimmed (`{%`, not
+    /// `{%-`): it is part of the boundary the real template closes its blocks
+    /// with, and a template that ate it would report no block at all.
+    const TEMPLATE_WITH_SYSTEM_BLOCK: &str = "<|im_start|>system
+You are a careful assistant.<|im_end|>
+{% for m in messages -%}{{ m.role }} {{ m.content }}          {% endfor %}<|im_start|>assistant
+<think>";
+
+    #[test]
+    fn a_render_with_no_system_block_reports_none() {
+        // The placeholder template writes no chat markers at all, so there is
+        // no structural point two unrelated requests provably share — and the
+        // scheduler is told so rather than being given a guess. Nothing is
+        // published, and no prefix is retained.
+        let (_fixture, _reader, provider) = build_provider();
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(!rendered.tokens.is_empty());
+        assert_eq!(rendered.system_block_tokens, None);
+        // Nor does a render that has an opener but opens on the conversation:
+        // the two boundaries are reported independently.
+        let (_f2, _r2, with_opener) = build_provider_with(TEMPLATE_WITH_OPENER);
+        let rendered = with_opener.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(rendered.opener_tokens.is_some(), "this render has an opener");
+        assert_eq!(rendered.system_block_tokens, None);
+    }
+
+    #[test]
+    fn the_system_block_is_reported_as_an_exact_token_prefix_before_the_opener() {
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
+        let messages = [ChatMessage::text("user", "hello world")];
+        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let block = rendered
+            .system_block_tokens
+            .expect("the render opens with a system block");
+        let opener = rendered.opener_tokens.expect("and ends with an opener");
+        assert!(block > 0);
+        assert!(
+            block < opener,
+            "the block ({block}) closes before the opener ({opener}) — the retained prefix is \
+             the head the checkpoint's own history stands on"
+        );
+        // What was promised: the first `block` ids really are the head's own
+        // ids, not a count someone hoped lined up.
+        let prompt = provider.render(&messages, &opts(), no_tools()).expect("render");
+        let at = ChatTemplate::system_block_offset(&prompt).expect("offset");
+        let head = provider.set.tokenizer().encode(&prompt[..at]).expect("encode");
+        assert_eq!(head.len(), block as usize);
+        assert_eq!(&rendered.tokens[..block as usize], head.as_slice());
+    }
+
+    #[test]
+    fn two_requests_sharing_a_system_block_report_the_same_boundary() {
+        // The burst property, at this seam: the boundary is a fact about the
+        // block, not about the query behind it, so two subagents that differ
+        // only in their question report the same count over the same ids.
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
+        let first =
+            provider.apply_chat_template(&[ChatMessage::text("user", "one")], &opts(), no_tools());
+        let second = provider.apply_chat_template(
+            &[ChatMessage::text("user", "a quite different question")],
+            &opts(),
+            no_tools(),
+        );
+        let block = first.system_block_tokens.expect("a block");
+        assert_eq!(second.system_block_tokens, Some(block));
+        assert_eq!(
+            first.tokens[..block as usize],
+            second.tokens[..block as usize],
+            "the shared boundary covers the same ids in both prompts"
+        );
+        assert_ne!(first.tokens, second.tokens, "and the prompts really differ");
     }
 
     #[test]

@@ -120,10 +120,27 @@ When output names a domain concept, use the term as defined here.
   never see the section layout; a restore validates the header and refuses a
   stale or foreign one. Whole-sequence only: GDN state cannot be recomputed
   without re-running the prefix a restore exists to avoid (ADR 0024).
+- **Blob identity** — what state was produced under, carried in the **snapshot
+  blob**'s header and in the retained entry alike: the artifact's content hash,
+  the **KV format**, the blob layout version the leaf writes, and the drafter's
+  presence and draft window. It answers whether these bytes may be written into
+  a sequence at all, and a mismatch is refused before one of them moves. Never a
+  request id, and never an operator knob that does not change state — the bind
+  address, the prefill chunk, the concurrency and every byte budget are outside
+  it, because a budget derived from free VRAM differs from one start to the next
+  (ADR 0029). Its artifact hash is **structural**: a digest of what the container
+  declares — its identity, its size, and every object's name, kind, numeric
+  format, storage layout, shape, offset and length — not of the weight bytes,
+  which the v2 container carries no digest of. So it catches another model, a
+  re-export, a re-layout, a renamed object or a format change, and it does *not*
+  catch an in-place re-quantization that left the whole directory untouched
+  (ADR 0029, §Consequences: departure).
 - **Residency tier** — where sequence state lives, in three levels: **Tier 0 —
   device** (VRAM), **Tier 1 — KV-RAM**, **Tier 2 — KV-disk**. State moves down a
-  tier when the one above needs the room, and back up to be served. "Host tier"
-  is not a synonym: say KV-RAM.
+  tier when the one above needs the room, and back up to be served. Each tier
+  below the first carries a **restore floor**: the prompt tokens a match there
+  must reuse beyond the best match above it before it is worth the crossing, so
+  a tie always goes to the tier above. "Host tier" is not a synonym: say KV-RAM.
 - **KV-RAM** — Tier 1: the host-RAM tier that holds **snapshot blobs** of
   evicted live sequences (so they resume instead of re-prefilling) and of
   retained state (**prompt checkpoints**, **retained prefixes**) that left the
@@ -167,6 +184,16 @@ When output names a domain concept, use the term as defined here.
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
   evicted live sequence.
+- **Match key** — what a piece of **retained state** is addressed by: a hash
+  chain over the prompt tokens it covers, with each media item's identity (its
+  content digest and grid) mixed in at that item's **first** placeholder, so a
+  prefix covering one placeholder has committed to the whole image. A chain
+  rather than a digest of the whole, because a claimant asks about every prefix
+  length of its prompt at once, and because it lets a blob name its content in
+  sixteen bytes instead of carrying sixty thousand token ids to another tier.
+  Never contains a request id: a wrong session identifier could hand one
+  conversation another's state, a content match can only hand over identical
+  history (ADR 0029).
 - **Prefix reuse** — requests sharing a prefix skip the redundant prefill —
   concurrent siblings through a **shared prefix**, later requests through
   **retained state**: the shared **KV pages** are refcounted and shared in place on the
@@ -191,7 +218,17 @@ When output names a domain concept, use the term as defined here.
   is a scheduling decision, not a detail of the publish call: what a claimant
   clones is the mutable state at the prefix's *end*, so the publishing
   request's prefill is cut there, and a prompt whose length is not a whole
-  page pays one extra chunk for it.
+  page pays one extra chunk for it. A request publishes **one** head, so its
+  two boundaries share a prefix when they fall in the same KV page and
+  compete for it when they do not: a short first turn leaves both a
+  **retained prefix** and a **prompt checkpoint**, while a prompt with tools
+  — a block several pages long — leaves the block alone. That competition is
+  a limit of today's leaf rather than a rule of the domain: a sequence may
+  hold one prefix, and a capture demands the opener's whole pages be it.
+  GitHub #187 lifts the first and satisfies the second rather than waiving
+  it — a request may publish a second prefix over the head it warmed itself,
+  so the pages below its opener become its own chained prefix and it keeps
+  both the block and its checkpoint.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained

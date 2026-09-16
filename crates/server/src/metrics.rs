@@ -256,9 +256,21 @@ impl Metrics {
                 &self.decoded_tokens,
             ),
             ("ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", &self.kv_evictions),
+            // GitHub #188 — a **declared departure**, not a widening nobody
+            // wrote down. This counted sibling-prefix reuse only (ADR 0017's
+            // table row, core-07). A **retained prefix** is claimed through
+            // the very same path and emits the very same
+            // `SchedEvent::PrefixReused`, so cross-request reuse now lands
+            // here too and the two kinds cannot be told apart from this
+            // series. The help text says so rather than staying narrower than
+            // the value it describes. #190 owns the per-tier hit / miss /
+            // spill / restore counters that separate them, and the ADR 0017
+            // amendment declaring them; the name and type are unchanged
+            // meanwhile, so no consumer breaks.
             (
                 "ignis_prefix_reused_tokens_total",
-                "Cumulative tokens skipped through sibling-prefix reuse.",
+                "Cumulative tokens skipped through prefix reuse, sibling and retained together \
+                 (separated per tier by #190).",
                 &self.prefix_reused_tokens,
             ),
         ];

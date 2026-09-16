@@ -111,6 +111,7 @@ fn request_input(rendered: RenderedPrompt) -> RequestInput {
         multimodal: None,
         opener_tokens: rendered.opener_tokens,
         user_turn_tokens: rendered.user_turn_tokens,
+        system_block_tokens: rendered.system_block_tokens,
     }
 }
 
@@ -135,12 +136,12 @@ fn reused(events: &[SchedEvent], request: RequestId) -> Option<u32> {
 
 /// The retained pool's entries, as their token reach and whether each opens a
 /// turn.
-fn pool(sched: &ConcreteScheduler) -> Vec<(usize, bool)> {
+fn pool(sched: &ConcreteScheduler) -> Vec<(u32, bool)> {
     sched
         .checkpoint_pool()
         .entries()
         .iter()
-        .map(|e| (e.tokens.len(), e.turn_opening))
+        .map(|e| (e.tokens, e.turn_opening))
         .collect()
 }
 
@@ -273,7 +274,7 @@ fn a_new_user_message_after_a_tool_loop_reuses_the_turn_opening_checkpoint() {
     // turn opener, and whatever the latest iteration captured.
     assert_eq!(
         pools[1],
-        vec![(opener_1 as usize, true), (it2_opener as usize, false)],
+        vec![(opener_1, true), (it2_opener, false)],
         "after iteration 2: the turn opener and iteration 2's own checkpoint"
     );
     assert_eq!(
@@ -284,11 +285,11 @@ fn a_new_user_message_after_a_tool_loop_reuses_the_turn_opening_checkpoint() {
     );
     assert_eq!(
         pools[2][0],
-        (opener_1 as usize, true),
+        (opener_1, true),
         "the turn opener is the one that survives the loop"
     );
     assert!(
-        pools[2][1].0 > it2_opener as usize && !pools[2][1].1,
+        pools[2][1].0 > it2_opener && !pools[2][1].1,
         "and iteration 2's was superseded by iteration 3's: {:?}",
         pools[2]
     );
@@ -305,7 +306,7 @@ fn a_new_user_message_after_a_tool_loop_reuses_the_turn_opening_checkpoint() {
     assert_eq!(pools[3].len(), 1, "the previous turn is retired: {:?}", pools[3]);
     assert!(pools[3][0].1, "and what is left opens the new turn");
     assert!(
-        pools[3][0].0 > opener_1 as usize,
+        pools[3][0].0 > opener_1,
         "reaching further than the entry it replaced"
     );
 }

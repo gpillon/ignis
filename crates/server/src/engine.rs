@@ -514,6 +514,7 @@ mod tests {
             multimodal: None,
             opener_tokens: None,
             user_turn_tokens: None,
+            system_block_tokens: None,
             model: model.into(),
             tokens,
             params: DecodeParams {

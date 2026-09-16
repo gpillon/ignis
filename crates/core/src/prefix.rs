@@ -81,6 +81,15 @@ pub struct PrefixEntry {
     /// Live claimants (the registrant counts as one; the entry is dropped
     /// when the last claimant releases).
     pub refcount: u32,
+    /// The scheduling tick this entry was retained or last used at, for an
+    /// entry kept alive as a **retained prefix** (GitHub #188, ADR 0029);
+    /// `None` for an ordinary sibling prefix, which dies with its claimants.
+    ///
+    /// One of [`PrefixEntry::refcount`]'s references is the retention itself
+    /// while this is `Some`, which is what carries the entry past its
+    /// publisher's completion — and why the flag lives beside the refcount
+    /// rather than in a second ledger that could drift from it.
+    pub retained_at: Option<u64>,
 }
 
 /// The result of a successful claim: the entry's id, the leading prompt
@@ -206,6 +215,7 @@ impl PrefixCache {
             parent,
             gdn: gdn.clone(),
             refcount: 1, // the registrant is the first claimant
+            retained_at: None,
         };
         let (id, pages) = (entry.id, entry.pages);
         self.next_id += 1;
@@ -289,6 +299,99 @@ impl PrefixCache {
             }
             None => false,
         }
+    }
+
+    /// Keep `entry` alive with no live claimant — make it a **retained
+    /// prefix** (GitHub #188, ADR 0029).
+    ///
+    /// The retention takes one reference of its own, so the entry survives
+    /// the request that published it and the next subagent of a burst claims
+    /// it exactly as a concurrent sibling would. The spec says the prefix
+    /// "becomes retained at refcount 0"; taking the reference at the publish
+    /// instead is the same fact with no window in it — the entry is never one
+    /// release away from a drop that would have to be undone.
+    ///
+    /// `tick` seeds the LRU order [`PrefixCache::lru_retained`] gives entries
+    /// up in. Returns `false` when the entry is gone or is already retained:
+    /// a second retention would be a second reference nothing ever releases,
+    /// and the pages would never come back.
+    pub fn retain_published(&mut self, entry: PrefixId, tick: u64) -> bool {
+        match self.entries.iter_mut().find(|e| e.id == entry) {
+            Some(e) if e.retained_at.is_none() => {
+                e.retained_at = Some(tick);
+                e.refcount += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `entry` is a **retained prefix** (GitHub #188): kept alive by
+    /// a retention reference rather than by a live request.
+    pub fn is_retained(&self, entry: PrefixId) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.id == entry && e.retained_at.is_some())
+    }
+
+    /// Give up the retention on `entry`, so its reference is the caller's to
+    /// release (GitHub #188): the first-victim path.
+    ///
+    /// Returns `false` when the entry is gone or was never retained — the
+    /// caller must not then release a reference the cache does not hold, which
+    /// would drop the entry out from under a live claimant. It is two steps
+    /// rather than one because releasing is the *scheduler's* act: only it
+    /// knows what the freed pages are charged against and what handle the
+    /// backend still holds.
+    pub fn unretain(&mut self, entry: PrefixId) -> bool {
+        match self.entries.iter_mut().find(|e| e.id == entry) {
+            Some(e) if e.retained_at.is_some() => {
+                e.retained_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Move `entry` to the back of the retained LRU order, if it is retained
+    /// (GitHub #188). A no-op on anything else, because a claimant cannot tell
+    /// a retained entry from a live sibling's and must not have to.
+    pub fn touch_retained(&mut self, entry: PrefixId, tick: u64) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.id == entry && e.retained_at.is_some())
+        {
+            e.retained_at = Some(tick);
+        }
+    }
+
+    /// The retained prefixes whose pages would actually come back if the
+    /// retention were given up: those whose only holder *is* the retention
+    /// (GitHub #188).
+    ///
+    /// The same question [`PrefixCache::refcount_of`] answers for a retained
+    /// checkpoint, asked about the other kind of retained state: a prefix a
+    /// live request is still standing on frees nothing when its retention
+    /// goes, so giving it up would cost the next burst its reuse and buy this
+    /// request no page.
+    pub fn reclaimable_retained(&self) -> Vec<PrefixId> {
+        self.entries
+            .iter()
+            .filter(|e| e.retained_at.is_some() && e.refcount == 1)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// The least recently used reclaimable retained prefix — the first-victim
+    /// path's choice among them (GitHub #188), or `None` when nothing can be
+    /// given up.
+    pub fn lru_retained(&self) -> Option<PrefixId> {
+        self.entries
+            .iter()
+            .filter(|e| e.retained_at.is_some() && e.refcount == 1)
+            .min_by_key(|e| (e.retained_at, e.id))
+            .map(|e| e.id)
     }
 
     /// The entry `id`'s live holders, or 0 when it is gone (GitHub #186).
@@ -700,6 +803,112 @@ mod tests {
             None,
             "the child covers nothing the parent does not"
         );
+        assert_eq!(cache.entry_count(), 1);
+    }
+
+    #[test]
+    fn a_retained_prefix_outlives_its_publisher_and_a_later_request_claims_it() {
+        // GitHub #188: the burst. The first subagent publishes its system and
+        // tools block and finishes; the entry does not drop, and the next
+        // subagent — which arrived after its sibling was gone, and whose
+        // prompt extends nothing of it but the block — claims it as if they
+        // had been concurrent.
+        let mut cache = PrefixCache::new(16);
+        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        assert_eq!(pages, 4);
+        assert!(cache.retain_published(id, 1), "the publish is retained");
+        assert!(cache.is_retained(id));
+        // The publisher completes. Its reference goes; the retention stays.
+        assert_eq!(cache.release(id), vec![], "the retention still holds it");
+        assert_eq!(cache.pinned_pages(), 4);
+        let claim = cache.claim(&prompt96()).expect("a later request claims it");
+        assert_eq!(claim.tokens, 64, "it skips the whole retained block");
+        assert_eq!(claim.publisher, 7, "named by the request that warmed it");
+        assert_eq!(cache.pinned_pages(), 4, "a claim adds no new pages");
+    }
+
+    #[test]
+    fn a_retained_prefix_is_reclaimable_only_while_nothing_live_stands_on_it() {
+        // The first-victim path asks this before it gives up a bet: a prefix a
+        // live request is also standing on frees not one page when the
+        // retention goes, and giving it up would cost the next burst its reuse
+        // while buying this request nothing.
+        let mut cache = PrefixCache::new(16);
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.retain_published(id, 1);
+        assert_eq!(
+            cache.reclaimable_retained(),
+            Vec::<PrefixId>::new(),
+            "the publisher is still live"
+        );
+        cache.release(id); // the publisher completes
+        assert_eq!(cache.reclaimable_retained(), vec![id], "now only the retention holds it");
+        cache.claim(&prompt64()).unwrap(); // a live claimant arrives
+        assert_eq!(
+            cache.reclaimable_retained(),
+            Vec::<PrefixId>::new(),
+            "a live claimant is standing on it again"
+        );
+    }
+
+    #[test]
+    fn giving_up_a_retention_hands_the_reference_back_once() {
+        // `unretain` says whether the caller now owes a release. Saying yes
+        // twice would release a reference the cache never held and drop the
+        // entry out from under a live claimant.
+        let mut cache = PrefixCache::new(16);
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.retain_published(id, 1);
+        assert!(
+            !cache.retain_published(id, 2),
+            "retaining twice would pin the pages forever"
+        );
+        cache.release(id); // the publisher completes; the retention holds it
+        assert!(cache.unretain(id), "the caller now owes one release");
+        assert!(!cache.is_retained(id));
+        assert!(!cache.unretain(id), "and owes it exactly once");
+        assert_eq!(cache.release(id), vec![(4, 7)], "that release frees the pages");
+        assert_eq!(cache.pinned_pages(), 0);
+        assert!(!cache.unretain(id), "a dropped entry is not retained");
+        assert!(!cache.retain_published(id, 3), "nor can it be retained again");
+    }
+
+    #[test]
+    fn the_least_recently_used_retention_is_the_victim_and_a_claim_refreshes_it() {
+        // LRU over the retained prefixes, refreshed when one is used: a system
+        // block a burst is still arriving against must not be given up ahead
+        // of one nothing has touched since the server started.
+        let mut cache = PrefixCache::new(16);
+        let (old, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        let other: Vec<TokenId> = (500..=595).collect();
+        let (new, _) = cache.register(8, &other, &gdn_boundary(0), None).unwrap();
+        cache.retain_published(old, 1);
+        cache.retain_published(new, 2);
+        cache.release(old);
+        cache.release(new);
+        assert_eq!(cache.lru_retained(), Some(old), "the older retention goes first");
+        // A claim on the older one moves it to the back of the order.
+        let claim = cache.claim(&prompt64()).unwrap();
+        cache.touch_retained(claim.id, 9);
+        cache.release(claim.id);
+        assert_eq!(cache.lru_retained(), Some(new), "the used one is no longer oldest");
+        // Only reclaimable retentions are offered: a live claimant hides one.
+        cache.claim(&other).unwrap();
+        assert_eq!(cache.lru_retained(), Some(old));
+        assert!(cache.unretain(old));
+        cache.release(old);
+        assert_eq!(cache.lru_retained(), None, "nothing else can be given up");
+    }
+
+    #[test]
+    fn touching_something_that_is_not_retained_changes_nothing() {
+        // Every claim touches, because the claimant cannot tell a retained
+        // entry from a live sibling's — and must not have to.
+        let mut cache = PrefixCache::new(16);
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.touch_retained(id, 5);
+        assert!(!cache.is_retained(id), "touching does not retain");
+        cache.touch_retained(999, 5); // a gone entry
         assert_eq!(cache.entry_count(), 1);
     }
 

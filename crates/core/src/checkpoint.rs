@@ -31,10 +31,20 @@
 //!   on the device, always, and it never delays or refuses an admission (ADR
 //!   0023 as amended by ADR 0029).
 //! - **Entries are addressed by content, never by session.** The match is the
-//!   longest retained entry whose tokens are a prefix of the request's prompt.
-//!   There is no API field for it and no `RequestId` in the key: a wrong
-//!   session id could hand one conversation another's state, a content match
-//!   can only hand over identical history (ADR 0029).
+//!   longest retained entry whose [`MatchKey`] — a hash chain over the token
+//!   ids, with each media item's identity mixed in (GitHub #189,
+//!   [`crate::identity`]) — is a prefix key of the request's prompt. There is
+//!   no API field for it and no `RequestId` in the key: a wrong session id
+//!   could hand one conversation another's state, a content match can only
+//!   hand over identical history (ADR 0029).
+//!
+//! An entry also carries the [`BlobIdentity`] its state was produced under,
+//! and the pool matches only entries whose identity this load accepts. Inside
+//! one process every entry was captured under the pool's own identity and the
+//! filter never fires; it exists because the entries a tier below the device
+//! holds do not all come from this process — that is the whole of the Tier 2
+//! seam, and a filter that only runs when a blob is adopted would be a filter
+//! that was never exercised.
 //!
 //! - **A conversation keeps at most two.** #187 added the third rule: every
 //!   capture joins the lineage of the entry its request claimed
@@ -46,17 +56,16 @@
 //!
 //! **What later slices change here.** #188 (retained prefix) adds a
 //! second kind of retained entry, matched against the same prompt; #190
-//! (KV-RAM) makes [`CheckpointPool::discard_victim`] a *spill* rather than a
-//! discard, and gives the match a second tier to choose between — which is
-//! why [`CheckpointMatch`] already names its [`ReuseSource`]; #189 (identity)
-//! replaces [`CheckpointEntry::tokens`] with a hash chain over the token ids
-//! and adds the compatibility identity a blob is refused on, with #193
-//! filling the media slot in that key. None of those need the shape here to
-//! change.
+//! (KV-RAM) fills the second [`ResidencyTier`] of the pool's [`TierList`]:
+//! [`CheckpointPool::discard_victim`] becomes a *spill* to
+//! [`TierList::below`], and [`CheckpointPool::best_match`] already weighs the
+//! tiers in order with each one's restore floor. None of those need the shape
+//! here to change.
 
 use crate::gdn::GdnState;
+use crate::identity::{BlobHeader, BlobIdentity, IdentityMismatch, MatchKey, PromptContent};
 use crate::prefix::PrefixId;
-use crate::types::{RequestId, TokenId};
+use crate::types::RequestId;
 
 /// An opaque handle to a retained prompt checkpoint.
 pub type CheckpointId = u64;
@@ -99,6 +108,142 @@ impl ReuseSource {
     }
 }
 
+/// One residency tier in the ordered list retained state lives across
+/// (CONTEXT.md, "Residency tier"; GitHub #189).
+///
+/// A tier is a place plus the price of reaching it. The price is what makes
+/// the list more than an enum: state on the device is already where it is
+/// needed, so the device costs nothing to prefer; a tier below it costs a
+/// transfer, and a match there is only worth taking when it reuses enough
+/// *more* to pay for the crossing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyTier {
+    /// Where state in this tier lives.
+    pub source: ReuseSource,
+    /// Prompt tokens a match here must reuse **beyond** the best match in
+    /// every tier above it before it is taken.
+    ///
+    /// 0 in the first tier, which has nothing above it, and at least 1 in
+    /// every tier below — which is also what makes a tie go to the tier above
+    /// (ADR 0029). #190 sets KV-RAM's to one prefill chunk.
+    pub restore_floor_tokens: u32,
+}
+
+/// The ordered list of [`ResidencyTier`]s this load retains state across:
+/// device first, then whatever is below it.
+///
+/// **Why a list and not a branch.** Tier 2 (KV-disk) is prepared, not built
+/// (ADR 0029). The thing it would otherwise force a rewrite of is every place
+/// that says "device, or else KV-RAM": a third place turns each of those into
+/// a three-way branch, and the branches drift. Written over a list, adding a
+/// tier is adding an entry — the selection below and the demotion order are
+/// already expressed in terms of "the tier above" and "the tier below".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierList(Vec<ResidencyTier>);
+
+impl Default for TierList {
+    fn default() -> Self {
+        Self::device_only()
+    }
+}
+
+impl TierList {
+    /// The device alone — today's engine, and what a pool built without a
+    /// tier list gets.
+    pub fn device_only() -> Self {
+        Self(vec![ResidencyTier {
+            source: ReuseSource::Device,
+            restore_floor_tokens: 0,
+        }])
+    }
+
+    /// An explicit ordered list, cheapest tier first.
+    ///
+    /// Panics on a list that could not be a residency order: empty, a tier
+    /// named twice, a first tier with a nonzero floor (there is nothing above
+    /// it to beat), or a lower tier with a zero floor (which would let it win
+    /// a tie against the tier above it, and ties go upward).
+    pub fn new(tiers: Vec<ResidencyTier>) -> Self {
+        assert!(!tiers.is_empty(), "a residency order needs a tier");
+        assert_eq!(
+            tiers[0].restore_floor_tokens, 0,
+            "the first tier has nothing above it to beat"
+        );
+        for (rank, tier) in tiers.iter().enumerate() {
+            assert!(
+                !tiers[..rank].iter().any(|t| t.source == tier.source),
+                "{} appears twice in the residency order",
+                tier.source.as_str()
+            );
+            assert!(
+                rank == 0 || tier.restore_floor_tokens > 0,
+                "a tier below the first must beat it by something"
+            );
+        }
+        Self(tiers)
+    }
+
+    /// The tiers, cheapest first.
+    pub fn tiers(&self) -> &[ResidencyTier] {
+        &self.0
+    }
+
+    /// `source`'s position in the order, or `None` when this load does not
+    /// carry that tier at all.
+    pub fn rank(&self, source: ReuseSource) -> Option<usize> {
+        self.0.iter().position(|t| t.source == source)
+    }
+
+    /// Where state released by `source` goes next, or `None` to discard it —
+    /// the demotion order, and the one question the first-victim path and
+    /// #190's spill both ask.
+    pub fn below(&self, source: ReuseSource) -> Option<ReuseSource> {
+        let rank = self.rank(source)?;
+        self.0.get(rank + 1).map(|t| t.source)
+    }
+
+    /// Whether a match of `tokens` prompt tokens found in `source` is worth
+    /// taking over `best`, the best match so far and where it came from.
+    ///
+    /// The whole selection policy, in one place: longest reuse wins inside a
+    /// tier, and between two tiers the **lower** one has to beat the upper by
+    /// its own restore floor — whichever of the two the caller happens to be
+    /// holding. A tie therefore always goes upward, and a `source` this list
+    /// does not carry never wins anything.
+    ///
+    /// The two cross-tier branches below are the same rule read from each
+    /// end, and they have to stay each other's mirror: a caller that offered
+    /// its candidates in one order and a caller that offered them in the
+    /// other must choose the same match.
+    pub fn replaces(
+        &self,
+        source: ReuseSource,
+        tokens: u32,
+        best: Option<(ReuseSource, u32)>,
+    ) -> bool {
+        if tokens == 0 {
+            return false;
+        }
+        let Some(rank) = self.rank(source) else {
+            return false;
+        };
+        let Some((best_source, best_tokens)) = best else {
+            return true;
+        };
+        match self.rank(best_source) {
+            None => true,
+            // The candidate is above the standing best: it takes the match
+            // unless the best below it clears *its* floor over the candidate.
+            Some(best_rank) if rank < best_rank => {
+                tokens.saturating_add(self.0[best_rank].restore_floor_tokens) > best_tokens
+            }
+            Some(best_rank) if rank == best_rank => tokens > best_tokens,
+            // The candidate is below: it has to clear its own floor.
+            Some(_) => tokens >= best_tokens.saturating_add(self.0[rank].restore_floor_tokens),
+        }
+    }
+}
+
 /// A retained prompt checkpoint: one finished request's state at its
 /// generation opener.
 ///
@@ -120,12 +265,27 @@ pub struct CheckpointEntry {
     /// is never reused, so it stays a valid name for the bytes it left
     /// behind. It is a *backend handle*, never part of the match key: ADR
     /// 0029's "keys never contain a `RequestId`" is about
-    /// [`CheckpointEntry::tokens`], which is what #189 turns into a hash
-    /// chain.
+    /// [`CheckpointEntry::key`], which is computed from prompt content alone
+    /// and cannot reach this field.
     pub publisher: RequestId,
-    /// The prompt tokens up to and including the generation opener: the match
-    /// key. A request whose prompt starts with these reuses this entry.
-    pub tokens: Vec<TokenId>,
+    /// The content of the prompt up to and including the generation opener:
+    /// the match key (GitHub #189). A request whose prompt's prefix key at
+    /// [`CheckpointEntry::tokens`] equals this reuses this entry.
+    ///
+    /// Sixteen bytes instead of the token ids themselves, which is what lets
+    /// a tier below the device name what it holds without holding a
+    /// conversation ([`BlobHeader`]).
+    pub key: MatchKey,
+    /// Prompt tokens the key covers — everything up to the generation opener.
+    pub tokens: u32,
+    /// What the state was produced under (GitHub #189). Matched against the
+    /// pool's own identity before the entry is ever offered to a claimant, so
+    /// a blob from another artifact, KV format, blob layout or drafter is
+    /// refused rather than written into a sequence.
+    pub identity: BlobIdentity,
+    /// Which residency tier the entry is in. Every entry a capture produces is
+    /// on the device; #190 moves entries down the pool's [`TierList`].
+    pub tier: ReuseSource,
     /// The shared-prefix entry whose pages carry this checkpoint's history.
     /// The checkpoint counts as one of its claimants, which is what keeps the
     /// pages alive after every live request has gone.
@@ -155,32 +315,52 @@ pub struct CheckpointEntry {
     pub use_tick: u64,
 }
 
-/// Everything a capture records about the checkpoint it is retaining — the
-/// argument of [`CheckpointPool::retain`].
+impl CheckpointEntry {
+    /// What this entry would say about itself to a tier that does not hold its
+    /// history: its identity and its content, and nothing that names a request
+    /// or a process (GitHub #189).
+    pub fn header(&self) -> BlobHeader {
+        BlobHeader {
+            identity: self.identity,
+            key: self.key,
+            tokens: self.tokens,
+        }
+    }
+}
+
+/// One checkpoint offered to the pool: everything an entry is made of except
+/// the id and the tick the pool assigns.
 ///
-/// A struct rather than nine positional arguments because two of the nine
-/// ([`Self::claimed`] and [`Self::turn_opening`]) are *policy* rather than
-/// description, and a call site that spells them by name cannot silently swap
-/// them for the two `bool`-ish neighbours they sit next to.
+/// A struct rather than nine positional arguments because two of them —
+/// [`CheckpointCapture::identity`] and [`CheckpointCapture::tier`] — are the
+/// difference between a capture this load just took and a blob adopted from
+/// somewhere else, and a caller that has to count commas to tell them apart
+/// will eventually get it wrong.
 #[derive(Debug, Clone)]
 pub struct CheckpointCapture {
-    /// The request whose prefill captured the image (the backend's handle).
+    /// The request whose prefill captured it — the backend's handle on the
+    /// device image, never part of the key.
     pub publisher: RequestId,
-    /// The prompt tokens up to and including the generation opener.
-    pub tokens: Vec<TokenId>,
-    /// The shared-prefix entry whose pages carry the history below the opener.
+    /// The content key at the generation opener.
+    pub key: MatchKey,
+    /// Prompt tokens the key covers.
+    pub tokens: u32,
+    /// The shared-prefix entry carrying the whole KV pages under the opener.
     pub prefix: PrefixId,
     /// Whole KV pages that shared prefix holds.
     pub pages: u32,
-    /// Device bytes the image occupies in the retained pool.
+    /// Device bytes the entry's own image occupies.
     pub bytes: u64,
     /// The GDN state at the opener.
     pub gdn: GdnState,
-    /// The scheduling tick of the capture.
-    pub use_tick: u64,
+    /// What the state was produced under.
+    pub identity: BlobIdentity,
+    /// The residency tier the entry lands in.
+    pub tier: ReuseSource,
     /// The retained entry the capturing request resumed from, or `None` when
-    /// it resumed from nothing. This is what names the conversation: the new
-    /// entry joins that entry's lineage, or opens one of its own.
+    /// it resumed from nothing (GitHub #187). This is what names the
+    /// conversation: the new entry joins that entry's lineage, or opens one of
+    /// its own.
     pub claimed: Option<CheckpointId>,
     /// Whether this capture opens a new turn — whether a real user message
     /// lies between [`Self::claimed`]'s opener and this one's. `true` for a
@@ -206,6 +386,33 @@ pub struct Retained {
     pub id: CheckpointId,
     /// Entries of the same lineage this capture displaced, oldest first.
     pub superseded: Vec<CheckpointEntry>,
+}
+
+/// Why the pool would not take a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainRefused {
+    /// The byte budget cannot hold the image. The ordinary, expected answer:
+    /// retention is a bet, and a full pool simply does not take one (ADR
+    /// 0029). Nothing is evicted to make room.
+    Budget,
+    /// The state was produced under an identity this load cannot accept — a
+    /// blob from another artifact, KV format, blob layout or drafter. It is
+    /// refused here, before a single byte is written into a sequence.
+    Identity(IdentityMismatch),
+    /// The tier named is not one this load carries.
+    UnknownTier(ReuseSource),
+}
+
+impl std::fmt::Display for RetainRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetainRefused::Budget => write!(f, "the retained pool's byte budget is full"),
+            RetainRefused::Identity(mismatch) => write!(f, "{mismatch}"),
+            RetainRefused::UnknownTier(source) => {
+                write!(f, "this load has no {} tier", source.as_str())
+            }
+        }
+    }
 }
 
 /// A successful match: what the claimant needs to be allocated against the
@@ -247,29 +454,46 @@ pub struct CheckpointMatch {
 pub struct CheckpointPool {
     capacity_bytes: u64,
     used_bytes: u64,
+    identity: BlobIdentity,
+    tiers: TierList,
     entries: Vec<CheckpointEntry>,
     next_id: CheckpointId,
     next_lineage: LineageId,
     reused_tok: u64,
     captures: u64,
     skipped_captures: u64,
+    refused_blobs: u64,
     discards: u64,
 }
 
 impl CheckpointPool {
-    /// A pool bounded by `capacity_bytes` of device image. `0` disables
-    /// retention entirely (every capture is skipped) — a legal, explicit
-    /// choice, the way a `0` KV-RAM budget disables the host tier.
+    /// A pool bounded by `capacity_bytes` of device image, holding state
+    /// produced under [`BlobIdentity::UNSET`] on the device alone. `0`
+    /// disables retention entirely (every capture is skipped) — a legal,
+    /// explicit choice, the way a `0` KV-RAM budget disables the host tier.
     pub fn new(capacity_bytes: u64) -> Self {
+        Self::with_identity(capacity_bytes, BlobIdentity::UNSET)
+    }
+
+    /// A pool for state produced under `identity`, on the device alone.
+    pub fn with_identity(capacity_bytes: u64, identity: BlobIdentity) -> Self {
+        Self::with_tiers(capacity_bytes, identity, TierList::device_only())
+    }
+
+    /// A pool for state produced under `identity`, across `tiers`.
+    pub fn with_tiers(capacity_bytes: u64, identity: BlobIdentity, tiers: TierList) -> Self {
         Self {
             capacity_bytes,
             used_bytes: 0,
+            identity,
+            tiers,
             entries: Vec::new(),
             next_id: 0,
             next_lineage: 0,
             reused_tok: 0,
             captures: 0,
             skipped_captures: 0,
+            refused_blobs: 0,
             discards: 0,
         }
     }
@@ -279,7 +503,25 @@ impl CheckpointPool {
         self.capacity_bytes
     }
 
-    /// Device image bytes the retained entries occupy.
+    /// The identity state retained here was produced under: what a blob has
+    /// to carry to be written into a sequence on this load.
+    pub fn identity(&self) -> BlobIdentity {
+        self.identity
+    }
+
+    /// The residency tiers this pool retains state across, cheapest first.
+    pub fn tiers(&self) -> &TierList {
+        &self.tiers
+    }
+
+    /// Image bytes the retained entries occupy.
+    ///
+    /// **One budget, the device's** — [`CheckpointPool::capacity_bytes`] is
+    /// `--retained-pool-bytes`, and every entry is charged to it whatever tier
+    /// it names. That is right while the device is the only tier that holds
+    /// anything, and it is the first thing #190 has to split: KV-RAM has its
+    /// own budget, and an entry that left the card must give its device bytes
+    /// back or the pool will refuse captures for room nothing is using.
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -289,7 +531,8 @@ impl CheckpointPool {
         self.entries.len()
     }
 
-    /// The retained entries, in capture order.
+    /// The retained entries, in capture order — what each one covers, what it
+    /// costs, which tier it is in and what it was produced under.
     pub fn entries(&self) -> &[CheckpointEntry] {
         &self.entries
     }
@@ -340,15 +583,16 @@ impl CheckpointPool {
         self.entries.iter().filter(|e| e.prefix == prefix).count() as u32
     }
 
-    /// Whether a checkpoint over exactly `tokens` is already retained.
+    /// Whether a checkpoint over exactly the content `key` names is already
+    /// retained.
     ///
     /// A second capture at the same point would be a second image of the same
     /// state: the same skip for a claimant, paid for twice out of the byte
     /// budget. The caller checks this before it asks the backend to capture,
     /// the way [`crate::prefix::PrefixCache::register`] declines a duplicate
     /// prompt head.
-    pub fn holds(&self, tokens: &[TokenId]) -> bool {
-        self.entries.iter().any(|e| e.tokens == tokens)
+    pub fn holds(&self, key: MatchKey) -> bool {
+        self.entries.iter().any(|e| e.key == key)
     }
 
     /// Whether the byte budget can take one more image of `bytes`.
@@ -360,34 +604,46 @@ impl CheckpointPool {
         bytes > 0 && self.used_bytes.saturating_add(bytes) <= self.capacity_bytes
     }
 
-    /// Retain a checkpoint captured at `capture.tokens`' end (the generation
-    /// opener) and apply its lineage (GitHub #187).
+    /// A content key this load may match against — one whose state was
+    /// produced under an identity this pool accepts.
     ///
-    /// Returns the new entry's id **and the entries it superseded**, or
-    /// `None` when the byte budget cannot take it — the caller must have
-    /// asked [`CheckpointPool::admits`] before it let the backend capture
-    /// anything, so a `None` here is the pool refusing a capture that raced
-    /// its own budget, not an error path.
+    /// Refuses before anything is admitted or offered, which is the whole of
+    /// "a mismatch is refused before any byte reaches a sequence" (ADR 0029).
+    pub fn accepts(&self, header: &BlobHeader) -> Result<(), IdentityMismatch> {
+        self.identity.accepts(&header.identity)
+    }
+
+    /// Retain a checkpoint: an image this load's backend just captured, or a
+    /// blob adopted from a tier that outlives it.
     ///
-    /// The lineage rule, in one place because the two halves of it only make
-    /// sense together (ADR 0029): the new entry joins the lineage of the
-    /// entry its request claimed, and that lineage is then cut back to two —
-    /// its **latest** entry, which is this one, and its newest
-    /// **turn-opening** one, which is this one too when the capture opened a
-    /// turn. Everything else of that conversation is superseded *immediately*
-    /// rather than left for the LRU: a tool loop takes one checkpoint per
-    /// iteration, and a pool that waited for pressure would spend its whole
-    /// budget on history no request can still match.
-    pub fn retain(&mut self, capture: CheckpointCapture) -> Option<Retained> {
+    /// Returns the new entry's id, or why the pool would not take it. A
+    /// [`RetainRefused::Budget`] is the ordinary answer to a full pool — the
+    /// caller must have asked [`CheckpointPool::admits`] before it let the
+    /// backend capture anything, so it means the capture raced its own budget
+    /// rather than that something went wrong. A [`RetainRefused::Identity`] is
+    /// the Tier 2 refusal: the bytes exist and this load cannot use them.
+    pub fn retain(
+        &mut self,
+        capture: CheckpointCapture,
+        use_tick: u64,
+    ) -> Result<Retained, RetainRefused> {
+        if let Err(mismatch) = self.identity.accepts(&capture.identity) {
+            self.refused_blobs += 1;
+            return Err(RetainRefused::Identity(mismatch));
+        }
+        if self.tiers.rank(capture.tier).is_none() {
+            self.refused_blobs += 1;
+            return Err(RetainRefused::UnknownTier(capture.tier));
+        }
         if !self.admits(capture.bytes) {
             self.skipped_captures += 1;
-            return None;
+            return Err(RetainRefused::Budget);
         }
-        // A claimed entry that is already gone — taken by the first-victim
-        // path, or superseded by a sibling that finished first — leaves this
-        // capture with no conversation to join. It opens one, which is the
-        // same answer a first turn gets and for the same reason: there is
-        // nothing to supersede either way.
+        // GitHub #187. A claimed entry that is already gone — taken by the
+        // first-victim path, or superseded by a sibling that finished first —
+        // leaves this capture with no conversation to join. It opens one,
+        // which is the same answer a first turn gets and for the same reason:
+        // there is nothing to supersede either way.
         let inherited = capture
             .claimed
             .and_then(|claimed| self.entries.iter().find(|e| e.id == claimed))
@@ -407,24 +663,27 @@ impl CheckpointPool {
         self.entries.push(CheckpointEntry {
             id,
             publisher: capture.publisher,
+            key: capture.key,
             tokens: capture.tokens,
+            identity: capture.identity,
+            tier: capture.tier,
             prefix: capture.prefix,
             pages: capture.pages,
             bytes: capture.bytes,
             gdn: capture.gdn,
             lineage,
             turn_opening: capture.turn_opening,
-            use_tick: capture.use_tick,
+            use_tick,
         });
-        Some(Retained {
+        Ok(Retained {
             id,
             superseded: self.cut_lineage_back(lineage),
         })
     }
 
     /// Cut `lineage` back to the two entries ADR 0029 lets a conversation
-    /// keep — its latest and its newest turn-opening one — and return the
-    /// rest for the caller to release.
+    /// keep — its latest and its newest turn-opening one — and return the rest
+    /// for the caller to release (GitHub #187).
     ///
     /// Newest by id rather than by [`CheckpointEntry::use_tick`]: ids are
     /// assigned in capture order, and what "latest" means here is *furthest
@@ -453,33 +712,56 @@ impl CheckpointPool {
             .collect()
     }
 
-    /// The longest retained checkpoint whose tokens are a prefix of `tokens`,
-    /// or `None` when nothing matches. A pure query: it decides nothing and
+    /// The best retained checkpoint whose content is a prefix of `prompt`, or
+    /// `None` when nothing matches. A pure query: it decides nothing and
     /// changes nothing.
+    ///
+    /// "Best" is the [`TierList`]'s answer, not this function's: longest reuse
+    /// wins inside a tier, a tier above wins a tie, and a tier below has to
+    /// clear its own restore floor (ADR 0029). Entries produced under an
+    /// identity this load does not accept are not candidates at all.
     ///
     /// It is separate from [`CheckpointPool::record_claim`] because the
     /// scheduler has to weigh this match against a *sibling prefix* match
-    /// before it takes either — longest reuse wins (ADR 0029), and a losing
-    /// match must leave no trace in the LRU order or the reuse counter.
-    pub fn best_match(&self, tokens: &[TokenId]) -> Option<CheckpointMatch> {
-        self.entries
+    /// before it takes either — longest reuse wins, and a losing match must
+    /// leave no trace in the LRU order or the reuse counter.
+    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
+        let length = prompt.tokens();
+        // An entry longer than the prompt cannot be a prefix of it, and one
+        // this load would refuse to write must never be offered.
+        let candidates: Vec<&CheckpointEntry> = self
+            .entries
             .iter()
-            .filter(|e| e.tokens.len() <= tokens.len() && tokens.starts_with(&e.tokens))
-            // The longest reuse wins (ADR 0029). Two device entries cannot
-            // tie — two entries with the same token content are the same
-            // conversation at the same point — but #190 has to break a
-            // device-vs-KV-RAM tie in favour of the device, which is why the
-            // tier is carried on the match rather than inferred from it.
-            .max_by_key(|e| e.tokens.len())
-            .map(|best| CheckpointMatch {
-                id: best.id,
-                publisher: best.publisher,
-                source: ReuseSource::Device,
-                prefix: best.prefix,
-                tokens: best.tokens.len() as u32,
-                pages: best.pages,
-                gdn: best.gdn.clone(),
-            })
+            .filter(|e| e.tokens <= length && self.identity.accepts(&e.identity).is_ok())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        // One forward pass over the prompt answers every candidate's length —
+        // the reason the key is a chain rather than a digest of the whole.
+        let lengths: Vec<u32> = candidates.iter().map(|e| e.tokens).collect();
+        let keys = prompt.keys_at(&lengths);
+        let mut best: Option<&CheckpointEntry> = None;
+        for tier in self.tiers.tiers() {
+            for (n, entry) in candidates.iter().enumerate() {
+                if entry.tier != tier.source || entry.key != keys[n] {
+                    continue;
+                }
+                let standing = best.map(|b| (b.tier, b.tokens));
+                if self.tiers.replaces(tier.source, entry.tokens, standing) {
+                    best = Some(entry);
+                }
+            }
+        }
+        best.map(|best| CheckpointMatch {
+            id: best.id,
+            publisher: best.publisher,
+            source: best.tier,
+            prefix: best.prefix,
+            tokens: best.tokens,
+            pages: best.pages,
+            gdn: best.gdn.clone(),
+        })
     }
 
     /// Record that `id` was claimed: refresh its LRU tick and count the
@@ -493,14 +775,14 @@ impl CheckpointPool {
             return;
         };
         entry.use_tick = use_tick;
-        self.reused_tok += entry.tokens.len() as u64;
+        self.reused_tok += u64::from(entry.tokens);
     }
 
     /// [`CheckpointPool::best_match`] followed by
     /// [`CheckpointPool::record_claim`], for a caller with nothing to weigh
     /// the match against.
-    pub fn claim(&mut self, tokens: &[TokenId], use_tick: u64) -> Option<CheckpointMatch> {
-        let matched = self.best_match(tokens)?;
+    pub fn claim(&mut self, prompt: &PromptContent<'_>, use_tick: u64) -> Option<CheckpointMatch> {
+        let matched = self.best_match(prompt)?;
         self.record_claim(matched.id, use_tick);
         Some(matched)
     }
@@ -511,7 +793,8 @@ impl CheckpointPool {
     ///
     /// This is the **first victim** path (ADR 0023 as amended): a live request
     /// that cannot materialize takes retained pages back before admission
-    /// considers evicting anybody. Until #190, released means discarded.
+    /// considers evicting anybody. Until #190, released means discarded —
+    /// where it goes instead is [`TierList::below`]'s answer.
     pub fn discard_victim(&mut self) -> Option<CheckpointEntry> {
         self.discard_victim_on(None)
     }
@@ -527,10 +810,25 @@ impl CheckpointPool {
     /// request no page. The caller works out which prefixes qualify, because
     /// only it can see the live holders.
     pub fn discard_victim_on(&mut self, prefixes: Option<&[PrefixId]>) -> Option<CheckpointEntry> {
+        self.discard_victim_in(ReuseSource::Device, prefixes)
+    }
+
+    /// [`CheckpointPool::discard_victim_on`], in one named tier.
+    ///
+    /// The first-victim path is about the **device**: what a live request
+    /// needs back is VRAM, and an entry that already left the card frees none
+    /// of it. #190 calls this for its own tier when KV-RAM is the budget under
+    /// pressure.
+    pub fn discard_victim_in(
+        &mut self,
+        tier: ReuseSource,
+        prefixes: Option<&[PrefixId]>,
+    ) -> Option<CheckpointEntry> {
         let pos = self
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, e)| e.tier == tier)
             .filter(|(_, e)| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
             .min_by_key(|(_, e)| (e.use_tick, e.id))
             .map(|(i, _)| i)?;
@@ -550,13 +848,14 @@ impl CheckpointPool {
         self.reused_tok
     }
 
-    /// Checkpoints taken, checkpoints the byte budget refused, and
-    /// checkpoints discarded — the three counters #190's per-tier
-    /// hit / miss / spill / discard reporting is built from.
+    /// Checkpoints taken, checkpoints the byte budget refused, blobs refused
+    /// on their identity, and checkpoints discarded — the counters #190's
+    /// per-tier hit / miss / spill / discard reporting is built from.
     pub fn counters(&self) -> CheckpointCounters {
         CheckpointCounters {
             captures: self.captures,
             skipped_captures: self.skipped_captures,
+            refused_blobs: self.refused_blobs,
             discards: self.discards,
             reused_tok: self.reused_tok,
         }
@@ -580,6 +879,11 @@ pub struct CheckpointCounters {
     pub captures: u64,
     /// Captures the byte budget refused (nothing was evicted for them).
     pub skipped_captures: u64,
+    /// Blobs refused on their compatibility identity (GitHub #189): state
+    /// produced under another artifact, KV format, blob layout or drafter.
+    /// Zero for the life of a process that adopts nothing from outside it,
+    /// which is every process until Tier 2 exists.
+    pub refused_blobs: u64,
     /// Entries discarded, whether for a live request's pages or superseded.
     pub discards: u64,
     /// Prompt tokens skipped through a retained checkpoint.
@@ -627,6 +931,9 @@ pub fn auto_retained_pool_bytes(free_device_bytes: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{ArtifactHash, MediaKey};
+    use crate::kv_format::KvFormat;
+    use crate::types::TokenId;
 
     /// A GDN state resumable at `position` (a recorded boundary).
     fn gdn_at(position: usize) -> GdnState {
@@ -638,31 +945,51 @@ mod tests {
     /// One image's worth of device bytes, for a pool sized in whole images.
     const IMAGE: u64 = 1_000;
 
-    fn pool_of(images: u64) -> CheckpointPool {
-        CheckpointPool::new(IMAGE * images)
+    /// A load's identity, distinguishable from another by `byte`.
+    fn load(byte: u8) -> BlobIdentity {
+        BlobIdentity::of_load(
+            ArtifactHash::from_bytes([byte; 32]),
+            KvFormat::HqE8_2b,
+            None,
+            2,
+        )
     }
 
-    /// Retain a checkpoint over `tokens`, at `tick`, holding `pages` pages —
-    /// one conversation of its own, claiming nothing.
+    fn pool_of(images: u64) -> CheckpointPool {
+        CheckpointPool::with_identity(IMAGE * images, load(1))
+    }
+
+    /// Retain a checkpoint over `tokens`, at `tick`, holding `pages` pages.
     fn retain(
         pool: &mut CheckpointPool,
         publisher: RequestId,
         tokens: &[TokenId],
         pages: u32,
         tick: u64,
-    ) -> Option<CheckpointId> {
-        pool.retain(CheckpointCapture {
+    ) -> Result<CheckpointId, RetainRefused> {
+        let capture = CheckpointCapture {
             publisher,
-            tokens: tokens.to_vec(),
+            key: PromptContent::text(tokens).key_at(tokens.len() as u32),
+            tokens: tokens.len() as u32,
             prefix: publisher, // one prefix per publisher in these tests
             pages,
             bytes: IMAGE,
             gdn: gdn_at(tokens.len()),
-            use_tick: tick,
+            identity: pool.identity(),
+            tier: ReuseSource::Device,
             claimed: None,
             turn_opening: true,
-        })
-        .map(|retained| retained.id)
+        };
+        pool.retain(capture, tick).map(|retained| retained.id)
+    }
+
+    /// The pool's answer for a text-only prompt.
+    fn claim(
+        pool: &mut CheckpointPool,
+        tokens: &[TokenId],
+        tick: u64,
+    ) -> Option<CheckpointMatch> {
+        pool.claim(&PromptContent::text(tokens), tick)
     }
 
     #[test]
@@ -674,7 +1001,7 @@ mod tests {
         let turn_n: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &turn_n, 1, 1).unwrap();
         let turn_n_plus_1: Vec<TokenId> = (1..=160).collect();
-        let matched = pool.claim(&turn_n_plus_1, 2).expect("turn N+1 extends turn N");
+        let matched = claim(&mut pool, &turn_n_plus_1, 2).expect("turn N+1 extends turn N");
         assert_eq!(matched.tokens, 100, "everything up to turn N's opener");
         assert_eq!(matched.publisher, 7);
         assert_eq!(matched.source, ReuseSource::Device);
@@ -694,7 +1021,7 @@ mod tests {
         divergent.push(999);
         divergent.extend(200..260);
         assert!(
-            pool.claim(&divergent, 2).is_none(),
+            claim(&mut pool, &divergent, 2).is_none(),
             "a prompt that diverges before the opener reuses nothing"
         );
         assert_eq!(pool.reused_tok(), 0);
@@ -710,7 +1037,7 @@ mod tests {
         retain(&mut pool, 1, &turn1, 1, 1).unwrap();
         retain(&mut pool, 2, &turn2, 2, 2).unwrap();
         let turn3: Vec<TokenId> = (1..=250).collect();
-        let matched = pool.claim(&turn3, 3).unwrap();
+        let matched = claim(&mut pool, &turn3, 3).unwrap();
         assert_eq!(matched.tokens, 180, "the longest reuse wins");
         assert_eq!(matched.publisher, 2);
         assert_eq!(matched.pages, 2);
@@ -725,7 +1052,7 @@ mod tests {
         retain(&mut pool, 7, &retained, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
         for tick in 2..=4 {
-            assert!(pool.claim(&prompt, tick).is_some(), "claim {tick} hits");
+            assert!(claim(&mut pool, &prompt, tick).is_some(), "claim {tick} hits");
         }
         assert_eq!(pool.entry_count(), 1, "the entry survives its claimants");
         assert_eq!(pool.reused_tok(), 300, "each claim counts its skip");
@@ -743,7 +1070,11 @@ mod tests {
         retain(&mut pool, 1, &a, 1, 1).unwrap();
         retain(&mut pool, 2, &b, 1, 2).unwrap();
         assert!(!pool.admits(IMAGE), "the budget is spent");
-        assert_eq!(retain(&mut pool, 3, &c, 1, 3), None, "the capture is skipped");
+        assert_eq!(
+            retain(&mut pool, 3, &c, 1, 3),
+            Err(RetainRefused::Budget),
+            "the capture is skipped"
+        );
         assert_eq!(pool.entry_count(), 2, "nothing was evicted to take it");
         assert_eq!(pool.used_bytes(), 2 * IMAGE);
         assert_eq!(pool.counters().skipped_captures, 1);
@@ -755,7 +1086,7 @@ mod tests {
         let mut pool = pool_of(0);
         let a: Vec<TokenId> = (1..=100).collect();
         assert!(!pool.admits(IMAGE));
-        assert_eq!(retain(&mut pool, 1, &a, 1, 1), None);
+        assert_eq!(retain(&mut pool, 1, &a, 1, 1), Err(RetainRefused::Budget));
         assert_eq!(pool.entry_count(), 0);
     }
 
@@ -770,7 +1101,7 @@ mod tests {
         retain(&mut pool, 2, &b, 5, 2).unwrap();
         // Claiming `a` refreshes it, so `b` is now the older entry.
         let prompt: Vec<TokenId> = (1..=140).collect();
-        pool.claim(&prompt, 9).unwrap();
+        claim(&mut pool, &prompt, 9).unwrap();
         assert_eq!(pool.retained_pages(), 8);
         let victim = pool.discard_victim().expect("a victim");
         assert_eq!(victim.publisher, 2, "the least recently used entry goes");
@@ -788,9 +1119,9 @@ mod tests {
         let a: Vec<TokenId> = (1..=100).collect();
         let id = retain(&mut pool, 1, &a, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
-        assert!(pool.claim(&prompt, 2).is_some());
+        assert!(claim(&mut pool, &prompt, 2).is_some());
         assert_eq!(pool.discard(id).map(|e| e.id), Some(id));
-        assert!(pool.claim(&prompt, 3).is_none(), "a discarded entry is gone");
+        assert!(claim(&mut pool, &prompt, 3).is_none(), "a discarded entry is gone");
         assert_eq!(pool.discard(id).map(|e| e.id), None, "and gone once");
     }
 
@@ -802,7 +1133,7 @@ mod tests {
         let a: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 1, &a, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
-        let matched = pool.claim(&prompt, 2).unwrap();
+        let matched = claim(&mut pool, &prompt, 2).unwrap();
         assert!(matched.gdn.is_valid_snapshot_point(100));
         assert_eq!(matched.gdn.position(), 100);
     }
@@ -819,7 +1150,9 @@ mod tests {
         retain(&mut pool, 1, &older, 1, 1).unwrap();
         retain(&mut pool, 2, &newer, 1, 5).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
-        let peek = pool.best_match(&prompt).expect("a match");
+        let peek = pool
+            .best_match(&PromptContent::text(&prompt))
+            .expect("a match");
         assert_eq!(peek.tokens, 100);
         assert_eq!(pool.reused_tok(), 0, "peeking is not reuse");
         // The LRU order is untouched: entry 1 is still the older one.
@@ -834,8 +1167,9 @@ mod tests {
         let mut pool = pool_of(4);
         let a: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 1, &a, 1, 1).unwrap();
-        assert!(pool.holds(&a));
-        assert!(!pool.holds(&a[..99]), "a different point is not held");
+        let key_at = |at: u32| PromptContent::text(&a).key_at(at);
+        assert!(pool.holds(key_at(100)));
+        assert!(!pool.holds(key_at(99)), "a different point is not held");
     }
 
     #[test]
@@ -846,17 +1180,22 @@ mod tests {
         let mut pool = pool_of(4);
         let early: Vec<TokenId> = (1..=100).collect();
         let late: Vec<TokenId> = (1..=120).collect();
-        let first = pool
-            .retain(CheckpointCapture { prefix: 42, pages: 6, ..capture(1, &early, None, true) })
-            .unwrap();
-        let second = pool
-            .retain(CheckpointCapture {
-                prefix: 42,
+        for (publisher, tokens) in [(1, early), (2, late)] {
+            let capture = CheckpointCapture {
+                publisher,
+                key: PromptContent::text(&tokens).key_at(tokens.len() as u32),
+                tokens: tokens.len() as u32,
+                prefix: 42, // both checkpoints stand on one prompt head
                 pages: 6,
-                ..capture(2, &late, Some(first.id), false)
-            })
-            .unwrap();
-        assert!(second.superseded.is_empty(), "the turn opener stays");
+                bytes: IMAGE,
+                gdn: gdn_at(tokens.len()),
+                identity: pool.identity(),
+                tier: ReuseSource::Device,
+                claimed: None,
+                turn_opening: true,
+            };
+            let _ = pool.retain(capture, publisher).unwrap();
+        }
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
     }
@@ -899,130 +1238,317 @@ mod tests {
         assert_eq!(ReuseSource::KvRam.as_str(), "kv_ram");
     }
 
-    // ── Lineage (GitHub #187) ───────────────────────────────────────────
+    // ── GitHub #189: identity, the media slot, and the tier list ─────────
 
-    /// Capture over `tokens` for a request that claimed `claimed`, with
-    /// `turn_opening` recording whether it opens a new turn.
-    fn capture(
-        publisher: RequestId,
-        tokens: &[TokenId],
-        claimed: Option<CheckpointId>,
-        turn_opening: bool,
-    ) -> CheckpointCapture {
-        CheckpointCapture {
-            publisher,
-            tokens: tokens.to_vec(),
-            prefix: publisher,
+    #[test]
+    fn a_blob_taken_under_another_load_is_refused() {
+        // The Tier 2 refusal, at the one place a blob can enter the ledger: a
+        // restart under `--kv-format bf16`, or a disk tier handing back what
+        // yesterday's artifact left. Nothing is retained, so nothing can be
+        // matched, so no byte of it ever reaches a sequence.
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        let foreign = CheckpointCapture {
+            publisher: 7,
+            key: PromptContent::text(&tokens).key_at(100),
+            tokens: 100,
+            prefix: 7,
             pages: 1,
             bytes: IMAGE,
-            gdn: gdn_at(tokens.len()),
-            use_tick: publisher,
-            claimed,
-            turn_opening,
-        }
-    }
-
-    fn ids(pool: &CheckpointPool) -> Vec<CheckpointId> {
-        pool.entries().iter().map(|e| e.id).collect()
-    }
-
-    #[test]
-    fn a_tool_loop_keeps_the_turn_opener_and_the_latest() {
-        // The shape of an agent's tool loop: every iteration re-sends the
-        // whole history, claims the previous iteration's checkpoint and
-        // captures its own one turn further along. Only the first of them
-        // opens a turn — the tool results between them are not real user
-        // messages — so each iteration supersedes the one it claimed and the
-        // conversation never holds more than the pair (ADR 0029).
-        let mut pool = pool_of(8);
-        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
-        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
-        assert_eq!(ids(&pool), vec![c1.id, c2.id], "the opener and the latest");
-        assert!(c2.superseded.is_empty(), "the turn opener is not superseded");
-
-        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c2.id), false)).unwrap();
+            gdn: gdn_at(100),
+            identity: load(2),
+            tier: ReuseSource::Device,
+            claimed: None,
+            turn_opening: true,
+        };
+        let refused = pool.retain(foreign, 1).expect_err("another artifact");
         assert_eq!(
-            c3.superseded.iter().map(|e| e.id).collect::<Vec<_>>(),
-            vec![c2.id],
-            "iteration 2's checkpoint is superseded the moment iteration 3 takes one"
+            refused,
+            RetainRefused::Identity(
+                load(1)
+                    .accepts(&load(2))
+                    .expect_err("the identities differ")
+            )
         );
-        assert_eq!(ids(&pool), vec![c1.id, c3.id], "still exactly two");
-        assert_eq!(pool.used_bytes(), 2 * IMAGE, "the superseded image came back");
-    }
-
-    #[test]
-    fn a_new_user_message_retires_the_previous_turn() {
-        // The user types again. The request claims the turn-opening
-        // checkpoint — the only one its re-rendered history still matches —
-        // and what it captures opens a turn of its own, so it becomes both
-        // roles at once and the whole previous turn goes.
-        let mut pool = pool_of(8);
-        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
-        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
-        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c2.id), false)).unwrap();
-        let c4 = pool
-            .retain(capture(4, &tokens_to(300), Some(c1.id), true))
-            .unwrap();
-        let mut retired: Vec<CheckpointId> = c4.superseded.iter().map(|e| e.id).collect();
-        retired.sort_unstable();
+        assert_eq!(pool.entry_count(), 0, "nothing was retained");
+        assert_eq!(pool.used_bytes(), 0, "and nothing was charged for");
+        assert_eq!(pool.counters().refused_blobs, 1);
         assert_eq!(
-            retired,
-            vec![c1.id, c3.id],
-            "the old turn opener and the old latest both go"
+            pool.counters().skipped_captures,
+            0,
+            "a refusal is not a full pool"
         );
-        assert_eq!(ids(&pool), vec![c4.id], "the new turn starts alone");
-        assert_eq!(pool.used_bytes(), IMAGE);
-
-        // And the loop under the new turn keeps the pair again.
-        let c5 = pool.retain(capture(5, &tokens_to(360), Some(c4.id), false)).unwrap();
-        assert_eq!(ids(&pool), vec![c4.id, c5.id]);
+        let prompt: Vec<TokenId> = (1..=140).collect();
+        assert!(claim(&mut pool, &prompt, 2).is_none());
     }
 
     #[test]
-    fn a_capture_that_claimed_nothing_opens_its_own_lineage() {
-        // Two conversations that never met: neither supersedes the other,
-        // however many checkpoints each leaves.
-        let mut pool = pool_of(8);
-        let a1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
-        let b1 = pool.retain(capture(2, &[500, 501, 502], None, true)).unwrap();
-        let a2 = pool.retain(capture(3, &tokens_to(160), Some(a1.id), false)).unwrap();
-        assert!(a2.superseded.is_empty());
-        assert_eq!(ids(&pool), vec![a1.id, b1.id, a2.id]);
+    fn an_entry_from_another_load_is_never_matched() {
+        // Defence in depth for the same rule. Even if a future tier put an
+        // entry in the ledger without going through `retain`, the match
+        // filters on the entry's own identity — the field exists on the entry
+        // exactly so that being in the pool is not the same as being usable.
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        retain(&mut pool, 7, &tokens, 1, 1).unwrap();
+        let prompt: Vec<TokenId> = (1..=140).collect();
+        assert!(claim(&mut pool, &prompt, 2).is_some(), "its own load matches");
+        // The same bytes, re-labelled as another load's.
+        pool.entries[0].identity = load(2);
+        assert!(
+            pool.best_match(&PromptContent::text(&prompt)).is_none(),
+            "a foreign entry is not a candidate"
+        );
     }
 
     #[test]
-    fn a_capture_whose_claimed_entry_is_gone_starts_a_fresh_lineage() {
-        // The first-victim path can take the entry a live request claimed
-        // out from under it. What that request captures has nothing to
-        // supersede and no lineage to join, so it opens one.
-        let mut pool = pool_of(8);
-        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
-        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
-        pool.discard(c1.id).expect("the victim");
-        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c1.id), false)).unwrap();
-        assert!(c3.superseded.is_empty(), "nothing of that lineage is left");
-        assert_eq!(ids(&pool), vec![c2.id, c3.id]);
+    fn the_match_key_does_not_depend_on_who_captured_it() {
+        // ADR 0029: keys never contain a `RequestId`. Two requests that
+        // reached the same opener leave the same key, and the publisher stays
+        // what it is — the backend's handle on the device image.
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        retain(&mut pool, 7, &tokens, 1, 1).unwrap();
+        retain(&mut pool, 99, &tokens, 1, 2).unwrap();
+        assert_eq!(
+            pool.entries[0].key, pool.entries[1].key,
+            "same content, same key"
+        );
+        assert_ne!(pool.entries[0].publisher, pool.entries[1].publisher);
+        assert!(
+            pool.holds(pool.entries[0].key),
+            "the second capture is a duplicate the caller would decline"
+        );
     }
 
     #[test]
-    fn n_claimants_of_one_checkpoint_all_hit_and_it_survives_them() {
-        // A retry, a regenerate and two forks of the same history reach the
-        // same entry, and none of them consumes it (ADR 0029). Lineage is
-        // decided at *capture*, so a claim on its own moves nothing.
-        let mut pool = pool_of(8);
-        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
-        let prompt = tokens_to(140);
-        for tick in 2..=5 {
-            let matched = pool.claim(&prompt, tick).expect("claimant {tick} hits");
-            assert_eq!(matched.id, c1.id);
-            assert_eq!(matched.tokens, 100);
+    fn two_prompts_with_equal_tokens_and_different_media_never_match() {
+        // Spec §11 (ADR 0029): "I am never answered about a picture I did not
+        // send." The two prompts are the same token ids — the placeholders are
+        // one token repeated — and differ only in the images behind them.
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        let mine = [MediaKey {
+            begin: 10,
+            count: 16,
+            digest: [0xAA; 32],
+            grid: [1, 8, 8],
+        }];
+        let yours = [MediaKey {
+            digest: [0xBB; 32],
+            ..mine[0]
+        }];
+        let capture = CheckpointCapture {
+            publisher: 7,
+            key: PromptContent::new(&tokens, &mine).key_at(100),
+            tokens: 100,
+            prefix: 7,
+            pages: 1,
+            bytes: IMAGE,
+            gdn: gdn_at(100),
+            identity: pool.identity(),
+            tier: ReuseSource::Device,
+            claimed: None,
+            turn_opening: true,
+        };
+        let _ = pool.retain(capture, 1).unwrap();
+        let longer: Vec<TokenId> = (1..=140).collect();
+        assert!(
+            pool.claim(&PromptContent::new(&longer, &yours), 2).is_none(),
+            "another image is another conversation"
+        );
+        assert!(
+            pool.claim(&PromptContent::text(&longer), 3).is_none(),
+            "and no image at all is a third one"
+        );
+        assert!(
+            pool.claim(&PromptContent::new(&longer, &mine), 4).is_some(),
+            "the same image still matches"
+        );
+    }
+
+    #[test]
+    fn a_device_only_load_has_nothing_below_the_device() {
+        let pool = pool_of(4);
+        let tiers = pool.tiers();
+        assert_eq!(tiers.tiers().len(), 1);
+        assert_eq!(tiers.rank(ReuseSource::Device), Some(0));
+        assert_eq!(tiers.rank(ReuseSource::KvRam), None);
+        assert_eq!(
+            tiers.below(ReuseSource::Device),
+            None,
+            "until #190, released means discarded"
+        );
+    }
+
+    #[test]
+    fn a_second_tier_is_an_entry_in_the_list() {
+        // What #190 adds, and the whole of what it has to add: KV-RAM below
+        // the device with a restore floor. The policy below is already
+        // written over the list.
+        let tiers = TierList::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: 1024,
+            },
+        ]);
+        assert_eq!(tiers.rank(ReuseSource::KvRam), Some(1));
+        assert_eq!(tiers.below(ReuseSource::Device), Some(ReuseSource::KvRam));
+        assert_eq!(tiers.below(ReuseSource::KvRam), None, "the last tier discards");
+    }
+
+    #[test]
+    fn a_lower_tier_has_to_clear_its_restore_floor() {
+        let tiers = TierList::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: 1024,
+            },
+        ]);
+        let device_best = Some((ReuseSource::Device, 4_000));
+        assert!(
+            !tiers.replaces(ReuseSource::KvRam, 4_000, device_best),
+            "a tie goes to the device"
+        );
+        assert!(
+            !tiers.replaces(ReuseSource::KvRam, 5_023, device_best),
+            "one token short of a chunk is not worth the crossing"
+        );
+        assert!(tiers.replaces(ReuseSource::KvRam, 5_024, device_best));
+        // Read from the other end it is the same rule, and it has to be: a
+        // caller that found the KV-RAM match first must choose what a caller
+        // that found the device match first chooses. The device takes the tie,
+        // and keeps the match until KV-RAM's lead is worth the crossing.
+        for (device_tokens, device_wins) in
+            [(5_024, true), (4_001, true), (4_000, false), (3_000, false)]
+        {
+            assert_eq!(
+                tiers.replaces(
+                    ReuseSource::Device,
+                    device_tokens,
+                    Some((ReuseSource::KvRam, 5_024))
+                ),
+                device_wins,
+                "{device_tokens} on the device against 5024 in KV-RAM"
+            );
+            assert_eq!(
+                tiers.replaces(
+                    ReuseSource::KvRam,
+                    5_024,
+                    Some((ReuseSource::Device, device_tokens))
+                ),
+                !device_wins,
+                "the same comparison offered the other way round"
+            );
         }
-        assert_eq!(ids(&pool), vec![c1.id], "the entry survived all four");
-        assert_eq!(pool.counters().discards, 0, "a claim discards nothing");
+        // Inside one tier it is simply the longest reuse.
+        assert!(tiers.replaces(ReuseSource::Device, 4_001, device_best));
+        assert!(!tiers.replaces(ReuseSource::Device, 4_000, device_best));
+        // Nothing beats nothing, and a tier this load does not carry never
+        // wins.
+        assert!(tiers.replaces(ReuseSource::Device, 1, None));
+        assert!(!tiers.replaces(ReuseSource::Device, 0, None));
+        assert!(!TierList::device_only().replaces(ReuseSource::KvRam, 9_000, None));
     }
 
-    /// `1..=n`, the token content these lineage tests extend turn by turn.
-    fn tokens_to(n: u32) -> Vec<TokenId> {
-        (1..=n).collect()
+    #[test]
+    fn the_first_victim_is_taken_from_the_device() {
+        // The first-victim path is about VRAM: an entry that already left the
+        // card frees none of it, so it is not a candidate however old it is.
+        let tiers = TierList::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: 1024,
+            },
+        ]);
+        let mut pool = CheckpointPool::with_tiers(IMAGE * 4, load(1), tiers);
+        let spilled: Vec<TokenId> = (1..=100).collect();
+        let resident: Vec<TokenId> = (500..=600).collect();
+        for (publisher, tokens, tier) in [
+            (1, &spilled, ReuseSource::KvRam),
+            (2, &resident, ReuseSource::Device),
+        ] {
+            let capture = CheckpointCapture {
+                publisher,
+                key: PromptContent::text(tokens).key_at(tokens.len() as u32),
+                tokens: tokens.len() as u32,
+                prefix: publisher,
+                pages: 1,
+                bytes: IMAGE,
+                gdn: gdn_at(tokens.len()),
+                identity: pool.identity(),
+                tier,
+                claimed: None,
+                turn_opening: true,
+            };
+            let _ = pool.retain(capture, publisher).unwrap();
+        }
+        let victim = pool.discard_victim().expect("a device victim");
+        assert_eq!(
+            victim.publisher, 2,
+            "the older entry is in KV-RAM and frees no device page"
+        );
+        assert!(pool.discard_victim().is_none());
+        assert_eq!(
+            pool.discard_victim_in(ReuseSource::KvRam, None)
+                .map(|e| e.publisher),
+            Some(1),
+            "#190's own budget asks for its own tier"
+        );
+    }
+
+    #[test]
+    fn a_tier_this_load_does_not_carry_is_refused() {
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        let capture = CheckpointCapture {
+            publisher: 7,
+            key: PromptContent::text(&tokens).key_at(100),
+            tokens: 100,
+            prefix: 7,
+            pages: 1,
+            bytes: IMAGE,
+            gdn: gdn_at(100),
+            identity: pool.identity(),
+            tier: ReuseSource::KvRam,
+            claimed: None,
+            turn_opening: true,
+        };
+        assert_eq!(
+            pool.retain(capture, 1).err(),
+            Some(RetainRefused::UnknownTier(ReuseSource::KvRam))
+        );
+        assert_eq!(pool.entry_count(), 0);
+    }
+
+    #[test]
+    fn an_entry_names_itself_to_a_tier_that_does_not_hold_its_history() {
+        // The Tier 2 seam: sixteen bytes of key and the identity it was taken
+        // under, and nothing that names a request or a process.
+        let mut pool = pool_of(4);
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        retain(&mut pool, 7, &tokens, 1, 1).unwrap();
+        let header = pool.entries[0].header();
+        assert_eq!(header.tokens, 100);
+        assert_eq!(header.key, PromptContent::text(&tokens).key_at(100));
+        assert_eq!(header.identity, load(1));
+        assert_eq!(pool.accepts(&header), Ok(()));
+        let stale = BlobHeader {
+            identity: load(2),
+            ..header
+        };
+        assert!(pool.accepts(&stale).is_err());
     }
 }

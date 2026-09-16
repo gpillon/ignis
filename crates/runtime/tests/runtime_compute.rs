@@ -718,6 +718,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
+                system_block_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2],
                 params: DecodeParams {
@@ -752,6 +753,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
+                system_block_tokens: None,
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
@@ -791,6 +793,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
+        system_block_tokens: None,
         model: "stub".into(),
         tokens,
         params: DecodeParams {
@@ -846,6 +849,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
+        system_block_tokens: None,
         model: "stub".into(),
         tokens: vec![1, 2, 3, 4],
         params: DecodeParams {
@@ -900,6 +904,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
         multimodal: None,
         opener_tokens: opener,
         user_turn_tokens: None,
+        system_block_tokens: None,
         model: "stub".into(),
         tokens,
         params: DecodeParams {
@@ -1080,6 +1085,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,
+                    system_block_tokens: None,
                     model: "stub".into(),
                     tokens: vec![token],
                     params: DecodeParams {
@@ -1395,6 +1401,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 multimodal: Some(multimodal(40, vec![image(5, 10), image(20, 10)])),
                 opener_tokens: None,
                 user_turn_tokens: None,
+                system_block_tokens: None,
             },
             RequestClass::Agent,
         )

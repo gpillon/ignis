@@ -127,6 +127,7 @@ use crate::admission::{
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
 use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
+use crate::identity::{MediaKey, PromptContent};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
 use crate::scheduler::{
@@ -220,6 +221,22 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 /// spins the model thread. The attempt that reaches this ends the request
 /// with [`FinishReason::Error`].
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
+
+/// The media identity of `input`'s prompt, for the content match key
+/// (GitHub #189; #193 is what makes this reachable).
+///
+/// Empty — and allocation-free — for the text-only request that is every
+/// request today: a multimodal one never reaches the reuse path at all
+/// (`Request::may_share_prefix`). It is wired here rather than in #193
+/// because the key's media slot is decided by *what* is mixed in, and taking
+/// exactly the processor's per-item content digest and grid out of the items
+/// is that decision. #193 opens the gate; it does not get to change the key.
+fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
+    match &input.multimodal {
+        None => Vec::new(),
+        Some(multimodal) => multimodal.media.iter().map(MediaKey::from).collect(),
+    }
+}
 
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
@@ -401,16 +418,22 @@ impl ConcreteScheduler {
             host: HostTier::new(config.host_capacity_bytes),
             tick: 0,
             prefix: PrefixCache::new(config.kv_page_tokens),
-            checkpoints: CheckpointPool::new(if config.prompt_reuse {
-                config.retained_pool_bytes
-            } else {
-                // `--prompt-reuse off` is not a budget of zero that something
-                // might later grow: it is a pool that never exists. Building
-                // it empty makes every read of it — `admits`, `best_match`,
-                // `retained_pages` — answer correctly without a second flag
-                // check at each site.
-                0
-            }),
+            // GitHub #189: the pool holds what this backend's state was
+            // produced under, so an entry it could not write into a sequence
+            // is never offered to one.
+            checkpoints: CheckpointPool::with_identity(
+                if config.prompt_reuse {
+                    config.retained_pool_bytes
+                } else {
+                    // `--prompt-reuse off` is not a budget of zero that
+                    // something might later grow: it is a pool that never
+                    // exists. Building it empty makes every read of it —
+                    // `admits`, `best_match`, `retained_pages` — answer
+                    // correctly without a second flag check at each site.
+                    0
+                },
+                compute.blob_identity(),
+            ),
             config,
             compute,
             next_id: 0,
@@ -524,16 +547,33 @@ impl ConcreteScheduler {
     /// holds.
     ///
     /// A prefix's pages return at refcount zero, and its holders are live
-    /// requests plus retained checkpoints. So "nothing live is standing on
-    /// it" is exactly "its refcount is the number of retained entries on it"
-    /// — which is why the two ledgers are compared rather than either being
-    /// read alone.
+    /// requests, retained checkpoints, and — since GitHub #188 — the
+    /// prefix's own retention when it is a **retained prefix**. So "nothing
+    /// live is standing on it" is exactly "its refcount is the number of
+    /// retained holders on it" — which is why the two ledgers are compared
+    /// rather than either being read alone.
+    ///
+    /// Both kinds are listed together because a prefix can be both: a request
+    /// whose system block and generation opener land in the same KV page
+    /// publishes one head and leaves a checkpoint standing on it. Giving up
+    /// either alone would free nothing there, and only listing them together
+    /// lets [`Self::reclaim_retained`] give up both.
     fn reclaimable_prefixes(&self) -> Vec<PrefixId> {
-        self.checkpoints
-            .retained_prefixes()
-            .into_iter()
-            .filter(|&p| self.prefix.refcount_of(p) == self.checkpoints.retained_holders(p))
-            .collect()
+        let mut out = self.checkpoints.retained_prefixes();
+        for p in self.prefix.reclaimable_retained() {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out.retain(|&p| self.prefix.refcount_of(p) == self.retained_holders_of(p));
+        out
+    }
+
+    /// Everything holding `prefix` that is retained state rather than a live
+    /// request: the checkpoints standing on it, plus its own retention when it
+    /// is a retained prefix (GitHub #186, #188).
+    fn retained_holders_of(&self, prefix: PrefixId) -> u32 {
+        self.checkpoints.retained_holders(prefix) + u32::from(self.prefix.is_retained(prefix))
     }
 
     /// KV pages the first-victim path could actually give back right now.
@@ -564,7 +604,7 @@ impl ConcreteScheduler {
     /// after this point keeps its checkpoint without a single extra rule
     /// (spec §Cancellation).
     fn retain_checkpoint(&mut self, idx: usize, at: u32) {
-        let (publisher, prefix, tokens, gdn, claimed, turn_opening) = {
+        let (publisher, prefix, key, gdn, claimed, turn_opening) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
                 // The leaf published a prefix and captured against it, and
@@ -575,30 +615,34 @@ impl ConcreteScheduler {
                 self.compute.release_checkpoint(r.id);
                 return;
             };
+            let media = media_keys(&r.input);
             (
                 r.id,
                 prefix,
-                r.input.tokens[..at as usize].to_vec(),
+                PromptContent::new(&r.input.tokens, &media).key_at(at),
                 r.gdn.clone(),
                 r.checkpoint_entry,
                 r.opens_a_turn(),
             )
         };
-        let pages = self.prefix.total_pages_of(prefix);
-        let bytes = self.compute.checkpoint_image_bytes();
-        let tick = self.tick;
-        match self.checkpoints.retain(CheckpointCapture {
+        let capture = CheckpointCapture {
             publisher,
-            tokens,
+            key,
+            tokens: at,
             prefix,
-            pages,
-            bytes,
+            // GitHub #187: the whole head below the opener, the prefix's chain
+            // included — what a claimant of this entry shares, which is not
+            // the same as what any one link would give back.
+            pages: self.prefix.total_pages_of(prefix),
+            bytes: self.compute.checkpoint_image_bytes(),
             gdn,
-            use_tick: tick,
+            identity: self.checkpoints.identity(),
+            tier: ReuseSource::Device,
             claimed,
             turn_opening,
-        }) {
-            Some(retained) => {
+        };
+        match self.checkpoints.retain(capture, self.tick) {
+            Ok(retained) => {
                 self.requests[idx].checkpoint_captured = true;
                 self.prefix.retain(prefix);
                 // GitHub #187 — the conversation's superseded checkpoints,
@@ -614,8 +658,10 @@ impl ConcreteScheduler {
             // in one call both cleared it before either had retained. The
             // image the backend took is real but nothing can now reach it, so
             // it is released here rather than left to outlive every ledger
-            // that knows it exists.
-            None => self.compute.release_checkpoint(publisher),
+            // that knows it exists. (An identity refusal cannot happen on this
+            // path: the capture carries the pool's own identity, because this
+            // load's backend is what produced it.)
+            Err(_) => self.compute.release_checkpoint(publisher),
         }
     }
 
@@ -640,10 +686,28 @@ impl ConcreteScheduler {
             // qualifies the answer is "retained state cannot help", and the
             // caller goes to the eviction machinery with the pool intact.
             let reclaimable = self.reclaimable_prefixes();
-            let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) else {
+            if let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) {
+                self.discard_checkpoint(victim);
+                continue;
+            }
+            // GitHub #188: then the retained prefixes. Checkpoints go first,
+            // and not by accident. A checkpoint is the narrow bet — one
+            // conversation's next turn — while a retained prefix is the wide
+            // one: every future request that opens with that system and tools
+            // block, whether or not it belongs to any conversation seen so
+            // far. Between two bets, the narrower one is given up first. It
+            // also frees strictly more, since a checkpoint's prefix reaches
+            // past the block its conversation opened with; and where a prefix
+            // carries both, this ordering is what makes the loop able to give
+            // up the checkpoints standing on it *and then* the retention,
+            // which is the only sequence that returns those pages at all.
+            let Some(prefix) = self.prefix.lru_retained() else {
                 return false;
             };
-            self.discard_checkpoint(victim);
+            if !self.prefix.unretain(prefix) {
+                return false;
+            }
+            self.release_prefix_claim(Some(prefix));
         }
     }
 
@@ -1627,16 +1691,68 @@ impl Scheduler for ConcreteScheduler {
                 // no checkpoint could be taken on those prompts at all.
                 // It never raises the head, so a concurrent sibling loses at
                 // most one page of shared prefix.
+                //
+                // GitHub #188 (ADR 0029): and floored again to the **system
+                // block's** page when the frontend reported one of at least a
+                // page. That is the retained-prefix boundary, and it is the
+                // only head a *burst* can ever share — no subagent's prompt
+                // extends its sibling's, so a prefix cut any further in
+                // matches nobody but its own conversation. A prompt whose
+                // block is under one page, or that has none, keeps #186's
+                // opener page and its prompt checkpoint with it.
+                //
+                // One head is published, not two: the leaf allows one prefix
+                // per sequence (`seq_prefix.cu:129`, "already claims a shared
+                // prefix"), and a checkpoint demands its whole pages *be* that
+                // prefix (`seq_checkpoint.cu:125`). So the extra chunk split
+                // the spec asks for is **moved**, not added.
+                //
+                // The two boundaries share that head when they fall in the
+                // same page — a short first turn leaves a retained prefix
+                // *and* a checkpoint — and compete for it when they do not,
+                // which is every prompt carrying tools.
+                //
+                // The competition is temporary, and GitHub #187 ends it by
+                // **chaining** the publish rather than by weakening the
+                // capture. `seq_checkpoint.cu:125`'s
+                // `below != seq->shared_pages` stays, and must: a checkpoint
+                // holds exactly one copied tail page and its capture takes
+                // `seq->kv.page_ids()[0]`, so with the opener pages above the
+                // block the copied page would not be the opener's at all and
+                // the pages between would have no holder — which is the
+                // defect #186 fixed in `565d634`. What #187 removes instead is
+                // `seq_prefix.cu:129`'s `seq->prefix != nullptr`, so a
+                // sequence standing on the block publishes a *second* prefix
+                // over the head it warmed itself, taking over the reference it
+                // held. The intermediate pages get their holder from that
+                // chained link, and `below == shared_pages` becomes true
+                // rather than relaxed.
+                let opener_page = |at: u32| (at / self.config.kv_page_tokens) * self.config.kv_page_tokens;
                 match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
-                    Some(opener) => head.min(
-                        (opener / self.config.kv_page_tokens) * self.config.kv_page_tokens,
-                    ),
+                    Some(opener) => head.min(opener_page(opener)),
                     None => head,
                 }
             }
         };
         let mut request = Request::new(id, class, input, resources, effective_max as u64);
+        // GitHub #187 × #188: the two boundaries **compose** rather than
+        // exclude each other. #188 floored this to the system block, because
+        // the leaf allowed one prefix per sequence and the block is the only
+        // head a burst can share — which cost every request its prompt
+        // checkpoint, since qwen-code sends tools and the block is therefore
+        // never short. A sequence now holds a prefix *chain*, so the request
+        // publishes at the block and then chains the opener's page over it
+        // (`Request::publish_point` walks both in prompt order). This stays
+        // the opener's page floor, and the block joins it there.
         request.publish_tokens = publish_tokens;
+        // And `--prompt-reuse off` publishes at neither boundary. #188 kept
+        // that by gating the block where it floored the publish point; with
+        // the flooring gone the gate lives here, on the request's own copy of
+        // the structural offsets — the same thing the opener filter above
+        // does, so that off really is the engine that existed before.
+        if !self.config.prompt_reuse {
+            request.input.system_block_tokens = None;
+        }
         self.requests.push(request);
         Ok(id)
     }
@@ -1722,14 +1838,22 @@ impl Scheduler for ConcreteScheduler {
                     // beat, because claiming a prefix is not free — it pins
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
-                    let retained = self
-                        .checkpoints
-                        .best_match(&self.requests[i].input.tokens);
+                    let media = media_keys(&self.requests[i].input);
+                    let retained = self.checkpoints.best_match(&PromptContent::new(
+                        &self.requests[i].input.tokens,
+                        &media,
+                    ));
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
                         .claim_longer_than(&self.requests[i].input.tokens, floor);
                     if let Some(claim) = claimed {
+                        // GitHub #188: a claim moves a *retained* prefix to
+                        // the back of the LRU order (a no-op on a live
+                        // sibling's). A system block a burst is still arriving
+                        // against must not be the first victim merely because
+                        // it was published long ago.
+                        self.prefix.touch_retained(claim.id, self.tick);
                         let r = &mut self.requests[i];
                         r.prefix_entry = Some(claim.id);
                         r.prefix_publisher = Some(claim.publisher);
@@ -1919,7 +2043,21 @@ impl Scheduler for ConcreteScheduler {
                     if at == 0 || !admits {
                         return 0;
                     }
-                    let head = &r.input.tokens[..at as usize];
+                    // GitHub #189: what makes two capture points the same is
+                    // their content, so the duplicate check is over the key —
+                    // and the key is what the entry will carry anyway.
+                    //
+                    // Known cost, filed as a follow-up rather than fixed here:
+                    // the chain is walked to `at` on every advance a capture is
+                    // possible on, not only on the chunk that lands on it — a
+                    // claimant whose opener floors to `shared_pages` pays it
+                    // every tick. The narrowing is to evaluate this only while
+                    // `start < at <= start + take`, and the `take` it has to
+                    // test is the **pre-cut** one: the cut below is computed
+                    // *from* this answer, so testing the cut width would make
+                    // the guard true by construction.
+                    let media = media_keys(&r.input);
+                    let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
                     if self.checkpoints.holds(head) { 0 } else { at }
                 })
                 .collect()
@@ -2138,6 +2276,48 @@ impl Scheduler for ConcreteScheduler {
                                     r.shared_pages += pages;
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
+                                    // GitHub #188 (ADR 0029): a prefix
+                                    // published at or below the system block
+                                    // boundary is **retained** — it does not
+                                    // drop when its last live claimant goes,
+                                    // so the next subagent of the burst claims
+                                    // it although its sibling finished. Asked
+                                    // of the request rather than re-derived,
+                                    // so the head that was published and the
+                                    // head that is retained cannot disagree.
+                                    //
+                                    // `<=`, not `==`: a prompt shorter than
+                                    // its own block publishes the whole pages
+                                    // it has, which is a prefix *of* the block
+                                    // and reusable by the same burst. What
+                                    // must never be retained is a head reaching
+                                    // *past* the block, since that is the
+                                    // request's own conversation and no
+                                    // sibling shares it.
+                                    let block = self.requests[i]
+                                        .retained_prefix_point(self.config.kv_page_tokens);
+                                    if self.config.prompt_reuse
+                                        && block > 0
+                                        && published <= block
+                                    {
+                                        let tick = self.tick;
+                                        let took = self.prefix.retain_published(entry, tick);
+                                        // `retain_published` refuses an entry
+                                        // that is gone or already retained,
+                                        // and `entry` is neither: `register`
+                                        // minted it a line ago, and a fresh
+                                        // id carries no retention. Asserted
+                                        // rather than dropped, because a
+                                        // silent `false` here is a prefix
+                                        // that quietly stopped outliving its
+                                        // publisher — which no test of a
+                                        // *later* request could tell from an
+                                        // ordinary miss.
+                                        debug_assert!(
+                                            took,
+                                            "a freshly registered prefix is always retainable"
+                                        );
+                                    }
                                 }
                                 // The leaf published and this cache declined
                                 // — the head is already registered by

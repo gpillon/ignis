@@ -219,7 +219,10 @@ fn request_input(
     // prefix's identity is token ids alone until the media-aware match key
     // lands (#189 defines the key, #193 fills its media slot), so two prompts
     // differing only in their images would share a checkpoint. The opener is
-    // therefore reported on the text-only path only.
+    // therefore reported on the text-only path only, and so — GitHub #188 —
+    // is the system block boundary: a retained prefix published across a
+    // media placeholder would be claimed by a request that sent another
+    // picture.
     let text_only = multimodal.is_none();
     let input = RequestInput {
         multimodal: multimodal.map(Arc::new),
@@ -230,6 +233,7 @@ fn request_input(
         // GitHub #187: the turn boundary rides along, filtered for the same
         // reason — a prompt that takes no checkpoint has no lineage to place.
         user_turn_tokens: rendered.user_turn_tokens.filter(|_| text_only),
+        system_block_tokens: rendered.system_block_tokens.filter(|_| text_only),
     };
     (input, model, prompt_tokens)
 }

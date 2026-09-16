@@ -30,6 +30,7 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
+        system_block_tokens: None,
         model: model.into(),
         tokens: prompt,
         params: DecodeParams {

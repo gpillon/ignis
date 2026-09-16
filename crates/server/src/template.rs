@@ -333,6 +333,22 @@ pub struct RenderedPrompt {
     /// turn-opening, which costs a superseded entry rather than the entry the
     /// next user message is the only thing that still matches.
     pub user_turn_tokens: Option<u32>,
+    /// How many leading tokens end the rendered prompt's **first system
+    /// block** — reasoning instructions, tools and the system message, which
+    /// this template renders into one `<|im_start|>system … <|im_end|>\n`
+    /// (GitHub #188, ADR 0029).
+    ///
+    /// The mirror of [`Self::opener_tokens`]: the opener is the last point a
+    /// conversation's own later turns share, this is the first point two
+    /// *unrelated* requests share, and it is what a burst of subagents
+    /// publishes a **retained prefix** at.
+    ///
+    /// `None`, and no prefix is retained, when the render does not open with a
+    /// system block, or when the block's byte offset does not tokenize to an
+    /// exact token prefix of the whole prompt — a boundary the tokenizer
+    /// disagrees about would hand a later request KV pages for history it does
+    /// not have.
+    pub system_block_tokens: Option<u32>,
 }
 
 impl From<Vec<TokenId>> for RenderedPrompt {
@@ -344,6 +360,7 @@ impl From<Vec<TokenId>> for RenderedPrompt {
             tokens,
             opener_tokens: None,
             user_turn_tokens: None,
+            system_block_tokens: None,
         }
     }
 }

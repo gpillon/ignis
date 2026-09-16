@@ -68,6 +68,7 @@ struct Inner {
 /// streams and different request seeds produce different streams.
 pub struct MockCompute {
     seed: u64,
+    identity: crate::identity::BlobIdentity,
     inner: Mutex<Inner>,
 }
 
@@ -82,7 +83,18 @@ impl MockCompute {
     pub fn with_seed(seed: u64) -> Self {
         Self {
             seed,
+            identity: crate::identity::BlobIdentity::UNSET,
             inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// A mock whose state is produced under `identity` (GitHub #189): what a
+    /// test uses to stand in for a real load, or for a *different* load than
+    /// the one some blob came from.
+    pub fn with_blob_identity(identity: crate::identity::BlobIdentity) -> Self {
+        Self {
+            identity,
+            ..Self::new()
         }
     }
 
@@ -201,6 +213,10 @@ impl Compute for MockCompute {
     // `retained_pool_bytes` to the number of checkpoints it wants to fit.
     fn checkpoint_image_bytes(&self) -> u64 {
         1
+    }
+
+    fn blob_identity(&self) -> crate::identity::BlobIdentity {
+        self.identity
     }
 
     fn release_checkpoint(&self, publisher: RequestId) {
