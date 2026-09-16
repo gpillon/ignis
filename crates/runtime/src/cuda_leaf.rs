@@ -23,7 +23,7 @@
 
 use ignis_artifact::{CudaDevice, Device, MaterializedArtifact, ObjectHandle, Reader};
 use ignis_core::model_load::{self, Model as CoreModel};
-use ignis_core::seq::{PinnedBuffer, Seq, SeqPool, SeqPoolBudget, SeqPrefix};
+use ignis_core::seq::{PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix};
 use ignis_core::step;
 use ignis_core::{
     DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig, N_DECODE_LANES, SpecCounters,
@@ -220,6 +220,7 @@ impl StepLeaf for CudaLeaf {
     type Model = CudaModel;
     type Sequence = Seq<'static>;
     type Prefix = SeqPrefix<'static>;
+    type Checkpoint = SeqCheckpoint<'static>;
     type SnapshotBuf = PinnedBuffer;
     type Media = step::MediaEmbedding<'static>;
 
@@ -453,6 +454,50 @@ impl StepLeaf for CudaLeaf {
         sequence
             .publish_prefix(prefix_tokens)
             .map_err(|e| leaf_error("prefix publish", e.to_string()))
+    }
+
+    /// GitHub #186: the leaf answers what a checkpoint of *this* pool costs
+    /// rather than the scheduler guessing from the geometry — the sections
+    /// are the pool's, and a drafter or a KV format changes them.
+    fn checkpoint_image_bytes(&self, model: &Self::Model) -> u64 {
+        model.pool.checkpoint_image_bytes().unwrap_or(0)
+    }
+
+    fn capture_checkpoint(
+        &self,
+        _model: &Self::Model,
+        sequence: &mut Self::Sequence,
+        opener_tokens: u32,
+    ) -> Result<Self::Checkpoint, i32> {
+        // A checkpoint borrows the pool, not the sequence — capturing from a
+        // `Seq<'static>` yields a `SeqCheckpoint<'static>` with no detaching
+        // needed, exactly as `publish_prefix` above does, and the capturing
+        // sequence stays usable for the rest of its prompt and its decode.
+        sequence
+            .capture_checkpoint(opener_tokens)
+            .map_err(|e| leaf_error("checkpoint capture", e.to_string()))
+    }
+
+    fn allocate_sequence_from_checkpoint(
+        &self,
+        model: &Self::Model,
+        context_tokens: u32,
+        checkpoint: &Self::Checkpoint,
+    ) -> Result<(Self::Sequence, u64), i32> {
+        let sequence = model
+            .pool
+            .alloc_from_checkpoint(context_tokens, checkpoint)
+            .map_err(|e| leaf_error("checkpoint claim", e))?;
+        // Measured by the leaf during the claim, not timed around the call:
+        // what a claimant pays is the point at which it can be stepped.
+        let micros = checkpoint.stats().last_claim_micros;
+        // Safety: as above — the pool outlives the sequences drawn from it.
+        Ok((unsafe { sequence.into_static() }, micros.round().max(0.0) as u64))
+    }
+
+    fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {
+        // `SeqCheckpoint`'s own `Drop` frees the images and lets go of the
+        // prefix under it (`ignis_seq_checkpoint_release`).
     }
 
     fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {

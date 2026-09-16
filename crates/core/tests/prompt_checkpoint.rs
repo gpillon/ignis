@@ -249,6 +249,50 @@ fn the_prefill_is_cut_at_the_publish_point_and_again_at_the_opener() {
 }
 
 #[test]
+fn a_page_aligned_opener_is_captured_on_the_publish_chunk() {
+    // One prompt in sixty-four has its opener land exactly on a page
+    // boundary. There is no second chunk to cut, so the capture rides the
+    // publish chunk: the backend publishes the prefix and captures against
+    // it in one call. Without this the aligned prompts would be the only
+    // ones that silently never retain anything.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched
+        .submit(input(tokens(1, 40), Some(2 * PAGE), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 8],
+        "no extra cut: the opener already is the publish point"
+    );
+    let jobs: Vec<(Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n)
+        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(Some(32), Some(32)), (None, None)],
+        "one chunk publishes and captures"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+
+    // And it is claimable like any other.
+    let later = sched
+        .submit(
+            input([tokens(1, 32), tokens(600, 28)].concat(), Some(57), 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 32, 1)]);
+}
+
+#[test]
 fn a_prompt_with_no_reported_opener_captures_nothing() {
     // The frontend could not place the opener — no `<|im_start|>assistant\n`,
     // or a byte offset that does not tokenize to an exact prefix. No
@@ -308,6 +352,69 @@ fn a_checkpoint_claimant_does_not_capture_its_own() {
             .filter(|j| j.request == n1)
             .all(|j| j.capture_checkpoint_tokens.is_none()),
         "and never asked the backend for one"
+    );
+}
+
+#[test]
+fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
+    // The scheduler's cache entry and the leaf's prefix are two ledgers over
+    // one set of pages, and they were the same number until the publish
+    // point was floored to the *opener's* page rather than the prompt's. If
+    // the cache registered the prompt's head instead, a sibling would skip
+    // prefill for tokens nothing ever warmed — and would answer from a hole,
+    // silently.
+    //
+    // A 40-token prompt whose opener ends at 30: two whole pages of prompt,
+    // but only one whole page below the opener.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let first = sched
+        .submit(input(tokens(1, 40), Some(30), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        chunk_widths(&compute, first),
+        vec![16, 14, 10],
+        "cut at the opener's page, then at the opener"
+    );
+
+    // The cache entry under the checkpoint covers one page — the head the
+    // backend published — and not the prompt's own two. Its pages are what
+    // the pool is charged and what a claimant's reservation shrinks by, so an
+    // entry claiming a page the leaf never published would hand a claimant
+    // warm history that does not exist.
+    assert_eq!(
+        sched.checkpoint_pool().retained_pages(),
+        1,
+        "the retained entry holds exactly the published page"
+    );
+    assert_eq!(
+        sched.kv_used_pages(),
+        1,
+        "and the pool is charged for exactly that page once every live          request is gone"
+    );
+
+    // A later request sharing the whole 40-token head resumes at the
+    // checkpoint's 30-token opener, which reaches further than the 16-token
+    // prefix under it: longest reuse wins (ADR 0029).
+    let later = sched
+        .submit(
+            input([tokens(1, 30), tokens(700, 30)].concat(), None, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 30, 1)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, .. } if *request == later)),
+        "and it took the checkpoint rather than the shorter prefix under it"
+    );
+    assert_eq!(
+        chunk_widths(&compute, later).iter().sum::<usize>(),
+        30,
+        "so it prefills only what the checkpoint does not cover"
     );
 }
 

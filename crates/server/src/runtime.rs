@@ -289,6 +289,7 @@ mod tests {
         type Prefix = ();
         type SnapshotBuf = Vec<u8>;
         type Media = ();
+        type Checkpoint = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())

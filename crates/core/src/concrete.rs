@@ -537,7 +537,12 @@ impl ConcreteScheduler {
         let (publisher, prefix, tokens, gdn) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
-                debug_assert!(false, "a capture point implies a shared prefix under it");
+                // The leaf published a prefix and captured against it, and
+                // *this* cache then declined to register the head — another
+                // request in the same batch took it. Nothing here can name
+                // the image, so it is released rather than left to outlive
+                // every ledger that knows it exists.
+                self.compute.release_checkpoint(r.id);
                 return;
             };
             (
@@ -1820,12 +1825,33 @@ impl Scheduler for ConcreteScheduler {
             let admits = self.checkpoints.admits(image_bytes);
             batch
                 .iter()
-                .map(|&i| {
-                    let at = self.requests[i].checkpoint_point(self.config.kv_page_tokens);
+                .enumerate()
+                .map(|(n, &i)| {
+                    let r = &self.requests[i];
+                    let at = match r.checkpoint_point(self.config.kv_page_tokens) {
+                        // A **page-aligned** opener falls exactly on the
+                        // publish point, and this is the chunk that creates
+                        // the prefix — so `checkpoint_point` cannot see one
+                        // yet and would refuse a capture that is in fact
+                        // perfectly placed. One prompt in sixty-four lands
+                        // here; the capture rides the publish chunk instead,
+                        // and the backend publishes then captures in the one
+                        // call.
+                        0 => {
+                            let publish_at = publish_points[n];
+                            let rides_the_publish = publish_at > 0
+                                && r.input.opener_tokens == Some(publish_at)
+                                && r.prefix_entry.is_none()
+                                && !r.checkpoint_captured
+                                && r.may_share_prefix();
+                            if rides_the_publish { publish_at } else { 0 }
+                        }
+                        at => at,
+                    };
                     if at == 0 || !admits {
                         return 0;
                     }
-                    let head = &self.requests[i].input.tokens[..at as usize];
+                    let head = &r.input.tokens[..at as usize];
                     if self.checkpoints.holds(head) { 0 } else { at }
                 })
                 .collect()
@@ -1992,13 +2018,21 @@ impl Scheduler for ConcreteScheduler {
                         // residual, and the entry's own release
                         // (`Self::release_prefix_claim`) subtracts the
                         // rest when its last claimant is gone.
-                        if job.publish_prefix_tokens.is_some() {
+                        if let Some(published) = job.publish_prefix_tokens {
                             let publisher = self.requests[i].id;
-                            let registered = self.prefix.register(
-                                publisher,
-                                &self.requests[i].input.tokens,
-                                &self.requests[i].gdn,
-                            );
+                            // Registered over exactly the head the *leaf*
+                            // published, not over the whole prompt. The two
+                            // were the same number until GitHub #186 floored
+                            // the publish point to the generation opener's
+                            // page rather than the prompt's; registering the
+                            // prompt's head now would cache an entry claiming
+                            // more warm history than the leaf's prefix
+                            // actually holds, and a claimant would skip
+                            // prefill for tokens nothing warmed.
+                            let head = &self.requests[i].input.tokens[..published as usize];
+                            let registered =
+                                self.prefix
+                                    .register(publisher, head, &self.requests[i].gdn);
                             match registered {
                                 Some((entry, pages)) => {
                                     let r = &mut self.requests[i];
