@@ -119,14 +119,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::checkpoint::{CheckpointCapture, CheckpointEntry, CheckpointPool, ReuseSource};
+use crate::checkpoint::{
+    CheckpointCapture, CheckpointEntry, CheckpointPool, ReuseSource, StateCacheOperation, TierList,
+};
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
     ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
     choose_resident_candidate_victim, choose_retained_lane_victim, make_admission_protection,
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
-use crate::host::{HostEntry, HostTier, ResumePhase, Tier};
+use crate::host::{HostEntry, HostTier, HostVictim, ResumePhase, RetainedHostEntry, Tier};
 use crate::identity::{MediaKey, PromptContent};
 use crate::prefix::{PrefixCache, PrefixId};
 use crate::request::Request;
@@ -421,7 +423,7 @@ impl ConcreteScheduler {
             // GitHub #189: the pool holds what this backend's state was
             // produced under, so an entry it could not write into a sequence
             // is never offered to one.
-            checkpoints: CheckpointPool::with_identity(
+            checkpoints: CheckpointPool::with_tiers(
                 if config.prompt_reuse {
                     config.retained_pool_bytes
                 } else {
@@ -433,6 +435,11 @@ impl ConcreteScheduler {
                     0
                 },
                 compute.blob_identity(),
+                if config.prompt_reuse && config.host_capacity_bytes > 0 {
+                    TierList::device_and_kv_ram()
+                } else {
+                    TierList::device_only()
+                },
             ),
             config,
             compute,
@@ -587,9 +594,64 @@ impl ConcreteScheduler {
     /// Discard a retained checkpoint: release the backend's device image and
     /// let go of the checkpoint's hold on the shared pages under it (which
     /// return to the pool if nothing else is holding them).
-    fn discard_checkpoint(&mut self, entry: CheckpointEntry) {
+    fn discard_checkpoint(&mut self, entry: CheckpointEntry, events: &mut Vec<SchedEvent>) {
+        events.push(SchedEvent::StateCache {
+            operation: StateCacheOperation::Discard,
+            source: entry.tier,
+        });
         self.compute.release_checkpoint(entry.publisher);
+        if entry.tier == ReuseSource::Device {
+            self.release_prefix_claim(Some(entry.prefix));
+        } else {
+            self.host.discard_retained(entry.id);
+        }
+    }
+
+    /// Move a device checkpoint to KV-RAM if the shared host budget can take
+    /// its materialized blob. Retained entries may displace older retained
+    /// entries, but never a suspended live request merely to preserve a bet.
+    fn spill_checkpoint(&mut self, entry: &CheckpointEntry, events: &mut Vec<SchedEvent>) -> bool {
+        let Ok(bytes) = self.compute.checkpoint_snapshot_size(entry.publisher) else {
+            return false;
+        };
+        if bytes == 0 || bytes > self.host.capacity_bytes() {
+            return false;
+        }
+        while self.host.used_bytes().saturating_add(bytes) > self.host.capacity_bytes() {
+            let Some(victim) = self.host.evict_retained() else {
+                return false;
+            };
+            if let Some(discarded) = self.checkpoints.discard(victim.checkpoint) {
+                self.discard_checkpoint(discarded, events);
+            }
+        }
+        let Ok(actual_bytes) = self.compute.spill_checkpoint(entry.publisher) else {
+            return false;
+        };
+        let owner = self
+            .requests
+            .iter()
+            .find(|request| request.id == entry.publisher)
+            .map_or(RequestClass::Agent, |request| request.class);
+        self.host
+            .capture_retained(RetainedHostEntry {
+                checkpoint: entry.id,
+                publisher: entry.publisher,
+                owner,
+                bytes: actual_bytes,
+                tier: Tier::Probation,
+                use_tick: self.tick,
+            })
+            .expect("the spill was priced and room was made before bytes moved");
+        self.checkpoints
+            .move_to_tier(entry.id, ReuseSource::KvRam, actual_bytes, self.tick)
+            .expect("KV-RAM is configured when a checkpoint is spilled");
         self.release_prefix_claim(Some(entry.prefix));
+        events.push(SchedEvent::StateCache {
+            operation: StateCacheOperation::Spill,
+            source: ReuseSource::KvRam,
+        });
+        true
     }
 
     /// Record the prompt checkpoint the backend just captured for request
@@ -603,7 +665,7 @@ impl ConcreteScheduler {
     /// on it while its publisher is still decoding — and a request cancelled
     /// after this point keeps its checkpoint without a single extra rule
     /// (spec §Cancellation).
-    fn retain_checkpoint(&mut self, idx: usize, at: u32) {
+    fn retain_checkpoint(&mut self, idx: usize, at: u32, events: &mut Vec<SchedEvent>) {
         let (publisher, prefix, key, gdn, claimed, turn_opening) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
@@ -651,7 +713,7 @@ impl ConcreteScheduler {
                 // scheduler's to give back: the pool moved the ledger, and
                 // nothing else in the engine knows the device still has them.
                 for entry in retained.superseded {
-                    self.discard_checkpoint(entry);
+                    self.discard_checkpoint(entry, events);
                 }
             }
             // The budget went while this batch was in flight — two requests
@@ -672,7 +734,7 @@ impl ConcreteScheduler {
     /// machinery is asked for anything: a bet is given up before any certain
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
-    fn reclaim_retained(&mut self, idx: usize) -> bool {
+    fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
         loop {
             if self.fits_for_materialization(&self.requests[idx]) {
                 return true;
@@ -686,8 +748,17 @@ impl ConcreteScheduler {
             // qualifies the answer is "retained state cannot help", and the
             // caller goes to the eviction machinery with the pool intact.
             let reclaimable = self.reclaimable_prefixes();
-            if let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) {
-                self.discard_checkpoint(victim);
+            if let Some(victim) = self
+                .checkpoints
+                .victim_in(ReuseSource::Device, Some(&reclaimable))
+            {
+                if !self.spill_checkpoint(&victim, events) {
+                    let victim = self
+                        .checkpoints
+                        .discard(victim.id)
+                        .expect("the peeked device victim is still retained");
+                    self.discard_checkpoint(victim, events);
+                }
                 continue;
             }
             // GitHub #188: then the retained prefixes. Checkpoints go first,
@@ -1284,11 +1355,15 @@ impl ConcreteScheduler {
     /// tier can hold `bytes` (there is room, or it was made).
     fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
         while self.host.used_bytes() + bytes > self.host.capacity_bytes() {
-            match self.host.evict_one() {
-                Some(discarded) => {
+            match self.host.evict_for_live() {
+                Some(HostVictim::Retained(discarded)) => {
+                    if let Some(entry) = self.checkpoints.discard(discarded.checkpoint) {
+                        self.discard_checkpoint(entry, events);
+                    }
+                }
+                Some(HostVictim::Live(discarded)) => {
                     self.compute.discard_snapshot(discarded.request);
-                    if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request)
-                    {
+                    if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request) {
                         self.requeue_request(idx, events);
                     }
                 }
@@ -1839,10 +1914,24 @@ impl Scheduler for ConcreteScheduler {
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
                     let media = media_keys(&self.requests[i].input);
-                    let retained = self.checkpoints.best_match(&PromptContent::new(
+                    let lookup = self.checkpoints.lookup(&PromptContent::new(
                         &self.requests[i].input.tokens,
                         &media,
                     ));
+                    let has_kv_ram = self
+                        .checkpoints
+                        .tiers()
+                        .tiers()
+                        .iter()
+                        .any(|tier| tier.source == ReuseSource::KvRam);
+                    let mut misses = 0u8;
+                    for (source, bit) in [(ReuseSource::Device, 1), (ReuseSource::KvRam, 2)] {
+                        if (source == ReuseSource::Device || has_kv_ram) && !lookup.matched(source) {
+                            misses |= bit;
+                        }
+                    }
+                    self.requests[i].pending_state_cache_misses = misses;
+                    let retained = lookup.best;
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
@@ -1885,9 +1974,13 @@ impl Scheduler for ConcreteScheduler {
                         // of the shared pages — a prefix claim would stop a
                         // whole page short and lose the opener.
                         self.checkpoints.record_claim(m.id, self.tick);
-                        self.prefix.retain(m.prefix);
+                        if m.source == ReuseSource::Device {
+                            self.prefix.retain(m.prefix);
+                        } else {
+                            self.host.restore_retained(m.id, self.tick);
+                        }
                         let r = &mut self.requests[i];
-                        r.prefix_entry = Some(m.prefix);
+                        r.prefix_entry = (m.source == ReuseSource::Device).then_some(m.prefix);
                         r.checkpoint_publisher = Some(m.publisher);
                         // GitHub #187 — the claim edge, kept so this request's
                         // own capture knows which conversation it continues
@@ -1895,10 +1988,16 @@ impl Scheduler for ConcreteScheduler {
                         r.checkpoint_entry = Some(m.id);
                         r.checkpoint_tokens = m.tokens;
                         r.reuse_source = Some(m.source);
-                        r.shared_pages = m.pages;
+                        r.shared_pages = if m.source == ReuseSource::Device { m.pages } else { 0 };
                         r.prefill_progress = m.tokens; // warm all the way to the opener
                         r.gdn = m.gdn;
-                        r.resources.kv_pages = r.resources.kv_pages.saturating_sub(m.pages);
+                        // A device claimant shares the checkpoint's whole
+                        // prefix pages and subtracts their existing charge.
+                        // KV-RAM restores a standalone materialized blob into
+                        // fresh pages, so it keeps the full reservation.
+                        if m.source == ReuseSource::Device {
+                            r.resources.kv_pages = r.resources.kv_pages.saturating_sub(m.pages);
+                        }
                     }
                 }
 
@@ -1957,7 +2056,7 @@ impl Scheduler for ConcreteScheduler {
                     // anything else is considered. A live request never waits
                     // for a bet and is never refused because of one.
                     if !self.fits_for_materialization(&self.requests[i]) {
-                        self.reclaim_retained(i);
+                        self.reclaim_retained(i, &mut events);
                     }
                     if !self.fits_for_materialization(&self.requests[i]) {
                         let needed = AdmissionResources {
@@ -2138,6 +2237,7 @@ impl Scheduler for ConcreteScheduler {
                         .map(|publisher| CheckpointClaim {
                             publisher,
                             tokens: r.checkpoint_tokens,
+                            source: r.reuse_source.unwrap_or(ReuseSource::Device),
                         }),
                     // 0 for a request that captures nothing, so this is
                     // exactly "the chunk that lands on the opener, for a
@@ -2340,7 +2440,11 @@ impl Scheduler for ConcreteScheduler {
                         // a backend that declined the bet; nothing is
                         // recorded and the request is none the wiser.
                         if job.capture_checkpoint_tokens.is_some() && outcome.checkpoint_captured {
-                            self.retain_checkpoint(i, job.capture_checkpoint_tokens.unwrap());
+                            self.retain_checkpoint(
+                                i,
+                                job.capture_checkpoint_tokens.unwrap(),
+                                &mut events,
+                            );
                         }
                         // The reuse this request's prefill actually landed
                         // (GitHub #186): reported here rather than where the
@@ -2356,6 +2460,17 @@ impl Scheduler for ConcreteScheduler {
                                 tokens: claim.tokens,
                                 restore_micros: outcome.restore_micros,
                             });
+                        }
+                        let misses = std::mem::take(
+                            &mut self.requests[i].pending_state_cache_misses,
+                        );
+                        for (source, bit) in [(ReuseSource::Device, 1), (ReuseSource::KvRam, 2)] {
+                            if misses & bit != 0 {
+                                events.push(SchedEvent::StateCache {
+                                    operation: StateCacheOperation::Miss,
+                                    source,
+                                });
+                            }
                         }
                     }
                 }

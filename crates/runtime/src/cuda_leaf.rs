@@ -528,6 +528,27 @@ impl StepLeaf for CudaLeaf {
         // prefix under it (`ignis_seq_checkpoint_release`).
     }
 
+    fn checkpoint_snapshot_bytes(
+        &self,
+        _model: &Self::Model,
+        checkpoint: &Self::Checkpoint,
+    ) -> Result<u64, i32> {
+        checkpoint
+            .snapshot_bytes()
+            .map_err(|e| leaf_error("checkpoint snapshot size", e.to_string()))
+    }
+
+    fn checkpoint_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        checkpoint: &Self::Checkpoint,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        checkpoint
+            .snapshot_into(dst)
+            .map_err(|e| leaf_error("checkpoint snapshot", e.to_string()))
+    }
+
     /// GitHub #189: the four facts that decide whether retained state may be
     /// written into a sequence of this load, read from the load itself.
     ///

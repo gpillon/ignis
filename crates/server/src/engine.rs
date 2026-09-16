@@ -379,7 +379,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::PrefixReused { request, .. }
         | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. } => Some(*request),
-        SchedEvent::Protected { .. } => None,
+        SchedEvent::Protected { .. } | SchedEvent::StateCache { .. } => None,
     }
 }
 
@@ -437,6 +437,9 @@ async fn telemetry_task(
                     tokens,
                     restore_micros,
                 } => telemetry.on_state_reused(request, source, tokens, restore_micros),
+                SchedEvent::StateCache { operation, source } => {
+                    telemetry.on_state_cache(operation, source)
+                }
                 _ => {}
             },
             TelemetryFact::Tick => {

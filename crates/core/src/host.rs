@@ -54,6 +54,7 @@
 use std::collections::HashSet;
 
 use crate::gdn::GdnState;
+use crate::checkpoint::CheckpointId;
 use crate::types::{LaneId, RequestClass, RequestId};
 
 /// The two-tier eviction tiers of the host tier (`CONTEXT.md`: "two-tier
@@ -144,6 +145,25 @@ pub struct HostEntry {
     pub use_tick: u64,
 }
 
+/// A retained prompt checkpoint whose materialized blob lives in KV-RAM.
+#[derive(Debug, Clone)]
+pub struct RetainedHostEntry {
+    pub checkpoint: CheckpointId,
+    pub publisher: RequestId,
+    pub owner: RequestClass,
+    pub bytes: u64,
+    pub tier: Tier,
+    pub use_tick: u64,
+}
+
+/// One host-budget victim. Retained state is always selected before a live
+/// suspended request, regardless of class or probation/protected status.
+#[derive(Debug, Clone)]
+pub enum HostVictim {
+    Retained(RetainedHostEntry),
+    Live(HostEntry),
+}
+
 /// Errors from capturing a lane into the host tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
@@ -215,6 +235,7 @@ pub struct HostTier {
     /// Protected entries (LRU order: oldest capture at the front, evicted
     /// after every probation entry).
     protected: Vec<HostEntry>,
+    retained: Vec<RetainedHostEntry>,
     /// The tier's current host-RAM usage, in bytes (the sum of every held
     /// entry's [`HostEntry::bytes`]).
     used_bytes: u64,
@@ -234,6 +255,7 @@ impl HostTier {
             capacity_bytes,
             probation: Vec::new(),
             protected: Vec::new(),
+            retained: Vec::new(),
             used_bytes: 0,
             promoted: HashSet::new(),
         }
@@ -251,7 +273,7 @@ impl HostTier {
 
     /// The number of snapshots currently held (both tiers).
     pub fn entry_count(&self) -> usize {
-        self.probation.len() + self.protected.len()
+        self.probation.len() + self.protected.len() + self.retained.len()
     }
 
     /// Whether the tier holds a snapshot for `request`.
@@ -321,6 +343,67 @@ impl HostTier {
         }
         self.used_bytes += bytes;
         Ok(())
+    }
+
+    /// Admit a materialized retained checkpoint after the caller has made
+    /// room. Unlike a live snapshot this never displaces certain work by
+    /// itself; callers use [`Self::evict_retained`] while pricing a spill.
+    pub fn capture_retained(&mut self, mut entry: RetainedHostEntry) -> Result<(), HostError> {
+        if entry.bytes > self.capacity_bytes
+            || self.used_bytes.saturating_add(entry.bytes) > self.capacity_bytes
+        {
+            return Err(HostError::Oversized);
+        }
+        entry.tier = Tier::Probation;
+        self.used_bytes += entry.bytes;
+        self.retained.push(entry);
+        Ok(())
+    }
+
+    /// Discard the least-recently-used retained checkpoint, never live work.
+    pub fn evict_retained(&mut self) -> Option<RetainedHostEntry> {
+        let pos = self
+            .retained
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| {
+                (
+                    entry.owner.eviction_rank(),
+                    tier_discard_rank(entry.tier),
+                    entry.use_tick,
+                    entry.checkpoint,
+                )
+            })
+            .map(|(pos, _)| pos)?;
+        let entry = self.retained.remove(pos);
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        Some(entry)
+    }
+
+    /// Make room for a live snapshot: retained bets go before any suspended
+    /// live request, then the existing class/tier/LRU ordering applies.
+    pub fn evict_for_live(&mut self) -> Option<HostVictim> {
+        if let Some(entry) = self.evict_retained() {
+            return Some(HostVictim::Retained(entry));
+        }
+        self.evict_one().map(HostVictim::Live)
+    }
+
+    /// Mark a non-consuming retained restore as proven and refresh its LRU.
+    pub fn restore_retained(&mut self, checkpoint: CheckpointId, use_tick: u64) -> bool {
+        let Some(entry) = self.retained.iter_mut().find(|entry| entry.checkpoint == checkpoint) else {
+            return false;
+        };
+        entry.tier = Tier::Protected;
+        entry.use_tick = use_tick;
+        true
+    }
+
+    pub fn discard_retained(&mut self, checkpoint: CheckpointId) -> Option<RetainedHostEntry> {
+        let pos = self.retained.iter().position(|entry| entry.checkpoint == checkpoint)?;
+        let entry = self.retained.remove(pos);
+        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        Some(entry)
     }
 
     /// Discard the lowest-value entry (host RAM → discard): [`Self::victim`]'s
@@ -674,6 +757,62 @@ mod tests {
             tier.victim().unwrap().request,
             3,
             "same class throughout: the probation entry is the victim, exactly as before #127"
+        );
+    }
+
+    #[test]
+    fn retained_state_is_discarded_before_a_live_interactive_snapshot() {
+        let mut tier = HostTier::new(20);
+        tier.capture(HostEntry {
+            owner: RequestClass::Interactive,
+            ..entry(1, 10, gdn_boundary(0), 1)
+        })
+        .unwrap();
+        tier.capture_retained(RetainedHostEntry {
+            checkpoint: 7,
+            publisher: 70,
+            owner: RequestClass::Agent,
+            bytes: 10,
+            tier: Tier::Probation,
+            use_tick: 2,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            tier.evict_for_live(),
+            Some(HostVictim::Retained(entry)) if entry.checkpoint == 7
+        ));
+        assert!(tier.contains(1), "certain live work outlives retained state");
+    }
+
+    #[test]
+    fn retained_discard_order_is_class_then_tier_then_lru() {
+        let mut host = HostTier::new(40);
+        for entry in [
+            RetainedHostEntry {
+                checkpoint: 1,
+                publisher: 10,
+                owner: RequestClass::Interactive,
+                bytes: 10,
+                tier: Tier::Probation,
+                use_tick: 1,
+            },
+            RetainedHostEntry {
+                checkpoint: 2,
+                publisher: 20,
+                owner: RequestClass::Agent,
+                bytes: 10,
+                tier: Tier::Probation,
+                use_tick: 3,
+            },
+        ] {
+            host.capture_retained(entry).unwrap();
+        }
+        assert!(host.restore_retained(2, 3), "promote the agent entry");
+        assert_eq!(
+            host.evict_retained().unwrap().checkpoint,
+            2,
+            "class outranks both the agent entry's protected tier and newer tick"
         );
     }
 }

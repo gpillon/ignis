@@ -22,7 +22,8 @@
 //      were: a partial page, a frontier that is not the prefix, a mid-chunk
 //      publisher, a chained publish that reaches no further than what is
 //      already shared, a reservation with no page of its own, and a state
-//      transfer of a sequence whose history is not all its own.
+//      restore into a target whose history is still shared. A snapshot of a
+//      claimant materializes that history since GitHub #190.
 //
 // It also reports the measured device-to-device clone cost at the real 27B
 // geometry -- the other half of ADR 0024's cost asymmetry, whose host-side
@@ -669,22 +670,35 @@ void check_refusals() {
   expect(claimant == nullptr, "refuse: nothing is allocated on a refusal");
   expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "refuse: claim");
 
-  // A sequence whose history is not all its own cannot be moved as one blob
-  // (P4-10 against P4-06): the leading pages belong to the prefix.
+  // GitHub #190: a sequence whose leading pages belong to a prefix is
+  // snapshotted as a self-contained blob. The target of a restore still may
+  // not share pages, because overwriting them would corrupt other claimants.
   std::uint64_t bytes = 0;
-  expect_rc(ignis_seq_snapshot_size(pool, claimant, &bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
-            "refuse: a claimant has no whole-sequence snapshot");
-  std::vector<unsigned char> scratch(4096);
-  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size()),
-            IGNIS_SEQ_ERR_SHARED_PREFIX, "refuse: a claimant is not snapshotted");
+  expect_rc(ignis_seq_snapshot_size(pool, claimant, &bytes), 0,
+            "materialize: size a claimant's whole-sequence snapshot");
+  std::vector<unsigned char> scratch(bytes);
+  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size()), 0,
+            "materialize: snapshot a claimant including its shared head");
   expect_rc(ignis_seq_restore(pool, claimant, scratch.data(), scratch.size()),
             IGNIS_SEQ_ERR_SHARED_PREFIX, "refuse: a claimant is not restored into");
-  // The publisher is a claimant of its own prefix, so the same holds for it.
-  expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
-            "refuse: a publisher shares its own head too");
+  // The publisher is a claimant of its own prefix and materializes too.
+  expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), 0,
+            "materialize: a publisher shares its own head too");
 
   ignis_seq_release(pool, claimant);
   ignis_seq_release(pool, seq);
+  ignis_seq *restored = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "materialize: alloc restore target");
+  expect_rc(ignis_seq_restore(pool, restored, scratch.data(), scratch.size()), 0,
+            "materialize: restore without the shared handle");
+  std::uint64_t restored_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, restored, &restored_bytes), 0,
+            "materialize: size restored state");
+  std::vector<unsigned char> again(restored_bytes);
+  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), again.size()), 0,
+            "materialize: re-snapshot restored state");
+  expect(again == scratch, "materialize: the standalone round trip is byte-exact");
+  ignis_seq_release(pool, restored);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);
 }

@@ -273,6 +273,24 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// Release the adapter's handle on a checkpoint: its images go, and the
     /// pages under it return to the pool once nothing else holds them.
     fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {}
+    /// Bytes a checkpoint occupies after its shared pages are materialized
+    /// into a whole-sequence host blob.
+    fn checkpoint_snapshot_bytes(
+        &self,
+        _model: &Self::Model,
+        _checkpoint: &Self::Checkpoint,
+    ) -> Result<u64, i32> {
+        Err(-1)
+    }
+    /// Materialize a checkpoint into a host snapshot buffer.
+    fn checkpoint_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        _checkpoint: &Self::Checkpoint,
+        _dst: &mut [u8],
+    ) -> Result<(), i32> {
+        Err(-1)
+    }
     /// The compatibility identity of the state this leaf produces (GitHub
     /// #189, ADR 0029): the artifact it loaded, its KV format, the blob
     /// layout version its sequence pool writes, and the drafter bound at
@@ -414,6 +432,10 @@ struct EvictedSequence<B> {
     generated: u32,
 }
 
+struct RetainedCheckpoint<B> {
+    buf: B,
+}
+
 /// Scheduler adapter over a loaded step-ABI model.
 ///
 /// A request gains a sequence on its first prefill. The map is private, so a
@@ -438,6 +460,10 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// their snapshot blob, held here until [`Compute::restore`] or
     /// [`Compute::discard_snapshot`] consumes it.
     evicted: Mutex<HashMap<RequestId, EvictedSequence<L::SnapshotBuf>>>,
+    /// Materialized retained checkpoints in pinned KV-RAM. Unlike live
+    /// evictions these are non-consuming: every matching request restores
+    /// from the same immutable blob.
+    retained: Mutex<HashMap<RequestId, RetainedCheckpoint<L::SnapshotBuf>>>,
     /// Media embeddings still needed by a request's next chunk (GitHub
     /// #178): at most one per request, held from its item's first covered
     /// chunk until its last placeholder is prefilled.
@@ -455,6 +481,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             prefixes: Mutex::new(HashMap::new()),
             checkpoints: Mutex::new(HashMap::new()),
             evicted: Mutex::new(HashMap::new()),
+            retained: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
         }
     }
@@ -552,6 +579,11 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         self.checkpoints.lock().unwrap().len()
     }
 
+    /// Number of non-consuming materialized checkpoint blobs in KV-RAM.
+    pub fn retained_checkpoints(&self) -> usize {
+        self.retained.lock().unwrap().len()
+    }
+
     /// Number of requests currently suspended in the host tier (the
     /// CPU-stub observation point for eviction round trips).
     pub fn evicted_sequences(&self) -> usize {
@@ -575,6 +607,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         let mut sequences = self.sequences.lock().unwrap();
         let mut prefixes = self.prefixes.lock().unwrap();
         let mut checkpoints = self.checkpoints.lock().unwrap();
+        let retained = self.retained.lock().unwrap();
         let mut media = self.media.lock().unwrap();
         // Requests whose chunk lands on the prefix they publish. Collected
         // here and published after every job has warmed, so a later job's
@@ -636,21 +669,49 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 // the opener ends inside copied, so the sequence stands at
                 // the opener rather than at a page boundary.
                 let allocated = match (&job.checkpoint, &job.shared_prefix) {
-                    (Some(claim), _) => match checkpoints.get(&claim.publisher) {
-                        Some(checkpoint) => self
-                            .model
-                            .leaf
-                            .allocate_sequence_from_checkpoint(
-                                self.model.handle(),
-                                job.context_tokens,
-                                checkpoint,
-                            )
-                            .map(|(handle, micros)| {
-                                outcomes[index].restore_micros = micros;
-                                handle
-                            }),
-                        // As below: the scheduler holds a claim on an entry
-                        // this adapter has no handle for.
+                    (Some(claim), _) if claim.source == ignis_core::checkpoint::ReuseSource::Device => {
+                        match checkpoints.get(&claim.publisher) {
+                            Some(checkpoint) => self
+                                .model
+                                .leaf
+                                .allocate_sequence_from_checkpoint(
+                                    self.model.handle(),
+                                    job.context_tokens,
+                                    checkpoint,
+                                )
+                                .map(|(handle, micros)| {
+                                    outcomes[index].restore_micros = micros;
+                                    handle
+                                }),
+                            None => Err(-1),
+                        }
+                    }
+                    (Some(claim), _) => match retained.get(&claim.publisher) {
+                        Some(checkpoint) => {
+                            let started = std::time::Instant::now();
+                            self.model
+                                .leaf
+                                .allocate_sequence(self.model.handle(), job.context_tokens)
+                                .and_then(|mut handle| {
+                                    match self.model.leaf.restore_sequence(
+                                        self.model.handle(),
+                                        &mut handle,
+                                        checkpoint.buf.as_ref(),
+                                    ) {
+                                        Ok(()) => {
+                                            outcomes[index].restore_micros =
+                                                started.elapsed().as_micros() as u64;
+                                            Ok(handle)
+                                        }
+                                        Err(code) => {
+                                            self.model
+                                                .leaf
+                                                .release_sequence(self.model.handle(), handle);
+                                            Err(code)
+                                        }
+                                    }
+                                })
+                        }
                         None => Err(-1),
                     },
                     (None, Some(claim)) => match prefixes.get(&claim.publisher) {
@@ -786,6 +847,56 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .leaf
                 .release_checkpoint(self.model.handle(), checkpoint);
         }
+        self.retained.lock().unwrap().remove(&publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        let checkpoints = self.checkpoints.lock().unwrap();
+        let checkpoint = checkpoints.get(&publisher).ok_or(ComputeError::Kernel(-1))?;
+        self.model
+            .leaf
+            .checkpoint_snapshot_bytes(self.model.handle(), checkpoint)
+            .map_err(|code| RuntimeError::Leaf(code).into())
+    }
+
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        let mut checkpoints = self.checkpoints.lock().unwrap();
+        let checkpoint = checkpoints.remove(&publisher).ok_or(ComputeError::Kernel(-1))?;
+        let bytes = match self
+            .model
+            .leaf
+            .checkpoint_snapshot_bytes(self.model.handle(), &checkpoint)
+        {
+            Ok(bytes) => bytes,
+            Err(code) => {
+                checkpoints.insert(publisher, checkpoint);
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+        let mut buf = match self.model.leaf.alloc_snapshot_buf(bytes) {
+            Ok(buf) => buf,
+            Err(code) => {
+                checkpoints.insert(publisher, checkpoint);
+                return Err(RuntimeError::Leaf(code).into());
+            }
+        };
+        if let Err(code) = self.model.leaf.checkpoint_snapshot_into(
+            self.model.handle(),
+            &checkpoint,
+            buf.as_mut(),
+        ) {
+            checkpoints.insert(publisher, checkpoint);
+            return Err(RuntimeError::Leaf(code).into());
+        }
+        self.model
+            .leaf
+            .release_checkpoint(self.model.handle(), checkpoint);
+        drop(checkpoints);
+        self.retained
+            .lock()
+            .unwrap()
+            .insert(publisher, RetainedCheckpoint { buf });
+        Ok(bytes)
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
@@ -1064,6 +1175,12 @@ impl<L: StepLeaf> Drop for RuntimeCompute<L> {
                 .leaf
                 .release_checkpoint(self.model.handle(), checkpoint);
         }
+        // Retained checkpoint buffers own only host memory and free it on
+        // drop; there is no leaf device handle left after spill.
+        self.retained
+            .get_mut()
+            .expect("RuntimeCompute is not dropped while its retained lock is held")
+            .clear();
         // Prefixes after sequences: a prefix's pages are released by its last
         // holder, and a live sequence is one.
         let prefixes = std::mem::take(

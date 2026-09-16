@@ -6,6 +6,8 @@ use ignis_core::{
     N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestClass, RequestInput, Scheduler,
     SchedulerConfig, SpecCounters,
 };
+use ignis_core::checkpoint::ReuseSource;
+use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_runtime::{
     DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats, StepLeaf,
@@ -302,6 +304,25 @@ impl StepLeaf for StubLeaf {
 
     fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {
         self.calls.lock().unwrap().checkpoints_released += 1;
+    }
+
+    fn checkpoint_snapshot_bytes(
+        &self,
+        _model: &Self::Model,
+        _checkpoint: &Self::Checkpoint,
+    ) -> Result<u64, i32> {
+        Ok(SNAPSHOT_MARKER.len() as u64)
+    }
+
+    fn checkpoint_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        _checkpoint: &Self::Checkpoint,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        dst.copy_from_slice(SNAPSHOT_MARKER);
+        self.calls.lock().unwrap().snapshots_taken += 1;
+        Ok(())
     }
 
     fn prefill(
@@ -1017,7 +1038,7 @@ fn a_declined_capture_leaves_the_batch_and_the_request_alone() {
 }
 
 #[test]
-fn a_discarded_checkpoint_releases_the_leaf_handle() {
+fn a_reclaimed_checkpoint_spills_to_kv_ram_and_releases_the_device_handle() {
     // The scheduler discarding a retained entry must reach the leaf: an
     // image nothing releases is device memory nothing will ever free.
     let leaf = Arc::new(StubLeaf::with_tokens([]));
@@ -1062,6 +1083,68 @@ fn a_discarded_checkpoint_releases_the_leaf_handle() {
         "the reclaimed entry's image went back to the leaf"
     );
     assert_eq!(observe.live_checkpoints(), 0, "and the adapter holds none");
+    assert_eq!(
+        observe.retained_checkpoints(),
+        1,
+        "the materialized blob stays in KV-RAM for a later non-consuming restore"
+    );
+    assert_eq!(
+        leaf.calls.lock().unwrap().snapshots_taken,
+        1,
+        "spill is lazy: exactly the reclaimed checkpoint crossed PCIe"
+    );
+}
+
+#[test]
+fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let params = DecodeParams::default();
+    compute
+        .prefill_step(&[PrefillJob {
+            request: 1,
+            tokens: vec![1, 2, 3, 4, 5, 6],
+            context_tokens: 16,
+            start_position: 0,
+            params,
+            shared_prefix: None,
+            publish_prefix_tokens: None,
+            checkpoint: None,
+            capture_checkpoint_tokens: Some(6),
+            multimodal: None,
+        }])
+        .unwrap();
+    compute.spill_checkpoint(1).unwrap();
+
+    for request in [2, 3] {
+        compute
+            .prefill_step(&[PrefillJob {
+                request,
+                tokens: vec![90, 91],
+                context_tokens: 16,
+                start_position: 6,
+                params,
+                shared_prefix: None,
+                publish_prefix_tokens: None,
+                checkpoint: Some(CheckpointClaim {
+                    publisher: 1,
+                    tokens: 6,
+                    source: ReuseSource::KvRam,
+                }),
+                capture_checkpoint_tokens: None,
+                multimodal: None,
+            }])
+            .unwrap();
+    }
+
+    assert_eq!(leaf.calls.lock().unwrap().restores, 2);
+    assert_eq!(compute.retained_checkpoints(), 1, "restore never consumes the blob");
+    assert_eq!(
+        leaf.calls.lock().unwrap().checkpoint_allocations.len(),
+        0,
+        "KV-RAM restores into fresh standalone sequences, not a dead device checkpoint"
+    );
 }
 
 #[test]

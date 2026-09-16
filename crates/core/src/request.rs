@@ -118,6 +118,11 @@ pub struct Request {
     /// a single point in its prompt, and a second capture would be a second
     /// image of state that has since moved on.
     pub checkpoint_captured: bool,
+    /// Tier-miss facts found while choosing this request's first prefill
+    /// path, held until that chunk succeeds. Bit 0 is device, bit 1 KV-RAM.
+    /// A failed prefill emits no lifecycle facts and retries with these still
+    /// pending, exactly like a retained-state restore.
+    pub pending_state_cache_misses: u8,
     /// The whole KV pages of this request's own prompt — what it *could*
     /// publish as a shared prefix (P4-10, GitHub #126), or 0 for a prompt
     /// shorter than one page.
@@ -184,6 +189,7 @@ impl Request {
             checkpoint_tokens: 0,
             reuse_source: None,
             checkpoint_captured: false,
+            pending_state_cache_misses: 0,
             publish_tokens: 0,
             prefill_progress: 0,
             cancelled: false,

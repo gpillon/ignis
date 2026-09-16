@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::http::header;
 use axum::routing::get;
+use ignis_core::checkpoint::{ReuseSource, StateCacheOperation};
 use ignis_core::SubmitError;
 
 /// The exposition's content type: Prometheus text format 0.0.4.
@@ -134,6 +135,11 @@ pub struct Metrics {
     decoded_tokens: AtomicU64,
     kv_evictions: AtomicU64,
     prefix_reused_tokens: AtomicU64,
+    retained_state_hits: [AtomicU64; 2],
+    retained_state_misses: [AtomicU64; 2],
+    retained_state_spills: [AtomicU64; 2],
+    retained_state_discards: [AtomicU64; 2],
+    retained_state_restores: [AtomicU64; 2],
     ttft: Histogram,
     duration: Histogram,
 }
@@ -158,6 +164,11 @@ impl Metrics {
             decoded_tokens: AtomicU64::new(0),
             kv_evictions: AtomicU64::new(0),
             prefix_reused_tokens: AtomicU64::new(0),
+            retained_state_hits: Default::default(),
+            retained_state_misses: Default::default(),
+            retained_state_spills: Default::default(),
+            retained_state_discards: Default::default(),
+            retained_state_restores: Default::default(),
             ttft: Histogram::new(&TTFT_BOUNDS_MS),
             duration: Histogram::new(&DURATION_BOUNDS_MS),
         }
@@ -178,6 +189,27 @@ impl Metrics {
     /// A request's prefill skipped `tokens` through a sibling's prefix.
     pub(crate) fn record_prefix_reused(&self, tokens: u32) {
         self.prefix_reused_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
+    }
+
+    /// Record one fixed-cardinality retained-state operation in its
+    /// residency tier. The telemetry consumer is the only writer.
+    pub(crate) fn record_state_cache(
+        &self,
+        operation: StateCacheOperation,
+        source: ReuseSource,
+    ) {
+        let tier = match source {
+            ReuseSource::Device => 0,
+            ReuseSource::KvRam => 1,
+        };
+        let series = match operation {
+            StateCacheOperation::Hit => &self.retained_state_hits,
+            StateCacheOperation::Miss => &self.retained_state_misses,
+            StateCacheOperation::Spill => &self.retained_state_spills,
+            StateCacheOperation::Discard => &self.retained_state_discards,
+            StateCacheOperation::Restore => &self.retained_state_restores,
+        };
+        series[tier].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A request's first token came `ms` after its submission.
@@ -278,6 +310,45 @@ impl Metrics {
             declare(&mut out, name, "counter", help);
             let _ = writeln!(out, "{name} {}", read(series));
         }
+        for (name, help, series) in [
+            (
+                "ignis_retained_state_hits_total",
+                "Retained-state matches used by residency tier.",
+                &self.retained_state_hits,
+            ),
+            (
+                "ignis_retained_state_misses_total",
+                "Retained-state lookups without a matching entry by residency tier.",
+                &self.retained_state_misses,
+            ),
+            (
+                "ignis_retained_state_spills_total",
+                "Retained-state entries spilled into a residency tier.",
+                &self.retained_state_spills,
+            ),
+            (
+                "ignis_retained_state_discards_total",
+                "Retained-state entries discarded from a residency tier.",
+                &self.retained_state_discards,
+            ),
+            (
+                "ignis_retained_state_restores_total",
+                "Retained-state entries restored from a residency tier.",
+                &self.retained_state_restores,
+            ),
+        ] {
+            declare(&mut out, name, "counter", help);
+            for (source, slot) in
+                [(ReuseSource::Device, &series[0]), (ReuseSource::KvRam, &series[1])]
+            {
+                let _ = writeln!(
+                    out,
+                    "{name}{{tier=\"{}\"}} {}",
+                    source.as_str(),
+                    read(slot)
+                );
+            }
+        }
         declare(
             &mut out,
             "ignis_requests_rejected_total",
@@ -357,6 +428,11 @@ mod tests {
             ("ignis_decoded_tokens_total", "counter"),
             ("ignis_kv_cache_evictions_total", "counter"),
             ("ignis_prefix_reused_tokens_total", "counter"),
+            ("ignis_retained_state_hits_total", "counter"),
+            ("ignis_retained_state_misses_total", "counter"),
+            ("ignis_retained_state_spills_total", "counter"),
+            ("ignis_retained_state_discards_total", "counter"),
+            ("ignis_retained_state_restores_total", "counter"),
             ("ignis_requests_rejected_total", "counter"),
             ("ignis_request_ttft_seconds", "histogram"),
             ("ignis_request_duration_seconds", "histogram"),
@@ -471,6 +547,31 @@ mod tests {
         assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"full\""), "1");
         assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"unknown_model\""), "0");
         assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"oversized\""), "2");
+    }
+
+    #[test]
+    fn retained_state_operations_are_counted_per_residency_tier() {
+        let metrics = Metrics::new();
+        metrics.record_state_cache(StateCacheOperation::Hit, ReuseSource::Device);
+        metrics.record_state_cache(StateCacheOperation::Miss, ReuseSource::Device);
+        metrics.record_state_cache(StateCacheOperation::Spill, ReuseSource::KvRam);
+        metrics.record_state_cache(StateCacheOperation::Discard, ReuseSource::KvRam);
+        metrics.record_state_cache(StateCacheOperation::Restore, ReuseSource::KvRam);
+
+        let text = metrics.render();
+        for (name, tier) in [
+            ("ignis_retained_state_hits_total", "device"),
+            ("ignis_retained_state_misses_total", "device"),
+            ("ignis_retained_state_spills_total", "kv_ram"),
+            ("ignis_retained_state_discards_total", "kv_ram"),
+            ("ignis_retained_state_restores_total", "kv_ram"),
+        ] {
+            assert_eq!(value(&text, name, &format!("tier=\"{tier}\"")), "1", "{name}");
+        }
+        assert_eq!(
+            value(&text, "ignis_retained_state_hits_total", "tier=\"kv_ram\""),
+            "0"
+        );
     }
 
     /// ADR 0017's fixed boundaries, in seconds, `+Inf` implied.

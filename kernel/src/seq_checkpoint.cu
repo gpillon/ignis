@@ -43,6 +43,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -67,6 +68,85 @@ template <typename Work> double timed(Work &&work) {
   return elapsed.count();
 }
 
+std::vector<std::int32_t> checkpoint_prefix_pages(const ignis_seq_checkpoint &checkpoint) {
+  std::vector<const ignis_seq_prefix *> chain;
+  for (const ignis_seq_prefix *at = checkpoint.prefix; at != nullptr; at = at->parent) {
+    chain.push_back(at);
+  }
+  std::vector<std::int32_t> pages;
+  for (auto at = chain.rbegin(); at != chain.rend(); ++at) {
+    const auto ids = (*at)->kv.page_ids();
+    pages.insert(pages.end(), ids.begin(), ids.end());
+  }
+  return pages;
+}
+
+void zero_snapshot_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
+                        std::uint64_t total_bytes) {
+  std::uint64_t cursor = sizeof(ignis_seq_snapshot_header) +
+                         sections.size() * sizeof(ignis_seq_section);
+  for (const ignis_seq_section &section : sections) {
+    if (cursor < section.offset) {
+      std::memset(base + cursor, 0, static_cast<std::size_t>(section.offset - cursor));
+    }
+    cursor = section.offset + section.bytes;
+  }
+  if (cursor < total_bytes) {
+    std::memset(base + cursor, 0, static_cast<std::size_t>(total_bytes - cursor));
+  }
+}
+
+const ignis_seq_section &section_named(const std::vector<ignis_seq_section> &sections,
+                                       std::int32_t kind) {
+  for (const ignis_seq_section &section : sections) {
+    if (section.kind == kind) {
+      return section;
+    }
+  }
+  throw std::logic_error(std::string("state-section table has no ") +
+                         ignis_seq_section_name(kind) + " section");
+}
+
+bool checkpoint_belongs_to(const ignis_seq_pool &pool,
+                           const ignis_seq_checkpoint &checkpoint) {
+  return checkpoint.prefix != nullptr && checkpoint.prefix->kv.belongs_to(pool.kv_pool);
+}
+
+void pack_checkpoint_pages(const ignis_seq_pool &pool, const ignis_seq_checkpoint &checkpoint,
+                           std::uint32_t page_count, void *dst) {
+  const std::vector<std::int32_t> prefix_pages = checkpoint_prefix_pages(checkpoint);
+  if (page_count < prefix_pages.size() || page_count > prefix_pages.size() + 1) {
+    throw std::logic_error("checkpoint materialization extent does not match its prefix and tail");
+  }
+  auto *out = static_cast<unsigned char *>(dst);
+  const auto *tail = static_cast<const unsigned char *>(checkpoint.tail_page.p);
+  std::size_t tail_offset = 0;
+  for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+    const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+    const std::size_t bytes = static_cast<std::size_t>(plane.nb[3]);
+    const auto *base = static_cast<const unsigned char *>(plane.data);
+    for (std::int32_t page : prefix_pages) {
+      const cudaError_t err = cudaMemcpyAsync(out, base + static_cast<std::int64_t>(page) * plane.nb[3],
+                                              bytes, cudaMemcpyDeviceToHost, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync(checkpoint prefix page) failed: ") +
+                                 cudaGetErrorString(err));
+      }
+      out += bytes;
+    }
+    if (page_count > prefix_pages.size()) {
+      const cudaError_t err = cudaMemcpyAsync(out, tail + tail_offset, bytes,
+                                              cudaMemcpyDeviceToHost, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync(checkpoint tail page) failed: ") +
+                                 cudaGetErrorString(err));
+      }
+      out += bytes;
+    }
+    tail_offset += bytes;
+  }
+}
+
 } // namespace
 
 extern "C" int32_t ignis_seq_checkpoint_image_bytes(const struct ignis_seq_pool *pool,
@@ -80,6 +160,87 @@ extern "C" int32_t ignis_seq_checkpoint_image_bytes(const struct ignis_seq_pool 
     return 0;
   } catch (const std::exception &e) {
     ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_image_bytes: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t
+ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
+                                   const struct ignis_seq_checkpoint *checkpoint,
+                                   uint64_t *out_bytes) {
+  if (out_bytes != nullptr) {
+    *out_bytes = 0;
+  }
+  if (pool == nullptr || checkpoint == nullptr || out_bytes == nullptr) {
+    ignis_seq_set_last_error("ignis_seq_checkpoint_snapshot_size: null argument");
+    return -1;
+  }
+  if (!checkpoint_belongs_to(*pool, *checkpoint)) {
+    ignis_seq_set_last_error(
+        "ignis_seq_checkpoint_snapshot_size: the checkpoint was not captured from this pool");
+    return -1;
+  }
+  try {
+    const std::uint32_t pages = ninfer::pages_for_tokens(checkpoint->tokens);
+    *out_bytes = ignis_seq_snapshot_bytes(ignis_seq_section_table(*pool, pages));
+    return 0;
+  } catch (const std::exception &e) {
+    ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_snapshot_size: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
+                                                   const struct ignis_seq_checkpoint *checkpoint,
+                                                   void *dst, uint64_t dst_bytes) {
+  if (pool == nullptr || checkpoint == nullptr || dst == nullptr) {
+    ignis_seq_set_last_error("ignis_seq_checkpoint_snapshot: null argument");
+    return -1;
+  }
+  if (!checkpoint_belongs_to(*pool, *checkpoint)) {
+    ignis_seq_set_last_error(
+        "ignis_seq_checkpoint_snapshot: the checkpoint was not captured from this pool");
+    return -1;
+  }
+  try {
+    const std::uint32_t pages = ninfer::pages_for_tokens(checkpoint->tokens);
+    const std::vector<ignis_seq_section> sections = ignis_seq_section_table(*pool, pages);
+    const ignis_seq_snapshot_header header = ignis_seq_snapshot_header_for(*pool, pages, sections);
+    if (dst_bytes < header.total_bytes) {
+      ignis_seq_set_last_error("ignis_seq_checkpoint_snapshot: destination is smaller than the blob");
+      return -1;
+    }
+    auto *base = static_cast<unsigned char *>(dst);
+    std::memcpy(base, &header, sizeof(header));
+    std::memcpy(base + sizeof(header), sections.data(), sections.size() * sizeof(ignis_seq_section));
+    zero_snapshot_gaps(base, sections, header.total_bytes);
+    const std::vector<ignis_seq_section> clone = ignis_seq_prefix_clone_layout(*pool);
+    for (const ignis_seq_section &section : sections) {
+      unsigned char *at = base + section.offset;
+      if (section.kind == IGNIS_SEQ_SECTION_KV_PAGES) {
+        pack_checkpoint_pages(*pool, *checkpoint, pages, at);
+      } else if (section.kind == IGNIS_SEQ_SECTION_PROGRESS) {
+        std::memcpy(at, &checkpoint->progress, sizeof(checkpoint->progress));
+      } else {
+        const ignis_seq_section &source = section_named(clone, section.kind);
+        const cudaError_t err = cudaMemcpyAsync(at,
+                                                static_cast<const unsigned char *>(checkpoint->image.p) + source.offset,
+                                                static_cast<std::size_t>(section.bytes),
+                                                cudaMemcpyDeviceToHost, nullptr);
+        if (err != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpyAsync(checkpoint state) failed: ") +
+                                   cudaGetErrorString(err));
+        }
+      }
+    }
+    const cudaError_t err = cudaStreamSynchronize(nullptr);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaStreamSynchronize after checkpoint snapshot failed: ") +
+                               cudaGetErrorString(err));
+    }
+    return 0;
+  } catch (const std::exception &e) {
+    ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_snapshot: ") + e.what());
     return -1;
   }
 }

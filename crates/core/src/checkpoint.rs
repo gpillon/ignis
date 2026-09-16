@@ -97,6 +97,17 @@ pub enum ReuseSource {
     KvRam,
 }
 
+/// A bounded retained-state lifecycle operation in one residency tier
+/// (GitHub #190).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateCacheOperation {
+    Hit,
+    Miss,
+    Spill,
+    Discard,
+    Restore,
+}
+
 impl ReuseSource {
     /// The request log's wire spelling (`device` / `kv_ram`). The gate spec
     /// maps these onto ninfer's `vram_resident` / `host_ram`.
@@ -155,6 +166,21 @@ impl TierList {
             source: ReuseSource::Device,
             restore_floor_tokens: 0,
         }])
+    }
+
+    /// The two tiers built by ADR 0029: device, then KV-RAM. The lower tier
+    /// must beat the device match by one fixed 1024-token prefill chunk.
+    pub fn device_and_kv_ram() -> Self {
+        Self::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: 1024,
+            },
+        ])
     }
 
     /// An explicit ordered list, cheapest tier first.
@@ -228,7 +254,7 @@ impl TierList {
             return false;
         };
         let Some((best_source, best_tokens)) = best else {
-            return true;
+            return rank == 0 || tokens >= self.0[rank].restore_floor_tokens;
         };
         match self.rank(best_source) {
             None => true,
@@ -442,6 +468,25 @@ pub struct CheckpointMatch {
     pub gdn: GdnState,
 }
 
+/// One retained-state lookup, including which configured tiers contained a
+/// matching key. The scheduler uses the latter only to emit bounded miss
+/// facts without hashing the prompt a second time.
+#[derive(Debug, Clone)]
+pub struct CheckpointLookup {
+    pub best: Option<CheckpointMatch>,
+    matched_device: bool,
+    matched_kv_ram: bool,
+}
+
+impl CheckpointLookup {
+    pub fn matched(&self, source: ReuseSource) -> bool {
+        match source {
+            ReuseSource::Device => self.matched_device,
+            ReuseSource::KvRam => self.matched_kv_ram,
+        }
+    }
+}
+
 /// The byte-budgeted device pool of retained prompt checkpoints (ADR 0029,
 /// `--retained-pool-bytes`).
 ///
@@ -553,7 +598,7 @@ impl CheckpointPool {
     pub fn retained_pages(&self) -> u32 {
         let mut counted: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
         let mut pages = 0;
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|entry| entry.tier == ReuseSource::Device) {
             if counted.contains(&entry.prefix) {
                 continue;
             }
@@ -566,7 +611,7 @@ impl CheckpointPool {
     /// The distinct shared prefixes the retained entries stand on.
     pub fn retained_prefixes(&self) -> Vec<PrefixId> {
         let mut out: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|entry| entry.tier == ReuseSource::Device) {
             if !out.contains(&entry.prefix) {
                 out.push(entry.prefix);
             }
@@ -580,7 +625,10 @@ impl CheckpointPool {
     /// caller asking "would giving these up return the pages" has to compare
     /// this against the prefix's own refcount rather than assume one holder.
     pub fn retained_holders(&self, prefix: PrefixId) -> u32 {
-        self.entries.iter().filter(|e| e.prefix == prefix).count() as u32
+        self.entries
+            .iter()
+            .filter(|e| e.tier == ReuseSource::Device && e.prefix == prefix)
+            .count() as u32
     }
 
     /// Whether a checkpoint over exactly the content `key` names is already
@@ -635,7 +683,7 @@ impl CheckpointPool {
             self.refused_blobs += 1;
             return Err(RetainRefused::UnknownTier(capture.tier));
         }
-        if !self.admits(capture.bytes) {
+        if capture.tier == ReuseSource::Device && !self.admits(capture.bytes) {
             self.skipped_captures += 1;
             return Err(RetainRefused::Budget);
         }
@@ -658,7 +706,9 @@ impl CheckpointPool {
         };
         let id = self.next_id;
         self.next_id += 1;
-        self.used_bytes += capture.bytes;
+        if capture.tier == ReuseSource::Device {
+            self.used_bytes += capture.bytes;
+        }
         self.captures += 1;
         self.entries.push(CheckpointEntry {
             id,
@@ -725,7 +775,7 @@ impl CheckpointPool {
     /// scheduler has to weigh this match against a *sibling prefix* match
     /// before it takes either — longest reuse wins, and a losing match must
     /// leave no trace in the LRU order or the reuse counter.
-    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
+    pub fn lookup(&self, prompt: &PromptContent<'_>) -> CheckpointLookup {
         let length = prompt.tokens();
         // An entry longer than the prompt cannot be a prefix of it, and one
         // this load would refuse to write must never be offered.
@@ -735,17 +785,27 @@ impl CheckpointPool {
             .filter(|e| e.tokens <= length && self.identity.accepts(&e.identity).is_ok())
             .collect();
         if candidates.is_empty() {
-            return None;
+            return CheckpointLookup {
+                best: None,
+                matched_device: false,
+                matched_kv_ram: false,
+            };
         }
         // One forward pass over the prompt answers every candidate's length —
         // the reason the key is a chain rather than a digest of the whole.
         let lengths: Vec<u32> = candidates.iter().map(|e| e.tokens).collect();
         let keys = prompt.keys_at(&lengths);
         let mut best: Option<&CheckpointEntry> = None;
+        let mut matched_device = false;
+        let mut matched_kv_ram = false;
         for tier in self.tiers.tiers() {
             for (n, entry) in candidates.iter().enumerate() {
                 if entry.tier != tier.source || entry.key != keys[n] {
                     continue;
+                }
+                match tier.source {
+                    ReuseSource::Device => matched_device = true,
+                    ReuseSource::KvRam => matched_kv_ram = true,
                 }
                 let standing = best.map(|b| (b.tier, b.tokens));
                 if self.tiers.replaces(tier.source, entry.tokens, standing) {
@@ -753,15 +813,23 @@ impl CheckpointPool {
                 }
             }
         }
-        best.map(|best| CheckpointMatch {
-            id: best.id,
-            publisher: best.publisher,
-            source: best.tier,
-            prefix: best.prefix,
-            tokens: best.tokens,
-            pages: best.pages,
-            gdn: best.gdn.clone(),
-        })
+        CheckpointLookup {
+            best: best.map(|best| CheckpointMatch {
+                id: best.id,
+                publisher: best.publisher,
+                source: best.tier,
+                prefix: best.prefix,
+                tokens: best.tokens,
+                pages: best.pages,
+                gdn: best.gdn.clone(),
+            }),
+            matched_device,
+            matched_kv_ram,
+        }
+    }
+
+    pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
+        self.lookup(prompt).best
     }
 
     /// Record that `id` was claimed: refresh its LRU tick and count the
@@ -824,21 +892,58 @@ impl CheckpointPool {
         tier: ReuseSource,
         prefixes: Option<&[PrefixId]>,
     ) -> Option<CheckpointEntry> {
-        let pos = self
+        let id = self.victim_in(tier, prefixes)?.id;
+        self.discard(id)
+    }
+
+    /// Peek at the least-recently-used entry in one tier without changing
+    /// accounting. The scheduler prices and attempts a spill before deciding
+    /// whether that entry is demoted or discarded.
+    pub fn victim_in(
+        &self,
+        tier: ReuseSource,
+        prefixes: Option<&[PrefixId]>,
+    ) -> Option<CheckpointEntry> {
+        self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| e.tier == tier)
-            .filter(|(_, e)| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
-            .min_by_key(|(_, e)| (e.use_tick, e.id))
-            .map(|(i, _)| i)?;
-        Some(self.remove_at(pos))
+            .filter(|e| e.tier == tier)
+            .filter(|e| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
+            .min_by_key(|e| (e.use_tick, e.id))
+            .cloned()
     }
 
     /// Discard the entry `id`, if it is still retained.
     pub fn discard(&mut self, id: CheckpointId) -> Option<CheckpointEntry> {
         let pos = self.entries.iter().position(|e| e.id == id)?;
         Some(self.remove_at(pos))
+    }
+
+    /// Move an existing entry down the configured residency order.
+    ///
+    /// The metadata stays in this pool so content matching and lineage do not
+    /// change when the bytes move. Device accounting is returned immediately;
+    /// the lower tier owns and budgets the materialized blob separately.
+    pub fn move_to_tier(
+        &mut self,
+        id: CheckpointId,
+        tier: ReuseSource,
+        bytes: u64,
+        use_tick: u64,
+    ) -> Result<(), RetainRefused> {
+        if self.tiers.rank(tier).is_none() {
+            return Err(RetainRefused::UnknownTier(tier));
+        }
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return Ok(());
+        };
+        if entry.tier == ReuseSource::Device {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
+        entry.tier = tier;
+        entry.bytes = bytes;
+        entry.use_tick = use_tick;
+        Ok(())
     }
 
     /// Cumulative prompt tokens claimants skipped through a retained
@@ -863,7 +968,9 @@ impl CheckpointPool {
 
     fn remove_at(&mut self, pos: usize) -> CheckpointEntry {
         let entry = self.entries.remove(pos);
-        self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        if entry.tier == ReuseSource::Device {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        }
         self.discards += 1;
         entry
     }
@@ -1415,6 +1522,11 @@ mod tests {
         ]);
         let device_best = Some((ReuseSource::Device, 4_000));
         assert!(
+            !tiers.replaces(ReuseSource::KvRam, 1_023, None),
+            "without a device match the lower tier still has to pay its crossing cost"
+        );
+        assert!(tiers.replaces(ReuseSource::KvRam, 1_024, None));
+        assert!(
             !tiers.replaces(ReuseSource::KvRam, 4_000, device_best),
             "a tie goes to the device"
         );
@@ -1550,5 +1662,36 @@ mod tests {
             ..header
         };
         assert!(pool.accepts(&stale).is_err());
+    }
+
+    #[test]
+    fn spilling_an_entry_returns_its_device_budget_without_forgetting_it() {
+        let tiers = TierList::new(vec![
+            ResidencyTier {
+                source: ReuseSource::Device,
+                restore_floor_tokens: 0,
+            },
+            ResidencyTier {
+                source: ReuseSource::KvRam,
+                restore_floor_tokens: 1024,
+            },
+        ]);
+        let mut pool = CheckpointPool::with_tiers(IMAGE, load(1), tiers);
+        let prompt: Vec<TokenId> = (1..=2048).collect();
+        let id = retain(&mut pool, 1, &prompt, 1, 1).unwrap();
+
+        pool.move_to_tier(id, ReuseSource::KvRam, IMAGE * 8, 9)
+            .expect("KV-RAM is in this pool's tier list");
+
+        assert_eq!(pool.used_bytes(), 0, "the image left the device");
+        let entry = pool.entries().iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(entry.tier, ReuseSource::KvRam);
+        assert_eq!(entry.bytes, IMAGE * 8, "the lower tier charges the materialized blob");
+        assert_eq!(entry.use_tick, 9);
+        assert_eq!(
+            pool.best_match(&PromptContent::text(&prompt)).unwrap().source,
+            ReuseSource::KvRam,
+            "the metadata remains matchable after the device image is gone"
+        );
     }
 }

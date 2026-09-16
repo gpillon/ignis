@@ -227,6 +227,15 @@ impl Compute for MockCompute {
             .push(publisher);
     }
 
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Ok(self.checkpoint_image_bytes())
+    }
+
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.lock().unwrap().checkpoints_released.push(publisher);
+        Ok(self.checkpoint_image_bytes())
+    }
+
     fn release(&self, request: RequestId) {
         self.inner.lock().unwrap().released.push(request);
     }
@@ -428,5 +437,13 @@ impl Compute for GatedCompute {
 
     fn release_checkpoint(&self, publisher: RequestId) {
         self.inner.release_checkpoint(publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.checkpoint_snapshot_size(publisher)
+    }
+
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.spill_checkpoint(publisher)
     }
 }

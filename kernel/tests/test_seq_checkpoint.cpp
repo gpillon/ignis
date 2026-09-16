@@ -29,6 +29,7 @@
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE is set on this test
 // (kernel/tests/CMakeLists.txt), so a missing/busy GPU fails it, never skips.
 
+#include "ignis_model.h"
 #include "ignis_seq.h"
 #include "ignis_seq_checkpoint_internal.h"
 #include "ignis_seq_internal.h"
@@ -90,6 +91,12 @@ void fill_device(void *dst, std::size_t bytes, std::uint32_t seed) {
   CUDA_CHECK(cudaMemcpy(dst, host.data(), bytes, cudaMemcpyHostToDevice));
 }
 
+void fill_lane(ninfer::CyclicKVCache &cache, std::int32_t slot, std::uint32_t seed) {
+  const std::vector<unsigned char> host = pattern(cache.lane_host_bytes(), seed);
+  cache.copy_lane_from_host(host.data(), slot, nullptr);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+}
+
 std::vector<unsigned char> read_device(const void *src, std::size_t bytes) {
   std::vector<unsigned char> host(bytes);
   if (bytes != 0) {
@@ -129,6 +136,11 @@ void dirty_state(ignis_seq_pool &pool, ignis_seq &seq, std::uint32_t own_pages,
     const ninfer::Tensor rec  = pool.gdn_pool.recurrent_slot(layer, seq.slot);
     fill_device(conv.data, conv.bytes(), ++salt);
     fill_device(rec.data, rec.bytes(), ++salt);
+  }
+  if (pool.has_dflash2()) {
+    fill_lane(*pool.dflash2_window, seq.slot, ++salt);
+    fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
+    seq.dflash2_position = seq.position;
   }
 }
 
@@ -434,7 +446,55 @@ void check_lifetime() {
   ignis_seq_pool_free(pool);
 }
 
-// ---- 5. every refusal refuses, and costs nothing -------------------------
+// ---- 5. a spilled checkpoint is a self-contained host blob ---------------
+
+void check_materialized_blob_outlives_every_device_handle(bool dflash2) {
+  ignis_seq_pool_spec spec = small_spec(IGNIS_KV_FORMAT_HQ_E8_2B);
+  spec.slot_count = 2;
+  if (dflash2) {
+    spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+  }
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "materialize: pool create");
+
+  ignis_seq_prefix *prefix = nullptr;
+  ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "materialize: publisher");
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+            "materialize: capture");
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0,
+            "materialize: size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+            "materialize: snapshot");
+
+  // The host blob, not a prefix/checkpoint handle, is now the only retained
+  // state. Releasing every device owner must therefore return all source
+  // pages without making the blob unusable.
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_release(pool, publisher);
+
+  ignis_seq *restored = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "materialize: target");
+  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes), 0,
+            "materialize: restore after handles released");
+  std::uint64_t restored_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, restored, &restored_bytes), 0,
+            "materialize: restored size");
+  std::vector<unsigned char> round_trip(static_cast<std::size_t>(restored_bytes));
+  expect_rc(ignis_seq_snapshot(pool, restored, round_trip.data(), restored_bytes), 0,
+            "materialize: restored snapshot");
+  expect(restored_bytes == bytes && round_trip == blob,
+         "materialize: restored state is byte-identical to the spilled blob");
+
+  ignis_seq_release(pool, restored);
+  ignis_seq_pool_free(pool);
+}
+
+// ---- 6. every refusal refuses, and costs nothing -------------------------
 
 void check_refusals() {
   const ignis_seq_pool_spec spec = small_spec();
@@ -511,6 +571,8 @@ int main() {
   check_claim_reproduces_the_state_at_the_opener(IGNIS_KV_FORMAT_HQ_E8_2B);
   check_penalty_counts_are_zero_at_the_opener();
   check_lifetime();
+  check_materialized_blob_outlives_every_device_handle(false);
+  check_materialized_blob_outlives_every_device_handle(true);
   check_refusals();
   if (failures != 0) {
     std::fprintf(stderr, "%d checkpoint check(s) failed\n", failures);

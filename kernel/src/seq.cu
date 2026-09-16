@@ -120,21 +120,60 @@ void zero_dflash2_lane(ignis_seq_pool &pool, std::int32_t slot) {
 
 // ---- state transfer (P4-06, GitHub #124, ADR 0024) -----------------------
 
-// Why `seq` cannot be moved as one blob, or nullptr if it can.
+// Why a restore target cannot already hold shared history, or nullptr if it can.
 //
-// A sequence that claims a shared prefix (P4-10, GitHub #126) does not own
-// its leading KV pages: they are the prefix's, refcounted and addressed by
-// every claimant's block-table row. A snapshot of it would either copy
-// another request's history into this request's blob, or leave a hole a
-// restore would read as zeroed attention -- so the transfer is refused
-// rather than approximated. Releasing the sequence drops the claim, and a
-// re-prefill is the way back on.
+// Snapshots materialize shared history since GitHub #190. Restoring over a
+// live shared row remains invalid: it would overwrite pages other claimants
+// still read.
 const char *shared_prefix_refusal(const ignis_seq &seq) {
   if (seq.prefix == nullptr) {
     return nullptr;
   }
   return "the sequence claims a shared prefix, so its KV history is not all "
          "its own; release it and re-prefill instead";
+}
+
+std::vector<std::int32_t> logical_page_ids(const ignis_seq &seq, std::uint32_t count) {
+  std::vector<const ignis_seq_prefix *> chain;
+  for (const ignis_seq_prefix *at = seq.prefix; at != nullptr; at = at->parent) {
+    chain.push_back(at);
+  }
+  std::vector<std::int32_t> pages;
+  pages.reserve(ignis_seq_logical_page_count(seq));
+  for (auto at = chain.rbegin(); at != chain.rend(); ++at) {
+    const auto ids = (*at)->kv.page_ids();
+    pages.insert(pages.end(), ids.begin(), ids.end());
+  }
+  const auto own = seq.kv.page_ids();
+  pages.insert(pages.end(), own.begin(), own.end());
+  if (count > pages.size()) {
+    throw std::logic_error("snapshot extent exceeds the sequence's logical pages");
+  }
+  pages.resize(count);
+  return pages;
+}
+
+void pack_logical_pages(const ignis_seq_pool &pool, const ignis_seq &seq, std::uint32_t count,
+                        void *dst) {
+  if (pool.kv_pool.plane_order() != ninfer::PagedKVPlaneOrder::PageMajor) {
+    throw std::logic_error("sequence snapshots require a PageMajor KV pool");
+  }
+  const std::vector<std::int32_t> pages = logical_page_ids(seq, count);
+  auto *out = static_cast<unsigned char *>(dst);
+  for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+    const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+    const std::size_t bytes = static_cast<std::size_t>(plane.nb[3]);
+    auto *base = static_cast<unsigned char *>(plane.data);
+    for (std::int32_t page : pages) {
+      const cudaError_t err = cudaMemcpyAsync(out, base + static_cast<std::int64_t>(page) * plane.nb[3],
+                                              bytes, cudaMemcpyDeviceToHost, nullptr);
+      if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpyAsync(materialized KV page) failed: ") +
+                                 cudaGetErrorString(err));
+      }
+      out += bytes;
+    }
+  }
 }
 
 // The offset of `kind` in `sections`. The table always carries every kind
@@ -540,10 +579,6 @@ extern "C" int32_t ignis_seq_snapshot_size(const struct ignis_seq_pool *pool,
     set_error("ignis_seq_snapshot_size: the sequence was not drawn from this pool");
     return -1;
   }
-  if (const char *refusal = shared_prefix_refusal(*seq)) {
-    set_error(std::string("ignis_seq_snapshot_size: ") + refusal);
-    return IGNIS_SEQ_ERR_SHARED_PREFIX;
-  }
   if (seq->rope_delta != 0) {
     set_error("ignis_seq_snapshot_size: sequence slot " + std::to_string(seq->slot) +
               " carries a multimodal rope delta, which the snapshot blob does not record yet");
@@ -575,10 +610,6 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     set_error("ignis_seq_snapshot: the sequence was not drawn from this pool");
     return -1;
-  }
-  if (const char *refusal = shared_prefix_refusal(*seq)) {
-    set_error(std::string("ignis_seq_snapshot: ") + refusal);
-    return IGNIS_SEQ_ERR_SHARED_PREFIX;
   }
   if (seq->rope_delta != 0) {
     set_error("ignis_seq_snapshot: sequence slot " + std::to_string(seq->slot) +
@@ -619,7 +650,7 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
       unsigned char *at = base + section.offset;
       switch (section.kind) {
       case IGNIS_SEQ_SECTION_KV_PAGES:
-        ninfer::pack_paged_kv_allocation_to_host(seq->kv, pool->kv_pool, pages, at, nullptr);
+        pack_logical_pages(*pool, *seq, pages, at);
         break;
       case IGNIS_SEQ_SECTION_GDN_CONV:
         // The vendored state pool moves a slot's conv taps and recurrent

@@ -461,6 +461,13 @@ pub enum SchedEvent {
         /// checkpoint into this request's slot, measured by the backend.
         restore_micros: u64,
     },
+    /// A bounded retained-state cache operation for the asynchronous
+    /// Prometheus projection (GitHub #190). It has no request owner: spills
+    /// and discards may happen while making room for another request.
+    StateCache {
+        operation: crate::checkpoint::StateCacheOperation,
+        source: crate::checkpoint::ReuseSource,
+    },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
     /// P3-06 request log): `chunk_tokens` is this chunk's width,
     /// `prefilled_tokens` the cumulative prompt tokens sent to the compute

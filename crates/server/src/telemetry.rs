@@ -30,7 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use ignis_core::checkpoint::ReuseSource;
+use ignis_core::checkpoint::{ReuseSource, StateCacheOperation};
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
@@ -480,8 +480,22 @@ impl Telemetry {
         tokens: u32,
         restore_micros: u64,
     ) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_state_cache(StateCacheOperation::Hit, source);
+            metrics.record_state_cache(StateCacheOperation::Restore, source);
+        }
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.reuse = Some((source, tokens, restore_micros));
+        }
+    }
+
+    /// Project one scheduler-owned retained-state cache operation. Hits and
+    /// restores arrive through [`Self::on_state_reused`] because only a
+    /// successful prefill is a completed restore; misses, spills and discards
+    /// have no request owner and use this path.
+    pub fn on_state_cache(&mut self, operation: StateCacheOperation, source: ReuseSource) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_state_cache(operation, source);
         }
     }
 
@@ -1394,6 +1408,20 @@ mod tests {
 
         let text = metrics.render();
         assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");
+    }
+
+    #[test]
+    fn a_completed_retained_state_restore_counts_as_a_hit_and_restore() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(7, 2048, RequestClass::Interactive);
+        telemetry.on_state_reused(7, ReuseSource::KvRam, 1536, 42);
+
+        let text = metrics.render();
+        assert!(text.contains("\nignis_retained_state_hits_total{tier=\"kv_ram\"} 1\n"));
+        assert!(text.contains("\nignis_retained_state_restores_total{tier=\"kv_ram\"} 1\n"));
+        assert!(text.contains("\nignis_retained_state_hits_total{tier=\"device\"} 0\n"));
     }
 
     #[test]

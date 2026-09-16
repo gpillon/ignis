@@ -19,6 +19,8 @@ is the scheduler's acceptance as the telemetry consumer observes it, the same
 anchor as the `ignis.request.ttft`/`done` log events: measuring from HTTP
 ingress would take a fact the consumer does not already receive. A request
 cancelled after its first token has a TTFT observation but no duration one.
+Amended 2026-09-16 (#190): retained prompt-checkpoint operations add five
+fixed-cardinality counter families, each split by `tier="device|kv_ram"`.
 One **proposed** amendment is outstanding, at the end of this document:
 `ignis_prefix_reused_tokens_total`'s meaning widens (2026-09-16, #188). It is
 **not decided** — this ADR's clarifications are the owner's to sign off — and
@@ -122,9 +124,11 @@ critical-path performance regression. The only numerical allowance is at most
 - The existing asynchronous telemetry consumer is the single projection owner.
   It updates aggregate state from facts already emitted by the model thread;
   scrape-time encoding happens only in the HTTP task.
-- The scheduler interface, core, runtime, kernel leaf, and model-thread loop are
-  unchanged. Flag-off and flag-on produce identical inference-side fact
-  traffic for the same successful workload.
+- Retained prompt-checkpoint lookup and lifecycle operations emit bounded
+  domain facts for hit, miss, spill, discard and restore (#190). Those facts
+  are emitted identically with metrics off and on; only the asynchronous
+  telemetry consumer conditionally projects them. Runtime and kernel code do
+  no metrics work.
 - Enabling metrics adds no scheduler query, snapshot, event, branch, atomic
   operation, clock read, allocation, task wake, event clone, or channel
   operation to the inference path.
@@ -159,6 +163,11 @@ The initial stable metric contract is:
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — **widening proposed, pending owner sign-off (#188): see the proposed amendment below** |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Retained prompt-checkpoint matches successfully used |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Retained prompt-checkpoint lookups with no matching entry in that configured tier |
+| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints spilled into the named tier |
+| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints discarded from the named tier |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints successfully restored from the named tier |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
@@ -195,8 +204,9 @@ dimension.
   concurrent scrapes, and slow-scraper isolation; which listener serves which
   path; and `/ui/metrics` following the API key.
 - Structural review and tests prove there is no metrics dependency or
-  metrics-aware code in core, runtime, the kernel leaf, or the model-thread
-  loop, and that flag-off and flag-on produce identical inference-side fact
+  flag-dependent code in core, runtime, the kernel leaf, or the model-thread
+  loop. Core emits canonical retained-state lifecycle facts independent of
+  Prometheus, and flag-off and flag-on produce identical inference-side fact
   traffic.
 - A real-GPU trace replay compares metrics disabled, enabled but unscraped, and
   enabled with a 15-second scrape cadence. There must be no repeatable
