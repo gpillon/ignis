@@ -81,12 +81,10 @@ fn messages(case: &Value) -> (Vec<ChatMessage>, Vec<Vec<u8>>) {
                         .collect()
                 })
                 .unwrap_or_default();
-            // The server drops history reasoning unless preserve_thinking.
-            let reasoning_content = case["preserve_thinking"]
-                .as_bool()
-                .unwrap_or(false)
-                .then(|| m["reasoning_content"].as_str().map(str::to_owned))
-                .flatten();
+            // The server hands the template every turn's reasoning and lets
+            // it decide what survives (GitHub #185), so the case's own text
+            // goes in whatever `preserve_thinking` says.
+            let reasoning_content = m["reasoning_content"].as_str().map(str::to_owned);
             ChatMessage { role, content, tool_calls, reasoning_content }
         })
         .collect();
@@ -131,7 +129,7 @@ fn prepared_prompts_match_the_reference_fixtures() {
     let processor = frontend.vision_processor().expect("vision processor");
     let mut dir: Vec<_> = std::fs::read_dir(fixtures().join("expected")).unwrap().map(|e| e.unwrap().path()).collect();
     dir.sort();
-    assert_eq!(dir.len(), 21, "every recorded fixture is present");
+    assert_eq!(dir.len(), 22, "every recorded fixture is present");
     // Every case is checked and every mismatch reported, so one divergence
     // does not hide another.
     let failures: Vec<String> = dir.iter().filter_map(|path| check_fixture(&frontend, &processor, path).err()).collect();

@@ -27,15 +27,20 @@ pub struct ThinkingOptions {
     /// Absent means "let the template's own default apply" — bound to the
     /// template's `reasoning_effort` variable only when `Some`.
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// Whether inbound assistant `reasoning_content` survives into the
-    /// rendered prompt (default: dropped).
+    /// Always resolved explicitly, like `enable_thinking` — this is what
+    /// gets bound to the template's `preserve_thinking` variable (GitHub
+    /// #185). False, the default, does not mean "no history reasoning": it
+    /// means the template's own rule decides, which keeps a tool loop's
+    /// in-flight turns and strips everything before the last real user
+    /// query. True keeps all of it.
     pub preserve_thinking: bool,
 }
 
 impl Default for ThinkingOptions {
-    /// Thinking on, template's own default effort, prior reasoning dropped
-    /// — the server's own out-of-the-box stance before any env-var default
-    /// or per-request override.
+    /// Thinking on, template's own default effort, history reasoning
+    /// stripped before the last real user query — the server's own
+    /// out-of-the-box stance before any env-var default or per-request
+    /// override, and the same default the reference serves.
     fn default() -> Self {
         Self {
             enable_thinking: true,

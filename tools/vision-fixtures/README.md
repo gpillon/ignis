@@ -37,7 +37,7 @@ re-record after regenerating images, since the fixtures pin the image bytes.
 ## Notes
 
 - The set also holds text-only multi-turn cases (`chat_history`,
-  `chat_history_preserved`, `new_turn_after_tool_loop`, GitHub #185), each
+  `chat_history_preserved`, `tool_loop`, `new_turn_after_tool_loop`, #185), each
   with history reasoning and recorded with `preserve_thinking` both ways.
   They carry no image, so only the token ids, positions and the rewrite
   checkpoint are meaningful — which is the point: how history renders is what

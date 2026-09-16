@@ -80,12 +80,19 @@ impl ArtifactTemplateProvider {
                 let role = Role::parse(&message.role).unwrap_or(Role::User);
                 let mut templated = ignis_artifact::ChatMessage::text(role, "");
                 templated.content = artifact_content(&message.content);
-                // Prior assistant reasoning rides into the prompt only when
-                // the request opted in (GitHub #68) — dropped by default so
-                // a long conversation does not silently accumulate traces.
-                if options.preserve_thinking {
-                    templated.reasoning_content = message.reasoning_content.clone();
-                }
+                // Prior assistant reasoning is handed to the template
+                // whole; which of it survives into the prompt is the
+                // template's decision, driven by the `preserve_thinking`
+                // bound below (GitHub #185). Dropping it here instead
+                // (GitHub #68) pre-empted that decision and left the
+                // template rendering an emptied think block on turns the
+                // reference renders without one (#182). The story #68 was
+                // protecting — a long conversation must not accumulate
+                // traces — is now the template's own
+                // strip-before-the-last-real-user-query branch, which keeps
+                // only the in-flight turn's reasoning, as the reference
+                // does.
+                templated.reasoning_content = message.reasoning_content.clone();
                 // A prior assistant turn's tool calls (GitHub #132): each
                 // call's `arguments` is a JSON-encoded string on the wire
                 // (matching #121's own response shape) and the template
@@ -529,24 +536,32 @@ mod tests {
     }
 
     #[test]
-    fn apply_chat_template_drops_reasoning_content_unless_preserved() {
+    fn apply_chat_template_forwards_reasoning_content_for_the_template_to_decide() {
+        // GitHub #185: which history reasoning survives into the prompt is
+        // the template's decision, not the provider's. The provider hands it
+        // every turn's `reasoning_content` in both states and binds the
+        // resolved `preserve_thinking` alongside it; the real template then
+        // strips the turns before the last real user query and keeps a tool
+        // loop's in-flight ones, exactly as the reference does
+        // (`ChatTemplate`'s `preserve_thinking_*` tests pin that decision on
+        // the real dialect).
+        //
+        // Blanking it here instead — what the provider used to do — made the
+        // decision unreachable: the template never saw the text it was
+        // supposed to keep.
         let (_fixture, _reader, provider) = build_thinking_provider(THINKING_TEMPLATE);
         let mut message = ChatMessage::text("assistant", "the answer");
         message.reasoning_content = Some("scratch work".to_owned());
 
-        let dropped = provider.apply_chat_template(&[message.clone()], &opts(), no_tools());
-        let dropped_text = provider.render_tokens(&dropped);
-        assert!(!dropped_text.contains("scratch"), "{dropped_text}");
-        assert!(!dropped_text.contains("work"), "{dropped_text}");
-
-        let preserved_options = ThinkingOptions {
-            preserve_thinking: true,
-            ..opts()
-        };
-        let preserved = provider.apply_chat_template(&[message], &preserved_options, no_tools());
-        let preserved_text = provider.render_tokens(&preserved);
-        assert!(preserved_text.contains("scratch"), "{preserved_text}");
-        assert!(preserved_text.contains("work"), "{preserved_text}");
+        for options in [opts(), ThinkingOptions { preserve_thinking: true, ..opts() }] {
+            let tokens = provider.apply_chat_template(&[message.clone()], &options, no_tools());
+            let text = provider.render_tokens(&tokens);
+            assert!(
+                text.contains("scratch") && text.contains("work"),
+                "preserve_thinking={}: {text}",
+                options.preserve_thinking
+            );
+        }
     }
 
     #[test]
