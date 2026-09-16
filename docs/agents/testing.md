@@ -349,6 +349,16 @@ bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
 default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the
 envelope check and the leaf's vision schema host-side.
 
+Since GitHub #195 `--vision` combines with `--spec dflash2`: both scopes bind
+in one load, the drafter's context append takes the span's KV positions (what
+the reference's own prefill sink captures on a multimodal span), and the verify
+round rotates its columns at `position + rope_delta` from its own staging, the
+way a decode round already did. `crates/server/tests/vision_dflash2_gpu.rs` is
+that load's check — the canary floor on it, greedy verify rounds against the
+same load's own plain decode rounds, and the acceptance on the text after an
+image against the 3.4–5.75 band. The verify round's rope staging exists only
+when vision is loaded, so a text-only speculative load allocates nothing new.
+
 **BF16 is the oracle format (ADR 0022).** Every correctness check in the GPU
 profile asks for it by name — `--kv-format bf16` at the server, and
 `ignis_core::KvFormat::Bf16` on both `load_qwen38_27b` and `SeqPoolBudget`
