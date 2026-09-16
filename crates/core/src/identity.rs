@@ -476,6 +476,27 @@ impl<'a> PromptContent<'a> {
         out
     }
 
+    /// This prompt's content keys at every one of `lengths` a prefix of it
+    /// could have, in **one** forward pass (GitHub #193).
+    ///
+    /// What a claimant hands to every pool it asks: the checkpoint pool, the
+    /// device prefixes and the KV-RAM ones each hold entries of their own
+    /// lengths, and walking the prompt once per pool is the cost this exists
+    /// to remove. A length past the prompt's end is dropped rather than
+    /// answered — no entry that long is a prefix of it — so
+    /// [`PromptKeys::key_at`] never stands the whole prompt's key in for a
+    /// longer entry's.
+    pub fn keys_for(&self, lengths: impl IntoIterator<Item = u32>) -> PromptKeys {
+        let mut lengths: Vec<u32> = lengths.into_iter().filter(|&at| at <= self.tokens()).collect();
+        lengths.sort_unstable();
+        lengths.dedup();
+        let keys = self.keys_at(&lengths);
+        PromptKeys {
+            tokens: self.tokens(),
+            keys: lengths.into_iter().zip(keys).collect(),
+        }
+    }
+
     /// Whether a prefix of `at` tokens would end **inside** a media item's
     /// placeholder span.
     ///
@@ -488,6 +509,39 @@ impl<'a> PromptContent<'a> {
         self.media
             .iter()
             .any(|m| m.begin < at && at < m.begin + m.count)
+    }
+}
+
+/// A prompt's content keys at a fixed set of lengths
+/// ([`PromptContent::keys_for`]): everything a lookup needs to know about the
+/// prompt, computed before any pool is asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptKeys {
+    tokens: u32,
+    /// Ascending by length, one key per length.
+    keys: Vec<(u32, MatchKey)>,
+}
+
+impl PromptKeys {
+    /// The prompt's length in tokens.
+    pub fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
+    /// The key of the prompt's first `at` tokens, or `None` when `at` was not
+    /// asked for or reaches past the prompt — either way, no entry of that
+    /// length can match.
+    pub fn key_at(&self, at: u32) -> Option<MatchKey> {
+        self.keys
+            .binary_search_by_key(&at, |&(length, _)| length)
+            .ok()
+            .map(|n| self.keys[n].1)
+    }
+
+    /// Whether an entry of `length` tokens named `key` is a prefix of this
+    /// prompt.
+    pub fn matches(&self, length: u32, key: MatchKey) -> bool {
+        self.key_at(length) == Some(key)
     }
 }
 
@@ -775,6 +829,23 @@ mod tests {
         let keys = prompt.keys_at(&[16, 32]);
         assert_eq!(keys, [prompt.head(16).key_at(16), prompt.head(32).key_at(32)]);
         assert_eq!(prompt.keys_at(&[16, 999])[1], prompt.key_at(300));
+    }
+
+    #[test]
+    fn prompt_keys_answer_exactly_the_lengths_asked_for() {
+        let tokens: Vec<TokenId> = (1..=100).collect();
+        let items = [media(10, 16, 0xAA)];
+        let prompt = PromptContent::new(&tokens, &items);
+        let keys = prompt.keys_for([64, 16, 64, 100, 101, 400]);
+        assert_eq!(keys.tokens(), 100);
+        for at in [16, 64, 100] {
+            assert_eq!(keys.key_at(at), Some(prompt.key_at(at)), "at {at}");
+            assert!(keys.matches(at, prompt.key_at(at)));
+        }
+        assert_eq!(keys.key_at(32), None, "a length nobody asked about");
+        assert_eq!(keys.key_at(101), None, "past the end is no prefix");
+        assert!(!keys.matches(400, prompt.key_at(100)), "never the whole prompt's key");
+        assert_eq!(prompt.keys_for([]).key_at(0), None);
     }
 
     #[test]

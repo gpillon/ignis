@@ -65,7 +65,7 @@
 use std::time::Instant;
 
 use crate::gdn::GdnState;
-use crate::identity::{BlobHeader, BlobIdentity, IdentityMismatch, MatchKey, PromptContent};
+use crate::identity::{BlobHeader, BlobIdentity, IdentityMismatch, MatchKey, PromptContent, PromptKeys};
 use crate::prefix::PrefixId;
 use crate::types::{RequestClass, RequestId};
 
@@ -859,7 +859,12 @@ impl CheckpointPool {
     /// scheduler has to weigh this match against a *sibling prefix* match
     /// before it takes either — longest reuse wins, and a losing match must
     /// leave no trace in the LRU order or the reuse counter.
-    pub fn lookup(&self, prompt: &PromptContent<'_>) -> CheckpointLookup {
+    ///
+    /// `prompt` carries the keys already (GitHub #193): the scheduler walks a
+    /// claimant's prompt once for this pool and the prefix cache together,
+    /// over [`CheckpointPool::match_lengths`] and
+    /// [`crate::prefix::PrefixCache::match_lengths`].
+    pub fn lookup(&self, prompt: &PromptKeys) -> CheckpointLookup {
         let length = prompt.tokens();
         // An entry longer than the prompt cannot be a prefix of it, and one
         // this load would refuse to write must never be offered.
@@ -868,16 +873,9 @@ impl CheckpointPool {
             .iter()
             .filter(|e| e.tokens <= length && self.identity.accepts(&e.identity).is_ok())
             .collect();
-        if candidates.is_empty() {
-            return CheckpointLookup::default();
-        }
-        // One forward pass over the prompt answers every candidate's length —
-        // the reason the key is a chain rather than a digest of the whole.
-        let lengths: Vec<u32> = candidates.iter().map(|e| e.tokens).collect();
-        let keys = prompt.keys_at(&lengths);
         let mut lookup = CheckpointLookup::default();
-        for (n, entry) in candidates.iter().enumerate() {
-            if self.tiers.rank(entry.tier).is_none() || entry.key != keys[n] {
+        for entry in candidates {
+            if self.tiers.rank(entry.tier).is_none() || !prompt.matches(entry.tokens, entry.key) {
                 continue;
             }
             let longest = &mut lookup.longest[entry.tier.index()];
@@ -933,7 +931,13 @@ impl CheckpointPool {
     /// device prefix to weigh — a pure query that decides nothing and changes
     /// nothing.
     pub fn best_match(&self, prompt: &PromptContent<'_>) -> Option<CheckpointMatch> {
-        self.select(&self.lookup(prompt), 0)
+        self.select(&self.lookup(&prompt.keys_for(self.match_lengths())), 0)
+    }
+
+    /// Every length a retained entry covers — what a prompt has to be keyed at
+    /// before [`CheckpointPool::lookup`] can answer it.
+    pub fn match_lengths(&self) -> impl Iterator<Item = u32> + '_ {
+        self.entries.iter().map(|e| e.tokens)
     }
 
     /// Record that `id` was claimed: refresh its LRU tick and count the
@@ -1816,7 +1820,7 @@ mod tests {
         let prompt: Vec<TokenId> = (1..=4_000).collect();
         let spilled = retain(&mut pool, 1, &prompt[..2_100], 1, 1).unwrap();
         pool.move_to_tier(spilled, ReuseSource::KvRam, IMAGE).unwrap();
-        let lookup = pool.lookup(&PromptContent::text(&prompt));
+        let lookup = pool.lookup(&PromptContent::text(&prompt).keys_for(pool.match_lengths()));
 
         assert_eq!(
             pool.select(&lookup, 0).map(|m| m.source),
@@ -1836,7 +1840,7 @@ mod tests {
         // With a device checkpoint too, the KV-RAM entry that loses to the
         // prefix leaves the device checkpoint standing.
         retain(&mut pool, 2, &prompt[..1_500], 1, 2).unwrap();
-        let lookup = pool.lookup(&PromptContent::text(&prompt));
+        let lookup = pool.lookup(&PromptContent::text(&prompt).keys_for(pool.match_lengths()));
         let chosen = pool.select(&lookup, 1_200).unwrap();
         assert_eq!((chosen.source, chosen.tokens), (ReuseSource::Device, 1_500));
         assert_eq!(

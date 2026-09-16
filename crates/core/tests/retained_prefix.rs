@@ -815,6 +815,32 @@ fn subagent_with_image(query: u32, digest: u8) -> RequestInput {
 }
 
 #[test]
+fn a_multimodal_prompt_ending_at_a_checkpoint_opener_does_not_resume_from_it() {
+    // GitHub #193: a claim that reaches the prompt's end prefills nothing, and
+    // for an image prompt the prefill is what hands the leaf its rope delta.
+    // A checkpoint's own capture always leaves a tail, but a claimant's
+    // prompt can stop exactly at that opener: it takes the whole-page head
+    // below instead, and prefills the rest.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched
+        .submit(subagent_with_image(500, 0xAA), RequestClass::Agent)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let mut short = subagent_with_image(500, 0xAA);
+    short.tokens.truncate(57);
+    short.opener_tokens = None;
+    let multimodal = Arc::get_mut(short.multimodal.as_mut().unwrap()).unwrap();
+    multimodal.positions = (0..3).flat_map(|_| 0..57).collect();
+    let short = sched.submit(short, RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(state_reuses(&events, short).is_empty(), "{events:?}");
+    assert_eq!(prefix_reuses(&events, short), [48]);
+    assert_eq!(chunk_widths(&compute, short), [9]);
+}
+
+#[test]
 fn a_multimodal_burst_shares_the_block_whatever_image_each_subagent_sends() {
     // GitHub #193: a prompt carrying an image publishes its retained prefix
     // like any other, because the prefix is keyed by its images too. The

@@ -36,7 +36,7 @@
 use std::time::Instant;
 
 use crate::gdn::GdnState;
-use crate::identity::{MatchKey, PromptContent};
+use crate::identity::{MatchKey, PromptContent, PromptKeys};
 use crate::types::{RequestClass, RequestId};
 
 /// An opaque handle to a cached prefix entry (a claimant's reference to a
@@ -317,7 +317,15 @@ impl PrefixCache {
     /// GDN state to resume from), or `None` when nothing cached matches
     /// the prompt head.
     pub fn claim<'a>(&mut self, prompt: impl Into<PromptContent<'a>>) -> Option<PrefixClaim> {
-        self.claim_longer_than(prompt, 0)
+        let keys = prompt.into().keys_for(self.match_lengths());
+        self.claim_longer_than(&keys, 0)
+    }
+
+    /// Every length an entry covers, on the device or in KV-RAM — what a
+    /// prompt has to be keyed at before this cache can match it (GitHub #193).
+    pub fn match_lengths(&self) -> impl Iterator<Item = u32> + '_ {
+        let device = self.entries.iter().map(|e| e.length_tokens);
+        device.chain(self.spilled.iter().map(|s| s.length_tokens))
     }
 
     /// [`PrefixCache::claim`], restricted to entries covering **more** than
@@ -329,12 +337,8 @@ impl PrefixCache {
     /// is the floor this has to beat — and it has to be a floor rather than a
     /// comparison made afterwards, because claiming here is not free: it pins
     /// the entry and counts the skip.
-    pub fn claim_longer_than<'a>(
-        &mut self,
-        prompt: impl Into<PromptContent<'a>>,
-        floor: u32,
-    ) -> Option<PrefixClaim> {
-        let match_entry = self.longest_match(prompt.into(), floor)?;
+    pub fn claim_longer_than(&mut self, prompt: &PromptKeys, floor: u32) -> Option<PrefixClaim> {
+        let match_entry = self.longest_match(prompt, floor)?;
         let id = match_entry.id;
         let claim = PrefixClaim {
             id,
@@ -357,19 +361,15 @@ impl PrefixCache {
     /// a claimant skip, or 0 — without claiming it (GitHub #190). What a
     /// KV-RAM checkpoint has to beat by its restore floor before a restore
     /// across the bus is worth more than sharing pages already on the device.
-    pub fn longest_match_tokens<'a>(&self, prompt: impl Into<PromptContent<'a>>) -> u32 {
-        self.longest_match(prompt.into(), 0)
-            .map_or(0, |e| e.length_tokens)
+    pub fn longest_match_tokens(&self, prompt: &PromptKeys) -> u32 {
+        self.longest_match(prompt, 0).map_or(0, |e| e.length_tokens)
     }
 
     /// The longest registered prefix of `prompt` reaching past `floor`.
     ///
     /// What matches is the entry's **content key** at its length (GitHub
     /// #193): the prompt's token ids *and* the media items inside that head.
-    /// Only entries no longer than the prompt are asked about — `keys_at`
-    /// answers a length past the end with the whole prompt's key, which must
-    /// never stand in for a longer entry's.
-    fn longest_match(&self, prompt: PromptContent<'_>, floor: u32) -> Option<&PrefixEntry> {
+    fn longest_match(&self, prompt: &PromptKeys, floor: u32) -> Option<&PrefixEntry> {
         let candidates = self.entries.iter().filter(|e| e.length_tokens > floor);
         longest_keyed(prompt, candidates, |e| (e.key, e.length_tokens))
     }
@@ -610,12 +610,9 @@ impl PrefixCache {
     /// The longest prefix of `prompt` held **only** in KV-RAM — one still on
     /// the device is matched there — or `None`. Matched by content key, as
     /// the device entries are (GitHub #193).
-    pub fn longest_spilled_match<'a>(
-        &self,
-        prompt: impl Into<PromptContent<'a>>,
-    ) -> Option<&SpilledPrefix> {
+    pub fn longest_spilled_match(&self, prompt: &PromptKeys) -> Option<&SpilledPrefix> {
         let candidates = self.spilled.iter().filter(|s| s.on_device.is_none());
-        longest_keyed(prompt.into(), candidates, |s| (s.key, s.length_tokens))
+        longest_keyed(prompt, candidates, |s| (s.key, s.length_tokens))
     }
 
     /// The spilled prefix `id`, if its blob is still held.
@@ -697,26 +694,16 @@ impl PrefixCache {
 /// The longest of `candidates` that is a prefix of `prompt` by content —
 /// whose key equals the prompt's key at its length (GitHub #193). The longest
 /// match wins: a cached prefix of a cached prefix is a shorter match.
-///
-/// Only candidates no longer than the prompt are asked about: `keys_at`
-/// answers a length past the end with the whole prompt's key, which must
-/// never stand in for a longer entry's.
 fn longest_keyed<'e, T>(
-    prompt: PromptContent<'_>,
+    prompt: &PromptKeys,
     candidates: impl Iterator<Item = &'e T>,
     name: impl Fn(&T) -> (MatchKey, u32),
 ) -> Option<&'e T> {
-    let candidates: Vec<&T> = candidates.filter(|c| name(c).1 <= prompt.tokens()).collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    let lengths: Vec<u32> = candidates.iter().map(|c| name(c).1).collect();
-    let keys = prompt.keys_at(&lengths);
     candidates
-        .into_iter()
-        .zip(keys)
-        .filter(|(c, key)| name(c).0 == *key)
-        .map(|(c, _)| c)
+        .filter(|c| {
+            let (key, length) = name(c);
+            prompt.matches(length, key)
+        })
         .max_by_key(|c| name(c).1)
 }
 
@@ -726,6 +713,12 @@ mod tests {
     use crate::gdn::GdnState;
     use crate::identity::MediaKey;
     use crate::types::TokenId;
+
+    /// `prompt` keyed at every length `cache` holds, as the scheduler keys a
+    /// claimant (GitHub #193).
+    fn keys<'a>(cache: &PrefixCache, prompt: impl Into<PromptContent<'a>>) -> PromptKeys {
+        prompt.into().keys_for(cache.match_lengths())
+    }
 
     fn retention(at: u64) -> Retention {
         Retention {
@@ -920,11 +913,11 @@ mod tests {
         cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         cache.register(8, &prompt96(), &gdn_boundary(0), None).unwrap();
         assert!(
-            cache.claim_longer_than(&prompt96(), 96).is_none(),
+            cache.claim_longer_than(&keys(&cache, &prompt96()), 96).is_none(),
             "nothing reaches past the floor"
         );
         assert_eq!(cache.reused_tok(), 0, "a refused claim counts no skip");
-        let claim = cache.claim_longer_than(&prompt96(), 64).unwrap();
+        let claim = cache.claim_longer_than(&keys(&cache, &prompt96()), 64).unwrap();
         assert_eq!(claim.tokens, 96, "only the entry past the floor is taken");
     }
 
@@ -1138,8 +1131,8 @@ mod tests {
         // pinning the entry or counting a skip it may never take.
         let mut cache = PrefixCache::new(16);
         cache.register(7, &prompt64(), &gdn_boundary(64), None).unwrap();
-        assert_eq!(cache.longest_match_tokens(&prompt96()), 64);
-        assert_eq!(cache.longest_match_tokens(&(500..600).collect::<Vec<_>>()), 0);
+        assert_eq!(cache.longest_match_tokens(&keys(&cache, &prompt96())), 64);
+        assert_eq!(cache.longest_match_tokens(&keys(&cache, &(500..600).collect::<Vec<_>>())), 0);
         let entry = cache.claim(&prompt96()).unwrap().id;
         assert_eq!(cache.refcount_of(entry), 2, "the publisher and this one claim, not the peeks");
         assert_eq!(cache.reused_tok(), 64);
@@ -1155,7 +1148,7 @@ mod tests {
         let spilled = cache.record_spill(id).unwrap();
         assert_eq!(cache.spilled_copy_of(id), Some(spilled));
         assert!(
-            cache.longest_spilled_match(&prompt96()).is_none(),
+            cache.longest_spilled_match(&keys(&cache, &prompt96())).is_none(),
             "while it is on the device it is matched there"
         );
 
@@ -1163,14 +1156,14 @@ mod tests {
         cache.release(id); // the retention
         cache.release(id); // the publisher
         assert_eq!(cache.entry_count(), 0);
-        let matched = cache.longest_spilled_match(&prompt96()).unwrap();
+        let matched = cache.longest_spilled_match(&keys(&cache, &prompt96())).unwrap();
         assert_eq!((matched.id, matched.publisher, matched.length_tokens), (spilled, 7, 64));
-        assert!(cache.longest_spilled_match(&(500..600).collect::<Vec<_>>()).is_none());
+        assert!(cache.longest_spilled_match(&keys(&cache, &(500..600).collect::<Vec<_>>())).is_none());
 
         // Brought back, it is the device's to match again; forgotten, nobody's.
         let (back, _) = cache.register(7, &prompt64(), &gdn_boundary(64), None).unwrap();
         cache.record_return(spilled, back);
-        assert!(cache.longest_spilled_match(&prompt96()).is_none());
+        assert!(cache.longest_spilled_match(&keys(&cache, &prompt96())).is_none());
         assert_eq!(cache.forget_spilled(spilled).map(|s| s.id), Some(spilled));
         assert_eq!(cache.spilled_count(), 0);
     }
@@ -1201,7 +1194,7 @@ mod tests {
             .register(7, PromptContent::new(&tokens, &mine), &gdn_boundary(0), None)
             .unwrap();
         let theirs = PromptContent::new(&tokens, &yours);
-        assert_eq!(cache.longest_match_tokens(theirs), 0);
+        assert_eq!(cache.longest_match_tokens(&keys(&cache, theirs)), 0);
         assert!(cache.claim(theirs).is_none(), "another picture never matches");
         assert!(cache.claim(&tokens).is_none(), "nor does no picture at all");
         let claim = cache.claim(PromptContent::new(&tokens, &mine)).unwrap();
@@ -1268,9 +1261,9 @@ mod tests {
         cache.release(id);
         assert!(cache.unretain(id));
         cache.release(id);
-        assert!(cache.longest_spilled_match(PromptContent::new(&tokens, &yours)).is_none());
+        assert!(cache.longest_spilled_match(&keys(&cache, PromptContent::new(&tokens, &yours))).is_none());
         let spilled = cache
-            .longest_spilled_match(PromptContent::new(&tokens, &mine))
+            .longest_spilled_match(&keys(&cache, PromptContent::new(&tokens, &mine)))
             .cloned()
             .expect("the same picture matches in KV-RAM");
         // And it comes back under the same name.

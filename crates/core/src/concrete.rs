@@ -133,7 +133,7 @@ use crate::host::{
     DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase, RetainedBlob,
     RetainedKvRamEntry, Tier,
 };
-use crate::identity::{MediaKey, PromptContent};
+use crate::identity::{MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
 use crate::request::Request;
 use crate::scheduler::{
@@ -255,23 +255,29 @@ fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
     }
 }
 
-/// What `input`'s prompt is matched against **shared prefixes** over
-/// (GitHub #193): its tokens and `media` — minus the last token for a
-/// multimodal request.
+/// `input`'s prompt keyed at every length retained state and shared prefixes
+/// hold (GitHub #193): the one forward pass a claimant's lookups share, rather
+/// than one per pool.
 ///
-/// A claim reaching the prompt's very end leaves nothing to prefill, and for
-/// a multimodal request the prefill is the only thing that hands the leaf its
-/// `rope_delta`: a claimant is cloned from the publisher's mutable state and
-/// pages, neither of which carries it (`step.cu` sets `seq->rope_delta` from
-/// the span options). Without one tail token its every decode round would
-/// rotate at `position + 0`. A prompt checkpoint needs no such rule — its
-/// opener always leaves a tail (`Request::checkpoint_point`).
-fn prefix_lookup<'a>(input: &'a RequestInput, media: &'a [MediaKey]) -> PromptContent<'a> {
-    let prompt = PromptContent::new(&input.tokens, media);
-    match input.multimodal {
-        Some(_) => prompt.head(prompt.tokens().saturating_sub(1)),
-        None => prompt,
-    }
+/// Its tokens and media — minus the last token for a multimodal request. A
+/// claim reaching the prompt's very end leaves nothing to prefill, and for a
+/// multimodal request the prefill is the only thing that hands the leaf its
+/// `rope_delta`: a claimant is cloned from a publisher's mutable state and
+/// pages, or from a checkpoint's image, and none of them carries it (`step.cu`
+/// sets `seq->rope_delta` from the span options). Without one tail token its
+/// every decode round would rotate at `position + 0`. A checkpoint is held to
+/// it too: its own capture leaves a tail, but a *claimant's* prompt can end
+/// exactly at another request's opener.
+fn reuse_keys(input: &RequestInput, checkpoints: &CheckpointPool, prefix: &PrefixCache) -> PromptKeys {
+    let media = media_keys(input);
+    let prompt = PromptContent::new(&input.tokens, &media);
+    let reach = match input.multimodal {
+        Some(_) => prompt.tokens().saturating_sub(1),
+        None => prompt.tokens(),
+    };
+    prompt
+        .head(reach)
+        .keys_for(checkpoints.match_lengths().chain(prefix.match_lengths()))
 }
 
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
@@ -2221,18 +2227,16 @@ impl Scheduler for ConcreteScheduler {
                     // beat, because claiming a prefix is not free — it pins
                     // the entry and counts a skip — so a prefix that reaches
                     // no further must never be claimed at all.
-                    let media = media_keys(&self.requests[i].input);
-                    let lookup = self.checkpoints.lookup(&PromptContent::new(
-                        &self.requests[i].input.tokens,
-                        &media,
-                    ));
+                    // One walk of the prompt answers all four questions below.
+                    let keys = reuse_keys(&self.requests[i].input, &self.checkpoints, &self.prefix);
+                    let lookup = self.checkpoints.lookup(&keys);
                     self.requests[i].pending_retained_misses =
                         lookup.misses(self.checkpoints.tiers());
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
                     let mut device_prefix = self
                         .prefix
-                        .longest_match_tokens(prefix_lookup(&self.requests[i].input, &media));
+                        .longest_match_tokens(&keys);
                     let mut retained = self.checkpoints.select(&lookup, device_prefix);
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
@@ -2240,7 +2244,7 @@ impl Scheduler for ConcreteScheduler {
                     // outright — and from then on the burst shares it there.
                     if let Some((spilled, length)) = self
                         .prefix
-                        .longest_spilled_match(prefix_lookup(&self.requests[i].input, &media))
+                        .longest_spilled_match(&keys)
                         .map(|s| (s.id, s.length_tokens))
                     {
                         let device_checkpoint =
@@ -2261,7 +2265,7 @@ impl Scheduler for ConcreteScheduler {
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
-                        .claim_longer_than(prefix_lookup(&self.requests[i].input, &media), floor);
+                        .claim_longer_than(&keys, floor);
                     if let Some(claim) = claimed {
                         // GitHub #188: a claim moves a *retained* prefix to
                         // the back of the LRU order (a no-op on a live
