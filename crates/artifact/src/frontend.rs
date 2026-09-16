@@ -414,7 +414,7 @@ impl ChatTemplate {
     /// that binds nothing, so callers that do not care about thinking are
     /// unaffected (GitHub #68).
     pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_context(messages, None, None)
+        self.render_context(messages, None, None, None)
     }
 
     /// Render a conversation with the thinking controls bound as template
@@ -434,12 +434,26 @@ impl ChatTemplate {
         enable_thinking: bool,
         effort: Option<ReasoningEffort>,
     ) -> Result<String> {
-        self.render_context(messages, Some((enable_thinking, effort)), None)
+        self.render_context(messages, Some((enable_thinking, effort)), None, None)
     }
 
-    /// [`Self::render_with_thinking`] plus tool definitions (GitHub #132):
-    /// `tools` is the client's own OpenAI `tools` array, opaque JSON,
-    /// bound as-is — the template's `tools` branch renders each entry with
+    /// [`Self::render_with_thinking`] plus history thinking (GitHub #185) and
+    /// tool definitions (GitHub #132) — the variant the request path uses,
+    /// which binds every control a request can resolve.
+    ///
+    /// `preserve_thinking` is always bound (never left undefined), for the
+    /// same reason `enable_thinking` is: the Qwen 3.8 template's assistant
+    /// branch reads `preserve_thinking is undefined or preserve_thinking is
+    /// true or loop.index0 > ns.last_query_index`, so an unbound variable is
+    /// not "the default" — it is a third state that keeps a think block on
+    /// every history assistant turn and disables the template's own
+    /// strip-before-the-last-query branch (GitHub #182). Bound, the template
+    /// renders history the way the reference does
+    /// (`chat_template.cpp`: `keep_thinking = preserve_thinking || i >
+    /// last_query_index`).
+    ///
+    /// `tools` is the client's own OpenAI `tools` array, opaque JSON, bound
+    /// as-is — the template's `tools` branch renders each entry with
     /// `tojson`, so no ignis-side schema is needed. `None`/empty leaves the
     /// `tools` variable unbound, same as a request that never mentioned
     /// tools at all (the template's own `{%- if tools and ... %}` guard
@@ -449,15 +463,22 @@ impl ChatTemplate {
         messages: &[ChatMessage],
         enable_thinking: bool,
         effort: Option<ReasoningEffort>,
+        preserve_thinking: bool,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
-        self.render_context(messages, Some((enable_thinking, effort)), tools)
+        self.render_context(
+            messages,
+            Some((enable_thinking, effort)),
+            Some(preserve_thinking),
+            tools,
+        )
     }
 
     fn render_context(
         &self,
         messages: &[ChatMessage],
         thinking: Option<(bool, Option<ReasoningEffort>)>,
+        preserve_thinking: Option<bool>,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
         let mut context = serde_json::Map::new();
@@ -471,6 +492,9 @@ impl ChatTemplate {
             if let Some(effort) = effort {
                 context.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
             }
+        }
+        if let Some(preserve_thinking) = preserve_thinking {
+            context.insert("preserve_thinking".to_owned(), json!(preserve_thinking));
         }
         if let Some(tools) = tools.filter(|t| !t.is_empty()) {
             context.insert("tools".to_owned(), json!(tools));
@@ -1000,6 +1024,7 @@ mod tests {
                 &[ChatMessage::text(Role::User, "hi")],
                 true,
                 None,
+                false,
                 Some(&tools),
             )
             .expect("render");
@@ -1012,12 +1037,12 @@ mod tests {
         let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
         let messages = [ChatMessage::text(Role::User, "hi")];
         let without = template
-            .render_with_thinking_and_tools(&messages, true, None, None)
+            .render_with_thinking_and_tools(&messages, true, None, false, None)
             .expect("render");
         assert!(!without.contains("TOOLS="), "{without}");
         let empty: [JsonValue; 0] = [];
         let with_empty = template
-            .render_with_thinking_and_tools(&messages, true, None, Some(&empty))
+            .render_with_thinking_and_tools(&messages, true, None, false, Some(&empty))
             .expect("render");
         assert!(!with_empty.contains("TOOLS="), "{with_empty}");
     }
@@ -1087,7 +1112,7 @@ mod tests {
             }
         })];
         let prompt = template
-            .render_with_thinking_and_tools(&[], true, None, Some(&tools))
+            .render_with_thinking_and_tools(&[], true, None, false, Some(&tools))
             .expect("render");
         assert_eq!(
             prompt,
@@ -1227,6 +1252,168 @@ enable_thinking={{ enable_thinking }};done"#;
     fn render_with_thinking_disabled_raises_on_a_template_that_cannot() {
         let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
         assert!(template.render_with_thinking(&[], false, None).is_err());
+    }
+
+    // -- preserve_thinking reaches the template (GitHub #185) ----------------
+
+    /// Reports which of the three states `preserve_thinking` reached the
+    /// template in. The real Qwen 3.8 template's assistant branch keys on
+    /// exactly that three-way distinction (`is undefined` / `is true` /
+    /// else), so a variable left unbound silently takes the "keep the think
+    /// block" path (GitHub #182).
+    const PRESERVE_PROBE_TEMPLATE: &str =
+        "{%- if preserve_thinking is undefined -%}UNDEF{%- elif preserve_thinking is true -%}TRUE\
+{%- else -%}FALSE{%- endif -%}";
+
+    #[test]
+    fn render_with_thinking_and_tools_binds_preserve_thinking() {
+        // GitHub #185: the request's resolved `preserve_thinking` reaches the
+        // template as a bound variable in both states, never as "undefined" —
+        // the state in which the template keeps history thinking whatever the
+        // request asked for.
+        let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
+        assert_eq!(
+            template
+                .render_with_thinking_and_tools(&[], true, None, false, None)
+                .expect("render"),
+            "FALSE"
+        );
+        assert_eq!(
+            template
+                .render_with_thinking_and_tools(&[], true, None, true, None)
+                .expect("render"),
+            "TRUE"
+        );
+    }
+
+    #[test]
+    fn render_and_render_with_thinking_leave_preserve_thinking_to_the_template() {
+        // The two option-free entry points bind nothing they were not told:
+        // `render` is the "I do not care" delegation, and the capability
+        // probe renders a single user message, where the variable cannot
+        // matter. Both leave the template's own default in force.
+        let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
+        assert_eq!(template.render(&[]).expect("render"), "UNDEF");
+        assert_eq!(
+            template.render_with_thinking(&[], true, None).expect("render"),
+            "UNDEF"
+        );
+    }
+
+    /// The real Qwen 3.8 template's history rendering, copied verbatim from
+    /// `frontend/chat_template.jinja` — the last-real-user-query scan (its
+    /// lines 88-101) and the assistant branch's think-block decision (its
+    /// lines 110-120) — with only what these conversations never reach
+    /// trimmed. A test against it exercises the exact branch production
+    /// takes, not an analogue of it (the same posture as
+    /// `REAL_TOOL_DIALECT_TEMPLATE` in `crates/server`).
+    const REAL_HISTORY_DIALECT_TEMPLATE: &str = r##"
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = message.content|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- set content = message.content|trim %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}"##;
+
+    /// GitHub #182's repro conversation: `user, assistant(content +
+    /// reasoning), user`. The assistant turn sits *before* the last real user
+    /// query, so the reference omits its think block entirely.
+    fn history_conversation() -> [ChatMessage; 3] {
+        let mut assistant = ChatMessage::text(Role::Assistant, "A gradient with a disc.");
+        assistant.reasoning_content = Some("Looks like a gradient.".to_owned());
+        [
+            ChatMessage::text(Role::User, "What is in this picture?"),
+            assistant,
+            ChatMessage::text(Role::User, "And the colours?"),
+        ]
+    }
+
+    #[test]
+    fn preserve_thinking_false_strips_history_thinking_before_the_last_query() {
+        // AC1 (GitHub #185): with `preserve_thinking` false the real
+        // template's strip branch runs, so a history assistant turn before
+        // the last real user query carries no think block at all — not the
+        // emptied one ignis rendered while the variable stayed unbound
+        // (#182).
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let prompt = template
+            .render_with_thinking_and_tools(&history_conversation(), true, None, false, None)
+            .expect("render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is in this picture?<|im_end|>\n\
+             <|im_start|>assistant\nA gradient with a disc.<|im_end|>\n\
+             <|im_start|>user\nAnd the colours?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn preserve_thinking_true_keeps_history_thinking() {
+        // AC2 (GitHub #185): with `preserve_thinking` true the same turn
+        // keeps its reasoning, exactly as the reference keeps it.
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let prompt = template
+            .render_with_thinking_and_tools(&history_conversation(), true, None, true, None)
+            .expect("render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is in this picture?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nLooks like a gradient.\n</think>\n\n\
+             A gradient with a disc.<|im_end|>\n\
+             <|im_start|>user\nAnd the colours?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn preserve_thinking_false_keeps_thinking_after_the_last_query() {
+        // The other half of the reference's rule (`chat_template.cpp`:
+        // `keep_thinking = preserve_thinking || i > last_query_index`): an
+        // assistant turn *after* the last real user query — a tool loop's
+        // in-flight turns — keeps its reasoning even with `preserve_thinking`
+        // false.
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let mut assistant = ChatMessage::text(Role::Assistant, "Reading the file.");
+        assistant.reasoning_content = Some("I should read it.".to_owned());
+        let messages = [
+            ChatMessage::text(Role::User, "Summarize a.txt"),
+            assistant,
+            ChatMessage::text(Role::User, "<tool_response>\nok\n</tool_response>"),
+        ];
+        let prompt = template
+            .render_with_thinking_and_tools(&messages, true, None, false, None)
+            .expect("render");
+        assert!(
+            prompt.contains("<think>\nI should read it.\n</think>\n\nReading the file."),
+            "{prompt}"
+        );
     }
 
     #[test]

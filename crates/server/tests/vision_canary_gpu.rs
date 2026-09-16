@@ -227,7 +227,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
             reasoning_content: None,
         }];
         let prepared = frontend
-            .prepare_prompt(&processor, &messages, &[&canary.image], false, None, None)
+            .prepare_prompt(&processor, &messages, &[&canary.image], false, None, false, None)
             .unwrap_or_else(|e| panic!("{}: prepare prompt: {e}", canary.id));
         let (token_ids, prompt) = Multimodal::from_prepared(prepared);
         let tokens: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
@@ -339,7 +339,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
         reasoning_content: None,
     }];
     let prepared = frontend
-        .prepare_prompt(&processor, &messages, &[&canary.image], false, None, None)
+        .prepare_prompt(&processor, &messages, &[&canary.image], false, None, false, None)
         .expect("prepare");
     let item = &prepared.media[0];
     let control = vision_item_control(item.grid);

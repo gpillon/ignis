@@ -56,7 +56,7 @@ fn params() -> DecodeParams {
 
 fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
     let messages = [ChatMessage::text(Role::User, question)];
-    let rendered = frontend.chat_template().render_with_thinking_and_tools(&messages, false, None, None).expect("render");
+    let rendered = frontend.chat_template().render_with_thinking_and_tools(&messages, false, None, false, None).expect("render");
     RequestInput {
         model: MODEL.into(),
         tokens: frontend.tokenizer().encode(&rendered).expect("tokenize"),
@@ -76,7 +76,7 @@ fn image_input(frontend: &FrontendSet, image: &[u8]) -> RequestInput {
         tool_calls: Vec::new(),
         reasoning_content: None,
     }];
-    let prepared = frontend.prepare_prompt(&processor, &messages, &[image], false, None, None).expect("prepare");
+    let prepared = frontend.prepare_prompt(&processor, &messages, &[image], false, None, false, None).expect("prepare");
     let (tokens, multimodal) = Multimodal::from_prepared(prepared);
     RequestInput { model: MODEL.into(), tokens, params: params(), multimodal: Some(Arc::new(multimodal)) }
 }

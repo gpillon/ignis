@@ -115,7 +115,13 @@ impl ArtifactTemplateProvider {
             .collect();
         self.set
             .chat_template()
-            .render_with_thinking_and_tools(&templated, options.enable_thinking, options.reasoning_effort, Some(tools))
+            .render_with_thinking_and_tools(
+                &templated,
+                options.enable_thinking,
+                options.reasoning_effort,
+                options.preserve_thinking,
+                Some(tools),
+            )
             .map_err(|err| err.to_string())
     }
 }
@@ -606,6 +612,7 @@ mod tests {
                 &[ArtifactMessage::text(Role::User, "hi")],
                 true,
                 None,
+                false,
                 Some(&tools),
             )
             .expect("render");
@@ -633,7 +640,7 @@ mod tests {
             }}),
         ];
         let prompt = template
-            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], true, None, Some(&tools))
+            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], true, None, false, Some(&tools))
             .expect("render");
         let expected = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n\
 {\"function\": {\"description\": \"Read <path> & print it's text\", \"name\": \"read_file\", \

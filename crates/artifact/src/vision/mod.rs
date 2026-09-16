@@ -326,11 +326,12 @@ impl FrontendSet {
         images: &[&[u8]],
         enable_thinking: bool,
         effort: Option<ReasoningEffort>,
+        preserve_thinking: bool,
         tools: Option<&[JsonValue]>,
     ) -> Result<PreparedPrompt, ProcessorError> {
         let rendered = self
             .chat_template()
-            .render_with_thinking_and_tools(messages, enable_thinking, effort, tools)
+            .render_with_thinking_and_tools(messages, enable_thinking, effort, preserve_thinking, tools)
             .map_err(|e| ProcessorError::Render(e.to_string()))?;
         processor.prepare(self.tokenizer(), &rendered, images, &[])
     }
