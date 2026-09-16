@@ -499,19 +499,49 @@ impl ConcreteScheduler {
             kv_pages: self.capacity.kv_pages.saturating_sub(
                 self.prefix
                     .pinned_pages()
-                    // GitHub #186: pages pinned *only* by retained
-                    // checkpoints are not occupied as far as this arithmetic
-                    // is concerned. They come back the instant a live request
+                    // GitHub #186: pages held *only* by retained checkpoints
+                    // are not occupied as far as this arithmetic is
+                    // concerned. They come back the instant a live request
                     // needs them (`Self::reclaim_retained`), so counting them
                     // here would let retained state open a protection — that
                     // is, make a live request *wait* for a bet that has
                     // already been given up. ADR 0029: retained state never
                     // delays or refuses an admission.
-                    .saturating_sub(self.checkpoints.retained_pages()),
+                    //
+                    // Only the pages that would *actually* come back, though.
+                    // A prefix a live claimant is also standing on is
+                    // genuinely occupied, and promising it here would be the
+                    // mirror of the mistake `reclaim_retained` used to make.
+                    .saturating_sub(self.reclaimable_retained_pages()),
             ),
             backend_pages: self.capacity.backend_pages,
             resident_slots: self.capacity.resident_slots,
         }
+    }
+
+    /// The shared prefixes whose pages would come back if every retained
+    /// entry standing on them were discarded: the ones no *live* request
+    /// holds.
+    ///
+    /// A prefix's pages return at refcount zero, and its holders are live
+    /// requests plus retained checkpoints. So "nothing live is standing on
+    /// it" is exactly "its refcount is the number of retained entries on it"
+    /// — which is why the two ledgers are compared rather than either being
+    /// read alone.
+    fn reclaimable_prefixes(&self) -> Vec<PrefixId> {
+        self.checkpoints
+            .retained_prefixes()
+            .into_iter()
+            .filter(|&p| self.prefix.refcount_of(p) == self.checkpoints.retained_holders(p))
+            .collect()
+    }
+
+    /// KV pages the first-victim path could actually give back right now.
+    fn reclaimable_retained_pages(&self) -> u32 {
+        self.reclaimable_prefixes()
+            .into_iter()
+            .map(|p| self.prefix.pages_of(p))
+            .sum()
     }
 
     /// Discard a retained checkpoint: release the backend's device image and
@@ -580,13 +610,24 @@ impl ConcreteScheduler {
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
     fn reclaim_retained(&mut self, idx: usize) -> bool {
-        while !self.fits_for_materialization(&self.requests[idx]) {
-            let Some(victim) = self.checkpoints.discard_victim() else {
+        loop {
+            if self.fits_for_materialization(&self.requests[idx]) {
+                return true;
+            }
+            // Only entries whose pages would genuinely come back are given
+            // up. In the steady state this feature exists for, turn N's
+            // prefix is held by its retained entry *and* by the live turn
+            // N+1 standing on it — discarding the entry there frees not one
+            // page, and a loop that did not know that would give up every
+            // checkpoint in the pool and still not fit. When nothing
+            // qualifies the answer is "retained state cannot help", and the
+            // caller goes to the eviction machinery with the pool intact.
+            let reclaimable = self.reclaimable_prefixes();
+            let Some(victim) = self.checkpoints.discard_victim_on(Some(&reclaimable)) else {
                 return false;
             };
             self.discard_checkpoint(victim);
         }
-        true
     }
 
     /// Release one reference to the shared prefix `entry` (core-07), if

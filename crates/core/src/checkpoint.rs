@@ -43,8 +43,9 @@
 //! discard, and gives the match a second tier to choose between — which is
 //! why [`CheckpointMatch`] already names its [`ReuseSource`]; #189 (identity)
 //! replaces [`CheckpointEntry::tokens`] with a hash chain over the token ids
-//! plus media identity, and adds the compatibility identity a blob is refused
-//! on. None of those need the shape here to change.
+//! and adds the compatibility identity a blob is refused on, with #193
+//! filling the media slot in that key. None of those need the shape here to
+//! change.
 
 use crate::gdn::GdnState;
 use crate::prefix::PrefixId;
@@ -222,6 +223,26 @@ impl CheckpointPool {
         pages
     }
 
+    /// The distinct shared prefixes the retained entries stand on.
+    pub fn retained_prefixes(&self) -> Vec<PrefixId> {
+        let mut out: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            if !out.contains(&entry.prefix) {
+                out.push(entry.prefix);
+            }
+        }
+        out
+    }
+
+    /// How many retained entries stand on `prefix`.
+    ///
+    /// A conversation can leave two checkpoints inside one prompt head, so a
+    /// caller asking "would giving these up return the pages" has to compare
+    /// this against the prefix's own refcount rather than assume one holder.
+    pub fn retained_holders(&self, prefix: PrefixId) -> u32 {
+        self.entries.iter().filter(|e| e.prefix == prefix).count() as u32
+    }
+
     /// Whether a checkpoint over exactly `tokens` is already retained.
     ///
     /// A second capture at the same point would be a second image of the same
@@ -340,10 +361,25 @@ impl CheckpointPool {
     /// that cannot materialize takes retained pages back before admission
     /// considers evicting anybody. Until #190, released means discarded.
     pub fn discard_victim(&mut self) -> Option<CheckpointEntry> {
+        self.discard_victim_on(None)
+    }
+
+    /// [`CheckpointPool::discard_victim`], restricted to entries standing on
+    /// one of `prefixes` (`None` means any).
+    ///
+    /// The restriction is what keeps the first-victim path from emptying the
+    /// pool for nothing. A retained entry's pages come back only when the
+    /// prefix under it has no holder left at all, so an entry whose prefix a
+    /// live request is *also* standing on frees nothing when it goes — and
+    /// giving it up would cost the next turn its reuse while buying this
+    /// request no page. The caller works out which prefixes qualify, because
+    /// only it can see the live holders.
+    pub fn discard_victim_on(&mut self, prefixes: Option<&[PrefixId]>) -> Option<CheckpointEntry> {
         let pos = self
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, e)| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
             .min_by_key(|(_, e)| (e.use_tick, e.id))
             .map(|(i, _)| i)?;
         Some(self.remove_at(pos))

@@ -451,6 +451,14 @@ impl Telemetry {
     /// prefill it skipped, what the restore cost — so it is stashed and
     /// reported on the request's own `done` line rather than only summed
     /// into a server-wide counter.
+    /// Nothing is projected from here. `ignis_prefix_reused_tokens_total`
+    /// counts **sibling-prefix** reuse — that is what its help text says and
+    /// what ADR 0017's table row says — and folding a second, different kind
+    /// of reuse into it would redefine a documented counter without saying
+    /// so. #190 owns the per-tier hit / miss / spill / restore counters and
+    /// the ADR amendment that declares them; until then checkpoint reuse is
+    /// reported where this ticket says it is, on the request's own `done`
+    /// line.
     pub fn on_state_reused(
         &mut self,
         id: RequestId,
@@ -458,9 +466,6 @@ impl Telemetry {
         tokens: u32,
         restore_micros: u64,
     ) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_prefix_reused(tokens);
-        }
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.reuse = Some((source, tokens, restore_micros));
         }

@@ -222,11 +222,11 @@ ignis_seq *publisher_at_opener(ignis_seq_pool *pool, ignis_seq_prefix **out_pref
   set_frontier(*seq, kOpener);
   seq->pending_token = 4242;
   dirty_state(*pool, *seq, 1, 0x57u);
-  // The penalty-count row is zero at the opener in a real request: nothing
-  // has been sampled yet. Set explicitly here because `dirty_state` above
-  // leaves the rest of the slot patterned.
-  CUDA_CHECK(cudaMemset(pool->token_counts_for(seq->slot), 0,
-                        static_cast<std::size_t>(pool->vocab) * sizeof(std::int32_t)));
+  // Note what is NOT done here: the penalty-count row is left exactly as the
+  // sequence's own life left it. `ignis_seq_alloc` zeroed it and nothing has
+  // sampled since, which is the state a real request is in at its generation
+  // opener -- the scheduler only ever asks for a capture from an intermediate,
+  // greedy chunk. Zeroing it here would stage the property the test asserts.
   return seq;
 }
 
@@ -360,20 +360,30 @@ void check_penalty_counts_are_zero_at_the_opener() {
   ignis_seq_prefix *prefix = nullptr;
   ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "counts: publisher");
 
+  // The property first, on the sequence itself and before anything is
+  // captured: a request that has reached its opener has sampled nothing, so
+  // its count row is untouched from allocation. Nothing in this test put it
+  // there.
+  const std::size_t counts_bytes =
+      static_cast<std::size_t>(pool->vocab) * sizeof(std::int32_t);
+  const std::vector<unsigned char> at_opener =
+      read_device(pool->token_counts_for(publisher->slot), counts_bytes);
+  expect(std::all_of(at_opener.begin(), at_opener.end(),
+                     [](unsigned char b) { return b == 0; }),
+         "counts: a sequence standing at its opener has sampled nothing");
+
   ignis_seq_checkpoint *checkpoint = nullptr;
   expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
             "counts: capture");
   // The capturing request now samples, which is what a real one does the
   // moment its prompt is warm: the checkpoint must not have picked that up.
-  fill_device(pool->token_counts_for(publisher->slot),
-              static_cast<std::size_t>(pool->vocab) * sizeof(std::int32_t), 0xB1u);
+  fill_device(pool->token_counts_for(publisher->slot), counts_bytes, 0xB1u);
 
   ignis_seq *claimant = nullptr;
   expect_rc(ignis_seq_alloc_from_checkpoint(pool, kContext, checkpoint, &claimant), 0,
             "counts: claim");
   const std::vector<unsigned char> counts =
-      read_device(pool->token_counts_for(claimant->slot),
-                  static_cast<std::size_t>(pool->vocab) * sizeof(std::int32_t));
+      read_device(pool->token_counts_for(claimant->slot), counts_bytes);
   expect(std::all_of(counts.begin(), counts.end(), [](unsigned char b) { return b == 0; }),
          "counts: the penalty-count row a claimant receives is all zeros");
 

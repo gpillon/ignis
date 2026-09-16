@@ -111,9 +111,23 @@ inline void ignis_seq_checkpoint_page_transfer(ignis_seq_pool &pool, std::int32_
   const bool capture      = direction == IGNIS_SEQ_PREFIX_CAPTURE;
   unsigned char *packed   = image;
   const std::size_t count = pool.kv_pool.plane_count();
+  // The bound is checked *before* each copy is enqueued, not after the loop:
+  // an out-of-bounds `cudaMemcpyAsync` that has already been issued is not
+  // something a later throw can take back. The sizing function and this loop
+  // agree today by construction -- both read the PageMajor page stride off
+  // each plane -- so this is here for the day one of them stops, and a
+  // refused capture is a bet not taken where an overrun is someone else's
+  // memory.
+  const std::uint64_t budget = ignis_seq_checkpoint_page_bytes(pool);
   for (std::size_t index = 0; index < count; ++index) {
     const ninfer::Tensor &plane = pool.kv_pool.plane(index);
     const std::size_t bytes     = static_cast<std::size_t>(plane.nb[3]);
+    if (static_cast<std::uint64_t>(packed - image) + bytes > budget) {
+      throw std::logic_error("prompt checkpoint tail page: plane " + std::to_string(index) +
+                             " would move past the " + std::to_string(budget) +
+                             " bytes the pool prices a page at; the page layout and its "
+                             "sizing have drifted apart");
+    }
     unsigned char *page =
         static_cast<unsigned char *>(plane.data) + static_cast<std::int64_t>(page_id) * plane.nb[3];
     void *dst             = capture ? static_cast<void *>(packed) : static_cast<void *>(page);
@@ -127,16 +141,12 @@ inline void ignis_seq_checkpoint_page_transfer(ignis_seq_pool &pool, std::int32_
     }
     packed += bytes;
   }
-  // The sizing function and this loop must agree about what a page costs, or
-  // a capture writes past the buffer it was given. They agree today by
-  // construction -- both read the PageMajor page stride off each plane -- so
-  // this is here for the day one of them stops: a refused capture is a bet
-  // not taken, an overrun is someone else's memory.
-  const std::uint64_t moved    = static_cast<std::uint64_t>(packed - image);
-  const std::uint64_t expected = ignis_seq_checkpoint_page_bytes(pool);
-  if (moved != expected) {
+  // And the whole page has to have been moved, not only part of one: a plane
+  // set that shrank would otherwise leave the rest of the image stale.
+  const std::uint64_t moved = static_cast<std::uint64_t>(packed - image);
+  if (moved != budget) {
     throw std::logic_error("prompt checkpoint tail page: moved " + std::to_string(moved) +
-                           " bytes for a page the pool prices at " + std::to_string(expected) +
+                           " bytes for a page the pool prices at " + std::to_string(budget) +
                            "; the page layout and its sizing have drifted apart");
   }
 }

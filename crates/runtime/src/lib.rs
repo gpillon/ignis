@@ -674,7 +674,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 .expect("sequence was inserted or already existed");
             // A full-prompt match carries no tail: the claim already put the
             // sequence where its prompt ends, with the pending token the
-            // publisher computed, so there is nothing left to warm.
+            // entry carried, so there is nothing left to warm. True of a
+            // shared prefix, whose image is the publisher's state at the
+            // prefix's end, and of a prompt checkpoint (GitHub #186), whose
+            // progress section carries the pending token the capturing
+            // sequence had at its opener.
             if !job.tokens.is_empty() {
                 let warmed = match &job.multimodal {
                     None => self

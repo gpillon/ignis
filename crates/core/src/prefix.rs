@@ -251,6 +251,20 @@ impl PrefixCache {
         }
     }
 
+    /// The entry `id`'s live holders, or 0 when it is gone (GitHub #186).
+    ///
+    /// The pages come back only at zero, so this is what answers "would
+    /// letting go of this actually free anything" — the question the
+    /// first-victim path has to ask before it gives up a bet, since a prefix
+    /// a live request is still standing on frees nothing when its retained
+    /// holder releases.
+    pub fn refcount_of(&self, entry: PrefixId) -> u32 {
+        self.entries
+            .iter()
+            .find(|e| e.id == entry)
+            .map_or(0, |e| e.refcount)
+    }
+
     /// The entry `id`'s pages, or 0 when it is gone (GitHub #186: what a
     /// retained checkpoint records as the pages it holds).
     pub fn pages_of(&self, entry: PrefixId) -> u32 {

@@ -112,10 +112,10 @@ impl Default for CudaLeafConfig {
 /// materialized artifact, and the bound-tensor handles `ignis_model_load`
 /// reads on every (re)load.
 pub struct CudaLeaf {
-    // Read only for `RuntimeStats::free_vram_bytes` (GitHub #186), never
-    // to size the KV pool — see the module doc; otherwise held purely so
-    // the device context outlives `artifact` and every loaded model, since dropping it would invalidate their device
-    // memory.
+    // Read only for `RuntimeStats::free_vram_bytes` (GitHub #186), never to
+    // size the KV pool — see the module doc; otherwise held purely so the
+    // device context outlives `artifact` and every loaded model, since
+    // dropping it would invalidate their device memory.
     device: CudaDevice,
     reader: Reader,
     artifact: MaterializedArtifact,

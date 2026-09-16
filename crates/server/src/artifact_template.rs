@@ -488,7 +488,7 @@ mod tests {
         assert!(opener > 0);
         assert!(
             (opener as usize) < rendered.tokens.len(),
-            "the prompt continues past the opener — that tail is what the              next turn re-renders away"
+            "the prompt continues past the opener — that tail is what the next \n             turn re-renders away"
         );
         // What was promised: the first `opener` ids really are the head's own
         // ids, not a count someone hoped lined up.

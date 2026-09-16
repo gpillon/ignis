@@ -216,9 +216,10 @@ fn request_input(
         .unwrap_or_else(|| server.engine.model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
     // GitHub #186: a prompt carrying images never reuses retained state — a
-    // prefix's identity is token ids alone until #180's media-aware match key
-    // lands, so two prompts differing only in their images would share a
-    // checkpoint. The opener is therefore reported on the text-only path only.
+    // prefix's identity is token ids alone until the media-aware match key
+    // lands (#189 defines the key, #193 fills its media slot), so two prompts
+    // differing only in their images would share a checkpoint. The opener is
+    // therefore reported on the text-only path only.
     let text_only = multimodal.is_none();
     let input = RequestInput {
         multimodal: multimodal.map(Arc::new),

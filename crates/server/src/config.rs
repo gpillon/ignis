@@ -704,7 +704,7 @@ fn resolve_retained_pool_bytes(
     };
     if !prompt_reuse {
         return Err(ConfigError(format!(
-            "`--retained-pool-bytes {raw}` requires `--prompt-reuse on`              (nothing is retained without it)"
+            "`--retained-pool-bytes {raw}` requires `--prompt-reuse on` \n             (nothing is retained without it)"
         )));
     }
     parse_bytes("--retained-pool-bytes", &raw).map(Some)

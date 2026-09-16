@@ -266,11 +266,18 @@ impl Request {
     /// - **no shared prefix** (`prefix_entry` is `None`) — a prompt head
     ///   shorter than one page, or a head another request in the same batch
     ///   already took. There is nothing to hang the checkpoint's history on.
-    /// - **the opener's pages are not the shared ones** — the request claimed
-    ///   state at an *earlier* point and prefilled past it, so its own first
-    ///   page is not the opener's. That is a conversation's *second* turn
-    ///   wanting to leave its own checkpoint, and it is #187's lineage work
-    ///   (supersede C by C'), not this slice's: here the chain simply stops.
+    /// - **the opener's pages are not the shared ones** — the request is
+    ///   standing on a prefix that stops somewhere other than its own
+    ///   opener's page, so its own first page is not the opener's. Two real
+    ///   cases fall here, and both are deferred rather than half-done: a
+    ///   conversation's *second* turn, which resumed from an earlier
+    ///   checkpoint and prefilled past it (#187's lineage work — supersede C
+    ///   by C'), and every **concurrent sibling** that claimed another
+    ///   request's shared prefix and whose own opener lies further on (a
+    ///   subagent burst therefore leaves one checkpoint, the publisher's, not
+    ///   one per sibling). Until #187 the chain stops here, and what keeps
+    ///   that honest is that the *earlier* entry still matches: a third turn
+    ///   reuses the first turn's checkpoint rather than nothing.
     /// - **already captured** — one checkpoint per request.
     ///
     /// One function, so that the chunk decomposition (where to cut) and the
@@ -283,7 +290,18 @@ impl Request {
         let Some(opener) = self.input.opener_tokens else {
             return 0;
         };
-        if opener == 0 || opener as usize > self.input.tokens.len() {
+        // The opener must leave at least one prompt token after it, and not
+        // only because a checkpoint at the prompt's end would be useless to
+        // the next turn. It is what makes the acceptance criterion "the
+        // penalty-count row at the opener is zero" true *by construction*
+        // rather than by luck: only the chunk that **ends** the prompt is
+        // dealt the request's real sampling parameters (see
+        // `ConcreteScheduler::advance`), so an opener strictly inside the
+        // prompt guarantees the capturing chunk is an intermediate one,
+        // therefore greedy, therefore has sampled nothing and has left the
+        // count row alone. An opener at the very end would be captured from
+        // a chunk that had just sampled.
+        if opener == 0 || opener as usize >= self.input.tokens.len() {
             return 0;
         }
         if self.prefix_entry.is_none() || opener / page_tokens != self.shared_pages {
