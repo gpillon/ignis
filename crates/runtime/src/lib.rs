@@ -515,6 +515,14 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         self.model.leaf.release_media(self.model.handle(), media);
     }
 
+    /// Release `request`'s live media embedding, if it holds one.
+    fn release_media_of(&self, request: RequestId) {
+        let media = self.media.lock().unwrap().remove(&request);
+        if let Some(media) = media {
+            self.release_media_handle(media.handle);
+        }
+    }
+
     /// One chunk of a multimodal prompt (GitHub #178): encode the media item
     /// the chunk covers unless its embedding is already live, prefill the
     /// span at its three-axis positions with the item's columns, and release
@@ -1093,10 +1101,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     fn release(&self, request: RequestId) {
         // GitHub #178: a request completed or cancelled mid-item releases
         // the item's embedding with its sequence.
-        let media = self.media.lock().unwrap().remove(&request);
-        if let Some(media) = media {
-            self.release_media_handle(media.handle);
-        }
+        self.release_media_of(request);
         let sequence = self.sequences.lock().unwrap().remove(&request);
         if let Some(sequence) = sequence {
             self.release_sequence(sequence.handle);
@@ -1157,10 +1162,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // part-way gives its embedding back — the load reserves room for
         // one — and the chunk that continues it after restore encodes it
         // again.
-        let media = self.media.lock().unwrap().remove(&request);
-        if let Some(media) = media {
-            self.release_media_handle(media.handle);
-        }
+        self.release_media_of(request);
         self.evicted.lock().unwrap().insert(
             request,
             EvictedSequence {

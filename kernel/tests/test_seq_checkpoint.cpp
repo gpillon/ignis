@@ -327,7 +327,8 @@ void check_claim_reproduces_the_state_at_the_opener(int32_t kv_format) {
 
   expect(claimant->position == kOpener, "claim: the claimant stands at the opener");
   expect(claimant->pending_token == 4242, "claim: with the capture's pending token");
-  expect(claimant->rope_delta == -42, "claim: with the capture's rope delta (GitHub #194)");
+  expect(claimant->rope_delta == 0,
+         "claim: without the capturing sequence's rope delta (GitHub #194)");
   expect(claimant->shared_pages == 2, "claim: sharing the two whole pages below it");
   expect(mutable_image_of(*pool, claimant->slot) == state_at_opener,
          "claim: its mutable state is the capture's, byte for byte");

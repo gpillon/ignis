@@ -1166,11 +1166,9 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (rc != 0) {
     return rc;
   }
-  // Every span of a multimodal prompt carries its positions, so a span
-  // without them is a text prompt's: its sequence rotates at `position`. It
-  // may have been cloned from a multimodal publisher's head, whose delta the
-  // clone carried (GitHub #194).
-  seq->rope_delta = multimodal.positions != nullptr ? multimodal.rope_delta : 0;
+  if (multimodal.positions != nullptr) {
+    seq->rope_delta = multimodal.rope_delta;
+  }
   // P5-05 (GitHub #155): the rewrite checkpoint is the window as the latest
   // prefill span leaves it. The reference saves it during prefill, at its chat
   // template's rewrite boundary, and restores it when a later turn rewrites

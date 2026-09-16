@@ -221,8 +221,9 @@ struct ignis_seq {
   // GitHub #178: the rope delta a multimodal prompt left (its largest
   // position + 1 - its length). Every GQA rotation after the prompt is at
   // `position + rope_delta`; `position` stays the KV index and the sampler's
-  // key. 0 for a text sequence. A progress scalar (GitHub #194): snapshot,
-  // restore and clone carry it with the pending token.
+  // key. 0 for a text sequence. A progress scalar (GitHub #194): snapshot and
+  // restore carry it; a clone's capture records 0, since a claimant's delta
+  // comes from its own tail span.
   std::int32_t rope_delta = 0;
   // P5-03 (GitHub #152): the drafter window's own frontier -- one past the
   // last absolute position whose context K/V it holds (the ring keeps the

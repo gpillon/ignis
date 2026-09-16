@@ -795,10 +795,9 @@ impl ConcreteScheduler {
     /// A claim reaching the prompt's very end leaves nothing to prefill, and
     /// for a multimodal request the prefill is the only thing that hands the
     /// leaf its `rope_delta`: a claimant is cloned from a publisher's mutable
-    /// state and pages, or from a checkpoint's image, and what they carry is
-    /// the publisher's delta (GitHub #194) — its whole prompt's, not the
-    /// claimed head's (`step.cu` sets `seq->rope_delta` from the span options).
-    /// Without one tail token its decode rounds would rotate at that delta. A
+    /// state and pages, or from a checkpoint's image, and none of them carries
+    /// it (`step.cu` sets `seq->rope_delta` from the span options). Without one
+    /// tail token its every decode round would rotate at `position + 0`. A
     /// checkpoint is held to it too: its own capture leaves a tail, but a
     /// *claimant's* prompt can end exactly at another request's opener.
     fn reuse_keys(&self, i: usize) -> PromptKeys {

@@ -429,29 +429,20 @@ void check_refusals() {
   give_history(*pool, *target, 64, 0x22u);
 
   // A stale format version, resealed so the checksum agrees -- the version
-  // is refused on its own merits, not because the blob looks corrupt.
-  {
+  // is refused on its own merits, not because the blob looks corrupt, by a
+  // message naming both versions. Version 2 is the pre-rope-delta layout
+  // (GitHub #194): restored, it would put a multimodal sequence at delta 0.
+  for (const std::uint32_t version : {kIgnisSeqSnapshotFormatVersion + 1, std::uint32_t{2}}) {
     std::vector<unsigned char> stale = blob;
     ignis_seq_snapshot_header header = header_of(stale);
-    header.format_version += 1;
+    header.format_version            = version;
     reseal(stale, header);
     expect_refused(pool, target, stale, stale.size(), "refusals: a stale format version");
-  }
-
-  // GitHub #194: a blob written before the progress section carried the
-  // rope delta (version 2) would restore a multimodal sequence at wrong
-  // positions, so it is refused -- by a message naming both versions.
-  {
-    std::vector<unsigned char> pre_vision = blob;
-    ignis_seq_snapshot_header header      = header_of(pre_vision);
-    header.format_version                 = 2;
-    reseal(pre_vision, header);
-    expect_refused(pool, target, pre_vision, pre_vision.size(),
-                   "refusals: a pre-rope-delta (version 2) blob");
     const std::string message = ignis_seq_last_error();
-    expect(message.find("format version 2") != std::string::npos &&
-               message.find("accepts 3") != std::string::npos,
-           "refusals: a pre-rope-delta blob's refusal names both versions");
+    expect(message.find("format version " + std::to_string(version) + ",") != std::string::npos &&
+               message.find("accepts " + std::to_string(kIgnisSeqSnapshotFormatVersion)) !=
+                   std::string::npos,
+           "refusals: a stale format version's refusal names both versions");
   }
 
   // A buffer that is not a snapshot at all.

@@ -288,6 +288,12 @@ inline void ignis_seq_state_transfer(ignis_seq_pool &pool, unsigned char *image,
    * so they are the one section this function moves with an assignment. */
   if (capture) {
     progress = ignis_seq_progress_of(seq);
+    // GitHub #194: a clone carries no rope delta. The publisher's is its
+    // whole prompt's, not the head's, and a text request claiming a
+    // multimodal publisher's text-only head to its prompt's end runs no
+    // prefill span that could set its own. A multimodal claimant always
+    // prefills a tail (ADR 0029), and that span sets the delta.
+    progress.rope_delta = 0;
   } else {
     ignis_seq_apply_progress(seq, progress);
   }

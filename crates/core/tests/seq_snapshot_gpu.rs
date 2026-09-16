@@ -66,7 +66,7 @@ const GENERATED: usize = 6;
 fn decode_n(
     model: &Model,
     pool: &SeqPool,
-    sequence: &mut ignis_core::seq::Seq<'_>,
+    sequence: &mut Seq<'_>,
     count: usize,
     label: &str,
 ) -> Vec<i32> {
@@ -82,7 +82,7 @@ fn decode_n(
 
 /// A fresh sequence prefilled with `prompt` as a multimodal span rotated at
 /// `positions` and left holding `rope_delta`, and the first tokens it decodes.
-fn multimodal_head<'p>(
+fn prefill_multimodal_and_decode<'p>(
     model: &Model,
     pool: &'p SeqPool,
     prompt: &[i32],
@@ -336,16 +336,21 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         .map(|id| i32::try_from(id).expect("token id fits i32"))
         .collect();
     let positions: Vec<i32> = (0..3).flat_map(|_| 0..long_prompt.len() as i32).collect();
-    let rope_delta = FAR_DELTA;
 
-    let (mut multimodal, multimodal_head_tokens) =
-        multimodal_head(&model, &pool, &long_prompt, &positions, rope_delta, "multimodal source");
+    let (mut multimodal, _) = prefill_multimodal_and_decode(
+        &model,
+        &pool,
+        &long_prompt,
+        &positions,
+        FAR_DELTA,
+        "multimodal source",
+    );
     let multimodal_blob =
         multimodal.snapshot().unwrap_or_else(|e| panic!("multimodal snapshot: {e}"));
     let (progress, _) = snapshot_blob::section(&multimodal_blob, snapshot_blob::SECTION_PROGRESS);
     assert_eq!(
         snapshot_blob::read_i32(&multimodal_blob, progress + snapshot_blob::PROGRESS_ROPE_DELTA),
-        rope_delta,
+        FAR_DELTA,
         "the blob's progress section carries the sequence's rope delta"
     );
     let multimodal_control = decode_n(&model, &pool, &mut multimodal, MULTIMODAL_TAIL, "multimodal control");
@@ -372,13 +377,12 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
     // The comparison above proves the delta crossed only if the delta decides
     // what the sequence generates: the same prompt at delta 0 — what a
     // restore that lost it would decode — must not produce the same text.
-    let (mut unrotated, unrotated_head) =
-        multimodal_head(&model, &pool, &long_prompt, &positions, 0, "delta-0 twin");
+    let (mut unrotated, _) =
+        prefill_multimodal_and_decode(&model, &pool, &long_prompt, &positions, 0, "delta-0 twin");
     let unrotated_tail = decode_n(&model, &pool, &mut unrotated, MULTIMODAL_TAIL, "delta-0 twin tail");
     drop(unrotated);
     assert_ne!(
-        [multimodal_head_tokens, multimodal_control].concat(),
-        [unrotated_head, unrotated_tail].concat(),
+        multimodal_control, unrotated_tail,
         "the rope delta must change the decoded tokens, or this leg proves nothing about it"
     );
 }

@@ -143,7 +143,9 @@ struct ignis_seq_progress_image {
    * it once a prefill span's chunks have run and synchronized, beside the
    * frontier advance, and every span of a multimodal prompt assigns the
    * same prompt-wide value, so a sequence evicted between its chunks
-   * already holds the delta its later chunks would set. */
+   * already holds the delta its later chunks would set. A clone's capture
+   * zeroes it (`ignis_seq_state_transfer`): a claimant takes its delta from
+   * its own prefill span. */
   std::int32_t rope_delta;
   /* The drafter window's frontier (`ignis_seq::dflash2_position`); 0 on a
    * pool without the drafter. */
