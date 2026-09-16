@@ -1043,6 +1043,7 @@ dependencies = [
  "axum",
  "futures-core",
  "ignis-artifact",
+ "png",
  "reqwest",
  "serde",
  "serde_json",
