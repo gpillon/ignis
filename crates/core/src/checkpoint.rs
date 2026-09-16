@@ -187,9 +187,15 @@ impl TierList {
     /// taking over `best`, the best match so far and where it came from.
     ///
     /// The whole selection policy, in one place: longest reuse wins inside a
-    /// tier; a tier above wins a tie; a tier below has to beat the standing
-    /// best by its own restore floor. A `source` this list does not carry
-    /// never wins anything.
+    /// tier, and between two tiers the **lower** one has to beat the upper by
+    /// its own restore floor — whichever of the two the caller happens to be
+    /// holding. A tie therefore always goes upward, and a `source` this list
+    /// does not carry never wins anything.
+    ///
+    /// The two cross-tier branches below are the same rule read from each
+    /// end, and they have to stay each other's mirror: a caller that offered
+    /// its candidates in one order and a caller that offered them in the
+    /// other must choose the same match.
     pub fn replaces(
         &self,
         source: ReuseSource,
@@ -207,8 +213,13 @@ impl TierList {
         };
         match self.rank(best_source) {
             None => true,
-            Some(best_rank) if rank < best_rank => tokens >= best_tokens,
+            // The candidate is above the standing best: it takes the match
+            // unless the best below it clears *its* floor over the candidate.
+            Some(best_rank) if rank < best_rank => {
+                tokens.saturating_add(self.0[best_rank].restore_floor_tokens) > best_tokens
+            }
             Some(best_rank) if rank == best_rank => tokens > best_tokens,
+            // The candidate is below: it has to clear its own floor.
             Some(_) => tokens >= best_tokens.saturating_add(self.0[rank].restore_floor_tokens),
         }
     }
@@ -440,7 +451,14 @@ impl CheckpointPool {
         &self.tiers
     }
 
-    /// Device image bytes the retained entries occupy.
+    /// Image bytes the retained entries occupy.
+    ///
+    /// **One budget, the device's** — [`CheckpointPool::capacity_bytes`] is
+    /// `--retained-pool-bytes`, and every entry is charged to it whatever tier
+    /// it names. That is right while the device is the only tier that holds
+    /// anything, and it is the first thing #190 has to split: KV-RAM has its
+    /// own budget, and an entry that left the card must give its device bytes
+    /// back or the pool will refuse captures for room nothing is using.
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
     }
@@ -1276,17 +1294,32 @@ mod tests {
             "one token short of a chunk is not worth the crossing"
         );
         assert!(tiers.replaces(ReuseSource::KvRam, 5_024, device_best));
-        // The device never pays a floor, and wins a tie from below.
-        assert!(tiers.replaces(
-            ReuseSource::Device,
-            4_000,
-            Some((ReuseSource::KvRam, 4_000))
-        ));
-        assert!(!tiers.replaces(
-            ReuseSource::Device,
-            3_999,
-            Some((ReuseSource::KvRam, 4_000))
-        ));
+        // Read from the other end it is the same rule, and it has to be: a
+        // caller that found the KV-RAM match first must choose what a caller
+        // that found the device match first chooses. The device takes the tie,
+        // and keeps the match until KV-RAM's lead is worth the crossing.
+        for (device_tokens, device_wins) in
+            [(5_024, true), (4_001, true), (4_000, false), (3_000, false)]
+        {
+            assert_eq!(
+                tiers.replaces(
+                    ReuseSource::Device,
+                    device_tokens,
+                    Some((ReuseSource::KvRam, 5_024))
+                ),
+                device_wins,
+                "{device_tokens} on the device against 5024 in KV-RAM"
+            );
+            assert_eq!(
+                tiers.replaces(
+                    ReuseSource::KvRam,
+                    5_024,
+                    Some((ReuseSource::Device, device_tokens))
+                ),
+                !device_wins,
+                "the same comparison offered the other way round"
+            );
+        }
         // Inside one tier it is simply the longest reuse.
         assert!(tiers.replaces(ReuseSource::Device, 4_001, device_best));
         assert!(!tiers.replaces(ReuseSource::Device, 4_000, device_best));
