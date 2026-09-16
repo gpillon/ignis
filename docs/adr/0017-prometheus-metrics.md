@@ -19,6 +19,16 @@ is the scheduler's acceptance as the telemetry consumer observes it, the same
 anchor as the `ignis.request.ttft`/`done` log events: measuring from HTTP
 ingress would take a fact the consumer does not already receive. A request
 cancelled after its first token has a TTFT observation but no duration one.
+Amended 2026-09-16 (#188): `ignis_prefix_reused_tokens_total` widens from
+sibling-prefix reuse to **all** prefix reuse, sibling and retained together —
+the table row below says so. A **retained prefix** (ADR 0029) is claimed
+through the same path and reported by the same lifecycle fact, so the two
+cannot be told apart at this seam. The series' name, type and empty label set
+are unchanged, so no consumer breaks. #190 owns the per-tier hit / miss /
+spill / restore counters that separate them and the amendment declaring those.
+Prompt-checkpoint reuse is *not* folded in here: it stays a per-request field
+on the request log (#186), which is the distinction this row was kept narrow
+to preserve.
 
 ## Context
 
@@ -154,7 +164,7 @@ The initial stable metric contract is:
 | `ignis_build_info` | gauge | `version` | Constant build identity with value 1 |
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
-| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse |
+| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through prefix reuse, sibling and retained together (separated per tier by #190) |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |

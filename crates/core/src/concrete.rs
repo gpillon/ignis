@@ -2185,7 +2185,22 @@ impl Scheduler for ConcreteScheduler {
                                         && published <= block
                                     {
                                         let tick = self.tick;
-                                        self.prefix.retain_published(entry, tick);
+                                        let took = self.prefix.retain_published(entry, tick);
+                                        // `retain_published` refuses an entry
+                                        // that is gone or already retained,
+                                        // and `entry` is neither: `register`
+                                        // minted it a line ago, and a fresh
+                                        // id carries no retention. Asserted
+                                        // rather than dropped, because a
+                                        // silent `false` here is a prefix
+                                        // that quietly stopped outliving its
+                                        // publisher — which no test of a
+                                        // *later* request could tell from an
+                                        // ordinary miss.
+                                        debug_assert!(
+                                            took,
+                                            "a freshly registered prefix is always retainable"
+                                        );
                                     }
                                 }
                                 // The leaf published and this cache declined

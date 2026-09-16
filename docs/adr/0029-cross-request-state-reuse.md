@@ -135,8 +135,13 @@ Three reasons, in the order they decide it:
   other order gives up the wide bet and still returns no page.
 
 This is a policy the accepted Decision did not fix, recorded here rather than
-left in a comment. The owner may reverse it without disturbing anything else:
-it lives wholly in `ConcreteScheduler::reclaim_retained`, and
+left in a comment. The owner may reverse it, and reversing it means two places
+rather than one: the order of the two arms in
+`ConcreteScheduler::reclaim_retained`, and the order
+`ConcreteScheduler::reclaimable_prefixes` builds its union in — checkpoint-held
+prefixes first, then the bare retained ones. The third reason above rests on
+that union listing both kinds, so a reversal touching only the first would
+still terminate but would no longer be justified by it.
 `crates/core/tests/retained_prefix.rs`'s
 `the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
-that would change with it.
+that changes with it; it is written to fail when the order is flipped.
