@@ -46,6 +46,17 @@ fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
         },
         multimodal: None,
         opener_tokens: opener,
+        user_turn_tokens: None,
+    }
+}
+
+/// [`input`], with the **last real user query** reported at `user_turn` tokens
+/// in (GitHub #187): what tells one more iteration of a tool loop from a new
+/// turn of the conversation.
+fn turn(prompt: Vec<u32>, opener: u32, user_turn: u32, max: u32) -> RequestInput {
+    RequestInput {
+        user_turn_tokens: Some(user_turn),
+        ..input(prompt, Some(opener), max)
     }
 }
 
@@ -161,35 +172,50 @@ fn turn_n_plus_1_reuses_turn_n_prompt_checkpoint() {
 
 #[test]
 fn a_claim_does_not_consume_the_checkpoint() {
-    // Regenerate, retry and two forks from one history all hit (ADR 0029).
+    // Regenerate, retry and two forks from one history all hit (ADR 0029),
+    // one after another, long after the request that captured the entry
+    // finished. The entry is still there at the end of all of them: a claim
+    // copies, it never takes.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
-    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
 
-    let mut claimants = Vec::new();
     for tail in [500u32, 700, 900] {
-        claimants.push(
-            sched
-                .submit(
-                    input([tokens(1, 37), tokens(tail, 23)].concat(), Some(57), 4),
-                    RequestClass::Interactive,
-                )
-                .unwrap(),
-        );
+        let fork = sched
+            .submit(
+                input([tokens(1, 37), tokens(tail, 23)].concat(), Some(57), 4),
+                RequestClass::Interactive,
+            )
+            .unwrap();
         let events = run_to_idle(&mut sched);
         assert_eq!(
-            reuses(&events, *claimants.last().unwrap()),
+            reuses(&events, fork),
             vec![(ReuseSource::Device, 37, 1)],
             "fork from {tail} hits the same checkpoint"
         );
     }
+    assert_eq!(sched.checkpoint_pool().reused_tok(), 3 * 37);
+    assert!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .any(|e| e.publisher == n && e.tokens.len() == 37),
+        "the claimed entry survived every claimant"
+    );
+    // GitHub #187's one open consequence, recorded rather than hidden: each
+    // fork now captures a checkpoint of its own, and — having claimed the same
+    // entry — joins the same lineage, so the last fork's capture supersedes
+    // the one before it. The forks all *reuse* (the acceptance criterion), and
+    // the turn opener they share is kept whatever they do; what is not kept is
+    // three sibling futures of one history. Splitting the lineage on a fork
+    // needs a rule ADR 0029 does not yet have.
     assert_eq!(
         sched.checkpoint_pool().entry_count(),
-        1,
-        "the entry survived every claimant"
+        2,
+        "the turn opener, and the newest fork's own checkpoint"
     );
-    assert_eq!(sched.checkpoint_pool().reused_tok(), 3 * 37);
 }
 
 #[test]
@@ -406,32 +432,46 @@ fn a_prompt_shorter_than_one_page_captures_nothing() {
 }
 
 #[test]
-fn a_checkpoint_claimant_does_not_capture_its_own() {
-    // The slice boundary, pinned so it is a decision rather than a surprise:
-    // turn N+1 resumed at turn N's opener, so its *own* first KV page is not
-    // the one its own opener falls in, and the leaf could not capture there.
-    // Superseding turn N's checkpoint with turn N+1's is #187's lineage work;
-    // here the chain stops at turn 2.
+fn a_checkpoint_claimant_publishes_a_chained_head_and_captures_its_own() {
+    // GitHub #187 — the limitation #186 refused by name, removed. Turn N+1
+    // resumed at turn N's 37-token opener, so the whole pages below its *own*
+    // 57-token opener are partly turn N's prefix: there is no head of its own
+    // to publish. It publishes a **chained** one instead — the third page,
+    // which it warmed itself, over the two it claimed — and from there its
+    // opener falls inside a page it alone writes, which is exactly what the
+    // capture demands.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
     let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
+
+    let jobs: Vec<(usize, Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n1)
+        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
     assert_eq!(
-        sched.checkpoint_pool().entry_count(),
-        1,
-        "turn N+1 left no checkpoint of its own"
+        jobs,
+        vec![(11, Some(48), None), (9, None, Some(57)), (3, None, None)],
+        "cut at its own opener's page, published there, then cut at the opener"
     );
-    assert!(
-        compute
-            .prefill_calls()
+    assert_eq!(
+        sched
+            .checkpoint_pool()
+            .entries()
             .iter()
-            .flatten()
-            .filter(|j| j.request == n1)
-            .all(|j| j.capture_checkpoint_tokens.is_none()),
-        "and never asked the backend for one"
+            .map(|e| e.tokens.len())
+            .collect::<Vec<_>>(),
+        vec![37, 57],
+        "the turn opener, and turn N+1's own checkpoint beside it"
     );
+    // The chained entry is charged only for the page it warmed: the two under
+    // it are still turn N's prefix, counted once for every holder.
+    assert_eq!(sched.kv_used_pages(), 3, "three pages, not five");
 }
 
 #[test]
@@ -498,44 +538,174 @@ fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
 }
 
 #[test]
-fn turn_3_still_matches_turn_1_when_turn_2_left_no_checkpoint() {
-    // Deferring lineage to #187 is only honest if the fallback works. Turn 2
-    // resumed from turn 1's opener and prefilled past it, so it leaves no
-    // checkpoint of its own — and the same is true of every concurrent
-    // sibling in a subagent burst. What must not happen is the conversation
-    // falling off the cache: turn 3 still starts with turn 1's head, so it
-    // still reuses turn 1's entry. The saving degrades to "everything up to
-    // turn 1's opener" rather than vanishing.
+fn a_tool_loop_keeps_two_checkpoints_and_discards_the_superseded_one() {
+    // GitHub #187's acceptance criterion, end to end on the mock backend. An
+    // agent's tool loop re-sends its whole history every iteration; each one
+    // claims the last one's checkpoint and captures its own one turn further
+    // along. Nothing between them is a real user message, so each supersedes
+    // what it claimed — and a conversation that ran all day would still be
+    // holding exactly two entries: its turn opener and its latest.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
-    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    // The user's one message ends 5 tokens in; everything after it is the
+    // assistant calling tools and the tools answering.
+    let it1 = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
     run_to_idle(&mut sched);
-    let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    let it2 = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 23)].concat(), 57, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
     let events = run_to_idle(&mut sched);
-    assert_eq!(reuses(&events, n1), vec![(ReuseSource::Device, 37, 1)]);
+    assert_eq!(reuses(&events, it2), vec![(ReuseSource::Device, 37, 1)]);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 2, "opener + latest");
+
+    let it3 = sched
+        .submit(
+            turn(
+                [tokens(1, 37), tokens(500, 20), tokens(700, 23)].concat(),
+                77,
+                5,
+                4,
+            ),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
     assert_eq!(
-        sched.checkpoint_pool().entry_count(),
-        1,
-        "turn 2 left none of its own"
+        reuses(&events, it3),
+        vec![(ReuseSource::Device, 57, 1)],
+        "iteration 3 resumes from iteration 2's checkpoint, not iteration 1's"
+    );
+    assert_eq!(
+        chunk_widths(&compute, it3).iter().sum::<usize>(),
+        80 - 57,
+        "so it prefills only the tool result and the new opener"
     );
 
-    // Turn 3: turn 2's prompt, plus turn 2's answer and a third question.
-    let turn_3 = input(
-        [tokens(1, 37), tokens(500, 23), tokens(900, 20)].concat(),
-        Some(77),
-        4,
+    let kept: Vec<(usize, bool)> = sched
+        .checkpoint_pool()
+        .entries()
+        .iter()
+        .map(|e| (e.tokens.len(), e.turn_opening))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(37, true), (77, false)],
+        "still two: the turn opener and the latest"
     );
-    let n2 = sched.submit(turn_3, RequestClass::Interactive).unwrap();
+    // "Discarded immediately", not "eventually": the byte budget was nowhere
+    // near full, so nothing but the lineage rule could have released it.
+    assert_eq!(
+        compute.released_checkpoints(),
+        vec![it2],
+        "iteration 2's image went the moment iteration 3 took one"
+    );
+    let _ = it1;
+}
+
+#[test]
+fn a_new_user_message_reuses_the_turn_opener_and_retires_the_turn() {
+    // The other half of the pair, and why it is kept: once the human speaks
+    // again the history renders differently (the tool loop's reasoning is
+    // dropped), so the *latest* checkpoint stops matching and the
+    // turn-opening one is the only thing left that does. What the new turn
+    // captures then opens a turn of its own, and the whole previous turn —
+    // its opener and its latest alike — is retired in one go.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let it1 = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    let it2 = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 23)].concat(), 57, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 2);
+
+    // The user types again. Its history diverges from iteration 2's the
+    // moment the assistant's re-rendered reply starts, so only the 37-token
+    // turn opener is still a prefix of it.
+    let next = sched
+        .submit(
+            turn([tokens(1, 37), tokens(1500, 30)].concat(), 57, 40, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
     let events = run_to_idle(&mut sched);
     assert_eq!(
-        reuses(&events, n2),
+        reuses(&events, next),
         vec![(ReuseSource::Device, 37, 1)],
-        "turn 3 still resumes from turn 1's checkpoint"
+        "the turn-opening checkpoint is what a new user message matches"
+    );
+    let kept: Vec<(usize, bool)> = sched
+        .checkpoint_pool()
+        .entries()
+        .iter()
+        .map(|e| (e.tokens.len(), e.turn_opening))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(57, true)],
+        "the new turn opens alone; the previous turn's pair is gone"
+    );
+    let mut released = compute.released_checkpoints();
+    released.sort_unstable();
+    assert_eq!(released, vec![it1, it2], "both of the old turn's images went");
+    let _ = next;
+}
+
+#[test]
+fn an_opener_inside_the_shared_page_captures_without_a_chained_publish() {
+    // The other regime, and the reason the lineage rule cannot assume the
+    // chained publish happens. While a conversation is still short its next
+    // opener floors to the *same* page as the entry it claimed, so there is
+    // no page to publish and #186's capture path already worked. The lineage
+    // has to come out the same either way.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Opener 40: page 2, exactly the two pages turn N's prefix already holds.
+    let short = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 8)].concat(), 40, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs: Vec<(Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == short)
+        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(None, Some(40)), (None, None)],
+        "nothing to publish — the pages below its opener are already shared"
     );
     assert_eq!(
-        chunk_widths(&compute, n2).iter().sum::<usize>(),
-        80 - 37,
-        "so it prefills only what that entry does not cover"
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .map(|e| (e.tokens.len(), e.turn_opening))
+            .collect::<Vec<_>>(),
+        vec![(37, true), (40, false)],
+        "and the pair is the same pair"
     );
 }
 

@@ -119,7 +119,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::checkpoint::{CheckpointEntry, CheckpointPool, ReuseSource};
+use crate::checkpoint::{CheckpointCapture, CheckpointEntry, CheckpointPool, ReuseSource};
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
     ResidentCandidate, RetainedLaneCandidate, admission_resources_fit,
@@ -564,7 +564,7 @@ impl ConcreteScheduler {
     /// after this point keeps its checkpoint without a single extra rule
     /// (spec §Cancellation).
     fn retain_checkpoint(&mut self, idx: usize, at: u32) {
-        let (publisher, prefix, tokens, gdn) = {
+        let (publisher, prefix, tokens, gdn, claimed, turn_opening) = {
             let r = &self.requests[idx];
             let Some(prefix) = r.prefix_entry else {
                 // The leaf published a prefix and captured against it, and
@@ -580,18 +580,35 @@ impl ConcreteScheduler {
                 prefix,
                 r.input.tokens[..at as usize].to_vec(),
                 r.gdn.clone(),
+                r.checkpoint_entry,
+                r.opens_a_turn(),
             )
         };
-        let pages = self.prefix.pages_of(prefix);
+        let pages = self.prefix.total_pages_of(prefix);
         let bytes = self.compute.checkpoint_image_bytes();
         let tick = self.tick;
-        match self
-            .checkpoints
-            .retain(publisher, tokens, prefix, pages, bytes, gdn, tick)
-        {
-            Some(_) => {
+        match self.checkpoints.retain(CheckpointCapture {
+            publisher,
+            tokens,
+            prefix,
+            pages,
+            bytes,
+            gdn,
+            use_tick: tick,
+            claimed,
+            turn_opening,
+        }) {
+            Some(retained) => {
                 self.requests[idx].checkpoint_captured = true;
                 self.prefix.retain(prefix);
+                // GitHub #187 — the conversation's superseded checkpoints,
+                // released here and now rather than left to the LRU. Their
+                // images and their holds on the pages below them are this
+                // scheduler's to give back: the pool moved the ledger, and
+                // nothing else in the engine knows the device still has them.
+                for entry in retained.superseded {
+                    self.discard_checkpoint(entry);
+                }
             }
             // The budget went while this batch was in flight — two requests
             // in one call both cleared it before either had retained. The
@@ -639,15 +656,17 @@ impl ConcreteScheduler {
         let Some(entry) = entry else {
             return;
         };
-        let Some((freed, publisher)) = self.prefix.release(entry) else {
-            return;
-        };
-        self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
-        // P4-10 (GitHub #126): the entry is gone from this cache, so the
-        // backend's own handle on the leaf's prefix goes too. The leaf's
-        // pages come back when its last *sequence* holder is released, which
-        // is why this is a handle drop and not a free.
-        self.compute.release_prefix(publisher);
+        // GitHub #187: a chained entry holds its parent's reference, so one
+        // release can drop a whole run of the chain — every link that drops
+        // returns its own pages and its own backend handle.
+        for (freed, publisher) in self.prefix.release(entry) {
+            self.kv_used_pages = self.kv_used_pages.saturating_sub(freed);
+            // P4-10 (GitHub #126): the entry is gone from this cache, so the
+            // backend's own handle on the leaf's prefix goes too. The leaf's
+            // pages come back when its last *sequence* holder is released,
+            // which is why this is a handle drop and not a free.
+            self.compute.release_prefix(publisher);
+        }
     }
 
     /// The last hard compute error the most recent advance reported, if
@@ -1746,6 +1765,10 @@ impl Scheduler for ConcreteScheduler {
                         let r = &mut self.requests[i];
                         r.prefix_entry = Some(m.prefix);
                         r.checkpoint_publisher = Some(m.publisher);
+                        // GitHub #187 — the claim edge, kept so this request's
+                        // own capture knows which conversation it continues
+                        // and which entry it is entitled to supersede.
+                        r.checkpoint_entry = Some(m.id);
                         r.checkpoint_tokens = m.tokens;
                         r.reuse_source = Some(m.source);
                         r.shared_pages = m.pages;
@@ -1845,7 +1868,7 @@ impl Scheduler for ConcreteScheduler {
         let publish_points: Vec<u32> = {
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
-                let at = self.requests[i].publish_point();
+                let at = self.requests[i].publish_point(self.config.kv_page_tokens);
                 let head = &self.requests[i].input.tokens[..at as usize];
                 let taken = batch[..n].iter().enumerate().any(|(m, &j)| {
                     points[m] == at && self.requests[j].input.tokens[..at as usize] == *head
@@ -1880,9 +1903,13 @@ impl Scheduler for ConcreteScheduler {
                         // call.
                         0 => {
                             let publish_at = publish_points[n];
+                            // GitHub #187: a *claimant* publishing a chained
+                            // head lands here too, so this no longer asks the
+                            // request to hold no prefix. `publish_at` already
+                            // answers that question — `Request::publish_point`
+                            // returns 0 for a request not publishing at all.
                             let rides_the_publish = publish_at > 0
                                 && r.input.opener_tokens == Some(publish_at)
-                                && r.prefix_entry.is_none()
                                 && !r.checkpoint_captured
                                 && r.may_share_prefix();
                             if rides_the_publish { publish_at } else { 0 }
@@ -2071,22 +2098,44 @@ impl Scheduler for ConcreteScheduler {
                             // actually holds, and a claimant would skip
                             // prefill for tokens nothing warmed.
                             let head = &self.requests[i].input.tokens[..published as usize];
-                            let registered =
-                                self.prefix
-                                    .register(publisher, head, &self.requests[i].gdn);
+                            // GitHub #187: a request that resumed from
+                            // retained state publishes a **chained** entry —
+                            // the pages it warmed past what it claimed, over
+                            // the claim it was already holding. Its own
+                            // reference on the parent becomes the child's, so
+                            // `prefix_entry` moves rather than doubling up.
+                            let parent = self.requests[i].prefix_entry;
+                            let registered = self.prefix.register(
+                                publisher,
+                                head,
+                                &self.requests[i].gdn,
+                                parent,
+                            );
                             match registered {
                                 Some((entry, pages)) => {
                                     let r = &mut self.requests[i];
                                     r.prefix_entry = Some(entry);
                                     r.prefix_publisher = Some(publisher);
                                     // GitHub #186: from here the publisher's
-                                    // own first KV page is page `pages`, so
-                                    // its generation opener — which the
-                                    // publish point was floored to — falls
-                                    // inside a page it alone writes. That is
-                                    // what makes a checkpoint capturable at
-                                    // all (`Request::checkpoint_point`).
-                                    r.shared_pages = pages;
+                                    // own first KV page is the one past the
+                                    // whole head, so its generation opener —
+                                    // which the publish point was floored to
+                                    // — falls inside a page it alone writes.
+                                    // That is what makes a checkpoint
+                                    // capturable at all
+                                    // (`Request::checkpoint_point`), and
+                                    // GitHub #187 is exactly this line
+                                    // reaching a claimant: `pages` counts the
+                                    // chain, `shared_pages` grows past what
+                                    // the request resumed from, and the
+                                    // capture that was refused becomes legal.
+                                    //
+                                    // `pages` is the entry's *own* pages,
+                                    // which is exactly the charge split this
+                                    // publish moves: whatever the request was
+                                    // already standing on it had already
+                                    // handed over when it claimed it.
+                                    r.shared_pages += pages;
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
                                 }

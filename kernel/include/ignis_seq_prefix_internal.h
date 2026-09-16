@@ -42,18 +42,38 @@
 
 /* A published prefix: the shared pages, the cloned state, and who holds it.
  *
- * Lifetime is one refcount over two kinds of holder. The handle
+ * Lifetime is one refcount over three kinds of holder. The handle
  * ignis_seq_prefix_publish returns is one (released by
- * ignis_seq_prefix_release), and every sequence allocated against the prefix
- * is one more (released by ignis_seq_release). The entry -- and with it the
- * KV pages -- is destroyed when the count reaches zero, which is the leaf's
- * answer to "a page is freed only when the last holder releases it". */
+ * ignis_seq_prefix_release), every sequence allocated against the prefix is
+ * one more (released by ignis_seq_release), and since GitHub #187 a *chained*
+ * prefix published on top of this one is one more again. The entry -- and
+ * with it the KV pages -- is destroyed when the count reaches zero, which is
+ * the leaf's answer to "a page is freed only when the last holder releases
+ * it". Destroying a chained entry drops one reference from its parent, so a
+ * whole run of the chain can go at once. */
 struct ignis_seq_prefix {
-  /* The shared KV pages. Owned here and nowhere else: a claiming sequence's
-   * own `ignis_seq::kv` covers only the tail it writes itself, and this
-   * allocation is never bound to a block-table row -- rows are per sequence,
-   * pages are not. */
+  /* The shared KV pages this entry itself owns. Owned here and nowhere else:
+   * a claiming sequence's own `ignis_seq::kv` covers only the tail it writes
+   * itself, and this allocation is never bound to a block-table row -- rows
+   * are per sequence, pages are not.
+   *
+   * GitHub #187: its OWN pages, not its whole history's. A chained entry
+   * covers `parent`'s pages too, and those stay the parent's allocation --
+   * charged to the pool once and freed once, whichever link of the chain a
+   * sequence happens to hold. */
   ninfer::PagedKVAllocation kv;
+  /* The prefix this one extends (GitHub #187), or null for one that owns
+   * every page of the head it covers.
+   *
+   * A sequence that resumed from retained state and prefilled past it has no
+   * head of its own to publish: the pages below its generation opener are
+   * partly the entry it claimed. It publishes a chained entry instead -- its
+   * own new pages, plus the reference on the parent that the sequence held
+   * until the publish, which *moves* here rather than being taken afresh. So
+   * the chain is held by exactly one reference per link, and every iteration
+   * of an agent's tool loop can leave a prompt checkpoint instead of only the
+   * first (ADR 0029). */
+  ignis_seq_prefix *parent = nullptr;
   /* The device-resident image of every device-resident CLONE section, laid
    * out by `ignis_seq_prefix_clone_layout`. One copy per prefix, not per
    * claimant. */
@@ -62,17 +82,33 @@ struct ignis_seq_prefix {
    * rather than in the device image above (the snapshot path writes them
    * with a plain memcpy for the same reason). */
   ignis_seq_progress_image progress{};
-  /* Tokens of history the prefix covers -- always `pages *
-   * kPagedKVPageSize`, which is what makes a claimant's first write land on
-   * a page it owns. */
+  /* Tokens of history the prefix covers, its chain included -- always
+   * `ignis_seq_prefix_total_pages * kPagedKVPageSize`, which is what makes a
+   * claimant's first write land on a page it owns. */
   std::uint32_t tokens = 0;
-  /* Live holders (the publisher's handle plus every claiming sequence). */
+  /* Live holders: the publisher's handle, every claiming sequence, and a
+   * chained child (GitHub #187). */
   std::uint32_t refcount = 0;
   /* What the clone actually cost, rather than what it was assumed to cost
    * (ADR 0024). Reported through ignis_seq_prefix_stats. */
   std::uint64_t clone_count      = 0;
   double last_clone_micros       = 0.0;
 };
+
+/* The KV pages the head `prefix` covers: its own and every ancestor's
+ * (GitHub #187).
+ *
+ * This is what a claimant shares and what `ignis_seq::shared_pages` counts —
+ * "how much history is warm", which the chain answers together. Who gives
+ * which page back is a different question, answered by each link's own
+ * `kv.mapped_page_count()`. */
+inline std::uint32_t ignis_seq_prefix_total_pages(const ignis_seq_prefix &prefix) {
+  std::uint32_t pages = 0;
+  for (const ignis_seq_prefix *at = &prefix; at != nullptr; at = at->parent) {
+    pages += at->kv.mapped_page_count();
+  }
+  return pages;
+}
 
 /* The device image's layout: the CLONE sections of `pool`'s state-section
  * table, in table order, each aligned to `kIgnisSeqSectionAlign`, with

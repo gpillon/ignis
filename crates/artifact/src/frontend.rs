@@ -477,6 +477,48 @@ impl ChatTemplate {
             .map(|at| at + Self::GENERATION_OPENER.len())
     }
 
+    /// The marker a user message opens with. A tool result wears the same
+    /// one — the template renders tool-role messages as user messages whose
+    /// content is a `<tool_response>` block — which is why
+    /// [`Self::last_user_query_offset`] cannot simply look for it.
+    pub const USER_QUERY_OPENER: &'static str = "<|im_start|>user\n";
+
+    /// What a tool result's content starts with, and the only thing that
+    /// tells it from the human speaking.
+    pub const TOOL_RESPONSE_OPENER: &'static str = "<tool_response>";
+
+    /// The byte offset where `rendered`'s **last real user query** begins —
+    /// the last `<|im_start|>user\n` that is not a tool result — or `None` for
+    /// a prompt with none (GitHub #187, ADR 0029).
+    ///
+    /// This is the template's own `last_query_index` scan, asked from outside
+    /// the template. The template uses it to decide whose reasoning survives
+    /// into the prompt; cross-request reuse uses it to decide whether a
+    /// request is a new **turn** of its conversation or one more iteration of
+    /// a tool loop — and the two must agree, because it is exactly the
+    /// reasoning the template drops here that stops the turn's later
+    /// checkpoints matching once the human speaks again.
+    ///
+    /// The offset is where the message *begins*, not where it ends: the
+    /// question asked of it is "does a real user message lie past the
+    /// checkpoint this request resumed from", and a message that *starts*
+    /// past that point is one the earlier turn had never seen.
+    ///
+    /// A byte offset rather than a token count, for the reason
+    /// [`Self::generation_opener_offset`] is one: turning it into a token
+    /// count means tokenizing the head and checking that it really is a token
+    /// prefix, which is the tokenizer's job and not this function's.
+    pub fn last_user_query_offset(rendered: &str) -> Option<usize> {
+        rendered
+            .match_indices(Self::USER_QUERY_OPENER)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                !rendered[at + Self::USER_QUERY_OPENER.len()..]
+                    .starts_with(Self::TOOL_RESPONSE_OPENER)
+            })
+            .last()
+    }
+
     /// Render an OpenAI-style conversation through the template.
     ///
     /// `add_generation_prompt` is set to `true` (the standard completion

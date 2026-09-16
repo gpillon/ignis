@@ -227,6 +227,9 @@ fn request_input(
         tokens: rendered.tokens,
         params,
         opener_tokens: rendered.opener_tokens.filter(|_| text_only),
+        // GitHub #187: the turn boundary rides along, filtered for the same
+        // reason — a prompt that takes no checkpoint has no lineage to place.
+        user_turn_tokens: rendered.user_turn_tokens.filter(|_| text_only),
     };
     (input, model, prompt_tokens)
 }

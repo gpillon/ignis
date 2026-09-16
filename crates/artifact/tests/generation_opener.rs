@@ -135,6 +135,91 @@ fn a_prompt_with_no_assistant_marker_has_no_opener() {
 }
 
 #[test]
+fn the_last_user_query_is_the_last_user_message_that_is_not_a_tool_result() {
+    // GitHub #187: what tells a tool-loop iteration from a new turn. The
+    // template makes exactly this distinction itself (its `last_query_index`
+    // scan skips a user message whose content is a `<tool_response>` block),
+    // and a boundary that disagreed with the template would call every tool
+    // result a new turn — retiring the turn-opening checkpoint the human's
+    // next message is the only thing that still matches.
+    let rendered = "<|im_start|>system\ntools<|im_end|>\n\
+                    <|im_start|>user\nread a.rs<|im_end|>\n\
+                    <|im_start|>assistant\ncalling<|im_end|>\n\
+                    <|im_start|>user\n<tool_response>\nfn main() {}\n</tool_response><|im_end|>\n\
+                    <|im_start|>assistant\n";
+    let at = ChatTemplate::last_user_query_offset(rendered).expect("a real user query");
+    assert!(
+        rendered[at..].starts_with("<|im_start|>user\nread a.rs"),
+        "the tool result was taken for the query"
+    );
+    // And a *second* human message moves it past the tool result.
+    let next_turn = format!("{rendered}answer<|im_end|>\n<|im_start|>user\nand b.rs?<|im_end|>\n<|im_start|>assistant\n");
+    let then = ChatTemplate::last_user_query_offset(&next_turn).expect("a real user query");
+    assert!(then > at, "the new user message is the last query now");
+    assert!(next_turn[then..].starts_with("<|im_start|>user\nand b.rs?"));
+}
+
+#[test]
+fn a_prompt_with_no_user_message_has_no_last_user_query() {
+    assert_eq!(ChatTemplate::last_user_query_offset("plain text"), None);
+    assert_eq!(ChatTemplate::last_user_query_offset(""), None);
+    assert_eq!(
+        ChatTemplate::last_user_query_offset(
+            "<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n"
+        ),
+        None,
+        "tool results alone are nobody speaking"
+    );
+}
+
+#[test]
+fn a_tool_loop_iteration_does_not_move_the_last_user_query_but_a_new_turn_does() {
+    let Some(frontend) = frontend_or_skip() else {
+        return;
+    };
+    // The lineage decision, on real renders: iteration 2's last real user
+    // query still sits *before* iteration 1's generation opener, so iteration
+    // 2's checkpoint supersedes iteration 1's. The turn after it sits past
+    // that opener, so its checkpoint opens a turn and keeps the pair.
+    let iteration_1 = [user("What is in a.rs?")];
+    let iteration_2 = [
+        user("What is in a.rs?"),
+        assistant("fn main is in it."),
+        ChatMessage {
+            role: Role::Tool,
+            content: MessageContent::Text("fn main() {}".to_owned()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        },
+    ];
+    let next_turn = [
+        user("What is in a.rs?"),
+        assistant("fn main is in it."),
+        user("And b.rs?"),
+    ];
+
+    let query_tokens = |messages: &[ChatMessage]| {
+        let prompt = render(&frontend, messages, true);
+        let at = ChatTemplate::last_user_query_offset(&prompt).expect("a real user query");
+        frontend.tokenizer().encode(&prompt[..at]).expect("encode").len()
+    };
+    let opener_1 = {
+        let prompt = render(&frontend, &iteration_1, true);
+        let (_, head) = tokens_and_head(&frontend, &prompt);
+        head.len()
+    };
+
+    assert!(
+        query_tokens(&iteration_2) < opener_1,
+        "a tool result is not the human speaking, so iteration 2 continues the turn"
+    );
+    assert!(
+        query_tokens(&next_turn) >= opener_1,
+        "a new user message lies past iteration 1's opener, so it opens a turn"
+    );
+}
+
+#[test]
 fn turn_n_head_is_a_token_prefix_of_turn_n_plus_1_in_a_plain_chat() {
     let Some(frontend) = frontend_or_skip() else {
         return;

@@ -14,6 +14,7 @@ fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
     RequestInput {
         multimodal: None,
         opener_tokens: None,
+        user_turn_tokens: None,
         model: model.into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
@@ -90,6 +91,7 @@ fn token_stream_is_deterministic_and_seed_sensitive() {
                 RequestInput {
                     multimodal: None,
                     opener_tokens: None,
+                    user_turn_tokens: None,
                     model: "qwen3.8-27b".into(),
                     tokens: vec![1, 2],
                     params,
@@ -132,6 +134,7 @@ fn token_stream_depends_on_the_request_seed() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: mk(7),
@@ -144,6 +147,7 @@ fn token_stream_depends_on_the_request_seed() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: mk(8),

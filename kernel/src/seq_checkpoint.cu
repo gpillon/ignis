@@ -25,9 +25,12 @@
 //   * a capture demands the whole pages below the opener already *be* the
 //     sequence's shared prefix. That is what puts the opener inside a page
 //     the sequence alone writes -- the page this copies. A sequence that
-//     resumed from an earlier point and prefilled past it fails here, which
-//     is a conversation's second turn wanting its own checkpoint: #187's
-//     lineage work, refused by name until then rather than half-done.
+//     resumed from an earlier point and prefilled past it satisfies this by
+//     publishing a **chained** prefix at its own opener's page floor first
+//     (GitHub #187, ignis_seq_prefix_publish): the pages it warmed itself,
+//     over the ones it claimed. That is how a conversation's second turn --
+//     and every later iteration of an agent's tool loop -- leaves a
+//     checkpoint of its own, without this file learning to own pages.
 //   * a capture changes nothing about the sequence, including on failure. It
 //     is a bet the caller may lose, and a lost bet must cost nothing.
 
@@ -134,7 +137,8 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
         "-token opener covers " + std::to_string(below) + " whole pages, but sequence slot " +
         std::to_string(seq->slot) + " shares " + std::to_string(seq->shared_pages) +
         "; the opener must fall inside the sequence's own first page (a sequence that resumed "
-        "from an earlier checkpoint and prefilled past it does not qualify -- GitHub #187)");
+        "from an earlier checkpoint and prefilled past it publishes a chained prefix at the "
+        "opener's page floor first -- ignis_seq_prefix_publish, GitHub #187)");
     return -1;
   }
   if (seq->kv.mapped_page_count() == 0) {
@@ -252,8 +256,11 @@ extern "C" int32_t ignis_seq_checkpoint_stats(const struct ignis_seq_checkpoint 
     return -1;
   }
   out_stats->tokens = checkpoint->tokens;
-  out_stats->pages =
-      checkpoint->prefix == nullptr ? 0 : checkpoint->prefix->kv.mapped_page_count();
+  // The whole head below the opener, the prefix's chain included (GitHub
+  // #187): what a claimant shares, which is what this number is read as.
+  out_stats->pages = checkpoint->prefix == nullptr
+                         ? 0
+                         : ignis_seq_prefix_total_pages(*checkpoint->prefix);
   out_stats->image_bytes =
       static_cast<std::uint64_t>(checkpoint->image.bytes) + checkpoint->tail_page.bytes;
   out_stats->claim_count       = checkpoint->claim_count;

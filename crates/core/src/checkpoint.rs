@@ -36,8 +36,15 @@
 //!   session id could hand one conversation another's state, a content match
 //!   can only hand over identical history (ADR 0029).
 //!
-//! **What later slices change here.** #187 (lineage) adds the
-//! latest/turn-opening pair and supersession; #188 (retained prefix) adds a
+//! - **A conversation keeps at most two.** #187 added the third rule: every
+//!   capture joins the lineage of the entry its request claimed
+//!   ([`CheckpointCapture::claimed`]), and that lineage is immediately cut
+//!   back to its latest entry and its newest **turn-opening** one. A tool
+//!   loop therefore costs one pair, not one entry per iteration, and the
+//!   turn-opening entry is what a *new* user message still matches after
+//!   history drops the earlier thinking.
+//!
+//! **What later slices change here.** #188 (retained prefix) adds a
 //! second kind of retained entry, matched against the same prompt; #190
 //! (KV-RAM) makes [`CheckpointPool::discard_victim`] a *spill* rather than a
 //! discard, and gives the match a second tier to choose between — which is
@@ -53,6 +60,18 @@ use crate::types::{RequestId, TokenId};
 
 /// An opaque handle to a retained prompt checkpoint.
 pub type CheckpointId = u64;
+
+/// An opaque handle to a **lineage** (GitHub #187): the chain of prompt
+/// checkpoints one conversation left behind.
+///
+/// A conversation has no name. The clients send no session id, and ADR 0029
+/// refuses to invent one — so what ties turn N+1's checkpoint to turn N's is
+/// the only link that actually exists: turn N+1 *claimed* turn N's entry.
+/// Every capture inherits the lineage of the entry its request resumed from,
+/// and a capture that resumed from nothing starts one. That is the whole of
+/// "per conversation" here: a conversation is a claim chain, and the pool
+/// bounds each chain rather than the pool as a whole.
+pub type LineageId = u64;
 
 /// Where a request's reused state came from — the `reuse_source` field of the
 /// request log (spec §12).
@@ -118,9 +137,75 @@ pub struct CheckpointEntry {
     /// The GDN state at the opener (core-02: a claimant resumes its recurrent
     /// state from a recorded boundary).
     pub gdn: GdnState,
+    /// The conversation this entry belongs to (GitHub #187): inherited from
+    /// the entry the capturing request claimed, fresh when it claimed none.
+    pub lineage: LineageId,
+    /// Whether this entry is a **turn-opening checkpoint**: the first one
+    /// captured after its conversation's last real user message (GitHub #187,
+    /// ADR 0029).
+    ///
+    /// It is the only one a *new* user message can still match. Once history
+    /// drops the earlier thinking, every checkpoint taken further along in the
+    /// turn covers tokens the next render no longer produces — so the pool
+    /// keeps this one whatever else it supersedes, and the pair it keeps is
+    /// "the latest, for the tool loop; the turn opener, for the human".
+    pub turn_opening: bool,
     /// The scheduling tick this entry was last captured or claimed at — the
     /// LRU order [`CheckpointPool::discard_victim`] discards in.
     pub use_tick: u64,
+}
+
+/// Everything a capture records about the checkpoint it is retaining — the
+/// argument of [`CheckpointPool::retain`].
+///
+/// A struct rather than nine positional arguments because two of the nine
+/// ([`Self::claimed`] and [`Self::turn_opening`]) are *policy* rather than
+/// description, and a call site that spells them by name cannot silently swap
+/// them for the two `bool`-ish neighbours they sit next to.
+#[derive(Debug, Clone)]
+pub struct CheckpointCapture {
+    /// The request whose prefill captured the image (the backend's handle).
+    pub publisher: RequestId,
+    /// The prompt tokens up to and including the generation opener.
+    pub tokens: Vec<TokenId>,
+    /// The shared-prefix entry whose pages carry the history below the opener.
+    pub prefix: PrefixId,
+    /// Whole KV pages that shared prefix holds.
+    pub pages: u32,
+    /// Device bytes the image occupies in the retained pool.
+    pub bytes: u64,
+    /// The GDN state at the opener.
+    pub gdn: GdnState,
+    /// The scheduling tick of the capture.
+    pub use_tick: u64,
+    /// The retained entry the capturing request resumed from, or `None` when
+    /// it resumed from nothing. This is what names the conversation: the new
+    /// entry joins that entry's lineage, or opens one of its own.
+    pub claimed: Option<CheckpointId>,
+    /// Whether this capture opens a new turn — whether a real user message
+    /// lies between [`Self::claimed`]'s opener and this one's. `true` for a
+    /// capture that claimed nothing (a conversation's first checkpoint is its
+    /// first turn's), and `false` when the frontend could not say, because a
+    /// wrong `true` retires a lineage's turn opener and sends the next user
+    /// message cold.
+    pub turn_opening: bool,
+}
+
+/// What [`CheckpointPool::retain`] did: the new entry, and the entries of its
+/// lineage that giving it a place superseded.
+///
+/// The superseded entries are **returned rather than dropped** because the
+/// pool owns no device memory: their images and their holds on the shared
+/// pages below them are the caller's to release, exactly as
+/// [`CheckpointPool::discard_victim`]'s are. A `retain` whose result is
+/// ignored leaks a device image per tool-call iteration.
+#[derive(Debug)]
+#[must_use = "the superseded entries still hold a device image and a shared prefix"]
+pub struct Retained {
+    /// The new entry's id.
+    pub id: CheckpointId,
+    /// Entries of the same lineage this capture displaced, oldest first.
+    pub superseded: Vec<CheckpointEntry>,
 }
 
 /// A successful match: what the claimant needs to be allocated against the
@@ -164,6 +249,7 @@ pub struct CheckpointPool {
     used_bytes: u64,
     entries: Vec<CheckpointEntry>,
     next_id: CheckpointId,
+    next_lineage: LineageId,
     reused_tok: u64,
     captures: u64,
     skipped_captures: u64,
@@ -180,6 +266,7 @@ impl CheckpointPool {
             used_bytes: 0,
             entries: Vec::new(),
             next_id: 0,
+            next_lineage: 0,
             reused_tok: 0,
             captures: 0,
             skipped_captures: 0,
@@ -200,6 +287,11 @@ impl CheckpointPool {
     /// Retained entries.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The retained entries, in capture order.
+    pub fn entries(&self) -> &[CheckpointEntry] {
+        &self.entries
     }
 
     /// The KV pages the retained entries hold through their shared prefixes.
@@ -263,42 +355,97 @@ impl CheckpointPool {
         bytes > 0 && self.used_bytes.saturating_add(bytes) <= self.capacity_bytes
     }
 
-    /// Retain a checkpoint captured at `tokens`' end (the generation opener).
+    /// Retain a checkpoint captured at `capture.tokens`' end (the generation
+    /// opener) and apply its lineage (GitHub #187).
     ///
-    /// Returns the new entry's id, or `None` when the byte budget cannot take
-    /// it — the caller must have asked [`CheckpointPool::admits`] before it
-    /// let the backend capture anything, so a `None` here is the pool
-    /// refusing a capture that raced its own budget, not an error path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn retain(
-        &mut self,
-        publisher: RequestId,
-        tokens: Vec<TokenId>,
-        prefix: PrefixId,
-        pages: u32,
-        bytes: u64,
-        gdn: GdnState,
-        use_tick: u64,
-    ) -> Option<CheckpointId> {
-        if !self.admits(bytes) {
+    /// Returns the new entry's id **and the entries it superseded**, or
+    /// `None` when the byte budget cannot take it — the caller must have
+    /// asked [`CheckpointPool::admits`] before it let the backend capture
+    /// anything, so a `None` here is the pool refusing a capture that raced
+    /// its own budget, not an error path.
+    ///
+    /// The lineage rule, in one place because the two halves of it only make
+    /// sense together (ADR 0029): the new entry joins the lineage of the
+    /// entry its request claimed, and that lineage is then cut back to two —
+    /// its **latest** entry, which is this one, and its newest
+    /// **turn-opening** one, which is this one too when the capture opened a
+    /// turn. Everything else of that conversation is superseded *immediately*
+    /// rather than left for the LRU: a tool loop takes one checkpoint per
+    /// iteration, and a pool that waited for pressure would spend its whole
+    /// budget on history no request can still match.
+    pub fn retain(&mut self, capture: CheckpointCapture) -> Option<Retained> {
+        if !self.admits(capture.bytes) {
             self.skipped_captures += 1;
             return None;
         }
+        // A claimed entry that is already gone — taken by the first-victim
+        // path, or superseded by a sibling that finished first — leaves this
+        // capture with no conversation to join. It opens one, which is the
+        // same answer a first turn gets and for the same reason: there is
+        // nothing to supersede either way.
+        let inherited = capture
+            .claimed
+            .and_then(|claimed| self.entries.iter().find(|e| e.id == claimed))
+            .map(|e| e.lineage);
+        let lineage = match inherited {
+            Some(lineage) => lineage,
+            None => {
+                let fresh = self.next_lineage;
+                self.next_lineage += 1;
+                fresh
+            }
+        };
         let id = self.next_id;
         self.next_id += 1;
-        self.used_bytes += bytes;
+        self.used_bytes += capture.bytes;
         self.captures += 1;
         self.entries.push(CheckpointEntry {
             id,
-            publisher,
-            tokens,
-            prefix,
-            pages,
-            bytes,
-            gdn,
-            use_tick,
+            publisher: capture.publisher,
+            tokens: capture.tokens,
+            prefix: capture.prefix,
+            pages: capture.pages,
+            bytes: capture.bytes,
+            gdn: capture.gdn,
+            lineage,
+            turn_opening: capture.turn_opening,
+            use_tick: capture.use_tick,
         });
-        Some(id)
+        Some(Retained {
+            id,
+            superseded: self.cut_lineage_back(lineage),
+        })
+    }
+
+    /// Cut `lineage` back to the two entries ADR 0029 lets a conversation
+    /// keep — its latest and its newest turn-opening one — and return the
+    /// rest for the caller to release.
+    ///
+    /// Newest by id rather than by [`CheckpointEntry::use_tick`]: ids are
+    /// assigned in capture order, and what "latest" means here is *furthest
+    /// along the conversation*, which a claim refreshing an older entry's LRU
+    /// tick must not change.
+    fn cut_lineage_back(&mut self, lineage: LineageId) -> Vec<CheckpointEntry> {
+        let of_lineage = |e: &&CheckpointEntry| e.lineage == lineage;
+        let latest = self.entries.iter().filter(of_lineage).map(|e| e.id).max();
+        let opening = self
+            .entries
+            .iter()
+            .filter(of_lineage)
+            .filter(|e| e.turn_opening)
+            .map(|e| e.id)
+            .max();
+        let superseded: Vec<CheckpointId> = self
+            .entries
+            .iter()
+            .filter(of_lineage)
+            .filter(|e| Some(e.id) != latest && Some(e.id) != opening)
+            .map(|e| e.id)
+            .collect();
+        superseded
+            .into_iter()
+            .filter_map(|id| self.discard(id))
+            .collect()
     }
 
     /// The longest retained checkpoint whose tokens are a prefix of `tokens`,
@@ -490,7 +637,8 @@ mod tests {
         CheckpointPool::new(IMAGE * images)
     }
 
-    /// Retain a checkpoint over `tokens`, at `tick`, holding `pages` pages.
+    /// Retain a checkpoint over `tokens`, at `tick`, holding `pages` pages —
+    /// one conversation of its own, claiming nothing.
     fn retain(
         pool: &mut CheckpointPool,
         publisher: RequestId,
@@ -498,15 +646,18 @@ mod tests {
         pages: u32,
         tick: u64,
     ) -> Option<CheckpointId> {
-        pool.retain(
+        pool.retain(CheckpointCapture {
             publisher,
-            tokens.to_vec(),
-            publisher, // one prefix per publisher in these tests
+            tokens: tokens.to_vec(),
+            prefix: publisher, // one prefix per publisher in these tests
             pages,
-            IMAGE,
-            gdn_at(tokens.len()),
-            tick,
-        )
+            bytes: IMAGE,
+            gdn: gdn_at(tokens.len()),
+            use_tick: tick,
+            claimed: None,
+            turn_opening: true,
+        })
+        .map(|retained| retained.id)
     }
 
     #[test]
@@ -690,8 +841,15 @@ mod tests {
         let mut pool = pool_of(4);
         let early: Vec<TokenId> = (1..=100).collect();
         let late: Vec<TokenId> = (1..=120).collect();
-        pool.retain(1, early, 42, 6, IMAGE, gdn_at(100), 1).unwrap();
-        pool.retain(2, late, 42, 6, IMAGE, gdn_at(120), 2).unwrap();
+        let first = pool
+            .retain(CheckpointCapture { prefix: 42, pages: 6, ..capture(1, &early, None, true) })
+            .unwrap();
+        pool.retain(CheckpointCapture {
+            prefix: 42,
+            pages: 6,
+            ..capture(2, &late, Some(first.id), false)
+        })
+        .unwrap();
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
     }
@@ -732,5 +890,132 @@ mod tests {
     fn reuse_source_spells_the_two_tiers() {
         assert_eq!(ReuseSource::Device.as_str(), "device");
         assert_eq!(ReuseSource::KvRam.as_str(), "kv_ram");
+    }
+
+    // ── Lineage (GitHub #187) ───────────────────────────────────────────
+
+    /// Capture over `tokens` for a request that claimed `claimed`, with
+    /// `turn_opening` recording whether it opens a new turn.
+    fn capture(
+        publisher: RequestId,
+        tokens: &[TokenId],
+        claimed: Option<CheckpointId>,
+        turn_opening: bool,
+    ) -> CheckpointCapture {
+        CheckpointCapture {
+            publisher,
+            tokens: tokens.to_vec(),
+            prefix: publisher,
+            pages: 1,
+            bytes: IMAGE,
+            gdn: gdn_at(tokens.len()),
+            use_tick: publisher,
+            claimed,
+            turn_opening,
+        }
+    }
+
+    fn ids(pool: &CheckpointPool) -> Vec<CheckpointId> {
+        pool.entries().iter().map(|e| e.id).collect()
+    }
+
+    #[test]
+    fn a_tool_loop_keeps_the_turn_opener_and_the_latest() {
+        // The shape of an agent's tool loop: every iteration re-sends the
+        // whole history, claims the previous iteration's checkpoint and
+        // captures its own one turn further along. Only the first of them
+        // opens a turn — the tool results between them are not real user
+        // messages — so each iteration supersedes the one it claimed and the
+        // conversation never holds more than the pair (ADR 0029).
+        let mut pool = pool_of(8);
+        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
+        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
+        assert_eq!(ids(&pool), vec![c1.id, c2.id], "the opener and the latest");
+        assert!(c2.superseded.is_empty(), "the turn opener is not superseded");
+
+        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c2.id), false)).unwrap();
+        assert_eq!(
+            c3.superseded.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![c2.id],
+            "iteration 2's checkpoint is superseded the moment iteration 3 takes one"
+        );
+        assert_eq!(ids(&pool), vec![c1.id, c3.id], "still exactly two");
+        assert_eq!(pool.used_bytes(), 2 * IMAGE, "the superseded image came back");
+    }
+
+    #[test]
+    fn a_new_user_message_retires_the_previous_turn() {
+        // The user types again. The request claims the turn-opening
+        // checkpoint — the only one its re-rendered history still matches —
+        // and what it captures opens a turn of its own, so it becomes both
+        // roles at once and the whole previous turn goes.
+        let mut pool = pool_of(8);
+        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
+        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
+        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c2.id), false)).unwrap();
+        let c4 = pool
+            .retain(capture(4, &tokens_to(300), Some(c1.id), true))
+            .unwrap();
+        let mut retired: Vec<CheckpointId> = c4.superseded.iter().map(|e| e.id).collect();
+        retired.sort_unstable();
+        assert_eq!(
+            retired,
+            vec![c1.id, c3.id],
+            "the old turn opener and the old latest both go"
+        );
+        assert_eq!(ids(&pool), vec![c4.id], "the new turn starts alone");
+        assert_eq!(pool.used_bytes(), IMAGE);
+
+        // And the loop under the new turn keeps the pair again.
+        let c5 = pool.retain(capture(5, &tokens_to(360), Some(c4.id), false)).unwrap();
+        assert_eq!(ids(&pool), vec![c4.id, c5.id]);
+    }
+
+    #[test]
+    fn a_capture_that_claimed_nothing_opens_its_own_lineage() {
+        // Two conversations that never met: neither supersedes the other,
+        // however many checkpoints each leaves.
+        let mut pool = pool_of(8);
+        let a1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
+        let b1 = pool.retain(capture(2, &[500, 501, 502], None, true)).unwrap();
+        let a2 = pool.retain(capture(3, &tokens_to(160), Some(a1.id), false)).unwrap();
+        assert!(a2.superseded.is_empty());
+        assert_eq!(ids(&pool), vec![a1.id, b1.id, a2.id]);
+    }
+
+    #[test]
+    fn a_capture_whose_claimed_entry_is_gone_starts_a_fresh_lineage() {
+        // The first-victim path can take the entry a live request claimed
+        // out from under it. What that request captures has nothing to
+        // supersede and no lineage to join, so it opens one.
+        let mut pool = pool_of(8);
+        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
+        let c2 = pool.retain(capture(2, &tokens_to(160), Some(c1.id), false)).unwrap();
+        pool.discard(c1.id).expect("the victim");
+        let c3 = pool.retain(capture(3, &tokens_to(220), Some(c1.id), false)).unwrap();
+        assert!(c3.superseded.is_empty(), "nothing of that lineage is left");
+        assert_eq!(ids(&pool), vec![c2.id, c3.id]);
+    }
+
+    #[test]
+    fn n_claimants_of_one_checkpoint_all_hit_and_it_survives_them() {
+        // A retry, a regenerate and two forks of the same history reach the
+        // same entry, and none of them consumes it (ADR 0029). Lineage is
+        // decided at *capture*, so a claim on its own moves nothing.
+        let mut pool = pool_of(8);
+        let c1 = pool.retain(capture(1, &tokens_to(100), None, true)).unwrap();
+        let prompt = tokens_to(140);
+        for tick in 2..=5 {
+            let matched = pool.claim(&prompt, tick).expect("claimant {tick} hits");
+            assert_eq!(matched.id, c1.id);
+            assert_eq!(matched.tokens, 100);
+        }
+        assert_eq!(ids(&pool), vec![c1.id], "the entry survived all four");
+        assert_eq!(pool.counters().discards, 0, "a claim discards nothing");
+    }
+
+    /// `1..=n`, the token content these lineage tests extend turn by turn.
+    fn tokens_to(n: u32) -> Vec<TokenId> {
+        (1..=n).collect()
     }
 }

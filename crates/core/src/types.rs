@@ -74,6 +74,24 @@ pub struct RequestInput {
     /// whoever rendered it and not recoverable from token ids. #188 adds the
     /// end of the system-and-tools block beside it for the same reason.
     pub opener_tokens: Option<u32>,
+    /// The **last real user query** (GitHub #187, ADR 0029): how many leading
+    /// prompt tokens end where the rendered prompt's last genuine
+    /// `<|im_start|>user\n` message *begins* — genuine meaning not a
+    /// `<tool_response>`, exactly the distinction the chat template's own
+    /// `last_query_index` scan makes.
+    ///
+    /// It answers one question, at capture time: does a real user message lie
+    /// between the checkpoint this request resumed from and the one it is
+    /// taking? If it does, this capture opens a new turn and becomes its
+    /// conversation's **turn-opening checkpoint**; if it does not, the request
+    /// is another iteration of the same tool loop and supersedes what it
+    /// claimed ([`crate::checkpoint::CheckpointPool::retain`]).
+    ///
+    /// `None` when the frontend could not report one — no user message in the
+    /// render, or an offset that does not tokenize to an exact token prefix.
+    /// A capture then counts as *not* turn-opening, because a wrong `true`
+    /// retires the very entry a new user message would have matched.
+    pub user_turn_tokens: Option<u32>,
 }
 
 /// Sampling / decoding parameters for a request.

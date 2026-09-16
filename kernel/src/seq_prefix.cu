@@ -44,8 +44,8 @@
 
 namespace {
 
-// The whole block-table row of `seq`: the prefix's physical pages first, then
-// the sequence's own, in logical page order.
+// The whole block-table row of `seq`: the prefix chain's physical pages
+// first, then the sequence's own, in logical page order.
 //
 // The vendored `PagedKVAllocation::bind_row` publishes an allocation's pages
 // from logical index 0, which is right for a sequence that owns its whole
@@ -56,8 +56,16 @@ namespace {
 void publish_shared_row(ignis_seq_pool &pool, const ignis_seq &seq) {
   std::vector<std::int32_t> ids;
   ids.reserve(ignis_seq_logical_page_count(seq));
-  if (seq.prefix != nullptr) {
-    const auto shared = seq.prefix->kv.page_ids();
+  // GitHub #187: the whole chain, oldest link first. A chained prefix owns
+  // only the pages past its parent's end, so walking `parent` yields the
+  // links newest-first while the row wants the other order -- a block table
+  // is logical page order, and logical page 0 is the root's first page.
+  std::vector<const ignis_seq_prefix *> chain;
+  for (const ignis_seq_prefix *at = seq.prefix; at != nullptr; at = at->parent) {
+    chain.push_back(at);
+  }
+  for (auto link = chain.rbegin(); link != chain.rend(); ++link) {
+    const auto shared = (*link)->kv.page_ids();
     ids.insert(ids.end(), shared.begin(), shared.end());
   }
   const auto own = seq.kv.page_ids();
@@ -95,21 +103,26 @@ double timed_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix, ignis_seq 
 } // namespace
 
 void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
-  if (prefix == nullptr) {
-    return;
+  // GitHub #187: a loop rather than one step, because a chained entry holds
+  // its parent's reference. Letting go of the child may let go of the parent,
+  // and of its parent in turn -- iteratively, so a long conversation's chain
+  // cannot overflow the stack on a release.
+  while (prefix != nullptr) {
+    if (prefix->refcount > 0) {
+      --prefix->refcount;
+    }
+    if (prefix->refcount != 0) {
+      return;
+    }
+    // The last holder let go. The prefix carries its own pool pointer inside
+    // `kv`, so `~PagedKVAllocation` returns the shared pages and the
+    // entitlement without being told where -- which is why a prefix's pages
+    // are charged to the pool once and released once, whatever the claimant
+    // count did in between.
+    ignis_seq_prefix *parent = prefix->parent;
+    delete prefix;
+    prefix = parent;
   }
-  if (prefix->refcount > 0) {
-    --prefix->refcount;
-  }
-  if (prefix->refcount != 0) {
-    return;
-  }
-  // The last holder let go. The prefix carries its own pool pointer inside
-  // `kv`, so `~PagedKVAllocation` returns the shared pages and the
-  // entitlement without being told where -- which is why a prefix's pages are
-  // charged to the pool once and released once, whatever the claimant count
-  // did in between.
-  delete prefix;
 }
 
 extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct ignis_seq *seq,
@@ -124,12 +137,6 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
   }
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     ignis_seq_set_last_error("ignis_seq_prefix_publish: the sequence was not drawn from this pool");
-    return -1;
-  }
-  if (seq->prefix != nullptr) {
-    ignis_seq_set_last_error(
-        "ignis_seq_prefix_publish: sequence slot " + std::to_string(seq->slot) +
-        " already claims a shared prefix, so its head is not its own to publish");
     return -1;
   }
   const auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
@@ -161,13 +168,29 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
   }
 
   const std::uint32_t pages = prefix_tokens / page_size;
-  if (pages > seq->kv.mapped_page_count()) {
-    ignis_seq_set_last_error("ignis_seq_prefix_publish: the sequence maps " +
-                             std::to_string(seq->kv.mapped_page_count()) + " KV pages, fewer than the " +
-                             std::to_string(pages) + " being published");
+  // GitHub #187: what this sequence already shares is not its to publish, and
+  // what it warmed past that is. So the entry owns `own` pages -- the ones
+  // trimmed off the front of the sequence's own allocation -- and reaches
+  // `pages` by holding the chain below it.
+  const std::uint32_t below = seq->shared_pages;
+  if (pages <= below) {
+    ignis_seq_set_last_error(
+        "ignis_seq_prefix_publish: sequence slot " + std::to_string(seq->slot) + " already shares " +
+        std::to_string(below) + " pages, so the " + std::to_string(pages) +
+        "-page head being published covers nothing of its own; publish past what is already "
+        "shared or not at all");
     return -1;
   }
-  const std::uint32_t tail = seq->kv.page_entitlement() - pages;
+  const std::uint32_t own = pages - below;
+  if (own > seq->kv.mapped_page_count()) {
+    ignis_seq_set_last_error("ignis_seq_prefix_publish: the sequence maps " +
+                             std::to_string(seq->kv.mapped_page_count()) +
+                             " KV pages of its own, fewer than the " + std::to_string(own) +
+                             " it would publish past the " + std::to_string(below) +
+                             " it already shares");
+    return -1;
+  }
+  const std::uint32_t tail = seq->kv.page_entitlement() - own;
   if (tail == 0) {
     ignis_seq_set_last_error(
         "ignis_seq_prefix_publish: the whole reservation of sequence slot " +
@@ -194,9 +217,14 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     // the prefix is still the zeroed page `ignis_seq_alloc` materialized --
     // trimming them loses no history, and hands back the pages the tail
     // reservation immediately takes.
-    shared.trim_pages(pages);
-    shared.set_page_entitlement(pages);
+    shared.trim_pages(own);
+    shared.set_page_entitlement(own);
     entry->kv = std::move(shared);
+    // GitHub #187: the sequence's reference on the head it was standing on
+    // *moves* to the entry. It is not taken afresh -- from here the sequence
+    // reaches the parent through this entry, so the chain keeps exactly one
+    // reference per link and the pages under it are still charged once.
+    entry->parent = seq->prefix;
 
     seq->kv = pool->kv_pool.reserve(tail);
     seq->kv.materialize_pages(tail);
@@ -242,8 +270,11 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
     ignis_seq_set_last_error(std::string(who) + ": context_tokens must be positive");
     return -1;
   }
-  const std::uint32_t total  = ninfer::pages_for_tokens(context_tokens);
-  const std::uint32_t shared = prefix->kv.mapped_page_count();
+  const std::uint32_t total = ninfer::pages_for_tokens(context_tokens);
+  // GitHub #187: every page of the head, the chain below this entry included.
+  // What a claimant shares is the whole history, whichever link happens to
+  // own each page of it.
+  const std::uint32_t shared = ignis_seq_prefix_total_pages(*prefix);
   if (total <= shared) {
     ignis_seq_set_last_error(
         std::string(who) + ": a reservation of " + std::to_string(context_tokens) + " tokens is " +
@@ -327,7 +358,10 @@ extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
   if (prefix == nullptr || out_stats == nullptr) {
     return -1;
   }
-  out_stats->tokens            = prefix->tokens;
+  out_stats->tokens = prefix->tokens;
+  // Its own pages: what comes back to the pool when this entry drops. A
+  // chained entry's ancestors give theirs back separately (GitHub #187), and
+  // `tokens` is what the head as a whole covers.
   out_stats->pages             = prefix->kv.mapped_page_count();
   out_stats->refcount          = prefix->refcount;
   out_stats->clone_image_bytes = prefix->clone_image.bytes;
