@@ -171,3 +171,48 @@ and is not a fifth entry point.
 - **A blob's header names its compatibility identity**: the artifact content
   hash, the KV format, the layout version, and the drafter configuration. A
   blob taken under another load is refused like a stale layout.
+
+## Amendment (2026-09-16) — the materialized checkpoint (#190)
+
+- **A retained prompt checkpoint is spilled as the blob its capturing sequence
+  would have written** (`ignis_seq_checkpoint_snapshot`): the prefix chain's
+  pages in block-table order, then the copied tail page, then its image. One
+  layout, written by one packer in `kernel/src/seq.cu`, so a spilled checkpoint
+  restores through `ignis_seq_restore` like any other blob.
+- **Restoring into a sequence that holds a shared prefix is still refused**
+  (`IGNIS_SEQ_ERR_SHARED_PREFIX`): its pages are other claimants' history. A
+  blob is restored into a fresh sequence.
+- **A sequence that owns its history keeps the vendored pack**; only a
+  materialized one goes through the page-run packer.
+
+- **A retained prefix spills as the blob its publisher would have written
+  standing on it** (`ignis_seq_prefix_snapshot`), through the same writer as a
+  checkpoint. It comes back by restoring that blob into a fresh carrier
+  sequence and publishing there (`ignis_seq_prefix_publish`); the kernel test
+  pins that the returned prefix, and a claimant of it, are byte-identical to
+  the original's.
+
+## Amendment (2026-09-16) — the multimodal rope delta (#194)
+
+- **A sequence's `rope_delta` is a progress scalar**, in the progress
+  section's former reserved word, so snapshot and restore carry it with the
+  pending token. It re-earns the snapshot-point permission at the
+  same completed chunk boundary: a prefill span assigns it after its chunks
+  have run and synchronized, and every span of a multimodal prompt assigns
+  the same prompt-wide value, so a sequence evicted between chunks already
+  holds it. Format version 3; a version-2 blob is refused by version, since
+  its reserved word would restore every multimodal sequence at delta 0. No
+  such blob of a multimodal sequence exists (the leaf refused to write one),
+  so the bump is ADR 0024's layout rule rather than a guard on live data.
+- **A clone does not carry it**: a shared prefix's or checkpoint's capture
+  records 0, and so do the blobs a spilled prefix or checkpoint is written as.
+  A multimodal publisher's own blob therefore differs from its prefix's in
+  that one word. The publisher's delta is
+  its whole prompt's, not the head's, and a text request may claim a
+  multimodal publisher's text-only head up to its prompt's end, prefilling
+  nothing that would set its own. A multimodal claimant gets its delta from
+  the tail it always prefills (ADR 0029's one-token tail rule, #201). This is
+  the one progress scalar the clone path leaves behind.
+- **Vision state is not a section.** A request evicted part-way through a
+  media item releases the item's embedding with its sequence; the chunk that
+  continues it after restore encodes the item again.

@@ -49,6 +49,10 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct IgnisSeqPrefix([u8; 1]);
 
+    /// Opaque `struct ignis_seq_checkpoint` (GitHub #186).
+    #[repr(C)]
+    pub struct IgnisSeqCheckpoint([u8; 1]);
+
     /// 1:1 with `struct ignis_seq_pool_spec`.
     #[repr(C)]
     pub struct IgnisSeqPoolSpec {
@@ -124,6 +128,17 @@ pub(crate) mod ffi {
         pub last_clone_micros: f64,
     }
 
+    /// 1:1 with `struct ignis_seq_checkpoint_stats` (GitHub #186).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct IgnisSeqCheckpointStats {
+        pub tokens: u32,
+        pub pages: u32,
+        pub image_bytes: u64,
+        pub claim_count: u64,
+        pub last_claim_micros: f64,
+    }
+
     unsafe extern "C" {
         pub fn ignis_seq_pool_create(
             spec: *const IgnisSeqPoolSpec,
@@ -190,6 +205,61 @@ pub(crate) mod ffi {
             out_stats: *mut IgnisSeqPrefixStats,
         ) -> i32;
 
+        pub fn ignis_seq_prefix_snapshot_size(
+            pool: *const IgnisSeqPool,
+            prefix: *const IgnisSeqPrefix,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_prefix_snapshot(
+            pool: *const IgnisSeqPool,
+            prefix: *const IgnisSeqPrefix,
+            dst: *mut c_void,
+            dst_bytes: u64,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_image_bytes(
+            pool: *const IgnisSeqPool,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_capture(
+            pool: *mut IgnisSeqPool,
+            seq: *mut IgnisSeq,
+            opener_tokens: u32,
+            out_checkpoint: *mut *mut IgnisSeqCheckpoint,
+        ) -> i32;
+
+        pub fn ignis_seq_alloc_from_checkpoint(
+            pool: *mut IgnisSeqPool,
+            context_tokens: u32,
+            checkpoint: *mut IgnisSeqCheckpoint,
+            out_seq: *mut *mut IgnisSeq,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_release(
+            pool: *mut IgnisSeqPool,
+            checkpoint: *mut IgnisSeqCheckpoint,
+        );
+
+        pub fn ignis_seq_checkpoint_stats(
+            checkpoint: *const IgnisSeqCheckpoint,
+            out_stats: *mut IgnisSeqCheckpointStats,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_snapshot_size(
+            pool: *const IgnisSeqPool,
+            checkpoint: *const IgnisSeqCheckpoint,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_checkpoint_snapshot(
+            pool: *const IgnisSeqPool,
+            checkpoint: *const IgnisSeqCheckpoint,
+            dst: *mut c_void,
+            dst_bytes: u64,
+        ) -> i32;
+
         pub fn ignis_seq_last_error() -> *const c_char;
 
         /// Pinned (page-locked) host memory (P4-07, GitHub #125): the host
@@ -229,7 +299,7 @@ pub(crate) mod ffi {
     }
 }
 
-pub use ffi::{IgnisSeqPoolStats, IgnisSeqPrefixStats, IgnisSeqStats};
+pub use ffi::{IgnisSeqCheckpointStats, IgnisSeqPoolStats, IgnisSeqPrefixStats, IgnisSeqStats};
 
 /// `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` (`kernel/include/ignis_seq.h`): the
 /// leaf's return code for an entry point that is declared but not built
@@ -243,10 +313,10 @@ pub const NOT_IMPLEMENTED: i32 = -2;
 /// completes, which is what an evicting scheduler waits for.
 pub const NOT_AT_BOUNDARY: i32 = -3;
 
-/// `IGNIS_SEQ_ERR_SHARED_PREFIX`: the sequence claims a shared prefix
-/// ([`SeqPrefix`]), so its KV history is not all its own and there is no
-/// whole-sequence blob to write or write back. Releasing the sequence drops
-/// the claim; the way off the GPU is a re-prefill, not a snapshot.
+/// `IGNIS_SEQ_ERR_SHARED_PREFIX`: a restore target claims a shared prefix
+/// ([`SeqPrefix`]), so writing a standalone blob into it would overwrite
+/// pages owned by the prefix. Snapshotting such a sequence is allowed since
+/// #190: the shared pages are materialized into the blob.
 pub const SHARED_PREFIX: i32 = -5;
 
 /// `IGNIS_SEQ_ERR_BAD_SNAPSHOT`: the blob is not one this leaf can restore
@@ -289,8 +359,8 @@ impl SeqTransferError {
         self.code == BAD_SNAPSHOT
     }
 
-    /// The sequence claims a shared prefix, so it cannot be moved as one
-    /// blob: release it and re-prefill instead of evicting it.
+    /// The restore target claims a shared prefix, so a standalone blob cannot
+    /// overwrite it. Snapshotting a claimant itself is supported.
     pub fn is_shared_prefix(&self) -> bool {
         self.code == SHARED_PREFIX
     }
@@ -442,12 +512,152 @@ impl SeqPool {
         })
     }
 
+    /// Device bytes one prompt checkpoint of this pool would occupy (GitHub
+    /// #186, ADR 0029): the mutable-state image plus one KV page's copy.
+    ///
+    /// A pool property, not a per-checkpoint one, and constant for the
+    /// pool's life — so a byte-budgeted pool of checkpoints may ask once and
+    /// budget against the answer. Allocates nothing and moves nothing.
+    pub fn checkpoint_image_bytes(&self) -> Result<u64, String> {
+        let mut bytes: u64 = 0;
+        let rc = unsafe { ffi::ignis_seq_checkpoint_image_bytes(self.handle, &mut bytes) };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(bytes)
+    }
+
+    /// Reserve a slot that **claims `checkpoint`** (GitHub #186, ADR 0029):
+    /// the whole pages below its generation opener are the shared prefix's
+    /// own physical pages, the rest is a fresh zeroed reservation, the
+    /// mutable state is a device-to-device clone of the checkpoint's image,
+    /// and the partial page the opener ends inside is copied into the first
+    /// page this sequence owns.
+    ///
+    /// The returned sequence stands exactly where the capturing one stood at
+    /// its opener, so it prefills only from there on. A claim never consumes
+    /// the checkpoint: N claimants all succeed, which is what makes a retry,
+    /// a regenerate and two forks of one history all hit.
+    ///
+    /// `context_tokens` is the whole reservation, the shared pages included,
+    /// and must leave at least one page of its own. `Err` (nothing
+    /// allocated) on a bad argument or exhaustion.
+    pub fn alloc_from_checkpoint<'a>(
+        &'a self,
+        context_tokens: u32,
+        checkpoint: &SeqCheckpoint<'a>,
+    ) -> Result<Seq<'a>, String> {
+        let mut handle: *mut ffi::IgnisSeq = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::ignis_seq_alloc_from_checkpoint(
+                self.handle,
+                context_tokens,
+                checkpoint.handle,
+                &mut handle,
+            )
+        };
+        if rc != 0 || handle.is_null() {
+            return Err(last_error());
+        }
+        Ok(Seq {
+            handle,
+            pool: self.handle,
+            _pool: PhantomData,
+        })
+    }
+
     /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never
     /// exposed outside this crate (mirrors the handle's C-ABI opacity).
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeqPool {
         self.handle
     }
 }
+
+/// A captured **prompt checkpoint** (GitHub #186, ADR 0029): one reference
+/// to the shared prefix holding the whole pages below a generation opener,
+/// plus device images of the mutable state at the opener and of the partial
+/// page the opener ends inside.
+///
+/// It outlives the request that captured it — that is the point: the next
+/// turn of a conversation arrives long after. Dropping the handle frees the
+/// images and lets go of the prefix, whose pages return to the pool only if
+/// nothing else is standing on them.
+///
+/// Borrows its [`SeqPool`] for the same reason [`Seq`] and [`SeqPrefix`] do:
+/// the flat C ABI frees the pool regardless of what is still drawn from it.
+#[derive(Debug)]
+pub struct SeqCheckpoint<'a> {
+    handle: *mut ffi::IgnisSeqCheckpoint,
+    pool: *mut ffi::IgnisSeqPool,
+    _pool: PhantomData<&'a SeqPool>,
+}
+
+impl SeqCheckpoint<'_> {
+    /// The checkpoint's reach, what it costs, and what its claims have
+    /// actually cost (ADR 0024 asks for the transfer to be measured rather
+    /// than assumed).
+    pub fn stats(&self) -> IgnisSeqCheckpointStats {
+        let mut stats = IgnisSeqCheckpointStats::default();
+        let rc = unsafe { ffi::ignis_seq_checkpoint_stats(self.handle, &mut stats) };
+        assert_eq!(
+            rc, 0,
+            "ignis_seq_checkpoint_stats: null handle (unreachable — SeqCheckpoint always holds one)"
+        );
+        stats
+    }
+
+    /// Bytes the checkpoint needs as a materialized whole-sequence blob in
+    /// KV-RAM: shared prefix pages included, not referenced.
+    pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
+        let mut bytes = 0;
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_snapshot_size(self.pool, self.handle, &mut bytes)
+        };
+        if rc == 0 { Ok(bytes) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Materialize this checkpoint into a host blob without consuming it.
+    pub fn snapshot_into(&self, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_snapshot(
+                self.pool,
+                self.handle,
+                dst.as_mut_ptr().cast(),
+                dst.len() as u64,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Detach the compile-time borrow tying this checkpoint to its pool,
+    /// exactly as [`Seq::into_static`] and [`SeqPrefix::into_static`] do and
+    /// for the same reason: a checkpoint outlives the stack frame — and the
+    /// request — that captured it.
+    ///
+    /// # Safety
+    /// The caller must keep the originating [`SeqPool`] alive (not dropped)
+    /// for as long as the returned handle exists or is dropped.
+    pub unsafe fn into_static(self) -> SeqCheckpoint<'static> {
+        let handle = self.handle;
+        let pool = self.pool;
+        std::mem::forget(self);
+        SeqCheckpoint {
+            handle,
+            pool,
+            _pool: PhantomData,
+        }
+    }
+}
+
+impl Drop for SeqCheckpoint<'_> {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_seq_checkpoint_release(self.pool, self.handle) };
+    }
+}
+
+// Moved into the scheduler adapter's `Mutex`-guarded checkpoint map, never
+// shared by reference across threads — the same contract `Seq` carries.
+unsafe impl Send for SeqCheckpoint<'_> {}
 
 /// A published shared prefix: physical KV pages a leaf-owned refcount keeps
 /// alive, plus the mutable state a claimant clones (P4-10, GitHub #126, ADR
@@ -480,6 +690,30 @@ impl SeqPrefix<'_> {
             "ignis_seq_prefix_stats: null handle (unreachable — SeqPrefix always holds one)"
         );
         stats
+    }
+
+    /// Bytes this prefix occupies as a materialized whole-sequence blob in
+    /// KV-RAM: every page of its chain, its image and its progress (GitHub
+    /// #190).
+    pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
+        let mut bytes = 0;
+        let rc = unsafe { ffi::ignis_seq_prefix_snapshot_size(self.pool, self.handle, &mut bytes) };
+        if rc == 0 { Ok(bytes) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Materialize this prefix into a host blob without consuming it — the
+    /// blob its publisher would have written standing on it, which a fresh
+    /// sequence restores and publishes again.
+    pub fn snapshot_into(&self, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let rc = unsafe {
+            ffi::ignis_seq_prefix_snapshot(
+                self.pool,
+                self.handle,
+                dst.as_mut_ptr().cast(),
+                dst.len() as u64,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
     }
 
     /// Detach the compile-time borrow tying this prefix to its pool, exactly
@@ -558,10 +792,9 @@ impl<'a> Seq<'a> {
     /// Write this sequence's whole device state into `dst` as an opaque
     /// blob, which must be at least [`Seq::snapshot_bytes`] long.
     ///
-    /// A sequence that claims a shared prefix is refused with
-    /// [`SHARED_PREFIX`](SeqTransferError::is_shared_prefix): its leading
-    /// pages belong to the prefix, so there is no whole-sequence blob to
-    /// write.
+    /// A sequence that claims a shared prefix materializes those leading
+    /// pages into the blob. The host image is self-contained and restores
+    /// without the prefix handle (GitHub #190).
     ///
     /// Synchronous: it returns with every byte already in `dst`. Pinned
     /// host memory is faster and is what the host tier uses (GitHub #125),
@@ -651,6 +884,45 @@ impl<'a> Seq<'a> {
             return Err(transfer_error(if rc == 0 { -1 } else { rc }));
         }
         Ok(SeqPrefix {
+            handle,
+            pool: self.pool,
+            _pool: PhantomData,
+        })
+    }
+
+    /// Capture this sequence's state at `opener_tokens` as a **prompt
+    /// checkpoint** (GitHub #186, ADR 0029), so a later request whose prompt
+    /// extends this one's resumes there instead of prefilling it again.
+    ///
+    /// The sequence must already hold a shared prefix whose pages are
+    /// exactly the whole pages below the opener, and must stand exactly at
+    /// `opener_tokens`, at a chunk boundary. The capture reads the sequence
+    /// and changes nothing about it — not its reservation, not its
+    /// block-table row — so it goes on prefilling and decoding as if it had
+    /// not been asked, and a request cancelled after this keeps its
+    /// checkpoint.
+    ///
+    /// The returned checkpoint borrows the **pool**, not this sequence: it
+    /// outlives the request that captured it, which is the whole point.
+    ///
+    /// `Err` on a sequence holding no shared prefix, an opener whose whole
+    /// pages are not that prefix's (a request that itself resumed from an
+    /// earlier checkpoint — GitHub #187's lineage work), a position that is
+    /// not the opener ([`NOT_AT_BOUNDARY`]), or a device allocation failure.
+    /// Nothing is allocated or changed on any failure: a refused capture
+    /// costs the caller nothing, which is what lets it be treated as a bet.
+    pub fn capture_checkpoint(
+        &mut self,
+        opener_tokens: u32,
+    ) -> Result<SeqCheckpoint<'a>, SeqTransferError> {
+        let mut handle: *mut ffi::IgnisSeqCheckpoint = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::ignis_seq_checkpoint_capture(self.pool, self.handle, opener_tokens, &mut handle)
+        };
+        if rc != 0 || handle.is_null() {
+            return Err(transfer_error(if rc == 0 { -1 } else { rc }));
+        }
+        Ok(SeqCheckpoint {
             handle,
             pool: self.pool,
             _pool: PhantomData,

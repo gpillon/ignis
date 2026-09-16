@@ -589,6 +589,12 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_decoded_tokens_total",
         "ignis_kv_cache_evictions_total",
         "ignis_prefix_reused_tokens_total",
+        "ignis_retained_reused_tokens_total",
+        "ignis_retained_state_hits_total",
+        "ignis_retained_state_misses_total",
+        "ignis_retained_state_spills_total",
+        "ignis_retained_state_discards_total",
+        "ignis_retained_state_restores_total",
         "ignis_requests_rejected_total",
         "ignis_request_ttft_seconds_bucket",
         "ignis_request_ttft_seconds_sum",
@@ -613,6 +619,8 @@ async fn labels_stay_within_the_bounded_sets() {
             "ignis_requests_rejected_total" => &[("reason", &["full", "unknown_model", "oversized"])],
             "ignis_request_ttft_seconds_bucket" => &[("le", TTFT_LE)],
             "ignis_request_duration_seconds_bucket" => &[("le", DURATION_LE)],
+            // GitHub #190: one series per residency tier, never per entry.
+            name if name.starts_with("ignis_retained_") => &[("tier", &["device", "kv_ram"])],
             _ => &[],
         };
         assert_eq!(labels.len(), allowed.len(), "{name} {labels:?}");

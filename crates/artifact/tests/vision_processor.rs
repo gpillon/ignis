@@ -4,6 +4,11 @@
 //! grids, token spans, the SHA-256 of the packed BF16 patch rows, and the
 //! rewrite-checkpoint frontier carried across the expansion.
 //!
+//! The set also carries the text-only multi-turn cases (GitHub #185): how a
+//! conversation's history renders is what decides whether two turns can share
+//! a prefill at all (ADR 0029), and the same recorder answers it against the
+//! same reference.
+//!
 //! Fixtures (`tests/fixtures/vision/expected/*.json`) were recorded from the
 //! reference by `tools/vision-fixtures` (see its README). CPU-only; skips
 //! when the artifact is not at its machine-local path (same convention as
@@ -12,7 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use ignis_artifact::vision::{layout, ProcessorError};
-use ignis_artifact::{ChatMessage, ContentPart, FrontendSet, MessageContent, Reader, Role, ToolCall};
+use ignis_artifact::{
+    ChatMessage, ChatRenderOptions, ContentPart, FrontendSet, MessageContent, Reader, Role, ToolCall,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -71,36 +78,48 @@ fn messages(case: &Value) -> (Vec<ChatMessage>, Vec<Vec<u8>>) {
                         .map(|c| ToolCall {
                             id: c["id"].as_str().map(str::to_owned),
                             name: c["name"].as_str().unwrap().to_owned(),
-                            arguments: c["arguments"].clone(),
+                            // The wire (and so `ToolCall`) carries the
+                            // arguments JSON-encoded as a string; the
+                            // fixture records the object the reference was
+                            // handed, whose keys `serde_json` writes back
+                            // in the same sorted order `nlohmann::json`
+                            // dumped them in when the fixture was taken.
+                            arguments: serde_json::to_string(&c["arguments"]).unwrap(),
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            // The server drops history reasoning unless preserve_thinking.
-            let reasoning_content = case["preserve_thinking"]
-                .as_bool()
-                .unwrap_or(false)
-                .then(|| m["reasoning_content"].as_str().map(str::to_owned))
-                .flatten();
+            // The server hands the template every turn's reasoning and lets
+            // it decide what survives (GitHub #185), so the case's own text
+            // goes in whatever `preserve_thinking` says.
+            let reasoning_content = m["reasoning_content"].as_str().map(str::to_owned);
             ChatMessage { role, content, tool_calls, reasoning_content }
         })
         .collect();
     (messages, images)
 }
 
-/// The reference's turn-closure rewrite checkpoint (`chat_template.cpp`):
-/// just after the header of the first assistant turn following the last
-/// real user query, else after the generation prompt's header.
-fn turn_closure_offset(rendered: &str) -> usize {
+/// The reference's rewrite checkpoint (`chat_template.cpp`), and which of
+/// its two kinds it is. With `preserve_thinking` the whole generation
+/// prologue is deterministic, so the checkpoint is the end of the rendered
+/// prompt (`response_replay`); otherwise it is just after the header of the
+/// first assistant turn following the last real user query, else after the
+/// generation prompt's header (`turn_closure`).
+fn checkpoint_offset(rendered: &str, preserve_thinking: bool) -> (&'static str, usize) {
     const USER: &str = "<|im_start|>user\n";
     const ASSISTANT: &str = "<|im_start|>assistant\n";
+    if preserve_thinking {
+        return ("response_replay", rendered.len());
+    }
     let last_query = rendered
         .match_indices(USER)
         .map(|(at, _)| at)
         .filter(|&at| !rendered[at + USER.len()..].starts_with("<tool_response>"))
         .last()
         .expect("a user query");
-    last_query + rendered[last_query..].find(ASSISTANT).expect("an assistant header") + ASSISTANT.len()
+    let at =
+        last_query + rendered[last_query..].find(ASSISTANT).expect("an assistant header") + ASSISTANT.len();
+    ("turn_closure", at)
 }
 
 fn as_vec<T: TryFrom<i64>>(value: &Value) -> Vec<T> {
@@ -118,7 +137,7 @@ fn prepared_prompts_match_the_reference_fixtures() {
     let processor = frontend.vision_processor().expect("vision processor");
     let mut dir: Vec<_> = std::fs::read_dir(fixtures().join("expected")).unwrap().map(|e| e.unwrap().path()).collect();
     dir.sort();
-    assert_eq!(dir.len(), 18, "every recorded fixture is present");
+    assert_eq!(dir.len(), 22, "every recorded fixture is present");
     // Every case is checked and every mismatch reported, so one divergence
     // does not hide another.
     let failures: Vec<String> = dir.iter().filter_map(|path| check_fixture(&frontend, &processor, path).err()).collect();
@@ -135,9 +154,17 @@ fn check_fixture(
     let name = case["name"].as_str().unwrap();
     let (messages, images) = messages(case);
     let thinking = case["enable_thinking"].as_bool().unwrap_or(false);
-    let rendered = frontend.chat_template().render_with_thinking(&messages, thinking, None).expect("render");
+    let preserve = case["preserve_thinking"].as_bool().unwrap_or(false);
+    let rendered = frontend
+        .chat_template()
+        .render_with_thinking_and_tools(
+            &messages,
+            ChatRenderOptions { enable_thinking: thinking, preserve_thinking: preserve, ..Default::default() },
+            None,
+        )
+        .expect("render");
     let refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
-    let boundary = turn_closure_offset(&rendered);
+    let (kind, boundary) = checkpoint_offset(&rendered, preserve);
     let result = processor.prepare(frontend.tokenizer(), &rendered, &refs, &[boundary]);
     let check = |ok: bool, what: String| if ok { Ok(()) } else { Err(format!("{name}: {what}")) };
 
@@ -186,8 +213,11 @@ fn check_fixture(
     let checkpoint = &expected["rewrite_checkpoint"];
     let frontier = checkpoint["frontier"].as_u64().unwrap() as u32;
     check(
-        checkpoint["kind"] == "turn_closure" && prompt.frontiers == [Some(frontier)],
-        format!("rewrite checkpoint frontier {:?} vs {frontier}", prompt.frontiers),
+        checkpoint["kind"] == kind && prompt.frontiers == [Some(frontier)],
+        format!(
+            "rewrite checkpoint {kind} {:?} vs {} {frontier}",
+            prompt.frontiers, checkpoint["kind"]
+        ),
     )
 }
 
@@ -222,12 +252,12 @@ fn messages_with_more_image_parts_than_images_are_a_placeholder_mismatch() {
         tool_calls: Vec::new(),
         reasoning_content: None,
     }];
-    let error = frontend.prepare_prompt(&processor, &messages, &[&image], false, None, None).unwrap_err();
+    let error = frontend.prepare_prompt(&processor, &messages, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap_err();
     assert!(matches!(error, ProcessorError::PlaceholderMismatch(_)), "{error}");
     assert_eq!(error.code(), "invalid_media");
     // One image for one part prepares.
     let one = [ChatMessage { content: MessageContent::Parts(vec![ContentPart::Image { url: None }]), ..messages[0].clone() }];
-    let prompt = frontend.prepare_prompt(&processor, &one, &[&image], false, None, None).unwrap();
+    let prompt = frontend.prepare_prompt(&processor, &one, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap();
     assert_eq!(prompt.vision_tokens(), 300);
 }
 
@@ -245,7 +275,7 @@ fn an_image_in_a_system_message_is_refused_by_the_template() {
         },
         ChatMessage::text(Role::User, "hi"),
     ];
-    let error = frontend.prepare_prompt(&processor, &messages, &[&image], false, None, None).unwrap_err();
+    let error = frontend.prepare_prompt(&processor, &messages, &[&image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).unwrap_err();
     assert!(matches!(error, ProcessorError::Render(_)), "{error}");
 }
 

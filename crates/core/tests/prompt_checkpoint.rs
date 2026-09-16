@@ -1,0 +1,1274 @@
+//! GitHub #186 (ADR 0029) — the prompt checkpoint on the device: the tracer
+//! bullet of cross-request state reuse.
+//!
+//! Every request's prefill is cut at its **generation opener**, the point
+//! where the rendered prompt hands over to the model, and the whole-sequence
+//! state there is retained after the request finishes. A later request whose
+//! prompt *extends* it — the next turn of a chat, the next iteration of an
+//! agent's tool loop — resumes there instead of re-prefilling the whole
+//! conversation.
+//!
+//! What these tests can prove, and what they cannot. The claim "reused state
+//! is the *right* state" needs the model to run, and lives in
+//! `prompt_checkpoint_gpu.rs`. What lives here is everything the next layer
+//! up observes without a card: which prompt tokens are prefilled at all,
+//! which are skipped and from where, what the retained pool costs, and — the
+//! load-bearing one — that none of it ever makes a live request wait.
+//!
+//! Seams (ADR 0006): the `Scheduler` trait driven with a `MockCompute` that
+//! records the prefill call shape behind the `Compute` seam, exactly as
+//! `prefix_reuse.rs` drives sibling reuse.
+
+use std::sync::Arc;
+
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
+use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
+use ignis_core::{
+    ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute, Scheduler,
+    SchedulerConfig, Speculation, SpeculativeBackend,
+};
+
+const MODEL: &str = "qwen3.8-27b";
+/// The default scheduler's KV page, in tokens.
+const PAGE: u32 = 16;
+
+/// `n` distinct tokens starting at `start`.
+fn tokens(start: u32, n: u32) -> Vec<u32> {
+    (start..start + n).collect()
+}
+
+/// A request whose rendered prompt's generation opener ends `opener` tokens
+/// in (`None` for a frontend that reported none).
+fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
+    RequestInput {
+        model: MODEL.into(),
+        tokens: prompt,
+        params: DecodeParams {
+            max_tokens: Some(max),
+            ..DecodeParams::default()
+        },
+        multimodal: None,
+        opener_tokens: opener,
+        user_turn_tokens: None,
+        system_block_tokens: None,
+    }
+}
+
+/// [`input`], with the **last real user query** reported at `user_turn` tokens
+/// in (GitHub #187): what tells one more iteration of a tool loop from a new
+/// turn of the conversation.
+fn turn(prompt: Vec<u32>, opener: u32, user_turn: u32, max: u32) -> RequestInput {
+    RequestInput {
+        user_turn_tokens: Some(user_turn),
+        ..input(prompt, Some(opener), max)
+    }
+}
+
+/// **Turn N** of a conversation: 40 prompt tokens whose opener ends at 37 —
+/// the last two or three tokens are the `<think>\n` the opener is deliberately
+/// placed *before* (ADR 0029), so the prompt really does continue past it.
+fn turn_n() -> RequestInput {
+    input(tokens(1, 40), Some(37), 4)
+}
+
+/// **Turn N+1**: turn N's prompt up to its opener, then the assistant's reply,
+/// the user's next message and a new opener of its own — the shape every
+/// later turn of a chat (and every iteration of a tool loop) actually has.
+fn turn_n_plus_1() -> RequestInput {
+    input([tokens(1, 37), tokens(500, 23)].concat(), Some(57), 4)
+}
+
+fn scheduler(compute: Arc<MockCompute>, config: SchedulerConfig) -> ConcreteScheduler {
+    ConcreteScheduler::with_config(config, compute)
+}
+
+fn config() -> SchedulerConfig {
+    SchedulerConfig {
+        model: MODEL.into(),
+        ..SchedulerConfig::default()
+    }
+}
+
+fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
+    let mut events = Vec::new();
+    while !sched.is_idle() {
+        events.extend(sched.advance());
+    }
+    events
+}
+
+/// The `StateReused` events for `request`, as (source, skipped tokens,
+/// restore micros).
+fn reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32, u64)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::StateReused {
+                request: r,
+                source,
+                tokens,
+                restore_micros,
+            } if *r == request => Some((*source, *tokens, *restore_micros)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every prefill chunk width dealt to `request`, in order.
+fn chunk_widths(compute: &MockCompute, request: RequestId) -> Vec<usize> {
+    compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == request)
+        .map(|j| j.tokens.len())
+        .collect()
+}
+
+// ── The reuse itself ────────────────────────────────────────────────────
+
+#[test]
+fn turn_n_plus_1_reuses_turn_n_prompt_checkpoint() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "turn N left a checkpoint at its opener"
+    );
+
+    // Turn N+1 arrives after turn N has finished: no sibling is alive to
+    // share anything with, which is exactly the case sibling prefix reuse
+    // cannot serve.
+    let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(
+        reuses(&events, n1),
+        vec![(ReuseSource::Device, 37, 1)],
+        "turn N+1 resumed from turn N's checkpoint, on the device"
+    );
+    // It prefilled its own 23 new tokens and nothing else: no chunk of it
+    // ever carried a token turn N had already warmed.
+    let widths = chunk_widths(&compute, n1);
+    assert_eq!(widths.iter().sum::<usize>(), 23, "only the new tokens");
+    let first = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .find(|j| j.request == n1)
+        .expect("turn N+1 was prefilled");
+    assert_eq!(first.start_position, 37, "it starts at turn N's opener");
+    assert_eq!(
+        first.checkpoint.map(|c| (c.publisher, c.tokens)),
+        Some((n, 37)),
+        "its first job claims turn N's checkpoint by name"
+    );
+    assert!(
+        first.shared_prefix.is_none(),
+        "a checkpoint claim subsumes a sibling-prefix claim, never doubles it"
+    );
+    assert_eq!(sched.checkpoint_pool().reused_tok(), 37);
+}
+
+#[test]
+fn a_claim_does_not_consume_the_checkpoint() {
+    // Regenerate, retry and two forks from one history all hit (ADR 0029),
+    // one after another, long after the request that captured the entry
+    // finished. The entry is still there at the end of all of them: a claim
+    // copies, it never takes.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+
+    for tail in [500u32, 700, 900] {
+        let fork = sched
+            .submit(
+                input([tokens(1, 37), tokens(tail, 23)].concat(), Some(57), 4),
+                RequestClass::Interactive,
+            )
+            .unwrap();
+        let events = run_to_idle(&mut sched);
+        assert_eq!(
+            reuses(&events, fork),
+            vec![(ReuseSource::Device, 37, 1)],
+            "fork from {tail} hits the same checkpoint"
+        );
+    }
+    assert_eq!(sched.checkpoint_pool().reused_tok(), 3 * 37);
+    assert!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .any(|e| e.publisher == n && e.tokens == 37),
+        "the claimed entry survived every claimant"
+    );
+    // GitHub #187's one open consequence, recorded rather than hidden: each
+    // fork now captures a checkpoint of its own, and — having claimed the same
+    // entry — joins the same lineage, so the last fork's capture supersedes
+    // the one before it. The forks all *reuse* (the acceptance criterion), and
+    // the turn opener they share is kept whatever they do; what is not kept is
+    // three sibling futures of one history. Splitting the lineage on a fork
+    // needs a rule ADR 0029 does not yet have.
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        2,
+        "the turn opener, and the newest fork's own checkpoint"
+    );
+}
+
+#[test]
+fn a_prompt_that_diverges_before_the_opener_reuses_nothing() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+
+    // A different conversation that happens to open the same way. Its prompt
+    // parts from turn N's at token 20, well before the opener.
+    let other = sched
+        .submit(
+            input([tokens(1, 20), tokens(800, 40)].concat(), Some(57), 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(reuses(&events, other).is_empty(), "no retained state matched");
+    assert_eq!(
+        chunk_widths(&compute, other).iter().sum::<usize>(),
+        60,
+        "it prefilled its whole prompt"
+    );
+}
+
+// ── Where the prefill is cut ────────────────────────────────────────────
+
+#[test]
+fn the_prefill_is_cut_at_the_publish_point_and_again_at_the_opener() {
+    // The state a claimant receives is the state *at the opener*, so the
+    // chunk that lands on it has to stop there — the same reason a shared
+    // prefix is published at a chunk boundary (ADR 0024). The opener is at
+    // most one page past the publish point, so the second cut costs one short
+    // chunk and only on the tick that takes the checkpoint.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 5, 3],
+        "cut at the 2-page publish point, then at the 37-token opener"
+    );
+    let capture: Vec<Option<u32>> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n)
+        .map(|j| j.capture_checkpoint_tokens)
+        .collect();
+    assert_eq!(
+        capture,
+        vec![None, Some(37), None],
+        "exactly the chunk that ends on the opener asks for the capture"
+    );
+}
+
+#[test]
+fn a_page_aligned_opener_is_captured_on_the_publish_chunk() {
+    // One prompt in sixty-four has its opener land exactly on a page
+    // boundary. There is no second chunk to cut, so the capture rides the
+    // publish chunk: the backend publishes the prefix and captures against
+    // it in one call. Without this the aligned prompts would be the only
+    // ones that silently never retain anything.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched
+        .submit(input(tokens(1, 40), Some(2 * PAGE), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 8],
+        "no extra cut: the opener already is the publish point"
+    );
+    let jobs: Vec<(Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n)
+        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(Some(32), Some(32)), (None, None)],
+        "one chunk publishes and captures"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+
+    // And it is claimable like any other.
+    let later = sched
+        .submit(
+            input([tokens(1, 32), tokens(600, 28)].concat(), Some(57), 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 32, 1)]);
+}
+
+#[test]
+fn the_chunk_that_captures_is_always_greedy() {
+    // Why "the penalty-count row at the opener is zero" is a design property
+    // and not a hope. A prefill chunk that ends the prompt is dealt the
+    // request's *real* sampling parameters — it samples, and sampling updates
+    // the sequence's penalty-count row. Every other chunk is dealt greedy
+    // parameters, whose leaf branch has no sampling side effect at all. So
+    // the capture is only ever asked for from an intermediate chunk, and the
+    // row it captures has never been written.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let stochastic = RequestInput {
+        params: DecodeParams {
+            max_tokens: Some(4),
+            temperature: 0.9,
+            presence_penalty: 0.7,
+            frequency_penalty: 0.5,
+            ..DecodeParams::default()
+        },
+        ..turn_n()
+    };
+    let n = sched.submit(stochastic, RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "it did capture");
+
+    let jobs: Vec<(Option<u32>, f32, f32)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n)
+        .map(|j| {
+            (
+                j.capture_checkpoint_tokens,
+                j.params.temperature,
+                j.params.presence_penalty,
+            )
+        })
+        .collect();
+    let capturing = jobs
+        .iter()
+        .find(|(at, _, _)| at.is_some())
+        .expect("one chunk captures");
+    assert_eq!(
+        (capturing.1, capturing.2),
+        (0.0, 0.0),
+        "the capturing chunk is greedy, so nothing has been sampled at the opener"
+    );
+    // And the request really was stochastic: the chunk that ends its prompt
+    // carries what it asked for, which is the chunk a capture must never be.
+    let final_chunk = jobs.last().expect("a last chunk");
+    assert_eq!(final_chunk.0, None, "the last chunk never captures");
+    assert_eq!(
+        (final_chunk.1, final_chunk.2),
+        (0.9, 0.7),
+        "and it is the one that samples"
+    );
+}
+
+#[test]
+fn an_opener_at_the_very_end_of_the_prompt_captures_nothing() {
+    // Such a prompt hands over to the model with nothing after the opener, so
+    // the chunk that would capture is also the chunk that samples. Refused
+    // rather than captured from — and the next turn loses nothing it could
+    // have had, since a checkpoint at the prompt's end is the point ADR 0029
+    // rejected in the first place.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched
+        .submit(input(tokens(1, 40), Some(40), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 8],
+        "and its prefill is not cut for a capture that cannot happen"
+    );
+}
+
+#[test]
+fn a_prompt_with_no_reported_opener_captures_nothing() {
+    // The frontend could not place the opener — no `<|im_start|>assistant\n`,
+    // or a byte offset that does not tokenize to an exact prefix. No
+    // checkpoint is taken, rather than one taken at a point the tokenizer
+    // disagrees about.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched
+        .submit(input(tokens(1, 40), None, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 8],
+        "only the shared-prefix publish cut remains"
+    );
+}
+
+#[test]
+fn a_prompt_shorter_than_one_page_captures_nothing() {
+    // There is no whole page under the opener to hang the checkpoint's
+    // history on, so nothing is retained — and the request pays nothing.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched
+        .submit(input(tokens(1, 12), Some(9), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+    assert_eq!(chunk_widths(&compute, n), vec![12], "one uncut chunk");
+}
+
+#[test]
+fn a_checkpoint_claimant_publishes_a_chained_head_and_captures_its_own() {
+    // GitHub #187 — the limitation #186 refused by name, removed. Turn N+1
+    // resumed at turn N's 37-token opener, so the whole pages below its *own*
+    // 57-token opener are partly turn N's prefix: there is no head of its own
+    // to publish. It publishes a **chained** one instead — the third page,
+    // which it warmed itself, over the two it claimed — and from there its
+    // opener falls inside a page it alone writes, which is exactly what the
+    // capture demands.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs: Vec<(usize, Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == n1)
+        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(11, Some(48), None), (9, None, Some(57)), (3, None, None)],
+        "cut at its own opener's page, published there, then cut at the opener"
+    );
+    assert_eq!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .map(|e| e.tokens)
+            .collect::<Vec<_>>(),
+        vec![37, 57],
+        "the turn opener, and turn N+1's own checkpoint beside it"
+    );
+    // The chained entry is charged only for the page it warmed: the two under
+    // it are still turn N's prefix, counted once for every holder.
+    assert_eq!(sched.kv_used_pages(), 3, "three pages, not five");
+}
+
+#[test]
+fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
+    // The scheduler's cache entry and the leaf's prefix are two ledgers over
+    // one set of pages, and they were the same number until the publish
+    // point was floored to the *opener's* page rather than the prompt's. If
+    // the cache registered the prompt's head instead, a sibling would skip
+    // prefill for tokens nothing ever warmed — and would answer from a hole,
+    // silently.
+    //
+    // A 40-token prompt whose opener ends at 30: two whole pages of prompt,
+    // but only one whole page below the opener.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let first = sched
+        .submit(input(tokens(1, 40), Some(30), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        chunk_widths(&compute, first),
+        vec![16, 14, 10],
+        "cut at the opener's page, then at the opener"
+    );
+
+    // The cache entry under the checkpoint covers one page — the head the
+    // backend published — and not the prompt's own two. Its pages are what
+    // the pool is charged and what a claimant's reservation shrinks by, so an
+    // entry claiming a page the leaf never published would hand a claimant
+    // warm history that does not exist.
+    assert_eq!(
+        sched.checkpoint_pool().retained_pages(),
+        1,
+        "the retained entry holds exactly the published page"
+    );
+    assert_eq!(
+        sched.kv_used_pages(),
+        1,
+        "and the pool is charged for exactly that page once every live request is gone"
+    );
+
+    // A later request sharing the whole 40-token head resumes at the
+    // checkpoint's 30-token opener, which reaches further than the 16-token
+    // prefix under it: longest reuse wins (ADR 0029).
+    let later = sched
+        .submit(
+            input([tokens(1, 30), tokens(700, 30)].concat(), None, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 30, 1)]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, .. } if *request == later)),
+        "and it took the checkpoint rather than the shorter prefix under it"
+    );
+    assert_eq!(
+        chunk_widths(&compute, later).iter().sum::<usize>(),
+        30,
+        "so it prefills only what the checkpoint does not cover"
+    );
+}
+
+#[test]
+fn a_tool_loop_keeps_two_checkpoints_and_discards_the_superseded_one() {
+    // GitHub #187's acceptance criterion, end to end on the mock backend. An
+    // agent's tool loop re-sends its whole history every iteration; each one
+    // claims the last one's checkpoint and captures its own one turn further
+    // along. Nothing between them is a real user message, so each supersedes
+    // what it claimed — and a conversation that ran all day would still be
+    // holding exactly two entries: its turn opener and its latest.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    // The user's one message ends 5 tokens in; everything after it is the
+    // assistant calling tools and the tools answering.
+    let it1 = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    let it2 = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 23)].concat(), 57, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, it2), vec![(ReuseSource::Device, 37, 1)]);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 2, "opener + latest");
+
+    let it3 = sched
+        .submit(
+            turn(
+                [tokens(1, 37), tokens(500, 20), tokens(700, 23)].concat(),
+                77,
+                5,
+                4,
+            ),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        reuses(&events, it3),
+        vec![(ReuseSource::Device, 57, 1)],
+        "iteration 3 resumes from iteration 2's checkpoint, not iteration 1's"
+    );
+    assert_eq!(
+        chunk_widths(&compute, it3).iter().sum::<usize>(),
+        80 - 57,
+        "so it prefills only the tool result and the new opener"
+    );
+
+    let kept: Vec<(u32, bool)> = sched
+        .checkpoint_pool()
+        .entries()
+        .iter()
+        .map(|e| (e.tokens, e.turn_opening))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(37, true), (77, false)],
+        "still two: the turn opener and the latest"
+    );
+    // "Discarded immediately", not "eventually": the byte budget was nowhere
+    // near full, so nothing but the lineage rule could have released it.
+    assert_eq!(
+        compute.released_checkpoints(),
+        vec![it2],
+        "iteration 2's image went the moment iteration 3 took one"
+    );
+    let _ = it1;
+}
+
+#[test]
+fn a_new_user_message_reuses_the_turn_opener_and_retires_the_turn() {
+    // The other half of the pair, and why it is kept: once the human speaks
+    // again the history renders differently (the tool loop's reasoning is
+    // dropped), so the *latest* checkpoint stops matching and the
+    // turn-opening one is the only thing left that does. What the new turn
+    // captures then opens a turn of its own, and the whole previous turn —
+    // its opener and its latest alike — is retired in one go.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let it1 = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    let it2 = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 23)].concat(), 57, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 2);
+
+    // The user types again. Its history diverges from iteration 2's the
+    // moment the assistant's re-rendered reply starts, so only the 37-token
+    // turn opener is still a prefix of it.
+    let next = sched
+        .submit(
+            turn([tokens(1, 37), tokens(1500, 30)].concat(), 57, 40, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        reuses(&events, next),
+        vec![(ReuseSource::Device, 37, 1)],
+        "the turn-opening checkpoint is what a new user message matches"
+    );
+    let kept: Vec<(u32, bool)> = sched
+        .checkpoint_pool()
+        .entries()
+        .iter()
+        .map(|e| (e.tokens, e.turn_opening))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![(57, true)],
+        "the new turn opens alone; the previous turn's pair is gone"
+    );
+    let mut released = compute.released_checkpoints();
+    released.sort_unstable();
+    assert_eq!(released, vec![it1, it2], "both of the old turn's images went");
+    let _ = next;
+}
+
+#[test]
+fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
+    // The other claimant #186 refused, and the one #188 runs into on every
+    // real request: a sequence standing on a prefix someone *else* published,
+    // which stops well short of its own generation opener. #186's rule —
+    // "your opener's whole pages must be the prefix you hold" — is satisfied
+    // by publishing a chained head, not by relaxing it, so this path and the
+    // checkpoint-claimant path above are one mechanism rather than two.
+    //
+    // With #188 the prefix below is published at the system-and-tools block
+    // instead of at a previous turn's head. The shape here is the same, and
+    // it is the shape that decides whether a request with a block prefix can
+    // still leave a prompt checkpoint at all.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    // Request A publishes a 2-page head (its own opener floors there).
+    let a = sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Request B shares A's published 32-token head and nothing past it — a
+    // burst sibling, not a later turn — and its own opener is two pages
+    // further on.
+    let b = sched
+        .submit(
+            turn([tokens(1, 32), tokens(600, 40)].concat(), 69, 20, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens, .. } if *request == b && *tokens == 32)),
+        "B claimed A's shared prefix, not a checkpoint"
+    );
+    assert!(reuses(&events, b).is_empty(), "and no checkpoint matched it");
+
+    let jobs: Vec<(usize, Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == b)
+        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(32, Some(64), None), (5, None, Some(69)), (3, None, None)],
+        "it chained a head over the one it claimed, then captured at its own opener"
+    );
+    assert_eq!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .map(|e| (e.publisher, e.tokens))
+            .collect::<Vec<_>>(),
+        vec![(a, 37), (b, 69)],
+        "a burst leaves one checkpoint per sibling, not one for the publisher"
+    );
+}
+
+#[test]
+fn an_opener_inside_the_shared_page_captures_without_a_chained_publish() {
+    // The other regime, and the reason the lineage rule cannot assume the
+    // chained publish happens. While a conversation is still short its next
+    // opener floors to the *same* page as the entry it claimed, so there is
+    // no page to publish and #186's capture path already worked. The lineage
+    // has to come out the same either way.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched
+        .submit(turn(tokens(1, 40), 37, 5, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Opener 40: page 2, exactly the two pages turn N's prefix already holds.
+    let short = sched
+        .submit(
+            turn([tokens(1, 37), tokens(500, 8)].concat(), 40, 5, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    let jobs: Vec<(Option<u32>, Option<u32>)> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == short)
+        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .collect();
+    assert_eq!(
+        jobs,
+        vec![(None, Some(40)), (None, None)],
+        "nothing to publish — the pages below its opener are already shared"
+    );
+    assert_eq!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .map(|e| (e.tokens, e.turn_opening))
+            .collect::<Vec<_>>(),
+        vec![(37, true), (40, false)],
+        "and the pair is the same pair"
+    );
+}
+
+#[test]
+fn a_prompt_that_ends_at_the_checkpoint_prefills_nothing_at_all() {
+    // The retry/regenerate shape (spec story 3) taken to its limit: a prompt
+    // that *is* the retained head. The claim alone puts the sequence where
+    // its prompt ends — position, pending token and all — so there is no span
+    // left to warm, and the job that builds the sequence carries no tokens.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+
+    let exact = sched
+        .submit(input(tokens(1, 37), None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, exact), vec![(ReuseSource::Device, 37, 1)]);
+    let jobs: Vec<usize> = chunk_widths(&compute, exact);
+    assert_eq!(jobs, vec![0], "one job, carrying no prompt tokens at all");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == exact)),
+        "and the request still completes"
+    );
+}
+
+// ── The byte budget ─────────────────────────────────────────────────────
+
+#[test]
+fn a_full_pool_skips_the_capture_and_evicts_nothing() {
+    // `MockCompute` prices a checkpoint image at one nominal byte, so a
+    // one-byte budget holds exactly one.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute.clone(),
+        SchedulerConfig {
+            retained_pool_bytes: 1,
+            ..config()
+        },
+    );
+    let first = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+    assert_eq!(sched.checkpoint_pool().used_bytes(), 1);
+
+    // A second, unrelated conversation reaches its own opener with the pool
+    // already full.
+    let second = sched
+        .submit(
+            input([tokens(900, 37), tokens(950, 3)].concat(), Some(37), 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "the capture was skipped, not made room for"
+    );
+    assert_eq!(
+        sched.checkpoint_pool().counters().discards,
+        0,
+        "nothing was evicted to take a checkpoint"
+    );
+    assert!(
+        compute.released_checkpoints().is_empty(),
+        "and no retained image was released"
+    );
+    assert!(
+        compute
+            .prefill_calls()
+            .iter()
+            .flatten()
+            .filter(|j| j.request == second)
+            .all(|j| j.capture_checkpoint_tokens.is_none()),
+        "a capture the budget cannot hold is never even asked for"
+    );
+    assert_eq!(
+        chunk_widths(&compute, second),
+        vec![32, 8],
+        "so its prefill is not cut at its opener either — a full pool is free"
+    );
+    // The entry that is there is still the first conversation's.
+    let later = sched
+        .submit(turn_n_plus_1(), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 37, 1)]);
+    let _ = first;
+}
+
+#[test]
+fn a_backend_that_declines_the_capture_retains_nothing() {
+    // A capture is a bet the backend may refuse — no room in its own image
+    // pool, a sequence the leaf will not capture. The chunk lands normally,
+    // the request is none the wiser, and the ledger records no entry, so the
+    // scheduler and the device never disagree about what exists.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    compute.refuse_capture(n);
+    let events = run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == n)),
+        "the request completed normally"
+    );
+}
+
+#[test]
+fn prompt_reuse_off_captures_and_reuses_nothing() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute.clone(),
+        SchedulerConfig {
+            prompt_reuse: false,
+            ..config()
+        },
+    );
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "nothing retained");
+    assert_eq!(
+        chunk_widths(&compute, n),
+        vec![32, 8],
+        "and the prefill is not cut at the opener: off costs nothing"
+    );
+
+    let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(reuses(&events, n1).is_empty(), "nothing reused");
+    assert_eq!(
+        chunk_widths(&compute, n1).iter().sum::<usize>(),
+        60,
+        "a cold bench measures a cold engine"
+    );
+}
+
+// ── Cancellation ────────────────────────────────────────────────────────
+
+#[test]
+fn cancel_after_the_capture_keeps_the_checkpoint() {
+    // "As a client whose request was cancelled mid-decode, I want the prompt
+    // checkpoint kept, so that the client's retry hits" (spec, story 8).
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    sched.advance(); // the publish chunk
+    sched.advance(); // the chunk that ends on the opener: captured
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "captured");
+
+    assert!(sched.cancel(n));
+    run_to_idle(&mut sched);
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "the cancelled request's checkpoint stays"
+    );
+    // And the client's retry hits it.
+    let retry = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, retry), vec![(ReuseSource::Device, 37, 1)]);
+}
+
+#[test]
+fn cancel_before_the_capture_leaves_none() {
+    // No partial checkpoints: a request cancelled before it reached its
+    // opener leaves nothing behind, however far its prefill had got.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    sched.advance(); // the publish chunk only — the opener is not reached yet
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+
+    assert!(sched.cancel(n));
+    run_to_idle(&mut sched);
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        0,
+        "nothing was retained"
+    );
+    let later = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(reuses(&events, later).is_empty(), "and nothing to reuse");
+}
+
+// ── Retained state never costs a live request anything ──────────────────
+
+/// A pool tight enough that one large request needs all of it: 8 pages of 16
+/// tokens, and a 128-token sequence envelope.
+fn tight_pool(prompt_reuse: bool) -> SchedulerConfig {
+    SchedulerConfig {
+        model: MODEL.into(),
+        max_sequence_tokens: 128,
+        kv_capacity_pages: 8,
+        kv_page_tokens: PAGE,
+        prompt_reuse,
+        ..SchedulerConfig::default()
+    }
+}
+
+/// Run turn N to completion, then the `hungry` request that needs the whole
+/// KV pool, and report every event the second one's admission produced.
+fn retained_then_hungry(prompt_reuse: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), tight_pool(prompt_reuse));
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    let retained = sched.checkpoint_pool().retained_pages();
+
+    // 120 prompt + 8 generated = 128 tokens = the whole 8-page pool. It
+    // reports no opener of its own, so its chunk decomposition is identical
+    // in both runs and the only thing that differs is whether the pool it has
+    // to fit into is holding something retained. (What *taking* a checkpoint
+    // costs — one short extra chunk — is a different claim, pinned by
+    // `the_prefill_is_cut_at_the_publish_point_and_again_at_the_opener`.)
+    let hungry = sched
+        .submit(input(tokens(2000, 120), None, 8), RequestClass::Interactive)
+        .unwrap();
+    let mut events = Vec::new();
+    let mut ticks_to_admission = None;
+    let mut tick = 0;
+    while !sched.is_idle() {
+        let step = sched.advance();
+        if ticks_to_admission.is_none()
+            && step
+                .iter()
+                .any(|e| matches!(e, SchedEvent::Admitted { request, .. } if *request == hungry))
+        {
+            ticks_to_admission = Some(tick);
+        }
+        events.extend(step);
+        tick += 1;
+    }
+    (
+        events,
+        compute,
+        ticks_to_admission.expect("the hungry request was admitted") * 10 + retained,
+    )
+}
+
+#[test]
+fn a_retained_entry_never_causes_an_admission_refusal_or_wait() {
+    // Retained state is the *first victim* on the device (ADR 0023 as amended
+    // by 0029): a live request that needs the pages takes them back before
+    // admission considers freezing a protection or evicting anybody.
+    //
+    // The proof is a comparison, not an absolute: the same request, against
+    // the same pool, with and without something retained in it. It must be
+    // admitted on the same tick either way, and the run that had retained
+    // state must not have had to protect, evict or re-queue anything to get
+    // there.
+    let (with_retained, compute, packed) = retained_then_hungry(true);
+    let (without, _, packed_cold) = retained_then_hungry(false);
+
+    assert!(packed % 10 > 0, "turn N really did retain pages");
+    assert_eq!(packed_cold % 10, 0, "the control retained nothing");
+    assert_eq!(
+        packed / 10,
+        packed_cold / 10,
+        "the hungry request is admitted on the same tick either way"
+    );
+    for event in &with_retained {
+        assert!(
+            !matches!(
+                event,
+                SchedEvent::Protected { .. }
+                    | SchedEvent::Evicted { .. }
+                    | SchedEvent::Requeued { .. }
+            ),
+            "retained state made a live request wait: {event:?}"
+        );
+    }
+    assert!(
+        !without.iter().any(|e| matches!(
+            e,
+            SchedEvent::Protected { .. } | SchedEvent::Evicted { .. }
+        )),
+        "the control itself must be an uncontended baseline"
+    );
+    assert_eq!(
+        compute.spilled_checkpoints().len(),
+        1,
+        "the retained entry was given up by the device — its image went to KV-RAM"
+    );
+}
+
+#[test]
+fn a_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
+    // The steady state this whole feature exists for: turn N's prefix is held
+    // by its retained entry *and* by the live turn N+1 standing on it. Giving
+    // the entry up there returns not one page — the prefix still has a holder
+    // — so a first-victim loop that did not know it would discard every
+    // checkpoint in the pool and still not fit. The pool must come through
+    // the pressure intact, and the request must go to the eviction machinery
+    // instead, which is what that machinery is for.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), tight_pool(true));
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+
+    // Turn N+1 claims it and is still generating when the pressure arrives.
+    let n1 = sched
+        .submit(
+            input([tokens(1, 37), tokens(500, 23)].concat(), None, 20),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    while sched.request_state(n1) != Some(ignis_core::types::RequestState::Running) {
+        sched.advance();
+    }
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "the claim did not consume the entry"
+    );
+
+    // A request that needs the whole pool arrives.
+    sched
+        .submit(input(tokens(2000, 120), None, 8), RequestClass::Interactive)
+        .unwrap();
+    for _ in 0..4 {
+        sched.advance();
+    }
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "the pool was not emptied for pages that were never going to come back"
+    );
+    assert!(
+        compute.released_checkpoints().is_empty(),
+        "and no image was released"
+    );
+
+    // Once turn N+1 is gone the entry *is* reclaimable, and the first-victim
+    // path takes it — the deferral above was about liveness, not a refusal.
+    run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_checkpoints(), vec![0], "off the device, into KV-RAM");
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
+}
+
+// ── GitHub #189: the identity the retained pool holds ───────────────────
+
+#[test]
+fn the_retained_pool_holds_the_identity_the_backend_reports() {
+    // The seam, end to end: the compatibility identity is read from the
+    // backend — only it knows which artifact it loaded and what version its
+    // own blob layout is at — and every entry a capture leaves carries it. A
+    // pool that took its identity from anywhere else could hand a claimant
+    // state this load's kernels never produced.
+    let loaded = BlobIdentity::of_load(
+        ArtifactHash::from_bytes([7; 32]),
+        KvFormat::Bf16,
+        Some(Speculation::new(SpeculativeBackend::Dflash2, 4).unwrap()),
+        2,
+    );
+    let mut sched = scheduler(
+        Arc::new(MockCompute::with_blob_identity(loaded)),
+        config(),
+    );
+    assert_eq!(sched.checkpoint_pool().identity(), loaded);
+
+    sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    let header = sched
+        .checkpoint_pool()
+        .entries()
+        .first()
+        .expect("turn N left a checkpoint")
+        .header();
+    assert_eq!(header.identity, loaded, "the entry names its own load");
+    assert_eq!(
+        sched.checkpoint_pool().accepts(&header),
+        Ok(()),
+        "and this load accepts what it produced"
+    );
+
+    // The same conversation, the same tokens, under a load that binds no
+    // drafter: its per-slot sections are not the ones those bytes were
+    // written for, so the blob is refused rather than restored — and a turn
+    // N+1 there re-prefills its whole prompt, standing on nothing.
+    let elsewhere = BlobIdentity {
+        drafter: None,
+        ..loaded
+    };
+    let other_compute = Arc::new(MockCompute::with_blob_identity(elsewhere));
+    let mut other = scheduler(other_compute.clone(), config());
+    assert_eq!(
+        other
+            .checkpoint_pool()
+            .accepts(&header)
+            .expect_err("another drafter configuration")
+            .field,
+        IdentityField::Drafter
+    );
+    let later = other
+        .submit(turn_n_plus_1(), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut other);
+    assert!(reuses(&events, later).is_empty(), "nothing to stand on");
+    assert_eq!(
+        chunk_widths(&other_compute, later).iter().sum::<usize>(),
+        60,
+        "every token of the prompt was prefilled, not one skipped"
+    );
+}
+
+#[test]
+fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), tight_pool(true));
+    let n = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        sched.kv_used_pages(),
+        sched.checkpoint_pool().retained_pages(),
+        "once every live request is gone, the pool holds exactly the retained pages"
+    );
+    assert!(sched.kv_used_pages() > 0);
+
+    // A request needing the whole pool, reporting no opener of its own so
+    // that what is left retained afterwards is unambiguous.
+    sched
+        .submit(input(tokens(2000, 120), None, 8), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "retained below the device");
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
+    assert_eq!(sched.checkpoint_pool().used_bytes(), 0, "no device image remains");
+    assert_eq!(sched.kv_used_pages(), 0, "and its pages came back");
+    assert_eq!(compute.spilled_checkpoints(), vec![n], "spilled");
+    assert!(compute.released_checkpoints().is_empty(), "not discarded");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Spill,
+            source: ReuseSource::KvRam,
+        }
+    )));
+    assert_eq!(
+        compute
+            .released_prefixes()
+            .iter()
+            .filter(|&&p| p == n)
+            .count(),
+        1,
+        "the shared pages under it were let go exactly once — the retained \
+         entry was the last holder, not a second, uncounted one"
+    );
+}
+
+#[test]
+fn a_kv_ram_match_clearing_the_floor_restores_without_shared_page_accounting() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute,
+        SchedulerConfig {
+            model: MODEL.into(),
+            max_sequence_tokens: 1280,
+            kv_capacity_pages: 80,
+            kv_page_tokens: PAGE,
+            ..SchedulerConfig::default()
+        },
+    );
+    let history = tokens(1, 1100);
+    sched
+        .submit(input(history.clone(), Some(1050), 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // Occupying the entire device pool takes the retained pages back and
+    // spills the 1050-token checkpoint, which clears KV-RAM's 1024-token
+    // restore floor even when there is no device match.
+    sched
+        .submit(input(tokens(5000, 1272), None, 8), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
+
+    let restored = sched
+        .submit(input(history, None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, restored), vec![(ReuseSource::KvRam, 1050, 1)]);
+    assert_eq!(
+        sched.kv_used_pages(),
+        0,
+        "the restored standalone sequence released its fresh pages; the host blob consumes none"
+    );
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "the KV-RAM restore is non-consuming");
+}

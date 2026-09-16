@@ -28,6 +28,9 @@ fn tokens(start: u32, n: u32) -> Vec<u32> {
 fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
+        opener_tokens: None,
+        user_turn_tokens: None,
+        system_block_tokens: None,
         model: model.into(),
         tokens: prompt,
         params: DecodeParams {
@@ -87,7 +90,12 @@ fn a_sibling_skips_the_shared_prefix() {
     let reused: Vec<u32> = events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::PrefixReused { request, tokens } if *request == sub_id => Some(*tokens),
+            // A live sibling's prefix: never counted as retained reuse (#190).
+            SchedEvent::PrefixReused {
+                request,
+                tokens,
+                retained: false,
+            } if *request == sub_id => Some(*tokens),
             _ => None,
         })
         .collect();

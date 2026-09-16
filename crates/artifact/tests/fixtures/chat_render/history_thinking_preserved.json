@@ -1,0 +1,26 @@
+{
+  "case": {
+    "name": "history_thinking_preserved",
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is in this picture?"
+      },
+      {
+        "role": "assistant",
+        "content": "A gradient with a disc.",
+        "reasoning_content": "The frame is a smooth gradient with a green disc near the top left."
+      },
+      {
+        "role": "user",
+        "content": "And the colours?"
+      }
+    ]
+  },
+  "expected": {
+    "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is in this picture?<|im_end|>\n<|im_start|>assistant\n<think>\nThe frame is a smooth gradient with a green disc near the top left.\n</think>\n\nA gradient with a disc.<|im_end|>\n<|im_start|>user\nAnd the colours?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "shared_prefix_offset": 237
+  }
+}

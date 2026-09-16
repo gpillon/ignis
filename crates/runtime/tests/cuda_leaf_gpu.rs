@@ -65,6 +65,8 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
     let request: RequestId = 1;
     compute
         .prefill_step(&[PrefillJob {
+            checkpoint: None,
+            capture_checkpoint_tokens: None,
             multimodal: None,
             request,
             tokens: prompt,

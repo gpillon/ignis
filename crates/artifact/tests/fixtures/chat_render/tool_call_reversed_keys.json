@@ -1,0 +1,30 @@
+{
+  "case": {
+    "name": "tool_call_reversed_keys",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Again, other way round."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "name": "edit",
+            "arguments": "{\"note\": \"a > b & 'c'\", \"count\": 2, \"edits\": [{\"new\": \"y\", \"old\": \"x\"}], \"dry_run\": false, \"path\": \"src/b.rs\"}"
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "2 edits applied"
+      }
+    ]
+  },
+  "expected": {
+    "text": "<|im_start|>user\nAgain, other way round.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=edit>\n<parameter=note>\na > b & 'c'\n</parameter>\n<parameter=count>\n2\n</parameter>\n<parameter=edits>\n[{\"new\": \"y\", \"old\": \"x\"}]\n</parameter>\n<parameter=dry_run>\nfalse\n</parameter>\n<parameter=path>\nsrc/b.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n2 edits applied\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+}

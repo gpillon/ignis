@@ -21,6 +21,11 @@
 //! live sequence *before* it produces the control tail, so a restore that
 //! had touched it would show up as a different tail below.
 //!
+//! GitHub #194 adds a multimodal sequence to the same claim: one whose rope
+//! delta is not 0 restores to the tokens it would have produced unevicted,
+//! which it cannot unless the blob carried the delta. The model is loaded
+//! with vision for it — a multimodal span is refused on a load without.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing GPU or artifact is a **skip**; under the profile it is a **hard
 //! failure**. Run via `scripts/gpu-profile.ps1` (stops the reference
@@ -28,15 +33,24 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/snapshot_blob.rs"]
+mod snapshot_blob;
+
 use std::path::Path;
 
-use ignis_artifact::{CudaDevice, Device, FrontendSet, Reader, bind_text_scope_27b, materialize};
+use ignis_artifact::{
+    CudaDevice, Device, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize,
+};
+use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::gqa_layer::run_gqa_layer;
-use ignis_core::model_load::load_qwen38_27b;
-use ignis_core::seq::{SeqPool, SeqPoolBudget};
-use ignis_core::step::{decode_program_batch, prefill_program};
+use ignis_core::model_load::{Model, load_qwen38_27b_with_options};
+use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
+use ignis_core::step::{
+    MultimodalPrefill, SamplingParams, decode_program_batch, prefill_program,
+    prefill_program_multimodal,
+};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 512;
@@ -50,9 +64,9 @@ const FIRST_GQA_LAYER: u32 = 3;
 const GENERATED: usize = 6;
 
 fn decode_n(
-    model: &ignis_core::model_load::Model,
+    model: &Model,
     pool: &SeqPool,
-    sequence: &mut ignis_core::seq::Seq<'_>,
+    sequence: &mut Seq<'_>,
     count: usize,
     label: &str,
 ) -> Vec<i32> {
@@ -64,6 +78,32 @@ fn decode_n(
         );
     }
     out
+}
+
+/// A fresh sequence prefilled with `prompt` as a multimodal span rotated at
+/// `positions` and left holding `rope_delta`, and the first tokens it decodes.
+fn prefill_multimodal_and_decode<'p>(
+    model: &Model,
+    pool: &'p SeqPool,
+    prompt: &[i32],
+    positions: &[i32],
+    rope_delta: i32,
+    label: &str,
+) -> (Seq<'p>, Vec<i32>) {
+    let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("{label}: alloc: {e}"));
+    prefill_program_multimodal(
+        model,
+        pool,
+        &mut sequence,
+        prompt,
+        0,
+        SamplingParams::greedy(),
+        MultimodalPrefill { positions, rope_delta, media: None },
+        None,
+    )
+    .unwrap_or_else(|e| panic!("{label}: multimodal prefill: {e}"));
+    let head = decode_n(model, pool, &mut sequence, GENERATED, label);
+    (sequence, head)
 }
 
 #[test]
@@ -84,7 +124,8 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         .collect();
     assert!(!prompt.is_empty());
 
-    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true })
+        .unwrap_or_else(|e| panic!("bind: {e}"));
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
         Err(e) => {
@@ -103,13 +144,15 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let model = load_qwen38_27b(
+    let model = load_qwen38_27b_with_options(
         &reader,
         &artifact,
         &handles,
         MAX_CONTEXT,
         MAX_CONTEXT,
         ignis_core::KvFormat::Bf16,
+        None,
+        Some(Vision::default()),
     )
     .unwrap_or_else(|e| panic!("load model: {e}"));
     // Two slots and room for two full-context sequences plus a short one:
@@ -264,4 +307,82 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         .snapshot_into(&mut vec![0u8; blob.len()])
         .expect_err("a mid-chunk sequence is not snapshotted");
     assert!(refusal.is_not_at_boundary(), "{refusal}");
+    drop(midchunk);
+
+    // ---- GitHub #194: a multimodal sequence restores with its rope delta ---
+    //
+    // A multimodal span over a real question, left holding a rope delta
+    // every later decode round rotates at. The delta is far larger than an
+    // image leaves (tens to hundreds of positions): this model rotates 64 of
+    // 256 head dims at theta 1e7 in 16 of its 64 layers, and at an image's
+    // delta its greedy tokens do not move, so a restore that dropped one
+    // would pass unnoticed. The leaf treats the delta as an opaque scalar
+    // either way. No media columns: a span rotates at its positions with or
+    // without an embedding.
+    const FAR_DELTA: i32 = 200_000;
+    // Even at that delta the first dozen greedy tokens agree with delta 0's;
+    // the tail after the restore is long enough to part company.
+    const MULTIMODAL_TAIL: usize = 34;
+    assert_eq!(snapshot_format_version(), 3, "this leg reads the version-3 blob layout");
+    let long_prompt: Vec<i32> = frontend
+        .tokenizer()
+        .encode(
+            "<|im_start|>user\nWrite a short, original poem about a lighthouse keeper who \
+             collects lost letters from the sea, using vivid and unusual imagery.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+        .unwrap_or_else(|e| panic!("tokenize multimodal prompt: {e}"))
+        .into_iter()
+        .map(|id| i32::try_from(id).expect("token id fits i32"))
+        .collect();
+    let positions: Vec<i32> = (0..3).flat_map(|_| 0..long_prompt.len() as i32).collect();
+
+    let (mut multimodal, _) = prefill_multimodal_and_decode(
+        &model,
+        &pool,
+        &long_prompt,
+        &positions,
+        FAR_DELTA,
+        "multimodal source",
+    );
+    let multimodal_blob =
+        multimodal.snapshot().unwrap_or_else(|e| panic!("multimodal snapshot: {e}"));
+    let (progress, _) = snapshot_blob::section(&multimodal_blob, snapshot_blob::SECTION_PROGRESS);
+    assert_eq!(
+        snapshot_blob::read_i32(&multimodal_blob, progress + snapshot_blob::PROGRESS_ROPE_DELTA),
+        FAR_DELTA,
+        "the blob's progress section carries the sequence's rope delta"
+    );
+    let multimodal_control = decode_n(&model, &pool, &mut multimodal, MULTIMODAL_TAIL, "multimodal control");
+    drop(multimodal);
+
+    let mut multimodal_restored =
+        pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc multimodal target: {e}"));
+    multimodal_restored
+        .restore(&multimodal_blob)
+        .unwrap_or_else(|e| panic!("multimodal restore: {e}"));
+    assert_eq!(
+        multimodal_restored.snapshot().unwrap_or_else(|e| panic!("multimodal re-snapshot: {e}")),
+        multimodal_blob,
+        "a restored multimodal sequence snapshots to the same bytes as its source"
+    );
+    let multimodal_tail =
+        decode_n(&model, &pool, &mut multimodal_restored, MULTIMODAL_TAIL, "multimodal restored tail");
+    drop(multimodal_restored);
+    assert_eq!(
+        multimodal_tail, multimodal_control,
+        "a multimodal sequence restored from a snapshot continues to the same tokens"
+    );
+
+    // The comparison above proves the delta crossed only if the delta decides
+    // what the sequence generates: the same prompt at delta 0 — what a
+    // restore that lost it would decode — must not produce the same text.
+    let (mut unrotated, _) =
+        prefill_multimodal_and_decode(&model, &pool, &long_prompt, &positions, 0, "delta-0 twin");
+    let unrotated_tail = decode_n(&model, &pool, &mut unrotated, MULTIMODAL_TAIL, "delta-0 twin tail");
+    drop(unrotated);
+    assert_ne!(
+        multimodal_control, unrotated_tail,
+        "the rope delta must change the decoded tokens, or this leg proves nothing about it"
+    );
 }

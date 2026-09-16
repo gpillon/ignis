@@ -49,6 +49,28 @@ struct Inner {
     prefixes_released: Vec<RequestId>,
     /// Requests whose device state the scheduler released, in order.
     released: Vec<RequestId>,
+    /// Retained prompt checkpoints the scheduler told the backend to let go
+    /// of (GitHub #186), in order: the capturing request of each. A retained
+    /// entry the scheduler drops without this call is a device image nothing
+    /// will ever free.
+    checkpoints_released: Vec<RequestId>,
+    /// Retained checkpoints the scheduler moved to KV-RAM (GitHub #190), in
+    /// order — each one a device-to-host copy. Kept apart from
+    /// `checkpoints_released` so a test can tell a spill from a discard.
+    checkpoints_spilled: Vec<RequestId>,
+    /// Requests whose next checkpoint spill the backend will fail.
+    spill_failures: std::collections::HashSet<RequestId>,
+    /// Retained prefixes written to KV-RAM, brought back, and freed there
+    /// (GitHub #190), as (publisher, tokens).
+    prefixes_spilled: Vec<(RequestId, u32)>,
+    prefixes_returned: Vec<(RequestId, u32)>,
+    spilled_prefixes_discarded: Vec<(RequestId, u32)>,
+    /// Requests whose next prefill batch the backend will fail (GitHub #190).
+    prefill_failures: std::collections::HashSet<RequestId>,
+    /// Requests whose next asked-for checkpoint capture the backend will
+    /// decline (`refuse_capture`) — a leaf with no room in its own image
+    /// pool, or a sequence it will not capture.
+    capture_refusals: std::collections::HashSet<RequestId>,
 }
 
 /// A deterministic, recording [`Compute`] implementation for tests.
@@ -59,6 +81,7 @@ struct Inner {
 /// streams and different request seeds produce different streams.
 pub struct MockCompute {
     seed: u64,
+    identity: crate::identity::BlobIdentity,
     inner: Mutex<Inner>,
 }
 
@@ -73,7 +96,18 @@ impl MockCompute {
     pub fn with_seed(seed: u64) -> Self {
         Self {
             seed,
+            identity: crate::identity::BlobIdentity::UNSET,
             inner: Mutex::new(Inner::default()),
+        }
+    }
+
+    /// A mock whose state is produced under `identity` (GitHub #189): what a
+    /// test uses to stand in for a real load, or for a *different* load than
+    /// the one some blob came from.
+    pub fn with_blob_identity(identity: crate::identity::BlobIdentity) -> Self {
+        Self {
+            identity,
+            ..Self::new()
         }
     }
 
@@ -118,6 +152,52 @@ impl MockCompute {
         self.inner.lock().unwrap().released.clone()
     }
 
+    /// The capturing requests whose retained prompt checkpoint the scheduler
+    /// released (GitHub #186), in order.
+    pub fn released_checkpoints(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().checkpoints_released.clone()
+    }
+
+    /// The capturing requests whose retained checkpoint the scheduler spilled
+    /// to KV-RAM (GitHub #190), in order.
+    pub fn spilled_checkpoints(&self) -> Vec<RequestId> {
+        self.inner.lock().unwrap().checkpoints_spilled.clone()
+    }
+
+    /// Make the backend fail the next spill of `publisher`'s checkpoint, the
+    /// way a leaf that could not write the blob does (GitHub #190).
+    pub fn fail_spill(&self, publisher: RequestId) {
+        self.inner.lock().unwrap().spill_failures.insert(publisher);
+    }
+
+    /// The retained prefixes spilled to KV-RAM (GitHub #190), in order.
+    pub fn spilled_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().prefixes_spilled.clone()
+    }
+
+    /// The spilled prefixes brought back onto the device, in order.
+    pub fn returned_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().prefixes_returned.clone()
+    }
+
+    /// The spilled prefixes whose blob was freed, in order.
+    pub fn discarded_spilled_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().spilled_prefixes_discarded.clone()
+    }
+
+    /// Fail the next prefill batch carrying a job for `request`, the way a
+    /// leaf error fails the whole call (GitHub #190).
+    pub fn fail_prefill(&self, request: RequestId) {
+        self.inner.lock().unwrap().prefill_failures.insert(request);
+    }
+
+    /// Make the backend decline `request`'s next checkpoint capture (GitHub
+    /// #186): the chunk lands normally and reports that nothing was captured,
+    /// which is how a real leaf refuses a bet it cannot afford.
+    pub fn refuse_capture(&self, request: RequestId) {
+        self.inner.lock().unwrap().capture_refusals.insert(request);
+    }
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -142,17 +222,97 @@ impl Default for MockCompute {
 impl Compute for MockCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         let mut g = self.inner.lock().unwrap();
+        if jobs.iter().any(|job| g.prefill_failures.remove(&job.request)) {
+            return Err(ComputeError::Kernel(-1));
+        }
         for job in jobs {
             // Learn the request's limits / seed from its params.
             g.limits.insert(job.request, job.params.max_tokens);
             g.seeds.insert(job.request, job.params.seed);
         }
         g.prefill_batches.push(jobs.to_vec());
-        Ok(PrefillOutcome::nothing_encoded(jobs.len()))
+        Ok(jobs
+            .iter()
+            .map(|job| PrefillOutcome {
+                encode_micros: 0,
+                // GitHub #186: a nominal, deterministic restore cost on the
+                // job that claimed a checkpoint, so the request log's
+                // `restore_ms` is observable on CPU without inventing a
+                // clock. 0 on every other job, as a real backend reports.
+                restore_micros: if job.checkpoint.is_some() { 1 } else { 0 },
+                // The mock holds no device image, but it *does* answer the
+                // question the scheduler is really asking — "did the capture
+                // you asked for happen?" — so the retained ledger is
+                // exercisable. `capture_failures` makes a backend that
+                // declines the bet testable too.
+                checkpoint_captured: job.capture_checkpoint_tokens.is_some()
+                    && !g.capture_refusals.remove(&job.request),
+            })
+            .collect())
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
+    fn release_prefix(&self, publisher: RequestId, _tokens: u32) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
+    }
+
+    // GitHub #186: the mock holds no device image, but the retained pool's
+    // byte budget has to be exercisable without one — the same reasoning
+    // `snapshot_size` below records. One nominal byte per checkpoint image,
+    // uniform across requests, so a test drives exhaustion by setting
+    // `retained_pool_bytes` to the number of checkpoints it wants to fit.
+    fn checkpoint_image_bytes(&self) -> u64 {
+        1
+    }
+
+    fn blob_identity(&self) -> crate::identity::BlobIdentity {
+        self.identity
+    }
+
+    fn release_checkpoint(&self, publisher: RequestId) {
+        self.inner
+            .lock()
+            .unwrap()
+            .checkpoints_released
+            .push(publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Ok(self.checkpoint_image_bytes())
+    }
+
+    // GitHub #190: the materialized blob is priced like the image — one
+    // nominal byte — so `host_capacity_bytes` counts how many spilled
+    // checkpoints KV-RAM holds.
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        let mut g = self.inner.lock().unwrap();
+        if g.spill_failures.remove(&publisher) {
+            return Err(ComputeError::Kernel(-1));
+        }
+        g.checkpoints_spilled.push(publisher);
+        Ok(1)
+    }
+
+    // GitHub #190: a retained prefix's blob is one nominal byte too.
+    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Ok(1)
+    }
+
+    fn spill_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        self.inner.lock().unwrap().prefixes_spilled.push((publisher, tokens));
+        Ok(1)
+    }
+
+    fn restore_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        self.inner.lock().unwrap().prefixes_returned.push((publisher, tokens));
+        Ok(1)
+    }
+
+    fn discard_spilled_prefix(&self, publisher: RequestId, tokens: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .spilled_prefixes_discarded
+            .push((publisher, tokens));
     }
 
     fn release(&self, request: RequestId) {
@@ -345,5 +505,24 @@ impl Compute for GatedCompute {
 
     fn discard_snapshot(&self, request: RequestId) {
         self.inner.discard_snapshot(request);
+    }
+
+    fn checkpoint_image_bytes(&self) -> u64 {
+        // Forwarded explicitly, like every other method on this decorator: a
+        // silent default of 0 would make a gated test retain nothing at all
+        // and look as though checkpoints simply did not work under latency.
+        self.inner.checkpoint_image_bytes()
+    }
+
+    fn release_checkpoint(&self, publisher: RequestId) {
+        self.inner.release_checkpoint(publisher);
+    }
+
+    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.checkpoint_snapshot_size(publisher)
+    }
+
+    fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
+        self.inner.spill_checkpoint(publisher)
     }
 }

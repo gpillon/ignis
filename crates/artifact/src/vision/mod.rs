@@ -28,7 +28,7 @@ use std::fmt;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::frontend::{ChatMessage, FrontendSet, ReasoningEffort, Tokenizer};
+use crate::frontend::{ChatMessage, ChatRenderOptions, FrontendSet, Tokenizer};
 
 pub use decode::{decode_image, DecodeFailure};
 pub use resize::{smart_resize, Size};
@@ -324,13 +324,12 @@ impl FrontendSet {
         processor: &VisionProcessor,
         messages: &[ChatMessage],
         images: &[&[u8]],
-        enable_thinking: bool,
-        effort: Option<ReasoningEffort>,
+        options: ChatRenderOptions,
         tools: Option<&[JsonValue]>,
     ) -> Result<PreparedPrompt, ProcessorError> {
         let rendered = self
             .chat_template()
-            .render_with_thinking_and_tools(messages, enable_thinking, effort, tools)
+            .render_with_thinking_and_tools(messages, options, tools)
             .map_err(|e| ProcessorError::Render(e.to_string()))?;
         processor.prepare(self.tokenizer(), &rendered, images, &[])
     }

@@ -42,6 +42,16 @@ pub struct EngineShape {
     /// P4-07 GitHub #125): pinned host memory for evicted (suspended)
     /// request snapshots, independent of the GPU-resident pool above.
     pub host_pool_bytes: u64,
+    /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
+    pub prompt_reuse: bool,
+    /// The retained checkpoint pool's device budget, in bytes
+    /// (`--retained-pool-bytes`, GitHub #186). `None` derives it from the
+    /// VRAM left once the model and its pools have landed, which only the
+    /// loaded leaf can report.
+    pub retained_pool_bytes: Option<u64>,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority (`--retained-interactive-ttl`, GitHub #190).
+    pub retained_interactive_ttl: std::time::Duration,
     /// Speculative decoding (`--spec`/`--draft-tokens`, P5-02 GitHub #150):
     /// `None` binds nothing of the drafter.
     pub speculation: Option<ignis_core::Speculation>,
@@ -64,6 +74,9 @@ impl Default for EngineShape {
                 ignis_runtime::DEFAULT_MAX_CONTEXT,
             ),
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
+            retained_pool_bytes: None,
+            retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
         }
@@ -78,6 +91,11 @@ impl From<&crate::config::Config> for EngineShape {
             kv_format: config.kv_format,
             kv_pool_bytes: config.kv_pool_bytes,
             host_pool_bytes: config.host_pool_bytes,
+            prompt_reuse: config.prompt_reuse,
+            retained_pool_bytes: config.retained_pool_bytes,
+            retained_interactive_ttl: std::time::Duration::from_secs(u64::from(
+                config.retained_interactive_ttl_secs,
+            )),
             speculation: config.speculation,
             vision: config.vision,
         }
@@ -90,6 +108,7 @@ fn scheduler_config_for_shape(
     shape: EngineShape,
     kv_page_tokens: u32,
     capacity_pages: u32,
+    retained_pool_bytes: u64,
 ) -> SchedulerConfig {
     SchedulerConfig {
         model,
@@ -98,7 +117,33 @@ fn scheduler_config_for_shape(
         kv_capacity_pages: capacity_pages,
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
+        prompt_reuse: shape.prompt_reuse,
+        retained_pool_bytes,
+        retained_interactive_ttl: shape.retained_interactive_ttl,
         ..SchedulerConfig::default()
+    }
+}
+
+/// The leaf the operator's [`EngineShape`] is loaded as: the last step
+/// before a device exists, and the whole of what `ignis-runtime` is told
+/// about the operator's flags.
+///
+/// Separate from [`cuda_scheduler`] because it is the only link in the chain
+/// from a flag to a blob's identity that needs no card — `Config` reaches
+/// `EngineShape` by [`From`], `EngineShape` reaches the leaf here, and
+/// [`ignis_runtime::CudaLeafConfig::blob_identity`] decides which of *these*
+/// fields the identity is made of (GitHub #189). Leaving this inline in
+/// `cuda_scheduler` would put a field-by-field copy behind a GPU.
+#[cfg(feature = "cuda")]
+fn leaf_config_for_shape(shape: EngineShape) -> ignis_runtime::CudaLeafConfig {
+    ignis_runtime::CudaLeafConfig {
+        max_context_tokens: shape.max_context,
+        kv_format: shape.kv_format,
+        kv_pool_bytes: shape.kv_pool_bytes,
+        prefill_chunk_tokens: shape.prefill_chunk,
+        speculation: shape.speculation,
+        vision: shape.vision,
+        ..ignis_runtime::CudaLeafConfig::default()
     }
 }
 
@@ -117,7 +162,7 @@ pub fn cuda_scheduler(
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
     use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
-    use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
+    use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     // P5-02 (GitHub #150) / GitHub #177: the drafter's and the vision tower's
@@ -130,15 +175,7 @@ pub fn cuda_scheduler(
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
 
-    let leaf_config = CudaLeafConfig {
-        max_context_tokens: shape.max_context,
-        kv_format: shape.kv_format,
-        kv_pool_bytes: shape.kv_pool_bytes,
-        prefill_chunk_tokens: shape.prefill_chunk,
-        speculation: shape.speculation,
-        vision: shape.vision,
-        ..CudaLeafConfig::default()
-    };
+    let leaf_config = leaf_config_for_shape(shape);
 
     // Match the scheduler's KV admission accounting to the pool the leaf
     // actually built. Both sides read the page count from the *same*
@@ -176,8 +213,39 @@ pub fn cuda_scheduler(
     .map_err(|e| e.to_string())?;
     let capacity_pages = kv_pool.block_count() as u32;
 
+    // GitHub #186 (ADR 0029): the retained pool's budget. The operator's own
+    // number wins; absent one it is derived from what the device says is
+    // *actually* free now that the weights, the KV pool and every other
+    // reservation are down — measured, not guessed from `total - weights`,
+    // which is the guess that OOM'd when the KV pool was sized that way
+    // (`cuda_leaf.rs`'s module doc).
+    let retained_pool_bytes = match (shape.prompt_reuse, shape.retained_pool_bytes) {
+        (false, _) => 0,
+        (true, Some(bytes)) => bytes,
+        (true, None) => ignis_core::auto_retained_pool_bytes(stats.free_vram_bytes),
+    };
+    // The startup capacity report for the retained tier, beside
+    // `ignis.runtime.kv_pool`: what was free, what the budget is, and
+    // whether the operator chose it. Read the budget off this line rather
+    // than computing it from a flag.
+    // hotpath-lint-allow: one line per model load.
+    tracing::info!(
+        name: "ignis.runtime.retained_pool",
+        prompt_reuse = shape.prompt_reuse,
+        budget_bytes = retained_pool_bytes,
+        derived = shape.retained_pool_bytes.is_none(),
+        free_vram_bytes = stats.free_vram_bytes,
+        "retained pool"
+    );
+
     Ok(scheduler(
-        scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
+        scheduler_config_for_shape(
+            model_id,
+            shape,
+            KV_PAGE_TOKENS,
+            capacity_pages,
+            retained_pool_bytes,
+        ),
         model,
         eos,
     ))
@@ -201,6 +269,114 @@ mod tests {
         assert_eq!(EngineShape::from(&config), EngineShape::default());
     }
 
+    /// The whole chain from an operator's flags to a blob's identity, with no
+    /// card in it: `Config` -> `EngineShape` -> `CudaLeafConfig` ->
+    /// `BlobIdentity` (GitHub #189). Only the first hop is device-free on its
+    /// own, which is why `leaf_config_for_shape` exists.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_operator_flags_reach_the_identity_through_the_load_and_nothing_else() {
+        let artifact = ignis_core::ArtifactHash::from_bytes([7; 32]);
+        const LAYOUT: u32 = 2;
+        let identity_of = |config: &crate::config::Config| {
+            leaf_config_for_shape(EngineShape::from(config)).blob_identity(artifact, LAYOUT)
+        };
+        let crate::config::ConfigOutcome::Config(base) =
+            crate::config::resolve(&[], |_| None).expect("resolve")
+        else {
+            panic!("expected a runnable config");
+        };
+
+        // Every serving knob at once: the bind address, the timeout, the UI,
+        // the metrics listener, the API key, the prefill chunk, the context,
+        // both pool budgets, `--prompt-reuse` and `--retained-pool-bytes`.
+        // `retained_pool_bytes` is the one that makes this a rule rather than
+        // a nicety: unset, its value is derived from the VRAM left after load,
+        // so it differs from one start of the same server to the next, and an
+        // identity that moved with it would refuse every blob after a reboot.
+        let elsewhere = crate::config::Config {
+            bind: "0.0.0.0:9999".into(),
+            request_timeout_secs: base.request_timeout_secs + 7,
+            ui: !base.ui,
+            metrics: Some("127.0.0.1:9101".into()),
+            api_key: Some(crate::config::ApiKeySetting::Generate),
+            prefill_chunk: 512,
+            max_context: base.max_context / 2,
+            kv_pool_bytes: base.kv_pool_bytes * 2,
+            host_pool_bytes: base.host_pool_bytes * 2,
+            prompt_reuse: !base.prompt_reuse,
+            retained_pool_bytes: Some(3 * 1024 * 1024 * 1024),
+            ..base.clone()
+        };
+        assert_ne!(base, elsewhere, "the two configs really do differ");
+        assert_eq!(
+            identity_of(&base),
+            identity_of(&elsewhere),
+            "no serving flag reaches what the engine is loaded as"
+        );
+
+        // And the two load options that do, end to end from the flag.
+        let bf16 = crate::config::Config {
+            kv_format: ignis_core::KvFormat::Bf16,
+            ..base.clone()
+        };
+        let hq = crate::config::Config {
+            kv_format: ignis_core::KvFormat::HqE8_2b,
+            ..base.clone()
+        };
+        assert_eq!(
+            identity_of(&bf16)
+                .accepts(&identity_of(&hq))
+                .expect_err("another KV format")
+                .field,
+            ignis_core::IdentityField::KvFormat
+        );
+        let drafted = crate::config::Config {
+            speculation: Some(
+                ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 4).unwrap(),
+            ),
+            ..base.clone()
+        };
+        assert_eq!(
+            identity_of(&base)
+                .accepts(&identity_of(&drafted))
+                .expect_err("a drafter this load has not bound")
+                .field,
+            ignis_core::IdentityField::Drafter
+        );
+    }
+
+    #[test]
+    fn the_serving_flags_never_reach_the_load_the_identity_names() {
+        // GitHub #189, ADR 0029, upstream half. A blob's compatibility
+        // identity is assembled by `CudaLeafConfig::blob_identity` (which
+        // tests which of *its* fields count), and `cuda_scheduler` builds
+        // that struct out of nothing but an `EngineShape`. So the operator
+        // flags below cannot change a blob's identity for a reason stronger
+        // than a rule someone remembers: they do not survive the step into
+        // the only value the load is configured from.
+        let crate::config::ConfigOutcome::Config(base) =
+            crate::config::resolve(&[], |_| None).expect("resolve")
+        else {
+            panic!("expected a runnable config");
+        };
+        let elsewhere = crate::config::Config {
+            bind: "0.0.0.0:9999".into(),
+            request_timeout_secs: base.request_timeout_secs + 7,
+            ui: !base.ui,
+            metrics: Some("127.0.0.1:9101".into()),
+            api_key: Some(crate::config::ApiKeySetting::Generate),
+            ..base.clone()
+        };
+        assert_ne!(base, elsewhere, "the two configs really do differ");
+        assert_eq!(
+            EngineShape::from(&base),
+            EngineShape::from(&elsewhere),
+            "the bind address, the timeout, the UI, the metrics listener and \
+             the API key are not part of what the engine is loaded as"
+        );
+    }
+
     #[test]
     fn the_operator_prefill_chunk_reaches_the_scheduler_config() {
         let shape = EngineShape {
@@ -209,13 +385,34 @@ mod tests {
             kv_format: ignis_core::KvFormat::Bf16,
             kv_pool_bytes: 8 * 1024 * 1024 * 1024,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
+            prompt_reuse: true,
+            retained_pool_bytes: None,
+            retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,
         };
 
-        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 4_096);
 
         assert_eq!(config.serving_chunk_tokens, 512);
+        // GitHub #186: the reuse knobs reach the scheduler too — the budget
+        // as the number the caller resolved (the operator's, or the one
+        // derived from free VRAM), never re-derived here.
+        assert!(config.prompt_reuse);
+        assert_eq!(config.retained_pool_bytes, 4_096);
+        // GitHub #190: and so does the Interactive TTL.
+        assert_eq!(config.retained_interactive_ttl, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn prompt_reuse_off_reaches_the_scheduler_config() {
+        let shape = EngineShape {
+            prompt_reuse: false,
+            ..EngineShape::default()
+        };
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 0);
+        assert!(!config.prompt_reuse);
+        assert_eq!(config.retained_pool_bytes, 0);
     }
 
     struct StubLeaf;
@@ -226,6 +423,7 @@ mod tests {
         type Prefix = ();
         type SnapshotBuf = Vec<u8>;
         type Media = ();
+        type Checkpoint = ();
 
         fn load_model(&self) -> Result<Self::Model, i32> {
             Ok(())
@@ -316,6 +514,9 @@ mod tests {
             .submit(
                 RequestInput {
                     multimodal: None,
+                    opener_tokens: None,
+                    user_turn_tokens: None,
+                    system_block_tokens: None,
                     model: "stub".into(),
                     tokens: vec![1],
                     params: DecodeParams {

@@ -184,6 +184,20 @@ pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
             )));
         }
     }
+    // A multimodal cell (GitHub #181) is named by its length *and* its image:
+    // the same length over another image, or over no image, is another cell.
+    for cell in &ours.cells {
+        let theirs = reference.cell(cell.prompt_tokens).expect("checked above");
+        if cell.image != theirs.image {
+            return Err(Refusal(format!(
+                "cell {} measured a different image on each side ({:?} vs {:?}): only the same \
+                 prompt can be compared",
+                cell.prompt_tokens,
+                cell.image.as_ref().map(|image| &image.sha256),
+                theirs.image.as_ref().map(|image| &image.sha256),
+            )));
+        }
+    }
     if ours.cells.is_empty() {
         return Err(Refusal("the records carry no cells".to_string()));
     }
@@ -289,6 +303,7 @@ mod tests {
             median_ttft_ms: crate::ttft::median(ttfts),
             samples,
             error: None,
+            image: None,
         }
     }
 
@@ -337,6 +352,26 @@ mod tests {
         let verdict = check(&ours, &reference).expect("a verdict");
         assert!((verdict.cells[0].ratio - RATIO_THRESHOLD).abs() < 1e-9);
         assert!(verdict.passed, "the threshold is inclusive");
+    }
+
+    #[test]
+    fn cells_of_one_length_over_different_images_are_refused() {
+        let image = |sha256: &str| crate::ttft::ImageIdentity {
+            sha256: sha256.into(),
+            width: 1280,
+            height: 800,
+            question: "q".into(),
+        };
+        let ours = Cell { image: Some(image("aa")), ..cell(1024, &[100.0]) };
+        let theirs = Cell { image: Some(image("bb")), ..cell(1024, &[100.0]) };
+        let refusal = check(&record("ignis", "S", vec![ours.clone()]), &record("reference", "S", vec![theirs]))
+            .expect_err("different images are not one cell");
+        assert!(refusal.0.contains("image"), "{refusal}");
+        // Nor is an image cell the text cell of the same length.
+        check(&record("ignis", "S", vec![ours.clone()]), &record("reference", "S", vec![cell(1024, &[100.0])]))
+            .expect_err("an image cell is not a text cell");
+        check(&record("ignis", "S", vec![ours.clone()]), &record("reference", "S", vec![ours]))
+            .expect("the same image on both sides is one cell");
     }
 
     #[test]

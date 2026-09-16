@@ -14,14 +14,15 @@
 use std::sync::Arc;
 
 use ignis_artifact::vision::{PreparedMedia, VisionProcessor};
-use ignis_artifact::{DecodeStreamState, FrontendSet, Role};
+use ignis_artifact::{ChatRenderOptions, ChatTemplate, DecodeStreamState, FrontendSet, Role};
 use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
 use crate::template::{
-    processor_rejection, ChatMessage, ContentRejection, MessageContent, TemplateProvider,
+    processor_rejection, ChatMessage, ContentRejection, MessageContent, RenderedPrompt,
+    TemplateProvider,
 };
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
@@ -66,6 +67,66 @@ impl ArtifactTemplateProvider {
         self
     }
 
+    /// How many leading tokens of `tokens` end at `prompt`'s generation
+    /// opener (GitHub #186, ADR 0029), or `None` when that cannot be said
+    /// exactly.
+    ///
+    /// The head is tokenized **separately** and required to be a real token
+    /// prefix of the whole prompt. That is not paranoia about the tokenizer:
+    /// a BPE merge that spans the boundary would make the head's ids differ
+    /// from the prompt's own leading ids, and a checkpoint taken at a
+    /// position the two disagree about would hand a later request state for
+    /// history it does not have. When they disagree the answer is `None` —
+    /// no checkpoint, rather than a wrong one.
+    fn opener_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        self.exact_token_prefix(prompt, ChatTemplate::generation_opener_offset(prompt)?, tokens)
+    }
+
+    /// How many leading tokens of `tokens` end `prompt`'s first system block
+    /// (GitHub #188, ADR 0029), or `None` when that cannot be said exactly.
+    ///
+    /// Checked the same way, and refused the same way, as the generation
+    /// opener above — and for a sharper reason. A checkpoint taken at a
+    /// position the two tokenizations disagree about would serve one
+    /// conversation its own near-miss; a *retained prefix* is claimed by
+    /// requests that have nothing else in common, so the same slip would hand
+    /// a subagent KV pages warmed from a block that is not the one it sent.
+    fn system_block_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        self.exact_token_prefix(prompt, ChatTemplate::system_block_offset(prompt)?, tokens)
+    }
+
+    /// How many leading tokens of `tokens` end at `prompt`'s byte offset `at`,
+    /// or `None` when the head does not tokenize to an exact token prefix of
+    /// the whole prompt.
+    ///
+    /// The head is tokenized **separately** and required to be a real token
+    /// prefix. That is not paranoia about the tokenizer: a BPE merge that
+    /// spans the boundary would make the head's ids differ from the prompt's
+    /// own leading ids, and state reused at a position the two disagree about
+    /// would be handed to a request whose history is not the one it was built
+    /// from. When they disagree the answer is `None` — no reuse, rather than
+    /// wrong reuse.
+    fn exact_token_prefix(&self, prompt: &str, at: usize, tokens: &[TokenId]) -> Option<u32> {
+        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
+        (!head.is_empty() && tokens.starts_with(&head)).then(|| head.len() as u32)
+    }
+
+    /// How many leading tokens of `tokens` end where `prompt`'s **last real
+    /// user query** begins (GitHub #187, ADR 0029), or `None` when that cannot
+    /// be said exactly.
+    ///
+    /// Tokenized separately and required to be a real token prefix, for the
+    /// reason [`Self::opener_tokens`] is: this number is compared against a
+    /// retained *checkpoint's* token count, and two offsets the tokenizer
+    /// disagrees about would be compared as if they were on one scale. Unlike
+    /// the opener, an empty head is a legitimate answer — a conversation whose
+    /// very first message is the user's puts its query at token 0.
+    fn user_turn_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        let at = ChatTemplate::last_user_query_offset(prompt)?;
+        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
+        tokens.starts_with(&head).then(|| head.len() as u32)
+    }
+
     /// The chat template's text for `messages`, image parts rendered as
     /// their placeholders.
     fn render(
@@ -80,42 +141,28 @@ impl ArtifactTemplateProvider {
                 let role = Role::parse(&message.role).unwrap_or(Role::User);
                 let mut templated = ignis_artifact::ChatMessage::text(role, "");
                 templated.content = artifact_content(&message.content);
-                // Prior assistant reasoning rides into the prompt only when
-                // the request opted in (GitHub #68) — dropped by default so
-                // a long conversation does not silently accumulate traces.
-                if options.preserve_thinking {
-                    templated.reasoning_content = message.reasoning_content.clone();
-                }
-                // A prior assistant turn's tool calls (GitHub #132): each
-                // call's `arguments` is a JSON-encoded string on the wire
-                // (matching #121's own response shape) and the template
-                // needs the parsed object (`arguments|items`) — a call
-                // whose string does not parse as a JSON object degrades to
-                // an empty one rather than failing the whole render (the
-                // same "never panic, degrade" posture as the render/encode
-                // failures below).
+                // Prior assistant reasoning is handed to the template
+                // whole; which of it survives into the prompt is the
+                // template's decision, driven by the `preserve_thinking`
+                // bound below (GitHub #185). Dropping it here instead
+                // (GitHub #68) pre-empted that decision and left the
+                // template rendering an emptied think block on turns the
+                // reference renders without one (#182). The story #68 was
+                // protecting — a long conversation must not accumulate
+                // traces — is now the template's own
+                // strip-before-the-last-real-user-query branch, which keeps
+                // only the in-flight turn's reasoning, as the reference
+                // does.
+                templated.reasoning_content = message.reasoning_content.clone();
                 if let Some(calls) = &message.tool_calls {
-                    templated.tool_calls = calls
-                        .iter()
-                        .map(|call| ignis_artifact::ToolCall {
-                            id: call.id.clone(),
-                            name: call.function.name.clone(),
-                            arguments: serde_json::from_str(&call.function.arguments)
-                                .unwrap_or_else(|err| {
-                                    eprintln!(
-                                        "ignis-server: history tool_calls[].function.arguments is not valid JSON, degrading to {{}}: {err}"
-                                    );
-                                    serde_json::json!({})
-                                }),
-                        })
-                        .collect();
+                    templated.tool_calls = calls.iter().map(artifact_tool_call).collect();
                 }
                 templated
             })
             .collect();
         self.set
             .chat_template()
-            .render_with_thinking_and_tools(&templated, options.enable_thinking, options.reasoning_effort, Some(tools))
+            .render_with_thinking_and_tools(&templated, render_options(options), Some(tools))
             .map_err(|err| err.to_string())
     }
 }
@@ -126,20 +173,29 @@ impl TemplateProvider for ArtifactTemplateProvider {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         let prompt = match self.render(messages, options, tools) {
             Ok(prompt) => prompt,
             Err(err) => {
                 eprintln!("ignis-server: chat template render failed: {err}");
-                return Vec::new();
+                return RenderedPrompt::default();
             }
         };
-        match self.set.tokenizer().encode(&prompt) {
+        let tokens = match self.set.tokenizer().encode(&prompt) {
             Ok(ids) => ids,
             Err(err) => {
                 eprintln!("ignis-server: tokenizer encode failed: {err}");
-                Vec::new()
+                return RenderedPrompt::default();
             }
+        };
+        let opener_tokens = self.opener_tokens(&prompt, &tokens);
+        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
+        let system_block_tokens = self.system_block_tokens(&prompt, &tokens);
+        RenderedPrompt {
+            tokens,
+            opener_tokens,
+            user_turn_tokens,
+            system_block_tokens,
         }
     }
 
@@ -181,7 +237,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         options: &ThinkingOptions,
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let Some(processor) = &self.vision else {
             return Err(ContentRejection {
                 code: "vision_disabled",
@@ -192,10 +248,34 @@ impl TemplateProvider for ArtifactTemplateProvider {
             code: "invalid_media",
             message: format!("chat template render failed: {err}"),
         })?;
-        let prompt = processor
-            .prepare_prompt(self.set.tokenizer(), &rendered, media, &[])
+        // GitHub #193: the boundaries cross-request reuse is cut at, carried
+        // across the placeholder expansion by the processor, which checks each
+        // for an exact token prefix of the expanded prompt the way
+        // `exact_token_prefix` does for a text one.
+        let user_query = ChatTemplate::last_user_query_offset(&rendered);
+        let offsets = [
+            ChatTemplate::generation_opener_offset(&rendered),
+            ChatTemplate::system_block_offset(&rendered),
+            user_query,
+        ];
+        let boundaries: Vec<usize> = offsets.iter().flatten().copied().collect();
+        let mut prompt = processor
+            .prepare_prompt(self.set.tokenizer(), &rendered, media, &boundaries)
             .map_err(processor_rejection)?;
-        Ok(Multimodal::from_prepared(prompt))
+        let mut frontiers = std::mem::take(&mut prompt.frontiers).into_iter();
+        let [opener_tokens, system_block_tokens, user_turn_tokens] =
+            offsets.map(|offset| offset.and_then(|_| frontiers.next().flatten()));
+        let (tokens, multimodal) = Multimodal::from_prepared(prompt);
+        let rendered = RenderedPrompt {
+            tokens,
+            opener_tokens,
+            // The processor refuses an empty head, as `exact_token_prefix`
+            // does; the user turn alone accepts one (`Self::user_turn_tokens`):
+            // a conversation opening on the user's message has its query at 0.
+            user_turn_tokens: user_turn_tokens.or(user_query.filter(|&at| at == 0).map(|_| 0)),
+            system_block_tokens,
+        };
+        Ok((rendered, multimodal))
     }
 }
 
@@ -228,6 +308,69 @@ impl TokenDecoder for ArtifactTokenDecoder {
                 String::new()
             }
         }
+    }
+}
+
+/// What the request resolved, in the shape the template seam takes it
+/// (GitHub #185). The two types carry the same three controls — the server's
+/// is the one the wire resolves into, the artifact's the one the render is
+/// driven by — and this is the single place they are matched up, by name.
+fn render_options(options: &ThinkingOptions) -> ChatRenderOptions {
+    ChatRenderOptions {
+        enable_thinking: options.enable_thinking,
+        reasoning_effort: options.reasoning_effort,
+        preserve_thinking: options.preserve_thinking,
+    }
+}
+
+/// A prior assistant turn's tool call, as the template takes it (GitHub
+/// #132).
+///
+/// The call's `arguments` is a JSON-encoded string on the wire (matching
+/// #121's own response shape) and rides to the template as that exact
+/// string, never re-serialized: the template walks `arguments|items`, and
+/// a `serde_json` round-trip here would sort the keys and lose the order
+/// the model emitted them in, which is what a later turn has to match
+/// (GitHub #184). A string that is not a JSON object renders as no
+/// parameters rather than failing the whole render — the same "never
+/// panic, degrade" posture as the render/encode failures — and is logged,
+/// since only a client can produce one.
+fn artifact_tool_call(call: &crate::template::ToolCallIn) -> ignis_artifact::ToolCall {
+    let arguments = &call.function.arguments;
+    if let Some(reason) = not_a_json_object(arguments) {
+        eprintln!(
+            "ignis-server: history tool_calls[].function.arguments is not a JSON object, degrading to {{}}: {reason}"
+        );
+    }
+    ignis_artifact::ToolCall {
+        id: call.id.clone(),
+        name: call.function.name.clone(),
+        arguments: arguments.clone(),
+    }
+}
+
+/// Why a wire `arguments` string is not the JSON object the template can
+/// walk, or `None` when it is one. Diagnostic only — the template itself
+/// degrades a string that is not one to no parameters (GitHub #184) — so
+/// this decides a log line, never the render, and it reports the reason
+/// rather than the string, which is a client's own content.
+fn not_a_json_object(arguments: &str) -> Option<String> {
+    match serde_json::from_str::<JsonValue>(arguments) {
+        Ok(value) if value.is_object() => None,
+        Ok(value) => Some(format!("a JSON {}", json_kind(&value))),
+        Err(err) => Some(err.to_string()),
+    }
+}
+
+/// The name of a JSON value's kind, for the log line above.
+fn json_kind(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
     }
 }
 
@@ -384,6 +527,135 @@ mod tests {
         &[]
     }
 
+    /// A template that ends its render the way the real one does — history,
+    /// then the generation opener, then the primed `<think>` (GitHub #186).
+    const TEMPLATE_WITH_OPENER: &str = "{%- for m in messages -%}{{ m.role }} {{ m.content }}          {% endfor %}<|im_start|>assistant
+<think>";
+
+    #[test]
+    fn a_render_with_no_generation_opener_reports_none() {
+        // The placeholder template writes no chat markers, so there is no
+        // point in its prompt that a later turn provably shares — and the
+        // scheduler is told so rather than being given a guess.
+        let (_fixture, _reader, provider) = build_provider();
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(!rendered.tokens.is_empty());
+        assert_eq!(rendered.opener_tokens, None);
+    }
+
+    #[test]
+    fn the_generation_opener_is_reported_as_an_exact_token_prefix() {
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_OPENER);
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        let opener = rendered.opener_tokens.expect("the render has an opener");
+        assert!(opener > 0);
+        assert!(
+            (opener as usize) < rendered.tokens.len(),
+            "the prompt continues past the opener — that tail is what the next turn re-renders away"
+        );
+        // What was promised: the first `opener` ids really are the head's own
+        // ids, not a count someone hoped lined up.
+        let prompt = provider
+            .render(&[ChatMessage::text("user", "hello world")], &opts(), no_tools())
+            .expect("render");
+        let at = ChatTemplate::generation_opener_offset(&prompt).expect("offset");
+        let head = provider.set.tokenizer().encode(&prompt[..at]).expect("encode");
+        assert_eq!(head.len(), opener as usize);
+        assert_eq!(&rendered.tokens[..opener as usize], head.as_slice());
+    }
+
+    /// A template that opens the way the real one does — one system block
+    /// holding the instructions and the tools — then the conversation and the
+    /// generation opener (GitHub #188).
+    /// The newline after `<|im_end|>` is deliberately *not* trimmed (`{%`, not
+    /// `{%-`): it is part of the boundary the real template closes its blocks
+    /// with, and a template that ate it would report no block at all.
+    const TEMPLATE_WITH_SYSTEM_BLOCK: &str = "<|im_start|>system
+You are a careful assistant.<|im_end|>
+{% for m in messages -%}{{ m.role }} {{ m.content }}          {% endfor %}<|im_start|>assistant
+<think>";
+
+    #[test]
+    fn a_render_with_no_system_block_reports_none() {
+        // The placeholder template writes no chat markers at all, so there is
+        // no structural point two unrelated requests provably share — and the
+        // scheduler is told so rather than being given a guess. Nothing is
+        // published, and no prefix is retained.
+        let (_fixture, _reader, provider) = build_provider();
+        let rendered = provider.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(!rendered.tokens.is_empty());
+        assert_eq!(rendered.system_block_tokens, None);
+        // Nor does a render that has an opener but opens on the conversation:
+        // the two boundaries are reported independently.
+        let (_f2, _r2, with_opener) = build_provider_with(TEMPLATE_WITH_OPENER);
+        let rendered = with_opener.apply_chat_template(
+            &[ChatMessage::text("user", "hello world")],
+            &opts(),
+            no_tools(),
+        );
+        assert!(rendered.opener_tokens.is_some(), "this render has an opener");
+        assert_eq!(rendered.system_block_tokens, None);
+    }
+
+    #[test]
+    fn the_system_block_is_reported_as_an_exact_token_prefix_before_the_opener() {
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
+        let messages = [ChatMessage::text("user", "hello world")];
+        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let block = rendered
+            .system_block_tokens
+            .expect("the render opens with a system block");
+        let opener = rendered.opener_tokens.expect("and ends with an opener");
+        assert!(block > 0);
+        assert!(
+            block < opener,
+            "the block ({block}) closes before the opener ({opener}) — the retained prefix is \
+             the head the checkpoint's own history stands on"
+        );
+        // What was promised: the first `block` ids really are the head's own
+        // ids, not a count someone hoped lined up.
+        let prompt = provider.render(&messages, &opts(), no_tools()).expect("render");
+        let at = ChatTemplate::system_block_offset(&prompt).expect("offset");
+        let head = provider.set.tokenizer().encode(&prompt[..at]).expect("encode");
+        assert_eq!(head.len(), block as usize);
+        assert_eq!(&rendered.tokens[..block as usize], head.as_slice());
+    }
+
+    #[test]
+    fn two_requests_sharing_a_system_block_report_the_same_boundary() {
+        // The burst property, at this seam: the boundary is a fact about the
+        // block, not about the query behind it, so two subagents that differ
+        // only in their question report the same count over the same ids.
+        let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
+        let first =
+            provider.apply_chat_template(&[ChatMessage::text("user", "one")], &opts(), no_tools());
+        let second = provider.apply_chat_template(
+            &[ChatMessage::text("user", "a quite different question")],
+            &opts(),
+            no_tools(),
+        );
+        let block = first.system_block_tokens.expect("a block");
+        assert_eq!(second.system_block_tokens, Some(block));
+        assert_eq!(
+            first.tokens[..block as usize],
+            second.tokens[..block as usize],
+            "the shared boundary covers the same ids in both prompts"
+        );
+        assert_ne!(first.tokens, second.tokens, "and the prompts really differ");
+    }
+
     #[test]
     fn apply_chat_template_uses_the_real_template_and_tokenizer() {
         let (_fixture, _reader, provider) = build_provider();
@@ -391,14 +663,14 @@ mod tests {
             ChatMessage::text("user", "hello world"),
             ChatMessage::text("assistant", "hi there"),
         ];
-        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
-        assert!(!tokens.is_empty(), "the rendered prompt must tokenize");
+        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        assert!(!rendered.tokens.is_empty(), "the rendered prompt must tokenize");
         // Determinism: the same conversation templates identically (the
         // trait's contract).
-        assert_eq!(tokens, provider.apply_chat_template(&messages, &opts(), no_tools()));
+        assert_eq!(rendered, provider.apply_chat_template(&messages, &opts(), no_tools()));
         // Property assertion (not an exact string): the templated prompt
         // contains the user's message text, decoded by the same tokenizer.
-        let text = provider.render_tokens(&tokens);
+        let text = provider.render_tokens(&rendered.tokens);
         assert!(text.contains("hello world"), "{text}");
     }
 
@@ -416,7 +688,7 @@ mod tests {
         let messages = [ChatMessage::text("bogus", "hello")];
         // The foreign role must not panic: it templates as `user` (the
         // documented v1 fallback), and the prompt still renders.
-        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools()).tokens;
         assert!(!tokens.is_empty());
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("hello"), "{text}");
@@ -436,8 +708,8 @@ mod tests {
                 .expect("parts deserialize");
         let mut parts_form = ChatMessage::text("user", "");
         parts_form.content = parts;
-        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools());
-        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools());
+        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools()).tokens;
+        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools()).tokens;
         assert_eq!(parts_tokens, string_tokens);
         assert!(provider.render_tokens(&parts_tokens).contains("hello world"));
     }
@@ -500,7 +772,7 @@ mod tests {
             preserve_thinking: false,
         };
         let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("true"), "{text}");
         assert!(text.contains("low"), "{text}");
@@ -518,29 +790,37 @@ mod tests {
             preserve_thinking: false,
         };
         let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools());
+            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
         assert!(tokens.is_empty(), "a raising render must degrade to no tokens");
     }
 
     #[test]
-    fn apply_chat_template_drops_reasoning_content_unless_preserved() {
+    fn apply_chat_template_forwards_reasoning_content_for_the_template_to_decide() {
+        // GitHub #185: which history reasoning survives into the prompt is
+        // the template's decision, not the provider's. The provider hands it
+        // every turn's `reasoning_content` in both states and binds the
+        // resolved `preserve_thinking` alongside it; the real template then
+        // strips the turns before the last real user query and keeps a tool
+        // loop's in-flight ones, exactly as the reference does
+        // (`ChatTemplate`'s `preserve_thinking_*` tests pin that decision on
+        // the real dialect).
+        //
+        // Blanking it here instead — what the provider used to do — made the
+        // decision unreachable: the template never saw the text it was
+        // supposed to keep.
         let (_fixture, _reader, provider) = build_thinking_provider(THINKING_TEMPLATE);
         let mut message = ChatMessage::text("assistant", "the answer");
         message.reasoning_content = Some("scratch work".to_owned());
 
-        let dropped = provider.apply_chat_template(&[message.clone()], &opts(), no_tools());
-        let dropped_text = provider.render_tokens(&dropped);
-        assert!(!dropped_text.contains("scratch"), "{dropped_text}");
-        assert!(!dropped_text.contains("work"), "{dropped_text}");
-
-        let preserved_options = ThinkingOptions {
-            preserve_thinking: true,
-            ..opts()
-        };
-        let preserved = provider.apply_chat_template(&[message], &preserved_options, no_tools());
-        let preserved_text = provider.render_tokens(&preserved);
-        assert!(preserved_text.contains("scratch"), "{preserved_text}");
-        assert!(preserved_text.contains("work"), "{preserved_text}");
+        for options in [opts(), ThinkingOptions { preserve_thinking: true, ..opts() }] {
+            let tokens = provider.apply_chat_template(&[message.clone()], &options, no_tools()).tokens;
+            let text = provider.render_tokens(&tokens);
+            assert!(
+                text.contains("scratch") && text.contains("work"),
+                "preserve_thinking={}: {text}",
+                options.preserve_thinking
+            );
+        }
     }
 
     #[test]
@@ -604,8 +884,7 @@ mod tests {
         let prompt = template
             .render_with_thinking_and_tools(
                 &[ArtifactMessage::text(Role::User, "hi")],
-                true,
-                None,
+                ChatRenderOptions::default(),
                 Some(&tools),
             )
             .expect("render");
@@ -633,7 +912,7 @@ mod tests {
             }}),
         ];
         let prompt = template
-            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], true, None, Some(&tools))
+            .render_with_thinking_and_tools(&[ArtifactMessage::text(Role::User, "hi")], ChatRenderOptions::default(), Some(&tools))
             .expect("render");
         let expected = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n\
 {\"function\": {\"description\": \"Read <path> & print it's text\", \"name\": \"read_file\", \
@@ -657,7 +936,7 @@ mod tests {
             tool_calls: vec![ArtifactToolCall {
                 id: Some("call_0".to_owned()),
                 name: "read_file".to_owned(),
-                arguments: json!({"path": "a.txt"}),
+                arguments: r#"{"path": "a.txt"}"#.to_owned(),
             }],
             reasoning_content: None,
         };
@@ -681,6 +960,63 @@ mod tests {
         assert_eq!(args, json!({"path": "a.txt"}));
     }
 
+    /// One wire tool call, as a client resends it in a history message.
+    fn wire_tool_call(name: &str, arguments: &str) -> crate::template::ToolCallIn {
+        crate::template::ToolCallIn {
+            id: Some("call_0".to_owned()),
+            function: crate::template::FunctionIn {
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_resent_tool_calls_arguments_reach_the_template_as_the_wire_string() {
+        // GitHub #184 AC1, at the server's own hop: the wire `arguments`
+        // string is handed to the template untouched, so no re-encoding
+        // step exists that could reorder its keys.
+        let wire = r#"{"path":"b.rs","dry_run":false,"count":2}"#;
+        let call = artifact_tool_call(&wire_tool_call("edit", wire));
+        assert_eq!(call.arguments, wire);
+        assert_eq!(call.name, "edit");
+        assert_eq!(call.id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn a_resent_tool_call_renders_its_parameters_in_the_wire_order() {
+        // GitHub #184 AC1, through the real tag dialect: the parameters
+        // come out in the order the `arguments` document carries them —
+        // `path`, `dry_run`, `edits`, `count` — not the alphabetical
+        // `count`, `dry_run`, `edits`, `path` a `serde_json::Map` would
+        // impose, and the nested object keeps `old` before `new` too.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let history = ArtifactMessage {
+            role: Role::Assistant,
+            content: ignis_artifact::MessageContent::Text(String::new()),
+            tool_calls: vec![artifact_tool_call(&wire_tool_call(
+                "edit",
+                r#"{"path":"src/b.rs","dry_run":false,"edits":[{"old":"x","new":"y"}],"count":2}"#,
+            ))],
+            reasoning_content: None,
+        };
+        let prompt = template.render(&[history]).expect("render");
+        // The reference's own bytes for these arguments
+        // (`chat_template.cpp` `render_tool_call`: a string parameter
+        // verbatim, anything else through `tojson_text`).
+        assert!(
+            prompt.contains(
+                "<tool_call>\n<function=edit>\n\
+                 <parameter=path>\nsrc/b.rs\n</parameter>\n\
+                 <parameter=dry_run>\nfalse\n</parameter>\n\
+                 <parameter=edits>\n[{\"old\": \"x\", \"new\": \"y\"}]\n</parameter>\n\
+                 <parameter=count>\n2\n</parameter>\n\
+                 </function>\n</tool_call>"
+            ),
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn a_malformed_tool_call_arguments_string_degrades_to_an_empty_object_not_a_panic() {
         // Acceptance: `ArtifactTemplateProvider::apply_chat_template`
@@ -700,7 +1036,7 @@ mod tests {
         // Must not panic; `TEMPLATE` has no `tool_calls` branch of its own,
         // so this only proves the degrade happens before the render call —
         // the real dialect is exercised in the round-trip test above.
-        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools());
+        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools()).tokens;
         assert!(!tokens.is_empty(), "the render must still complete");
     }
 }

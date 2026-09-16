@@ -187,6 +187,32 @@ impl Multimodal {
         }
     }
 
+    /// The last whole-page boundary at or before `at` that does not fall
+    /// **inside** a media item's placeholder span (GitHub #193), or 0.
+    ///
+    /// Retained state — a shared prefix, a retained prefix — is cut at whole
+    /// KV pages, and a page floor lands mid-image whenever an image straddles
+    /// a page boundary, which a picture hundreds of tokens long almost always
+    /// does. The boundary walks back to the page holding the item's first
+    /// placeholder rather than being refused: the head before the image is
+    /// still the history every sibling shares, whatever picture it sent. A
+    /// boundary exactly at an item's first placeholder is outside it.
+    pub fn floor_outside_media(&self, at: u32, page_tokens: u32) -> u32 {
+        if page_tokens == 0 {
+            return 0;
+        }
+        let mut floor = (at / page_tokens) * page_tokens;
+        // Walking back past one item can land inside the one before it; the
+        // items are ascending, so one pass from the last item down settles it.
+        for item in self.media.iter().rev() {
+            let begin = item.token_span.begin as u32;
+            if begin < floor && floor < begin + item.token_span.count as u32 {
+                floor = (begin / page_tokens) * page_tokens;
+            }
+        }
+        floor
+    }
+
     /// The media item the chunk `[start, start + len)` covers, if any. The
     /// chunk must already be capped by [`Self::cap_chunk`].
     pub fn chunk_media(&self, start: u32, len: u32) -> Option<ChunkMedia> {
@@ -339,6 +365,24 @@ mod tests {
         assert_eq!(tail.scatter_indices, (0..12).collect::<Vec<i32>>());
         let second = prompt.chunk_media(40, 60).unwrap();
         assert_eq!((second.item, second.first_column, second.completes_item), (1, 0, true));
+    }
+
+    #[test]
+    fn a_page_floor_never_lands_inside_an_image() {
+        let prompt = multimodal(200, vec![item(20, 30), item(60, 50)]);
+        // Text before any image, and a floor exactly at an image's first
+        // placeholder, stand.
+        assert_eq!(prompt.floor_outside_media(19, 16), 16);
+        assert_eq!(prompt.floor_outside_media(20, 4), 20);
+        // 48 is inside 20..50: back to the page holding placeholder 20.
+        assert_eq!(prompt.floor_outside_media(50, 16), 16);
+        // 96 is inside 60..110, and its first placeholder's page (48) is
+        // inside 20..50 in turn: both walk back.
+        assert_eq!(prompt.floor_outside_media(100, 16), 16);
+        // Past both images, the plain floor.
+        assert_eq!(prompt.floor_outside_media(130, 16), 128);
+        assert_eq!(prompt.floor_outside_media(130, 0), 0);
+        assert_eq!(multimodal(64, Vec::new()).floor_outside_media(63, 16), 48);
     }
 
     #[test]

@@ -243,6 +243,7 @@ pub fn run_canaries(ep: &dyn Endpoint) -> Vec<CanaryResult> {
                 stream: false,
                 include_usage: false,
                 enable_thinking: None,
+                images: Vec::new(),
             };
             let run = |ep: &dyn Endpoint| {
                 ep.complete(&req)

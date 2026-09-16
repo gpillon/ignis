@@ -83,6 +83,16 @@ pub trait PromptTemplate: Send + Sync {
     fn eos_token_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// The post-template token ids for a single user message carrying
+    /// `content` and then `image` (PNG bytes) — the placeholder expanded
+    /// into the image's vision tokens, which is what an engine counts in
+    /// `usage.prompt_tokens` (GitHub #181). A template that cannot render
+    /// images says so, and an image cell over it fails.
+    fn encode_user_message_with_image(&self, content: &str, image: &[u8]) -> Result<Vec<u32>, String> {
+        let _ = (content, image);
+        Err("this template cannot render an image".to_string())
+    }
 }
 
 impl PromptTemplate for ignis_artifact::FrontendSet {
@@ -110,6 +120,27 @@ impl PromptTemplate for ignis_artifact::FrontendSet {
 
     fn eos_token_ids(&self) -> Vec<u32> {
         eos_token_ids_from_generation_config(self.generation_config())
+    }
+
+    fn encode_user_message_with_image(&self, content: &str, image: &[u8]) -> Result<Vec<u32>, String> {
+        use ignis_artifact::{ChatMessage, ChatRenderOptions, ContentPart, MessageContent, Role};
+        let processor = self
+            .vision_processor()
+            .map_err(|e| format!("the artifact's vision processor: {e}"))?;
+        // The order `client::request_body` sends: the text part, then the image.
+        let messages = [ChatMessage {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text(content.to_string()),
+                ContentPart::Image { url: None },
+            ]),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        }];
+        let options = ChatRenderOptions { enable_thinking: false, ..Default::default() };
+        self.prepare_prompt(&processor, &messages, &[image], options, None)
+            .map(|prepared| prepared.token_ids)
+            .map_err(|e| format!("prepare the image prompt: {e}"))
     }
 }
 
@@ -370,6 +401,160 @@ fn prove_divergence(tokens: &[Vec<u32>], overhead: usize) -> Result<(), String> 
     Ok(())
 }
 
+// ── the multimodal cell (GitHub #181) ────────────────────────────────────
+
+/// The question the multimodal cell asks when the operator names none.
+pub const DEFAULT_IMAGE_QUESTION: &str = "Describe what this screenshot shows in one sentence.";
+
+/// The multimodal cell: time to first token of one fixed image plus a short
+/// question — an error detector for the whole vision path (acquisition,
+/// preprocessing, the encode and the image's prefill), not a gate.
+///
+/// Every prompt, the warmup's included, is cold in *everything* an engine
+/// could cache: its text part starts with its own nonce, like a text cell's,
+/// and its image is the operator's with one pixel changed ([`sample_image`]),
+/// so neither a prefix cache nor a preprocessing cache keyed by the image's
+/// digest (both engines have one) can serve it. The size is untouched, so
+/// every sample expands to the same vision tokens.
+#[derive(Debug, Clone)]
+pub struct ImageCellSpec {
+    /// The image, as PNG bytes.
+    pub png: Vec<u8>,
+    /// The question sent before the image.
+    pub question: String,
+    /// Samples after the warmup.
+    pub samples: usize,
+}
+
+/// Which image a multimodal cell measured: what makes two engines' cells
+/// comparable, since a prompt length no longer says what was sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageIdentity {
+    /// SHA-256 (hex) of the image as the operator supplied it, before any
+    /// sample's pixel was changed.
+    pub sha256: String,
+    /// The image's width, in pixels.
+    pub width: u32,
+    /// The image's height, in pixels.
+    pub height: u32,
+    /// The question every sample asked.
+    pub question: String,
+}
+
+impl ImageIdentity {
+    /// The identity of `png` asked `question`.
+    pub fn of(png: &[u8], question: &str) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        let (width, height, _, _) = decode_png(png)?;
+        let sha256 = Sha256::digest(png).iter().map(|b| format!("{b:02x}")).collect();
+        Ok(Self { sha256, width, height, question: question.to_string() })
+    }
+}
+
+/// An 8-bit RGB or RGBA PNG's width, height, colour type and pixels.
+fn decode_png(png: &[u8]) -> Result<(u32, u32, png::ColorType, Vec<u8>), String> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png));
+    let mut reader = decoder.read_info().map_err(|e| format!("decode the image: {e}"))?;
+    let size = reader.output_buffer_size().ok_or("decode the image: the frame is too large")?;
+    let mut pixels = vec![0u8; size];
+    let info = reader.next_frame(&mut pixels).map_err(|e| format!("decode the image: {e}"))?;
+    if info.bit_depth != png::BitDepth::Eight
+        || !matches!(info.color_type, png::ColorType::Rgb | png::ColorType::Rgba)
+    {
+        return Err(format!(
+            "the image must be an 8-bit RGB or RGBA PNG, not {:?} at {:?}",
+            info.color_type, info.bit_depth
+        ));
+    }
+    pixels.truncate(info.buffer_size());
+    Ok((info.width, info.height, info.color_type, pixels))
+}
+
+/// `png` with its top-left pixel set to a colour unique to `index`: the same
+/// size, so the same vision tokens, but different bytes and a different
+/// digest for every index below 65,536.
+pub fn sample_image(png: &[u8], index: usize) -> Result<Vec<u8>, String> {
+    let (width, height, color_type, mut pixels) = decode_png(png)?;
+    pixels[..3].copy_from_slice(&[index as u8, (index >> 8) as u8, 0x5A]);
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| format!("encode the image: {e}"))?;
+        writer.write_image_data(&pixels).map_err(|e| format!("encode the image: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// `bytes` as a base64 `data:image/png` URI.
+pub fn png_data_uri(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity("data:image/png;base64,".len() + bytes.len().div_ceil(3) * 4);
+    out.push_str("data:image/png;base64,");
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A multimodal cell's prompts: one text part and one image per sample,
+/// plus the warmup's, all expanding to the same post-template length.
+#[derive(Debug, Clone)]
+pub struct ImagePromptSet {
+    /// `[0]` is the warmup's text part; `[1..]` are the samples', in order.
+    pub prompts: Vec<String>,
+    /// Each prompt's image (PNG bytes), same order.
+    pub images: Vec<Vec<u8>>,
+    /// The post-template length every prompt shares, vision tokens included.
+    pub prompt_tokens: u32,
+}
+
+/// Generate `count` multimodal prompts over `png` asking `question` (the
+/// warmup's first), and prove before any is sent that they are all the same
+/// length and diverge at the first content token, as a text cell's do.
+pub fn generate_image_cell_prompts(
+    template: &dyn PromptTemplate,
+    png: &[u8],
+    question: &str,
+    count: usize,
+) -> Result<ImagePromptSet, String> {
+    if count == 0 {
+        return Err("a cell needs at least one prompt".to_string());
+    }
+    let mut prompts = Vec::with_capacity(count);
+    let mut images = Vec::with_capacity(count);
+    let mut tokens: Vec<Vec<u32>> = Vec::with_capacity(count);
+    for index in 0..count {
+        let prompt = format!("{} {question}", nonce(index));
+        let image = sample_image(png, index)?;
+        let ids = template.encode_user_message_with_image(&prompt, &image)?;
+        if let Some(first) = tokens.first() {
+            if ids.len() != first.len() {
+                return Err(format!(
+                    "prompt {index} came out {} tokens where prompt 0 came out {}: the samples \
+                     would not measure one length",
+                    ids.len(),
+                    first.len()
+                ));
+            }
+        }
+        prompts.push(prompt);
+        images.push(image);
+        tokens.push(ids);
+    }
+    let overhead = template.encode_user_message("")?.len();
+    prove_divergence(&tokens, overhead)?;
+    Ok(ImagePromptSet { prompts, images, prompt_tokens: tokens[0].len() as u32 })
+}
+
 // ── corpus-cut prompts of an exact length (the `--corpus` path) ──────────
 
 /// Load a corpus of pre-tokenized ids: whitespace-separated `u32`s, one
@@ -595,6 +780,11 @@ pub struct Cell {
     /// generation, or the warmup request).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The image every prompt of this cell carries, for the multimodal cell
+    /// (GitHub #181); absent for a text cell. Its `prompt_tokens` then count
+    /// the image's vision tokens too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageIdentity>,
 }
 
 impl Cell {
@@ -682,6 +872,12 @@ impl Record {
             self.endpoint, self.artifact, self.date
         ));
         for cell in &self.cells {
+            if let Some(image) = &cell.image {
+                out.push_str(&format!(
+                    "  image {}x{} sha256 {}  question {:?}\n",
+                    image.width, image.height, image.sha256, image.question
+                ));
+            }
             match (&cell.error, cell.median_ttft_ms) {
                 (Some(err), _) => {
                     out.push_str(&format!("  {:>7} tokens  FAILED: {err}\n", cell.prompt_tokens));
@@ -762,6 +958,9 @@ pub struct TtftConfig {
     /// windows instead of the filler generator's word growth. Absent, the
     /// filler generator is used, byte for byte the old behavior.
     pub corpus: Option<PathBuf>,
+    /// The multimodal cell (the `--image` flag, GitHub #181), measured after
+    /// the text cells when set.
+    pub image: Option<ImageCellSpec>,
 }
 
 /// The request one sample sends: streaming (TTFT is the first content
@@ -769,7 +968,7 @@ pub struct TtftConfig {
 /// `seed: 0`), thinking disabled (a thinking preamble would move the first
 /// *content* delta behind a reasoning stream), a small output budget, and
 /// the trailing usage chunk (the cold-prefix evidence).
-fn sample_request(id: String, prompt: String, max_tokens: u32) -> Request {
+fn sample_request(id: String, prompt: String, images: Vec<String>, max_tokens: u32) -> Request {
     Request {
         id,
         class: RequestClass::Main,
@@ -778,6 +977,7 @@ fn sample_request(id: String, prompt: String, max_tokens: u32) -> Request {
         stream: true,
         include_usage: true,
         enable_thinking: Some(false),
+        images,
     }
 }
 
@@ -823,46 +1023,104 @@ fn measure_cell_with(
     max_tokens: u32,
     prompts: impl FnOnce() -> Result<PromptSet, String>,
 ) -> Cell {
-    let failed = |error: String| Cell {
-        prompt_tokens: spec.prompt_tokens,
+    if spec.samples == 0 {
+        return failed_cell(spec.prompt_tokens, None, "a cell needs at least one sample".to_string());
+    }
+    // One prompt per sample plus the warmup's — all distinct from the first
+    // content token, proven before anything is sent.
+    match prompts() {
+        Ok(set) => measure_prompts(
+            ep,
+            spec.prompt_tokens,
+            None,
+            max_tokens,
+            set.prompts.into_iter().map(|prompt| (prompt, Vec::new())).collect(),
+        ),
+        Err(err) => failed_cell(spec.prompt_tokens, None, err),
+    }
+}
+
+/// Measure the multimodal cell (GitHub #181): its prompts are generated
+/// from the operator's image ([`generate_image_cell_prompts`]), each sent
+/// with its own image as a `data:` URI, then the same warmup, samples, void
+/// rule and median as a text cell. The cell's length is the one every prompt
+/// expands to, vision tokens included, so an engine that counts the image
+/// differently voids its samples rather than being compared on another
+/// length.
+pub fn measure_image_cell(
+    ep: &dyn Endpoint,
+    template: &dyn PromptTemplate,
+    spec: &ImageCellSpec,
+    max_tokens: u32,
+) -> Cell {
+    let identity = match ImageIdentity::of(&spec.png, &spec.question) {
+        Ok(identity) => identity,
+        Err(err) => return failed_cell(0, None, err),
+    };
+    if spec.samples == 0 {
+        return failed_cell(0, Some(identity), "a cell needs at least one sample".to_string());
+    }
+    match generate_image_cell_prompts(template, &spec.png, &spec.question, spec.samples + 1) {
+        Ok(set) => measure_prompts(
+            ep,
+            set.prompt_tokens,
+            Some(identity),
+            max_tokens,
+            set.prompts
+                .into_iter()
+                .zip(set.images.iter().map(|image| vec![png_data_uri(image)]))
+                .collect(),
+        ),
+        Err(err) => failed_cell(0, Some(identity), err),
+    }
+}
+
+/// A cell that failed before it could be measured.
+fn failed_cell(prompt_tokens: u32, image: Option<ImageIdentity>, error: String) -> Cell {
+    Cell {
+        prompt_tokens,
         warmup_ttft_ms: None,
         samples: Vec::new(),
         median_ttft_ms: None,
         error: Some(error),
-    };
-    if spec.samples == 0 {
-        return failed("a cell needs at least one sample".to_string());
+        image,
     }
-    // One prompt per sample plus the warmup's — all distinct from the first
-    // content token, proven before anything is sent.
-    let set = match prompts() {
-        Ok(set) => set,
-        Err(err) => return failed(err),
+}
+
+/// Send `requests` — `[0]` the warmup's text and images, `[1..]` the
+/// samples' — and reduce the samples to a cell of `prompt_tokens`.
+fn measure_prompts(
+    ep: &dyn Endpoint,
+    prompt_tokens: u32,
+    image: Option<ImageIdentity>,
+    max_tokens: u32,
+    requests: Vec<(String, Vec<String>)>,
+) -> Cell {
+    let mut requests = requests.into_iter();
+    let Some((warmup_prompt, warmup_images)) = requests.next() else {
+        return failed_cell(prompt_tokens, image, "a cell needs at least one prompt".to_string());
     };
 
     // The warmup: its own distinct prompt, so it cannot leave a prefix the
     // measured samples reuse. Its timing is recorded but never counted.
     let warmup = ep.complete(&sample_request(
-        format!("ttft-{}-warmup", spec.prompt_tokens),
-        set.prompts[0].clone(),
+        format!("ttft-{prompt_tokens}-warmup"),
+        warmup_prompt,
+        warmup_images,
         max_tokens,
     ));
     let warmup_ttft_ms = match warmup {
         Ok(outcome) => Some(outcome.ttft_ms),
-        Err(err) => return failed(format!("the warmup request failed: {err}")),
+        Err(err) => return failed_cell(prompt_tokens, image, format!("the warmup request failed: {err}")),
     };
 
-    let mut samples = Vec::with_capacity(spec.samples);
-    for index in 0..spec.samples {
-        let request = sample_request(
-            format!("ttft-{}-{index}", spec.prompt_tokens),
-            set.prompts[index + 1].clone(),
-            max_tokens,
-        );
+    let mut samples = Vec::with_capacity(requests.len());
+    for (index, (prompt, images)) in requests.enumerate() {
+        let request = sample_request(format!("ttft-{prompt_tokens}-{index}"), prompt, images, max_tokens);
         samples.push(match ep.complete(&request) {
             Ok(outcome) => {
                 let computed = outcome.computed_prefill_tokens();
-                let void_reason = coldness_failure(computed, spec.prompt_tokens);
+                let void_reason = coldness_failure(computed, prompt_tokens);
                 Sample {
                     index,
                     ttft_ms: outcome.ttft_ms,
@@ -882,11 +1140,12 @@ fn measure_cell_with(
     }
     let ttfts: Vec<f64> = samples.iter().map(|s| s.ttft_ms).collect();
     Cell {
-        prompt_tokens: spec.prompt_tokens,
+        prompt_tokens,
         warmup_ttft_ms,
         median_ttft_ms: median(&ttfts),
         samples,
         error: None,
+        image,
     }
 }
 
@@ -929,21 +1188,18 @@ pub fn measure(
     // file that cannot be read fails every cell with that error rather
     // than silently measuring with different prompts.
     let corpus = cfg.corpus.as_ref().map(|path| load_corpus(path));
-    let cells = cfg
+    let mut cells: Vec<Cell> = cfg
         .cells
         .iter()
         .map(|spec| match &corpus {
             Some(Ok(ids)) => measure_cell_from_corpus(ep, template, spec, cfg.max_tokens, ids),
-            Some(Err(error)) => Cell {
-                prompt_tokens: spec.prompt_tokens,
-                warmup_ttft_ms: None,
-                samples: Vec::new(),
-                median_ttft_ms: None,
-                error: Some(error.clone()),
-            },
+            Some(Err(error)) => failed_cell(spec.prompt_tokens, None, error.clone()),
             None => measure_cell(ep, template, spec, cfg.max_tokens),
         })
         .collect();
+    if let Some(spec) = &cfg.image {
+        cells.push(measure_image_cell(ep, template, spec, cfg.max_tokens));
+    }
     Record {
         session: cfg.session.clone(),
         label: cfg.label.clone(),
@@ -990,6 +1246,100 @@ mod tests {
             // the corpus tests use the exact `CorpusMock` instead.
             Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
         }
+        /// The text's ids, then one placeholder per 32x32 block of the image.
+        fn encode_user_message_with_image(&self, content: &str, image: &[u8]) -> Result<Vec<u32>, String> {
+            let (width, height, _, _) = decode_png(image)?;
+            let mut ids = self.encode_user_message(content)?;
+            let footer = ids.split_off(ids.len() - self.footer);
+            ids.extend(std::iter::repeat_n(151_655, (width / 32 * (height / 32)) as usize));
+            ids.extend(footer);
+            Ok(ids)
+        }
+    }
+
+    /// A `width` x `height` RGB PNG with a gradient, so no pixel is special.
+    fn gradient_png(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels: Vec<u8> =
+                (0..width * height).flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8]).collect();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn a_sample_image_keeps_its_size_and_changes_only_its_first_pixel() {
+        let png = gradient_png(64, 48);
+        let (_, _, _, original) = decode_png(&png).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for index in [0usize, 1, 2, 255, 256, 65_535] {
+            let sample = sample_image(&png, index).expect("a sample image");
+            let (width, height, color, pixels) = decode_png(&sample).unwrap();
+            assert_eq!((width, height, color), (64, 48, png::ColorType::Rgb));
+            assert_eq!(pixels[3..], original[3..], "only the first pixel changes");
+            assert!(seen.insert(pixels[..3].to_vec()), "index {index} has its own first pixel");
+        }
+    }
+
+    #[test]
+    fn an_image_the_cell_cannot_edit_is_refused_by_name() {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, 4, 4);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&[7u8; 16]).unwrap();
+        }
+        assert!(sample_image(&out, 0).unwrap_err().contains("8-bit RGB or RGBA"));
+        assert!(sample_image(b"not a png", 0).unwrap_err().contains("decode the image"));
+    }
+
+    #[test]
+    fn a_data_uri_is_standard_padded_base64() {
+        assert_eq!(png_data_uri(b""), "data:image/png;base64,");
+        assert_eq!(png_data_uri(b"f"), "data:image/png;base64,Zg==");
+        assert_eq!(png_data_uri(b"fo"), "data:image/png;base64,Zm8=");
+        assert_eq!(png_data_uri(b"foo"), "data:image/png;base64,Zm9v");
+        assert_eq!(png_data_uri(&[0xFB, 0xFF, 0xBF]), "data:image/png;base64,+/+/");
+    }
+
+    #[test]
+    fn image_cell_prompts_share_one_length_and_diverge_at_the_first_content_token() {
+        let template = MockTemplate::new();
+        let png = gradient_png(320, 160);
+        let set = generate_image_cell_prompts(&template, &png, "What is shown?", 6).expect("prompts");
+        assert_eq!(set.prompts.len(), 6);
+        assert_eq!(set.images.len(), 6);
+        // header + nonce + three question words + 10x5 blocks + footer
+        assert_eq!(set.prompt_tokens, (6 + 1 + 3 + 50 + 3) as u32);
+        for i in 0..6 {
+            assert!(set.prompts[i].ends_with("What is shown?"));
+            for j in (i + 1)..6 {
+                assert_ne!(set.images[i], set.images[j], "images {i} and {j} differ");
+                let first = |p: &String| p.split_whitespace().next().unwrap().to_string();
+                assert_ne!(first(&set.prompts[i]), first(&set.prompts[j]));
+            }
+        }
+    }
+
+    #[test]
+    fn an_image_cell_over_a_template_that_cannot_render_images_fails() {
+        struct TextOnly;
+        impl PromptTemplate for TextOnly {
+            fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+                Ok(content.bytes().map(u32::from).collect())
+            }
+            fn decode(&self, _: &[u32]) -> Result<String, String> {
+                Ok(String::new())
+            }
+        }
+        let err = generate_image_cell_prompts(&TextOnly, &gradient_png(32, 32), "q", 2).unwrap_err();
+        assert!(err.contains("cannot render an image"), "{err}");
     }
 
     #[test]

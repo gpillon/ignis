@@ -30,6 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
@@ -157,6 +158,13 @@ struct RequestTelemetry {
     /// Microseconds this request's prefill chunks spent encoding media
     /// (GitHub #192), summed as the chunks land.
     encode_micros: u64,
+    /// The retained state this request's prefill resumed from (GitHub #186,
+    /// ADR 0029): the residency tier, the prompt tokens it skipped, and what
+    /// the restore itself cost. `None` for a request that reused nothing,
+    /// which is how the request log says `reuse_source: none` — by saying
+    /// nothing at all, exactly as it does for `spec.*` on a load with no
+    /// drafter.
+    reuse: Option<(ReuseSource, u32, u64)>,
 }
 
 /// The server's telemetry: tracks per-request state and emits the interval +
@@ -367,7 +375,7 @@ impl Telemetry {
         }
         let rt = self.requests.remove(&id);
         let known = rt.is_some();
-        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class) = match rt {
+        let (submitted_ms, lane, itl_count, itl_sum_ms, itl_max_ms, class, reuse) = match rt {
             Some(rt) => (
                 rt.submitted_ms,
                 rt.lane,
@@ -375,8 +383,17 @@ impl Telemetry {
                 rt.itl_sum_ms,
                 rt.itl_max_ms,
                 rt.class,
+                rt.reuse,
             ),
-            None => (self.clock.now_ms(), 0, 0, 0, 0, RequestClass::default()),
+            None => (
+                self.clock.now_ms(),
+                0,
+                0,
+                0,
+                0,
+                RequestClass::default(),
+                None,
+            ),
         };
         let ms = self.clock.now_ms().saturating_sub(submitted_ms);
         // Only a request this consumer saw submitted has a real span; one
@@ -403,6 +420,7 @@ impl Telemetry {
             itl_count,
             class,
             spec,
+            reuse,
         );
     }
 
@@ -418,12 +436,54 @@ impl Telemetry {
         self.emit_evicted(id, snapshot_micros);
     }
 
-    /// A request's prefill skipped `tokens` prompt tokens through a sibling's
-    /// cached prefix (core-07). Not logged — the request log has no line for
-    /// it — so only the installed projection observes it (GitHub #90).
-    pub fn on_prefix_reused(&mut self, tokens: u32) {
+    /// A request's prefill skipped `tokens` prompt tokens through a cached
+    /// prefix (core-07). Not logged — the request log has no line for it — so
+    /// only the installed projection observes it (GitHub #90).
+    ///
+    /// Two kinds arrive here since GitHub #188: a concurrent sibling's prefix,
+    /// and a **retained prefix** left by a request that has already finished.
+    /// `retained` tells them apart (#190), so `ignis_prefix_reused_tokens_total`
+    /// keeps the *sibling*-prefix meaning ADR 0017's row gives it, and
+    /// cross-request reuse is counted as reuse of retained state on the device.
+    pub fn on_prefix_reused(&mut self, tokens: u32, retained: bool) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_prefix_reused(tokens);
+            if retained {
+                metrics.record_retained_reused(ReuseSource::Device, tokens);
+            } else {
+                metrics.record_prefix_reused(tokens);
+            }
+        }
+    }
+
+    /// A request's prefill resumed from retained state left by an earlier,
+    /// already-finished request (GitHub #186, ADR 0029). Unlike a sibling
+    /// prefix this is a *per-request* fact — which tier served it, how much
+    /// prefill it skipped, what the restore cost — so it is stashed and
+    /// reported on the request's own `done` line rather than only summed
+    /// into a server-wide counter. The skipped tokens are also summed per
+    /// tier into `ignis_retained_reused_tokens_total` (#190) — never into
+    /// `ignis_prefix_reused_tokens_total`, which counts sibling-prefix reuse.
+    pub fn on_state_reused(
+        &mut self,
+        id: RequestId,
+        source: ReuseSource,
+        tokens: u32,
+        restore_micros: u64,
+    ) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_retained_reused(source, tokens);
+        }
+        if let Some(rt) = self.requests.get_mut(&id) {
+            rt.reuse = Some((source, tokens, restore_micros));
+        }
+    }
+
+    /// Something happened to retained state in one tier (GitHub #190). Not
+    /// logged: none of it belongs to one request's line, so only the
+    /// installed projection observes it.
+    pub fn on_retained_state(&mut self, operation: RetainedStateOperation, source: ReuseSource) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_retained_state(operation, source);
         }
     }
 
@@ -445,8 +505,8 @@ impl Telemetry {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
             rt.prefilled_tokens = 0;
-            // GitHub #192: a requeued multimodal request is released and
-            // re-prefilled (#178's fence), so it encodes its items again —
+            // GitHub #192: a requeued multimodal request re-prefills from
+            // the start, so it encodes its items again —
             // the encode seconds of the discarded attempt are not this
             // prefill's, for the same reason its chunks are not.
             rt.encode_micros = 0;
@@ -634,6 +694,7 @@ impl Telemetry {
         itl_samples: u64,
         class: RequestClass,
         spec: Option<SpecCounters>,
+        reuse: Option<(ReuseSource, u32, u64)>,
     ) {
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         // A `None` field records nothing, so a request without speculative
@@ -655,6 +716,14 @@ impl Telemetry {
             spec.drafted = spec.map(|s| s.drafted),
             spec.accepted = spec.map(|s| s.accepted),
             spec.pos = spec_pos.as_deref(),
+            // GitHub #186 (ADR 0029). Absent on a request that reused
+            // nothing: `reuse_source: none` *is* the absence of the field,
+            // the way `spec.*` is absent on a load with no drafter, so the
+            // log never reports a placeholder for something that never
+            // happened.
+            reuse_source = reuse.map(|(source, _, _)| source.as_str()),
+            reused_prompt_tokens = reuse.map(|(_, tokens, _)| tokens),
+            restore_ms = reuse.map(|(_, _, micros)| micros as f64 / 1000.0),
             "request done"
         );
     }
@@ -896,8 +965,8 @@ mod tests {
             telemetry.note_submit(1, 20, RequestClass::Agent);
             telemetry.note_media(1, media);
             telemetry.on_prefill_chunk(1, 8, 250_000);
-            // The attempt is discarded: a multimodal request is released and
-            // re-prefilled, so it encodes its item again.
+            // The attempt is discarded: the request re-prefills from the
+            // start, so it encodes its item again.
             telemetry.on_requeued(1);
             telemetry.on_prefill_chunk(1, 8, 125_000);
             telemetry.on_prefill_chunk(1, 20, 0);
@@ -1290,7 +1359,7 @@ mod tests {
         telemetry.with_metrics(Arc::clone(&metrics));
 
         telemetry.note_submit(1, 3, RequestClass::Agent);
-        telemetry.on_prefix_reused(32);
+        telemetry.on_prefix_reused(32, false);
         telemetry.on_evicted(1, 450);
         telemetry.on_token(1);
         telemetry.on_token(1);
@@ -1327,6 +1396,34 @@ mod tests {
 
         let text = metrics.render();
         assert!(text.contains("\nignis_request_duration_seconds_count 0\n"), "{text}");
+    }
+
+    #[test]
+    fn reuse_is_counted_by_kind_and_tier_never_summed_into_the_sibling_counter() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(7, 2048, RequestClass::Interactive);
+        telemetry.on_state_reused(7, ReuseSource::KvRam, 1536, 42);
+        telemetry.on_prefix_reused(64, true);
+        telemetry.on_prefix_reused(32, false);
+        telemetry.on_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam);
+
+        let text = metrics.render();
+        for line in [
+            "ignis_retained_reused_tokens_total{tier=\"kv_ram\"} 1536",
+            "ignis_retained_reused_tokens_total{tier=\"device\"} 64",
+            "ignis_prefix_reused_tokens_total 32",
+            "ignis_retained_state_spills_total{tier=\"kv_ram\"} 1",
+            // A restore is the scheduler's fact, not this call's: nothing here
+            // may count one a second time.
+            "ignis_retained_state_restores_total{tier=\"kv_ram\"} 0",
+        ] {
+            assert!(text.contains(&format!("
+{line}
+")), "{line} in:
+{text}");
+        }
     }
 
     #[test]

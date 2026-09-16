@@ -31,6 +31,30 @@ pub struct SharedPrefixClaim {
     pub tokens: u32,
 }
 
+/// The retained **prompt checkpoint** a prefill job claims (GitHub #186, ADR
+/// 0029): which request captured it, and how many leading prompt tokens it
+/// covers.
+///
+/// Shaped like [`SharedPrefixClaim`] and for the same reason — the backend
+/// needs a name for the device-resident thing, and the request that captured
+/// it is that name. The difference is what the number means: a shared
+/// prefix's `tokens` is always whole KV pages, a checkpoint's is the
+/// generation opener **wherever it falls**, so the claimant copies the
+/// partial tail page rather than sharing it (CONTEXT.md, "publish point").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointClaim {
+    /// The request whose prefill captured the checkpoint. It is long
+    /// finished; its id is never reused, so it stays a valid name for the
+    /// bytes it left behind.
+    pub publisher: RequestId,
+    /// The leading prompt tokens the checkpoint covers — always equal to this
+    /// job's `start_position`.
+    pub tokens: u32,
+    /// Where the retained bytes live. Device claims clone an image and share
+    /// pages; KV-RAM claims restore one materialized blob into a fresh slot.
+    pub source: crate::checkpoint::ReuseSource,
+}
+
 /// One prefill job handed to the compute backend (batched prefill groups
 /// several of these into one GPU batch to saturate the GPU and cut burst TTFT).
 #[derive(Debug, Clone)]
@@ -66,6 +90,27 @@ pub struct PrefillJob {
     /// prefix's end, so the publish happens at that boundary and nowhere
     /// else.
     pub publish_prefix_tokens: Option<u32>,
+    /// The retained prompt checkpoint this request claims (GitHub #186), if
+    /// any. Set on the request's **first** job, exactly as `shared_prefix` is:
+    /// the backend allocates its sequence against the checkpoint, sharing the
+    /// whole KV pages under it, cloning its mutable state and copying its
+    /// partial tail page, so the sequence begins at `start_position` — the
+    /// generation opener — with the captured state.
+    ///
+    /// Never set together with `shared_prefix`: a checkpoint claim subsumes
+    /// one (the checkpoint sits on a shared prefix of its own), and longest
+    /// reuse wins between the two.
+    pub checkpoint: Option<CheckpointClaim>,
+    /// Capture this request's state as a prompt checkpoint once this chunk
+    /// lands (GitHub #186). Set only on the chunk that ends exactly at the
+    /// generation opener: the state a claimant receives is the state *there*,
+    /// and a chunk that overshot it would have moved that state on — the same
+    /// reason `publish_prefix_tokens` exists.
+    ///
+    /// The capture is a pure read of the live sequence: it perturbs nothing,
+    /// and the request goes on prefilling its last few prompt tokens and
+    /// decoding as if it had not been asked.
+    pub capture_checkpoint_tokens: Option<u32>,
     /// The request's multimodal part (GitHub #178), whole-prompt: the
     /// backend reads this job's span of it at `start_position`. The chunk
     /// holds at most one media item's placeholders
@@ -111,6 +156,22 @@ pub struct DecodeJob {
 pub struct PrefillOutcome {
     /// Wall time this chunk spent encoding a media item, in microseconds.
     pub encode_micros: u64,
+    /// Wall time this job spent restoring retained state, in microseconds
+    /// (GitHub #186): the device-to-device clone of a claimed prompt
+    /// checkpoint into this request's slot. 0 on every job that claimed
+    /// nothing. It is measured rather than assumed (ADR 0024) and it is the
+    /// `restore_ms` the request log reports, so the TTFT a reuse bought is
+    /// attributable against what the reuse itself cost.
+    pub restore_micros: u64,
+    /// Whether this job's `capture_checkpoint_tokens` actually produced a
+    /// retained image (GitHub #186).
+    ///
+    /// A capture is a **bet**, never certain work: a backend that cannot take
+    /// one — no room in its image pool, a sequence the leaf refuses to
+    /// capture — says so here and completes the chunk normally. The scheduler
+    /// records the retained entry only on `true`, so its ledger and the
+    /// device never disagree about what exists.
+    pub checkpoint_captured: bool,
 }
 
 impl PrefillOutcome {
@@ -211,12 +272,14 @@ pub trait Compute: Send + Sync {
     /// CPU-only compute implementations need no lifecycle bookkeeping.
     fn release(&self, _request: RequestId) {}
 
-    /// Release the backend's own handle on the shared prefix `publisher`
-    /// published (P4-10, GitHub #126), once the scheduler's last claimant has
-    /// gone. The leaf's pages return to the pool when every sequence holding
-    /// them has been released too, so this is a handle drop and not a free.
+    /// Release the backend's own handle on the `tokens`-long shared prefix
+    /// `publisher` published (P4-10, GitHub #126), once the scheduler's last
+    /// claimant has gone. The leaf's pages return to the pool when every
+    /// sequence holding them has been released too, so this is a handle drop
+    /// and not a free. A head is named by both: one request may publish its
+    /// system block and then a chained head over it (#187 x #188).
     /// CPU-only compute implementations hold no such handle.
-    fn release_prefix(&self, _publisher: RequestId) {}
+    fn release_prefix(&self, _publisher: RequestId, _tokens: u32) {}
 
     // ── core-06: the KV-RAM host tier (P4-07, GitHub #125, ADR 0024) ────
     //
@@ -270,6 +333,99 @@ pub trait Compute: Send + Sync {
     /// frees the pinned buffer. The request re-prefills from scratch later.
     /// A request with no pending snapshot is a no-op.
     fn discard_snapshot(&self, _request: RequestId) {}
+
+    // ── Prompt checkpoints on the device (GitHub #186, ADR 0029) ─────────
+    //
+    // The retained pool's *policy* — which checkpoints exist, what they cost,
+    // which one a prompt matches, and which one a live request takes back —
+    // is CPU bookkeeping in `crate::checkpoint`, testable without a GPU
+    // exactly as the host tier's is. The two methods below are where that
+    // bookkeeping meets device memory. Capture and claim are not here at all:
+    // they ride on [`PrefillJob`], because a claim has to happen at the moment
+    // the backend builds the sequence and a capture at the moment the chunk
+    // ending on the opener lands.
+
+    /// Device bytes one prompt checkpoint's image would occupy right now: the
+    /// mutable state sections plus the copy of the partial tail page.
+    ///
+    /// A cheap query with nothing allocated and nothing moved — the scheduler
+    /// asks it *before* it tells a job to capture, so a byte budget that
+    /// cannot hold an image never asks for one. Constant for the life of a
+    /// load (the sections are the pool's geometry), so a caller may treat two
+    /// answers as equal. `0` means this backend retains nothing, which is
+    /// what keeps a CPU-only `Compute` behaving exactly as it did before
+    /// checkpoints existed: a zero-byte image is never admitted by the pool.
+    fn checkpoint_image_bytes(&self) -> u64 {
+        0
+    }
+
+    /// The compatibility identity of the state this backend produces
+    /// (GitHub #189, ADR 0029): the artifact it loaded, the KV format its
+    /// pages are written in, the blob layout version its sequence pool
+    /// writes, and the drafter bound at load.
+    ///
+    /// Read from the backend rather than assembled here, because only the
+    /// backend knows two of the four. The blob layout version in particular
+    /// belongs to the leaf — its state-section table is internal by design
+    /// (ADR 0024), so a version this crate held its own copy of would not
+    /// move when the table did, and a stale blob would restore garbage
+    /// instead of being refused.
+    ///
+    /// The default is [`BlobIdentity::UNSET`]: a backend that retains nothing
+    /// has no blobs to hand anybody, and an identity that matches no real
+    /// load is the right answer for one.
+    fn blob_identity(&self) -> crate::identity::BlobIdentity {
+        crate::identity::BlobIdentity::UNSET
+    }
+
+    /// Release the device image `publisher`'s prompt checkpoint left behind,
+    /// and the backend's own hold on the KV pages under it.
+    ///
+    /// Called when the scheduler discards a retained entry — a live request
+    /// taking the pages back (retained state is the first victim, ADR 0023 as
+    /// amended), or, from #187 on, a successor superseding it. The pages come
+    /// back to the pool when every other holder has released too, so this is a
+    /// handle drop and not a free, exactly like
+    /// [`Compute::release_prefix`].
+    fn release_checkpoint(&self, _publisher: RequestId) {}
+
+    /// Bytes a materialized KV-RAM blob of a retained checkpoint needs.
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Lazily materialize a retained checkpoint into pinned host memory and
+    /// release its device image. Returns the host allocation's byte size.
+    fn spill_checkpoint(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    // ── retained prefixes in KV-RAM (GitHub #190) ───────────────────────
+    //
+    // A retained prefix is named as a published head is: its publisher and
+    // its length (one request may publish two heads, #187 x #188).
+
+    /// Bytes a materialized KV-RAM blob of the prefix needs.
+    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Write the prefix's blob into pinned host memory. The device prefix is
+    /// left as it is: the scheduler releases it the usual way, through
+    /// [`Compute::release_prefix`], once the blob exists. Returns its size.
+    fn spill_prefix(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Bring a spilled prefix back onto the device as a published prefix
+    /// under the same name, from its blob, which stays in KV-RAM. Returns the
+    /// restore's wall time in microseconds.
+    fn restore_prefix(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Free a spilled prefix's blob.
+    fn discard_spilled_prefix(&self, _publisher: RequestId, _tokens: u32) {}
 }
 
 /// The engine's scheduling interface — what the server drives.

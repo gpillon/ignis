@@ -34,6 +34,9 @@ use ignis_core::{ConcreteScheduler, MockCompute, ProtectionPhase, Scheduler, Sch
 fn input(tokens: &[u32], max: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
+        opener_tokens: None,
+        user_turn_tokens: None,
+        system_block_tokens: None,
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
         params: DecodeParams {
@@ -64,6 +67,9 @@ fn small_pool() -> SchedulerConfig {
         // for its donors instead of being admitted via a lane eviction.
         host_capacity_bytes: 0,
         serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
+        prompt_reuse: true,
+        retained_pool_bytes: 16,
+        retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
     }
 }
 
@@ -343,6 +349,9 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
         sched.submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
+                user_turn_tokens: None,
+                system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: full_prompt,
                 params: DecodeParams::default(),
@@ -360,6 +369,9 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
         .submit(
             RequestInput {
                 multimodal: None,
+                opener_tokens: None,
+                user_turn_tokens: None,
+                system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (0..10).collect(),
                 params: DecodeParams::default(),
@@ -416,6 +428,9 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             resident_slot_capacity: 16,
             host_capacity_bytes: 0,
             serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
+            prompt_reuse: true,
+            retained_pool_bytes: 16,
+            retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
         },
         compute.clone(),
     );

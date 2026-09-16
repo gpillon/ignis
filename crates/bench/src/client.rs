@@ -50,6 +50,12 @@ pub struct Request {
     /// `oracle::record`'s doc comment for why the G1 comparison needs
     /// thinking disabled.
     pub enable_thinking: Option<bool>,
+    /// Images to send after [`Request::prompt`], each a `data:` URI or an
+    /// HTTP(S) URL (GitHub #181: the multimodal TTFT cell). Empty sends the
+    /// plain-string content every text request always sent; otherwise the
+    /// user message becomes OpenAI content parts, the prompt's text part
+    /// first and then one `image_url` part per image, in order.
+    pub images: Vec<String>,
 }
 
 /// Why a request's token stream ended.
@@ -456,8 +462,19 @@ impl HttpEndpoint {
 /// rides along only when the request set it — most replay traffic leaves it
 /// unset, letting the server's configured default apply).
 fn request_body(req: &Request) -> serde_json::Value {
+    let content = if req.images.is_empty() {
+        serde_json::json!(req.prompt)
+    } else {
+        let mut parts = vec![serde_json::json!({ "type": "text", "text": req.prompt })];
+        parts.extend(
+            req.images
+                .iter()
+                .map(|url| serde_json::json!({ "type": "image_url", "image_url": { "url": url } })),
+        );
+        serde_json::Value::Array(parts)
+    };
     let mut body = serde_json::json!({
-        "messages": [{ "role": "user", "content": req.prompt }],
+        "messages": [{ "role": "user", "content": content }],
         "max_tokens": req.max_tokens,
         "temperature": 0,
         "seed": 0,
@@ -904,6 +921,7 @@ mod tests {
             stream: false,
             include_usage: false,
             enable_thinking: None,
+            images: Vec::new(),
         };
         assert!(request_body(&req).get("enable_thinking").is_none());
     }
@@ -918,6 +936,7 @@ mod tests {
             stream: false,
             include_usage: false,
             enable_thinking: Some(false),
+            images: Vec::new(),
         };
         assert_eq!(request_body(&req)["enable_thinking"], false);
     }
@@ -932,6 +951,7 @@ mod tests {
             stream: false,
             include_usage: false,
             enable_thinking: None,
+            images: Vec::new(),
         };
         assert_eq!(request_body(&req)["class"], "interactive");
         req.class = RequestClass::Sub;
@@ -948,11 +968,40 @@ mod tests {
             stream: true,
             include_usage: true,
             enable_thinking: Some(false),
+            images: Vec::new(),
         };
         let body = request_body_suppressing_eos(&req, &[151_645, 151_643]);
         assert_eq!(body["ignore_eos"], true, "Ignis control");
         assert_eq!(body["logit_bias"]["151645"], -100.0, "reference control");
         assert_eq!(body["logit_bias"]["151643"], -100.0, "every reference EOS");
+    }
+
+    #[test]
+    fn a_request_with_images_sends_its_prompt_then_each_image_as_content_parts() {
+        let mut req = Request {
+            id: "r".into(),
+            class: RequestClass::Main,
+            prompt: "a000 What does this screenshot show?".into(),
+            max_tokens: 4,
+            stream: true,
+            include_usage: true,
+            enable_thinking: Some(false),
+            images: vec!["data:image/png;base64,AAAA".into(), "http://127.0.0.1/b.png".into()],
+        };
+        assert_eq!(
+            request_body(&req)["messages"],
+            serde_json::json!([{ "role": "user", "content": [
+                { "type": "text", "text": "a000 What does this screenshot show?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url", "image_url": { "url": "http://127.0.0.1/b.png" } },
+            ]}])
+        );
+        req.images.clear();
+        assert_eq!(
+            request_body(&req)["messages"][0]["content"],
+            "a000 What does this screenshot show?",
+            "a text-only request keeps the plain-string content"
+        );
     }
 
     #[test]
@@ -965,6 +1014,7 @@ mod tests {
             stream: true,
             include_usage: true,
             enable_thinking: None,
+            images: Vec::new(),
         };
         assert_eq!(
             request_body(&base)["stream_options"]["include_usage"],
@@ -1028,6 +1078,7 @@ mod tests {
             stream: false,
             include_usage: false,
             enable_thinking: None,
+            images: Vec::new(),
         });
         assert_eq!(o.computed_prefill_tokens(), Some(3));
         o.cached_prompt_tokens = Some(2);
@@ -1159,6 +1210,7 @@ mod tests {
             stream: false,
             include_usage: false,
             enable_thinking: None,
+            images: Vec::new(),
         };
         let o = MockEndpoint::fallback_for(&req);
         let m = RequestMetrics {

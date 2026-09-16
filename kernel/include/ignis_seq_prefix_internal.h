@@ -42,18 +42,38 @@
 
 /* A published prefix: the shared pages, the cloned state, and who holds it.
  *
- * Lifetime is one refcount over two kinds of holder. The handle
+ * Lifetime is one refcount over three kinds of holder. The handle
  * ignis_seq_prefix_publish returns is one (released by
- * ignis_seq_prefix_release), and every sequence allocated against the prefix
- * is one more (released by ignis_seq_release). The entry -- and with it the
- * KV pages -- is destroyed when the count reaches zero, which is the leaf's
- * answer to "a page is freed only when the last holder releases it". */
+ * ignis_seq_prefix_release), every sequence allocated against the prefix is
+ * one more (released by ignis_seq_release), and since GitHub #187 a *chained*
+ * prefix published on top of this one is one more again. The entry -- and
+ * with it the KV pages -- is destroyed when the count reaches zero, which is
+ * the leaf's answer to "a page is freed only when the last holder releases
+ * it". Destroying a chained entry drops one reference from its parent, so a
+ * whole run of the chain can go at once. */
 struct ignis_seq_prefix {
-  /* The shared KV pages. Owned here and nowhere else: a claiming sequence's
-   * own `ignis_seq::kv` covers only the tail it writes itself, and this
-   * allocation is never bound to a block-table row -- rows are per sequence,
-   * pages are not. */
+  /* The shared KV pages this entry itself owns. Owned here and nowhere else:
+   * a claiming sequence's own `ignis_seq::kv` covers only the tail it writes
+   * itself, and this allocation is never bound to a block-table row -- rows
+   * are per sequence, pages are not.
+   *
+   * GitHub #187: its OWN pages, not its whole history's. A chained entry
+   * covers `parent`'s pages too, and those stay the parent's allocation --
+   * charged to the pool once and freed once, whichever link of the chain a
+   * sequence happens to hold. */
   ninfer::PagedKVAllocation kv;
+  /* The prefix this one extends (GitHub #187), or null for one that owns
+   * every page of the head it covers.
+   *
+   * A sequence that resumed from retained state and prefilled past it has no
+   * head of its own to publish: the pages below its generation opener are
+   * partly the entry it claimed. It publishes a chained entry instead -- its
+   * own new pages, plus the reference on the parent that the sequence held
+   * until the publish, which *moves* here rather than being taken afresh. So
+   * the chain is held by exactly one reference per link, and every iteration
+   * of an agent's tool loop can leave a prompt checkpoint instead of only the
+   * first (ADR 0029). */
+  ignis_seq_prefix *parent = nullptr;
   /* The device-resident image of every device-resident CLONE section, laid
    * out by `ignis_seq_prefix_clone_layout`. One copy per prefix, not per
    * claimant. */
@@ -62,17 +82,33 @@ struct ignis_seq_prefix {
    * rather than in the device image above (the snapshot path writes them
    * with a plain memcpy for the same reason). */
   ignis_seq_progress_image progress{};
-  /* Tokens of history the prefix covers -- always `pages *
-   * kPagedKVPageSize`, which is what makes a claimant's first write land on
-   * a page it owns. */
+  /* Tokens of history the prefix covers, its chain included -- always
+   * `ignis_seq_prefix_total_pages * kPagedKVPageSize`, which is what makes a
+   * claimant's first write land on a page it owns. */
   std::uint32_t tokens = 0;
-  /* Live holders (the publisher's handle plus every claiming sequence). */
+  /* Live holders: the publisher's handle, every claiming sequence, and a
+   * chained child (GitHub #187). */
   std::uint32_t refcount = 0;
   /* What the clone actually cost, rather than what it was assumed to cost
    * (ADR 0024). Reported through ignis_seq_prefix_stats. */
   std::uint64_t clone_count      = 0;
   double last_clone_micros       = 0.0;
 };
+
+/* The KV pages the head `prefix` covers: its own and every ancestor's
+ * (GitHub #187).
+ *
+ * This is what a claimant shares and what `ignis_seq::shared_pages` counts —
+ * "how much history is warm", which the chain answers together. Who gives
+ * which page back is a different question, answered by each link's own
+ * `kv.mapped_page_count()`. */
+inline std::uint32_t ignis_seq_prefix_total_pages(const ignis_seq_prefix &prefix) {
+  std::uint32_t pages = 0;
+  for (const ignis_seq_prefix *at = &prefix; at != nullptr; at = at->parent) {
+    pages += at->kv.mapped_page_count();
+  }
+  return pages;
+}
 
 /* The device image's layout: the CLONE sections of `pool`'s state-section
  * table, in table order, each aligned to `kIgnisSeqSectionAlign`, with
@@ -124,8 +160,15 @@ enum ignis_seq_prefix_direction {
   IGNIS_SEQ_PREFIX_CLONE = 1
 };
 
-/* Move every mutable state section between `seq`'s slot and `prefix`'s
- * device image, in `direction`.
+/* Move every mutable state section between `seq`'s slot and a device
+ * `image` laid out by `ignis_seq_prefix_clone_layout`, in `direction`, and
+ * the host-side progress scalars with it.
+ *
+ * The image is a plain pointer rather than a shared prefix because a prompt
+ * checkpoint (GitHub #186, ADR 0029) captures the same sections into an
+ * image of its own, at the generation opener rather than at the prefix's
+ * page boundary. One function, so the two cannot drift apart about what a
+ * sequence is made of.
  *
  * Both directions are device-to-device for the device-resident sections:
  * nothing here touches pinned host memory or crosses PCIe, which is the
@@ -136,10 +179,10 @@ enum ignis_seq_prefix_direction {
  * Throws `std::logic_error` for a CLONE section with no case below -- the
  * same loud failure ignis_seq_snapshot and ignis_seq_restore make, so that a
  * section added to the table is carried by all three or by none. */
-inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix,
-                                      ignis_seq &seq, ignis_seq_prefix_direction direction) {
+inline void ignis_seq_state_transfer(ignis_seq_pool &pool, unsigned char *image,
+                                     ignis_seq_progress_image &progress, ignis_seq &seq,
+                                     ignis_seq_prefix_direction direction) {
   const bool capture = direction == IGNIS_SEQ_PREFIX_CAPTURE;
-  auto *image        = static_cast<unsigned char *>(prefix.clone_image.p);
   const auto copy    = [&](void *device_state, void *image_at, std::size_t bytes,
                         const char *what) {
     if (bytes == 0) {
@@ -244,10 +287,25 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
   /* The progress scalars, whichever way we are going. They are host state,
    * so they are the one section this function moves with an assignment. */
   if (capture) {
-    prefix.progress = ignis_seq_progress_of(seq);
+    progress = ignis_seq_progress_of(seq);
+    // GitHub #194: a clone carries no rope delta. The publisher's is its
+    // whole prompt's, not the head's, and a text request claiming a
+    // multimodal publisher's text-only head to its prompt's end runs no
+    // prefill span that could set its own. A multimodal claimant always
+    // prefills a tail (ADR 0029), and that span sets the delta.
+    progress.rope_delta = 0;
   } else {
-    ignis_seq_apply_progress(seq, prefix.progress);
+    ignis_seq_apply_progress(seq, progress);
   }
+}
+
+/* [`ignis_seq_state_transfer`] against a shared prefix's own image and
+ * progress -- the original call, kept so every prefix call site reads
+ * exactly as it did before a second consumer existed. */
+inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix,
+                                      ignis_seq &seq, ignis_seq_prefix_direction direction) {
+  ignis_seq_state_transfer(pool, static_cast<unsigned char *>(prefix.clone_image.p),
+                           prefix.progress, seq, direction);
 }
 
 /* Drop one reference to `prefix`, destroying it -- and returning its pages to
@@ -258,5 +316,54 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
  * ignis_seq_release has to call it: a released sequence is one holder fewer,
  * and nothing else in the leaf knows that. */
 void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix);
+
+/* --- the materialized blob (GitHub #190) ----------------------------------
+ *
+ * A snapshot of a sequence holding a shared prefix, and a retained prompt
+ * checkpoint spilled to KV-RAM, are both written as the blob ignis_seq_snapshot
+ * writes for a sequence that owns its history: the shared pages are copied
+ * into it rather than referenced. Defined in kernel/src/seq.cu and declared
+ * here because kernel/src/seq_checkpoint.cu writes that blob too, and two
+ * copies of its layout could drift apart without either failing. */
+
+/* The offset of `kind` in `sections`. The table always carries every kind
+ * (ignis_seq_section_table builds it unconditionally), so a miss is a
+ * programming error rather than a caller's. */
+std::uint64_t ignis_seq_section_offset(const std::vector<ignis_seq_section> &sections,
+                                       int32_t kind);
+
+/* Zero the bytes of a blob no section's payload covers, so two blobs of the
+ * same state are the same bytes whatever buffer they were written into. */
+void ignis_seq_zero_blob_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
+                              std::uint64_t total_bytes);
+
+/* One checked device-to-host copy on the default stream. */
+void ignis_seq_copy_to_host(void *dst, const void *src, std::size_t bytes, const char *what);
+
+/* The physical pages of a prefix chain, root first: the block-table order a
+ * claimant of `head` addresses them in. Empty for a null `head`. */
+std::vector<std::int32_t> ignis_seq_prefix_chain_page_ids(const ignis_seq_prefix *head);
+
+/* Pack `pages` of `pool` into `dst` in the vendored snapshot layout (plane by
+ * plane, page by page), followed on every plane by that plane's slice of
+ * `tail_page` when it is not null -- a checkpoint's copy of the page its
+ * opener ends inside, packed the same way. Consecutive pages go in one copy. */
+void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
+                                  const std::vector<std::int32_t> &pages, const void *tail_page,
+                                  void *dst);
+
+/* Bytes a materialized blob of `pages` KV pages occupies. */
+std::uint64_t ignis_seq_materialized_blob_bytes(const ignis_seq_pool &pool, std::uint32_t pages);
+
+/* Write the blob of retained state that stands on `chain` -- plus
+ * `tail_page`, a partial page copied beside it, when not null -- with `image`
+ * (laid out by ignis_seq_prefix_clone_layout) and `progress` as its state.
+ * The layout ignis_seq_snapshot writes for a sequence standing at the same
+ * point, so ignis_seq_restore takes it back. Throws on a short `dst`, an
+ * extent that does not match the chain, or a failed device copy. */
+void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
+                                       const void *tail_page, const void *image,
+                                       const ignis_seq_progress_image &progress,
+                                       std::uint32_t pages, void *dst, std::uint64_t dst_bytes);
 
 #endif /* IGNIS_SEQ_PREFIX_INTERNAL_H */

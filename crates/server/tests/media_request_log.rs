@@ -75,6 +75,7 @@ impl Compute for EncodingCompute {
             .iter()
             .map(|job| PrefillOutcome {
                 encode_micros: if job.multimodal.is_some() { self.micros } else { 0 },
+                ..PrefillOutcome::default()
             })
             .collect())
     }
@@ -89,8 +90,8 @@ impl Compute for EncodingCompute {
         self.inner.release(request);
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
-        self.inner.release_prefix(publisher);
+    fn release_prefix(&self, publisher: RequestId, tokens: u32) {
+        self.inner.release_prefix(publisher, tokens);
     }
 
     fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {

@@ -101,11 +101,132 @@ correctness oracles.
   prefill is recorded as information, not failure.
 - **Amends ADR 0024.** A prompt checkpoint's publish point is not a page
   boundary, and a snapshot of a sequence holding a shared prefix materializes
-  the shared pages instead of being refused.
+  the shared pages instead of being refused. A shared prefix may also be
+  published *over* another one (#187, a **chained prefix**): a request that
+  resumed from retained state owns only the pages it warmed past it, so the
+  entry it publishes owns those and holds the chain below — taking over the
+  reference the sequence was holding rather than adding one. One reference per
+  link, every page still charged once, and a claimant of the chain shares all
+  of it. Without it a conversation grown past its first KV page could never
+  take a second checkpoint, and "at most two" above would bound something that
+  never grew.
 - **Amends ADR 0023.** Retained state goes first, on the device and in
   KV-RAM.
+- **Departure (#189): the "artifact content hash" above is a hash of the
+  container's *directory*, not of its payload.** The v2 container carries no
+  per-tensor digest by design (`ignis_artifact::checksum`'s module doc), and
+  hashing ~19 GB of weights at every startup is not a price a compatibility
+  check may charge. `Reader::content_hash` therefore digests everything the
+  container *declares*: its identity, its byte size, its payload start, and
+  every object's name, kind, numeric format, storage layout, shape, offset and
+  length. That catches a different model, a re-export, a re-layout, a renamed
+  or added object, and a format change. It does **not** catch an *in-place
+  re-quantization* that rewrote payload bytes while preserving every name,
+  format, shape and offset — a different model this identity would accept
+  blobs from, and the one hole left in user story 16. Recorded as a test
+  rather than a comment (`a_rewritten_payload_alone_is_the_proxys_known_limit`
+  in `crates/artifact/src/lib.rs`). Closing it needs a digest the *producer*
+  writes into the container: a change to the artifact format, not to this
+  feature. **Open for the owner** — whether the proxy is enough, or whether
+  the v2 container should start carrying a payload digest.
 - **Vision (#180)** builds its media-aware prefix identity on the match key
-  defined here, instead of adding its own.
+  defined here, instead of adding its own. Landed as #193, which keys the
+  sibling shared prefixes by it too: a prefix cache matching raw token ids
+  would have let a sibling sending another picture share one.
 - **Rendering must be stable.** The chat template has to render history the
   way the reference does (tool-argument order, `preserve_thinking`); a
   rendering drift silently turns every match into a miss.
+
+## Amendment (2026-09-16) — which retained object goes first (#188)
+
+The Decision says retained state is "always the first victim" on the device
+but not which of the two kinds goes first. #188 makes both kinds real at the
+same time, so the device's first-victim path needs the order.
+
+**Retained prompt checkpoints are given up before retained prefixes; least
+recently used within each kind.**
+
+Three reasons, in the order they decide it:
+
+- **Width of the bet.** A checkpoint serves one conversation's next turn. A
+  retained prefix serves every future request that opens with that system and
+  tools block, including ones belonging to no conversation seen so far. Between
+  two bets, the narrower one is given up first.
+- **Pages returned per discard.** A checkpoint's prefix reaches past the block
+  its conversation opened with, so discarding one frees at least as many pages
+  as discarding a prefix does. Fewer discards, less reuse lost.
+- **Termination where a prefix carries both.** When the block and the opener
+  fall in the same KV page, one prefix is both the burst's retained block and
+  the pages a checkpoint stands on. Its pages come back only when *every*
+  holder lets go, so the checkpoints on it must go before its retention — any
+  other order gives up the wide bet and still returns no page.
+
+This is a policy the accepted Decision did not fix, recorded here rather than
+left in a comment. The owner may reverse it, and reversing it means two places
+rather than one:
+
+- the order of the two arms in `ConcreteScheduler::reclaim_retained`, which is
+  the ordering itself;
+- `ConcreteScheduler::reclaimable_prefixes`, which must go on listing **both**
+  kinds — checkpoint-held prefixes and bare retained ones — in one set. The
+  third reason above rests on that *membership*, not on the order the union
+  happens to be built in: a prefix carrying both is reclaimable only because
+  both kinds appear in the set, and narrowing it would strand that prefix
+  whichever arm ran first.
+
+`crates/core/tests/retained_prefix.rs`'s
+`the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
+that changes with it; it is written to fail when the order is flipped.
+
+## Amendment (2026-09-16) — the KV-RAM tier (#190)
+
+What building Tier 1 decided that the Decision left open.
+
+- **The restore floor is `KV_RAM_RESTORE_FLOOR_TOKENS` = 1024**, one prefill
+  chunk: a fixed starting value, to be tuned by measurement (the trace replay,
+  #191), not derived. It is measured against the **best reuse still on the
+  device**, a sibling or retained *prefix* included — a KV-RAM restore that
+  beats a device checkpoint but not a device prefix by a chunk pays the
+  crossing for nothing.
+- **Retained prefixes spill too, and come back to the device** (owner
+  decision). A retained prefix the device gives up is written to KV-RAM, ranked
+  with the checkpoints there. A prompt whose longest reuse is such a prefix —
+  beating every device reuse by the restore floor and every KV-RAM checkpoint
+  outright — brings it back **once**: the blob is restored into a carrier
+  sequence, published again under its original name, and retained on the
+  device, where that request and every later member of its burst claim it in
+  place. The blob stays in KV-RAM, so giving the prefix up again copies
+  nothing. Its pages are taken back from retained state like a request's, and
+  it never evicts live work.
+- **A published head is named by its publisher and its length.** One request
+  publishes its system block and then a chained head over it (#187 x #188);
+  keyed by the publisher alone, the second replaced the first, and a burst
+  member claiming the block was stood up on the chain.
+- **A request restored from a materialized blob owns every page it restored.**
+  No publish point at or below the restored length can be reached again, so
+  it publishes, if at all, at its own generation opener's page — the one that
+  makes its next checkpoint capturable — and only when it has an opener, as a
+  claimant's chained publish already must. Without this a conversation that
+  came back from KV-RAM would never leave another checkpoint.
+- **A blob a request has chosen is held until its restore lands.** Nothing
+  discards it in between; a discard that arrives meanwhile takes effect when
+  the claim lets go.
+- **Lifecycle facts.** Hit (chosen), miss (first chunk landed with no match in
+  a tier), spill, discard and restore (landed) are emitted by the core, one
+  per event, per tier, identically with metrics on or off (ADR 0017 as
+  amended by #190).
+
+## Amendment (2026-09-16) — multimodal prompts (#193)
+
+- **Prefix identity is the match key everywhere.** Sibling shared prefixes,
+  retained prefixes, their KV-RAM copies and prompt checkpoints are all matched
+  by token ids *and* media items; a publish point never ends inside a media
+  item's placeholders.
+- **A multimodal claim always leaves one prompt token to prefill** (owner
+  decision). A claimant is built from cloned pages and mutable state, neither
+  of which carries the sequence's `rope_delta`; only a prefill span hands it to
+  the leaf. So neither a shared prefix nor a prompt checkpoint reaching a
+  multimodal prompt's last token is offered — a claimant's prompt can end
+  exactly at another request's opener. It costs one re-prefilled token in that
+  rare case. Lifting it means carrying `rope_delta` with the reused state
+  (#201).

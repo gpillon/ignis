@@ -14,10 +14,16 @@
 //   3. **a page is freed only when the last holder releases it.** Releasing
 //      one claimant returns its tail and nothing else, and the shared pages
 //      come back when the publisher's handle and every claimant are gone;
+//   3b. **a chained publish extends a claimed head** (GitHub #187): a
+//      sequence standing on a prefix publishes the pages it warmed past it,
+//      over the ones it claimed — one reference per link, the row in logical
+//      page order, and the whole chain freed in one cascade;
 //   4. **every refusal refuses**, leaving the sequence and the pool as they
 //      were: a partial page, a frontier that is not the prefix, a mid-chunk
-//      publisher, a second publish, a reservation with no page of its own,
-//      and a state transfer of a sequence whose history is not all its own.
+//      publisher, a chained publish that reaches no further than what is
+//      already shared, a reservation with no page of its own, and a state
+//      restore into a target whose history is still shared. A snapshot of a
+//      claimant materializes that history since GitHub #190.
 //
 // It also reports the measured device-to-device clone cost at the real 27B
 // geometry -- the other half of ADR 0024's cost asymmetry, whose host-side
@@ -340,6 +346,7 @@ void check_a_claimant_receives_the_mutable_state() {
   ignis_seq *publisher = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "clone: alloc publisher");
   give_history(*pool, *publisher, kPrefix, 0x37u);
+  publisher->rope_delta = -55; // a multimodal publisher (GitHub #194)
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, publisher->slot);
 
   ignis_seq_prefix *prefix = nullptr;
@@ -365,6 +372,11 @@ void check_a_claimant_receives_the_mutable_state() {
   expect(claimant->position == kPrefix, "clone: a claimant stands where the prefix ends");
   expect(claimant->pending_token == publisher->pending_token,
          "clone: a claimant carries the pending token the prefix ended on");
+  // GitHub #194: a snapshot carries the rope delta, a clone does not -- the
+  // publisher's is its whole prompt's, and a claimant's comes from its own
+  // prefill span.
+  expect(publisher->rope_delta != 0 && claimant->rope_delta == 0,
+         "clone: a claimant does not inherit the publisher's rope delta");
   expect(ignis_seq_at_chunk_boundary(*claimant),
          "clone: every layer's frontier is the prefix's end");
 
@@ -499,6 +511,116 @@ void check_the_last_holder_frees_the_pages() {
   ignis_seq_pool_free(pool);
 }
 
+// ---- 3b. a chained publish extends a claimed head (GitHub #187) -----------
+
+// Warm `own_pages` of `seq`'s own pages and put it at the boundary they end
+// on. Unlike `give_history` this writes only pages the sequence owns, which
+// is what a claimant standing on a prefix actually has to write.
+void extend_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint32_t own_pages,
+                    std::uint64_t tokens, std::uint32_t seed) {
+  set_frontier(seq, tokens);
+  seq.pending_token = static_cast<std::int32_t>(1000 + seed);
+  std::uint32_t salt = seed;
+  for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+    const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+    auto *base                  = static_cast<unsigned char *>(plane.data);
+    const auto page_ids         = seq.kv.page_ids();
+    for (std::uint32_t page = 0; page < own_pages && page < page_ids.size(); ++page) {
+      fill_device(base + static_cast<std::int64_t>(page_ids[page]) * plane.nb[3],
+                  static_cast<std::size_t>(plane.nb[3]), ++salt);
+    }
+  }
+}
+
+void check_a_chained_publish_extends_a_claimed_head() {
+  // GitHub #187. A sequence that resumed from retained state and prefilled
+  // past it has no head of its own to publish -- the pages below its own
+  // generation opener are partly the entry it claimed. It publishes a
+  // *chained* entry: the pages it warmed itself, over the ones it claimed.
+  // That is what puts its own opener inside a page it alone writes, which is
+  // exactly what ignis_seq_checkpoint_capture demands, and it is why every
+  // iteration of an agent's tool loop can leave a checkpoint instead of only
+  // the first.
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "chain: pool create");
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(pool, &empty), 0, "chain: pool stats empty");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "chain: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x71u);
+  ignis_seq_prefix *parent = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &parent), 0, "chain: publish parent");
+
+  // Turn N+1: it claims the parent, prefills one page past it, and publishes
+  // what it now covers -- three pages, only one of them its own.
+  ignis_seq *turn2 = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, parent, &turn2), 0, "chain: claim parent");
+  const std::vector<std::int32_t> parent_ids = row_of(*pool, turn2->slot, 2);
+  const std::uint32_t kChained               = 3 * kPageTokens;
+  extend_history(*pool, *turn2, 1, kChained, 0x72u);
+  const std::int32_t own_page = turn2->kv.page_ids()[0];
+
+  struct ignis_seq_pool_stats before{};
+  expect_rc(ignis_seq_pool_stats(pool, &before), 0, "chain: pool stats before");
+  ignis_seq_prefix *child = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, turn2, kChained, &child), 0, "chain: publish chained");
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "chain: pool stats after");
+  expect(after.kv_free_pages == before.kv_free_pages,
+         "chain: a chained publish charges the pool nothing new either");
+
+  const struct ignis_seq_prefix_stats child_stats = stats_of(child, "chain: child stats");
+  expect(child_stats.tokens == kChained, "chain: the entry covers the whole head");
+  expect(child_stats.pages == 1, "chain: but owns only the page it warmed itself");
+  expect(child_stats.refcount == 2, "chain: the handle and the publishing sequence");
+  const struct ignis_seq_prefix_stats parent_stats = stats_of(parent, "chain: parent stats");
+  expect(parent_stats.refcount == 3,
+         "chain: the publisher, the returned handle, and the child -- the claimant's own "
+         "reference moved to the child rather than a new one being taken");
+
+  const struct ignis_seq_stats turn2_stats = seq_stats_of(turn2, "chain: turn 2 seq stats");
+  expect(turn2_stats.shared_pages == 3, "chain: it now shares the whole three-page head");
+  expect(turn2_stats.mapped_pages == 6, "chain: and still maps its whole reservation");
+  // Logical page order: the parent's two pages, then the child's one, then
+  // the tail the publisher re-reserved. A row that put the child's page first
+  // would answer from history in the wrong order, silently.
+  const std::vector<std::int32_t> row = row_of(*pool, turn2->slot, 3);
+  expect(row[0] == parent_ids[0] && row[1] == parent_ids[1],
+         "chain: the parent's pages are still logical pages 0 and 1");
+  expect(row[2] == own_page, "chain: and the child's page is logical page 2");
+
+  // Turn N+2 claims the chained entry and shares all three pages, the
+  // parent's included.
+  ignis_seq *turn3 = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, child, &turn3), 0, "chain: claim the chain");
+  const struct ignis_seq_stats turn3_stats = seq_stats_of(turn3, "chain: turn 3 seq stats");
+  expect(turn3_stats.shared_pages == 3, "chain: a claimant shares the whole chain");
+  const std::vector<std::int32_t> claimed_row = row_of(*pool, turn3->slot, 3);
+  expect(claimed_row == row, "chain: over the same physical pages, in the same order");
+
+  // Lifetime: the parent outlives its own publisher, and the whole chain
+  // comes back in one release when the last holder of the child lets go.
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, parent);
+  ignis_seq_release(pool, turn2);
+  struct ignis_seq_pool_stats held{};
+  expect_rc(ignis_seq_pool_stats(pool, &held), 0, "chain: pool stats with the chain held");
+  expect(empty.kv_free_pages - held.kv_free_pages == 3 + 3,
+         "chain: the three shared pages and turn 3's tail are still out of the pool");
+  expect(row_of(*pool, turn3->slot, 3) == row,
+         "chain: and the survivor still addresses every page of the chain");
+
+  ignis_seq_release(pool, turn3);
+  ignis_seq_prefix_release(pool, child);
+  struct ignis_seq_pool_stats freed{};
+  expect_rc(ignis_seq_pool_stats(pool, &freed), 0, "chain: pool stats after");
+  expect(freed.kv_free_pages == freed.kv_page_group_count,
+         "chain: the last release returns the child's page and cascades to the parent's");
+  ignis_seq_pool_free(pool);
+}
+
 // ---- 4. the refusals ------------------------------------------------------
 
 void check_refusals() {
@@ -537,12 +659,14 @@ void check_refusals() {
          "refuse: a refused publish charges the pool nothing");
 
   expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &prefix), 0, "refuse: publish");
-  // A sequence claims at most one prefix, and a claimed head is not its own
-  // to publish.
+  // GitHub #187 made a second publish legal — as a *chained* entry over what
+  // the sequence already shares. One that reaches no further covers nothing of
+  // its own, and would be a second entry over pages it does not own, so it is
+  // refused where a second publish used to be refused outright.
   ignis_seq_prefix *second = nullptr;
   expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &second), -1,
-            "refuse: a second publish from a sequence that already shares its head");
-  expect(second == nullptr, "refuse: nothing is published on a second publish");
+            "refuse: a chained publish that reaches no further than what is already shared");
+  expect(second == nullptr, "refuse: nothing is published on it");
 
   // A reservation that leaves the claimant no page of its own is refused:
   // it would have nowhere to write without touching a shared page.
@@ -552,22 +676,35 @@ void check_refusals() {
   expect(claimant == nullptr, "refuse: nothing is allocated on a refusal");
   expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "refuse: claim");
 
-  // A sequence whose history is not all its own cannot be moved as one blob
-  // (P4-10 against P4-06): the leading pages belong to the prefix.
+  // GitHub #190: a sequence whose leading pages belong to a prefix is
+  // snapshotted as a self-contained blob. The target of a restore still may
+  // not share pages, because overwriting them would corrupt other claimants.
   std::uint64_t bytes = 0;
-  expect_rc(ignis_seq_snapshot_size(pool, claimant, &bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
-            "refuse: a claimant has no whole-sequence snapshot");
-  std::vector<unsigned char> scratch(4096);
-  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size()),
-            IGNIS_SEQ_ERR_SHARED_PREFIX, "refuse: a claimant is not snapshotted");
+  expect_rc(ignis_seq_snapshot_size(pool, claimant, &bytes), 0,
+            "materialize: size a claimant's whole-sequence snapshot");
+  std::vector<unsigned char> scratch(bytes);
+  expect_rc(ignis_seq_snapshot(pool, claimant, scratch.data(), scratch.size()), 0,
+            "materialize: snapshot a claimant including its shared head");
   expect_rc(ignis_seq_restore(pool, claimant, scratch.data(), scratch.size()),
             IGNIS_SEQ_ERR_SHARED_PREFIX, "refuse: a claimant is not restored into");
-  // The publisher is a claimant of its own prefix, so the same holds for it.
-  expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), IGNIS_SEQ_ERR_SHARED_PREFIX,
-            "refuse: a publisher shares its own head too");
+  // The publisher is a claimant of its own prefix and materializes too.
+  expect_rc(ignis_seq_snapshot_size(pool, seq, &bytes), 0,
+            "materialize: a publisher shares its own head too");
 
   ignis_seq_release(pool, claimant);
   ignis_seq_release(pool, seq);
+  ignis_seq *restored = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "materialize: alloc restore target");
+  expect_rc(ignis_seq_restore(pool, restored, scratch.data(), scratch.size()), 0,
+            "materialize: restore without the shared handle");
+  std::uint64_t restored_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, restored, &restored_bytes), 0,
+            "materialize: size restored state");
+  std::vector<unsigned char> again(restored_bytes);
+  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), again.size()), 0,
+            "materialize: re-snapshot restored state");
+  expect(again == scratch, "materialize: the standalone round trip is byte-exact");
+  ignis_seq_release(pool, restored);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_pool_free(pool);
 }
@@ -646,6 +783,95 @@ void report_clone_cost() {
 
 } // namespace
 
+// ---- 3c. a retained prefix spills to a blob and comes back (GitHub #190) --
+//
+// What leaves the device is the blob its publisher would have written while
+// standing on the prefix. What comes back is a *published prefix* again:
+// restored into a fresh sequence, published there, and claimable -- with the
+// same bytes, so a burst member that claims it stands exactly where one that
+// claimed the original stood.
+
+void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
+  ignis_seq_pool_spec spec = small_spec();
+  if (dflash2) {
+    spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+  }
+  ignis_seq_pool *pool = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "spill: pool create");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "spill: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x91u);
+  publisher->rope_delta = -77; // a multimodal publisher (GitHub #194)
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "spill: publish");
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, prefix, &bytes), 0, "spill: size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_prefix_snapshot(pool, prefix, blob.data(), bytes), 0, "spill: snapshot");
+  std::uint64_t publisher_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, publisher, &publisher_bytes), 0, "spill: publisher size");
+  std::vector<unsigned char> own(static_cast<std::size_t>(publisher_bytes));
+  expect_rc(ignis_seq_snapshot(pool, publisher, own.data(), publisher_bytes), 0,
+            "spill: publisher snapshot");
+  // GitHub #194: the one word the two differ in is the rope delta, which a
+  // prefix does not carry -- its publisher's is the whole prompt's.
+  if (own.size() == blob.size()) {
+    ignis_seq_snapshot_header header{};
+    std::memcpy(&header, own.data(), sizeof(header));
+    std::uint64_t at = 0;
+    for (const ignis_seq_section &section : ignis_seq_section_table(*pool, header.kv_page_count)) {
+      if (section.kind == IGNIS_SEQ_SECTION_PROGRESS) {
+        at = section.offset + offsetof(ignis_seq_progress_image, rope_delta);
+      }
+    }
+    std::int32_t own_delta  = 0;
+    std::int32_t blob_delta = 0;
+    std::memcpy(&own_delta, own.data() + at, sizeof(own_delta));
+    std::memcpy(&blob_delta, blob.data() + at, sizeof(blob_delta));
+    expect(own_delta == -77 && blob_delta == 0,
+           "spill: the publisher's blob carries its rope delta, the prefix's does not");
+    std::memset(own.data() + at, 0, sizeof(own_delta));
+  }
+  expect(own == blob,
+         "spill: the prefix's blob is its publisher's, standing on it, but for the rope delta");
+
+  // Every device holder goes: nothing of the prefix is left on the card.
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, prefix);
+
+  // Back up: restore into a fresh sequence, publish there, let it go.
+  ignis_seq *carrier = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kPrefix + kPageTokens, &carrier), 0, "spill: alloc carrier");
+  expect_rc(ignis_seq_restore(pool, carrier, blob.data(), bytes), 0, "spill: restore");
+  ignis_seq_prefix *returned = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, carrier, kPrefix, &returned), 0,
+            "spill: publish the restored head");
+  ignis_seq_release(pool, carrier);
+
+  std::uint64_t again_bytes = 0;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, returned, &again_bytes), 0, "spill: size again");
+  std::vector<unsigned char> again(static_cast<std::size_t>(again_bytes));
+  expect_rc(ignis_seq_prefix_snapshot(pool, returned, again.data(), again_bytes), 0,
+            "spill: snapshot again");
+  expect(again == blob, "spill: the prefix that came back is the prefix that left");
+
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, returned, &claimant), 0,
+            "spill: a burst member claims the returned prefix");
+  std::uint64_t claimant_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, claimant, &claimant_bytes), 0, "spill: claimant size");
+  std::vector<unsigned char> claimed(static_cast<std::size_t>(claimant_bytes));
+  expect_rc(ignis_seq_snapshot(pool, claimant, claimed.data(), claimant_bytes), 0,
+            "spill: claimant snapshot");
+  expect(claimed == blob, "spill: and stands exactly where the original's claimant stood");
+
+  ignis_seq_release(pool, claimant);
+  ignis_seq_prefix_release(pool, returned);
+  ignis_seq_pool_free(pool);
+}
+
 int main() {
   int device_count            = 0;
   const cudaError_t available = cudaGetDeviceCount(&device_count);
@@ -659,6 +885,9 @@ int main() {
   check_a_claimant_receives_the_mutable_state();
   check_a_claimant_receives_the_drafter_window();
   check_the_last_holder_frees_the_pages();
+  check_a_chained_publish_extends_a_claimed_head();
+  check_a_spilled_prefix_comes_back_as_the_same_prefix(false);
+  check_a_spilled_prefix_comes_back_as_the_same_prefix(true);
   check_refusals();
   report_clone_cost();
 

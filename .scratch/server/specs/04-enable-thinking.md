@@ -2,6 +2,10 @@
 
 GitHub: #68
 
+**Amended by #185** (2026-09-16), story 28 and §Multi-turn reasoning: how
+history reasoning is dropped changed, and with it what survives. See those two
+places.
+
 ## Problem Statement
 
 Qwen 3.8-27B is a thinking model. Its chat template decides, at prompt-render
@@ -140,7 +144,13 @@ against ninfer works against ignis unchanged.
     model previously thought.
 28. As an agent author, I want prior assistant reasoning dropped from the prompt
     by default, so that a long conversation does not accumulate context I did
-    not ask to keep.
+    not ask to keep. *(Amended by #185: dropped means what the reference means
+    by it — reasoning before the last real user query goes, reasoning after it
+    stays. The in-flight turns of a tool loop therefore keep their thinking
+    until the next user message closes the turn, which is what
+    `chat_template.cpp:410`'s `keep_thinking = preserve_thinking || i >
+    last_query_index` does. A long conversation still accumulates nothing: every
+    new user message strips everything before it.)*
 29. As an agent author, I want to send `preserve_thinking: true` to keep prior
     reasoning in the rendered prompt, so that I can opt into the more expensive
     behaviour deliberately.
@@ -331,6 +341,31 @@ forwards it; the server's own message type gains the optional field and passes
 it through. When `preserve_thinking` resolves false — the default — inbound
 assistant reasoning is dropped before rendering, so a long conversation does not
 silently accumulate traces.
+
+**Amended by #185** (2026-09-16). The server no longer drops anything: it hands
+the template every turn's `reasoning_content` and binds the resolved
+`preserve_thinking` beside it, and the template decides. As delivered, the drop
+was the only mechanism, and it was the wrong one — it made the template's own
+branch unreachable, so ignis rendered an emptied `<think></think>` block on
+every history assistant turn where the reference renders none (#182), and
+blanked a tool loop's in-flight reasoning where the reference keeps it.
+
+What `preserve_thinking` false now means, which is what it means in the
+reference (`chat_template.cpp:410`, `keep_thinking = preserve_thinking || i >
+last_query_index`):
+
+- reasoning on turns **before the last real user query** is not rendered at all
+  — not the block, not an empty one. This is story 28, and it is the whole of
+  it: a new user message strips every earlier turn's thinking.
+- reasoning on turns **after** it — the in-flight turns of a tool loop — is
+  rendered. That is a real token cost on clients that echo `reasoning_content`
+  back: measured on the `tool_loop` fixture, +8 ids for one short in-flight
+  turn, and in a long agent loop it is the sum of every step's thinking until
+  the next user message. It is also what makes iteration N+1's prompt an
+  extension of what iteration N actually generated, which is the prerequisite
+  spec 01 §Rendering prerequisites needs from this ticket.
+
+`preserve_thinking` true is unchanged: everything is kept.
 
 ### `/v1/responses`
 

@@ -22,7 +22,7 @@ use tower::ServiceExt;
 use ignis_core::{mock::MockCompute, ConcreteScheduler, SchedulerConfig, TokenId};
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
-use ignis_server::template::{ChatMessage, TemplateProvider};
+use ignis_server::template::{ChatMessage, RenderedPrompt, TemplateProvider};
 use ignis_server::thinking::{ThinkingCapabilities, ThinkingOptions};
 use ignis_server::Server;
 
@@ -59,7 +59,7 @@ impl TemplateProvider for RecordingTemplateProvider {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[serde_json::Value],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         self.captured_tools.lock().unwrap().push(tools.to_vec());
         self.inner.apply_chat_template(messages, options, tools)
     }

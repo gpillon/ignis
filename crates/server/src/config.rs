@@ -78,6 +78,23 @@ pub struct Config {
     /// snapshot's fixed GDN floor (~145 MiB) is paid regardless of prompt
     /// length.
     pub host_pool_bytes: u64,
+    /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
+    /// On by default. Off means a request captures no prompt checkpoint and
+    /// claims none, so a cold bench measures a cold engine and a correctness
+    /// oracle prefills every prompt it is given.
+    pub prompt_reuse: bool,
+    /// The retained checkpoint pool's device budget, in bytes
+    /// (`--retained-pool-bytes`, GitHub #186). `0` retains nothing. A byte
+    /// budget for the reason [`Config::host_pool_bytes`] is one: an image is
+    /// dominated by a fixed state floor a short conversation pays exactly as
+    /// a long one does. Unset derives a default from the VRAM left after
+    /// load; this is what the operator asked for, `None` meaning "derive it".
+    pub retained_pool_bytes: Option<u64>,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority after its conversation last used it, in seconds
+    /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
+    /// an Agent's would.
+    pub retained_interactive_ttl_secs: u32,
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
     /// GitHub #150). `None` loads nothing of the drafter.
     pub speculation: Option<Speculation>,
@@ -187,6 +204,18 @@ impl std::fmt::Debug for ApiKey {
 /// about the format's per-snapshot cost just to start the server.
 pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// `--prompt-reuse`'s default (GitHub #186, ADR 0029): on. Cross-request
+/// reuse is the owner's workload — an agent's tool loop re-sends its whole
+/// history every iteration — so it is what the engine does unless asked not
+/// to.
+pub const DEFAULT_PROMPT_REUSE: bool = true;
+
+/// `--retained-interactive-ttl`'s default, in seconds (GitHub #190): the
+/// scheduler's own starting value, restated as a flag default rather than
+/// chosen twice.
+pub const DEFAULT_RETAINED_INTERACTIVE_TTL_SECS: u32 =
+    ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL.as_secs() as u32;
+
 /// What [`resolve`] produced: a runnable config, or a request to print
 /// `--help`/`--version` text and exit before any loader/scheduler work runs.
 /// `resolve` never prints or exits itself — that stays in `main`.
@@ -236,6 +265,9 @@ pub fn resolve(
     let mut kv_format = None;
     let mut kv_pool_bytes = None;
     let mut host_pool_bytes = None;
+    let mut prompt_reuse = None;
+    let mut retained_pool_bytes = None;
+    let mut retained_interactive_ttl = None;
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
@@ -263,6 +295,13 @@ pub fn resolve(
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
+            "--prompt-reuse" => prompt_reuse = Some(take_value(args, &mut i, flag)?),
+            "--retained-pool-bytes" => {
+                retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
+            }
+            "--retained-interactive-ttl" => {
+                retained_interactive_ttl = Some(take_value(args, &mut i, flag)?)
+            }
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
@@ -312,18 +351,18 @@ pub fn resolve(
     let kv_format = resolve_kv_format(kv_format, &env)?;
     let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
+    let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
+    let retained_pool_bytes =
+        resolve_retained_pool_bytes(retained_pool_bytes, &env, prompt_reuse)?;
+    let retained_interactive_ttl_secs =
+        resolve_retained_interactive_ttl(retained_interactive_ttl, &env, prompt_reuse)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
-    // GitHub #178: DFlash2's drafter does not follow a multimodal prompt yet,
-    // so the two load options are refused together here, before any load
-    // work, as the reference refuses `--spec dflash` with `--vision`.
-    if vision.is_some() && speculation.is_some_and(|s| s.backend() == SpeculativeBackend::Dflash2) {
-        return Err(ConfigError(
-            "`--vision` cannot be combined with `--spec dflash2` yet (speculative decoding does not follow image prompts)"
-                .to_owned(),
-        ));
-    }
+    // GitHub #195 lifted #178's refusal of the two together: the drafter
+    // follows a multimodal prompt now (its context append takes the span's KV
+    // positions, and the verify round rotates at `position + rope_delta`), so
+    // they are two independent load options again.
     let media = resolve_media(vision.is_some(), media_allow_private_network, media_cache_mib, &env)?;
     // `--metrics` (GitHub #89, ADR 0017) opens its own listener; naming its
     // address without turning metrics on is refused rather than ignored, and
@@ -367,6 +406,9 @@ pub fn resolve(
         kv_format,
         kv_pool_bytes,
         host_pool_bytes,
+        prompt_reuse,
+        retained_pool_bytes,
+        retained_interactive_ttl_secs,
         speculation,
         vision,
         media,
@@ -637,6 +679,50 @@ fn resolve_kv_pool_bytes(
     Ok(bytes)
 }
 
+/// `--prompt-reuse on|off` / `IGNIS_PROMPT_REUSE` / [`DEFAULT_PROMPT_REUSE`]
+/// (GitHub #186, ADR 0029). A value, not a bare switch, because the useful
+/// direction is *off* — a cold bench or a correctness oracle turning
+/// something on-by-default back off — and a bare `--prompt-reuse` could only
+/// ever ask for the default.
+fn resolve_prompt_reuse(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_PROMPT_REUSE"))) else {
+        return Ok(DEFAULT_PROMPT_REUSE);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(ConfigError(format!(
+            "`--prompt-reuse` must be on or off, got `{raw}`"
+        ))),
+    }
+}
+
+/// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` (GitHub #186).
+/// Unset is `None`: the budget is then derived from the VRAM left after the
+/// model lands, which only the loader can know.
+///
+/// Naming a budget with `--prompt-reuse off` is refused rather than ignored,
+/// the house rule every other sub-flag follows: a pool that will never hold
+/// anything is not what the operator meant to size.
+fn resolve_retained_pool_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+    prompt_reuse: bool,
+) -> Result<Option<u64>, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_POOL_BYTES"))) else {
+        return Ok(None);
+    };
+    if !prompt_reuse {
+        return Err(ConfigError(format!(
+            "`--retained-pool-bytes {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
+        )));
+    }
+    parse_bytes("--retained-pool-bytes", &raw).map(Some)
+}
+
 /// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES` / [`DEFAULT_HOST_POOL_BYTES`]
 /// (P4-07, GitHub #125). `0` is a legal, explicit choice — it disables the
 /// host tier (admission refuses instead of evicting) — so it is accepted
@@ -649,6 +735,26 @@ fn resolve_host_pool_bytes(
         return Ok(DEFAULT_HOST_POOL_BYTES);
     };
     parse_bytes("--kv-host-pool-bytes", &raw)
+}
+
+/// `--retained-interactive-ttl` / `IGNIS_RETAINED_INTERACTIVE_TTL` /
+/// [`DEFAULT_RETAINED_INTERACTIVE_TTL_SECS`] (GitHub #190). `0` is legal: an
+/// Interactive entry then never outranks an Agent's in KV-RAM. Refused with
+/// `--prompt-reuse off`, like every other sub-flag of a feature that is off.
+fn resolve_retained_interactive_ttl(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+    prompt_reuse: bool,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_INTERACTIVE_TTL"))) else {
+        return Ok(DEFAULT_RETAINED_INTERACTIVE_TTL_SECS);
+    };
+    if !prompt_reuse {
+        return Err(ConfigError(format!(
+            "`--retained-interactive-ttl {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
+        )));
+    }
+    parse_count("--retained-interactive-ttl", "second count", &raw)
 }
 
 /// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
@@ -708,6 +814,9 @@ fn help_text() -> String {
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
          \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: auto, {default_kv_pool_gib} GiB; accepts a K/M/G suffix)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
+         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused)\n\
+         \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: derived from the VRAM left after load; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
+         \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
@@ -1157,6 +1266,94 @@ mod tests {
         assert_eq!(config.host_pool_bytes, 256 * 1024 * 1024, "flag must win over env");
     }
 
+    // ── GitHub #186: cross-request state reuse (ADR 0029) ──────────────
+
+    #[test]
+    fn prompt_reuse_is_on_unless_the_operator_turns_it_off() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(config.prompt_reuse, "on by default (ADR 0029)");
+        assert_eq!(
+            config.retained_pool_bytes, None,
+            "no budget named: derived from the VRAM left after load"
+        );
+
+        let config =
+            expect_config(resolve(&args(&["--prompt-reuse", "off"]), no_env).expect("resolve"));
+        assert!(!config.prompt_reuse);
+
+        let env = env_map(&[("IGNIS_PROMPT_REUSE", "off")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(!config.prompt_reuse, "the env var turns it off too");
+
+        // A flag wins over its env var, in both directions.
+        let env = env_map(&[("IGNIS_PROMPT_REUSE", "off")]);
+        let a = args(&["--prompt-reuse", "on"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert!(config.prompt_reuse, "flag must win over env");
+    }
+
+    #[test]
+    fn a_malformed_prompt_reuse_value_is_a_usage_error() {
+        let err = resolve(&args(&["--prompt-reuse", "maybe"]), no_env)
+            .expect_err("`maybe` is neither on nor off");
+        assert!(err.0.contains("--prompt-reuse"), "{}", err.0);
+        assert!(err.0.contains("maybe"), "names the value: {}", err.0);
+    }
+
+    #[test]
+    fn an_explicit_retained_pool_budget_overrides_the_derived_one() {
+        let config = expect_config(
+            resolve(&args(&["--retained-pool-bytes", "512M"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.retained_pool_bytes, Some(512 * 1024 * 1024));
+
+        let env = env_map(&[("IGNIS_RETAINED_POOL_BYTES", "1G")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.retained_pool_bytes, Some(1024 * 1024 * 1024));
+
+        let env = env_map(&[("IGNIS_RETAINED_POOL_BYTES", "1G")]);
+        let a = args(&["--retained-pool-bytes", "256M"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(
+            config.retained_pool_bytes,
+            Some(256 * 1024 * 1024),
+            "flag must win over env"
+        );
+    }
+
+    #[test]
+    fn the_retained_interactive_ttl_is_configurable_and_needs_reuse_on() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.retained_interactive_ttl_secs, 300, "five minutes by default");
+
+        let config = expect_config(
+            resolve(&args(&["--retained-interactive-ttl", "60"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.retained_interactive_ttl_secs, 60);
+
+        let env = env_map(&[("IGNIS_RETAINED_INTERACTIVE_TTL", "0")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.retained_interactive_ttl_secs, 0, "zero is a legal choice");
+
+        let err = resolve(&args(&["--retained-interactive-ttl", "5m"]), no_env)
+            .expect_err("not a second count");
+        assert!(err.0.contains("--retained-interactive-ttl"), "{}", err.0);
+
+        let a = args(&["--prompt-reuse", "off", "--retained-interactive-ttl", "60"]);
+        let err = resolve(&a, no_env).expect_err("a TTL with reuse off");
+        assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
+    }
+
+    #[test]
+    fn a_retained_pool_budget_without_reuse_is_refused_not_ignored() {
+        // The house rule every other sub-flag follows: sizing a pool that
+        // will never hold anything is not what the operator meant.
+        let a = args(&["--prompt-reuse", "off", "--retained-pool-bytes", "512M"]);
+        let err = resolve(&a, no_env).expect_err("a budget with reuse off");
+        assert!(err.0.contains("--retained-pool-bytes"), "{}", err.0);
+        assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
+    }
+
     #[test]
     fn a_zero_host_pool_budget_is_accepted_and_disables_the_tier() {
         // Unlike an empty string (falls through to the default), `0` is an
@@ -1364,16 +1561,23 @@ mod tests {
         assert!(text.contains("--vision ") && text.contains("--vision-max-tokens"), "{text}");
     }
 
+    /// GitHub #195: the two are independent load options again.
     #[test]
-    fn vision_with_dflash2_is_refused_naming_both() {
+    fn vision_and_dflash2_resolve_together_as_two_independent_load_options() {
         let a = args(&["--vision", "--spec", "dflash2", "--draft-tokens", "4"]);
-        let err = resolve(&a, no_env).expect_err("vision + dflash2");
-        assert!(err.0.contains("--vision") && err.0.contains("dflash2"), "{}", err.0);
+        let config = expect_config(resolve(&a, no_env).expect("vision + dflash2"));
+        assert_eq!(config.vision, Some(Vision::default()));
+        assert_eq!(config.speculation, Speculation::new(SpeculativeBackend::Dflash2, 4).ok());
         let env = env_map(&[("IGNIS_VISION", "true"), ("IGNIS_SPEC", "dflash2"), ("IGNIS_DRAFT_TOKENS", "4")]);
-        assert!(resolve(&[], env).is_err(), "the env form too");
-        // Each alone still loads.
-        assert!(resolve(&args(&["--vision"]), no_env).is_ok());
-        assert!(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).is_ok());
+        let from_env = expect_config(resolve(&[], env).expect("the env form too"));
+        assert_eq!(from_env.vision, config.vision);
+        assert_eq!(from_env.speculation, config.speculation);
+        // Each alone still resolves, and neither one turns the other on.
+        let vision_only = expect_config(resolve(&args(&["--vision"]), no_env).expect("vision alone"));
+        assert_eq!((vision_only.vision, vision_only.speculation), (config.vision, None));
+        let spec_only =
+            expect_config(resolve(&args(&["--spec", "dflash2", "--draft-tokens", "4"]), no_env).expect("spec alone"));
+        assert_eq!((spec_only.vision, spec_only.speculation), (None, config.speculation));
     }
 
     // ── media acquisition (GitHub #179) ──────────────────────────────────

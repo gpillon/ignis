@@ -59,6 +59,71 @@ pub struct RequestInput {
     /// The prompt's positions, `rope_delta` and media items (GitHub #178),
     /// or `None` for a text-only request — today's path, unchanged.
     pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
+    /// The **generation opener** (GitHub #186, ADR 0029): how many leading
+    /// prompt tokens end at the rendered prompt's last
+    /// `<|im_start|>assistant\n`, the point where the prompt hands over to the
+    /// model, and the last position every later turn of the conversation
+    /// provably shares.
+    ///
+    /// `None` when the frontend could not report one — a prompt with no
+    /// opener, or an opener whose byte offset does not tokenize to an exact
+    /// token prefix of the prompt. In that case no checkpoint is taken at all,
+    /// rather than one taken at a point the tokenizer disagrees about.
+    ///
+    /// It is a *structural* fact about the rendered prompt, known only to
+    /// whoever rendered it and not recoverable from token ids. #188 adds the
+    /// end of the system-and-tools block beside it for the same reason.
+    pub opener_tokens: Option<u32>,
+    /// The **last real user query** (GitHub #187, ADR 0029): how many leading
+    /// prompt tokens end where the rendered prompt's last genuine
+    /// `<|im_start|>user\n` message *begins* — genuine meaning not a
+    /// `<tool_response>`, exactly the distinction the chat template's own
+    /// `last_query_index` scan makes.
+    ///
+    /// It answers one question, at capture time: does a real user message lie
+    /// between the checkpoint this request resumed from and the one it is
+    /// taking? If it does, this capture opens a new turn and becomes its
+    /// conversation's **turn-opening checkpoint**; if it does not, the request
+    /// is another iteration of the same tool loop and supersedes what it
+    /// claimed ([`crate::checkpoint::CheckpointPool::retain`]).
+    ///
+    /// `None` when the frontend could not report one — no user message in the
+    /// render, or an offset that does not tokenize to an exact token prefix.
+    /// A capture then counts as *not* turn-opening, because a wrong `true`
+    /// retires the very entry a new user message would have matched.
+    pub user_turn_tokens: Option<u32>,
+    /// The **system block boundary** (GitHub #188, ADR 0029): how many leading
+    /// prompt tokens end the rendered prompt's first
+    /// `<|im_start|>system … <|im_end|>\n` — the reasoning instructions, the
+    /// tools and the system message, which the template renders as one block.
+    ///
+    /// The mirror of [`Self::opener_tokens`], and the point a **retained
+    /// prefix** is published at. The opener is the last position a
+    /// conversation's own later turns share; this is the first position two
+    /// *unrelated* requests share, which is all a burst of subagents has: no
+    /// subagent's prompt extends its sibling's, so no prompt checkpoint can
+    /// ever match between them.
+    ///
+    /// `None` when the frontend could not report one — a render that does not
+    /// open with a system block, or a boundary whose byte offset does not
+    /// tokenize to an exact token prefix of the prompt. Then nothing is
+    /// published there, rather than a prefix published at a point the
+    /// tokenizer disagrees about.
+    pub system_block_tokens: Option<u32>,
+}
+
+impl RequestInput {
+    /// The last whole-page boundary at or before `at` that a prefix of this
+    /// prompt may end at: the plain page floor, walked back out of any media
+    /// item it would land inside (GitHub #193,
+    /// [`crate::vision::Multimodal::floor_outside_media`]).
+    pub fn prefix_floor(&self, at: u32, page_tokens: u32) -> u32 {
+        match &self.multimodal {
+            Some(multimodal) => multimodal.floor_outside_media(at, page_tokens),
+            None if page_tokens == 0 => 0,
+            None => (at / page_tokens) * page_tokens,
+        }
+    }
 }
 
 /// Sampling / decoding parameters for a request.
@@ -375,12 +440,54 @@ pub enum SchedEvent {
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.
     Requeued { request: RequestId },
-    /// A request's prefill reused a cached sibling prefix (core-07): the
-    /// `tokens` leading prompt tokens were skipped — the shared KV prefix
-    /// is already warm, so no redundant prefill. Telemetry accumulates
-    /// these into the `sibling_prefix_reused_tok` counter (design §5,
-    /// `server-02`).
-    PrefixReused { request: RequestId, tokens: u32 },
+    /// A request's prefill reused a cached prefix (core-07): the `tokens`
+    /// leading prompt tokens were skipped — the shared KV prefix is already
+    /// warm, so no redundant prefill. Telemetry accumulates these into the
+    /// `sibling_prefix_reused_tok` counter (design §5, `server-02`).
+    ///
+    /// Since GitHub #188 the entry may be a **retained prefix**, whose
+    /// publisher has already finished, rather than a live sibling's. The claim
+    /// is the same act on the same object, so it is the same event; `retained`
+    /// is what tells the two apart (GitHub #190), so sibling reuse and
+    /// cross-request reuse are never summed into one number.
+    PrefixReused {
+        request: RequestId,
+        tokens: u32,
+        /// The claimed entry's publisher had already finished: this was
+        /// reuse of retained state, not of a concurrent sibling's prefix.
+        retained: bool,
+    },
+    /// A request's prefill resumed from **retained state** left by an earlier,
+    /// already-finished request (GitHub #186, ADR 0029): the `tokens` leading
+    /// prompt tokens — everything up to that state's generation opener — were
+    /// not prefilled at all.
+    ///
+    /// Emitted once per request, on the chunk that actually landed the claim,
+    /// so a claim whose prefill batch failed and was retried is reported when
+    /// it succeeds and never twice. This is where the request log's
+    /// `reuse_source`, `reused_prompt_tokens` and `restore_ms` come from; a
+    /// request that reused nothing emits none of it, which is what "source
+    /// `none`" means.
+    StateReused {
+        request: RequestId,
+        /// The residency tier the state came from (`device`; #190 adds
+        /// `kv_ram`).
+        source: crate::checkpoint::ReuseSource,
+        /// Leading prompt tokens skipped.
+        tokens: u32,
+        /// What the restore itself cost — the device-to-device clone of the
+        /// checkpoint into this request's slot, measured by the backend.
+        restore_micros: u64,
+    },
+    /// Something happened to retained state in one residency tier (GitHub
+    /// #190) — a hit, a miss, a spill, a discard or a restore, as
+    /// [`crate::checkpoint::RetainedStateOperation`] defines each. It names
+    /// no request: a spill or a discard happens to state no live request
+    /// owns, usually while making room for some other request.
+    RetainedState {
+        operation: crate::checkpoint::RetainedStateOperation,
+        source: crate::checkpoint::ReuseSource,
+    },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
     /// P3-06 request log): `chunk_tokens` is this chunk's width,
     /// `prefilled_tokens` the cumulative prompt tokens sent to the compute

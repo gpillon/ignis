@@ -32,6 +32,47 @@ use crate::{fail, Object, Reader, Result};
 // per-template capability set a chat template supports.
 // ---------------------------------------------------------------------------
 
+/// The thinking controls a request resolves before a render — the
+/// reference's `ChatRenderOptions` (`chat_template.h`) minus the fields ignis
+/// does not vary.
+///
+/// A struct rather than three positional arguments because two of them are
+/// `bool` and they mean nearly opposite things: `enable_thinking` asks the
+/// model to think *now*, `preserve_thinking` keeps what it thought *before*.
+/// Passed positionally they sat one argument apart, and a swap both compiled
+/// and rendered a plausible prompt — the render would simply have been the
+/// wrong one, on a path whose whole job is that two turns render identically
+/// (GitHub #185, ADR 0029).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatRenderOptions {
+    /// Bound to the template's `enable_thinking`: whether this turn's
+    /// generation prompt opens a think block or a pre-closed empty one.
+    pub enable_thinking: bool,
+    /// Bound to `reasoning_effort` only when `Some` — `None` means "let the
+    /// template's own default apply".
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Bound to `preserve_thinking`: `true` keeps every history assistant
+    /// turn's reasoning, `false` leaves the template's own rule in force,
+    /// which keeps the turns after the last real user query and strips the
+    /// rest. Never left unbound — see
+    /// [`ChatTemplate::render_with_thinking_and_tools`].
+    pub preserve_thinking: bool,
+}
+
+impl Default for ChatRenderOptions {
+    /// Thinking on, the template's own default effort, history reasoning left
+    /// to the template's rule — the server's resolved default
+    /// (`ThinkingOptions::default`), which is the default the reference
+    /// serves too.
+    fn default() -> Self {
+        Self {
+            enable_thinking: true,
+            reasoning_effort: None,
+            preserve_thinking: false,
+        }
+    }
+}
+
 /// The protocol's full `reasoning_effort` vocabulary (the reference's wire
 /// contract). Not every value is supported by every template — see
 /// [`ThinkingCapabilities`].
@@ -406,6 +447,140 @@ impl ChatTemplate {
         )
     }
 
+    /// The **generation opener** (GitHub #186, ADR 0029): the marker a
+    /// rendered prompt ends its history with and hands over to the model at.
+    ///
+    /// It is the last position a conversation's later turns provably share.
+    /// Everything after it — the `<think>` block, the assistant's text, its
+    /// tool calls — is re-rendered on the next turn differently from how it
+    /// was generated (thinking dropped or emptied, a `\n` after `<|im_end|>`,
+    /// tool arguments re-serialized), so the state *after* generation never
+    /// matches while the state at the opener always does.
+    pub const GENERATION_OPENER: &'static str = "<|im_start|>assistant\n";
+
+    /// The byte offset just past `rendered`'s **last** generation opener, or
+    /// `None` for a prompt that has none.
+    ///
+    /// The last, not the first: a conversation renders one opener per
+    /// assistant turn, and the one that matters is the one the prompt ends
+    /// on, where generation begins. The earlier ones are history, and what
+    /// follows them in *this* render is not what followed them when they were
+    /// generated.
+    ///
+    /// A byte offset rather than a token count, because a byte offset is all
+    /// the renderer knows. Turning it into a token count means tokenizing the
+    /// head and checking that it really is a token prefix of the whole prompt
+    /// (ADR 0029) — the tokenizer's job, not this function's.
+    pub fn generation_opener_offset(rendered: &str) -> Option<usize> {
+        rendered
+            .rfind(Self::GENERATION_OPENER)
+            .map(|at| at + Self::GENERATION_OPENER.len())
+    }
+
+    /// The marker a user message opens with. A tool result wears the same
+    /// one — the template renders tool-role messages as user messages whose
+    /// content is a `<tool_response>` block — which is why
+    /// [`Self::last_user_query_offset`] cannot simply look for it.
+    pub const USER_QUERY_OPENER: &'static str = "<|im_start|>user\n";
+
+    /// What a tool result's content is wrapped in, and the only thing that
+    /// tells it from the human speaking. **Both ends**, exactly as the
+    /// template tests it (`content.startswith(…) and content.endswith(…)`):
+    /// a human message that merely *opens* with the literal is still the human
+    /// speaking, and reading it as a tool result would cost the next turn its
+    /// reuse.
+    pub const TOOL_RESPONSE_OPENER: &'static str = "<tool_response>";
+    /// See [`Self::TOOL_RESPONSE_OPENER`].
+    pub const TOOL_RESPONSE_CLOSER: &'static str = "</tool_response>";
+
+    /// The marker every rendered message's *content* ends at. Not
+    /// [`Self::BLOCK_CLOSER`], which carries the line break after it too: one
+    /// bounds the content a tool result is recognized by, the other bounds a
+    /// whole rendered block, which is where the system block's boundary falls.
+    pub const MESSAGE_CLOSER: &'static str = "<|im_end|>";
+
+    /// The marker a rendered prompt opens its **system block** with (GitHub
+    /// #188, ADR 0029).
+    pub const SYSTEM_BLOCK_OPENER: &'static str = "<|im_start|>system\n";
+
+    /// The marker every rendered block ends with.
+    pub const BLOCK_CLOSER: &'static str = "<|im_end|>\n";
+
+
+    /// The byte offset where `rendered`'s **last real user query** begins —
+    /// the last `<|im_start|>user\n` that is not a tool result — or `None` for
+    /// a prompt with none (GitHub #187, ADR 0029).
+    ///
+    /// This is the template's own `last_query_index` scan, asked from outside
+    /// the template. The template uses it to decide whose reasoning survives
+    /// into the prompt; cross-request reuse uses it to decide whether a
+    /// request is a new **turn** of its conversation or one more iteration of
+    /// a tool loop — and the two must agree, because it is exactly the
+    /// reasoning the template drops here that stops the turn's later
+    /// checkpoints matching once the human speaks again.
+    ///
+    /// The offset is where the message *begins*, not where it ends: the
+    /// question asked of it is "does a real user message lie past the
+    /// checkpoint this request resumed from", and a message that *starts*
+    /// past that point is one the earlier turn had never seen.
+    ///
+    /// A byte offset rather than a token count, for the reason
+    /// [`Self::generation_opener_offset`] is one: turning it into a token
+    /// count means tokenizing the head and checking that it really is a token
+    /// prefix, which is the tokenizer's job and not this function's.
+    pub fn last_user_query_offset(rendered: &str) -> Option<usize> {
+        rendered
+            .match_indices(Self::USER_QUERY_OPENER)
+            .map(|(at, _)| at)
+            .filter(|&at| !Self::is_tool_result(rendered, at))
+            .last()
+    }
+
+    /// Whether the user message beginning at `at` is a tool result rather than
+    /// the human speaking — the template's own test, both ends of it.
+    ///
+    /// The rendered content is the span between the message's opener and its
+    /// `<|im_end|>`, which is exactly the trimmed content the template applied
+    /// `startswith`/`endswith` to. A message with no closer runs to the end of
+    /// the render; the same test applies to it, so a truncated render can only
+    /// misread a message that looks like a tool result all the way down.
+    fn is_tool_result(rendered: &str, at: usize) -> bool {
+        let rest = &rendered[at + Self::USER_QUERY_OPENER.len()..];
+        let content = rest.find(Self::MESSAGE_CLOSER).map_or(rest, |end| &rest[..end]);
+        content.starts_with(Self::TOOL_RESPONSE_OPENER)
+            && content.ends_with(Self::TOOL_RESPONSE_CLOSER)
+    }
+
+    /// The byte offset just past the end of `rendered`'s **first** system
+    /// block — reasoning instructions, tools and the system message, all of
+    /// which this template renders into one `<|im_start|>system … <|im_end|>\n`
+    /// — or `None` for a render that does not open with one (GitHub #188, ADR
+    /// 0029).
+    ///
+    /// This is the **retained prefix**'s boundary, and it is the mirror of
+    /// [`Self::generation_opener_offset`]. The opener is the *last* point a
+    /// conversation's own later turns share; this is the *first* point two
+    /// unrelated requests share. A burst of subagents spawned from one parent
+    /// sends one prompt per question, and no prompt extends another's — so no
+    /// prompt checkpoint can ever match between them, and the system and tools
+    /// block is the whole of what they have in common.
+    ///
+    /// The *first* block, and only when the render opens with it: a system
+    /// message that arrives later in the conversation is not a point two
+    /// different requests provably share from their first byte, and a
+    /// boundary inside a prompt's history is what the checkpoint is for.
+    ///
+    /// A byte offset rather than a token count, for the reason
+    /// [`Self::generation_opener_offset`] is one: turning it into a token
+    /// count means tokenizing the head and checking that it really is a token
+    /// prefix of the whole prompt (ADR 0029) — the tokenizer's job, not this
+    /// function's. Flooring it to whole KV pages is the scheduler's.
+    pub fn system_block_offset(rendered: &str) -> Option<usize> {
+        let body = rendered.strip_prefix(Self::SYSTEM_BLOCK_OPENER)?;
+        let at = body.find(Self::BLOCK_CLOSER)?;
+        Some(Self::SYSTEM_BLOCK_OPENER.len() + at + Self::BLOCK_CLOSER.len())
+    }
+
     /// Render an OpenAI-style conversation through the template.
     ///
     /// `add_generation_prompt` is set to `true` (the standard completion
@@ -414,7 +589,7 @@ impl ChatTemplate {
     /// that binds nothing, so callers that do not care about thinking are
     /// unaffected (GitHub #68).
     pub fn render(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.render_context(messages, None, None)
+        self.render_context(messages, None, None, None)
     }
 
     /// Render a conversation with the thinking controls bound as template
@@ -428,18 +603,48 @@ impl ChatTemplate {
     /// "which default won" ambiguity. `reasoning_effort` is bound only when
     /// `effort` is `Some` — an unresolved effort means "let the template's
     /// own default apply".
+    ///
+    /// **Single-turn only.** This variant leaves `preserve_thinking`
+    /// undefined, and undefined is not a neutral default: the Qwen 3.8
+    /// template's assistant branch reads `preserve_thinking is undefined or
+    /// preserve_thinking is true or …`, so a conversation rendered here keeps
+    /// a think block on *every* history assistant turn — which is the defect
+    /// GitHub #182 reported. Its callers are the capability probe below and
+    /// `ignis-bench`'s TTFT cell, both of which render one user message, where
+    /// the variable cannot matter;
+    /// `render_and_render_with_thinking_leave_preserve_thinking_to_the_template`
+    /// pins that state deliberately. A multi-turn caller wants
+    /// [`Self::render_with_thinking_and_tools`] instead — and if one ever
+    /// needs this signature, the fix is to bind the variable here too, not to
+    /// keep the test.
     pub fn render_with_thinking(
         &self,
         messages: &[ChatMessage],
         enable_thinking: bool,
         effort: Option<ReasoningEffort>,
     ) -> Result<String> {
-        self.render_context(messages, Some((enable_thinking, effort)), None)
+        self.render_context(messages, Some((enable_thinking, effort)), None, None)
     }
 
-    /// [`Self::render_with_thinking`] plus tool definitions (GitHub #132):
-    /// `tools` is the client's own OpenAI `tools` array, opaque JSON,
-    /// bound as-is — the template's `tools` branch renders each entry with
+    /// [`Self::render_with_thinking`] plus history thinking (GitHub #185) and
+    /// tool definitions (GitHub #132) — the variant the request path uses,
+    /// which binds every control a request can resolve. The controls arrive
+    /// as a [`ChatRenderOptions`] rather than positionally: see that type for
+    /// why.
+    ///
+    /// `preserve_thinking` is always bound (never left undefined), for the
+    /// same reason `enable_thinking` is: the Qwen 3.8 template's assistant
+    /// branch reads `preserve_thinking is undefined or preserve_thinking is
+    /// true or loop.index0 > ns.last_query_index`, so an unbound variable is
+    /// not "the default" — it is a third state that keeps a think block on
+    /// every history assistant turn and disables the template's own
+    /// strip-before-the-last-query branch (GitHub #182). Bound, the template
+    /// renders history the way the reference does
+    /// (`chat_template.cpp`: `keep_thinking = preserve_thinking || i >
+    /// last_query_index`).
+    ///
+    /// `tools` is the client's own OpenAI `tools` array, opaque JSON, bound
+    /// as-is — the template's `tools` branch renders each entry with
     /// `tojson`, so no ignis-side schema is needed. `None`/empty leaves the
     /// `tools` variable unbound, same as a request that never mentioned
     /// tools at all (the template's own `{%- if tools and ... %}` guard
@@ -447,40 +652,53 @@ impl ChatTemplate {
     pub fn render_with_thinking_and_tools(
         &self,
         messages: &[ChatMessage],
-        enable_thinking: bool,
-        effort: Option<ReasoningEffort>,
+        options: ChatRenderOptions,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
-        self.render_context(messages, Some((enable_thinking, effort)), tools)
+        self.render_context(
+            messages,
+            Some((options.enable_thinking, options.reasoning_effort)),
+            Some(options.preserve_thinking),
+            tools,
+        )
     }
 
     fn render_context(
         &self,
         messages: &[ChatMessage],
         thinking: Option<(bool, Option<ReasoningEffort>)>,
+        preserve_thinking: Option<bool>,
         tools: Option<&[JsonValue]>,
     ) -> Result<String> {
-        let mut context = serde_json::Map::new();
-        context.insert(
-            "messages".to_owned(),
-            json!(messages.iter().map(message_to_json).collect::<Vec<_>>()),
-        );
-        context.insert("add_generation_prompt".to_owned(), json!(true));
+        let mut context: Vec<(&'static str, Value)> = vec![
+            (
+                "messages",
+                Value::from_iter(messages.iter().map(message_to_value)),
+            ),
+            ("add_generation_prompt", Value::from(true)),
+        ];
         if let Some((enable_thinking, effort)) = thinking {
-            context.insert("enable_thinking".to_owned(), json!(enable_thinking));
+            context.push(("enable_thinking", Value::from(enable_thinking)));
             if let Some(effort) = effort {
-                context.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
+                context.push(("reasoning_effort", Value::from(effort.as_str())));
             }
         }
+        if let Some(preserve_thinking) = preserve_thinking {
+            context.push(("preserve_thinking", Value::from(preserve_thinking)));
+        }
         if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-            context.insert("tools".to_owned(), json!(tools));
+            // The client's `tools` array, opaque JSON, bound as-is: it
+            // arrives as `serde_json` and so is already key-sorted, which
+            // is exactly what the reference renders (its request JSON is
+            // an `nlohmann::json`, dumped sorted into `tool_jsons`).
+            context.push(("tools", Value::from_serialize(tools)));
         }
         let template = self
             .env
             .get_template(self.name)
             .map_err(|e| fail(format!("render chat template: {e}")))?;
         template
-            .render(&JsonValue::Object(context))
+            .render(Value::from_iter(context))
             .map_err(|e| fail(format!("render chat template: {e}")))
     }
 
@@ -735,41 +953,82 @@ pub struct ToolCall {
     pub id: Option<String>,
     /// The tool (function) name.
     pub name: String,
-    /// The tool arguments (a JSON object, or a JSON-encoded string).
-    pub arguments: JsonValue,
+    /// The tool arguments, held as the JSON-encoded object string the
+    /// OpenAI wire carries — never re-serialized on the way in, so the
+    /// key order the model emitted is still there when the template walks
+    /// `arguments|items` (GitHub #184; the reference's own
+    /// `ToolCall::arguments_json`, parsed with `nlohmann::ordered_json`).
+    /// A string that is not a JSON object renders as no parameters.
+    pub arguments: String,
 }
 
 // ---------------------------------------------------------------------------
-// Message → template context (Jinja sees plain JSON, OpenAI wire shape)
+// Message → template context (Jinja sees the OpenAI wire shape)
 // ---------------------------------------------------------------------------
 
-/// The JSON a [`ChatMessage`] presents to the template (OpenAI wire
-/// shape: `role`, `content`, `reasoning_content`, `tool_calls`).
-fn message_to_json(message: &ChatMessage) -> JsonValue {
-    let mut object = serde_json::Map::new();
-    object.insert("role".to_owned(), json!(message.role.name()));
-    object.insert("content".to_owned(), content_to_json(&message.content));
+/// What a [`ChatMessage`] presents to the template (OpenAI wire shape:
+/// `role`, `content`, `reasoning_content`, `tool_calls`).
+///
+/// A minijinja value rather than a `serde_json` one for a single reason:
+/// `serde_json::Map` is a `BTreeMap`, so every object that passes through
+/// it comes out key-sorted, and a tool call's `arguments` must reach the
+/// template in the order the model emitted (GitHub #184). Only `arguments`
+/// is order-sensitive — it is the one object the template walks with
+/// `|items` — but the whole message is built here so the ordered value
+/// never has to pass back through `serde_json` on its way in.
+fn message_to_value(message: &ChatMessage) -> Value {
+    let mut fields: Vec<(&'static str, Value)> = vec![
+        ("role", Value::from(message.role.name())),
+        (
+            "content",
+            Value::from_serialize(content_to_json(&message.content)),
+        ),
+    ];
     if let Some(reasoning) = &message.reasoning_content {
-        object.insert("reasoning_content".to_owned(), json!(reasoning));
+        fields.push(("reasoning_content", Value::from(reasoning.as_str())));
     }
     if !message.tool_calls.is_empty() {
-        let calls: Vec<JsonValue> = message
-            .tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    },
-                })
-            })
-            .collect();
-        object.insert("tool_calls".to_owned(), json!(calls));
+        fields.push((
+            "tool_calls",
+            Value::from_iter(message.tool_calls.iter().map(tool_call_to_value)),
+        ));
     }
-    JsonValue::Object(object)
+    Value::from_iter(fields)
+}
+
+/// One tool call in the OpenAI wire shape the template matches against
+/// (`id` / `type` / `function.name` / `function.arguments`).
+fn tool_call_to_value(call: &ToolCall) -> Value {
+    Value::from_iter([
+        (
+            "id",
+            call.id.as_deref().map_or_else(|| Value::from(()), Value::from),
+        ),
+        ("type", Value::from("function")),
+        (
+            "function",
+            Value::from_iter([
+                ("name", Value::from(call.name.as_str())),
+                ("arguments", tool_arguments_to_value(&call.arguments)),
+            ]),
+        ),
+    ])
+}
+
+/// A tool call's wire `arguments` as the parameter map the template walks:
+/// the JSON-encoded object string parsed straight into a minijinja value,
+/// whose map keeps the document's own key order (GitHub #184, the
+/// reference's `nlohmann::ordered_json` parse in `render_tool_call`).
+///
+/// A string that does not parse as a JSON *object* — the empty string an
+/// argument-less call carries, or a malformed one — becomes an empty map,
+/// which renders as no parameters at all rather than failing the whole
+/// conversation (the "never panic, degrade" posture of GitHub #132).
+fn tool_arguments_to_value(arguments: &str) -> Value {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value) if value.kind() == ValueKind::Map => value,
+        _ => Value::from_iter(std::iter::empty::<(Value, Value)>()),
+    }
 }
 
 /// The JSON of a message's [`MessageContent`] (plain text, or the
@@ -998,8 +1257,7 @@ mod tests {
         let prompt = template
             .render_with_thinking_and_tools(
                 &[ChatMessage::text(Role::User, "hi")],
-                true,
-                None,
+                ChatRenderOptions::default(),
                 Some(&tools),
             )
             .expect("render");
@@ -1012,18 +1270,18 @@ mod tests {
         let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
         let messages = [ChatMessage::text(Role::User, "hi")];
         let without = template
-            .render_with_thinking_and_tools(&messages, true, None, None)
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), None)
             .expect("render");
         assert!(!without.contains("TOOLS="), "{without}");
         let empty: [JsonValue; 0] = [];
         let with_empty = template
-            .render_with_thinking_and_tools(&messages, true, None, Some(&empty))
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), Some(&empty))
             .expect("render");
         assert!(!with_empty.contains("TOOLS="), "{with_empty}");
     }
 
     #[test]
-    fn message_to_json_carries_tool_calls_in_the_openai_shape() {
+    fn message_to_value_carries_tool_calls_in_the_openai_shape() {
         let template = ChatTemplate::from_source(TOOLS_TEMPLATE).expect("compile");
         let messages = [ChatMessage {
             role: Role::Assistant,
@@ -1031,7 +1289,7 @@ mod tests {
             tool_calls: vec![ToolCall {
                 id: Some("call_0".to_owned()),
                 name: "read_file".to_owned(),
-                arguments: json!({"path": "a.txt"}),
+                arguments: r#"{"path": "a.txt"}"#.to_owned(),
             }],
             reasoning_content: None,
         }];
@@ -1087,7 +1345,7 @@ mod tests {
             }
         })];
         let prompt = template
-            .render_with_thinking_and_tools(&[], true, None, Some(&tools))
+            .render_with_thinking_and_tools(&[], ChatRenderOptions::default(), Some(&tools))
             .expect("render");
         assert_eq!(
             prompt,
@@ -1097,27 +1355,63 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tojson_renders_history_tool_call_arguments_as_the_reference_does() {
-        // The real template walks `arguments|items` and renders non-string
-        // values with `tojson`.
-        let template = ChatTemplate::from_source(
-            "{%- for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments|items %}\
-             <{{ k }}>{{ v if v is string else v | tojson }}{% endfor %}{% endfor %}{% endfor %}",
-        )
-        .expect("compile");
-        let messages = [ChatMessage {
+    /// Walks `arguments|items` the way the real template does, rendering
+    /// non-string values with `tojson` — the smallest source that shows a
+    /// tool call's parameter order.
+    const ARGUMENT_ITEMS_TEMPLATE: &str =
+        "{%- for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments|items %}\
+         <{{ k }}>{{ v if v is string else v | tojson }}{% endfor %}{% endfor %}{% endfor %}";
+
+    /// One assistant history message carrying a single tool call whose
+    /// `arguments` is the wire string `arguments`.
+    fn history_tool_call(arguments: &str) -> [ChatMessage; 1] {
+        [ChatMessage {
             role: Role::Assistant,
             content: MessageContent::Text(String::new()),
             tool_calls: vec![ToolCall {
                 id: None,
                 name: "edit".to_owned(),
-                arguments: json!({"path": "b.rs", "edits": [{"old": "x", "new": "y"}], "all": true}),
+                arguments: arguments.to_owned(),
             }],
             reasoning_content: None,
-        }];
-        let prompt = template.render(&messages).expect("render");
-        assert_eq!(prompt, r#"<all>true<edits>[{"new": "y", "old": "x"}]<path>b.rs"#);
+        }]
+    }
+
+    #[test]
+    fn tojson_renders_history_tool_call_arguments_as_the_reference_does() {
+        // The real template walks `arguments|items` and renders non-string
+        // values with `tojson`.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        let prompt = template
+            .render(&history_tool_call(r#"{"path": "b.rs", "edits": [{"old": "x", "new": "y"}], "all": true}"#))
+            .expect("render");
+        assert_eq!(prompt, r#"<path>b.rs<edits>[{"old": "x", "new": "y"}]<all>true"#);
+    }
+
+    #[test]
+    fn history_tool_call_arguments_keep_the_models_key_order() {
+        // GitHub #184: the reference parses a resent call's `arguments`
+        // with `nlohmann::ordered_json` (`chat_template.cpp`
+        // `render_tool_call`), so the model's emitted order survives a
+        // re-render. Sorting them — what a `serde_json::Map` would do —
+        // turns every tool-loop turn into a prompt-content mismatch.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        let prompt = template
+            .render(&history_tool_call(r#"{"z": 1, "a": 2, "m": 3}"#))
+            .expect("render");
+        assert_eq!(prompt, "<z>1<a>2<m>3");
+    }
+
+    #[test]
+    fn history_tool_call_arguments_that_are_not_a_json_object_degrade_to_an_empty_one() {
+        // The provider's posture since GitHub #132: a call whose wire
+        // string does not parse as a JSON object renders no parameters
+        // rather than failing the whole request.
+        let template = ChatTemplate::from_source(ARGUMENT_ITEMS_TEMPLATE).expect("compile");
+        for arguments in ["", "not json", "[1, 2]", "\"a\"", "null"] {
+            let prompt = template.render(&history_tool_call(arguments)).expect("render");
+            assert_eq!(prompt, "", "{arguments} must render no parameters");
+        }
     }
 
     #[test]
@@ -1227,6 +1521,175 @@ enable_thinking={{ enable_thinking }};done"#;
     fn render_with_thinking_disabled_raises_on_a_template_that_cannot() {
         let template = ChatTemplate::from_source(THINKING_TEMPLATE).expect("compile");
         assert!(template.render_with_thinking(&[], false, None).is_err());
+    }
+
+    // -- preserve_thinking reaches the template (GitHub #185) ----------------
+
+    /// Reports which of the three states `preserve_thinking` reached the
+    /// template in. The real Qwen 3.8 template's assistant branch keys on
+    /// exactly that three-way distinction (`is undefined` / `is true` /
+    /// else), so a variable left unbound silently takes the "keep the think
+    /// block" path (GitHub #182).
+    const PRESERVE_PROBE_TEMPLATE: &str =
+        "{%- if preserve_thinking is undefined -%}UNDEF{%- elif preserve_thinking is true -%}TRUE\
+{%- else -%}FALSE{%- endif -%}";
+
+    #[test]
+    fn render_with_thinking_and_tools_binds_preserve_thinking() {
+        // GitHub #185: the request's resolved `preserve_thinking` reaches the
+        // template as a bound variable in both states, never as "undefined" —
+        // the state in which the template keeps history thinking whatever the
+        // request asked for.
+        let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
+        assert_eq!(
+            template
+                .render_with_thinking_and_tools(&[], ChatRenderOptions::default(), None)
+                .expect("render"),
+            "FALSE"
+        );
+        assert_eq!(
+            template
+                .render_with_thinking_and_tools(&[], ChatRenderOptions { preserve_thinking: true, ..Default::default() }, None)
+                .expect("render"),
+            "TRUE"
+        );
+    }
+
+    #[test]
+    fn render_and_render_with_thinking_leave_preserve_thinking_to_the_template() {
+        // The two option-free entry points bind nothing they were not told:
+        // `render` is the "I do not care" delegation, and the capability
+        // probe renders a single user message, where the variable cannot
+        // matter. Both leave the template's own default in force.
+        //
+        // This pins a limitation, not a guarantee. Undefined is the state
+        // that keeps a think block on every history assistant turn (#182), so
+        // if a multi-turn caller ever reaches one of these, the fix is to
+        // bind the variable there and change this test — not to route the
+        // caller around it. `render_with_thinking`'s doc comment says the
+        // same, where a caller will actually read it.
+        let template = ChatTemplate::from_source(PRESERVE_PROBE_TEMPLATE).expect("compile");
+        assert_eq!(template.render(&[]).expect("render"), "UNDEF");
+        assert_eq!(
+            template.render_with_thinking(&[], true, None).expect("render"),
+            "UNDEF"
+        );
+    }
+
+    /// The real Qwen 3.8 template's history rendering, copied verbatim from
+    /// `frontend/chat_template.jinja` — the last-real-user-query scan (its
+    /// lines 88-101) and the assistant branch's think-block decision (its
+    /// lines 110-120) — with only what these conversations never reach
+    /// trimmed. A test against it exercises the exact branch production
+    /// takes, not an analogue of it (the same posture as
+    /// `REAL_TOOL_DIALECT_TEMPLATE` in `crates/server`).
+    const REAL_HISTORY_DIALECT_TEMPLATE: &str = r##"
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = message.content|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- set content = message.content|trim %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n' }}
+{%- endif %}"##;
+
+    /// GitHub #182's repro conversation: `user, assistant(content +
+    /// reasoning), user`. The assistant turn sits *before* the last real user
+    /// query, so the reference omits its think block entirely.
+    fn history_conversation() -> [ChatMessage; 3] {
+        let mut assistant = ChatMessage::text(Role::Assistant, "A gradient with a disc.");
+        assistant.reasoning_content = Some("Looks like a gradient.".to_owned());
+        [
+            ChatMessage::text(Role::User, "What is in this picture?"),
+            assistant,
+            ChatMessage::text(Role::User, "And the colours?"),
+        ]
+    }
+
+    #[test]
+    fn preserve_thinking_false_strips_history_thinking_before_the_last_query() {
+        // AC1 (GitHub #185): with `preserve_thinking` false the real
+        // template's strip branch runs, so a history assistant turn before
+        // the last real user query carries no think block at all — not the
+        // emptied one ignis rendered while the variable stayed unbound
+        // (#182).
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let prompt = template
+            .render_with_thinking_and_tools(&history_conversation(), ChatRenderOptions::default(), None)
+            .expect("render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is in this picture?<|im_end|>\n\
+             <|im_start|>assistant\nA gradient with a disc.<|im_end|>\n\
+             <|im_start|>user\nAnd the colours?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn preserve_thinking_true_keeps_history_thinking() {
+        // AC2 (GitHub #185): with `preserve_thinking` true the same turn
+        // keeps its reasoning, exactly as the reference keeps it.
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let prompt = template
+            .render_with_thinking_and_tools(&history_conversation(), ChatRenderOptions { preserve_thinking: true, ..Default::default() }, None)
+            .expect("render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is in this picture?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\nLooks like a gradient.\n</think>\n\n\
+             A gradient with a disc.<|im_end|>\n\
+             <|im_start|>user\nAnd the colours?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn preserve_thinking_false_keeps_thinking_after_the_last_query() {
+        // The other half of the reference's rule (`chat_template.cpp`:
+        // `keep_thinking = preserve_thinking || i > last_query_index`): an
+        // assistant turn *after* the last real user query — a tool loop's
+        // in-flight turns — keeps its reasoning even with `preserve_thinking`
+        // false.
+        let template = ChatTemplate::from_source(REAL_HISTORY_DIALECT_TEMPLATE).expect("compile");
+        let mut assistant = ChatMessage::text(Role::Assistant, "Reading the file.");
+        assistant.reasoning_content = Some("I should read it.".to_owned());
+        let messages = [
+            ChatMessage::text(Role::User, "Summarize a.txt"),
+            assistant,
+            ChatMessage::text(Role::User, "<tool_response>\nok\n</tool_response>"),
+        ];
+        let prompt = template
+            .render_with_thinking_and_tools(&messages, ChatRenderOptions::default(), None)
+            .expect("render");
+        assert!(
+            prompt.contains("<think>\nI should read it.\n</think>\n\nReading the file."),
+            "{prompt}"
+        );
     }
 
     #[test]

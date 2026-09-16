@@ -120,10 +120,27 @@ When output names a domain concept, use the term as defined here.
   never see the section layout; a restore validates the header and refuses a
   stale or foreign one. Whole-sequence only: GDN state cannot be recomputed
   without re-running the prefix a restore exists to avoid (ADR 0024).
+- **Blob identity** — what state was produced under, carried in the **snapshot
+  blob**'s header and in the retained entry alike: the artifact's content hash,
+  the **KV format**, the blob layout version the leaf writes, and the drafter's
+  presence and draft window. It answers whether these bytes may be written into
+  a sequence at all, and a mismatch is refused before one of them moves. Never a
+  request id, and never an operator knob that does not change state — the bind
+  address, the prefill chunk, the concurrency and every byte budget are outside
+  it, because a budget derived from free VRAM differs from one start to the next
+  (ADR 0029). Its artifact hash is **structural**: a digest of what the container
+  declares — its identity, its size, and every object's name, kind, numeric
+  format, storage layout, shape, offset and length — not of the weight bytes,
+  which the v2 container carries no digest of. So it catches another model, a
+  re-export, a re-layout, a renamed object or a format change, and it does *not*
+  catch an in-place re-quantization that left the whole directory untouched
+  (ADR 0029, §Consequences: departure).
 - **Residency tier** — where sequence state lives, in three levels: **Tier 0 —
   device** (VRAM), **Tier 1 — KV-RAM**, **Tier 2 — KV-disk**. State moves down a
-  tier when the one above needs the room, and back up to be served. "Host tier"
-  is not a synonym: say KV-RAM.
+  tier when the one above needs the room, and back up to be served. Each tier
+  below the first carries a **restore floor**: the prompt tokens a match there
+  must reuse beyond the best match above it before it is worth the crossing, so
+  a tie always goes to the tier above. "Host tier" is not a synonym: say KV-RAM.
 - **KV-RAM** — Tier 1: the host-RAM tier that holds **snapshot blobs** of
   evicted live sequences (so they resume instead of re-prefilling) and of
   retained state (**prompt checkpoints**, **retained prefixes**) that left the
@@ -149,10 +166,37 @@ When output names a domain concept, use the term as defined here.
   it were a sibling. Its boundary is a structural point of the rendered prompt
   (the end of the system and tools block, floored to whole KV pages), not the
   publishing request's whole prompt head.
+- **Lineage** — one conversation's chain of **prompt checkpoints**, and the
+  only name a conversation has. The clients send no session id, so what ties
+  turn N+1's checkpoint to turn N's is the link that does exist: turn N+1
+  claimed turn N's entry. Every capture joins the lineage of the entry its
+  request resumed from, or opens one of its own — and it is per lineage, not
+  per pool, that at most two checkpoints are kept.
+- **Chained prefix** — a **shared prefix** published on top of another. A
+  request that resumed from retained state and prefilled past it has no head
+  of its own to publish: the pages below its generation opener are partly the
+  entry it claimed. It publishes the pages it warmed itself *over* that entry,
+  taking over the reference it was holding rather than adding one, so every
+  page is still charged to the pool exactly once and a claimant of the chain
+  shares all of it. This is what lets every iteration of a tool loop leave a
+  **prompt checkpoint** instead of only the first.
 - **Retained state** — prompt checkpoints and retained prefixes: state no live
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
   evicted live sequence.
+- **Match key** — what a piece of **retained state**, and every **shared
+  prefix**, is addressed by: a hash
+  chain over the prompt tokens it covers, with each media item's identity (its
+  content digest and grid) mixed in at that item's **first** placeholder, so a
+  prefix covering one placeholder has committed to the whole image. Token ids
+  alone are not enough: two same-size images expand to identical placeholder
+  ids. A chain
+  rather than a digest of the whole, because a claimant asks about every prefix
+  length of its prompt at once, and because it lets a blob name its content in
+  sixteen bytes instead of carrying sixty thousand token ids to another tier.
+  Never contains a request id: a wrong session identifier could hand one
+  conversation another's state, a content match can only hand over identical
+  history (ADR 0029).
 - **Prefix reuse** — requests sharing a prefix skip the redundant prefill —
   concurrent siblings through a **shared prefix**, later requests through
   **retained state**: the shared **KV pages** are refcounted and shared in place on the
@@ -169,18 +213,33 @@ When output names a domain concept, use the term as defined here.
   blob owns every byte of its history and outlives the prefix.
 - **Publish point** — the chunk boundary a prefix is published at, and 0 for a
   request that publishes nothing. A shared or retained prefix's is always a
-  whole number of KV pages in; a **prompt checkpoint**'s is the generation
+  whole number of KV pages in — a **chained prefix**'s is measured from the
+  start of the prompt, not from what the publisher already shares; a **prompt
+  checkpoint**'s is the generation
   opener wherever it falls, and whoever reuses it copies the partial page
-  rather than sharing it. It
+  rather than sharing it. A prefix's never ends inside a **media item**'s
+  placeholders: it walks back to the page holding the item's first one. It
   is a scheduling decision, not a detail of the publish call: what a claimant
   clones is the mutable state at the prefix's *end*, so the publishing
   request's prefill is cut there, and a prompt whose length is not a whole
-  page pays one extra chunk for it.
+  page pays one extra chunk for it. A request publishes **one** head, so its
+  two boundaries share a prefix when they fall in the same KV page and
+  compete for it when they do not: a short first turn leaves both a
+  **retained prefix** and a **prompt checkpoint**, while a prompt with tools
+  — a block several pages long — leaves the block alone. That competition is
+  a limit of today's leaf rather than a rule of the domain: a sequence may
+  hold one prefix, and a capture demands the opener's whole pages be it.
+  GitHub #187 lifts the first and satisfies the second rather than waiving
+  it — a request may publish a second prefix over the head it warmed itself,
+  so the pages below its opener become its own chained prefix and it keeps
+  both the block and its checkpoint.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained
   state** before evicted live sequences, then request class, then probation
-  before protected, then least-recently-used. On the device, retained state
+  before protected, then least-recently-used — a main-conversation entry idle
+  past its TTL ranking as a subagent's probation entry, and a spill displacing
+  only what ranks below it. On the device, retained state
   goes before any of it. Protection
   outranks class only where something is actively being served (ADR 0023).
 - **Chunked prefill** — prefilling a prompt span through the span+position
@@ -321,7 +380,26 @@ When output names a domain concept, use the term as defined here.
 - **MTP** — the model's native multi-token-prediction head, the alternative
   drafter (draft window 1..7 chosen at load, verification width chosen per
   round). Deferred behind **DFlash2** at G5.
-- **Vision** — multimodal (image/video) input.
+- **Vision** — multimodal input: images today, video refused until its own
+  spec. A load option (`--vision`): without it nothing of the tower is bound
+  or reserved and text serving is unchanged. With it, a chat message's
+  content parts may carry images by `data:` URI or HTTP(S) URL; the server
+  **acquires** and prepares each one before admission, the template expands
+  its placeholder into its **vision tokens**, and from there a multimodal
+  request is an ordinary request — chunked and interleaved with decode lanes,
+  speculated by **DFlash2**, sharing prefixes under its **match key**, evicted to and
+  restored from **KV-RAM** — whose prefill additionally runs a **media
+  encode** per item and whose rounds rotate at its **rope delta**.
+- **Media acquisition** — turning a request's image parts into prepared
+  **media items** before it is admitted: decoding a `data:` URI or fetching a
+  URL under the media policy (private addresses refused unless
+  `--media-allow-private-network`, byte cap, deadline), then preprocessing,
+  memoized by content digest. A refused image refuses its request before
+  admission; nothing reaches the scheduler.
+- **Media encode** — the prefill step that runs the **vision encoder** over
+  one **media item** and leaves its **media embedding** on the device, in the
+  first chunk that reaches the item. Its wall time is reported on the
+  request, apart from the prefill's.
 - **Media item** — one image in a prompt: its patch grid, the run of
   placeholder tokens it expands to, its BF16 patch rows and the digest of the
   bytes it came from. The unit the processor prepares, the encoder encodes and
@@ -338,7 +416,12 @@ When output names a domain concept, use the term as defined here.
 - **Rope delta** — `max_position + 1 - prompt_length` for a multimodal prompt,
   whose three-axis positions advance more slowly than its tokens. Every decode
   round after such a prompt rotates at `position + rope_delta`; the position
-  itself stays the KV index and the sampler's key.
+  itself stays the KV index and the sampler's key. Part of a sequence's
+  progress, so a snapshot blob carries it — but a clone does not: a
+  **shared prefix** or **prompt checkpoint** captures it as zero, since a
+  text claimant may stand on a multimodal publisher's head. A claimant learns
+  its own delta only from a prefill span, which is why a multimodal claim
+  always leaves at least one prompt token to prefill (ADR 0029).
 
 ## Observability
 

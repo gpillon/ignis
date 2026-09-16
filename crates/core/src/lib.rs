@@ -29,6 +29,7 @@
 //! reuse) are implemented on top of this contract.
 
 pub mod admission;
+pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
 pub mod gdn;
@@ -38,6 +39,7 @@ pub mod gdn_layer;
 pub mod gqa_layer;
 pub mod gpu_profile;
 pub mod host;
+pub mod identity;
 pub mod kv;
 pub mod kv_format;
 pub mod mock;
@@ -58,12 +60,21 @@ pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
     ProtectionPhase, RetainedLaneCandidate,
 };
+pub use checkpoint::{
+    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool,
+    MAX_AUTO_RETAINED_POOL_BYTES, RETAINED_POOL_RESERVE_BYTES, ReuseSource,
+    auto_retained_pool_bytes,
+};
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{
-    ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
+    Clock, ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
     resolve_serving_chunk_tokens,
 };
-pub use host::{HostEntry, HostError, HostTier, Tier};
+pub use host::{HostEntry, HostError, HostTier, KvRamVictim, RetainedKvRamEntry, Tier};
+pub use identity::{
+    ArtifactHash, BlobHeader, BlobIdentity, IdentityField, IdentityMismatch, MATCH_KEY_VERSION,
+    MatchKey, MatchKeyChain, MediaKey, PromptContent, PromptKeys,
+};
 pub use kv_format::{
     DEFAULT_KV_POOL_BYTES, KV_PAGE_TOKENS, KvBudgetTooSmall, KvFormat, KvGeometry, KvPlaneDtype,
     KvPlaneSpec, KvPoolPlan, auto_kv_pool_bytes, plan_kv_pool, plan_kv_pool_for_context,

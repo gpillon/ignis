@@ -309,6 +309,7 @@ fn send_needle_request(
         stream: true,
         include_usage: false,
         enable_thinking: Some(false),
+        images: Vec::new(),
     };
     match ep.complete(&req) {
         Ok(outcome) => NeedleResult {

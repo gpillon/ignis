@@ -23,7 +23,7 @@ use tower::ServiceExt;
 use ignis_core::{mock::MockCompute, ConcreteScheduler, SchedulerConfig, TokenId};
 use ignis_server::decoder::TokenDecoder;
 use ignis_server::engine::Engine;
-use ignis_server::template::{ChatMessage, TemplateProvider};
+use ignis_server::template::{ChatMessage, RenderedPrompt, TemplateProvider};
 use ignis_server::thinking::{ReasoningEffort, ThinkingCapabilities, ThinkingOptions};
 use ignis_server::Server;
 
@@ -71,7 +71,7 @@ impl TemplateProvider for RecordingTemplateProvider {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[serde_json::Value],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         self.captured.lock().unwrap().push(*options);
         self.inner.apply_chat_template(messages, options, tools)
     }
@@ -448,12 +448,12 @@ async fn responses_api_text_carries_only_the_content_channel() {
 
 // ── multi-turn reasoning (stories 27-29) ────────────────────────────────
 //
-// The actual drop-vs-preserve *behavior* (whether the prior reasoning text
-// reaches the real template's rendered prompt) is pinned with the real
-// Qwen-shaped template in `artifact_template.rs`'s
-// `apply_chat_template_drops_reasoning_content_unless_preserved` — the
-// placeholder provider used by this file's harness has no jinja template to
-// observe that in. What belongs at the HTTP seam is that `preserve_thinking`
+// The actual keep-vs-strip *behavior* (which prior reasoning reaches the
+// rendered prompt) is pinned against the real template in the artifact
+// crate's `preserve_thinking_*` tests and against the reference itself in
+// `tests/fixtures/vision/expected/chat_history*.json` — the placeholder
+// provider used by this file's harness has no jinja template to observe
+// that in. What belongs at the HTTP seam is that `preserve_thinking`
 // parses off the wire and reaches the resolved `ThinkingOptions` the
 // provider is handed.
 

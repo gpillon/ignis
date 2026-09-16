@@ -27,11 +27,14 @@
 
 #![cfg(feature = "cuda")]
 
-use std::path::{Path, PathBuf};
+#[path = "support/mod.rs"]
+mod support;
+
+use std::path::Path;
 
 use ignis_artifact::{
-    bind_model_scope_27b_with, materialize, ChatMessage, ContentPart, CudaDevice, FrontendSet,
-    MessageContent, ModelScope, Reader, Role,
+    bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
+    FrontendSet, MessageContent, ModelScope, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -39,13 +42,13 @@ use ignis_bench::oracle::{
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::model_load::{load_qwen38_27b_with_options, Model};
-use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
-use ignis_core::step::{
-    self, MediaEmbedding, MultimodalPrefill, SamplingParams, SpanMediaColumns,
-};
+use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::seq::{SeqPool, SeqPoolBudget};
+use ignis_core::step;
 use ignis_core::vision::{vision_item_control, Multimodal};
 use ignis_core::{KvFormat, Vision};
+
+use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 2048;
@@ -55,100 +58,6 @@ const FIRST_N: usize = 32;
 const SPANNING_CHUNK: u32 = 48;
 /// Decode rounds compared against the prefill path's greedy chain.
 const DECODE_ROUNDS: usize = 16;
-
-struct Canary {
-    id: String,
-    image: Vec<u8>,
-    question: String,
-    expected: Vec<u32>,
-}
-
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("vision_canary")
-}
-
-/// The answers are short and the reference stopped on its own, so the turn's
-/// end is scored too: each expected run closes with the model's EOS.
-fn load_canaries(frontend: &FrontendSet) -> Vec<Canary> {
-    let eos = frontend.eos_token_id().expect("eos");
-    let dir = fixture_dir();
-    let text = std::fs::read_to_string(dir.join("fixture.json"))
-        .unwrap_or_else(|e| panic!("read the vision canary fixture: {e}"));
-    let fixture: serde_json::Value = serde_json::from_str(&text).expect("fixture json");
-    fixture["canaries"]
-        .as_array()
-        .expect("canaries")
-        .iter()
-        .map(|canary| {
-            let field = |name: &str| canary[name].as_str().unwrap_or_else(|| panic!("{name}")).to_owned();
-            Canary {
-                id: field("id"),
-                image: std::fs::read(dir.join(field("image"))).expect("canary image"),
-                question: field("question"),
-                expected: {
-                    let mut ids = frontend.tokenizer().encode(&field("text")).expect("tokenize the answer");
-                    ids.push(eos);
-                    ids
-                },
-            }
-        })
-        .collect()
-}
-
-fn argmax_lowest_id(logits: &[f32]) -> u32 {
-    let mut best_id = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    for (id, &v) in logits.iter().enumerate() {
-        if v > best {
-            best = v;
-            best_id = id;
-        }
-    }
-    best_id as u32
-}
-
-/// Prefill the whole prompt in spans of at most `chunk` tokens (one media
-/// item per span, as the scheduler cuts them), leaving the last position's
-/// logits in `logits`.
-fn prefill_prompt(
-    model: &Model,
-    pool: &SeqPool,
-    sequence: &mut Seq<'_>,
-    tokens: &[i32],
-    prompt: &Multimodal,
-    embedding: &MediaEmbedding<'_>,
-    chunk: u32,
-    logits: &mut [f32],
-) -> Result<(), String> {
-    let total = tokens.len() as u32;
-    let mut start = 0u32;
-    while start < total {
-        let len = prompt.cap_chunk(start, chunk.min(total - start));
-        let positions = prompt.span_positions(start as usize, len as usize);
-        let media = prompt.chunk_media(start, len);
-        let last = start + len == total;
-        step::prefill_program_multimodal(
-            model,
-            pool,
-            sequence,
-            &tokens[start as usize..(start + len) as usize],
-            u64::from(start),
-            SamplingParams::greedy(),
-            MultimodalPrefill {
-                positions: &positions,
-                rope_delta: prompt.rope_delta,
-                media: media.as_ref().map(|media| SpanMediaColumns {
-                    embedding,
-                    first_column: media.first_column,
-                    scatter_indices: &media.scatter_indices,
-                }),
-            },
-            if last { Some(&mut *logits) } else { None },
-        )?;
-        start += len;
-    }
-    Ok(())
-}
 
 fn new_pool() -> SeqPool {
     SeqPool::create(
@@ -227,7 +136,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
             reasoning_content: None,
         }];
         let prepared = frontend
-            .prepare_prompt(&processor, &messages, &[&canary.image], false, None, None)
+            .prepare_prompt(&processor, &messages, &[&canary.image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None)
             .unwrap_or_else(|e| panic!("{}: prepare prompt: {e}", canary.id));
         let (token_ids, prompt) = Multimodal::from_prepared(prepared);
         let tokens: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
@@ -339,7 +248,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
         reasoning_content: None,
     }];
     let prepared = frontend
-        .prepare_prompt(&processor, &messages, &[&canary.image], false, None, None)
+        .prepare_prompt(&processor, &messages, &[&canary.image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None)
         .expect("prepare");
     let item = &prepared.media[0];
     let control = vision_item_control(item.grid);

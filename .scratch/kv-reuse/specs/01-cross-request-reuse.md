@@ -116,15 +116,37 @@ this today (verified 2026-09-15):
 
 ### Lineage and non-consuming reuse (slice 2)
 
+- **Chained prefixes** (amended 2026-09-16, #187, from what the leaf turned
+  out to be). A capture demands that the whole pages below the opener *be* the
+  sequence's shared prefix, and the leaf allowed one prefix per sequence — so
+  a sequence that resumed from retained state, or claimed a sibling's head,
+  could never capture at its own opener. Both are removed by one change, and
+  it is a **composition rather than a relaxed check**: a sequence may now
+  publish a prefix *over* the one it holds, owning only the pages it warmed
+  itself and taking over the reference it was holding on the head below. The
+  capture rule is then satisfied rather than weakened — which matters, because
+  a checkpoint standing on pages the capturing sequence owns would outlive its
+  own history the moment that request ended. A request publishes at each of
+  its boundaries in turn (§Retained prefix), each chained over the last.
 - A request that claimed checkpoint C and captures its own checkpoint C'
   supersedes C, unless C is a **turn-opening checkpoint**. C is turn-opening
-  when no real user message lies between C's opener and the end of the
-  prompt that claimed it, that is, when C was the first checkpoint after its
-  conversation's last user message.
-- A conversation keeps at most two checkpoints: its latest and its
-  turn-opening one. Superseded entries are discarded immediately.
+  when it was the first checkpoint captured after its conversation's last real
+  user message — recorded at capture from the frontend's last-real-user-query
+  offset, not recomputed later, so a tool-loop iteration does not re-earn the
+  role every time it claims.
+- A conversation is a **lineage**: the chain of checkpoints linked by "this
+  request claimed that entry". There is no session id, so the claim edge is
+  the only link there is. A capture joins the lineage of the entry its request
+  claimed, or opens one of its own.
+- A lineage keeps at most two checkpoints: its latest and its newest
+  turn-opening one. Superseded entries are discarded immediately, and the
+  discard releases the device image and the hold on the pages below it.
 - Regenerate, retry and fork: N claimants of one checkpoint all hit, and the
-  entry survives them.
+  entry survives them. **Open** (#187): two forks of one history join one
+  lineage, so the later fork's *capture* supersedes the earlier fork's. The
+  entry they both claimed is kept either way, and the acceptance criterion
+  holds. Splitting a lineage on a fork needs a rule this spec does not have —
+  from inside the engine a fork and a new turn are the same shape.
 
 ### Retained prefix for bursts (slice 3)
 
@@ -136,25 +158,47 @@ this today (verified 2026-09-15):
   an identical one is already retained, paying one extra chunk split (ADR
   0024). At refcount 0 the prefix is not dropped: it becomes retained, and is
   a first victim like any retained state.
+- **Two boundaries, not one** (amended 2026-09-16, #188 measured it and #187
+  fixed it). This spec said "one extra chunk split"; with one prefix per
+  sequence the split turned out to be **moved**, not added, and the cost was
+  not a chunk but the whole feature: qwen-code sends tools on every request,
+  so the system block is always at least a page, so the checkpoint boundary
+  always lost and *no prompt checkpoint was ever captured in production*.
+  With chained prefixes (§Lineage) both boundaries are published, in prompt
+  order, the opener's page chained over the block: two cuts, both real, and
+  the pages under each charged to the pool once. The two are always in that
+  order — the system block ends before the last `<|im_start|>assistant\n`, and
+  flooring is monotone, so the block's page floor never lies past the opener's.
+  The list of boundaries a request publishes at is ascending, and the code that
+  walks it ("the first boundary past what I already share") depends on that.
 - **Claim.** A later request claims it exactly like a concurrent sibling does
   today. A prompt checkpoint match that is longer wins (ADR 0029: longest
-  reuse wins).
+  reuse wins). A claimant of a retained prefix chains its own head over it and
+  leaves a checkpoint of its own, so a burst leaves one checkpoint per
+  sibling rather than one for whoever published first.
 
 ### Retained state in KV-RAM (slice 4)
 
 - **Spill.** When the device releases retained state (first-victim path),
-  it is snapshotted into KV-RAM if the byte budget can take it, and discarded
-  otherwise. There is no eager copy.
+  it is snapshotted into KV-RAM if the byte budget can take it — discarding,
+  for it, only retained entries that rank strictly below it, planned before
+  anything goes — and discarded otherwise. There is no eager copy. (#190, owner
+  decision 2026-09-16; ADR 0023 amendment.) A retained prefix that spilled
+  comes back to the device once, when a prompt's best reuse is it, and the
+  burst shares it there; its blob stays in KV-RAM (ADR 0029 amendment).
 - **Materialized blobs.** A snapshot of a sequence or checkpoint holding a
   shared prefix materializes the shared pages (ADR 0024 amendment). The leaf
   refusal code for that case goes away.
 - **Discard ordering** (ADR 0023 amendment): retained entries before evicted
   live sequences; then class, probation/protected, LRU. A retained entry
   carries its producer's class. A restore promotes the entry to protected,
-  as today.
+  as today, once it lands. An Interactive entry idle past
+  `--retained-interactive-ttl` (default 300 s) ranks as an Agent's probation
+  entry; a structured retention score is #199.
 - **Restore floor.** A KV-RAM match is used only if it reuses at least one
-  prefill chunk (1024 tokens) more than the best device match. This is a
-  fixed starting value, tuned by measurement, not derived.
+  prefill chunk (1024 tokens) more than the best device match — a device
+  prefix included. This is a fixed starting value, tuned by measurement, not
+  derived.
 - **Lifecycle.** A restored retained entry stays in KV-RAM (non-consuming,
   like the device). Rust never interprets the blob; it keeps
   one host allocation per entry.
@@ -170,6 +214,14 @@ this today (verified 2026-09-15):
   presence and draft window. Operator knobs that do not change state are
   excluded (bind, prefill chunk, concurrency, budgets). A mismatch is refused
   before any byte is written into a sequence.
+  - **Departure as built (#189).** The artifact content hash is a digest of
+    the container's *directory* — identity, size, payload start, and every
+    object's name, kind, numeric format, storage layout, shape, offset and
+    length — not of its payload: the v2 container carries no per-tensor
+    digest, and hashing ~19 GB at every startup is not a price this check may
+    charge. It misses only an in-place re-quantization that preserved the
+    whole directory. See ADR 0029 §Consequences; the owner decides whether the
+    proxy stands or the container starts carrying a payload digest.
 - **Match key**: a hash chain over token ids, with media identity (the
   per-item content digest from the vision processor, #176) mixed in at the
   placeholder spans. It is text-only until vision lands, but the key's shape

@@ -308,7 +308,7 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     // Width 8 carries the four canaries twice: the suite has four prompts.
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
     assert!(prompts8.iter().all(|p| p.len() + TOTAL <= MAX_CONTEXT as usize), "a canary outgrows the context");
-    assert_eq!(snapshot_format_version(), 2, "this test reads the version-2 blob layout");
+    assert_eq!(snapshot_format_version(), 3, "this test reads the version-3 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));

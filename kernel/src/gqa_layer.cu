@@ -645,8 +645,14 @@ int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
   }
   const uint32_t gqa_layer = ignis_gqa_relative_layer(layer);
   const IgnisVerifyRound &verify = *model->verify;
+  // GitHub #195: a vision load rotates the round's columns at `position +
+  // rope_delta` from its own staging -- the decode round's rule, at the
+  // verify round's column shape. Without vision there is no such buffer and
+  // the columns rotate at their cache positions, exactly as before.
+  const void *rotation =
+      verify.rope_positions != nullptr ? verify.rope_positions->p : verify.positions->p;
   return run_gqa_layer_batch(model, pool, layer, width, static_cast<std::int32_t>(verify.window + 1),
-                             verify.positions->p, verify.positions->p, verify.valid_columns->p,
+                             verify.positions->p, rotation, verify.valid_columns->p,
                              const_cast<void *>(in_residual), out_residual, gqa_layer, mode,
                              "ignis_gqa_layer_verify");
 }

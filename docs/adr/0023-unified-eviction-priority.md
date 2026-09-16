@@ -84,3 +84,26 @@ request needs — is placed ahead of both orderings.
 
 The reason is asymmetry of loss. An evicted live sequence is work that will
 certainly be redone; a retained entry is a bet that it will be needed.
+
+## Amendment (2026-09-16) — spill admission and the Interactive TTL (#190)
+
+Owner decision, replacing "discarded otherwise" in the device bullet above.
+
+- **A spill displaces only what ranks below it.** When KV-RAM cannot hold a
+  checkpoint the device is giving up, retained entries ranking strictly below
+  the newcomer in KV-RAM's order may be discarded for it; if even all of those
+  are not enough, nothing is discarded and the device discards the newcomer.
+  The room is planned before anything goes, so a spill that fails costs no
+  other entry. Live snapshots are never displaced by a spill.
+- **An Interactive entry idle past a TTL ranks as an Agent's probation entry**
+  (`--retained-interactive-ttl`, default 300 s, a starting value). Class alone
+  would let conversations nobody returns to hold KV-RAM against every
+  subagent. Agent entries have no TTL yet.
+- **A live sequence holding a shared prefix is a victim like any other.** Its
+  snapshot materializes the prefix's pages (ADR 0024 as amended), so it
+  resumes rather than re-prefilling. A lane holder is still preferred over a
+  lane-less candidate, so a lane-less `Prefilling` request is now chosen only
+  when every lane is protected.
+
+A single structured retention score that would replace these orderings is
+#199.

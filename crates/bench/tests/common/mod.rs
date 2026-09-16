@@ -90,6 +90,8 @@ struct Inner {
     /// Every prompt the mock has been sent, in arrival order (so a test
     /// can prove the samples were distinct on the wire).
     prompts: Mutex<Vec<String>>,
+    /// The image URLs of every request, same order as `prompts`.
+    images: Mutex<Vec<Vec<String>>>,
     /// The token count of every completed request (for test assertions).
     completed: Mutex<Vec<u32>>,
 }
@@ -110,6 +112,7 @@ impl MockState {
                 prefill_ms: std::sync::atomic::AtomicU64::new(PREFILL.as_millis() as u64),
                 completed: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
+                images: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -182,6 +185,11 @@ impl MockState {
     /// Every prompt the mock received, in arrival order.
     pub fn prompts(&self) -> Vec<String> {
         self.inner.prompts.lock().unwrap().clone()
+    }
+
+    /// Every request's image URLs, in arrival order.
+    pub fn images(&self) -> Vec<Vec<String>> {
+        self.inner.images.lock().unwrap().clone()
     }
 }
 
@@ -279,7 +287,40 @@ struct StreamOptions {
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
     role: String,
-    content: String,
+    /// A plain string, or OpenAI content parts (GitHub #181).
+    content: serde_json::Value,
+}
+
+/// The prompt tokens the mock counts for each image part — a stand-in for
+/// an image's vision tokens.
+pub const IMAGE_TOKENS: u32 = 64;
+
+impl ChatMessage {
+    /// The message's text: the plain string, or its text parts joined by a
+    /// space.
+    fn text(&self) -> String {
+        match &self.content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        }
+    }
+
+    /// The URLs of its image parts, in order.
+    fn image_urls(&self) -> Vec<String> {
+        match &self.content {
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.pointer("/image_url/url").and_then(|u| u.as_str()))
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// `POST /v1/chat/completions` — streaming (SSE) or non-streaming, mimicking
@@ -310,7 +351,13 @@ async fn completions(
         .prompts
         .lock()
         .unwrap()
-        .push(req.messages.last().map(|m| m.content.clone()).unwrap_or_default());
+        .push(req.messages.last().map(|m| m.text()).unwrap_or_default());
+    state
+        .inner
+        .images
+        .lock()
+        .unwrap()
+        .push(req.messages.last().map(|m| m.image_urls()).unwrap_or_default());
     let cached = match state.inner.cached_prompt_tokens.load(Ordering::Relaxed) {
         c if c < 0 => None,
         c => Some(c as u32),
@@ -369,7 +416,7 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 fn prompt_token_count(req: &CompletionsRequest) -> u32 {
     req.messages
         .last()
-        .map(|m| m.content.split_whitespace().count() as u32)
+        .map(|m| m.text().split_whitespace().count() as u32 + IMAGE_TOKENS * m.image_urls().len() as u32)
         .unwrap_or(0)
 }
 

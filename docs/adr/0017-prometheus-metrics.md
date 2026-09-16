@@ -19,6 +19,13 @@ is the scheduler's acceptance as the telemetry consumer observes it, the same
 anchor as the `ignis.request.ttft`/`done` log events: measuring from HTTP
 ingress would take a fact the consumer does not already receive. A request
 cancelled after its first token has a TTFT observation but no duration one.
+Amended 2026-09-16 (#190, accepted by the owner the same day): six
+fixed-cardinality counter families for retained state, each split by
+`tier="device|kv_ram"`, and the core emits the retained-state lifecycle facts
+they are projected from (see Decision). The proposed widening of
+`ignis_prefix_reused_tokens_total` (#188), at the end of this document, was
+**not** taken: the counter keeps its sibling-prefix meaning, and retained
+reuse is counted in its own family instead.
 
 ## Context
 
@@ -118,9 +125,11 @@ critical-path performance regression. The only numerical allowance is at most
 - The existing asynchronous telemetry consumer is the single projection owner.
   It updates aggregate state from facts already emitted by the model thread;
   scrape-time encoding happens only in the HTTP task.
-- The scheduler interface, core, runtime, kernel leaf, and model-thread loop are
-  unchanged. Flag-off and flag-on produce identical inference-side fact
-  traffic for the same successful workload.
+- Retained prompt-checkpoint lookup and lifecycle operations emit bounded
+  domain facts for hit, miss, spill, discard and restore (#190). Those facts
+  are emitted identically with metrics off and on; only the asynchronous
+  telemetry consumer conditionally projects them. Runtime and kernel code do
+  no metrics work.
 - Enabling metrics adds no scheduler query, snapshot, event, branch, atomic
   operation, clock read, allocation, task wake, event clone, or channel
   operation to the inference path.
@@ -154,7 +163,13 @@ The initial stable metric contract is:
 | `ignis_build_info` | gauge | `version` | Constant build identity with value 1 |
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
-| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse |
+| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
+| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Retained state a request chose to resume from, by tier: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries |
+| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
+| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes that left the tier for nowhere |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
@@ -191,8 +206,9 @@ dimension.
   concurrent scrapes, and slow-scraper isolation; which listener serves which
   path; and `/ui/metrics` following the API key.
 - Structural review and tests prove there is no metrics dependency or
-  metrics-aware code in core, runtime, the kernel leaf, or the model-thread
-  loop, and that flag-off and flag-on produce identical inference-side fact
+  flag-dependent code in core, runtime, the kernel leaf, or the model-thread
+  loop. Core emits canonical retained-state lifecycle facts independent of
+  Prometheus, and flag-off and flag-on produce identical inference-side fact
   traffic.
 - A real-GPU trace replay compares metrics disabled, enabled but unscraped, and
   enabled with a 15-second scrape cadence. There must be no repeatable
@@ -249,3 +265,56 @@ dimension.
 - Prometheus encoding and aggregation can consume asynchronous CPU time and
   affect HTTP-plane latency; that is why the explicit 1% HTTP budget exists.
   They cannot consume inference-path time by design.
+
+## Proposed amendment (2026-09-16) — the prefix-reuse counter widens (#188) — superseded
+
+**Superseded by #190 (2026-09-16).** The owner chose the decline path below:
+`SchedEvent::PrefixReused` carries whether the claimed entry's publisher had
+already finished, the projection counts only a live sibling's claim in
+`ignis_prefix_reused_tokens_total`, and a retained prefix's claim lands in
+`ignis_retained_reused_tokens_total{tier="device"}`. The text below is kept as
+the record of what was proposed.
+
+**Not decided.** This ADR is an owner-decision ADR whose clarifications are
+reserved for the owner's sign-off, so #188 records this rather than taking it.
+Until it is signed off, the table row above stands as written and this section
+describes what the code already emits.
+
+**What changed underneath the counter.** `ignis_prefix_reused_tokens_total`
+counted sibling-prefix reuse (core-07). ADR 0029's **retained prefix**, built
+in #188, is the same object claimed by the same call and reported by the same
+lifecycle fact (`SchedEvent::PrefixReused`), so reuse by a request whose
+publisher has already finished now lands in this series too. The two cannot be
+told apart at this seam.
+
+**The proposal.** Read the series as *all* prefix reuse, sibling and retained
+together — "Cumulative tokens skipped through prefix reuse, sibling and
+retained together (separated per tier by #190)".
+
+**What accepting it also touches**, so the blast radius is on one page: the
+Problem Statement's list of what operators need visibility into, and user
+story 11, both say "sibling-prefix reuse". Accepting this widens their reading
+too. Nothing else in this ADR names the series.
+
+Safe to accept as it stands:
+
+- the series' **name, type and empty label set are unchanged**, so no
+  consumer breaks and no dashboard query is rewritten;
+- **prompt-checkpoint reuse stays out of it.** That is the other kind of
+  cross-request reuse, and it remains a per-request field on the request log
+  (`reuse_source` / `reused_prompt_tokens` / `restore_ms`, #186) — the
+  distinction this row was kept narrow to preserve;
+- the widening is already declared in the code, at the three places a reader
+  meets the counter: its help text (`crates/server/src/metrics.rs`),
+  `TelemetrySink::on_prefix_reused` and `SchedEvent::PrefixReused`. Those
+  declarations exist so the code does not silently contradict this table while
+  the question is open.
+
+**If the owner declines**, the counter stays narrow and the *routing* changes
+instead, which is #190's work rather than a revert of #188: either
+`SchedEvent::PrefixReused` carries which kind of entry was claimed and the
+projection counts only the sibling kind here, or the scheduler emits a
+distinct fact for a retained-prefix claim. #190 already owns the per-tier
+hit / miss / spill / restore counters and the amendment that declares them,
+so the separation has a home either way. The three in-code declarations would
+then be updated to say the counter is narrow again.

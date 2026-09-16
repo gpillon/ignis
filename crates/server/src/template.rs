@@ -38,8 +38,10 @@ pub struct ChatMessage {
     pub role: String,
     /// The message content.
     pub content: MessageContent,
-    /// A prior assistant turn's thinking trace (GitHub #68). Dropped before
-    /// rendering unless the request sets `preserve_thinking: true`.
+    /// A prior assistant turn's thinking trace (GitHub #68). Handed to the
+    /// chat template whole (GitHub #185), which keeps it on turns after the
+    /// last real user query — or on all of them when the request sets
+    /// `preserve_thinking: true` — and strips the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// A prior assistant turn's tool calls (GitHub #132) — the OpenAI wire
@@ -299,6 +301,70 @@ pub struct FunctionIn {
     pub arguments: String,
 }
 
+/// A templated prompt: the tokens the scheduler is submitted, plus the
+/// structural boundaries of the rendered text that cross-request state reuse
+/// is cut at (GitHub #186, ADR 0029).
+///
+/// Only the renderer knows these. By the time the prompt is a token vector
+/// the structure is gone — which is why they travel with the tokens rather
+/// than being recovered later. #188 adds the end of the system-and-tools
+/// block here for the same reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderedPrompt {
+    /// The templated prompt tokens.
+    pub tokens: Vec<TokenId>,
+    /// How many leading tokens end at the **generation opener**, the
+    /// rendered prompt's last `<|im_start|>assistant\n`.
+    ///
+    /// `None` when the render has no opener, or when the opener's byte
+    /// offset does not tokenize to an exact token prefix of the whole prompt
+    /// — in which case no checkpoint is taken at all, rather than one taken
+    /// at a point the tokenizer disagrees about.
+    pub opener_tokens: Option<u32>,
+    /// How many leading tokens end where the **last real user query** begins,
+    /// the rendered prompt's last `<|im_start|>user` marker that is not a
+    /// tool result (GitHub #187, ADR 0029).
+    ///
+    /// It says whether this request is a new turn of its conversation or one
+    /// more iteration of a tool loop, which decides whether the checkpoint it
+    /// takes supersedes the one it resumed from or opens a turn beside it.
+    /// `None` when the render has no user query, or when the offset does not
+    /// tokenize to an exact token prefix — a capture then counts as *not*
+    /// turn-opening, which costs a superseded entry rather than the entry the
+    /// next user message is the only thing that still matches.
+    pub user_turn_tokens: Option<u32>,
+    /// How many leading tokens end the rendered prompt's **first system
+    /// block** — reasoning instructions, tools and the system message, which
+    /// this template renders into one `<|im_start|>system … <|im_end|>\n`
+    /// (GitHub #188, ADR 0029).
+    ///
+    /// The mirror of [`Self::opener_tokens`]: the opener is the last point a
+    /// conversation's own later turns share, this is the first point two
+    /// *unrelated* requests share, and it is what a burst of subagents
+    /// publishes a **retained prefix** at.
+    ///
+    /// `None`, and no prefix is retained, when the render does not open with a
+    /// system block, or when the block's byte offset does not tokenize to an
+    /// exact token prefix of the whole prompt — a boundary the tokenizer
+    /// disagrees about would hand a later request KV pages for history it does
+    /// not have.
+    pub system_block_tokens: Option<u32>,
+}
+
+impl From<Vec<TokenId>> for RenderedPrompt {
+    /// A prompt with no reported structure: what a provider that renders no
+    /// chat markers (the built-in placeholder) and every test double that
+    /// does not care about reuse produce.
+    fn from(tokens: Vec<TokenId>) -> Self {
+        Self {
+            tokens,
+            opener_tokens: None,
+            user_turn_tokens: None,
+            system_block_tokens: None,
+        }
+    }
+}
+
 /// The template / tokenizer seam (artifact-02 plugs the real implementation
 /// in here): apply the chat template to a conversation to get the prompt
 /// tokens the scheduler submits, and render generated tokens back to the
@@ -308,18 +374,22 @@ pub struct FunctionIn {
 /// same tokens on every call) and `Send + Sync` (the router shares one
 /// instance across request handlers).
 pub trait TemplateProvider: Send + Sync {
-    /// Apply the chat template: the templated prompt tokens for
-    /// `messages` (the scheduler prompt — role markers, delimiters, etc.),
-    /// with `options` (GitHub #68) and `tools` (GitHub #132) the only other
-    /// things that cross this seam. `tools` is the client's own OpenAI
-    /// `tools` array, opaque JSON — empty means the request never
-    /// mentioned tools at all.
+    /// Apply the chat template: the templated prompt for `messages` (the
+    /// scheduler prompt — role markers, delimiters, etc.), with `options`
+    /// (GitHub #68) and `tools` (GitHub #132) the only other things that
+    /// cross this seam. `tools` is the client's own OpenAI `tools` array,
+    /// opaque JSON — empty means the request never mentioned tools at all.
+    ///
+    /// The answer is a [`RenderedPrompt`] rather than a bare token vector
+    /// because a prompt's *structure* is knowable only here (GitHub #186):
+    /// where the rendered text hands over to the model is a fact about this
+    /// render, and nothing downstream could recover it from token ids.
     fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> Vec<TokenId>;
+    ) -> RenderedPrompt;
 
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
@@ -361,13 +431,17 @@ pub trait TemplateProvider: Send + Sync {
     /// the prompt comes back with its three-axis positions, `rope_delta` and
     /// media items. A provider that cannot render images refuses with
     /// `vision_disabled`.
+    ///
+    /// The rendered prompt carries the same structural boundaries a text
+    /// render does (GitHub #193), counted over the **expanded** tokens: an
+    /// image before a boundary moves it by its placeholder run.
     fn prepare_multimodal(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let _ = (messages, options, tools, media);
         Err(ContentRejection {
             code: "vision_disabled",
@@ -399,7 +473,7 @@ impl TemplateProvider for SimpleTemplateProvider {
         messages: &[ChatMessage],
         _options: &ThinkingOptions,
         _tools: &[JsonValue],
-    ) -> Vec<TokenId> {
+    ) -> RenderedPrompt {
         // The placeholder has no jinja template to bind thinking variables
         // or tools into — it ignores both (a test-only `TemplateProvider`
         // that wants to observe them records them itself; see
@@ -413,7 +487,11 @@ impl TemplateProvider for SimpleTemplateProvider {
                     .map(|word| fnv1a32(format!("{}:{}", m.role, word).as_bytes()))
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect::<Vec<TokenId>>()
+            // It renders no chat markers at all, so it has no generation
+            // opener to report and nothing it produces is ever reused
+            // (GitHub #186).
+            .into()
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -450,7 +528,7 @@ impl TemplateProvider for SimpleTemplateProvider {
         _options: &ThinkingOptions,
         _tools: &[JsonValue],
         media: Vec<PreparedMedia>,
-    ) -> Result<(Vec<TokenId>, Multimodal), ContentRejection> {
+    ) -> Result<(RenderedPrompt, Multimodal), ContentRejection> {
         let mut tokens = Vec::new();
         let mut images = media.iter();
         for message in messages {
@@ -494,7 +572,8 @@ impl TemplateProvider for SimpleTemplateProvider {
                 content_digest: m.content_digest,
             })
             .collect();
-        Ok((tokens, Multimodal { positions, rope_delta, media }))
+        // No chat markers, so no boundaries — as on its text path.
+        Ok((tokens.into(), Multimodal { positions, rope_delta, media }))
     }
 }
 
@@ -551,29 +630,29 @@ mod tests {
     fn template_is_deterministic() {
         let p = SimpleTemplateProvider;
         let messages = [msg("user", "hello world"), msg("assistant", "hi")];
-        let a = p.apply_chat_template(&messages, &opts(), no_tools());
-        let b = p.apply_chat_template(&messages, &opts(), no_tools());
+        let a = p.apply_chat_template(&messages, &opts(), no_tools()).tokens;
+        let b = p.apply_chat_template(&messages, &opts(), no_tools()).tokens;
         assert_eq!(a, b, "the same conversation must template identically");
     }
 
     #[test]
     fn one_token_per_word_and_role_scoped() {
         let p = SimpleTemplateProvider;
-        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts(), no_tools());
+        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts(), no_tools()).tokens;
         assert_eq!(tokens.len(), 3, "one token per whitespace word");
         // The same word under a different role is a different token (the
         // role is part of the hashed key).
-        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts(), no_tools());
-        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts(), no_tools());
+        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts(), no_tools()).tokens;
+        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts(), no_tools()).tokens;
         assert_ne!(other, user_a);
     }
 
     #[test]
     fn empty_conversation_has_no_tokens() {
         let p = SimpleTemplateProvider;
-        assert!(p.apply_chat_template(&[], &opts(), no_tools()).is_empty());
+        assert!(p.apply_chat_template(&[], &opts(), no_tools()).tokens.is_empty());
         assert!(p
-            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools())
+            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools()).tokens
             .is_empty());
     }
 
