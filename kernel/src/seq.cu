@@ -268,6 +268,56 @@ void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
   }
 }
 
+std::uint64_t ignis_seq_materialized_blob_bytes(const ignis_seq_pool &pool, std::uint32_t pages) {
+  return ignis_seq_snapshot_bytes(ignis_seq_section_table(pool, pages));
+}
+
+void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
+                                       const void *tail_page, const void *image,
+                                       const ignis_seq_progress_image &progress,
+                                       std::uint32_t pages, void *dst, std::uint64_t dst_bytes) {
+  const std::vector<ignis_seq_section> sections = ignis_seq_section_table(pool, pages);
+  const ignis_seq_snapshot_header header = ignis_seq_snapshot_header_for(pool, pages, sections);
+  if (dst_bytes < header.total_bytes) {
+    throw std::invalid_argument("destination holds " + std::to_string(dst_bytes) +
+                                " bytes, this blob is " + std::to_string(header.total_bytes));
+  }
+  const std::vector<std::int32_t> chain_pages = ignis_seq_prefix_chain_page_ids(chain);
+  if (pages != chain_pages.size() + (tail_page != nullptr ? 1U : 0U)) {
+    throw std::logic_error("materialization extent does not match the chain and its tail");
+  }
+  auto *base = static_cast<unsigned char *>(dst);
+  std::memcpy(base, &header, sizeof(header));
+  std::memcpy(base + sizeof(header), sections.data(), sections.size() * sizeof(ignis_seq_section));
+  ignis_seq_zero_blob_gaps(base, sections, header.total_bytes);
+  const std::vector<ignis_seq_section> clone = ignis_seq_prefix_clone_layout(pool);
+  for (const ignis_seq_section &section : sections) {
+    unsigned char *at = base + section.offset;
+    switch (section.kind) {
+    case IGNIS_SEQ_SECTION_KV_PAGES:
+      ignis_seq_pack_pages_to_host(pool, chain_pages, tail_page, at);
+      break;
+    case IGNIS_SEQ_SECTION_PROGRESS:
+      std::memcpy(at, &progress, sizeof(progress));
+      break;
+    default:
+      // Every other section is a device-resident CLONE section, laid out in
+      // the image by ignis_seq_prefix_clone_layout.
+      checked_memcpy_async(at,
+                           static_cast<const unsigned char *>(image) +
+                               ignis_seq_section_offset(clone, section.kind),
+                           static_cast<std::size_t>(section.bytes), cudaMemcpyDeviceToHost,
+                           "retained state image");
+      break;
+    }
+  }
+  const cudaError_t err = cudaStreamSynchronize(nullptr);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaStreamSynchronize after materializing failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
 namespace {
 
 // Why `header` cannot be restored into `seq` of `pool`, or an empty string

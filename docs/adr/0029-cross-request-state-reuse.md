@@ -186,9 +186,20 @@ What building Tier 1 decided that the Decision left open.
   device**, a sibling or retained *prefix* included — a KV-RAM restore that
   beats a device checkpoint but not a device prefix by a chunk pays the
   crossing for nothing.
-- **Only prompt checkpoints spill.** A retained prefix the device gives up is
-  discarded, as before; spilling it too is open work, not a decision against
-  it.
+- **Retained prefixes spill too, and come back to the device** (owner
+  decision). A retained prefix the device gives up is written to KV-RAM, ranked
+  with the checkpoints there. A prompt whose longest reuse is such a prefix —
+  beating every device reuse by the restore floor and every KV-RAM checkpoint
+  outright — brings it back **once**: the blob is restored into a carrier
+  sequence, published again under its original name, and retained on the
+  device, where that request and every later member of its burst claim it in
+  place. The blob stays in KV-RAM, so giving the prefix up again copies
+  nothing. Its pages are taken back from retained state like a request's, and
+  it never evicts live work.
+- **A published head is named by its publisher and its length.** One request
+  publishes its system block and then a chained head over it (#187 x #188);
+  keyed by the publisher alone, the second replaced the first, and a burst
+  member claiming the block was stood up on the chain.
 - **A request restored from a materialized blob owns every page it restored.**
   No publish point at or below the restored length can be reached again, so
   it publishes, if at all, at its own generation opener's page — the one that

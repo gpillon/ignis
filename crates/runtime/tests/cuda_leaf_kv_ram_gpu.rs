@@ -20,4 +20,5 @@ fn retained_state_restored_from_kv_ram_continues_bit_exactly() {
     };
     kv_ram_gpu_common::an_idle_conversation_resumes_from_kv_ram_exactly(&loaded);
     kv_ram_gpu_common::a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(&loaded);
+    kv_ram_gpu_common::a_burst_block_brought_back_from_kv_ram_serves_exactly(&loaded);
 }

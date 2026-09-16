@@ -353,6 +353,52 @@ extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,
   ignis_seq_prefix_drop_reference(prefix);
 }
 
+extern "C" int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *pool,
+                                                   const struct ignis_seq_prefix *prefix,
+                                                   uint64_t *out_bytes) {
+  if (out_bytes != nullptr) {
+    *out_bytes = 0;
+  }
+  if (pool == nullptr || prefix == nullptr || out_bytes == nullptr) {
+    ignis_seq_set_last_error("ignis_seq_prefix_snapshot_size: null argument");
+    return -1;
+  }
+  if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
+    ignis_seq_set_last_error(
+        "ignis_seq_prefix_snapshot_size: the prefix was not published from this pool");
+    return -1;
+  }
+  try {
+    *out_bytes = ignis_seq_materialized_blob_bytes(*pool, ignis_seq_prefix_total_pages(*prefix));
+    return 0;
+  } catch (const std::exception &e) {
+    ignis_seq_set_last_error(std::string("ignis_seq_prefix_snapshot_size: ") + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
+                                              const struct ignis_seq_prefix *prefix, void *dst,
+                                              uint64_t dst_bytes) {
+  if (pool == nullptr || prefix == nullptr || dst == nullptr) {
+    ignis_seq_set_last_error("ignis_seq_prefix_snapshot: null argument");
+    return -1;
+  }
+  if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
+    ignis_seq_set_last_error("ignis_seq_prefix_snapshot: the prefix was not published from this pool");
+    return -1;
+  }
+  try {
+    ignis_seq_write_materialized_blob(*pool, prefix, nullptr, prefix->clone_image.p,
+                                      prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,
+                                      dst_bytes);
+    return 0;
+  } catch (const std::exception &e) {
+    ignis_seq_set_last_error(std::string("ignis_seq_prefix_snapshot: ") + e.what());
+    return -1;
+  }
+}
+
 extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
                                            struct ignis_seq_prefix_stats *out_stats) {
   if (prefix == nullptr || out_stats == nullptr) {

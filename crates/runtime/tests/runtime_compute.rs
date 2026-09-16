@@ -31,6 +31,10 @@ struct Calls {
     /// allocated normally and prefilled from a hole.
     prefixes_published: Vec<u32>,
     shared_allocations: Vec<u32>,
+    /// The prefix each shared allocation stood on (the stub's prefix is its
+    /// token count), so a test can see *which* of a publisher's heads a
+    /// claimant was given.
+    claimed_prefixes: Vec<u32>,
     prefixes_released: u32,
     /// GitHub #186: the prompt checkpoints captured (their opener token
     /// counts), the claims served (each claimant's reservation), and the
@@ -239,7 +243,7 @@ impl StepLeaf for StubLeaf {
         &self,
         _model: &Self::Model,
         context_tokens: u32,
-        _prefix: &Self::Prefix,
+        prefix: &Self::Prefix,
     ) -> Result<Self::Sequence, i32> {
         if let Some(code) = self.allocation_error {
             return Err(code);
@@ -247,6 +251,7 @@ impl StepLeaf for StubLeaf {
         let mut calls = self.calls.lock().unwrap();
         calls.sequences_allocated.push(context_tokens);
         calls.shared_allocations.push(context_tokens);
+        calls.claimed_prefixes.push(*prefix);
         Ok(())
     }
 
@@ -262,6 +267,21 @@ impl StepLeaf for StubLeaf {
 
     fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {
         self.calls.lock().unwrap().prefixes_released += 1;
+    }
+
+    fn prefix_snapshot_bytes(&self, _model: &Self::Model, _prefix: &Self::Prefix) -> Result<u64, i32> {
+        Ok(SNAPSHOT_MARKER.len() as u64)
+    }
+
+    fn prefix_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        _prefix: &Self::Prefix,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        dst.copy_from_slice(SNAPSHOT_MARKER);
+        self.calls.lock().unwrap().snapshots_taken += 1;
+        Ok(())
     }
 
     fn checkpoint_image_bytes(&self, _model: &Self::Model) -> u64 {
@@ -1537,4 +1557,102 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
     assert_eq!(calls.media_encoded, [5, 20]);
     assert_eq!(calls.media_released, [1, 2]);
     assert_eq!(compute.live_media(), 0);
+}
+
+#[test]
+fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimable() {
+    // GitHub #187 x #188: one request publishes its system block, then chains
+    // its opener's page over it. A later burst member claims the *block* —
+    // and must be stood up on the block, not on the longer chained head the
+    // same publisher also owns.
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let job = |request, tokens: Vec<u32>, start, publish| PrefillJob {
+        request,
+        tokens,
+        context_tokens: 32,
+        start_position: start,
+        params: DecodeParams::default(),
+        shared_prefix: None,
+        publish_prefix_tokens: publish,
+        checkpoint: None,
+        capture_checkpoint_tokens: None,
+        multimodal: None,
+    };
+    compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
+    compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().prefixes_released, 0, "neither head was dropped");
+
+    compute
+        .prefill_step(&[PrefillJob {
+            shared_prefix: Some(ignis_core::scheduler::SharedPrefixClaim { publisher: 1, tokens: 4 }),
+            ..job(2, vec![50, 51], 4, None)
+        }])
+        .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "the block, not the chain");
+
+    compute.release_prefix(1, 8);
+    assert_eq!(leaf.calls.lock().unwrap().prefixes_released, 1);
+    compute.release_prefix(1, 4);
+    assert_eq!(leaf.calls.lock().unwrap().prefixes_released, 2, "each head is released by name");
+}
+
+#[test]
+fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
+    // GitHub #190: spilled while its device handle still exists, released
+    // the usual way, then published again from the blob by a carrier
+    // sequence that goes as soon as the prefix exists.
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute
+        .prefill_step(&[PrefillJob {
+            request: 1,
+            tokens: vec![1, 2, 3, 4],
+            context_tokens: 32,
+            start_position: 0,
+            params: DecodeParams::default(),
+            shared_prefix: None,
+            publish_prefix_tokens: Some(4),
+            checkpoint: None,
+            capture_checkpoint_tokens: None,
+            multimodal: None,
+        }])
+        .unwrap();
+    compute.release(1);
+
+    assert!(compute.restore_prefix(1, 4).is_err(), "nothing spilled yet");
+    compute.spill_prefix(1, 4).unwrap();
+    assert_eq!(compute.spilled_prefixes(), 1);
+    assert!(compute.restore_prefix(1, 4).is_err(), "it is still on the device");
+    compute.release_prefix(1, 4);
+    assert_eq!(compute.live_prefixes(), 0);
+
+    let sequences_before = leaf.calls.lock().unwrap().sequences_released;
+    compute.restore_prefix(1, 4).unwrap();
+    assert_eq!(compute.live_prefixes(), 1, "the prefix is back");
+    assert_eq!(compute.live_sequences(), 0, "and its carrier is gone");
+    assert_eq!(leaf.calls.lock().unwrap().sequences_released, sequences_before + 1);
+    assert_eq!(leaf.calls.lock().unwrap().restores, 1);
+    assert_eq!(compute.spilled_prefixes(), 1, "the blob stays");
+
+    compute
+        .prefill_step(&[PrefillJob {
+            request: 2,
+            tokens: vec![9],
+            context_tokens: 32,
+            start_position: 4,
+            params: DecodeParams::default(),
+            shared_prefix: Some(ignis_core::scheduler::SharedPrefixClaim { publisher: 1, tokens: 4 }),
+            publish_prefix_tokens: None,
+            checkpoint: None,
+            capture_checkpoint_tokens: None,
+            multimodal: None,
+        }])
+        .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");
+
+    compute.discard_spilled_prefix(1, 4);
+    assert_eq!(compute.spilled_prefixes(), 0);
 }

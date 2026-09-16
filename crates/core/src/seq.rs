@@ -205,6 +205,19 @@ pub(crate) mod ffi {
             out_stats: *mut IgnisSeqPrefixStats,
         ) -> i32;
 
+        pub fn ignis_seq_prefix_snapshot_size(
+            pool: *const IgnisSeqPool,
+            prefix: *const IgnisSeqPrefix,
+            out_bytes: *mut u64,
+        ) -> i32;
+
+        pub fn ignis_seq_prefix_snapshot(
+            pool: *const IgnisSeqPool,
+            prefix: *const IgnisSeqPrefix,
+            dst: *mut c_void,
+            dst_bytes: u64,
+        ) -> i32;
+
         pub fn ignis_seq_checkpoint_image_bytes(
             pool: *const IgnisSeqPool,
             out_bytes: *mut u64,
@@ -677,6 +690,30 @@ impl SeqPrefix<'_> {
             "ignis_seq_prefix_stats: null handle (unreachable — SeqPrefix always holds one)"
         );
         stats
+    }
+
+    /// Bytes this prefix occupies as a materialized whole-sequence blob in
+    /// KV-RAM: every page of its chain, its image and its progress (GitHub
+    /// #190).
+    pub fn snapshot_bytes(&self) -> Result<u64, SeqTransferError> {
+        let mut bytes = 0;
+        let rc = unsafe { ffi::ignis_seq_prefix_snapshot_size(self.pool, self.handle, &mut bytes) };
+        if rc == 0 { Ok(bytes) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Materialize this prefix into a host blob without consuming it — the
+    /// blob its publisher would have written standing on it, which a fresh
+    /// sequence restores and publishes again.
+    pub fn snapshot_into(&self, dst: &mut [u8]) -> Result<(), SeqTransferError> {
+        let rc = unsafe {
+            ffi::ignis_seq_prefix_snapshot(
+                self.pool,
+                self.handle,
+                dst.as_mut_ptr().cast(),
+                dst.len() as u64,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
     }
 
     /// Detach the compile-time borrow tying this prefix to its pool, exactly

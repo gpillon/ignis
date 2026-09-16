@@ -777,6 +777,74 @@ void report_clone_cost() {
 
 } // namespace
 
+// ---- 3c. a retained prefix spills to a blob and comes back (GitHub #190) --
+//
+// What leaves the device is the blob its publisher would have written while
+// standing on the prefix. What comes back is a *published prefix* again:
+// restored into a fresh sequence, published there, and claimable -- with the
+// same bytes, so a burst member that claims it stands exactly where one that
+// claimed the original stood.
+
+void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
+  ignis_seq_pool_spec spec = small_spec();
+  if (dflash2) {
+    spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+  }
+  ignis_seq_pool *pool = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "spill: pool create");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "spill: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x91u);
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "spill: publish");
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, prefix, &bytes), 0, "spill: size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_prefix_snapshot(pool, prefix, blob.data(), bytes), 0, "spill: snapshot");
+  std::uint64_t publisher_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, publisher, &publisher_bytes), 0, "spill: publisher size");
+  std::vector<unsigned char> own(static_cast<std::size_t>(publisher_bytes));
+  expect_rc(ignis_seq_snapshot(pool, publisher, own.data(), publisher_bytes), 0,
+            "spill: publisher snapshot");
+  expect(own == blob, "spill: the prefix's blob is its publisher's, standing on it");
+
+  // Every device holder goes: nothing of the prefix is left on the card.
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, prefix);
+
+  // Back up: restore into a fresh sequence, publish there, let it go.
+  ignis_seq *carrier = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kPrefix + kPageTokens, &carrier), 0, "spill: alloc carrier");
+  expect_rc(ignis_seq_restore(pool, carrier, blob.data(), bytes), 0, "spill: restore");
+  ignis_seq_prefix *returned = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, carrier, kPrefix, &returned), 0,
+            "spill: publish the restored head");
+  ignis_seq_release(pool, carrier);
+
+  std::uint64_t again_bytes = 0;
+  expect_rc(ignis_seq_prefix_snapshot_size(pool, returned, &again_bytes), 0, "spill: size again");
+  std::vector<unsigned char> again(static_cast<std::size_t>(again_bytes));
+  expect_rc(ignis_seq_prefix_snapshot(pool, returned, again.data(), again_bytes), 0,
+            "spill: snapshot again");
+  expect(again == blob, "spill: the prefix that came back is the prefix that left");
+
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, returned, &claimant), 0,
+            "spill: a burst member claims the returned prefix");
+  std::uint64_t claimant_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, claimant, &claimant_bytes), 0, "spill: claimant size");
+  std::vector<unsigned char> claimed(static_cast<std::size_t>(claimant_bytes));
+  expect_rc(ignis_seq_snapshot(pool, claimant, claimed.data(), claimant_bytes), 0,
+            "spill: claimant snapshot");
+  expect(claimed == blob, "spill: and stands exactly where the original's claimant stood");
+
+  ignis_seq_release(pool, claimant);
+  ignis_seq_prefix_release(pool, returned);
+  ignis_seq_pool_free(pool);
+}
+
 int main() {
   int device_count            = 0;
   const cudaError_t available = cudaGetDeviceCount(&device_count);
@@ -791,6 +859,8 @@ int main() {
   check_a_claimant_receives_the_drafter_window();
   check_the_last_holder_frees_the_pages();
   check_a_chained_publish_extends_a_claimed_head();
+  check_a_spilled_prefix_comes_back_as_the_same_prefix(false);
+  check_a_spilled_prefix_comes_back_as_the_same_prefix(true);
   check_refusals();
   report_clone_cost();
 

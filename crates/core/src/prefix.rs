@@ -33,12 +33,50 @@
 //! request whose prefill produced the pages: every claim carries it to the
 //! backend, which keys the leaf's prefix by it.
 
+use std::time::Instant;
+
 use crate::gdn::GdnState;
-use crate::types::{RequestId, TokenId};
+use crate::types::{RequestClass, RequestId, TokenId};
 
 /// An opaque handle to a cached prefix entry (a claimant's reference to a
 /// shared prefix).
 pub type PrefixId = u64;
+
+/// An opaque handle to a retained prefix whose blob lives in KV-RAM (GitHub
+/// #190).
+pub type SpilledPrefixId = u64;
+
+/// What keeps a **retained prefix** alive with no live claimant (GitHub #188),
+/// and what KV-RAM ranks it by once the device gives it up (#190).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// The scheduling tick it was retained or last claimed at: the device's
+    /// LRU order.
+    pub at: u64,
+    /// The class of the request that published it.
+    pub class: RequestClass,
+    /// When it was retained or last claimed, in wall time.
+    pub used_at: Instant,
+}
+
+/// A retained prefix whose materialized blob is in KV-RAM (GitHub #190): what
+/// a prompt has to match to bring it back, and what it comes back as.
+#[derive(Debug, Clone)]
+pub struct SpilledPrefix {
+    pub id: SpilledPrefixId,
+    /// The backend's name for the blob, with [`SpilledPrefix::length_tokens`]
+    /// — the name the prefix it came from was published under, and the one it
+    /// is published under again.
+    pub publisher: RequestId,
+    pub tokens: Vec<TokenId>,
+    pub length_tokens: u32,
+    pub gdn: GdnState,
+    pub class: RequestClass,
+    /// The device entry that is this same prefix, while one exists — spilled
+    /// and still being released, or brought back. A prompt matches that entry
+    /// on the device instead, and giving it up again copies nothing.
+    pub on_device: Option<PrefixId>,
+}
 
 /// A cached sibling prefix: the shared KV pages of a prompt head (whole
 /// pages only — a partial page cannot be split between two requests), its
@@ -81,15 +119,15 @@ pub struct PrefixEntry {
     /// Live claimants (the registrant counts as one; the entry is dropped
     /// when the last claimant releases).
     pub refcount: u32,
-    /// The scheduling tick this entry was retained or last used at, for an
-    /// entry kept alive as a **retained prefix** (GitHub #188, ADR 0029);
-    /// `None` for an ordinary sibling prefix, which dies with its claimants.
+    /// What keeps this entry alive as a **retained prefix** (GitHub #188, ADR
+    /// 0029); `None` for an ordinary sibling prefix, which dies with its
+    /// claimants.
     ///
     /// One of [`PrefixEntry::refcount`]'s references is the retention itself
     /// while this is `Some`, which is what carries the entry past its
     /// publisher's completion — and why the flag lives beside the refcount
     /// rather than in a second ledger that could drift from it.
-    pub retained_at: Option<u64>,
+    pub retained: Option<Retention>,
 }
 
 /// The result of a successful claim: the entry's id, the leading prompt
@@ -125,6 +163,9 @@ pub struct PrefixCache {
     page_tokens: u32,
     entries: Vec<PrefixEntry>,
     next_id: PrefixId,
+    /// Retained prefixes whose blob is in KV-RAM (GitHub #190).
+    spilled: Vec<SpilledPrefix>,
+    next_spilled: SpilledPrefixId,
     /// The cumulative `sibling_prefix_reused_tok` counter (telemetry,
     /// design §5): every prompt token skipped through a cached prefix.
     reused_tok: u64,
@@ -138,6 +179,8 @@ impl PrefixCache {
             page_tokens,
             entries: Vec::new(),
             next_id: 0,
+            spilled: Vec::new(),
+            next_spilled: 0,
             reused_tok: 0,
         }
     }
@@ -215,7 +258,7 @@ impl PrefixCache {
             parent,
             gdn: gdn.clone(),
             refcount: 1, // the registrant is the first claimant
-            retained_at: None,
+            retained: None,
         };
         let (id, pages) = (entry.id, entry.pages);
         self.next_id += 1;
@@ -324,14 +367,15 @@ impl PrefixCache {
     /// instead is the same fact with no window in it — the entry is never one
     /// release away from a drop that would have to be undone.
     ///
-    /// `tick` seeds the LRU order [`PrefixCache::lru_retained`] gives entries
-    /// up in. Returns `false` when the entry is gone or is already retained:
-    /// a second retention would be a second reference nothing ever releases,
-    /// and the pages would never come back.
-    pub fn retain_published(&mut self, entry: PrefixId, tick: u64) -> bool {
+    /// `retention` seeds the LRU order [`PrefixCache::lru_retained`] gives
+    /// entries up in, and what KV-RAM ranks the prefix by if it gets there.
+    /// Returns `false` when the entry is gone or is already retained: a second
+    /// retention would be a second reference nothing ever releases, and the
+    /// pages would never come back.
+    pub fn retain_published(&mut self, entry: PrefixId, retention: Retention) -> bool {
         match self.entries.iter_mut().find(|e| e.id == entry) {
-            Some(e) if e.retained_at.is_none() => {
-                e.retained_at = Some(tick);
+            Some(e) if e.retained.is_none() => {
+                e.retained = Some(retention);
                 e.refcount += 1;
                 true
             }
@@ -344,7 +388,7 @@ impl PrefixCache {
     pub fn is_retained(&self, entry: PrefixId) -> bool {
         self.entries
             .iter()
-            .any(|e| e.id == entry && e.retained_at.is_some())
+            .any(|e| e.id == entry && e.retained.is_some())
     }
 
     /// Give up the retention on `entry`, so its reference is the caller's to
@@ -358,8 +402,8 @@ impl PrefixCache {
     /// backend still holds.
     pub fn unretain(&mut self, entry: PrefixId) -> bool {
         match self.entries.iter_mut().find(|e| e.id == entry) {
-            Some(e) if e.retained_at.is_some() => {
-                e.retained_at = None;
+            Some(e) if e.retained.is_some() => {
+                e.retained = None;
                 true
             }
             _ => false,
@@ -369,13 +413,15 @@ impl PrefixCache {
     /// Move `entry` to the back of the retained LRU order, if it is retained
     /// (GitHub #188). A no-op on anything else, because a claimant cannot tell
     /// a retained entry from a live sibling's and must not have to.
-    pub fn touch_retained(&mut self, entry: PrefixId, tick: u64) {
-        if let Some(e) = self
+    pub fn touch_retained(&mut self, entry: PrefixId, tick: u64, used_at: Instant) {
+        if let Some(retention) = self
             .entries
             .iter_mut()
-            .find(|e| e.id == entry && e.retained_at.is_some())
+            .find(|e| e.id == entry)
+            .and_then(|e| e.retained.as_mut())
         {
-            e.retained_at = Some(tick);
+            retention.at = tick;
+            retention.used_at = used_at;
         }
     }
 
@@ -391,7 +437,7 @@ impl PrefixCache {
     pub fn reclaimable_retained(&self) -> Vec<PrefixId> {
         self.entries
             .iter()
-            .filter(|e| e.retained_at.is_some() && e.refcount == 1)
+            .filter(|e| e.retained.is_some() && e.refcount == 1)
             .map(|e| e.id)
             .collect()
     }
@@ -402,8 +448,8 @@ impl PrefixCache {
     pub fn lru_retained(&self) -> Option<PrefixId> {
         self.entries
             .iter()
-            .filter(|e| e.retained_at.is_some() && e.refcount == 1)
-            .min_by_key(|e| (e.retained_at, e.id))
+            .filter(|e| e.retained.is_some() && e.refcount == 1)
+            .min_by_key(|e| (e.retained.map(|r| r.at), e.id))
             .map(|e| e.id)
     }
 
@@ -458,14 +504,16 @@ impl PrefixCache {
     /// re-queued). When the last reference drops, the entry (and its own
     /// pages) is released.
     ///
-    /// Returns every entry that dropped as a result — the pages each freed
-    /// **and the request that published them**, so the caller can drop the
-    /// backend's handle on the leaf's prefix too (P4-10) — innermost first,
+    /// Returns every entry that dropped as a result — the pages each freed,
+    /// **the request that published them and the head's length**, so the
+    /// caller can drop the backend's handle on that leaf prefix too (P4-10;
+    /// one request may publish two heads, #187 x #188, so the publisher alone
+    /// does not name one) — innermost first,
     /// and empty while the entry is still pinned by other claimants. It is a
     /// list rather than one entry because a chained entry (GitHub #187) holds
     /// its parent's reference: letting go of the child may let go of the
     /// parent, and of its parent in turn.
-    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId)> {
+    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId, u32)> {
         let mut dropped = Vec::new();
         let mut at = Some(entry);
         while let Some(id) = at {
@@ -477,10 +525,82 @@ impl PrefixCache {
                 break;
             }
             let entry = self.entries.remove(pos);
-            dropped.push((entry.pages, entry.publisher));
+            dropped.push((entry.pages, entry.publisher, entry.length_tokens));
+            // A KV-RAM copy of it stays, and is what a prompt matches now.
+            for spilled in self.spilled.iter_mut().filter(|s| s.on_device == Some(entry.id)) {
+                spilled.on_device = None;
+            }
             at = entry.parent;
         }
         dropped
+    }
+
+    /// The entry `id`, if it is live.
+    pub fn entry(&self, id: PrefixId) -> Option<&PrefixEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    // ── retained prefixes in KV-RAM (GitHub #190) ────────────────────────
+
+    /// Record that retained entry `entry`'s blob was written to KV-RAM. It
+    /// stays linked to the device entry until that entry drops. `None` when
+    /// the entry is gone or is not retained.
+    pub fn record_spill(&mut self, entry: PrefixId) -> Option<SpilledPrefixId> {
+        let e = self.entries.iter().find(|e| e.id == entry)?;
+        let retention = e.retained?;
+        let id = self.next_spilled;
+        self.next_spilled += 1;
+        self.spilled.push(SpilledPrefix {
+            id,
+            publisher: e.publisher,
+            tokens: e.tokens.clone(),
+            length_tokens: e.length_tokens,
+            gdn: e.gdn.clone(),
+            class: retention.class,
+            on_device: Some(entry),
+        });
+        Some(id)
+    }
+
+    /// The KV-RAM copy of device entry `entry`, if it has one.
+    pub fn spilled_copy_of(&self, entry: PrefixId) -> Option<SpilledPrefixId> {
+        self.spilled
+            .iter()
+            .find(|s| s.on_device == Some(entry))
+            .map(|s| s.id)
+    }
+
+    /// The longest prefix of `tokens` held **only** in KV-RAM — one still on
+    /// the device is matched there — or `None`.
+    pub fn longest_spilled_match(&self, tokens: &[TokenId]) -> Option<&SpilledPrefix> {
+        self.spilled
+            .iter()
+            .filter(|s| s.on_device.is_none())
+            .filter(|s| s.tokens.len() <= tokens.len() && tokens.starts_with(&s.tokens))
+            .max_by_key(|s| s.length_tokens)
+    }
+
+    /// The spilled prefix `id`, if its blob is still held.
+    pub fn spilled(&self, id: SpilledPrefixId) -> Option<&SpilledPrefix> {
+        self.spilled.iter().find(|s| s.id == id)
+    }
+
+    /// Link spilled prefix `id` to the device entry it was brought back as.
+    pub fn record_return(&mut self, id: SpilledPrefixId, entry: PrefixId) {
+        if let Some(spilled) = self.spilled.iter_mut().find(|s| s.id == id) {
+            spilled.on_device = Some(entry);
+        }
+    }
+
+    /// Forget spilled prefix `id` — its blob is being freed.
+    pub fn forget_spilled(&mut self, id: SpilledPrefixId) -> Option<SpilledPrefix> {
+        let pos = self.spilled.iter().position(|s| s.id == id)?;
+        Some(self.spilled.remove(pos))
+    }
+
+    /// Retained prefixes with a blob in KV-RAM.
+    pub fn spilled_count(&self) -> usize {
+        self.spilled.len()
     }
 
     /// Whether the cache holds a live entry for `entry` (a claimant's
@@ -538,6 +658,14 @@ impl PrefixCache {
 mod tests {
     use super::*;
     use crate::gdn::GdnState;
+
+    fn retention(at: u64) -> Retention {
+        Retention {
+            at,
+            class: RequestClass::Agent,
+            used_at: Instant::now(),
+        }
+    }
 
     /// A GDN state resumable at `position` (a recorded boundary): valid
     /// for prefix reuse.
@@ -678,7 +806,7 @@ mod tests {
         // The last release drops the entry, frees its pages and names the
         // request that published them (P4-10: the backend's own handle on
         // the leaf's prefix is dropped by that id).
-        assert_eq!(cache.release(id), vec![(4, 7)]);
+        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
         // A dropped entry cannot be claimed or released again.
@@ -751,7 +879,7 @@ mod tests {
         );
         assert_eq!(cache.release(id), vec![]);
         // The checkpoint is discarded last: now the pages come back.
-        assert_eq!(cache.release(id), vec![(4, 7)]);
+        assert_eq!(cache.release(id), vec![(4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.retain(id), "a dropped entry cannot be retained");
         assert_eq!(cache.pages_of(id), 0);
@@ -799,7 +927,7 @@ mod tests {
         assert_eq!(cache.pinned_pages(), 6);
         // Request 8 completes, releasing the child: both entries drop, and
         // each names the request whose leaf prefix the backend must let go of.
-        assert_eq!(cache.release(child), vec![(2, 8), (4, 7)]);
+        assert_eq!(cache.release(child), vec![(2, 8, 96), (4, 7, 64)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
     }
@@ -829,7 +957,7 @@ mod tests {
         let mut cache = PrefixCache::new(16);
         let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
-        assert!(cache.retain_published(id, 1), "the publish is retained");
+        assert!(cache.retain_published(id, retention(1)), "the publish is retained");
         assert!(cache.is_retained(id));
         // The publisher completes. Its reference goes; the retention stays.
         assert_eq!(cache.release(id), vec![], "the retention still holds it");
@@ -848,7 +976,7 @@ mod tests {
         // while buying this request nothing.
         let mut cache = PrefixCache::new(16);
         let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
-        cache.retain_published(id, 1);
+        cache.retain_published(id, retention(1));
         assert_eq!(
             cache.reclaimable_retained(),
             Vec::<PrefixId>::new(),
@@ -871,19 +999,19 @@ mod tests {
         // entry out from under a live claimant.
         let mut cache = PrefixCache::new(16);
         let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
-        cache.retain_published(id, 1);
+        cache.retain_published(id, retention(1));
         assert!(
-            !cache.retain_published(id, 2),
+            !cache.retain_published(id, retention(2)),
             "retaining twice would pin the pages forever"
         );
         cache.release(id); // the publisher completes; the retention holds it
         assert!(cache.unretain(id), "the caller now owes one release");
         assert!(!cache.is_retained(id));
         assert!(!cache.unretain(id), "and owes it exactly once");
-        assert_eq!(cache.release(id), vec![(4, 7)], "that release frees the pages");
+        assert_eq!(cache.release(id), vec![(4, 7, 64)], "that release frees the pages");
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.unretain(id), "a dropped entry is not retained");
-        assert!(!cache.retain_published(id, 3), "nor can it be retained again");
+        assert!(!cache.retain_published(id, retention(3)), "nor can it be retained again");
     }
 
     #[test]
@@ -895,14 +1023,14 @@ mod tests {
         let (old, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         let other: Vec<TokenId> = (500..=595).collect();
         let (new, _) = cache.register(8, &other, &gdn_boundary(0), None).unwrap();
-        cache.retain_published(old, 1);
-        cache.retain_published(new, 2);
+        cache.retain_published(old, retention(1));
+        cache.retain_published(new, retention(2));
         cache.release(old);
         cache.release(new);
         assert_eq!(cache.lru_retained(), Some(old), "the older retention goes first");
         // A claim on the older one moves it to the back of the order.
         let claim = cache.claim(&prompt64()).unwrap();
-        cache.touch_retained(claim.id, 9);
+        cache.touch_retained(claim.id, 9, Instant::now());
         cache.release(claim.id);
         assert_eq!(cache.lru_retained(), Some(new), "the used one is no longer oldest");
         // Only reclaimable retentions are offered: a live claimant hides one.
@@ -919,9 +1047,9 @@ mod tests {
         // entry from a live sibling's — and must not have to.
         let mut cache = PrefixCache::new(16);
         let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
-        cache.touch_retained(id, 5);
+        cache.touch_retained(id, 5, Instant::now());
         assert!(!cache.is_retained(id), "touching does not retain");
-        cache.touch_retained(999, 5); // a gone entry
+        cache.touch_retained(999, 5, Instant::now()); // a gone entry
         assert_eq!(cache.entry_count(), 1);
     }
 
@@ -947,5 +1075,35 @@ mod tests {
         let entry = cache.claim(&prompt96()).unwrap().id;
         assert_eq!(cache.refcount_of(entry), 2, "the publisher and this one claim, not the peeks");
         assert_eq!(cache.reused_tok(), 64);
+    }
+
+    #[test]
+    fn a_spilled_prefix_is_matched_in_kv_ram_only_once_the_device_copy_is_gone() {
+        // GitHub #190.
+        let mut cache = PrefixCache::new(16);
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(64), None).unwrap();
+        assert!(cache.record_spill(id).is_none(), "only a retained prefix spills");
+        assert!(cache.retain_published(id, retention(1)));
+        let spilled = cache.record_spill(id).unwrap();
+        assert_eq!(cache.spilled_copy_of(id), Some(spilled));
+        assert!(
+            cache.longest_spilled_match(&prompt96()).is_none(),
+            "while it is on the device it is matched there"
+        );
+
+        assert!(cache.unretain(id));
+        cache.release(id); // the retention
+        cache.release(id); // the publisher
+        assert_eq!(cache.entry_count(), 0);
+        let matched = cache.longest_spilled_match(&prompt96()).unwrap();
+        assert_eq!((matched.id, matched.publisher, matched.length_tokens), (spilled, 7, 64));
+        assert!(cache.longest_spilled_match(&(500..600).collect::<Vec<_>>()).is_none());
+
+        // Brought back, it is the device's to match again; forgotten, nobody's.
+        let (back, _) = cache.register(7, &prompt64(), &gdn_boundary(64), None).unwrap();
+        cache.record_return(spilled, back);
+        assert!(cache.longest_spilled_match(&prompt96()).is_none());
+        assert_eq!(cache.forget_spilled(spilled).map(|s| s.id), Some(spilled));
+        assert_eq!(cache.spilled_count(), 0);
     }
 }

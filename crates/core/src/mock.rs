@@ -60,6 +60,11 @@ struct Inner {
     checkpoints_spilled: Vec<RequestId>,
     /// Requests whose next checkpoint spill the backend will fail.
     spill_failures: std::collections::HashSet<RequestId>,
+    /// Retained prefixes written to KV-RAM, brought back, and freed there
+    /// (GitHub #190), as (publisher, tokens).
+    prefixes_spilled: Vec<(RequestId, u32)>,
+    prefixes_returned: Vec<(RequestId, u32)>,
+    spilled_prefixes_discarded: Vec<(RequestId, u32)>,
     /// Requests whose next prefill batch the backend will fail (GitHub #190).
     prefill_failures: std::collections::HashSet<RequestId>,
     /// Requests whose next asked-for checkpoint capture the backend will
@@ -165,6 +170,21 @@ impl MockCompute {
         self.inner.lock().unwrap().spill_failures.insert(publisher);
     }
 
+    /// The retained prefixes spilled to KV-RAM (GitHub #190), in order.
+    pub fn spilled_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().prefixes_spilled.clone()
+    }
+
+    /// The spilled prefixes brought back onto the device, in order.
+    pub fn returned_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().prefixes_returned.clone()
+    }
+
+    /// The spilled prefixes whose blob was freed, in order.
+    pub fn discarded_spilled_prefixes(&self) -> Vec<(RequestId, u32)> {
+        self.inner.lock().unwrap().spilled_prefixes_discarded.clone()
+    }
+
     /// Fail the next prefill batch carrying a job for `request`, the way a
     /// leaf error fails the whole call (GitHub #190).
     pub fn fail_prefill(&self, request: RequestId) {
@@ -231,7 +251,7 @@ impl Compute for MockCompute {
             .collect())
     }
 
-    fn release_prefix(&self, publisher: RequestId) {
+    fn release_prefix(&self, publisher: RequestId, _tokens: u32) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
     }
 
@@ -270,6 +290,29 @@ impl Compute for MockCompute {
         }
         g.checkpoints_spilled.push(publisher);
         Ok(1)
+    }
+
+    // GitHub #190: a retained prefix's blob is one nominal byte too.
+    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Ok(1)
+    }
+
+    fn spill_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        self.inner.lock().unwrap().prefixes_spilled.push((publisher, tokens));
+        Ok(1)
+    }
+
+    fn restore_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        self.inner.lock().unwrap().prefixes_returned.push((publisher, tokens));
+        Ok(1)
+    }
+
+    fn discard_spilled_prefix(&self, publisher: RequestId, tokens: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .spilled_prefixes_discarded
+            .push((publisher, tokens));
     }
 
     fn release(&self, request: RequestId) {

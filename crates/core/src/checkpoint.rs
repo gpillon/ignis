@@ -149,15 +149,18 @@ impl TierSet {
 /// What happened to retained state in one residency tier (GitHub #190) — the
 /// lifecycle facts the scheduler reports, each a count of one:
 ///
-/// - **Hit**: a request chose a retained checkpoint in this tier to resume
-///   from. Chosen, not yet restored: its prefill has not run.
-/// - **Miss**: a request's first chunk landed with nothing in this tier
+/// - **Hit**: a request chose retained state in this tier to resume
+///   from — a checkpoint (chosen, not yet restored: its prefill has not
+///   run), or a retained prefix brought back from KV-RAM for it.
+/// - **Miss**: a request's first chunk landed with no checkpoint in this tier
 ///   matching its prompt. Counted at the chunk rather than at the lookup,
 ///   because a request waiting for room looks again on every tick.
-/// - **Spill**: a checkpoint the device gave up was written into this tier.
-/// - **Discard**: a checkpoint left this tier for nowhere.
-/// - **Restore**: a claimant's prefill landed on a checkpoint from this tier.
-///   A hit whose prefill never lands is a hit without a restore.
+/// - **Spill**: a checkpoint or retained prefix the device gave up was
+///   written into this tier.
+/// - **Discard**: a checkpoint or retained prefix left this tier for nowhere.
+/// - **Restore**: a claimant's prefill landed on a checkpoint from this tier,
+///   or a retained prefix was brought back from it. A hit whose prefill never
+///   lands is a hit without a restore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetainedStateOperation {
     Hit,

@@ -165,11 +165,11 @@ The initial stable metric contract is:
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
 | `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints a request chose to resume from, by tier — chosen, not yet restored |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Retained state a request chose to resume from, by tier: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
 | `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries |
-| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints written into the tier (today only `kv_ram`) |
-| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints that left the tier for nowhere |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Prefills that landed on a checkpoint from the tier; a hit whose prefill never lands has no restore |
+| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
+| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes that left the tier for nowhere |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
