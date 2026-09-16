@@ -116,6 +116,29 @@ fn scheduler_config_for_shape(
     }
 }
 
+/// The leaf the operator's [`EngineShape`] is loaded as: the last step
+/// before a device exists, and the whole of what `ignis-runtime` is told
+/// about the operator's flags.
+///
+/// Separate from [`cuda_scheduler`] because it is the only link in the chain
+/// from a flag to a blob's identity that needs no card — `Config` reaches
+/// `EngineShape` by [`From`], `EngineShape` reaches the leaf here, and
+/// [`ignis_runtime::CudaLeafConfig::blob_identity`] decides which of *these*
+/// fields the identity is made of (GitHub #189). Leaving this inline in
+/// `cuda_scheduler` would put a field-by-field copy behind a GPU.
+#[cfg(feature = "cuda")]
+fn leaf_config_for_shape(shape: EngineShape) -> ignis_runtime::CudaLeafConfig {
+    ignis_runtime::CudaLeafConfig {
+        max_context_tokens: shape.max_context,
+        kv_format: shape.kv_format,
+        kv_pool_bytes: shape.kv_pool_bytes,
+        prefill_chunk_tokens: shape.prefill_chunk,
+        speculation: shape.speculation,
+        vision: shape.vision,
+        ..ignis_runtime::CudaLeafConfig::default()
+    }
+}
+
 /// Build the server's real GPU-backed scheduler (GitHub #61 / P1-25):
 /// open a second [`ignis_artifact::Reader`] over `artifact_path` (the
 /// caller already verified the container through the loader path — this
@@ -131,7 +154,7 @@ pub fn cuda_scheduler(
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
     use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
-    use ignis_runtime::{CudaLeaf, CudaLeafConfig, KV_PAGE_TOKENS};
+    use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
     // P5-02 (GitHub #150) / GitHub #177: the drafter's and the vision tower's
@@ -144,15 +167,7 @@ pub fn cuda_scheduler(
     let artifact = materialize(&reader, &plan, &mut device, None)
         .map_err(|e| format!("materialize weights: {e}"))?;
 
-    let leaf_config = CudaLeafConfig {
-        max_context_tokens: shape.max_context,
-        kv_format: shape.kv_format,
-        kv_pool_bytes: shape.kv_pool_bytes,
-        prefill_chunk_tokens: shape.prefill_chunk,
-        speculation: shape.speculation,
-        vision: shape.vision,
-        ..CudaLeafConfig::default()
-    };
+    let leaf_config = leaf_config_for_shape(shape);
 
     // Match the scheduler's KV admission accounting to the pool the leaf
     // actually built. Both sides read the page count from the *same*
@@ -244,6 +259,83 @@ mod tests {
             panic!("expected a runnable config");
         };
         assert_eq!(EngineShape::from(&config), EngineShape::default());
+    }
+
+    /// The whole chain from an operator's flags to a blob's identity, with no
+    /// card in it: `Config` -> `EngineShape` -> `CudaLeafConfig` ->
+    /// `BlobIdentity` (GitHub #189). Only the first hop is device-free on its
+    /// own, which is why `leaf_config_for_shape` exists.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_operator_flags_reach_the_identity_through_the_load_and_nothing_else() {
+        let artifact = ignis_core::ArtifactHash::from_bytes([7; 32]);
+        const LAYOUT: u32 = 2;
+        let identity_of = |config: &crate::config::Config| {
+            leaf_config_for_shape(EngineShape::from(config)).blob_identity(artifact, LAYOUT)
+        };
+        let crate::config::ConfigOutcome::Config(base) =
+            crate::config::resolve(&[], |_| None).expect("resolve")
+        else {
+            panic!("expected a runnable config");
+        };
+
+        // Every serving knob at once: the bind address, the timeout, the UI,
+        // the metrics listener, the API key, the prefill chunk, the context,
+        // both pool budgets, `--prompt-reuse` and `--retained-pool-bytes`.
+        // `retained_pool_bytes` is the one that makes this a rule rather than
+        // a nicety: unset, its value is derived from the VRAM left after load,
+        // so it differs from one start of the same server to the next, and an
+        // identity that moved with it would refuse every blob after a reboot.
+        let elsewhere = crate::config::Config {
+            bind: "0.0.0.0:9999".into(),
+            request_timeout_secs: base.request_timeout_secs + 7,
+            ui: !base.ui,
+            metrics: Some("127.0.0.1:9101".into()),
+            api_key: Some(crate::config::ApiKeySetting::Generate),
+            prefill_chunk: 512,
+            max_context: base.max_context / 2,
+            kv_pool_bytes: base.kv_pool_bytes * 2,
+            host_pool_bytes: base.host_pool_bytes * 2,
+            prompt_reuse: !base.prompt_reuse,
+            retained_pool_bytes: Some(3 * 1024 * 1024 * 1024),
+            ..base.clone()
+        };
+        assert_ne!(base, elsewhere, "the two configs really do differ");
+        assert_eq!(
+            identity_of(&base),
+            identity_of(&elsewhere),
+            "no serving flag reaches what the engine is loaded as"
+        );
+
+        // And the two load options that do, end to end from the flag.
+        let bf16 = crate::config::Config {
+            kv_format: ignis_core::KvFormat::Bf16,
+            ..base.clone()
+        };
+        let hq = crate::config::Config {
+            kv_format: ignis_core::KvFormat::HqE8_2b,
+            ..base.clone()
+        };
+        assert_eq!(
+            identity_of(&bf16)
+                .accepts(&identity_of(&hq))
+                .expect_err("another KV format")
+                .field,
+            ignis_core::IdentityField::KvFormat
+        );
+        let drafted = crate::config::Config {
+            speculation: Some(
+                ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 4).unwrap(),
+            ),
+            ..base.clone()
+        };
+        assert_eq!(
+            identity_of(&base)
+                .accepts(&identity_of(&drafted))
+                .expect_err("a drafter this load has not bound")
+                .field,
+            ignis_core::IdentityField::Drafter
+        );
     }
 
     #[test]

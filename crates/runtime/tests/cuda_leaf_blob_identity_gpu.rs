@@ -13,14 +13,20 @@
 //!     pool that was actually built;
 //!   * a blob refused on its identity is refused **before a byte of it is
 //!     written**: the four mismatches go through the same guarded restore the
-//!     accepted one does, and afterwards the sequence is still evicted and the
-//!     blob still intact — which the legitimate restore, run last, proves by
-//!     succeeding;
+//!     accepted one does, and after each one the sequence is still gone from
+//!     the leaf — a decode round for it errors, which is the only way to ask —
+//!     and the blob is still whole, which the legitimate restore proves at the
+//!     end by succeeding and landing on the right state;
 //!   * the restored sequence is the **right** one. Its continuation is
 //!     compared token for token against a control sequence over the same
-//!     prompt that never moved, and — the ordering that makes the refusals
-//!     bite — the control's tail is generated *after* the four refusals, so a
-//!     refusal that had written anything would have to show up as a divergence.
+//!     prompt that never moved.
+//!
+//! The control is a *second* sequence, not the snapshotted one, so — unlike
+//! `seq_snapshot_gpu.rs`, where the control is the source — its tail is not
+//! itself evidence about the refusals: a refused restore would have written
+//! into a freshly acquired slot for the subject, never into the control's
+//! pages. It is still generated after the refusals, which costs nothing and
+//! keeps the comparison out of any state they might have left behind.
 //!
 //! BF16 is asked for by name: it is the oracle format (ADR 0022).
 //!
@@ -256,9 +262,10 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
 
     // ── The control's tail, from the sequence that never moved ──────────
     //
-    // Generated *after* the four refusals, the way `seq_snapshot_gpu.rs`
-    // orders its own control: had a refused restore written anything into the
-    // pool, this tail would no longer be what the subject's has to match.
+    // After the refusals rather than before — defensively, not as the proof.
+    // A refused restore would have written into a slot freshly acquired for
+    // the *subject*, which cannot be the control's; what shows that nothing
+    // was written is the failing decode above and the bit-exact tail below.
     let mut control_tail = Vec::new();
     for _ in 0..GENERATED {
         control_tail.extend(decode_once(&compute, control, params, "control tail"));
