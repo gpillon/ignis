@@ -234,15 +234,21 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
         "the leaf's pool spends the unshared control sequence plus the prefix once          and one tail per holder — the admission machine's own charge for the same set"
     );
 
-    // A claimant's history is not all its own, so it cannot be moved as one
-    // blob (P4-10 against P4-06). The right response is to release it and
-    // re-prefill, which is what the distinct code is for.
-    let refusal = first
+    // A claimant's history is not all its own, and its snapshot copies the
+    // shared head in (GitHub #190) rather than being refused: the blob of a
+    // claimant standing on the prefix's two pages is a blob of two pages.
+    // That it restores to the same state is
+    // `crates/runtime/tests/cuda_leaf_kv_ram_gpu.rs`'s question.
+    let materialized = first
         .snapshot_bytes()
-        .expect_err("a sequence sharing a prefix has no whole-sequence snapshot");
+        .unwrap_or_else(|e| panic!("a claimant's snapshot materializes its shared head: {e}"));
+    let longer = control
+        .snapshot_bytes()
+        .unwrap_or_else(|e| panic!("the unshared control's snapshot: {e}"));
     assert!(
-        refusal.is_shared_prefix(),
-        "the sequence, not the call, is what cannot be transferred: {refusal}"
+        materialized > 0 && materialized < longer,
+        "the claimant's blob covers its shared head, not less and not the control's history: \
+         {materialized} vs {longer}"
     );
 
     let claim_stats = prefix.stats();

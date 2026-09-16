@@ -30,7 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use ignis_core::checkpoint::{ReuseSource, StateCacheOperation};
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
 use serde::Serialize;
 
@@ -440,22 +440,18 @@ impl Telemetry {
     /// prefix (core-07). Not logged — the request log has no line for it — so
     /// only the installed projection observes it (GitHub #90).
     ///
-    /// **Two kinds arrive here since GitHub #188, and this cannot tell them
-    /// apart.** A concurrent sibling's prefix and a **retained prefix** left
-    /// by a request that has already finished are claimed through one path
-    /// and emit one event, so `ignis_prefix_reused_tokens_total` — whose ADR
-    /// 0017 row said *sibling*-prefix reuse — now counts cross-request reuse
-    /// too. That is a **declared** departure rather than the silent widening
-    /// of a documented counter that #186's finding 3 was made to prevent: the
-    /// counter's own help text says so (`metrics.rs`), and #190 owns the
-    /// per-tier hit / miss / spill / restore counters that separate them.
-    ///
-    /// Prompt-checkpoint reuse is the *other* kind of cross-request reuse and
-    /// still does not come through here — see [`Self::on_state_reused`],
-    /// which is per-request by design.
-    pub fn on_prefix_reused(&mut self, tokens: u32) {
+    /// Two kinds arrive here since GitHub #188: a concurrent sibling's prefix,
+    /// and a **retained prefix** left by a request that has already finished.
+    /// `retained` tells them apart (#190), so `ignis_prefix_reused_tokens_total`
+    /// keeps the *sibling*-prefix meaning ADR 0017's row gives it, and
+    /// cross-request reuse is counted as reuse of retained state on the device.
+    pub fn on_prefix_reused(&mut self, tokens: u32, retained: bool) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_prefix_reused(tokens);
+            if retained {
+                metrics.record_retained_reused(ReuseSource::Device, tokens);
+            } else {
+                metrics.record_prefix_reused(tokens);
+            }
         }
     }
 
@@ -464,15 +460,9 @@ impl Telemetry {
     /// prefix this is a *per-request* fact — which tier served it, how much
     /// prefill it skipped, what the restore cost — so it is stashed and
     /// reported on the request's own `done` line rather than only summed
-    /// into a server-wide counter.
-    /// Nothing is projected from here. `ignis_prefix_reused_tokens_total`
-    /// counts **sibling-prefix** reuse — that is what its help text says and
-    /// what ADR 0017's table row says — and folding a second, different kind
-    /// of reuse into it would redefine a documented counter without saying
-    /// so. #190 owns the per-tier hit / miss / spill / restore counters and
-    /// the ADR amendment that declares them; until then checkpoint reuse is
-    /// reported where this ticket says it is, on the request's own `done`
-    /// line.
+    /// into a server-wide counter. The skipped tokens are also summed per
+    /// tier into `ignis_retained_reused_tokens_total` (#190) — never into
+    /// `ignis_prefix_reused_tokens_total`, which counts sibling-prefix reuse.
     pub fn on_state_reused(
         &mut self,
         id: RequestId,
@@ -481,21 +471,19 @@ impl Telemetry {
         restore_micros: u64,
     ) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_state_cache(StateCacheOperation::Hit, source);
-            metrics.record_state_cache(StateCacheOperation::Restore, source);
+            metrics.record_retained_reused(source, tokens);
         }
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.reuse = Some((source, tokens, restore_micros));
         }
     }
 
-    /// Project one scheduler-owned retained-state cache operation. Hits and
-    /// restores arrive through [`Self::on_state_reused`] because only a
-    /// successful prefill is a completed restore; misses, spills and discards
-    /// have no request owner and use this path.
-    pub fn on_state_cache(&mut self, operation: StateCacheOperation, source: ReuseSource) {
+    /// Something happened to retained state in one tier (GitHub #190). Not
+    /// logged: none of it belongs to one request's line, so only the
+    /// installed projection observes it.
+    pub fn on_retained_state(&mut self, operation: RetainedStateOperation, source: ReuseSource) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_state_cache(operation, source);
+            metrics.record_retained_state(operation, source);
         }
     }
 
@@ -1371,7 +1359,7 @@ mod tests {
         telemetry.with_metrics(Arc::clone(&metrics));
 
         telemetry.note_submit(1, 3, RequestClass::Agent);
-        telemetry.on_prefix_reused(32);
+        telemetry.on_prefix_reused(32, false);
         telemetry.on_evicted(1, 450);
         telemetry.on_token(1);
         telemetry.on_token(1);
@@ -1411,17 +1399,31 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_retained_state_restore_counts_as_a_hit_and_restore() {
+    fn reuse_is_counted_by_kind_and_tier_never_summed_into_the_sibling_counter() {
         let metrics = Arc::new(Metrics::new());
         let mut telemetry = telemetry();
         telemetry.with_metrics(Arc::clone(&metrics));
         telemetry.note_submit(7, 2048, RequestClass::Interactive);
         telemetry.on_state_reused(7, ReuseSource::KvRam, 1536, 42);
+        telemetry.on_prefix_reused(64, true);
+        telemetry.on_prefix_reused(32, false);
+        telemetry.on_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam);
 
         let text = metrics.render();
-        assert!(text.contains("\nignis_retained_state_hits_total{tier=\"kv_ram\"} 1\n"));
-        assert!(text.contains("\nignis_retained_state_restores_total{tier=\"kv_ram\"} 1\n"));
-        assert!(text.contains("\nignis_retained_state_hits_total{tier=\"device\"} 0\n"));
+        for line in [
+            "ignis_retained_reused_tokens_total{tier=\"kv_ram\"} 1536",
+            "ignis_retained_reused_tokens_total{tier=\"device\"} 64",
+            "ignis_prefix_reused_tokens_total 32",
+            "ignis_retained_state_spills_total{tier=\"kv_ram\"} 1",
+            // A restore is the scheduler's fact, not this call's: nothing here
+            // may count one a second time.
+            "ignis_retained_state_restores_total{tier=\"kv_ram\"} 0",
+        ] {
+            assert!(text.contains(&format!("
+{line}
+")), "{line} in:
+{text}");
+        }
     }
 
     #[test]

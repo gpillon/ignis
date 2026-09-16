@@ -494,6 +494,80 @@ void check_materialized_blob_outlives_every_device_handle(bool dflash2) {
   ignis_seq_pool_free(pool);
 }
 
+// ---- 5b. a checkpoint on a prefix chain materializes every link ----------
+//
+// GitHub #187 made the pages under a checkpoint a *chain* -- the block a burst
+// shares, then the pages a later turn warmed itself -- and #190's blob has to
+// carry all of them in block-table order. The reference is the sequence that
+// took the checkpoint, snapshotted where it stands: the two blobs describe the
+// same history and have to be the same bytes.
+
+void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2) {
+  ignis_seq_pool_spec spec = small_spec(IGNIS_KV_FORMAT_HQ_E8_2B);
+  spec.slot_count          = 3;
+  if (dflash2) {
+    spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
+  }
+  ignis_seq_pool *pool = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "chain blob: pool create");
+
+  // Turn 1 publishes the block: two pages.
+  ignis_seq *turn1 = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &turn1), 0, "chain blob: alloc turn 1");
+  set_frontier(*turn1, kPrefix);
+  dirty_state(*pool, *turn1, 2, 0x61u);
+  ignis_seq_prefix *block = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, turn1, kPrefix, &block), 0, "chain blob: publish block");
+
+  // Turn 2 claims it, warms a page of its own, chains it over the block, and
+  // walks on to an opener inside the page after.
+  const std::uint32_t chained = 3 * kPageTokens;
+  const std::uint32_t opener  = chained + 40;
+  ignis_seq *turn2            = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, block, &turn2), 0, "chain blob: claim block");
+  set_frontier(*turn2, chained);
+  dirty_state(*pool, *turn2, 1, 0x62u);
+  ignis_seq_prefix *link = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, turn2, chained, &link), 0, "chain blob: publish link");
+  set_frontier(*turn2, opener);
+  turn2->pending_token = 777;
+  dirty_state(*pool, *turn2, 1, 0x63u);
+
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, turn2, opener, &checkpoint), 0,
+            "chain blob: capture on the chain");
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0, "chain blob: size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+            "chain blob: snapshot the checkpoint");
+
+  std::uint64_t own_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, turn2, &own_bytes), 0, "chain blob: sequence size");
+  std::vector<unsigned char> own(static_cast<std::size_t>(own_bytes));
+  expect_rc(ignis_seq_snapshot(pool, turn2, own.data(), own_bytes), 0,
+            "chain blob: snapshot the capturing sequence");
+  expect(own_bytes == bytes && own == blob,
+         "chain blob: the checkpoint's blob is the capturing sequence's own, link for link");
+
+  // Nothing on the device is needed to bring it back.
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  ignis_seq_prefix_release(pool, link);
+  ignis_seq_prefix_release(pool, block);
+  ignis_seq_release(pool, turn2);
+  ignis_seq_release(pool, turn1);
+  ignis_seq *restored = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &restored), 0, "chain blob: restore target");
+  expect_rc(ignis_seq_restore(pool, restored, blob.data(), bytes), 0,
+            "chain blob: restore with every link released");
+  std::vector<unsigned char> again(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_snapshot(pool, restored, again.data(), bytes), 0,
+            "chain blob: re-snapshot the restored sequence");
+  expect(again == blob, "chain blob: the round trip is byte-exact");
+  ignis_seq_release(pool, restored);
+  ignis_seq_pool_free(pool);
+}
+
 // ---- 6. every refusal refuses, and costs nothing -------------------------
 
 void check_refusals() {
@@ -573,6 +647,8 @@ int main() {
   check_lifetime();
   check_materialized_blob_outlives_every_device_handle(false);
   check_materialized_blob_outlives_every_device_handle(true);
+  check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(false);
+  check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(true);
   check_refusals();
   if (failures != 0) {
     std::fprintf(stderr, "%d checkpoint check(s) failed\n", failures);

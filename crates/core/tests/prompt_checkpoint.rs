@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::checkpoint::{ReuseSource, StateCacheOperation};
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute, Scheduler,
@@ -700,7 +700,7 @@ fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens } if *request == b && *tokens == 32)),
+            .any(|e| matches!(e, SchedEvent::PrefixReused { request, tokens, .. } if *request == b && *tokens == 32)),
         "B claimed A's shared prefix, not a checkpoint"
     );
     assert!(reuses(&events, b).is_empty(), "and no checkpoint matched it");
@@ -1060,9 +1060,9 @@ fn a_retained_entry_never_causes_an_admission_refusal_or_wait() {
         "the control itself must be an uncontended baseline"
     );
     assert_eq!(
-        compute.released_checkpoints().len(),
+        compute.spilled_checkpoints().len(),
         1,
-        "the retained entry was given up — and it is the backend's image that went"
+        "the retained entry was given up by the device — its image went to KV-RAM"
     );
 }
 
@@ -1117,7 +1117,7 @@ fn a_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
     // Once turn N+1 is gone the entry *is* reclaimable, and the first-victim
     // path takes it — the deferral above was about liveness, not a refusal.
     run_to_idle(&mut sched);
-    assert_eq!(compute.released_checkpoints(), vec![0]);
+    assert_eq!(compute.spilled_checkpoints(), vec![0], "off the device, into KV-RAM");
     assert_eq!(sched.checkpoint_pool().entry_count(), 1);
     assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
 }
@@ -1211,11 +1211,12 @@ fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
     assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
     assert_eq!(sched.checkpoint_pool().used_bytes(), 0, "no device image remains");
     assert_eq!(sched.kv_used_pages(), 0, "and its pages came back");
-    assert_eq!(compute.released_checkpoints(), vec![n]);
+    assert_eq!(compute.spilled_checkpoints(), vec![n], "spilled");
+    assert!(compute.released_checkpoints().is_empty(), "not discarded");
     assert!(events.iter().any(|event| matches!(
         event,
-        SchedEvent::StateCache {
-            operation: StateCacheOperation::Spill,
+        SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Spill,
             source: ReuseSource::KvRam,
         }
     )));

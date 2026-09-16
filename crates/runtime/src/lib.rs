@@ -432,10 +432,6 @@ struct EvictedSequence<B> {
     generated: u32,
 }
 
-struct RetainedCheckpoint<B> {
-    buf: B,
-}
-
 /// Scheduler adapter over a loaded step-ABI model.
 ///
 /// A request gains a sequence on its first prefill. The map is private, so a
@@ -463,7 +459,7 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// Materialized retained checkpoints in pinned KV-RAM. Unlike live
     /// evictions these are non-consuming: every matching request restores
     /// from the same immutable blob.
-    retained: Mutex<HashMap<RequestId, RetainedCheckpoint<L::SnapshotBuf>>>,
+    retained: Mutex<HashMap<RequestId, L::SnapshotBuf>>,
     /// Media embeddings still needed by a request's next chunk (GitHub
     /// #178): at most one per request, held from its item's first covered
     /// chunk until its last placeholder is prefilled.
@@ -686,8 +682,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             None => Err(-1),
                         }
                     }
+                    // GitHub #190: a KV-RAM claim restores the materialized
+                    // blob into a fresh sequence, and leaves the blob in place.
                     (Some(claim), _) => match retained.get(&claim.publisher) {
-                        Some(checkpoint) => {
+                        Some(blob) => {
                             let started = std::time::Instant::now();
                             self.model
                                 .leaf
@@ -696,7 +694,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                                     match self.model.leaf.restore_sequence(
                                         self.model.handle(),
                                         &mut handle,
-                                        checkpoint.buf.as_ref(),
+                                        blob.as_ref(),
                                     ) {
                                         Ok(()) => {
                                             outcomes[index].restore_micros =
@@ -861,41 +859,22 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
     fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
         let mut checkpoints = self.checkpoints.lock().unwrap();
-        let checkpoint = checkpoints.remove(&publisher).ok_or(ComputeError::Kernel(-1))?;
-        let bytes = match self
-            .model
-            .leaf
-            .checkpoint_snapshot_bytes(self.model.handle(), &checkpoint)
-        {
-            Ok(bytes) => bytes,
-            Err(code) => {
-                checkpoints.insert(publisher, checkpoint);
-                return Err(RuntimeError::Leaf(code).into());
-            }
-        };
-        let mut buf = match self.model.leaf.alloc_snapshot_buf(bytes) {
-            Ok(buf) => buf,
-            Err(code) => {
-                checkpoints.insert(publisher, checkpoint);
-                return Err(RuntimeError::Leaf(code).into());
-            }
-        };
-        if let Err(code) = self.model.leaf.checkpoint_snapshot_into(
-            self.model.handle(),
-            &checkpoint,
-            buf.as_mut(),
-        ) {
-            checkpoints.insert(publisher, checkpoint);
-            return Err(RuntimeError::Leaf(code).into());
-        }
-        self.model
-            .leaf
-            .release_checkpoint(self.model.handle(), checkpoint);
+        let checkpoint = checkpoints.get(&publisher).ok_or(ComputeError::Kernel(-1))?;
+        // Every step before the release leaves the device image where it was,
+        // so a failed spill is one the caller can still discard normally.
+        let leaf = &self.model.leaf;
+        let buf = leaf
+            .checkpoint_snapshot_bytes(self.model.handle(), checkpoint)
+            .and_then(|bytes| Ok((bytes, leaf.alloc_snapshot_buf(bytes)?)))
+            .and_then(|(bytes, mut buf)| {
+                leaf.checkpoint_snapshot_into(self.model.handle(), checkpoint, buf.as_mut())?;
+                Ok((bytes, buf))
+            });
+        let (bytes, buf) = buf.map_err(RuntimeError::Leaf)?;
+        let checkpoint = checkpoints.remove(&publisher).expect("looked up above");
+        leaf.release_checkpoint(self.model.handle(), checkpoint);
         drop(checkpoints);
-        self.retained
-            .lock()
-            .unwrap()
-            .insert(publisher, RetainedCheckpoint { buf });
+        self.retained.lock().unwrap().insert(publisher, buf);
         Ok(bytes)
     }
 

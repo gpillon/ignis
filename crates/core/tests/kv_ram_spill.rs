@@ -1,0 +1,527 @@
+//! GitHub #190 (ADR 0029, spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md`
+//! §"Retained state in KV-RAM") — retained state the device gives up is
+//! **spilled** to KV-RAM instead of lost, and comes back from there.
+//!
+//! What these tests can prove without a card is what the next layer up
+//! observes: which checkpoints cross to KV-RAM and when, which are discarded
+//! instead, which reuse a request lands (`reuse_source`), the retained-state
+//! lifecycle facts, and that the pool and the tier are charged exactly what
+//! they hold. That the bytes that come back are the *right* bytes
+//! needs the model, and lives in `prompt_checkpoint_gpu.rs` and
+//! `crates/runtime/tests/cuda_leaf_kv_ram_gpu.rs`.
+//!
+//! Seams (ADR 0006): the `Scheduler` trait driven with a `MockCompute`, whose
+//! checkpoint image, materialized blob and live snapshot are one nominal byte
+//! each — so `host_capacity_bytes` counts entries.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
+use ignis_core::host::Tier;
+use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
+use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
+
+const MODEL: &str = "qwen3.8-27b";
+const PAGE: u32 = 16;
+
+fn tokens(start: u32, n: u32) -> Vec<u32> {
+    (start..start + n).collect()
+}
+
+fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
+    RequestInput {
+        model: MODEL.into(),
+        tokens: prompt,
+        params: DecodeParams {
+            max_tokens: Some(max),
+            ..DecodeParams::default()
+        },
+        multimodal: None,
+        opener_tokens: opener,
+        user_turn_tokens: None,
+        system_block_tokens: None,
+    }
+}
+
+/// A device pool of exactly one full sequence (80 pages = 1280 tokens), so a
+/// request needing all of it takes the retained pages back — and `host`
+/// KV-RAM entries below it.
+fn tight(host: u64) -> SchedulerConfig {
+    SchedulerConfig {
+        model: MODEL.into(),
+        max_in_flight: 16,
+        max_sequence_tokens: 1280,
+        kv_capacity_pages: 80,
+        kv_page_tokens: PAGE,
+        host_capacity_bytes: host,
+        ..SchedulerConfig::default()
+    }
+}
+
+/// A clock the test moves by hand.
+fn manual_clock() -> (ignis_core::Clock, Arc<AtomicU64>) {
+    let base = Instant::now();
+    let offset = Arc::new(AtomicU64::new(0));
+    let read = offset.clone();
+    (
+        Arc::new(move || base + Duration::from_secs(read.load(Ordering::SeqCst))),
+        offset,
+    )
+}
+
+fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
+    let mut events = Vec::new();
+    while !sched.is_idle() {
+        events.extend(sched.advance());
+    }
+    events
+}
+
+/// The system-and-tools block every turn opens with: four pages, published
+/// and retained as a prefix (GitHub #188) — the shape every qwen-code request
+/// has.
+const BLOCK: u32 = 64;
+
+/// A conversation's turn: 1200 prompt tokens starting at `start`, opener at
+/// 1150 — more than KV-RAM's 1024-token restore floor past the block, so its
+/// checkpoint is worth restoring from there even while the block is on the
+/// device.
+fn turn_at(start: u32) -> RequestInput {
+    RequestInput {
+        system_block_tokens: Some(BLOCK),
+        ..input(tokens(start, 1200), Some(1150), 4)
+    }
+}
+
+/// Its next turn: the first up to the opener, then 100 new tokens and an
+/// opener of its own.
+fn next_turn_at(start: u32) -> RequestInput {
+    RequestInput {
+        system_block_tokens: Some(BLOCK),
+        ..input([tokens(start, 1150), tokens(start + 50_000, 100)].concat(), Some(1240), 4)
+    }
+}
+
+/// A request that needs the whole device pool, so every retained page has to
+/// come back for it.
+fn whole_pool(start: u32) -> RequestInput {
+    input(tokens(start, 1272), None, 8)
+}
+
+fn retained_state(events: &[SchedEvent]) -> Vec<(RetainedStateOperation, ReuseSource)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::RetainedState { operation, source } => Some((*operation, *source)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count(events: &[SchedEvent], operation: RetainedStateOperation, source: ReuseSource) -> usize {
+    retained_state(events)
+        .into_iter()
+        .filter(|&fact| fact == (operation, source))
+        .count()
+}
+
+fn reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::StateReused {
+                request: r,
+                source,
+                tokens,
+                ..
+            } if *r == request => Some((*source, *tokens)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Leave `start`'s conversation turn on the device, then push it to KV-RAM.
+/// Returns the turn's request id.
+fn turn_spilled_to_kv_ram(
+    sched: &mut ConcreteScheduler,
+    start: u32,
+    class: RequestClass,
+) -> RequestId {
+    let turn = sched.submit(turn_at(start), class).unwrap();
+    run_to_idle(sched);
+    sched
+        .submit(whole_pool(start + 100_000), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(sched);
+    turn
+}
+
+// ── AC1: an idle conversation pushed off the device resumes from KV-RAM ──
+
+#[test]
+fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_going() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+
+    let n = sched.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    let pressure = sched.submit(whole_pool(100_000), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == pressure)));
+    assert_eq!(compute.spilled_checkpoints(), vec![n], "the device gave turn N up to KV-RAM");
+    assert!(compute.released_checkpoints().is_empty(), "rather than discarding it");
+    assert_eq!(count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam), 1);
+    let spilled = sched.checkpoint_pool().entries()[0].id;
+    assert_eq!(sched.host().retained(spilled).unwrap().tier, Tier::Probation);
+
+    // Turn N+1 resumes from the blob.
+    let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, n1), vec![(ReuseSource::KvRam, 1150)]);
+    assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1);
+    assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
+    assert_eq!(
+        sched.checkpoint_pool().reused_tok(),
+        1150,
+        "chosen once, however many ticks it took to land"
+    );
+    assert_eq!(
+        sched.host().retained(spilled).unwrap().tier,
+        Tier::Protected,
+        "a landed restore is the proof two-tier eviction waits for"
+    );
+    assert_eq!(sched.host().retained_count(), 1, "and the restore did not consume the blob");
+
+    // And the conversation keeps its reuse: turn N+1 — a sequence that owns
+    // every page it restored, the block's included — cannot publish at the
+    // block any more, which is behind it, and publishes and captures at its
+    // own opener instead, so turn N+2 resumes on the device.
+    assert!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .any(|e| e.tier == ReuseSource::Device && e.tokens == 1240),
+        "turn N+1 left a device checkpoint at its opener: {:?}",
+        sched.checkpoint_pool().entries()
+    );
+    let n2 = sched
+        .submit(
+            RequestInput {
+                system_block_tokens: Some(BLOCK),
+                ..input(
+                    [next_turn_at(1).tokens[..1240].to_vec(), tokens(900_000, 30)].concat(),
+                    Some(1265),
+                    4,
+                )
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, n2), vec![(ReuseSource::Device, 1240)]);
+    assert_eq!(
+        sched.kv_used_pages(),
+        sched.prefix_pinned_pages(),
+        "nothing is charged but the pages the retained chain still holds"
+    );
+}
+
+#[test]
+fn a_kv_ram_claimant_with_no_opener_to_capture_at_pays_no_chunk_split() {
+    // What it would publish is a head over history it restored, which only
+    // earns a split when a checkpoint is captured there — the rule a device
+    // claimant's chained publish already follows.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+
+    let n1 = sched
+        .submit(
+            RequestInput {
+                opener_tokens: None,
+                ..next_turn_at(1)
+            },
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, n1), vec![(ReuseSource::KvRam, 1150)]);
+    let widths: Vec<usize> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|job| job.request == n1)
+        .map(|job| job.tokens.len())
+        .collect();
+    assert_eq!(widths, vec![100], "the whole tail in one chunk");
+}
+
+// ── AC4: no device-to-host copy while capacity is sufficient ─────────────
+
+#[test]
+fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    );
+    let mut events = Vec::new();
+    for start in [1, 200_000, 400_000] {
+        sched.submit(turn_at(start), RequestClass::Interactive).unwrap();
+        events.extend(run_to_idle(&mut sched));
+        sched.submit(next_turn_at(start), RequestClass::Agent).unwrap();
+        events.extend(run_to_idle(&mut sched));
+    }
+
+    assert!(compute.spilled_checkpoints().is_empty(), "no blob was written");
+    assert_eq!(count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam), 0);
+    assert_eq!(sched.host().retained_count(), 0);
+    assert_eq!(sched.host().used_bytes(), 0);
+    assert_eq!(
+        count(&events, RetainedStateOperation::Hit, ReuseSource::Device),
+        3,
+        "and every next turn still reused its checkpoint on the device"
+    );
+}
+
+// ── AC3: retained state before evicted live sequences, class aside ───────
+
+#[test]
+fn a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequence() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
+
+    let agent_turn = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Agent);
+    assert_eq!(compute.spilled_checkpoints(), vec![agent_turn]);
+    assert_eq!(sched.host().used_bytes(), 1, "KV-RAM: the Agent blob");
+
+    // Eight Interactive requests hold every lane; two more Interactive heads
+    // each take one by snapshotting a lane holder into KV-RAM. The second
+    // snapshot does not fit next to the first *and* the blob.
+    for i in 0..8 {
+        sched
+            .submit(input(tokens(300_000 + i * 10, 4), None, 60), RequestClass::Interactive)
+            .unwrap();
+    }
+    sched.advance();
+    let mut events = Vec::new();
+    for i in 0..2 {
+        sched
+            .submit(input(tokens(400_000 + i * 10, 4), None, 4), RequestClass::Interactive)
+            .unwrap();
+        events.extend(sched.advance());
+    }
+
+    let evicted = events
+        .iter()
+        .filter(|e| matches!(e, SchedEvent::Evicted { .. }))
+        .count();
+    assert_eq!(evicted, 2, "both heads went through the host tier");
+    assert_eq!(
+        count(&events, RetainedStateOperation::Discard, ReuseSource::KvRam),
+        1,
+        "the retained Agent blob made the room"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SchedEvent::Requeued { .. })),
+        "no evicted Interactive sequence was discarded for it"
+    );
+    assert_eq!(compute.released_checkpoints(), vec![agent_turn], "the blob was released");
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0, "and left the pool");
+    assert_eq!(sched.host().retained_count(), 0);
+}
+
+// ── Spill admission: rank, TTL, budget, failure ───────────────────────────
+
+#[test]
+fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_ttl() {
+    let compute = Arc::new(MockCompute::new());
+    let (clock, elapsed) = manual_clock();
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            retained_interactive_ttl: Duration::from_secs(300),
+            ..tight(1)
+        },
+        compute.clone(),
+    )
+    .with_clock(clock);
+
+    // KV-RAM holds one blob: the main conversation's.
+    let main = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    assert_eq!(compute.spilled_checkpoints(), vec![main]);
+
+    // A subagent's checkpoint ranks below it: its spill is refused and the
+    // device discards it instead, leaving the main conversation's in place.
+    elapsed.store(299, Ordering::SeqCst);
+    let sub = turn_at(200_000);
+    let sub = sched.submit(sub, RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    sched.submit(whole_pool(300_000), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_checkpoints(), vec![main], "no second blob was written");
+    assert_eq!(compute.released_checkpoints(), vec![sub], "the subagent's checkpoint went");
+    assert_eq!(count(&events, RetainedStateOperation::Discard, ReuseSource::Device), 1);
+    assert_eq!(count(&events, RetainedStateOperation::Discard, ReuseSource::KvRam), 0);
+
+    // Past the TTL the main conversation's blob, idle since before either
+    // turn, ranks as an Agent's probation entry — older than the newcomer.
+    elapsed.store(600, Ordering::SeqCst);
+    let later = sched.submit(turn_at(500_000), RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    sched.submit(whole_pool(600_000), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_checkpoints(), vec![main, later]);
+    assert_eq!(count(&events, RetainedStateOperation::Discard, ReuseSource::KvRam), 1);
+    assert_eq!(count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam), 1);
+    let kv_ram: Vec<RequestId> = sched
+        .checkpoint_pool()
+        .entries()
+        .iter()
+        .filter(|e| e.tier == ReuseSource::KvRam)
+        .map(|e| e.publisher)
+        .collect();
+    assert_eq!(kv_ram, vec![later], "the idle entry made room for the fresh one");
+}
+
+#[test]
+fn a_spill_the_leaf_fails_discards_only_the_victim() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    let kept = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Agent);
+
+    let doomed = sched.submit(turn_at(200_000), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    compute.fail_spill(doomed);
+    sched.submit(whole_pool(300_000), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+
+    assert_eq!(compute.spilled_checkpoints(), vec![kept]);
+    assert_eq!(compute.released_checkpoints(), vec![doomed], "discarded, not leaked");
+    assert_eq!(count(&events, RetainedStateOperation::Discard, ReuseSource::Device), 1);
+    assert_eq!(sched.host().retained_count(), 1, "KV-RAM is as it was");
+    assert_eq!(sched.kv_used_pages(), 0, "and the device got its pages back either way");
+}
+
+#[test]
+fn prompt_reuse_without_a_kv_ram_budget_discards_what_the_device_gives_up() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(0), compute.clone());
+    let turn = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+
+    assert!(compute.spilled_checkpoints().is_empty());
+    assert_eq!(compute.released_checkpoints(), vec![turn]);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 0);
+}
+
+// ── A restore that has not landed ────────────────────────────────────────
+
+#[test]
+fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    let blob = sched.checkpoint_pool().entries()[0].id;
+
+    let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
+    compute.fail_prefill(n1);
+    let events = sched.advance();
+    assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1, "chosen");
+    assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 0);
+    assert_eq!(
+        sched.host().retained(blob).unwrap().tier,
+        Tier::Probation,
+        "a restore that failed proved nothing"
+    );
+
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuses(&events, n1), vec![(ReuseSource::KvRam, 1150)], "the retry landed it");
+    assert_eq!(
+        count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam),
+        0,
+        "the retry keeps the claim it had rather than choosing again"
+    );
+    assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
+    assert_eq!(sched.host().retained(blob).unwrap().tier, Tier::Protected);
+}
+
+#[test]
+fn a_request_cancelled_before_its_kv_ram_restore_lands_lets_the_blob_go() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
+    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    let blob = sched.checkpoint_pool().entries()[0].id;
+
+    let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
+    compute.fail_prefill(n1);
+    sched.advance();
+    sched.cancel(n1);
+    run_to_idle(&mut sched);
+
+    // Unpromoted, and discardable again: a live snapshot's room takes it.
+    let entry = sched.host().retained(blob).expect("still retained");
+    assert_eq!(entry.tier, Tier::Probation);
+    assert!(sched.host().plan_retained_room(4, RequestClass::Interactive, Instant::now(), Instant::now()).is_some());
+}
+
+// ── Miss facts ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_first_turn_misses_every_configured_tier_once() {
+    let compute = Arc::new(MockCompute::new());
+    let mut with_kv_ram = ConcreteScheduler::with_config(tight(4), compute.clone());
+    with_kv_ram.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut with_kv_ram);
+    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
+    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam), 1);
+
+    let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::new()));
+    device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut device_only);
+    assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
+    assert_eq!(
+        count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam),
+        0,
+        "a tier this load does not carry is never missed"
+    );
+}
+
+#[test]
+fn a_superseded_checkpoint_is_reported_as_a_discard_from_its_tier() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    );
+    // A tool loop: three iterations of one turn keep two checkpoints, so the
+    // first is superseded by the third.
+    let mut prompt = tokens(1, 40);
+    let mut opener = 37;
+    let mut events = Vec::new();
+    for step in 0..3 {
+        let request = RequestInput {
+            user_turn_tokens: Some(0),
+            ..input(prompt.clone(), Some(opener), 4)
+        };
+        sched.submit(request, RequestClass::Agent).unwrap();
+        events.extend(run_to_idle(&mut sched));
+        prompt = [prompt[..opener as usize].to_vec(), tokens(10_000 * (step + 1), 40)].concat();
+        opener += 37;
+    }
+    assert!(!compute.released_checkpoints().is_empty(), "the loop superseded an entry");
+    assert_eq!(
+        compute.released_checkpoints().len(),
+        count(&events, RetainedStateOperation::Discard, ReuseSource::Device),
+        "every image released is a discard reported"
+    );
+}

@@ -225,6 +225,7 @@ async fn main() {
         host_pool_bytes: _,
         prompt_reuse: _,
         retained_pool_bytes: _,
+        retained_interactive_ttl_secs: _,
         speculation: _,
         vision,
         media,

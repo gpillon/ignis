@@ -90,6 +90,11 @@ pub struct Config {
     /// a long one does. Unset derives a default from the VRAM left after
     /// load; this is what the operator asked for, `None` meaning "derive it".
     pub retained_pool_bytes: Option<u64>,
+    /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
+    /// priority after its conversation last used it, in seconds
+    /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
+    /// an Agent's would.
+    pub retained_interactive_ttl_secs: u32,
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
     /// GitHub #150). `None` loads nothing of the drafter.
     pub speculation: Option<Speculation>,
@@ -205,6 +210,12 @@ pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// to.
 pub const DEFAULT_PROMPT_REUSE: bool = true;
 
+/// `--retained-interactive-ttl`'s default, in seconds (GitHub #190): the
+/// scheduler's own starting value, restated as a flag default rather than
+/// chosen twice.
+pub const DEFAULT_RETAINED_INTERACTIVE_TTL_SECS: u32 =
+    ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL.as_secs() as u32;
+
 /// What [`resolve`] produced: a runnable config, or a request to print
 /// `--help`/`--version` text and exit before any loader/scheduler work runs.
 /// `resolve` never prints or exits itself — that stays in `main`.
@@ -256,6 +267,7 @@ pub fn resolve(
     let mut host_pool_bytes = None;
     let mut prompt_reuse = None;
     let mut retained_pool_bytes = None;
+    let mut retained_interactive_ttl = None;
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
@@ -286,6 +298,9 @@ pub fn resolve(
             "--prompt-reuse" => prompt_reuse = Some(take_value(args, &mut i, flag)?),
             "--retained-pool-bytes" => {
                 retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
+            }
+            "--retained-interactive-ttl" => {
+                retained_interactive_ttl = Some(take_value(args, &mut i, flag)?)
             }
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
@@ -339,6 +354,8 @@ pub fn resolve(
     let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
     let retained_pool_bytes =
         resolve_retained_pool_bytes(retained_pool_bytes, &env, prompt_reuse)?;
+    let retained_interactive_ttl_secs =
+        resolve_retained_interactive_ttl(retained_interactive_ttl, &env, prompt_reuse)?;
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
@@ -391,6 +408,7 @@ pub fn resolve(
         host_pool_bytes,
         prompt_reuse,
         retained_pool_bytes,
+        retained_interactive_ttl_secs,
         speculation,
         vision,
         media,
@@ -719,6 +737,26 @@ fn resolve_host_pool_bytes(
     parse_bytes("--kv-host-pool-bytes", &raw)
 }
 
+/// `--retained-interactive-ttl` / `IGNIS_RETAINED_INTERACTIVE_TTL` /
+/// [`DEFAULT_RETAINED_INTERACTIVE_TTL_SECS`] (GitHub #190). `0` is legal: an
+/// Interactive entry then never outranks an Agent's in KV-RAM. Refused with
+/// `--prompt-reuse off`, like every other sub-flag of a feature that is off.
+fn resolve_retained_interactive_ttl(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+    prompt_reuse: bool,
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_INTERACTIVE_TTL"))) else {
+        return Ok(DEFAULT_RETAINED_INTERACTIVE_TTL_SECS);
+    };
+    if !prompt_reuse {
+        return Err(ConfigError(format!(
+            "`--retained-interactive-ttl {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
+        )));
+    }
+    parse_count("--retained-interactive-ttl", "second count", &raw)
+}
+
 /// `--request-timeout` / `IGNIS_REQUEST_TIMEOUT` / [`DEFAULT_REQUEST_TIMEOUT_SECS`].
 fn resolve_request_timeout_secs(
     flag: Option<String>,
@@ -778,6 +816,7 @@ fn help_text() -> String {
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
          \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused)\n\
          \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: derived from the VRAM left after load; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
+         \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
@@ -1280,6 +1319,29 @@ mod tests {
             Some(256 * 1024 * 1024),
             "flag must win over env"
         );
+    }
+
+    #[test]
+    fn the_retained_interactive_ttl_is_configurable_and_needs_reuse_on() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.retained_interactive_ttl_secs, 300, "five minutes by default");
+
+        let config = expect_config(
+            resolve(&args(&["--retained-interactive-ttl", "60"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.retained_interactive_ttl_secs, 60);
+
+        let env = env_map(&[("IGNIS_RETAINED_INTERACTIVE_TTL", "0")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.retained_interactive_ttl_secs, 0, "zero is a legal choice");
+
+        let err = resolve(&args(&["--retained-interactive-ttl", "5m"]), no_env)
+            .expect_err("not a second count");
+        assert!(err.0.contains("--retained-interactive-ttl"), "{}", err.0);
+
+        let a = args(&["--prompt-reuse", "off", "--retained-interactive-ttl", "60"]);
+        let err = resolve(&a, no_env).expect_err("a TTL with reuse off");
+        assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
     }
 
     #[test]

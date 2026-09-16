@@ -379,7 +379,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::PrefixReused { request, .. }
         | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. } => Some(*request),
-        SchedEvent::Protected { .. } | SchedEvent::StateCache { .. } => None,
+        SchedEvent::Protected { .. } | SchedEvent::RetainedState { .. } => None,
     }
 }
 
@@ -426,7 +426,9 @@ async fn telemetry_task(
                     encode_micros,
                     ..
                 } => telemetry.on_prefill_chunk(request, prefilled_tokens, encode_micros),
-                SchedEvent::PrefixReused { tokens, .. } => telemetry.on_prefix_reused(tokens),
+                SchedEvent::PrefixReused {
+                    tokens, retained, ..
+                } => telemetry.on_prefix_reused(tokens, retained),
                 // GitHub #186: unlike `PrefixReused`, this one keeps its
                 // request id — `reuse_source`, `reused_prompt_tokens` and
                 // `restore_ms` are per-request fields of the request log,
@@ -437,8 +439,8 @@ async fn telemetry_task(
                     tokens,
                     restore_micros,
                 } => telemetry.on_state_reused(request, source, tokens, restore_micros),
-                SchedEvent::StateCache { operation, source } => {
-                    telemetry.on_state_cache(operation, source)
+                SchedEvent::RetainedState { operation, source } => {
+                    telemetry.on_retained_state(operation, source)
                 }
                 _ => {}
             },
@@ -709,6 +711,7 @@ mod tests {
                 SchedEvent::PrefixReused {
                     request: ProtectedBatchScheduler::ID,
                     tokens: 32,
+                    retained: false,
                 },
                 SchedEvent::Token {
                     request: ProtectedBatchScheduler::ID,
@@ -970,6 +973,11 @@ mod tests {
             "ignis_requests_completed_total 3",
             "ignis_requests_cancelled_total 0",
             "ignis_generated_tokens_total 12",
+            // GitHub #190: the retained-state facts reach the projection
+            // through this consumer too — three first turns, each missing
+            // both tiers the default load carries.
+            "ignis_retained_state_misses_total{tier=\"device\"} 3",
+            "ignis_retained_state_misses_total{tier=\"kv_ram\"} 3",
         ] {
             assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
         }

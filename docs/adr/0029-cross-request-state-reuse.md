@@ -175,3 +175,30 @@ rather than one:
 `crates/core/tests/retained_prefix.rs`'s
 `the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
 that changes with it; it is written to fail when the order is flipped.
+
+## Amendment (2026-09-16) — the KV-RAM tier (#190)
+
+What building Tier 1 decided that the Decision left open.
+
+- **The restore floor is `KV_RAM_RESTORE_FLOOR_TOKENS` = 1024**, one prefill
+  chunk: a fixed starting value, to be tuned by measurement (the trace replay,
+  #191), not derived. It is measured against the **best reuse still on the
+  device**, a sibling or retained *prefix* included — a KV-RAM restore that
+  beats a device checkpoint but not a device prefix by a chunk pays the
+  crossing for nothing.
+- **Only prompt checkpoints spill.** A retained prefix the device gives up is
+  discarded, as before; spilling it too is open work, not a decision against
+  it.
+- **A request restored from a materialized blob owns every page it restored.**
+  No publish point at or below the restored length can be reached again, so
+  it publishes, if at all, at its own generation opener's page — the one that
+  makes its next checkpoint capturable — and only when it has an opener, as a
+  claimant's chained publish already must. Without this a conversation that
+  came back from KV-RAM would never leave another checkpoint.
+- **A blob a request has chosen is held until its restore lands.** Nothing
+  discards it in between; a discard that arrives meanwhile takes effect when
+  the claim lets go.
+- **Lifecycle facts.** Hit (chosen), miss (first chunk landed with no match in
+  a tier), spill, discard and restore (landed) are emitted by the core, one
+  per event, per tier, identically with metrics on or off (ADR 0017 as
+  amended by #190).

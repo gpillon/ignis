@@ -19,12 +19,13 @@ is the scheduler's acceptance as the telemetry consumer observes it, the same
 anchor as the `ignis.request.ttft`/`done` log events: measuring from HTTP
 ingress would take a fact the consumer does not already receive. A request
 cancelled after its first token has a TTFT observation but no duration one.
-Amended 2026-09-16 (#190): retained prompt-checkpoint operations add five
-fixed-cardinality counter families, each split by `tier="device|kv_ram"`.
-One **proposed** amendment is outstanding, at the end of this document:
-`ignis_prefix_reused_tokens_total`'s meaning widens (2026-09-16, #188). It is
-**not decided** — this ADR's clarifications are the owner's to sign off — and
-the contract table below marks that row as awaiting it.
+Amended 2026-09-16 (#190, accepted by the owner the same day): six
+fixed-cardinality counter families for retained state, each split by
+`tier="device|kv_ram"`, and the core emits the retained-state lifecycle facts
+they are projected from (see Decision). The proposed widening of
+`ignis_prefix_reused_tokens_total` (#188), at the end of this document, was
+**not** taken: the counter keeps its sibling-prefix meaning, and retained
+reuse is counted in its own family instead.
 
 ## Context
 
@@ -162,12 +163,13 @@ The initial stable metric contract is:
 | `ignis_build_info` | gauge | `version` | Constant build identity with value 1 |
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
-| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — **widening proposed, pending owner sign-off (#188): see the proposed amendment below** |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Retained prompt-checkpoint matches successfully used |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Retained prompt-checkpoint lookups with no matching entry in that configured tier |
-| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints spilled into the named tier |
-| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints discarded from the named tier |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Retained prompt checkpoints successfully restored from the named tier |
+| `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
+| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints a request chose to resume from, by tier — chosen, not yet restored |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries |
+| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints written into the tier (today only `kv_ram`) |
+| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Prompt checkpoints that left the tier for nowhere |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Prefills that landed on a checkpoint from the tier; a hit whose prefill never lands has no restore |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
@@ -264,7 +266,14 @@ dimension.
   affect HTTP-plane latency; that is why the explicit 1% HTTP budget exists.
   They cannot consume inference-path time by design.
 
-## Proposed amendment (2026-09-16) — the prefix-reuse counter widens (#188), pending owner sign-off
+## Proposed amendment (2026-09-16) — the prefix-reuse counter widens (#188) — superseded
+
+**Superseded by #190 (2026-09-16).** The owner chose the decline path below:
+`SchedEvent::PrefixReused` carries whether the claimed entry's publisher had
+already finished, the projection counts only a live sibling's claim in
+`ignis_prefix_reused_tokens_total`, and a retained prefix's claim lands in
+`ignis_retained_reused_tokens_total{tier="device"}`. The text below is kept as
+the record of what was proposed.
 
 **Not decided.** This ADR is an owner-decision ADR whose clarifications are
 reserved for the owner's sign-off, so #188 records this rather than taking it.

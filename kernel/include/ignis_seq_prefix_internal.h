@@ -311,4 +311,39 @@ inline void ignis_seq_prefix_transfer(ignis_seq_pool &pool, ignis_seq_prefix &pr
  * and nothing else in the leaf knows that. */
 void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix);
 
+/* --- the materialized blob (GitHub #190) ----------------------------------
+ *
+ * A snapshot of a sequence holding a shared prefix, and a retained prompt
+ * checkpoint spilled to KV-RAM, are both written as the blob ignis_seq_snapshot
+ * writes for a sequence that owns its history: the shared pages are copied
+ * into it rather than referenced. Defined in kernel/src/seq.cu and declared
+ * here because kernel/src/seq_checkpoint.cu writes that blob too, and two
+ * copies of its layout could drift apart without either failing. */
+
+/* The offset of `kind` in `sections`. The table always carries every kind
+ * (ignis_seq_section_table builds it unconditionally), so a miss is a
+ * programming error rather than a caller's. */
+std::uint64_t ignis_seq_section_offset(const std::vector<ignis_seq_section> &sections,
+                                       int32_t kind);
+
+/* Zero the bytes of a blob no section's payload covers, so two blobs of the
+ * same state are the same bytes whatever buffer they were written into. */
+void ignis_seq_zero_blob_gaps(unsigned char *base, const std::vector<ignis_seq_section> &sections,
+                              std::uint64_t total_bytes);
+
+/* One checked device-to-host copy on the default stream. */
+void ignis_seq_copy_to_host(void *dst, const void *src, std::size_t bytes, const char *what);
+
+/* The physical pages of a prefix chain, root first: the block-table order a
+ * claimant of `head` addresses them in. Empty for a null `head`. */
+std::vector<std::int32_t> ignis_seq_prefix_chain_page_ids(const ignis_seq_prefix *head);
+
+/* Pack `pages` of `pool` into `dst` in the vendored snapshot layout (plane by
+ * plane, page by page), followed on every plane by that plane's slice of
+ * `tail_page` when it is not null -- a checkpoint's copy of the page its
+ * opener ends inside, packed the same way. Consecutive pages go in one copy. */
+void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
+                                  const std::vector<std::int32_t> &pages, const void *tail_page,
+                                  void *dst);
+
 #endif /* IGNIS_SEQ_PREFIX_INTERNAL_H */

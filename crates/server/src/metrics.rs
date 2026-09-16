@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::http::header;
 use axum::routing::get;
-use ignis_core::checkpoint::{ReuseSource, StateCacheOperation};
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::SubmitError;
 
 /// The exposition's content type: Prometheus text format 0.0.4.
@@ -135,11 +135,13 @@ pub struct Metrics {
     decoded_tokens: AtomicU64,
     kv_evictions: AtomicU64,
     prefix_reused_tokens: AtomicU64,
-    retained_state_hits: [AtomicU64; 2],
-    retained_state_misses: [AtomicU64; 2],
-    retained_state_spills: [AtomicU64; 2],
-    retained_state_discards: [AtomicU64; 2],
-    retained_state_restores: [AtomicU64; 2],
+    /// Per [`ReuseSource::index`], for each of the families below (#190).
+    retained_reused_tokens: [AtomicU64; ReuseSource::ALL.len()],
+    retained_state_hits: [AtomicU64; ReuseSource::ALL.len()],
+    retained_state_misses: [AtomicU64; ReuseSource::ALL.len()],
+    retained_state_spills: [AtomicU64; ReuseSource::ALL.len()],
+    retained_state_discards: [AtomicU64; ReuseSource::ALL.len()],
+    retained_state_restores: [AtomicU64; ReuseSource::ALL.len()],
     ttft: Histogram,
     duration: Histogram,
 }
@@ -164,6 +166,7 @@ impl Metrics {
             decoded_tokens: AtomicU64::new(0),
             kv_evictions: AtomicU64::new(0),
             prefix_reused_tokens: AtomicU64::new(0),
+            retained_reused_tokens: Default::default(),
             retained_state_hits: Default::default(),
             retained_state_misses: Default::default(),
             retained_state_spills: Default::default(),
@@ -191,25 +194,23 @@ impl Metrics {
         self.prefix_reused_tokens.fetch_add(u64::from(tokens), Ordering::Relaxed);
     }
 
-    /// Record one fixed-cardinality retained-state operation in its
-    /// residency tier. The telemetry consumer is the only writer.
-    pub(crate) fn record_state_cache(
-        &self,
-        operation: StateCacheOperation,
-        source: ReuseSource,
-    ) {
-        let tier = match source {
-            ReuseSource::Device => 0,
-            ReuseSource::KvRam => 1,
-        };
+    /// A request's prefill skipped `tokens` through retained state in
+    /// `source` — a retained prefix, or a prompt checkpoint (GitHub #190).
+    pub(crate) fn record_retained_reused(&self, source: ReuseSource, tokens: u32) {
+        self.retained_reused_tokens[source.index()].fetch_add(u64::from(tokens), Ordering::Relaxed);
+    }
+
+    /// One retained-state lifecycle operation in its residency tier (GitHub
+    /// #190). The telemetry consumer is the only writer.
+    pub(crate) fn record_retained_state(&self, operation: RetainedStateOperation, source: ReuseSource) {
         let series = match operation {
-            StateCacheOperation::Hit => &self.retained_state_hits,
-            StateCacheOperation::Miss => &self.retained_state_misses,
-            StateCacheOperation::Spill => &self.retained_state_spills,
-            StateCacheOperation::Discard => &self.retained_state_discards,
-            StateCacheOperation::Restore => &self.retained_state_restores,
+            RetainedStateOperation::Hit => &self.retained_state_hits,
+            RetainedStateOperation::Miss => &self.retained_state_misses,
+            RetainedStateOperation::Spill => &self.retained_state_spills,
+            RetainedStateOperation::Discard => &self.retained_state_discards,
+            RetainedStateOperation::Restore => &self.retained_state_restores,
         };
-        series[tier].fetch_add(1, Ordering::Relaxed);
+        series[source.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A request's first token came `ms` after its submission.
@@ -288,21 +289,13 @@ impl Metrics {
                 &self.decoded_tokens,
             ),
             ("ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", &self.kv_evictions),
-            // GitHub #188 — a **declared departure**, not a widening nobody
-            // wrote down. This counted sibling-prefix reuse only (ADR 0017's
-            // table row, core-07). A **retained prefix** is claimed through
-            // the very same path and emits the very same
-            // `SchedEvent::PrefixReused`, so cross-request reuse now lands
-            // here too and the two kinds cannot be told apart from this
-            // series. The help text says so rather than staying narrower than
-            // the value it describes. #190 owns the per-tier hit / miss /
-            // spill / restore counters that separate them, and the ADR 0017
-            // amendment declaring them; the name and type are unchanged
-            // meanwhile, so no consumer breaks.
+            // Sibling-prefix reuse only, as ADR 0017's table row says. A
+            // retained prefix is claimed through the same path (#188), and
+            // `SchedEvent::PrefixReused::retained` is what keeps its tokens
+            // out of here and in `ignis_retained_reused_tokens_total` (#190).
             (
                 "ignis_prefix_reused_tokens_total",
-                "Cumulative tokens skipped through prefix reuse, sibling and retained together \
-                 (separated per tier by #190).",
+                "Cumulative tokens skipped through sibling-prefix reuse.",
                 &self.prefix_reused_tokens,
             ),
         ];
@@ -312,41 +305,39 @@ impl Metrics {
         }
         for (name, help, series) in [
             (
+                "ignis_retained_reused_tokens_total",
+                "Cumulative tokens skipped through retained state, by residency tier.",
+                &self.retained_reused_tokens,
+            ),
+            (
                 "ignis_retained_state_hits_total",
-                "Retained-state matches used by residency tier.",
+                "Retained prompt checkpoints chosen to resume from, by residency tier.",
                 &self.retained_state_hits,
             ),
             (
                 "ignis_retained_state_misses_total",
-                "Retained-state lookups without a matching entry by residency tier.",
+                "First prefill chunks with no retained checkpoint matching in the tier.",
                 &self.retained_state_misses,
             ),
             (
                 "ignis_retained_state_spills_total",
-                "Retained-state entries spilled into a residency tier.",
+                "Retained prompt checkpoints spilled into the tier.",
                 &self.retained_state_spills,
             ),
             (
                 "ignis_retained_state_discards_total",
-                "Retained-state entries discarded from a residency tier.",
+                "Retained prompt checkpoints discarded from the tier.",
                 &self.retained_state_discards,
             ),
             (
                 "ignis_retained_state_restores_total",
-                "Retained-state entries restored from a residency tier.",
+                "Prefills that landed on a retained prompt checkpoint from the tier.",
                 &self.retained_state_restores,
             ),
         ] {
             declare(&mut out, name, "counter", help);
-            for (source, slot) in
-                [(ReuseSource::Device, &series[0]), (ReuseSource::KvRam, &series[1])]
-            {
-                let _ = writeln!(
-                    out,
-                    "{name}{{tier=\"{}\"}} {}",
-                    source.as_str(),
-                    read(slot)
-                );
+            for (source, slot) in ReuseSource::ALL.iter().zip(series) {
+                let _ = writeln!(out, "{name}{{tier=\"{}\"}} {}", source.as_str(), read(slot));
             }
         }
         declare(
@@ -428,6 +419,7 @@ mod tests {
             ("ignis_decoded_tokens_total", "counter"),
             ("ignis_kv_cache_evictions_total", "counter"),
             ("ignis_prefix_reused_tokens_total", "counter"),
+            ("ignis_retained_reused_tokens_total", "counter"),
             ("ignis_retained_state_hits_total", "counter"),
             ("ignis_retained_state_misses_total", "counter"),
             ("ignis_retained_state_spills_total", "counter"),
@@ -552,11 +544,11 @@ mod tests {
     #[test]
     fn retained_state_operations_are_counted_per_residency_tier() {
         let metrics = Metrics::new();
-        metrics.record_state_cache(StateCacheOperation::Hit, ReuseSource::Device);
-        metrics.record_state_cache(StateCacheOperation::Miss, ReuseSource::Device);
-        metrics.record_state_cache(StateCacheOperation::Spill, ReuseSource::KvRam);
-        metrics.record_state_cache(StateCacheOperation::Discard, ReuseSource::KvRam);
-        metrics.record_state_cache(StateCacheOperation::Restore, ReuseSource::KvRam);
+        metrics.record_retained_state(RetainedStateOperation::Hit, ReuseSource::Device);
+        metrics.record_retained_state(RetainedStateOperation::Miss, ReuseSource::Device);
+        metrics.record_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam);
+        metrics.record_retained_state(RetainedStateOperation::Discard, ReuseSource::KvRam);
+        metrics.record_retained_state(RetainedStateOperation::Restore, ReuseSource::KvRam);
 
         let text = metrics.render();
         for (name, tier) in [

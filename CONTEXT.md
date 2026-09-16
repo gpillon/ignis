@@ -233,7 +233,9 @@ When output names a domain concept, use the term as defined here.
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained
   state** before evicted live sequences, then request class, then probation
-  before protected, then least-recently-used. On the device, retained state
+  before protected, then least-recently-used — a main-conversation entry idle
+  past its TTL ranking as a subagent's probation entry, and a spill displacing
+  only what ranks below it. On the device, retained state
   goes before any of it. Protection
   outranks class only where something is actively being served (ADR 0023).
 - **Chunked prefill** — prefilling a prompt span through the span+position

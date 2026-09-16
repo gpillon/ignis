@@ -69,6 +69,7 @@ fn small_pool() -> SchedulerConfig {
         serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
         prompt_reuse: true,
         retained_pool_bytes: 16,
+        retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
     }
 }
 
@@ -429,6 +430,7 @@ fn admission_capacity_is_built_from_the_leaf_verified_kv_pool_and_never_dispatch
             serving_chunk_tokens: ignis_core::DEFAULT_SERVING_CHUNK_TOKENS,
             prompt_reuse: true,
             retained_pool_bytes: 16,
+            retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
         },
         compute.clone(),
     );

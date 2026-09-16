@@ -432,13 +432,17 @@ pub enum SchedEvent {
     /// `sibling_prefix_reused_tok` counter (design §5, `server-02`).
     ///
     /// Since GitHub #188 the entry may be a **retained prefix**, whose
-    /// publisher has already finished, rather than a live sibling's, and this
-    /// event does not distinguish them: the claim is the same act on the same
-    /// object, so it is deliberately the same event. What that costs is that
-    /// `ignis_prefix_reused_tokens_total` now sums both kinds — a declared
-    /// departure, resolved by #190's per-tier counters. See
-    /// `ignis_server::telemetry`'s `on_prefix_reused`.
-    PrefixReused { request: RequestId, tokens: u32 },
+    /// publisher has already finished, rather than a live sibling's. The claim
+    /// is the same act on the same object, so it is the same event; `retained`
+    /// is what tells the two apart (GitHub #190), so sibling reuse and
+    /// cross-request reuse are never summed into one number.
+    PrefixReused {
+        request: RequestId,
+        tokens: u32,
+        /// The claimed entry's publisher had already finished: this was
+        /// reuse of retained state, not of a concurrent sibling's prefix.
+        retained: bool,
+    },
     /// A request's prefill resumed from **retained state** left by an earlier,
     /// already-finished request (GitHub #186, ADR 0029): the `tokens` leading
     /// prompt tokens — everything up to that state's generation opener — were
@@ -461,11 +465,13 @@ pub enum SchedEvent {
         /// checkpoint into this request's slot, measured by the backend.
         restore_micros: u64,
     },
-    /// A bounded retained-state cache operation for the asynchronous
-    /// Prometheus projection (GitHub #190). It has no request owner: spills
-    /// and discards may happen while making room for another request.
-    StateCache {
-        operation: crate::checkpoint::StateCacheOperation,
+    /// Something happened to retained state in one residency tier (GitHub
+    /// #190) — a hit, a miss, a spill, a discard or a restore, as
+    /// [`crate::checkpoint::RetainedStateOperation`] defines each. It names
+    /// no request: a spill or a discard happens to state no live request
+    /// owns, usually while making room for some other request.
+    RetainedState {
+        operation: crate::checkpoint::RetainedStateOperation,
         source: crate::checkpoint::ReuseSource,
     },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;

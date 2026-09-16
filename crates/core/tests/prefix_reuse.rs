@@ -90,7 +90,12 @@ fn a_sibling_skips_the_shared_prefix() {
     let reused: Vec<u32> = events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::PrefixReused { request, tokens } if *request == sub_id => Some(*tokens),
+            // A live sibling's prefix: never counted as retained reuse (#190).
+            SchedEvent::PrefixReused {
+                request,
+                tokens,
+                retained: false,
+            } if *request == sub_id => Some(*tokens),
             _ => None,
         })
         .collect();

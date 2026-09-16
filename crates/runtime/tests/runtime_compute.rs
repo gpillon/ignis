@@ -42,6 +42,8 @@ struct Calls {
     checkpoints_released: u32,
     snapshots_taken: u32,
     restores: u32,
+    /// GitHub #190: fail every checkpoint materialization while set.
+    fail_checkpoint_snapshots: bool,
     /// GitHub #178: the token span begin of each encoded media item, the
     /// embeddings released (by encode order, from 1), and every multimodal
     /// prefill span.
@@ -320,8 +322,12 @@ impl StepLeaf for StubLeaf {
         _checkpoint: &Self::Checkpoint,
         dst: &mut [u8],
     ) -> Result<(), i32> {
+        let mut calls = self.calls.lock().unwrap();
+        if calls.fail_checkpoint_snapshots {
+            return Err(-7);
+        }
         dst.copy_from_slice(SNAPSHOT_MARKER);
-        self.calls.lock().unwrap().snapshots_taken += 1;
+        calls.snapshots_taken += 1;
         Ok(())
     }
 
@@ -1093,6 +1099,41 @@ fn a_reclaimed_checkpoint_spills_to_kv_ram_and_releases_the_device_handle() {
         1,
         "spill is lazy: exactly the reclaimed checkpoint crossed PCIe"
     );
+}
+
+#[test]
+fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
+    // GitHub #190: every step before the release leaves the image where it
+    // was, so the scheduler's discard that follows still has a handle to drop
+    // — and a later spill of the same checkpoint can still succeed.
+    let leaf = Arc::new(StubLeaf::with_tokens([]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    compute
+        .prefill_step(&[PrefillJob {
+            request: 1,
+            tokens: vec![1, 2, 3, 4, 5, 6],
+            context_tokens: 16,
+            start_position: 0,
+            params: DecodeParams::default(),
+            shared_prefix: None,
+            publish_prefix_tokens: None,
+            checkpoint: None,
+            capture_checkpoint_tokens: Some(6),
+            multimodal: None,
+        }])
+        .unwrap();
+
+    leaf.calls.lock().unwrap().fail_checkpoint_snapshots = true;
+    assert!(compute.spill_checkpoint(1).is_err());
+    assert_eq!(compute.live_checkpoints(), 1, "the device image is still held");
+    assert_eq!(compute.retained_checkpoints(), 0, "and no blob was kept");
+    assert_eq!(leaf.calls.lock().unwrap().checkpoints_released, 0);
+
+    leaf.calls.lock().unwrap().fail_checkpoint_snapshots = false;
+    assert!(compute.spill_checkpoint(1).is_ok(), "the same checkpoint spills once the leaf can");
+    assert_eq!(compute.live_checkpoints(), 0);
+    assert_eq!(compute.retained_checkpoints(), 1);
 }
 
 #[test]
