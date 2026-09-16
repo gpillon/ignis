@@ -120,8 +120,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::checkpoint::{
-    CheckpointCapture, CheckpointEntry, CheckpointPool, RetainedStateOperation, ReuseSource,
-    TierList,
+    CheckpointCapture, CheckpointEntry, CheckpointPool, KV_RAM_RESTORE_FLOOR_TOKENS,
+    RetainedStateOperation, ReuseSource, TierList,
 };
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
@@ -130,11 +130,11 @@ use crate::admission::{
     persistent_backfill_is_safe, protected_head_safe_without_temporal, protection_frontier_distance,
 };
 use crate::host::{
-    DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase,
+    DEFAULT_RETAINED_INTERACTIVE_TTL, HostEntry, HostTier, KvRamVictim, ResumePhase, RetainedBlob,
     RetainedKvRamEntry, Tier,
 };
 use crate::identity::{MediaKey, PromptContent};
-use crate::prefix::{PrefixCache, PrefixId};
+use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
 use crate::request::Request;
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler,
@@ -659,7 +659,7 @@ impl ConcreteScheduler {
                 self.release_prefix_claim(Some(entry.prefix));
             }
             ReuseSource::KvRam => {
-                if let Some(blob) = self.host.discard_retained(entry.id) {
+                if let Some(blob) = self.host.discard_retained(RetainedBlob::Checkpoint(entry.id)) {
                     self.compute.release_checkpoint(blob.publisher);
                 }
             }
@@ -673,9 +673,183 @@ impl ConcreteScheduler {
             return;
         };
         let restored_at = restored.then(|| self.now());
-        if let Some(blob) = self.host.release_retained_claim(checkpoint, restored_at) {
+        if let Some(blob) = self
+            .host
+            .release_retained_claim(RetainedBlob::Checkpoint(checkpoint), restored_at)
+        {
             self.compute.release_checkpoint(blob.publisher);
         }
+    }
+
+    /// Give up KV-RAM blob `blob`, whichever kind it is (GitHub #190).
+    fn discard_kv_ram_blob(&mut self, blob: RetainedBlob, events: &mut Vec<SchedEvent>) {
+        match blob {
+            RetainedBlob::Checkpoint(id) => {
+                if let Some(entry) = self.checkpoints.discard(id) {
+                    self.discard_checkpoint(entry, events);
+                }
+            }
+            RetainedBlob::Prefix(_) => {
+                if let Some(entry) = self.host.discard_retained(blob) {
+                    self.forget_kv_ram_blob(entry, events);
+                }
+            }
+        }
+    }
+
+    /// A KV-RAM entry already out of the tier's budget: drop what names it,
+    /// free its blob, and report the discard.
+    fn forget_kv_ram_blob(&mut self, entry: RetainedKvRamEntry, events: &mut Vec<SchedEvent>) {
+        match entry.blob {
+            RetainedBlob::Checkpoint(id) => {
+                self.checkpoints.discard(id);
+                self.compute.release_checkpoint(entry.publisher);
+            }
+            RetainedBlob::Prefix(id) => {
+                if let Some(spilled) = self.prefix.forget_spilled(id) {
+                    self.compute
+                        .discard_spilled_prefix(spilled.publisher, spilled.length_tokens);
+                }
+            }
+        }
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Discard,
+            source: ReuseSource::KvRam,
+        });
+    }
+
+    /// The retained prefix `entry`, which the first-victim path is giving up,
+    /// goes to KV-RAM if the budget takes it (GitHub #190) — before the caller
+    /// releases it, while its pages are still on the device to copy. A prefix
+    /// that already has a blob there (it was brought back from one) copies
+    /// nothing: the blob just ranks by the prefix's latest use.
+    fn spill_prefix(&mut self, entry: PrefixId, events: &mut Vec<SchedEvent>) {
+        let Some((publisher, tokens, retention)) = self
+            .prefix
+            .entry(entry)
+            .and_then(|e| e.retained.map(|r| (e.publisher, e.length_tokens, r)))
+        else {
+            return;
+        };
+        if let Some(copy) = self.prefix.spilled_copy_of(entry) {
+            self.host
+                .refresh_retained(RetainedBlob::Prefix(copy), retention.used_at);
+            return;
+        }
+        let spilled = self.checkpoints.tiers().below(ReuseSource::Device) == Some(ReuseSource::KvRam)
+            && self.write_prefix_blob(entry, publisher, tokens, retention, events);
+        if !spilled {
+            events.push(SchedEvent::RetainedState {
+                operation: RetainedStateOperation::Discard,
+                source: ReuseSource::Device,
+            });
+        }
+    }
+
+    fn write_prefix_blob(
+        &mut self,
+        entry: PrefixId,
+        publisher: RequestId,
+        tokens: u32,
+        retention: Retention,
+        events: &mut Vec<SchedEvent>,
+    ) -> bool {
+        let Ok(bytes) = self.compute.prefix_snapshot_size(publisher, tokens) else {
+            return false;
+        };
+        let now = self.now();
+        let Some(victims) =
+            self.host
+                .plan_retained_room(bytes, retention.class, retention.used_at, now)
+        else {
+            return false;
+        };
+        for victim in victims {
+            self.discard_kv_ram_blob(victim, events);
+        }
+        let Ok(bytes) = self.compute.spill_prefix(publisher, tokens) else {
+            return false;
+        };
+        let Some(id) = self.prefix.record_spill(entry) else {
+            self.compute.discard_spilled_prefix(publisher, tokens);
+            return false;
+        };
+        let blob =
+            RetainedKvRamEntry::new(RetainedBlob::Prefix(id), publisher, retention.class, bytes, retention.used_at);
+        if self.host.capture_retained(blob).is_err() {
+            self.prefix.forget_spilled(id);
+            self.compute.discard_spilled_prefix(publisher, tokens);
+            return false;
+        }
+        events.push(SchedEvent::RetainedState {
+            operation: RetainedStateOperation::Spill,
+            source: ReuseSource::KvRam,
+        });
+        true
+    }
+
+    /// Bring spilled prefix `id` back onto the device as a retained prefix
+    /// (GitHub #190, owner decision): one restore across the bus, after which
+    /// the request that matched it — and every later member of its burst —
+    /// claims it in place like any sibling. The blob stays in KV-RAM.
+    ///
+    /// Its pages are taken back from retained state first, like any live
+    /// request's; it never evicts live work, and it needs a free resident
+    /// slot for the moment the restore stands a sequence up. Returns whether
+    /// the prefix is on the device now.
+    fn return_prefix(&mut self, id: SpilledPrefixId, events: &mut Vec<SchedEvent>) -> bool {
+        let Some(spilled) = self.prefix.spilled(id).cloned() else {
+            return false;
+        };
+        if self.resident_slots_used >= self.capacity.resident_slots {
+            return false;
+        }
+        let blob = RetainedBlob::Prefix(id);
+        // Held while retained state makes room, so the room is never made out
+        // of this blob.
+        if !self.host.claim_retained(blob) {
+            return false;
+        }
+        let pages = spilled.length_tokens / self.config.kv_page_tokens;
+        let fits = self.reclaim_retained_until(|s| s.kv_used_pages + pages <= s.capacity.kv_pages, events)
+            && self
+                .compute
+                .restore_prefix(spilled.publisher, spilled.length_tokens)
+                .is_ok();
+        let now = self.now();
+        if let Some(entry) = self.host.release_retained_claim(blob, fits.then_some(now)) {
+            self.forget_kv_ram_blob(entry, events);
+        }
+        if !fits {
+            return false;
+        }
+        let Some((entry, own_pages)) =
+            self.prefix
+                .register(spilled.publisher, &spilled.tokens, &spilled.gdn, None)
+        else {
+            self.compute
+                .release_prefix(spilled.publisher, spilled.length_tokens);
+            return false;
+        };
+        // No live request warmed these pages, so nothing else charges them:
+        // the entry does, as it does a publisher's once the publisher is gone.
+        self.kv_used_pages += own_pages;
+        let retention = Retention {
+            at: self.tick,
+            class: spilled.class,
+            used_at: now,
+        };
+        self.prefix.retain_published(entry, retention);
+        // `register` counted a registrant; nobody is one.
+        self.prefix.release(entry);
+        self.prefix.record_return(id, entry);
+        for operation in [RetainedStateOperation::Hit, RetainedStateOperation::Restore] {
+            events.push(SchedEvent::RetainedState {
+                operation,
+                source: ReuseSource::KvRam,
+            });
+        }
+        true
     }
 
     /// Move a device checkpoint the first-victim path is giving up into KV-RAM
@@ -702,15 +876,18 @@ impl ConcreteScheduler {
             return false;
         };
         for victim in victims {
-            if let Some(discarded) = self.checkpoints.discard(victim) {
-                self.discard_checkpoint(discarded, events);
-            }
+            self.discard_kv_ram_blob(victim, events);
         }
         let Ok(bytes) = self.compute.spill_checkpoint(entry.publisher) else {
             return false;
         };
-        let blob =
-            RetainedKvRamEntry::new(entry.id, entry.publisher, entry.class, bytes, entry.used_at);
+        let blob = RetainedKvRamEntry::new(
+            RetainedBlob::Checkpoint(entry.id),
+            entry.publisher,
+            entry.class,
+            bytes,
+            entry.used_at,
+        );
         if self.host.capture_retained(blob).is_err()
             || self
                 .checkpoints
@@ -814,8 +991,18 @@ impl ConcreteScheduler {
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
     fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
+        self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), events)
+    }
+
+    /// [`Self::reclaim_retained`] until `fits` holds (GitHub #190: a prefix
+    /// coming back from KV-RAM needs pages without being a request).
+    fn reclaim_retained_until(
+        &mut self,
+        fits: impl Fn(&Self) -> bool,
+        events: &mut Vec<SchedEvent>,
+    ) -> bool {
         loop {
-            if self.fits_for_materialization(&self.requests[idx]) {
+            if fits(self) {
                 return true;
             }
             // Only entries whose pages would genuinely come back are given
@@ -854,6 +1041,8 @@ impl ConcreteScheduler {
             let Some(prefix) = self.prefix.lru_retained() else {
                 return false;
             };
+            // GitHub #190: to KV-RAM first, while its pages are still there.
+            self.spill_prefix(prefix, events);
             if !self.prefix.unretain(prefix) {
                 return false;
             }
@@ -1435,14 +1624,7 @@ impl ConcreteScheduler {
             let now = self.now();
             match self.host.evict_for_live(now) {
                 Some(KvRamVictim::Retained(discarded)) => {
-                    // Already out of the tier's budget; out of the pool too,
-                    // and its blob released. Reported as the discard it is.
-                    self.checkpoints.discard(discarded.checkpoint);
-                    self.compute.release_checkpoint(discarded.publisher);
-                    events.push(SchedEvent::RetainedState {
-                        operation: RetainedStateOperation::Discard,
-                        source: ReuseSource::KvRam,
-                    });
+                    self.forget_kv_ram_blob(discarded, events);
                 }
                 Some(KvRamVictim::Live(discarded)) => {
                     self.compute.discard_snapshot(discarded.request);
@@ -2033,10 +2215,34 @@ impl Scheduler for ConcreteScheduler {
                         lookup.misses(self.checkpoints.tiers());
                     // A KV-RAM checkpoint has to beat every device reuse by
                     // its restore floor, a prefix's included (GitHub #190).
-                    let device_prefix = self
+                    let mut device_prefix = self
                         .prefix
                         .longest_match_tokens(&self.requests[i].input.tokens);
-                    let retained = self.checkpoints.select(&lookup, device_prefix);
+                    let mut retained = self.checkpoints.select(&lookup, device_prefix);
+                    // GitHub #190: a retained prefix only KV-RAM still holds
+                    // comes back to the device when it beats every device
+                    // reuse by the restore floor and every KV-RAM checkpoint
+                    // outright — and from then on the burst shares it there.
+                    if let Some((spilled, length)) = self
+                        .prefix
+                        .longest_spilled_match(&self.requests[i].input.tokens)
+                        .map(|s| (s.id, s.length_tokens))
+                    {
+                        let device_checkpoint =
+                            lookup.longest_in(ReuseSource::Device).map_or(0, |m| m.tokens);
+                        let kv_ram_checkpoint = retained
+                            .as_ref()
+                            .filter(|m| m.source == ReuseSource::KvRam)
+                            .map_or(0, |m| m.tokens);
+                        let best_on_device = device_prefix.max(device_checkpoint);
+                        if length >= best_on_device.saturating_add(KV_RAM_RESTORE_FLOOR_TOKENS)
+                            && length > kv_ram_checkpoint
+                            && self.return_prefix(spilled, &mut events)
+                        {
+                            device_prefix = length;
+                            retained = self.checkpoints.select(&lookup, device_prefix);
+                        }
+                    }
                     let floor = retained.as_ref().map_or(0, |m| m.tokens);
                     let claimed = self
                         .prefix
@@ -2047,7 +2253,8 @@ impl Scheduler for ConcreteScheduler {
                         // sibling's). A system block a burst is still arriving
                         // against must not be the first victim merely because
                         // it was published long ago.
-                        self.prefix.touch_retained(claim.id, self.tick);
+                        let now = self.now();
+                        self.prefix.touch_retained(claim.id, self.tick, now);
                         let r = &mut self.requests[i];
                         r.prefix_entry = Some(claim.id);
                         r.prefix_publisher = Some(claim.publisher);
@@ -2088,7 +2295,7 @@ impl Scheduler for ConcreteScheduler {
                         } else {
                             // GitHub #190: held until the restore lands, so
                             // nothing discards the only copy in between.
-                            let held = self.host.claim_retained(m.id);
+                            let held = self.host.claim_retained(RetainedBlob::Checkpoint(m.id));
                             debug_assert!(held, "a KV-RAM match is a held KV-RAM blob");
                         }
                         events.push(SchedEvent::RetainedState {
@@ -2520,8 +2727,12 @@ impl Scheduler for ConcreteScheduler {
                                         && block > 0
                                         && published <= block
                                     {
-                                        let tick = self.tick;
-                                        let took = self.prefix.retain_published(entry, tick);
+                                        let retention = Retention {
+                                            at: self.tick,
+                                            class: self.requests[i].class,
+                                            used_at: self.now(),
+                                        };
+                                        let took = self.prefix.retain_published(entry, retention);
                                         // `retain_published` refuses an entry
                                         // that is gone or already retained,
                                         // and `entry` is neither: `register`

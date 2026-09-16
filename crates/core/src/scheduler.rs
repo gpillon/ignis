@@ -399,6 +399,33 @@ pub trait Compute: Send + Sync {
     fn spill_checkpoint(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
         Err(ComputeError::Kernel(-1))
     }
+
+    // ── retained prefixes in KV-RAM (GitHub #190) ───────────────────────
+    //
+    // A retained prefix is named as a published head is: its publisher and
+    // its length (one request may publish two heads, #187 x #188).
+
+    /// Bytes a materialized KV-RAM blob of the prefix needs.
+    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Write the prefix's blob into pinned host memory. The device prefix is
+    /// left as it is: the scheduler releases it the usual way, through
+    /// [`Compute::release_prefix`], once the blob exists. Returns its size.
+    fn spill_prefix(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Bring a spilled prefix back onto the device as a published prefix
+    /// under the same name, from its blob, which stays in KV-RAM. Returns the
+    /// restore's wall time in microseconds.
+    fn restore_prefix(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Err(ComputeError::Kernel(-1))
+    }
+
+    /// Free a spilled prefix's blob.
+    fn discard_spilled_prefix(&self, _publisher: RequestId, _tokens: u32) {}
 }
 
 /// The engine's scheduling interface — what the server drives.

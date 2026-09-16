@@ -56,6 +56,17 @@ use std::time::{Duration, Instant};
 
 use crate::gdn::GdnState;
 use crate::checkpoint::CheckpointId;
+
+/// What a retained KV-RAM entry holds (GitHub #190): a prompt checkpoint, or
+/// a retained prefix the device gave up. One tier, one budget and one order
+/// for both — they are the same kind of bet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RetainedBlob {
+    Checkpoint(CheckpointId),
+    /// A spilled retained prefix, named by [`crate::prefix::PrefixCache`]'s
+    /// KV-RAM ledger.
+    Prefix(crate::prefix::SpilledPrefixId),
+}
 use crate::types::{LaneId, RequestClass, RequestId};
 
 /// How long a retained Interactive entry in KV-RAM keeps its class's priority
@@ -162,7 +173,7 @@ pub struct HostEntry {
 /// so an entry changes tier without changing identity.
 #[derive(Debug, Clone)]
 pub struct RetainedKvRamEntry {
-    pub checkpoint: CheckpointId,
+    pub blob: RetainedBlob,
     /// The backend's name for the blob (the request that captured it).
     pub publisher: RequestId,
     /// The capturing request's class.
@@ -184,14 +195,14 @@ pub struct RetainedKvRamEntry {
 impl RetainedKvRamEntry {
     /// An entry fresh into KV-RAM: probation, unclaimed.
     pub fn new(
-        checkpoint: CheckpointId,
+        blob: RetainedBlob,
         publisher: RequestId,
         owner: RequestClass,
         bytes: u64,
         used_at: Instant,
     ) -> Self {
         Self {
-            checkpoint,
+            blob,
             publisher,
             owner,
             bytes,
@@ -212,7 +223,7 @@ struct RetainedRank {
     class: u8,
     tier: u8,
     used_at: Instant,
-    checkpoint: CheckpointId,
+    blob: RetainedBlob,
 }
 
 /// One host-budget victim. Retained state is always selected before a live
@@ -419,10 +430,10 @@ impl HostTier {
     }
 
     /// The retained entry for `checkpoint`, if it is still ranked.
-    pub fn retained(&self, checkpoint: CheckpointId) -> Option<&RetainedKvRamEntry> {
+    pub fn retained(&self, blob: RetainedBlob) -> Option<&RetainedKvRamEntry> {
         self.retained
             .iter()
-            .find(|e| e.checkpoint == checkpoint && !e.discarded)
+            .find(|e| e.blob == blob && !e.discarded)
     }
 
     fn rank_of(&self, owner: RequestClass, tier: Tier, used_at: Instant, now: Instant) -> (u8, u8) {
@@ -441,7 +452,7 @@ impl HostTier {
             class,
             tier,
             used_at: entry.used_at,
-            checkpoint: entry.checkpoint,
+            blob: entry.blob,
         }
     }
 
@@ -474,7 +485,7 @@ impl HostTier {
         owner: RequestClass,
         used_at: Instant,
         now: Instant,
-    ) -> Option<Vec<CheckpointId>> {
+    ) -> Option<Vec<RetainedBlob>> {
         if bytes > self.capacity_bytes {
             return None;
         }
@@ -483,7 +494,7 @@ impl HostTier {
             class,
             tier,
             used_at,
-            checkpoint: CheckpointId::MAX,
+            blob: RetainedBlob::Prefix(u64::MAX),
         };
         let mut free = self.capacity_bytes - self.used_bytes.min(self.capacity_bytes);
         let mut victims = Vec::new();
@@ -492,7 +503,7 @@ impl HostTier {
                 break;
             }
             free += self.retained[pos].bytes;
-            victims.push(self.retained[pos].checkpoint);
+            victims.push(self.retained[pos].blob);
         }
         (free >= bytes).then_some(victims)
     }
@@ -526,13 +537,22 @@ impl HostTier {
         self.evict_one().map(KvRamVictim::Live)
     }
 
+    /// The conversation or burst behind `blob` used its device copy until
+    /// `used_at` (GitHub #190): a prefix given back to KV-RAM that already had
+    /// a blob there ranks by its latest use, not by when it was spilled.
+    pub fn refresh_retained(&mut self, blob: RetainedBlob, used_at: Instant) {
+        if let Some(entry) = self.retained.iter_mut().find(|e| e.blob == blob && !e.discarded) {
+            entry.used_at = entry.used_at.max(used_at);
+        }
+    }
+
     /// A request chose `checkpoint` to restore from: hold it until the
     /// restore lands or the request lets go. `false` when it is not held.
-    pub fn claim_retained(&mut self, checkpoint: CheckpointId) -> bool {
+    pub fn claim_retained(&mut self, blob: RetainedBlob) -> bool {
         let Some(entry) = self
             .retained
             .iter_mut()
-            .find(|e| e.checkpoint == checkpoint && !e.discarded)
+            .find(|e| e.blob == blob && !e.discarded)
         else {
             return false;
         };
@@ -548,10 +568,10 @@ impl HostTier {
     /// while claimed — its blob is the caller's to release now.
     pub fn release_retained_claim(
         &mut self,
-        checkpoint: CheckpointId,
+        blob: RetainedBlob,
         restored_at: Option<Instant>,
     ) -> Option<RetainedKvRamEntry> {
-        let pos = self.retained.iter().position(|e| e.checkpoint == checkpoint)?;
+        let pos = self.retained.iter().position(|e| e.blob == blob)?;
         let entry = &mut self.retained[pos];
         entry.claimants = entry.claimants.saturating_sub(1);
         if let Some(at) = restored_at
@@ -571,8 +591,8 @@ impl HostTier {
     /// Discard `checkpoint` (its lineage superseded it, or the scheduler gave
     /// it up). Returns the entry when its blob can go now; a claimed one is
     /// marked instead and handed back by [`Self::release_retained_claim`].
-    pub fn discard_retained(&mut self, checkpoint: CheckpointId) -> Option<RetainedKvRamEntry> {
-        let pos = self.retained.iter().position(|e| e.checkpoint == checkpoint)?;
+    pub fn discard_retained(&mut self, blob: RetainedBlob) -> Option<RetainedKvRamEntry> {
+        let pos = self.retained.iter().position(|e| e.blob == blob)?;
         if self.retained[pos].claimants > 0 {
             self.retained[pos].discarded = true;
             return None;
@@ -936,8 +956,12 @@ mod tests {
         );
     }
 
+    fn ck(id: CheckpointId) -> RetainedBlob {
+        RetainedBlob::Checkpoint(id)
+    }
+
     fn retained_entry(checkpoint: CheckpointId, owner: RequestClass, bytes: u64, at: Instant) -> RetainedKvRamEntry {
-        RetainedKvRamEntry::new(checkpoint, checkpoint * 10, owner, bytes, at)
+        RetainedKvRamEntry::new(ck(checkpoint), checkpoint * 10, owner, bytes, at)
     }
 
     #[test]
@@ -954,7 +978,7 @@ mod tests {
 
         assert!(matches!(
             tier.evict_for_live(now),
-            Some(KvRamVictim::Retained(entry)) if entry.checkpoint == 7
+            Some(KvRamVictim::Retained(entry)) if entry.blob == ck(7)
         ));
         assert!(tier.contains(1), "certain live work outlives retained state");
     }
@@ -967,12 +991,12 @@ mod tests {
             .unwrap();
         host.capture_retained(retained_entry(2, RequestClass::Agent, 10, now))
             .unwrap();
-        assert!(host.claim_retained(2));
-        assert!(host.release_retained_claim(2, Some(now)).is_none(), "promote the agent entry");
-        assert_eq!(host.retained(2).unwrap().tier, Tier::Protected);
+        assert!(host.claim_retained(ck(2)));
+        assert!(host.release_retained_claim(ck(2), Some(now)).is_none(), "promote the agent entry");
+        assert_eq!(host.retained(ck(2)).unwrap().tier, Tier::Protected);
         assert_eq!(
-            host.evict_retained(now).unwrap().checkpoint,
-            2,
+            host.evict_retained(now).unwrap().blob,
+            ck(2),
             "class outranks both the agent entry's protected tier and its newer use"
         );
     }
@@ -984,8 +1008,8 @@ mod tests {
         host.set_retained_interactive_ttl(Duration::from_secs(300));
         host.capture_retained(retained_entry(1, RequestClass::Interactive, 10, start))
             .unwrap();
-        assert!(host.claim_retained(1));
-        host.release_retained_claim(1, Some(start));
+        assert!(host.claim_retained(ck(1)));
+        host.release_retained_claim(ck(1), Some(start));
         host.capture_retained(retained_entry(2, RequestClass::Agent, 10, start + Duration::from_secs(10)))
             .unwrap();
 
@@ -999,7 +1023,7 @@ mod tests {
         let stale = start + Duration::from_secs(300);
         assert_eq!(
             host.plan_retained_room(30, RequestClass::Agent, stale, stale),
-            Some(vec![1]),
+            Some(vec![ck(1)]),
             "past it, the idle Interactive entry goes first — even protected, even \
              before the Agent entry used after it"
         );
@@ -1019,7 +1043,7 @@ mod tests {
 
         assert_eq!(
             host.plan_retained_room(10, RequestClass::Agent, later, later),
-            Some(vec![1]),
+            Some(vec![ck(1)]),
             "an Agent newcomer displaces the older Agent entry"
         );
         assert_eq!(
@@ -1029,7 +1053,7 @@ mod tests {
         );
         assert_eq!(
             host.plan_retained_room(20, RequestClass::Interactive, later, later),
-            Some(vec![1, 2]),
+            Some(vec![ck(1), ck(2)]),
             "an Interactive newcomer displaces the Agent entry, then the older Interactive one"
         );
         assert_eq!(
@@ -1047,7 +1071,7 @@ mod tests {
         let mut host = HostTier::new(20);
         host.capture_retained(retained_entry(1, RequestClass::Agent, 10, now))
             .unwrap();
-        assert!(host.claim_retained(1));
+        assert!(host.claim_retained(ck(1)));
 
         assert!(host.evict_retained(now).is_none(), "a claimed blob is not a victim");
         assert_eq!(
@@ -1055,12 +1079,12 @@ mod tests {
             None,
             "nor room a spill may plan on"
         );
-        assert!(host.discard_retained(1).is_none(), "a discard waits for the claim");
-        assert!(host.retained(1).is_none(), "but the entry is out of every ranking");
+        assert!(host.discard_retained(ck(1)).is_none(), "a discard waits for the claim");
+        assert!(host.retained(ck(1)).is_none(), "but the entry is out of every ranking");
         assert_eq!(host.used_bytes(), 10, "and its blob is still held");
 
-        let released = host.release_retained_claim(1, Some(now));
-        assert_eq!(released.map(|e| e.checkpoint), Some(1), "the last claimant releases it");
+        let released = host.release_retained_claim(ck(1), Some(now));
+        assert_eq!(released.map(|e| e.blob), Some(ck(1)), "the last claimant releases it");
         assert_eq!(host.used_bytes(), 0);
         assert_eq!(host.retained_count(), 0);
     }

@@ -311,7 +311,7 @@ impl Metrics {
             ),
             (
                 "ignis_retained_state_hits_total",
-                "Retained prompt checkpoints chosen to resume from, by residency tier.",
+                "Retained state chosen to resume from or brought back, by residency tier.",
                 &self.retained_state_hits,
             ),
             (
@@ -321,17 +321,17 @@ impl Metrics {
             ),
             (
                 "ignis_retained_state_spills_total",
-                "Retained prompt checkpoints spilled into the tier.",
+                "Retained checkpoints and prefixes spilled into the tier.",
                 &self.retained_state_spills,
             ),
             (
                 "ignis_retained_state_discards_total",
-                "Retained prompt checkpoints discarded from the tier.",
+                "Retained checkpoints and prefixes discarded from the tier.",
                 &self.retained_state_discards,
             ),
             (
                 "ignis_retained_state_restores_total",
-                "Prefills that landed on a retained prompt checkpoint from the tier.",
+                "Retained state restored from the tier.",
                 &self.retained_state_restores,
             ),
         ] {

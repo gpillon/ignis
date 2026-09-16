@@ -184,3 +184,10 @@ and is not a fifth entry point.
   blob is restored into a fresh sequence.
 - **A sequence that owns its history keeps the vendored pack**; only a
   materialized one goes through the page-run packer.
+
+- **A retained prefix spills as the blob its publisher would have written
+  standing on it** (`ignis_seq_prefix_snapshot`), through the same writer as a
+  checkpoint. It comes back by restoring that blob into a fresh carrier
+  sequence and publishing there (`ignis_seq_prefix_publish`); the kernel test
+  pins that the returned prefix, and a claimant of it, are byte-identical to
+  the original's.

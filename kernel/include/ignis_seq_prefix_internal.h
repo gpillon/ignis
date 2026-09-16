@@ -346,4 +346,18 @@ void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
                                   const std::vector<std::int32_t> &pages, const void *tail_page,
                                   void *dst);
 
+/* Bytes a materialized blob of `pages` KV pages occupies. */
+std::uint64_t ignis_seq_materialized_blob_bytes(const ignis_seq_pool &pool, std::uint32_t pages);
+
+/* Write the blob of retained state that stands on `chain` -- plus
+ * `tail_page`, a partial page copied beside it, when not null -- with `image`
+ * (laid out by ignis_seq_prefix_clone_layout) and `progress` as its state.
+ * The layout ignis_seq_snapshot writes for a sequence standing at the same
+ * point, so ignis_seq_restore takes it back. Throws on a short `dst`, an
+ * extent that does not match the chain, or a failed device copy. */
+void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
+                                       const void *tail_page, const void *image,
+                                       const ignis_seq_progress_image &progress,
+                                       std::uint32_t pages, void *dst, std::uint64_t dst_bytes);
+
 #endif /* IGNIS_SEQ_PREFIX_INTERNAL_H */

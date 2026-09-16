@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
-use ignis_core::host::Tier;
+use ignis_core::host::{RetainedBlob, Tier};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
@@ -79,28 +79,29 @@ fn run_to_idle(sched: &mut ConcreteScheduler) -> Vec<SchedEvent> {
     events
 }
 
-/// The system-and-tools block every turn opens with: four pages, published
-/// and retained as a prefix (GitHub #188) — the shape every qwen-code request
-/// has.
+/// A system-and-tools block of four pages, published and retained as a prefix
+/// (GitHub #188) — the shape every qwen-code request has.
 const BLOCK: u32 = 64;
 
 /// A conversation's turn: 1200 prompt tokens starting at `start`, opener at
-/// 1150 — more than KV-RAM's 1024-token restore floor past the block, so its
+/// 1150 — more than KV-RAM's 1024-token restore floor past a block, so its
 /// checkpoint is worth restoring from there even while the block is on the
-/// device.
+/// device. No block of its own: see [`with_block`].
 fn turn_at(start: u32) -> RequestInput {
-    RequestInput {
-        system_block_tokens: Some(BLOCK),
-        ..input(tokens(start, 1200), Some(1150), 4)
-    }
+    input(tokens(start, 1200), Some(1150), 4)
 }
 
 /// Its next turn: the first up to the opener, then 100 new tokens and an
 /// opener of its own.
 fn next_turn_at(start: u32) -> RequestInput {
+    input([tokens(start, 1150), tokens(start + 50_000, 100)].concat(), Some(1240), 4)
+}
+
+/// `request`, opening with a [`BLOCK`]-token system block.
+fn with_block(request: RequestInput) -> RequestInput {
     RequestInput {
         system_block_tokens: Some(BLOCK),
-        ..input([tokens(start, 1150), tokens(start + 50_000, 100)].concat(), Some(1240), 4)
+        ..request
     }
 }
 
@@ -146,13 +147,14 @@ fn reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32)> 
 /// Returns the turn's request id.
 fn turn_spilled_to_kv_ram(
     sched: &mut ConcreteScheduler,
-    start: u32,
+    turn: RequestInput,
     class: RequestClass,
 ) -> RequestId {
-    let turn = sched.submit(turn_at(start), class).unwrap();
+    let pressure = turn.tokens[0] + 100_000;
+    let turn = sched.submit(turn, class).unwrap();
     run_to_idle(sched);
     sched
-        .submit(whole_pool(start + 100_000), RequestClass::Interactive)
+        .submit(whole_pool(pressure), RequestClass::Interactive)
         .unwrap();
     run_to_idle(sched);
     turn
@@ -165,7 +167,7 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
 
-    let n = sched.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    let n = sched.submit(with_block(turn_at(1)), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
     let pressure = sched.submit(whole_pool(100_000), RequestClass::Interactive).unwrap();
     let events = run_to_idle(&mut sched);
@@ -174,14 +176,25 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
         .any(|e| matches!(e, SchedEvent::Done { request, .. } if *request == pressure)));
     assert_eq!(compute.spilled_checkpoints(), vec![n], "the device gave turn N up to KV-RAM");
     assert!(compute.released_checkpoints().is_empty(), "rather than discarding it");
-    assert_eq!(count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam), 1);
-    let spilled = sched.checkpoint_pool().entries()[0].id;
+    assert_eq!(
+        count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam),
+        2,
+        "the checkpoint, and the block under it (GitHub #190)"
+    );
+    assert_eq!(compute.spilled_prefixes(), vec![(n, BLOCK)]);
+    let spilled = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
     assert_eq!(sched.host().retained(spilled).unwrap().tier, Tier::Probation);
 
     // Turn N+1 resumes from the blob.
-    let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
+    let n1 = sched
+        .submit(with_block(next_turn_at(1)), RequestClass::Interactive)
+        .unwrap();
     let events = run_to_idle(&mut sched);
     assert_eq!(reuses(&events, n1), vec![(ReuseSource::KvRam, 1150)]);
+    assert!(
+        compute.returned_prefixes().is_empty(),
+        "the checkpoint reaches further than the block: nothing else comes back"
+    );
     assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1);
     assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
     assert_eq!(
@@ -194,7 +207,11 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
         Tier::Protected,
         "a landed restore is the proof two-tier eviction waits for"
     );
-    assert_eq!(sched.host().retained_count(), 1, "and the restore did not consume the blob");
+    assert_eq!(
+        sched.host().retained_count(),
+        2,
+        "and the restore consumed no blob: the checkpoint's and the block's are both there"
+    );
 
     // And the conversation keeps its reuse: turn N+1 — a sequence that owns
     // every page it restored, the block's included — cannot publish at the
@@ -211,14 +228,11 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
     );
     let n2 = sched
         .submit(
-            RequestInput {
-                system_block_tokens: Some(BLOCK),
-                ..input(
-                    [next_turn_at(1).tokens[..1240].to_vec(), tokens(900_000, 30)].concat(),
-                    Some(1265),
-                    4,
-                )
-            },
+            with_block(input(
+                [next_turn_at(1).tokens[..1240].to_vec(), tokens(900_000, 30)].concat(),
+                Some(1265),
+                4,
+            )),
             RequestClass::Interactive,
         )
         .unwrap();
@@ -238,7 +252,7 @@ fn a_kv_ram_claimant_with_no_opener_to_capture_at_pays_no_chunk_split() {
     // claimant's chained publish already follows.
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
-    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
 
     let n1 = sched
         .submit(
@@ -299,7 +313,7 @@ fn a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequen
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
 
-    let agent_turn = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Agent);
+    let agent_turn = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
     assert_eq!(compute.spilled_checkpoints(), vec![agent_turn]);
     assert_eq!(sched.host().used_bytes(), 1, "KV-RAM: the Agent blob");
 
@@ -355,7 +369,7 @@ fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_
     .with_clock(clock);
 
     // KV-RAM holds one blob: the main conversation's.
-    let main = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    let main = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
     assert_eq!(compute.spilled_checkpoints(), vec![main]);
 
     // A subagent's checkpoint ranks below it: its spill is refused and the
@@ -395,7 +409,7 @@ fn a_spill_never_displaces_a_higher_ranked_entry_until_it_has_sat_idle_past_the_
 fn a_spill_the_leaf_fails_discards_only_the_victim() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
-    let kept = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Agent);
+    let kept = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
 
     let doomed = sched.submit(turn_at(200_000), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
@@ -414,7 +428,7 @@ fn a_spill_the_leaf_fails_discards_only_the_victim() {
 fn prompt_reuse_without_a_kv_ram_budget_discards_what_the_device_gives_up() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(0), compute.clone());
-    let turn = turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
+    let turn = turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
 
     assert!(compute.spilled_checkpoints().is_empty());
     assert_eq!(compute.released_checkpoints(), vec![turn]);
@@ -427,8 +441,8 @@ fn prompt_reuse_without_a_kv_ram_budget_discards_what_the_device_gives_up() {
 fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
-    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
-    let blob = sched.checkpoint_pool().entries()[0].id;
+    turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
+    let blob = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
 
     let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
     compute.fail_prefill(n1);
@@ -456,8 +470,8 @@ fn a_kv_ram_restore_is_promoted_only_when_it_lands() {
 fn a_request_cancelled_before_its_kv_ram_restore_lands_lets_the_blob_go() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(tight(4), compute.clone());
-    turn_spilled_to_kv_ram(&mut sched, 1, RequestClass::Interactive);
-    let blob = sched.checkpoint_pool().entries()[0].id;
+    turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Interactive);
+    let blob = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
 
     let n1 = sched.submit(next_turn_at(1), RequestClass::Interactive).unwrap();
     compute.fail_prefill(n1);
@@ -524,4 +538,137 @@ fn a_superseded_checkpoint_is_reported_as_a_discard_from_its_tier() {
         count(&events, RetainedStateOperation::Discard, ReuseSource::Device),
         "every image released is a discard reported"
     );
+}
+
+// ── Retained prefixes in KV-RAM ──────────────────────────────────────────
+
+/// A system block past the restore floor: 68 pages.
+const BIG_BLOCK: u32 = 1088;
+
+/// A burst member: the shared block, then a question of its own. No opener,
+/// so it leaves no checkpoint and only the block is retained.
+fn subagent(question: u32) -> RequestInput {
+    RequestInput {
+        system_block_tokens: Some(BIG_BLOCK),
+        ..input([tokens(1, BIG_BLOCK), tokens(question, 40)].concat(), None, 4)
+    }
+}
+
+fn prefix_reuses(events: &[SchedEvent], request: RequestId) -> Vec<(u32, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::PrefixReused {
+                request: r,
+                tokens,
+                retained,
+            } if *r == request => Some((*tokens, *retained)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn widths(compute: &MockCompute, request: RequestId) -> Vec<usize> {
+    compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|job| job.request == request)
+        .map(|job| job.tokens.len())
+        .collect()
+}
+
+#[test]
+fn a_burst_block_the_device_gave_up_comes_back_once_and_the_burst_shares_it() {
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
+
+    let first = sched.submit(subagent(10_000), RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.prefix_pinned_pages(), BIG_BLOCK / PAGE, "the block is retained");
+
+    sched.submit(whole_pool(900_000), RequestClass::Interactive).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_prefixes(), vec![(first, BIG_BLOCK)], "the device gave it to KV-RAM");
+    assert_eq!(count(&events, RetainedStateOperation::Spill, ReuseSource::KvRam), 1);
+    assert_eq!(sched.prefix_pinned_pages(), 0, "and its pages came back");
+    assert_eq!(sched.host().retained_count(), 1);
+
+    // The next member brings it back — one restore — and claims it in place.
+    let second = sched.submit(subagent(20_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.returned_prefixes(), vec![(first, BIG_BLOCK)]);
+    assert_eq!(count(&events, RetainedStateOperation::Hit, ReuseSource::KvRam), 1);
+    assert_eq!(count(&events, RetainedStateOperation::Restore, ReuseSource::KvRam), 1);
+    assert_eq!(prefix_reuses(&events, second), vec![(BIG_BLOCK, true)]);
+    assert_eq!(widths(&compute, second), vec![40], "it prefilled its own question only");
+    assert_eq!(sched.prefix_pinned_pages(), BIG_BLOCK / PAGE, "the block is on the device again");
+
+    // Every later member shares it there: no second restore.
+    let third = sched.submit(subagent(30_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.returned_prefixes().len(), 1);
+    assert_eq!(prefix_reuses(&events, third), vec![(BIG_BLOCK, true)]);
+
+    // Given up again, it copies nothing: the blob is still in KV-RAM...
+    sched.submit(whole_pool(700_000), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_prefixes().len(), 1, "no second device-to-host copy");
+    assert_eq!(sched.prefix_pinned_pages(), 0);
+    assert_eq!(sched.host().retained_count(), 1);
+
+    // ...and brings the block back again.
+    let fourth = sched.submit(subagent(40_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(compute.returned_prefixes().len(), 2);
+    assert_eq!(prefix_reuses(&events, fourth), vec![(BIG_BLOCK, true)]);
+    assert_eq!(
+        sched.kv_used_pages(),
+        sched.prefix_pinned_pages(),
+        "nothing is charged but the block on the device"
+    );
+}
+
+#[test]
+fn a_block_short_of_the_restore_floor_stays_in_kv_ram() {
+    // Four pages cost less to prefill than to bring across the bus.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(8), compute.clone());
+    let small = |question| RequestInput {
+        system_block_tokens: Some(BLOCK),
+        ..input([tokens(1, BLOCK), tokens(question, 40)].concat(), None, 4)
+    };
+    let first = sched.submit(small(10_000), RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    sched.submit(whole_pool(900_000), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_prefixes(), vec![(first, BLOCK)]);
+
+    let second = sched.submit(small(20_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(compute.returned_prefixes().is_empty());
+    assert!(prefix_reuses(&events, second).is_empty(), "prefilled cold");
+    assert_eq!(widths(&compute, second).iter().sum::<usize>(), (BLOCK + 40) as usize);
+}
+
+#[test]
+fn a_subagent_block_in_kv_ram_gives_way_to_the_main_conversation() {
+    // One blob fits. The burst's block is an Agent's bet; the main
+    // conversation's checkpoint outranks it.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(1), compute.clone());
+    let first = sched.submit(subagent(10_000), RequestClass::Agent).unwrap();
+    run_to_idle(&mut sched);
+    sched.submit(whole_pool(900_000), RequestClass::Interactive).unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(compute.spilled_prefixes(), vec![(first, BIG_BLOCK)]);
+
+    let main = turn_spilled_to_kv_ram(&mut sched, turn_at(300_000), RequestClass::Interactive);
+    assert_eq!(compute.spilled_checkpoints(), vec![main]);
+    assert_eq!(compute.discarded_spilled_prefixes(), vec![(first, BIG_BLOCK)], "the block's blob went");
+
+    let second = sched.submit(subagent(20_000), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(compute.returned_prefixes().is_empty(), "there is nothing left to bring back");
+    assert!(prefix_reuses(&events, second).is_empty());
 }

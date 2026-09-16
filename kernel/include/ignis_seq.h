@@ -438,6 +438,20 @@ void ignis_seq_prefix_release(struct ignis_seq_pool *pool, struct ignis_seq_pref
 int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
                                 struct ignis_seq_prefix_stats *out_stats);
 
+/* Materialize a retained prefix as the opaque whole-sequence blob
+ * ignis_seq_snapshot writes for a sequence standing at the prefix's end
+ * (GitHub #190): every page of its chain, its cloned state and its progress.
+ * The prefix is read and stays claimable. Restoring the blob into a fresh
+ * sequence and publishing there gives the prefix back to the device.
+ * Returns 0; -1 on a null argument, a prefix that is not `pool`'s, a short
+ * `dst_bytes`, or a failed device copy (see ignis_seq_last_error). */
+int32_t ignis_seq_prefix_snapshot_size(const struct ignis_seq_pool *pool,
+                                        const struct ignis_seq_prefix *prefix,
+                                        uint64_t *out_bytes);
+int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
+                                   const struct ignis_seq_prefix *prefix, void *dst,
+                                   uint64_t dst_bytes);
+
 /* --- prompt checkpoints (GitHub #186, ADR 0029) ---------------------------
  *
  * A **prompt checkpoint** is a finished request's whole state at its

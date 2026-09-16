@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ignis_artifact::{bind_model_scope_27b, materialize, CudaDevice, DraftModule, FrontendSet, Reader};
-use ignis_core::checkpoint::ReuseSource;
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::gpu_profile;
 use ignis_core::{
     ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId, RequestInput, SchedEvent,
@@ -109,8 +109,13 @@ impl Loaded {
     /// A system-and-tools block several pages long, which every request here
     /// opens with — the retained prefix a qwen-code request always carries.
     fn block(&self) -> Vec<TokenId> {
+        self.block_of(3 * KV_PAGE_TOKENS as usize)
+    }
+
+    /// A system block of at least `tokens` tokens.
+    fn block_of(&self, tokens: usize) -> Vec<TokenId> {
         let mut block = self.tokens("<|im_start|>system\n");
-        while block.len() < 3 * KV_PAGE_TOKENS as usize {
+        while block.len() < tokens {
             block.extend(self.tokens(
                 "You are a careful coding assistant. You answer in short, precise sentences and \
                  you never invent APIs. When a question is about Rust, you name the crate and \
@@ -347,4 +352,72 @@ pub fn a_retained_prefix_claimant_evicted_mid_decode_continues_exactly(loaded: &
         actual, expected,
         "a claimant restored from a materialized blob must continue exactly"
     );
+}
+
+/// GitHub #190: a burst's system block, given up by the device into KV-RAM
+/// and brought back by the next subagent, serves it exactly as the block that
+/// never left does.
+pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
+    // Past the restore floor, so bringing it back is worth the crossing.
+    let block = loaded.block_of(1_100);
+    let block_tokens = block.len() as u32;
+    let subagent = |text: &str, max| {
+        let mut prompt = block.clone();
+        prompt.extend(loaded.tokens(&format!(
+            "<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )));
+        loaded.request(prompt, None, block_tokens, max)
+    };
+
+    let run = |pressure: bool| -> (Vec<TokenId>, Vec<SchedEvent>, RequestId) {
+        let mut sched = loaded.scheduler(8);
+        sched
+            .submit(subagent("Name one Rust crate for HTTP clients.", 4), RequestClass::Agent)
+            .unwrap();
+        run_to_idle(&mut sched);
+        let mut events = Vec::new();
+        if pressure {
+            sched.submit(whole_pool(loaded), RequestClass::Interactive).unwrap();
+            events.extend(run_to_idle(&mut sched));
+        }
+        let second = sched
+            .submit(
+                subagent("Name one Rust crate for serializing to JSON.", GENERATED),
+                RequestClass::Agent,
+            )
+            .unwrap();
+        events.extend(run_to_idle(&mut sched));
+        (generated(&events, second), events, second)
+    };
+
+    let (expected, control, second) = run(false);
+    assert!(
+        control.iter().any(|e| matches!(
+            e,
+            SchedEvent::PrefixReused { request, retained: true, .. } if *request == second
+        )),
+        "the control's second subagent claims the block on the device"
+    );
+    assert!(expected.len() > 1, "the control generated past its first token");
+
+    let (actual, events, second) = run(true);
+    let kv_ram = |operation: RetainedStateOperation| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                SchedEvent::RetainedState { operation: o, source: ReuseSource::KvRam } if *o == operation
+            )
+        })
+    };
+    assert!(kv_ram(RetainedStateOperation::Spill), "the block was spilled");
+    assert!(kv_ram(RetainedStateOperation::Restore), "and brought back");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SchedEvent::PrefixReused { request, retained: true, tokens, .. }
+                if *request == second && *tokens > 0
+        )),
+        "the second subagent claimed the block that came back"
+    );
+    assert_eq!(actual, expected, "a block brought back from KV-RAM must serve exactly");
 }

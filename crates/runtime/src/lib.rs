@@ -291,6 +291,20 @@ pub trait StepLeaf: Send + Sync + 'static {
     ) -> Result<(), i32> {
         Err(-1)
     }
+    /// Bytes a prefix occupies as a materialized whole-sequence host blob
+    /// (GitHub #190).
+    fn prefix_snapshot_bytes(&self, _model: &Self::Model, _prefix: &Self::Prefix) -> Result<u64, i32> {
+        Err(-1)
+    }
+    /// Materialize a prefix into a host snapshot buffer, leaving it claimable.
+    fn prefix_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        _prefix: &Self::Prefix,
+        _dst: &mut [u8],
+    ) -> Result<(), i32> {
+        Err(-1)
+    }
     /// The compatibility identity of the state this leaf produces (GitHub
     /// #189, ADR 0029): the artifact it loaded, its KV format, the blob
     /// layout version its sequence pool writes, and the drafter bound at
@@ -464,6 +478,10 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// evictions these are non-consuming: every matching request restores
     /// from the same immutable blob.
     retained: Mutex<HashMap<RequestId, L::SnapshotBuf>>,
+    /// Materialized retained prefixes in pinned KV-RAM (GitHub #190), named
+    /// as `prefixes` is. Non-consuming too: a prefix brought back onto the
+    /// device keeps its blob, so giving it up again copies nothing.
+    spilled_prefixes: Mutex<HashMap<(RequestId, u32), L::SnapshotBuf>>,
     /// Media embeddings still needed by a request's next chunk (GitHub
     /// #178): at most one per request, held from its item's first covered
     /// chunk until its last placeholder is prefilled.
@@ -482,6 +500,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             checkpoints: Mutex::new(HashMap::new()),
             evicted: Mutex::new(HashMap::new()),
             retained: Mutex::new(HashMap::new()),
+            spilled_prefixes: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
         }
     }
@@ -582,6 +601,11 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// Number of non-consuming materialized checkpoint blobs in KV-RAM.
     pub fn retained_checkpoints(&self) -> usize {
         self.retained.lock().unwrap().len()
+    }
+
+    /// Number of retained prefix blobs in KV-RAM (GitHub #190).
+    pub fn spilled_prefixes(&self) -> usize {
+        self.spilled_prefixes.lock().unwrap().len()
     }
 
     /// Number of requests currently suspended in the host tier (the
@@ -885,6 +909,61 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         Ok(bytes)
     }
 
+    fn prefix_snapshot_size(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        let prefixes = self.prefixes.lock().unwrap();
+        let prefix = prefixes.get(&(publisher, tokens)).ok_or(ComputeError::Kernel(-1))?;
+        self.model
+            .leaf
+            .prefix_snapshot_bytes(self.model.handle(), prefix)
+            .map_err(|code| RuntimeError::Leaf(code).into())
+    }
+
+    fn spill_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        let prefixes = self.prefixes.lock().unwrap();
+        let prefix = prefixes.get(&(publisher, tokens)).ok_or(ComputeError::Kernel(-1))?;
+        let leaf = &self.model.leaf;
+        let (bytes, buf) = leaf
+            .prefix_snapshot_bytes(self.model.handle(), prefix)
+            .and_then(|bytes| Ok((bytes, leaf.alloc_snapshot_buf(bytes)?)))
+            .and_then(|(bytes, mut buf)| {
+                leaf.prefix_snapshot_into(self.model.handle(), prefix, buf.as_mut())?;
+                Ok((bytes, buf))
+            })
+            .map_err(RuntimeError::Leaf)?;
+        drop(prefixes);
+        self.spilled_prefixes.lock().unwrap().insert((publisher, tokens), buf);
+        Ok(bytes)
+    }
+
+    fn restore_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+        let key = (publisher, tokens);
+        let spilled = self.spilled_prefixes.lock().unwrap();
+        let blob = spilled.get(&key).ok_or(ComputeError::Kernel(-1))?;
+        let mut prefixes = self.prefixes.lock().unwrap();
+        if prefixes.contains_key(&key) {
+            return Err(ComputeError::Kernel(-1));
+        }
+        let leaf = &self.model.leaf;
+        let started = std::time::Instant::now();
+        // A carrier sequence one page longer than the head, so publishing
+        // leaves it a page of its own; it goes as soon as the prefix exists,
+        // and the prefix keeps the pages.
+        let mut carrier = leaf
+            .allocate_sequence(self.model.handle(), tokens + KV_PAGE_TOKENS)
+            .map_err(RuntimeError::Leaf)?;
+        let published = leaf
+            .restore_sequence(self.model.handle(), &mut carrier, blob.as_ref())
+            .and_then(|()| leaf.publish_prefix(self.model.handle(), &mut carrier, tokens));
+        leaf.release_sequence(self.model.handle(), carrier);
+        let prefix = published.map_err(RuntimeError::Leaf)?;
+        prefixes.insert(key, prefix);
+        Ok(started.elapsed().as_micros() as u64)
+    }
+
+    fn discard_spilled_prefix(&self, publisher: RequestId, tokens: u32) {
+        self.spilled_prefixes.lock().unwrap().remove(&(publisher, tokens));
+    }
+
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
         if jobs.len() > N_DECODE_LANES {
             return Err(ComputeError::Kernel(-1));
@@ -1166,6 +1245,10 @@ impl<L: StepLeaf> Drop for RuntimeCompute<L> {
         self.retained
             .get_mut()
             .expect("RuntimeCompute is not dropped while its retained lock is held")
+            .clear();
+        self.spilled_prefixes
+            .get_mut()
+            .expect("RuntimeCompute is not dropped while its spilled-prefix lock is held")
             .clear();
         // Prefixes after sequences: a prefix's pages are released by its last
         // holder, and a live sequence is one.

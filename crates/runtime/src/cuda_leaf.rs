@@ -549,6 +549,23 @@ impl StepLeaf for CudaLeaf {
             .map_err(|e| leaf_error("checkpoint snapshot", e.to_string()))
     }
 
+    fn prefix_snapshot_bytes(&self, _model: &Self::Model, prefix: &Self::Prefix) -> Result<u64, i32> {
+        prefix
+            .snapshot_bytes()
+            .map_err(|e| leaf_error("prefix snapshot size", e.to_string()))
+    }
+
+    fn prefix_snapshot_into(
+        &self,
+        _model: &Self::Model,
+        prefix: &Self::Prefix,
+        dst: &mut [u8],
+    ) -> Result<(), i32> {
+        prefix
+            .snapshot_into(dst)
+            .map_err(|e| leaf_error("prefix snapshot", e.to_string()))
+    }
+
     /// GitHub #189: the four facts that decide whether retained state may be
     /// written into a sequence of this load, read from the load itself.
     ///

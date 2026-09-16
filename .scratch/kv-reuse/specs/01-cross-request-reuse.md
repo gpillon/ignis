@@ -183,8 +183,9 @@ this today (verified 2026-09-15):
   it is snapshotted into KV-RAM if the byte budget can take it — discarding,
   for it, only retained entries that rank strictly below it, planned before
   anything goes — and discarded otherwise. There is no eager copy. (#190, owner
-  decision 2026-09-16; ADR 0023 amendment. Only prompt checkpoints spill so
-  far: a retained prefix the device gives up is still discarded.)
+  decision 2026-09-16; ADR 0023 amendment.) A retained prefix that spilled
+  comes back to the device once, when a prompt's best reuse is it, and the
+  burst shares it there; its blob stays in KV-RAM (ADR 0029 amendment).
 - **Materialized blobs.** A snapshot of a sequence or checkpoint holding a
   shared prefix materializes the shared pages (ADR 0024 amendment). The leaf
   refusal code for that case goes away.
