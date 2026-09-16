@@ -26,8 +26,14 @@ serde_json = { workspace = true }
 tokenizers = "0.21"
 # The `json` feature (not a minijinja default) brings serde_json into
 # minijinja; the chat template's `tojson` itself is the reference's
-# (`frontend.rs` `reference_tojson`, GitHub #172).
-minijinja = { version = "2", features = ["json"] }
+# (`frontend.rs` `reference_tojson`, GitHub #172). `preserve_order` makes
+# minijinja's own map an `IndexMap`, so a value deserialized from a JSON
+# document keeps that document's key order — what a resent tool call's
+# `arguments` needs to render in the order the model emitted (GitHub
+# #184). It changes nothing for values that arrive as `serde_json::Value`:
+# its `Map` is a `BTreeMap`, so those are already sorted when minijinja
+# receives them (the tool definitions, which the reference also sorts).
+minijinja = { version = "2", features = ["json", "preserve_order"] }
 # The vision processor (GitHub #176): the SHA-256 content digest of acquired
 # media, and pure-Rust decoders for the lossless image formats (PNG, GIF,
 # lossless WebP), whose pixels are exactly what the reference's FFmpeg

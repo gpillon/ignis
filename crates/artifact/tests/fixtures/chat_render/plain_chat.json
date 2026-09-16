@@ -1,0 +1,27 @@
+{
+  "case": {
+    "name": "plain_chat",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a careful assistant."
+      },
+      {
+        "role": "user",
+        "content": "Hello."
+      },
+      {
+        "role": "assistant",
+        "content": "Hi there."
+      },
+      {
+        "role": "user",
+        "content": "And again."
+      }
+    ]
+  },
+  "expected": {
+    "text": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nHello.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHi there.<|im_end|>\n<|im_start|>user\nAnd again.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "shared_prefix_offset": 58
+  }
+}

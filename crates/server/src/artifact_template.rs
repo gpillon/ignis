@@ -86,29 +86,8 @@ impl ArtifactTemplateProvider {
                 if options.preserve_thinking {
                     templated.reasoning_content = message.reasoning_content.clone();
                 }
-                // A prior assistant turn's tool calls (GitHub #132): each
-                // call's `arguments` is a JSON-encoded string on the wire
-                // (matching #121's own response shape) and the template
-                // needs the parsed object (`arguments|items`) — a call
-                // whose string does not parse as a JSON object degrades to
-                // an empty one rather than failing the whole render (the
-                // same "never panic, degrade" posture as the render/encode
-                // failures below).
                 if let Some(calls) = &message.tool_calls {
-                    templated.tool_calls = calls
-                        .iter()
-                        .map(|call| ignis_artifact::ToolCall {
-                            id: call.id.clone(),
-                            name: call.function.name.clone(),
-                            arguments: serde_json::from_str(&call.function.arguments)
-                                .unwrap_or_else(|err| {
-                                    eprintln!(
-                                        "ignis-server: history tool_calls[].function.arguments is not valid JSON, degrading to {{}}: {err}"
-                                    );
-                                    serde_json::json!({})
-                                }),
-                        })
-                        .collect();
+                    templated.tool_calls = calls.iter().map(artifact_tool_call).collect();
                 }
                 templated
             })
@@ -228,6 +207,57 @@ impl TokenDecoder for ArtifactTokenDecoder {
                 String::new()
             }
         }
+    }
+}
+
+/// A prior assistant turn's tool call, as the template takes it (GitHub
+/// #132).
+///
+/// The call's `arguments` is a JSON-encoded string on the wire (matching
+/// #121's own response shape) and rides to the template as that exact
+/// string, never re-serialized: the template walks `arguments|items`, and
+/// a `serde_json` round-trip here would sort the keys and lose the order
+/// the model emitted them in, which is what a later turn has to match
+/// (GitHub #184). A string that is not a JSON object renders as no
+/// parameters rather than failing the whole render — the same "never
+/// panic, degrade" posture as the render/encode failures — and is logged,
+/// since only a client can produce one.
+fn artifact_tool_call(call: &crate::template::ToolCallIn) -> ignis_artifact::ToolCall {
+    let arguments = &call.function.arguments;
+    if let Some(reason) = not_a_json_object(arguments) {
+        eprintln!(
+            "ignis-server: history tool_calls[].function.arguments is not a JSON object, degrading to {{}}: {reason}"
+        );
+    }
+    ignis_artifact::ToolCall {
+        id: call.id.clone(),
+        name: call.function.name.clone(),
+        arguments: arguments.clone(),
+    }
+}
+
+/// Why a wire `arguments` string is not the JSON object the template can
+/// walk, or `None` when it is one. Diagnostic only — the template itself
+/// degrades a string that is not one to no parameters (GitHub #184) — so
+/// this decides a log line, never the render, and it reports the reason
+/// rather than the string, which is a client's own content.
+fn not_a_json_object(arguments: &str) -> Option<String> {
+    match serde_json::from_str::<JsonValue>(arguments) {
+        Ok(value) if value.is_object() => None,
+        Ok(value) => Some(format!("a JSON {}", json_kind(&value))),
+        Err(err) => Some(err.to_string()),
+    }
+}
+
+/// The name of a JSON value's kind, for the log line above.
+fn json_kind(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
     }
 }
 
@@ -657,7 +687,7 @@ mod tests {
             tool_calls: vec![ArtifactToolCall {
                 id: Some("call_0".to_owned()),
                 name: "read_file".to_owned(),
-                arguments: json!({"path": "a.txt"}),
+                arguments: r#"{"path": "a.txt"}"#.to_owned(),
             }],
             reasoning_content: None,
         };
@@ -679,6 +709,63 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         let args: JsonValue = serde_json::from_str(&calls[0].arguments).unwrap();
         assert_eq!(args, json!({"path": "a.txt"}));
+    }
+
+    /// One wire tool call, as a client resends it in a history message.
+    fn wire_tool_call(name: &str, arguments: &str) -> crate::template::ToolCallIn {
+        crate::template::ToolCallIn {
+            id: Some("call_0".to_owned()),
+            function: crate::template::FunctionIn {
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_resent_tool_calls_arguments_reach_the_template_as_the_wire_string() {
+        // GitHub #184 AC1, at the server's own hop: the wire `arguments`
+        // string is handed to the template untouched, so no re-encoding
+        // step exists that could reorder its keys.
+        let wire = r#"{"path":"b.rs","dry_run":false,"count":2}"#;
+        let call = artifact_tool_call(&wire_tool_call("edit", wire));
+        assert_eq!(call.arguments, wire);
+        assert_eq!(call.name, "edit");
+        assert_eq!(call.id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn a_resent_tool_call_renders_its_parameters_in_the_wire_order() {
+        // GitHub #184 AC1, through the real tag dialect: the parameters
+        // come out in the order the `arguments` document carries them —
+        // `path`, `dry_run`, `edits`, `count` — not the alphabetical
+        // `count`, `dry_run`, `edits`, `path` a `serde_json::Map` would
+        // impose, and the nested object keeps `old` before `new` too.
+        let template = ChatTemplate::from_source(REAL_TOOL_DIALECT_TEMPLATE).expect("compile");
+        let history = ArtifactMessage {
+            role: Role::Assistant,
+            content: ignis_artifact::MessageContent::Text(String::new()),
+            tool_calls: vec![artifact_tool_call(&wire_tool_call(
+                "edit",
+                r#"{"path":"src/b.rs","dry_run":false,"edits":[{"old":"x","new":"y"}],"count":2}"#,
+            ))],
+            reasoning_content: None,
+        };
+        let prompt = template.render(&[history]).expect("render");
+        // The reference's own bytes for these arguments
+        // (`chat_template.cpp` `render_tool_call`: a string parameter
+        // verbatim, anything else through `tojson_text`).
+        assert!(
+            prompt.contains(
+                "<tool_call>\n<function=edit>\n\
+                 <parameter=path>\nsrc/b.rs\n</parameter>\n\
+                 <parameter=dry_run>\nfalse\n</parameter>\n\
+                 <parameter=edits>\n[{\"old\": \"x\", \"new\": \"y\"}]\n</parameter>\n\
+                 <parameter=count>\n2\n</parameter>\n\
+                 </function>\n</tool_call>"
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]

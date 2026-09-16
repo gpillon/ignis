@@ -71,7 +71,13 @@ fn messages(case: &Value) -> (Vec<ChatMessage>, Vec<Vec<u8>>) {
                         .map(|c| ToolCall {
                             id: c["id"].as_str().map(str::to_owned),
                             name: c["name"].as_str().unwrap().to_owned(),
-                            arguments: c["arguments"].clone(),
+                            // The wire (and so `ToolCall`) carries the
+                            // arguments JSON-encoded as a string; the
+                            // fixture records the object the reference was
+                            // handed, whose keys `serde_json` writes back
+                            // in the same sorted order `nlohmann::json`
+                            // dumped them in when the fixture was taken.
+                            arguments: serde_json::to_string(&c["arguments"]).unwrap(),
                         })
                         .collect()
                 })
