@@ -436,9 +436,23 @@ impl Telemetry {
         self.emit_evicted(id, snapshot_micros);
     }
 
-    /// A request's prefill skipped `tokens` prompt tokens through a sibling's
-    /// cached prefix (core-07). Not logged — the request log has no line for
-    /// it — so only the installed projection observes it (GitHub #90).
+    /// A request's prefill skipped `tokens` prompt tokens through a cached
+    /// prefix (core-07). Not logged — the request log has no line for it — so
+    /// only the installed projection observes it (GitHub #90).
+    ///
+    /// **Two kinds arrive here since GitHub #188, and this cannot tell them
+    /// apart.** A concurrent sibling's prefix and a **retained prefix** left
+    /// by a request that has already finished are claimed through one path
+    /// and emit one event, so `ignis_prefix_reused_tokens_total` — whose ADR
+    /// 0017 row said *sibling*-prefix reuse — now counts cross-request reuse
+    /// too. That is a **declared** departure rather than the silent widening
+    /// of a documented counter that #186's finding 3 was made to prevent: the
+    /// counter's own help text says so (`metrics.rs`), and #190 owns the
+    /// per-tier hit / miss / spill / restore counters that separate them.
+    ///
+    /// Prompt-checkpoint reuse is the *other* kind of cross-request reuse and
+    /// still does not come through here — see [`Self::on_state_reused`],
+    /// which is per-request by design.
     pub fn on_prefix_reused(&mut self, tokens: u32) {
         if let Some(metrics) = &self.metrics {
             metrics.record_prefix_reused(tokens);

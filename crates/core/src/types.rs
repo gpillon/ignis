@@ -408,11 +408,18 @@ pub enum SchedEvent {
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.
     Requeued { request: RequestId },
-    /// A request's prefill reused a cached sibling prefix (core-07): the
-    /// `tokens` leading prompt tokens were skipped — the shared KV prefix
-    /// is already warm, so no redundant prefill. Telemetry accumulates
-    /// these into the `sibling_prefix_reused_tok` counter (design §5,
-    /// `server-02`).
+    /// A request's prefill reused a cached prefix (core-07): the `tokens`
+    /// leading prompt tokens were skipped — the shared KV prefix is already
+    /// warm, so no redundant prefill. Telemetry accumulates these into the
+    /// `sibling_prefix_reused_tok` counter (design §5, `server-02`).
+    ///
+    /// Since GitHub #188 the entry may be a **retained prefix**, whose
+    /// publisher has already finished, rather than a live sibling's, and this
+    /// event does not distinguish them: the claim is the same act on the same
+    /// object, so it is deliberately the same event. What that costs is that
+    /// `ignis_prefix_reused_tokens_total` now sums both kinds — a declared
+    /// departure, resolved by #190's per-tier counters. See
+    /// `ignis_server::telemetry`'s `on_prefix_reused`.
     PrefixReused { request: RequestId, tokens: u32 },
     /// A request's prefill resumed from **retained state** left by an earlier,
     /// already-finished request (GitHub #186, ADR 0029): the `tokens` leading

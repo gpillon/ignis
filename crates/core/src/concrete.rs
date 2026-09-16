@@ -1653,12 +1653,20 @@ impl Scheduler for ConcreteScheduler {
                 // block is under one page, or that has none, keeps #186's
                 // opener page and its prompt checkpoint with it.
                 //
-                // The two cannot both be published: the leaf allows one prefix
-                // per sequence (`ignis_seq_prefix_publish`, "already claims a
-                // shared prefix"), and a checkpoint demands its whole pages
-                // *be* that prefix (`ignis_seq_checkpoint_capture`). So the
-                // extra chunk split the spec asks for is **moved**, not added
-                // — see this ticket's report.
+                // One head is published, not two: the leaf allows one prefix
+                // per sequence (`seq_prefix.cu:129`, "already claims a shared
+                // prefix"), and a checkpoint demands its whole pages *be* that
+                // prefix (`seq_checkpoint.cu:125`). So the extra chunk split
+                // the spec asks for is **moved**, not added.
+                //
+                // The two boundaries share that head when they fall in the
+                // same page — a short first turn leaves a retained prefix
+                // *and* a checkpoint — and compete for it when they do not,
+                // which is every prompt carrying tools. The competition is
+                // temporary: GitHub #187 relaxes
+                // `seq_checkpoint.cu`'s `below != seq->shared_pages`, after
+                // which a claimant of the block captures at its own opener and
+                // this floor costs a checkpoint no longer.
                 let opener_page = |at: u32| (at / self.config.kv_page_tokens) * self.config.kv_page_tokens;
                 match input.opener_tokens.filter(|_| self.config.prompt_reuse) {
                     Some(opener) => head.min(opener_page(opener)),
@@ -2153,14 +2161,23 @@ impl Scheduler for ConcreteScheduler {
                                     r.resources.kv_pages =
                                         r.resources.kv_pages.saturating_sub(pages);
                                     // GitHub #188 (ADR 0029): a prefix
-                                    // published at the system block boundary
-                                    // is **retained** — it does not drop when
-                                    // its last live claimant goes, so the next
-                                    // subagent of the burst claims it although
-                                    // its sibling finished. Asked of the
-                                    // request rather than re-derived, so the
-                                    // head that was published and the head
-                                    // that is retained cannot disagree.
+                                    // published at or below the system block
+                                    // boundary is **retained** — it does not
+                                    // drop when its last live claimant goes,
+                                    // so the next subagent of the burst claims
+                                    // it although its sibling finished. Asked
+                                    // of the request rather than re-derived,
+                                    // so the head that was published and the
+                                    // head that is retained cannot disagree.
+                                    //
+                                    // `<=`, not `==`: a prompt shorter than
+                                    // its own block publishes the whole pages
+                                    // it has, which is a prefix *of* the block
+                                    // and reusable by the same burst. What
+                                    // must never be retained is a head reaching
+                                    // *past* the block, since that is the
+                                    // request's own conversation and no
+                                    // sibling shares it.
                                     let block = self.requests[i]
                                         .retained_prefix_point(self.config.kv_page_tokens);
                                     if self.config.prompt_reuse

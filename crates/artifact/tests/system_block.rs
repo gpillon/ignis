@@ -125,13 +125,17 @@ fn the_boundary_closes_the_first_system_block_of_every_recorded_render() {
     dir.sort();
     assert_eq!(dir.len(), 7, "every recorded fixture is present");
     let mut with_block = 0;
+    let mut opens_with_block = 0;
     for path in dir {
         let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let name = fixture["case"]["name"].as_str().unwrap().to_owned();
         let text = fixture["expected"]["text"].as_str().unwrap();
-        // Three of the seven recorded renders carry neither a system message
-        // nor tools, and the reference opens them straight on the user turn.
-        // Those publish nothing, and saying so is half of what this checks:
+        if text.starts_with("<|im_start|>system\n") {
+            opens_with_block += 1;
+        }
+        // Some of the recorded renders carry neither a system message nor
+        // tools, and the reference opens those straight on the user turn.
+        // They publish nothing, and saying so is half of what this checks:
         // the boundary exists exactly when the render opens with a block.
         let Some(at) = ChatTemplate::system_block_offset(text) else {
             assert!(
@@ -163,10 +167,15 @@ fn the_boundary_closes_the_first_system_block_of_every_recorded_render() {
             "{name}: the system block ({at}) must end before the opener ({opener})"
         );
     }
+    // Counted from the fixtures themselves rather than against a number
+    // written here: a boundary is reported for exactly the renders that open
+    // with one. A fixture added or changed later moves both sides together,
+    // which a literal would not.
     assert_eq!(
-        with_block, 4,
-        "four of the seven recorded renders open with a system block"
+        with_block, opens_with_block,
+        "a boundary is reported for exactly the renders that open with a system block"
     );
+    assert!(with_block > 0, "at least one recorded render has one");
 }
 
 #[test]
@@ -223,12 +232,33 @@ fn two_subagents_of_a_burst_share_the_boundary_as_an_exact_token_prefix() {
         head_1.len() < whole_1.len(),
         "the boundary is inside the prompt, not its end"
     );
-    // And it is worth publishing: the tools block dominates a subagent prompt.
+    // The safety direction, which is a property of the boundary and not of
+    // the questions this test happened to pick: the block never reaches past
+    // what the two prompts actually share. Reaching further is the failure
+    // that matters — it would hand a subagent pages warmed from history it
+    // never sent.
+    let common = whole_1
+        .iter()
+        .zip(&whole_2)
+        .take_while(|(a, b)| a == b)
+        .count();
     assert!(
-        head_1.len() * 2 > whole_1.len(),
-        "the system block ({}) should be most of a subagent's prompt ({})",
-        head_1.len(),
-        whole_1.len()
+        head_1.len() <= common,
+        "the boundary ({}) reaches past what the two prompts share ({common})",
+        head_1.len()
+    );
+    assert!(
+        common < whole_1.len().min(whole_2.len()),
+        "the two prompts must really diverge, or this proves nothing"
+    );
+    // They share a little more than the block — the next turn's opening
+    // marker — and that remainder is deliberately left unused: reuse happens
+    // at recorded structural points, never at an arbitrary longest common
+    // prefix (ADR 0029, Out of Scope), because GDN state exists only where it
+    // was captured.
+    println!(
+        "two subagents share {common} leading ids; the boundary publishes {} of them",
+        head_1.len()
     );
 }
 

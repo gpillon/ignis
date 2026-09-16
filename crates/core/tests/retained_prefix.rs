@@ -19,14 +19,28 @@
 //! what the pool is charged, and — the load-bearing one — that a retained
 //! prefix never makes a live request wait.
 //!
-//! **One prefix per sequence.** The leaf refuses a second publish from a
-//! sequence that already holds one (`ignis_seq_prefix_publish`), and a prompt
-//! checkpoint demands that the whole pages below its opener *be* that prefix
-//! (`ignis_seq_checkpoint_capture`). So a request publishes at the system
-//! block **or** at its opener's page, never both: the extra chunk split the
-//! spec asks for is moved, not added. A prompt whose block is under one page
-//! keeps #186's behaviour unchanged, and that is asserted below rather than
-//! left to be discovered.
+//! **One prefix per sequence, today.** The leaf refuses a second publish from
+//! a sequence that already holds one (`kernel/src/seq_prefix.cu:129`), and a
+//! prompt checkpoint demands that the whole pages below its opener *be* that
+//! prefix (`kernel/src/seq_checkpoint.cu:125`, whose own message names #187 as
+//! the extension point). So a request publishes **one** head, and the two
+//! boundaries compete for it whenever they fall in different KV pages: the
+//! extra chunk split the spec asks for is moved, not added.
+//!
+//! They are not exclusive in general, only per published head. When the block
+//! and the opener land in the *same* page, the one prefix below it serves
+//! both, and the request leaves a retained prefix *and* a checkpoint —
+//! `a_block_and_an_opener_in_one_page_leave_both_a_retained_prefix_and_a_checkpoint`
+//! below, and what #186's live GPU check observed.
+//!
+//! **This is a state that ends.** #187 owns relaxing
+//! `seq_checkpoint.cu`'s `below != seq->shared_pages`, after which a claimant
+//! of the block prefix captures at its own opener and the two compose instead
+//! of competing. Until then a prompt with tools — every qwen-code request —
+//! leaves the block and no checkpoint, which is what
+//! `the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener` pins.
+//! A prompt whose block is under one page keeps #186's behaviour unchanged,
+//! and that is asserted below rather than left to be discovered.
 //!
 //! Seams (ADR 0006): the `Scheduler` trait driven with a `MockCompute` that
 //! records the prefill call shape behind the `Compute` seam, exactly as
@@ -259,12 +273,12 @@ fn a_subagent_with_a_different_block_shares_nothing() {
 
 #[test]
 fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
-    // The boundary moves: #186 cut this prompt at its opener's page (32 here
-    // too, but for a different reason and on a different prompt shape) — this
+    // The boundary moves: #186 cut this prompt at its opener's page — this
     // cuts it at the block's page, because that is the only head a *burst*
-    // can share. One prefix per sequence at the leaf, so the checkpoint the
-    // opener would have carried is not taken, and saying so out loud is the
-    // point of this assertion.
+    // can share. One prefix per sequence at the leaf, and here the two
+    // boundaries fall in different pages (the block's ends page 2, the opener
+    // is in page 3), so the checkpoint the opener would have carried is not
+    // taken. Saying so out loud is the point of the last assertion.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
     let id = sched.submit(subagent(500), RequestClass::Agent).unwrap();
@@ -287,11 +301,91 @@ fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
         vec![Some(32), None],
         "exactly the chunk that ends on the block publishes it"
     );
+    // **#187 flips this assertion.** Today the leaf allows one prefix per
+    // sequence and a capture demands the opener's whole pages *be* it
+    // (`seq_checkpoint.cu:125`), so publishing the block is publishing
+    // instead of the opener's page. Once #187 relaxes that, this request
+    // keeps its checkpoint too and the expected count here becomes 1 — a
+    // composition, not a regression.
     assert_eq!(
         sched.checkpoint_pool().entry_count(),
         0,
-        "and no prompt checkpoint: the leaf allows one prefix per sequence, so \
-         publishing the block is publishing instead of the opener's page"
+        "no prompt checkpoint while the leaf allows one prefix per sequence (#187)"
+    );
+}
+
+#[test]
+fn a_block_and_an_opener_in_one_page_leave_both_a_retained_prefix_and_a_checkpoint() {
+    // The two are not exclusive in general — they are exclusive *per published
+    // head*. A short first turn puts the block's end and the generation opener
+    // inside the same KV page, so the one prefix published below that page is
+    // both the burst's retained block and the whole pages the conversation's
+    // own checkpoint stands on. #186's live GPU check observed exactly this.
+    //
+    // A 35-token block (two whole pages) with a 45-token opener: 45 / 16 is 2,
+    // which is the publish point's page count, so `checkpoint_point` is
+    // satisfied on the very prefix the block published.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(compute.clone(), config());
+    let id = sched
+        .submit(
+            input(
+                [tokens(1, BLOCK), tokens(500, 15)].concat(),
+                Some(BLOCK),
+                Some(45),
+                4,
+            ),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    assert_eq!(
+        chunk_widths(&compute, id),
+        vec![32, 13, 5],
+        "cut at the block's page, then again at the opener inside that page"
+    );
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        1,
+        "the conversation kept its checkpoint"
+    );
+    assert_eq!(
+        sched.prefix_pinned_pages(),
+        BLOCK / PAGE,
+        "standing on the same two pages the burst's block retained"
+    );
+
+    // Both are then claimable, each by the request it exists for: the next
+    // turn of this conversation through the checkpoint, an unrelated burst
+    // member through the block under it.
+    // Turn N+1 is turn N's prompt *up to its opener* — the block, then the
+    // ten tokens of the first question that preceded the opener — and then
+    // its own continuation.
+    let next_turn = sched
+        .submit(
+            input(
+                [tokens(1, BLOCK), tokens(500, 10), tokens(700, 15)].concat(),
+                Some(BLOCK),
+                Some(57),
+                4,
+            ),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        state_reuses(&events, next_turn),
+        vec![(ReuseSource::Device, 45)],
+        "the next turn resumed at the opener"
+    );
+
+    let sibling = sched.submit(subagent(900), RequestClass::Agent).unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        prefix_reuses(&events, sibling),
+        vec![32],
+        "and a burst member that shares only the block still claims it"
     );
 }
 
@@ -485,6 +579,85 @@ fn a_live_request_takes_a_retained_prefix_back_rather_than_waiting_for_it() {
     let events = run_to_idle(&mut sched);
     assert!(prefix_reuses(&events, after).is_empty());
     assert_eq!(chunk_widths(&compute, after).iter().sum::<usize>(), 60);
+}
+
+#[test]
+fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
+    // ADR 0029's amendment (2026-09-16, #188): retained checkpoints go before
+    // retained prefixes, LRU within each. A checkpoint serves one
+    // conversation's next turn; a retained prefix serves every future request
+    // that opens with that block. Between two bets the narrower one goes
+    // first — and it frees more pages doing it.
+    //
+    // The two entries exist together only because the requests that left them
+    // were concurrent (whoever arrives second claims and therefore publishes
+    // nothing), which is a burst and a conversation landing in one batch.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute.clone(),
+        SchedulerConfig {
+            kv_capacity_pages: 6,
+            max_sequence_tokens: 96,
+            ..config()
+        },
+    );
+    // The conversation: no block reported, so it publishes at its opener's
+    // page (32 = two pages) and captures a checkpoint at 37.
+    sched
+        .submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive)
+        .unwrap();
+    // The burst member: a one-page block, so it publishes at 16 — a different
+    // head, so the one-publisher-per-head rule does not silence it.
+    sched
+        .submit(
+            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), Some(47), 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.checkpoint_pool().entry_count(), 1, "one checkpoint");
+    assert_eq!(sched.prefix_pinned_pages(), 3, "its two pages, and the block's one");
+
+    // A live request needing four pages, with only three free. Exactly one
+    // discard is required, so which kind goes is observable: giving up the
+    // checkpoint returns two pages and is enough, giving up the block would
+    // return one and would also have been enough — so a pool that chose the
+    // block would pass every other assertion in this file.
+    let live = sched
+        .submit(input(tokens(2000, 60), None, None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(
+        chunk_widths(&compute, live).iter().sum::<usize>(),
+        60,
+        "the live request ran"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, SchedEvent::Evicted { .. })),
+        "and nothing live was evicted for it"
+    );
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        0,
+        "the narrow bet went"
+    );
+    assert_eq!(
+        sched.prefix_pinned_pages(),
+        1,
+        "and the block survived it — the wide bet is given up last"
+    );
+
+    // Not an exemption, an ordering: enough pressure and the block goes too.
+    let bigger = sched
+        .submit(input(tokens(3000, 92), None, None, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(
+        chunk_widths(&compute, bigger).iter().sum::<usize>(),
+        92,
+        "the larger request ran too"
+    );
+    assert_eq!(sched.prefix_pinned_pages(), 0, "the block went when it had to");
 }
 
 #[test]

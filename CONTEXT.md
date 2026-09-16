@@ -175,11 +175,15 @@ When output names a domain concept, use the term as defined here.
   is a scheduling decision, not a detail of the publish call: what a claimant
   clones is the mutable state at the prefix's *end*, so the publishing
   request's prefill is cut there, and a prompt whose length is not a whole
-  page pays one extra chunk for it. A sequence holds **one** prefix, and a
-  **prompt checkpoint** demands that the whole pages below its opener *be*
-  that prefix — so a request publishes at its system block or at its opener's
-  page, never both, and a prompt whose system block is at least a page long
-  leaves a **retained prefix** and no checkpoint.
+  page pays one extra chunk for it. A request publishes **one** head, so its
+  two boundaries share a prefix when they fall in the same KV page and
+  compete for it when they do not: a short first turn leaves both a
+  **retained prefix** and a **prompt checkpoint**, while a prompt with tools
+  — a block several pages long — leaves the block alone. That competition is
+  a limit of today's leaf rather than a rule of the domain (a sequence may
+  hold one prefix, and a capture demands the opener's whole pages be it);
+  GitHub #187 relaxes it so a claimant of the block captures at its own
+  opener.
 - **Eviction priority** — the one ordering that decides what loses residency,
   expressed at two levels: leaving the GPU is eligibility and protection, then
   request class, then least-recently-used; leaving KV-RAM is **retained
