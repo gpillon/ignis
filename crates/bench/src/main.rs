@@ -18,11 +18,14 @@
 //!       self-consistency — the v1 verdict is their conjunction), shipped
 //!       as a single JSON file. Exits non-zero when the v1 verdict fails.
 //!   `ttft    --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768
+//!             [--image <screenshot.png> [--image-question <text>]]
 //!             [--samples 5] [--max-tokens 8] [--label L] [--profile P]
 //!             [--session S] [--corpus <bank.ids>] [--out <record.json>]`
 //!       The G2 measurement instrument (P2-05, ADR 0015): time to first
 //!       token at an exact prompt length, on cold prefixes, against any
-//!       OpenAI-compatible endpoint. Writes one engine's record.
+//!       OpenAI-compatible endpoint. Writes one engine's record. `--image`
+//!       adds the multimodal cell (GitHub #181): the PNG plus a short
+//!       question, after the text cells; with it `--cells` may be omitted.
 //!   `g2      --ours <ignis-record.json> --ref <reference-record.json>
 //!             [--note <text>] [--out <verdict.json>]`
 //!       The G2 verdict over two such records: the ratio of medians per
@@ -111,7 +114,7 @@ use ignis_bench::{
     report::PerformanceReport,
     time::new_session_id,
     trace::Trace,
-    ttft::{self, CellSpec, TtftConfig},
+    ttft::{self, CellSpec, ImageCellSpec, TtftConfig},
 };
 
 fn main() -> ExitCode {
@@ -151,6 +154,7 @@ fn print_usage() {
   ignis-bench oracle compare --fixture <fixture.json> --endpoint <url> --artifact <artifact.ninfer> [--first-n N]
   ignis-bench oracle compare --fixture <fixture.json> --candidate <candidate-fixture.json> [--first-n N]
   ignis-bench ttft --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768 [--samples 5] [--max-tokens 8]
+                   [--image <screenshot.png> [--image-question <text>]]
                    [--label ignis] [--profile <text>] [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
   ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
   ignis-bench g3 --endpoint <url> --artifact <artifact.ninfer> [--label ignis] [--profile <text>]
@@ -588,10 +592,17 @@ fn repeated_opt(args: &[String], key: &str) -> Vec<String> {
 /// endpoint. The record it writes is one half of a G2 verdict; `g2`
 /// compares two of them.
 fn cmd_ttft(args: &[String]) -> ExitCode {
+    // GitHub #181: a record may carry only the multimodal cell.
+    let image_path = opt(args, "image").map(PathBuf::from);
+    let cells_required = if image_path.is_some() {
+        Ok(opt(args, "cells").unwrap_or_default())
+    } else {
+        require(args, "cells")
+    };
     let (endpoint, artifact, cells_raw) = match (
         require(args, "endpoint"),
         require(args, "artifact"),
-        require(args, "cells"),
+        cells_required,
     ) {
         (Ok(e), Ok(a), Ok(c)) => (e, a, c),
         (e, a, c) => {
@@ -636,10 +647,24 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
             }
         }
     }
-    if specs.is_empty() {
+    if specs.is_empty() && image_path.is_none() {
         eprintln!("error: --cells named no cells");
         return ExitCode::FAILURE;
     }
+    let image = match &image_path {
+        None => None,
+        Some(path) => match std::fs::read(path) {
+            Ok(png) => Some(ImageCellSpec {
+                png,
+                question: opt(args, "image-question").unwrap_or_else(|| ttft::DEFAULT_IMAGE_QUESTION.into()),
+                samples,
+            }),
+            Err(e) => {
+                eprintln!("error: --image {path:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
 
     // The artifact's own tokenizer + chat template: what makes a cell's
     // claimed prompt length the length the engine actually prefills.
@@ -667,7 +692,7 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
     };
     eprintln!(
         "ttft session {session}: {} cells x {samples} samples (+1 warmup) against {label}",
-        specs.len()
+        specs.len() + usize::from(image.is_some())
     );
 
     let cfg = TtftConfig {
@@ -678,6 +703,7 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
         artifact,
         session,
         corpus,
+        image,
     };
     let record = ttft::measure(&ep, &frontend, engine, endpoint, &cfg);
     print!("{}", record.render());

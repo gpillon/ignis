@@ -50,6 +50,7 @@ fn needle_request(stream: bool) -> Request {
         stream,
         include_usage: false,
         enable_thinking: Some(false),
+        images: Vec::new(),
     }
 }
 

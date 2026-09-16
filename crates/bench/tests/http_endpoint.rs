@@ -23,6 +23,7 @@ fn request(id: &str, prompt: &str, max_tokens: u32, stream: bool) -> Request {
         stream,
         include_usage: false,
         enable_thinking: None,
+        images: Vec::new(),
     }
 }
 

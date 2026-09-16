@@ -126,6 +126,7 @@ pub fn record(
             stream: false,
             include_usage: false,
             enable_thinking: Some(false),
+            images: Vec::new(),
         };
         let outcome = ep
             .complete(&req)

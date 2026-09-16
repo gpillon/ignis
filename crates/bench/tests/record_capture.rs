@@ -38,6 +38,7 @@ fn chat_request(id: &str, prompt: &str, max_tokens: u32, stream: bool) -> Reques
         stream,
         include_usage: false,
         enable_thinking: None,
+        images: Vec::new(),
     }
 }
 

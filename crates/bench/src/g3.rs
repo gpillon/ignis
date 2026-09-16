@@ -124,6 +124,7 @@ fn sample_request(id: String, prompt: String, max_tokens: u32) -> Request {
         stream: true,
         include_usage: true,
         enable_thinking: Some(false),
+        images: Vec::new(),
     }
 }
 

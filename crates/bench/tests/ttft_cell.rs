@@ -12,11 +12,11 @@
 
 mod common;
 
-use common::MockEngine;
+use common::{MockEngine, IMAGE_TOKENS};
 use ignis_bench::client::{Endpoint, HttpEndpoint, Request};
 use ignis_bench::g2;
 use ignis_bench::trace::RequestClass;
-use ignis_bench::ttft::{self, CellSpec, PromptTemplate, Record, TtftConfig};
+use ignis_bench::ttft::{self, CellSpec, ImageCellSpec, PromptTemplate, Record, TtftConfig};
 
 /// A template whose post-template token count is the content's whitespace
 /// word count — exactly how the mock engine counts a prompt's tokens, so a
@@ -34,6 +34,25 @@ impl PromptTemplate for WordTemplate {
         // The filler path never decodes: a placeholder for the seam.
         Ok(ids.iter().map(|id| format!("t{id}")).collect::<Vec<_>>().join(" "))
     }
+    /// The words, then the image's tokens as the mock counts them.
+    fn encode_user_message_with_image(&self, content: &str, _image: &[u8]) -> Result<Vec<u32>, String> {
+        let mut ids = self.encode_user_message(content)?;
+        ids.extend(std::iter::repeat_n(151_655, IMAGE_TOKENS as usize));
+        Ok(ids)
+    }
+}
+
+/// A 64x40 RGB PNG.
+fn screenshot() -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, 64, 40);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let pixels: Vec<u8> = (0..64u32 * 40).flat_map(|i| [i as u8, (i >> 3) as u8, 200]).collect();
+        encoder.write_header().unwrap().write_image_data(&pixels).unwrap();
+    }
+    out
 }
 
 fn config(session: &str, label: &str, cells: &[u32], samples: usize) -> TtftConfig {
@@ -48,6 +67,7 @@ fn config(session: &str, label: &str, cells: &[u32], samples: usize) -> TtftConf
         artifact: "mock.ninfer".into(),
         session: session.into(),
         corpus: None,
+        image: None,
     }
 }
 
@@ -156,6 +176,7 @@ fn an_engine_that_reports_no_usage_cannot_prove_a_cold_prefix() {
             stream: true,
             include_usage: false,
             enable_thinking: Some(false),
+            images: Vec::new(),
         })
         .expect("the completion");
     assert_eq!(
@@ -196,6 +217,81 @@ fn a_contaminated_record_is_refused_a_verdict_rather_than_failing_one() {
 
     let refusal = g2::check(&ours, &reference).expect_err("must refuse");
     assert!(refusal.0.contains("void sample"), "{refusal}");
+}
+
+#[test]
+fn an_image_cell_measures_cold_samples_each_sending_its_own_image() {
+    let engine = MockEngine::start();
+    let question = "What does this screenshot show?";
+    let cfg = TtftConfig {
+        image: Some(ImageCellSpec { png: screenshot(), question: question.into(), samples: 3 }),
+        ..config("S-image", "ignis", &[40], 3)
+    };
+    let record = measure(&engine, &cfg);
+
+    assert_eq!(record.cells.len(), 2, "the text cell, then the image cell");
+    assert!(record.cells[0].image.is_none());
+    let cell = &record.cells[1];
+    assert!(cell.error.is_none(), "{:?}", cell.error);
+    // The nonce, the question's five words and the image's tokens.
+    assert_eq!(cell.prompt_tokens, 1 + 5 + IMAGE_TOKENS);
+    assert!(cell.all_cold(), "{:?}", cell.void_samples());
+    let image = cell.image.as_ref().expect("the image cell names its image");
+    assert_eq!((image.width, image.height, image.question.as_str()), (64, 40, question));
+    assert_eq!(image.sha256.len(), 64);
+
+    // The text cell's four requests sent no image; the image cell's warmup
+    // and three samples each sent one, all different.
+    let images = engine.state.images();
+    assert_eq!(images.len(), 8);
+    assert!(images[..4].iter().all(Vec::is_empty));
+    let sent: Vec<&String> = images[4..].iter().map(|urls| {
+        assert_eq!(urls.len(), 1);
+        &urls[0]
+    }).collect();
+    for (i, url) in sent.iter().enumerate() {
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        assert!(sent[i + 1..].iter().all(|other| other != url), "image {i} is sent once");
+    }
+    assert!(record.render().contains("image 64x40"), "{}", record.render());
+    assert_eq!(Record::from_json(&record.to_json().unwrap()).unwrap(), record);
+}
+
+#[test]
+fn an_image_cell_whose_image_the_engine_counts_differently_is_void() {
+    let engine = MockEngine::start();
+    // Our template claims one token fewer per sample than the engine counts:
+    // the samples are not measuring the length the cell claims.
+    struct Undercounting;
+    impl PromptTemplate for Undercounting {
+        fn encode_user_message(&self, content: &str) -> Result<Vec<u32>, String> {
+            WordTemplate.encode_user_message(content)
+        }
+        fn decode(&self, ids: &[u32]) -> Result<String, String> {
+            WordTemplate.decode(ids)
+        }
+        fn encode_user_message_with_image(&self, content: &str, image: &[u8]) -> Result<Vec<u32>, String> {
+            let mut ids = WordTemplate.encode_user_message_with_image(content, image)?;
+            ids.pop();
+            Ok(ids)
+        }
+    }
+    let spec = ImageCellSpec { png: screenshot(), question: "What is it?".into(), samples: 2 };
+    let cell = ttft::measure_image_cell(&HttpEndpoint::new(engine.url()), &Undercounting, &spec, 4);
+    assert_eq!(cell.void_samples().len(), 2, "{cell:?}");
+    assert!(cell.samples[0].void_reason.as_deref().unwrap().contains("not measuring the length"));
+}
+
+#[test]
+fn two_live_image_records_produce_a_verdict() {
+    let (ours_engine, reference_engine) = (MockEngine::start(), MockEngine::start());
+    let spec = || ImageCellSpec { png: screenshot(), question: "What is it?".into(), samples: 3 };
+    let ours = measure(&ours_engine, &TtftConfig { cells: Vec::new(), image: Some(spec()), ..config("S-img", "ignis", &[], 3) });
+    let reference =
+        measure(&reference_engine, &TtftConfig { cells: Vec::new(), image: Some(spec()), ..config("S-img", "reference", &[], 3) });
+    let verdict = g2::check(&ours, &reference).expect("a verdict");
+    assert_eq!(verdict.cells.len(), 1);
+    assert_eq!(verdict.cells[0].prompt_tokens, ours.cells[0].prompt_tokens);
 }
 
 #[test]

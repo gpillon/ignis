@@ -185,6 +185,7 @@ pub fn capture(
                 stream: false,
                 include_usage: false,
                 enable_thinking: Some(false),
+                images: Vec::new(),
             };
             let out = endpoint.complete(&req).map_err(|e| format!("canary {}: {e}", c.id))?;
             let tokens = tokenizer

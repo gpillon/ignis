@@ -41,6 +41,10 @@ ignis-artifact = { path = "../artifact" }
 # Inline dependency: a parallel actor owns the workspace manifest (the root
 # `Cargo.toml` is not edited by this ticket).
 sha2 = "0.10"
+# The multimodal TTFT cell (`ttft`, GitHub #181): each sample's copy of the
+# operator's PNG gets one changed pixel, so no engine's preprocessing cache
+# (keyed by the image's digest) can serve it. The workspace's own version.
+png = "0.18"
 
 [dev-dependencies]
 # The in-process mock engine (the tests): a small axum router mimicking the

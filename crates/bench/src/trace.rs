@@ -97,6 +97,7 @@ impl TraceLine {
             // Replay measures timing, not prefix coldness — no usage chunk.
             include_usage: false,
             enable_thinking: None,
+            images: Vec::new(),
         }
     }
 }
