@@ -98,6 +98,14 @@ pub struct Request {
     /// carries so the backend can find the device image. `None` for a request
     /// that reused no retained state.
     pub checkpoint_publisher: Option<RequestId>,
+    /// The pool's own handle on the entry [`Self::checkpoint_publisher`] names
+    /// (GitHub #187), as opposed to the backend's.
+    ///
+    /// It is what ties this request's own capture to the conversation it is
+    /// continuing: the lineage the new entry joins, and the entry it
+    /// supersedes when the turn has not changed. There is no session id to do
+    /// that with (ADR 0029), so the claim edge is the link.
+    pub checkpoint_entry: Option<crate::checkpoint::CheckpointId>,
     /// Leading prompt tokens reused from a retained prompt checkpoint (GitHub
     /// #186): everything up to that checkpoint's generation opener, which is
     /// **not** a whole number of pages. 0 = nothing reused.
@@ -172,6 +180,7 @@ impl Request {
             shared_prefix_tokens: 0,
             shared_pages: 0,
             checkpoint_publisher: None,
+            checkpoint_entry: None,
             checkpoint_tokens: 0,
             reuse_source: None,
             checkpoint_captured: false,
@@ -237,16 +246,54 @@ impl Request {
     /// request publishes its prompt head as a shared prefix, or 0 for a
     /// request that publishes nothing (P4-10, GitHub #126).
     ///
-    /// A request holding a claim publishes nothing: the head it would offer
-    /// is the entry it is already holding, and publishing it again would own
-    /// the same pages twice. One function so that the chunk decomposition
-    /// (where to cut) and the registration (when to publish) cannot disagree
-    /// about it.
-    pub fn publish_point(&self) -> u32 {
-        if self.prefix_entry.is_some() {
+    /// A request holding a claim publishes a **chained** head (GitHub #187):
+    /// the pages it warmed past the entry it resumed from, over that entry.
+    /// Publishing its whole head instead would own the shared pages twice, and
+    /// publishing nothing — which is what #186 did — is what stopped a
+    /// conversation past its first page from ever taking a second checkpoint.
+    ///
+    /// **This is a sequence, not a number.** A request may publish at more
+    /// than one boundary in its prompt, each as a chained entry over the last,
+    /// and what it publishes *next* is the first boundary past what it already
+    /// shares. #187 supplies one boundary, the generation opener's page floor,
+    /// which is what makes the request's own checkpoint capturable. #188 adds
+    /// the end of the system-and-tools block **before** it — the only head a
+    /// subagent burst can share — and the two compose rather than exclude each
+    /// other: publish the block, chain the opener's page over it, capture
+    /// there. (Merge note: `boundaries` below becomes
+    /// `[self.retained_prefix_point(page_tokens), self.publish_tokens]` and
+    /// `ConcreteScheduler::submit` stops flooring `publish_tokens` to the
+    /// block, which is the whole of the #187 × #188 join.)
+    ///
+    /// A boundary past the first is published only when the request has a
+    /// generation opener to capture at. Without that gate every concurrent
+    /// sibling of a burst would pay a chunk split for a chained prefix nobody
+    /// is going to claim — no subagent's prompt extends its sibling's.
+    ///
+    /// One function so that the chunk decomposition (where to cut) and the
+    /// registration (when to publish) cannot disagree about it.
+    pub fn publish_point(&self, page_tokens: u32) -> u32 {
+        if !self.may_share_prefix() {
             return 0;
         }
-        self.publish_tokens
+        let shared = self.shared_pages.saturating_mul(page_tokens);
+        // Ascending, and it has to be: "the first boundary past what I already
+        // share" is only the next one if they are in prompt order. They always
+        // are — the system block ends before the last generation opener, and
+        // flooring to pages is monotone.
+        let boundaries = [self.retained_prefix_point(page_tokens), self.publish_tokens];
+        for at in boundaries {
+            // Already published, or covered by the entry this request claimed.
+            if at <= shared {
+                continue;
+            }
+            // A chained publish has to earn its chunk split.
+            if self.prefix_entry.is_some() && self.input.opener_tokens.is_none() {
+                continue;
+            }
+            return at;
+        }
+        0
     }
 
     /// The **retained-prefix boundary** (GitHub #188, ADR 0029): the end of
@@ -299,15 +346,15 @@ impl Request {
     /// - **the opener's pages are not the shared ones** — the request is
     ///   standing on a prefix that stops somewhere other than its own
     ///   opener's page, so its own first page is not the opener's. Two real
-    ///   cases fall here, and both are deferred rather than half-done: a
-    ///   conversation's *second* turn, which resumed from an earlier
-    ///   checkpoint and prefilled past it (#187's lineage work — supersede C
-    ///   by C'), and every **concurrent sibling** that claimed another
-    ///   request's shared prefix and whose own opener lies further on (a
-    ///   subagent burst therefore leaves one checkpoint, the publisher's, not
-    ///   one per sibling). Until #187 the chain stops here, and what keeps
-    ///   that honest is that the *earlier* entry still matches: a third turn
-    ///   reuses the first turn's checkpoint rather than nothing.
+    ///   cases used to end here, and #187 removed both: a conversation's
+    ///   *second* turn, which resumed from an earlier checkpoint and prefilled
+    ///   past it, and every **concurrent sibling** that claimed another
+    ///   request's shared prefix and whose own opener lies further on. Neither
+    ///   is refused now — each publishes a **chained** prefix at its own
+    ///   opener's page floor first ([`Request::publish_point`]), which makes
+    ///   this condition true rather than weakening it. What still lands here
+    ///   is a request whose claim already reaches *past* its own opener's
+    ///   page, which has nothing of its own to cut at.
     /// - **already captured** — one checkpoint per request.
     ///
     /// One function, so that the chunk decomposition (where to cut) and the
@@ -338,6 +385,35 @@ impl Request {
             return 0;
         }
         opener
+    }
+
+    /// Whether the checkpoint this request is about to capture **opens a new
+    /// turn** of its conversation (GitHub #187, ADR 0029) — whether a real
+    /// user message lies past the entry it resumed from.
+    ///
+    /// A request that resumed from nothing is the start of a conversation as
+    /// far as anything here can tell, so its checkpoint opens that
+    /// conversation's first turn. Otherwise the frontend's
+    /// last-real-user-query offset decides it, against the claimed entry's
+    /// reach: **at or past** it means the human spoke again and this is a new
+    /// turn; before it means the prompt grew by an assistant message and a
+    /// tool result, which is one more iteration of the same turn. At or past,
+    /// not strictly past, because the offset is where the user message
+    /// *begins* — one beginning exactly where the claimed entry ends is
+    /// history that entry never covered.
+    ///
+    /// A frontend that could not report the offset answers **false**. A wrong
+    /// `false` costs a superseded entry that would have been kept; a wrong
+    /// `true` retires the turn-opening entry the next user message was going
+    /// to match, which is the reuse this whole slice exists to protect.
+    pub fn opens_a_turn(&self) -> bool {
+        match self.checkpoint_entry {
+            None => true,
+            Some(_) => self
+                .input
+                .user_turn_tokens
+                .is_some_and(|user| user >= self.checkpoint_tokens),
+        }
     }
 
     /// Whether this request has finished prefill: every prompt token has
@@ -468,6 +544,7 @@ impl Request {
         // reset: whatever this request already retained is a real entry in
         // the pool, which a re-prefill must not duplicate.
         self.checkpoint_publisher = None;
+        self.checkpoint_entry = None;
         self.checkpoint_tokens = 0;
         self.reuse_source = None;
         // `publish_tokens` is untouched: it is a property of the prompt, not
@@ -567,6 +644,7 @@ mod tests {
                 params: DecodeParams::default(),
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
             },
             AdmissionResources::default(),

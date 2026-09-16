@@ -166,6 +166,20 @@ When output names a domain concept, use the term as defined here.
   it were a sibling. Its boundary is a structural point of the rendered prompt
   (the end of the system and tools block, floored to whole KV pages), not the
   publishing request's whole prompt head.
+- **Lineage** — one conversation's chain of **prompt checkpoints**, and the
+  only name a conversation has. The clients send no session id, so what ties
+  turn N+1's checkpoint to turn N's is the link that does exist: turn N+1
+  claimed turn N's entry. Every capture joins the lineage of the entry its
+  request resumed from, or opens one of its own — and it is per lineage, not
+  per pool, that at most two checkpoints are kept.
+- **Chained prefix** — a **shared prefix** published on top of another. A
+  request that resumed from retained state and prefilled past it has no head
+  of its own to publish: the pages below its generation opener are partly the
+  entry it claimed. It publishes the pages it warmed itself *over* that entry,
+  taking over the reference it was holding rather than adding one, so every
+  page is still charged to the pool exactly once and a claimant of the chain
+  shares all of it. This is what lets every iteration of a tool loop leave a
+  **prompt checkpoint** instead of only the first.
 - **Retained state** — prompt checkpoints and retained prefixes: state no live
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
@@ -196,7 +210,9 @@ When output names a domain concept, use the term as defined here.
   blob owns every byte of its history and outlives the prefix.
 - **Publish point** — the chunk boundary a prefix is published at, and 0 for a
   request that publishes nothing. A shared or retained prefix's is always a
-  whole number of KV pages in; a **prompt checkpoint**'s is the generation
+  whole number of KV pages in — a **chained prefix**'s is measured from the
+  start of the prompt, not from what the publisher already shares; a **prompt
+  checkpoint**'s is the generation
   opener wherever it falls, and whoever reuses it copies the partial page
   rather than sharing it. It
   is a scheduling decision, not a detail of the publish call: what a claimant

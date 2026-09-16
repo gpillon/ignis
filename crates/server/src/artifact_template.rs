@@ -111,6 +111,22 @@ impl ArtifactTemplateProvider {
         (!head.is_empty() && tokens.starts_with(&head)).then(|| head.len() as u32)
     }
 
+    /// How many leading tokens of `tokens` end where `prompt`'s **last real
+    /// user query** begins (GitHub #187, ADR 0029), or `None` when that cannot
+    /// be said exactly.
+    ///
+    /// Tokenized separately and required to be a real token prefix, for the
+    /// reason [`Self::opener_tokens`] is: this number is compared against a
+    /// retained *checkpoint's* token count, and two offsets the tokenizer
+    /// disagrees about would be compared as if they were on one scale. Unlike
+    /// the opener, an empty head is a legitimate answer — a conversation whose
+    /// very first message is the user's puts its query at token 0.
+    fn user_turn_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        let at = ChatTemplate::last_user_query_offset(prompt)?;
+        let head = self.set.tokenizer().encode(&prompt[..at]).ok()?;
+        tokens.starts_with(&head).then(|| head.len() as u32)
+    }
+
     /// The chat template's text for `messages`, image parts rendered as
     /// their placeholders.
     fn render(
@@ -173,10 +189,12 @@ impl TemplateProvider for ArtifactTemplateProvider {
             }
         };
         let opener_tokens = self.opener_tokens(&prompt, &tokens);
+        let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
         let system_block_tokens = self.system_block_tokens(&prompt, &tokens);
         RenderedPrompt {
             tokens,
             opener_tokens,
+            user_turn_tokens,
             system_block_tokens,
         }
     }

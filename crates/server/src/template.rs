@@ -321,6 +321,18 @@ pub struct RenderedPrompt {
     /// — in which case no checkpoint is taken at all, rather than one taken
     /// at a point the tokenizer disagrees about.
     pub opener_tokens: Option<u32>,
+    /// How many leading tokens end where the **last real user query** begins,
+    /// the rendered prompt's last `<|im_start|>user` marker that is not a
+    /// tool result (GitHub #187, ADR 0029).
+    ///
+    /// It says whether this request is a new turn of its conversation or one
+    /// more iteration of a tool loop, which decides whether the checkpoint it
+    /// takes supersedes the one it resumed from or opens a turn beside it.
+    /// `None` when the render has no user query, or when the offset does not
+    /// tokenize to an exact token prefix — a capture then counts as *not*
+    /// turn-opening, which costs a superseded entry rather than the entry the
+    /// next user message is the only thing that still matches.
+    pub user_turn_tokens: Option<u32>,
     /// How many leading tokens end the rendered prompt's **first system
     /// block** — reasoning instructions, tools and the system message, which
     /// this template renders into one `<|im_start|>system … <|im_end|>\n`
@@ -347,6 +359,7 @@ impl From<Vec<TokenId>> for RenderedPrompt {
         Self {
             tokens,
             opener_tokens: None,
+            user_turn_tokens: None,
             system_block_tokens: None,
         }
     }

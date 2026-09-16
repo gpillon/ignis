@@ -76,6 +76,7 @@ fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
         opener_tokens: None,
+        user_turn_tokens: None,
         system_block_tokens: None,
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),

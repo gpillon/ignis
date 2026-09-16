@@ -88,6 +88,7 @@ fn input(prompt: Vec<u32>, block: Option<u32>, opener: Option<u32>, max: u32) ->
         },
         multimodal: None,
         opener_tokens: opener,
+        user_turn_tokens: None,
         system_block_tokens: block,
     }
 }
@@ -187,8 +188,8 @@ fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() 
     assert!(sched.is_idle(), "the first subagent is gone");
     assert_eq!(
         sched.prefix_pinned_pages(),
-        BLOCK / PAGE,
-        "its block is still held — two whole pages, charged once"
+        BLOCK / PAGE + 1,
+        "its block is still held — two whole pages, charged once — plus the one page          it chained over them for its own prompt checkpoint (#187)"
     );
 
     let second = sched.submit(subagent(900), RequestClass::Agent).unwrap();
@@ -220,8 +221,8 @@ fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() 
     );
     assert_eq!(
         sched.prefix_pinned_pages(),
-        BLOCK / PAGE,
-        "and the entry is still one set of pages, not two"
+        BLOCK / PAGE + 2,
+        "and the block is still one set of pages, not two — what grew is one chained          page per subagent, each holding that subagent's own checkpoint (#187)"
     );
 }
 
@@ -246,8 +247,17 @@ fn a_whole_burst_of_subagents_claims_the_one_retained_block() {
     assert_eq!(sched.sibling_prefix_reused_tok(), 4 * 32);
     assert_eq!(
         sched.prefix_pinned_pages(),
-        BLOCK / PAGE,
-        "one entry, one charge, however many claimed it"
+        BLOCK / PAGE + 5,
+        "one entry, one charge, however many claimed it — and one chained page each"
+    );
+    // GitHub #187 closed #186's departure here: a burst used to leave one
+    // checkpoint, whoever published first. Each member now chains its own
+    // head over the shared block and captures at its own opener, so a retry
+    // of any one of these five questions hits rather than re-prefills.
+    assert_eq!(
+        sched.checkpoint_pool().entry_count(),
+        5,
+        "one checkpoint per sibling, not one for the publisher"
     );
 }
 
@@ -283,13 +293,24 @@ fn a_subagent_with_a_different_block_shares_nothing() {
 // ── Where the prefill is cut ────────────────────────────────────────────
 
 #[test]
-fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
-    // The boundary moves: #186 cut this prompt at its opener's page — this
-    // cuts it at the block's page, because that is the only head a *burst*
-    // can share. One prefix per sequence at the leaf, and here the two
+fn the_prefill_is_cut_at_the_system_block_and_again_at_the_opener() {
+    // The composition proof for the whole wave, and the reason this file's
+    // assertion used to read the other way round.
+    //
+    // #186 cut this prompt at its opener's page. #188 cut it at the block's
+    // page instead, because that is the only head a *burst* can share — and
+    // while the leaf allowed one prefix per sequence that was publishing
+    // *instead of* the opener's page, so the capture's `below ==
+    // shared_pages` could not hold and the checkpoint was lost. Here the two
     // boundaries fall in different pages (the block's ends page 2, the opener
-    // is in page 3), so the checkpoint the opener would have carried is not
-    // taken. Saying so out loud is the point of the last assertion.
+    // is in page 3), which is exactly the shape qwen-code sends on every
+    // request, so that was every request.
+    //
+    // #187 makes the two compose: a sequence holds a prefix *chain*, so this
+    // request publishes the block, chains its own opener's page over it, and
+    // captures there. Three cuts, one retained prefix, one prompt checkpoint
+    // — and the capture's precondition is satisfied rather than weakened
+    // (see this file's header).
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(compute.clone(), config());
     let id = sched.submit(subagent(500), RequestClass::Agent).unwrap();
@@ -297,8 +318,8 @@ fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
 
     assert_eq!(
         chunk_widths(&compute, id),
-        vec![32, 28],
-        "one cut, at the two-page block boundary"
+        vec![32, 16, 9, 3],
+        "cut at the two-page block boundary, then at the opener's page, then at the opener"
     );
     let published: Vec<Option<u32>> = compute
         .prefill_calls()
@@ -309,21 +330,25 @@ fn the_prefill_is_cut_at_the_system_block_rather_than_at_the_opener() {
         .collect();
     assert_eq!(
         published,
-        vec![Some(32), None],
-        "exactly the chunk that ends on the block publishes it"
+        vec![Some(32), Some(48), None, None],
+        "the block, then the chained head this request warmed past it"
     );
-    // **#187 flips this assertion.** Today the leaf allows one prefix per
-    // sequence, so publishing the block is publishing *instead of* the
-    // opener's page and the capture's `below == shared_pages` cannot hold.
-    // #187 chains the publish — a second prefix over the head this request
-    // warmed itself — which makes that equality true and leaves it a
-    // checkpoint as well: the count here becomes 1, a composition and not a
-    // regression. The capture's own precondition is not weakened to get
-    // there, and must not be (see this file's header).
+    let captured: Vec<Option<u32>> = compute
+        .prefill_calls()
+        .iter()
+        .flatten()
+        .filter(|j| j.request == id)
+        .map(|j| j.capture_checkpoint_tokens)
+        .collect();
+    assert_eq!(
+        captured,
+        vec![None, None, Some(57), None],
+        "and exactly the chunk that ends on the opener asks for the capture"
+    );
     assert_eq!(
         sched.checkpoint_pool().entry_count(),
-        0,
-        "no prompt checkpoint while a sequence may publish only one prefix (#187)"
+        1,
+        "and it still leaves a prompt checkpoint: the block prefix and the opener's page are a chain, not a choice (#187)"
     );
 }
 
@@ -470,10 +495,13 @@ fn a_longer_prompt_checkpoint_match_wins_over_the_retained_prefix() {
         .unwrap();
     // The burst member, submitted before the conversation prefills: a
     // one-page block, so it publishes at 16 — a different head, so the
-    // one-publisher-per-head rule does not silence it.
+    // one-publisher-per-head rule does not silence it. No opener reported, so
+    // the block is all it leaves: what this test weighs is one checkpoint
+    // against one retained prefix, and a member that chained and captured too
+    // (#187) would be weighing three.
     let burst = sched
         .submit(
-            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), Some(47), 4),
+            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), None, 4),
             RequestClass::Interactive,
         )
         .unwrap();
@@ -561,7 +589,11 @@ fn a_live_request_takes_a_retained_prefix_back_rather_than_waiting_for_it() {
     );
     sched.submit(subagent(500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
-    assert_eq!(sched.prefix_pinned_pages(), 2, "the block is retained");
+    assert_eq!(
+        sched.prefix_pinned_pages(),
+        3,
+        "the block is retained, and the page the subagent chained over it (#187)"
+    );
 
     // A request that cannot fit beside it: 90 tokens + 4 generated is six
     // pages, and two of them are under the retained block.
@@ -620,10 +652,14 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
         .submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive)
         .unwrap();
     // The burst member: a one-page block, so it publishes at 16 — a different
-    // head, so the one-publisher-per-head rule does not silence it.
+    // head, so the one-publisher-per-head rule does not silence it. It reports
+    // no opener, so the block is *all* it publishes: a burst member with one
+    // would chain its own head over the block and capture there too (#187),
+    // which is a second bet and would make "which kind goes first" a question
+    // about three entries instead of two.
     sched
         .submit(
-            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), Some(47), 4),
+            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), None, 4),
             RequestClass::Interactive,
         )
         .unwrap();

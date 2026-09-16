@@ -46,8 +46,15 @@
 //! seam, and a filter that only runs when a blob is adopted would be a filter
 //! that was never exercised.
 //!
-//! **What later slices change here.** #187 (lineage) adds the
-//! latest/turn-opening pair and supersession; #188 (retained prefix) adds a
+//! - **A conversation keeps at most two.** #187 added the third rule: every
+//!   capture joins the lineage of the entry its request claimed
+//!   ([`CheckpointCapture::claimed`]), and that lineage is immediately cut
+//!   back to its latest entry and its newest **turn-opening** one. A tool
+//!   loop therefore costs one pair, not one entry per iteration, and the
+//!   turn-opening entry is what a *new* user message still matches after
+//!   history drops the earlier thinking.
+//!
+//! **What later slices change here.** #188 (retained prefix) adds a
 //! second kind of retained entry, matched against the same prompt; #190
 //! (KV-RAM) fills the second [`ResidencyTier`] of the pool's [`TierList`]:
 //! [`CheckpointPool::discard_victim`] becomes a *spill* to
@@ -62,6 +69,18 @@ use crate::types::RequestId;
 
 /// An opaque handle to a retained prompt checkpoint.
 pub type CheckpointId = u64;
+
+/// An opaque handle to a **lineage** (GitHub #187): the chain of prompt
+/// checkpoints one conversation left behind.
+///
+/// A conversation has no name. The clients send no session id, and ADR 0029
+/// refuses to invent one — so what ties turn N+1's checkpoint to turn N's is
+/// the only link that actually exists: turn N+1 *claimed* turn N's entry.
+/// Every capture inherits the lineage of the entry its request resumed from,
+/// and a capture that resumed from nothing starts one. That is the whole of
+/// "per conversation" here: a conversation is a claim chain, and the pool
+/// bounds each chain rather than the pool as a whole.
+pub type LineageId = u64;
 
 /// Where a request's reused state came from — the `reuse_source` field of the
 /// request log (spec §12).
@@ -278,6 +297,19 @@ pub struct CheckpointEntry {
     /// The GDN state at the opener (core-02: a claimant resumes its recurrent
     /// state from a recorded boundary).
     pub gdn: GdnState,
+    /// The conversation this entry belongs to (GitHub #187): inherited from
+    /// the entry the capturing request claimed, fresh when it claimed none.
+    pub lineage: LineageId,
+    /// Whether this entry is a **turn-opening checkpoint**: the first one
+    /// captured after its conversation's last real user message (GitHub #187,
+    /// ADR 0029).
+    ///
+    /// It is the only one a *new* user message can still match. Once history
+    /// drops the earlier thinking, every checkpoint taken further along in the
+    /// turn covers tokens the next render no longer produces — so the pool
+    /// keeps this one whatever else it supersedes, and the pair it keeps is
+    /// "the latest, for the tool loop; the turn opener, for the human".
+    pub turn_opening: bool,
     /// The scheduling tick this entry was last captured or claimed at — the
     /// LRU order [`CheckpointPool::discard_victim`] discards in.
     pub use_tick: u64,
@@ -325,6 +357,35 @@ pub struct CheckpointCapture {
     pub identity: BlobIdentity,
     /// The residency tier the entry lands in.
     pub tier: ReuseSource,
+    /// The retained entry the capturing request resumed from, or `None` when
+    /// it resumed from nothing (GitHub #187). This is what names the
+    /// conversation: the new entry joins that entry's lineage, or opens one of
+    /// its own.
+    pub claimed: Option<CheckpointId>,
+    /// Whether this capture opens a new turn — whether a real user message
+    /// lies between [`Self::claimed`]'s opener and this one's. `true` for a
+    /// capture that claimed nothing (a conversation's first checkpoint is its
+    /// first turn's), and `false` when the frontend could not say, because a
+    /// wrong `true` retires a lineage's turn opener and sends the next user
+    /// message cold.
+    pub turn_opening: bool,
+}
+
+/// What [`CheckpointPool::retain`] did: the new entry, and the entries of its
+/// lineage that giving it a place superseded.
+///
+/// The superseded entries are **returned rather than dropped** because the
+/// pool owns no device memory: their images and their holds on the shared
+/// pages below them are the caller's to release, exactly as
+/// [`CheckpointPool::discard_victim`]'s are. A `retain` whose result is
+/// ignored leaks a device image per tool-call iteration.
+#[derive(Debug)]
+#[must_use = "the superseded entries still hold a device image and a shared prefix"]
+pub struct Retained {
+    /// The new entry's id.
+    pub id: CheckpointId,
+    /// Entries of the same lineage this capture displaced, oldest first.
+    pub superseded: Vec<CheckpointEntry>,
 }
 
 /// Why the pool would not take a checkpoint.
@@ -397,6 +458,7 @@ pub struct CheckpointPool {
     tiers: TierList,
     entries: Vec<CheckpointEntry>,
     next_id: CheckpointId,
+    next_lineage: LineageId,
     reused_tok: u64,
     captures: u64,
     skipped_captures: u64,
@@ -427,6 +489,7 @@ impl CheckpointPool {
             tiers,
             entries: Vec::new(),
             next_id: 0,
+            next_lineage: 0,
             reused_tok: 0,
             captures: 0,
             skipped_captures: 0,
@@ -474,14 +537,19 @@ impl CheckpointPool {
         &self.entries
     }
 
-    /// The KV pages the retained entries hold through their shared prefixes.
-    ///
-    /// Counted once per **prefix**, not once per entry: two checkpoints taken
-    /// at different openers inside the same prompt head hold the same shared
+    /// The KV pages of history the retained entries cover, counted once per
+    /// **prefix** rather than once per entry: two checkpoints taken at
+    /// different openers inside the same prompt head hold the same shared
     /// prefix, and its pages are charged to the KV pool exactly once
-    /// ([`crate::prefix::PrefixCache`] is what carries that charge). Summing
-    /// per entry would tell the admission machine that more of the pool is
-    /// reclaimable than actually is.
+    /// ([`crate::prefix::PrefixCache`] is what carries that charge).
+    ///
+    /// **Diagnostic, not the admission machine's number.** Since #187 an entry
+    /// may stand on a *chained* prefix, whose reach includes its ancestors' —
+    /// so two entries on two links of one chain count the shared links twice
+    /// here. What the admission path reads instead is
+    /// `ConcreteScheduler::reclaimable_retained_pages`, which sums each
+    /// prefix's **own** pages and only for prefixes no live request holds:
+    /// pages that would genuinely come back, never a promise that would not.
     pub fn retained_pages(&self) -> u32 {
         let mut counted: Vec<PrefixId> = Vec::with_capacity(self.entries.len());
         let mut pages = 0;
@@ -558,7 +626,7 @@ impl CheckpointPool {
         &mut self,
         capture: CheckpointCapture,
         use_tick: u64,
-    ) -> Result<CheckpointId, RetainRefused> {
+    ) -> Result<Retained, RetainRefused> {
         if let Err(mismatch) = self.identity.accepts(&capture.identity) {
             self.refused_blobs += 1;
             return Err(RetainRefused::Identity(mismatch));
@@ -571,6 +639,23 @@ impl CheckpointPool {
             self.skipped_captures += 1;
             return Err(RetainRefused::Budget);
         }
+        // GitHub #187. A claimed entry that is already gone — taken by the
+        // first-victim path, or superseded by a sibling that finished first —
+        // leaves this capture with no conversation to join. It opens one,
+        // which is the same answer a first turn gets and for the same reason:
+        // there is nothing to supersede either way.
+        let inherited = capture
+            .claimed
+            .and_then(|claimed| self.entries.iter().find(|e| e.id == claimed))
+            .map(|e| e.lineage);
+        let lineage = match inherited {
+            Some(lineage) => lineage,
+            None => {
+                let fresh = self.next_lineage;
+                self.next_lineage += 1;
+                fresh
+            }
+        };
         let id = self.next_id;
         self.next_id += 1;
         self.used_bytes += capture.bytes;
@@ -586,9 +671,45 @@ impl CheckpointPool {
             pages: capture.pages,
             bytes: capture.bytes,
             gdn: capture.gdn,
+            lineage,
+            turn_opening: capture.turn_opening,
             use_tick,
         });
-        Ok(id)
+        Ok(Retained {
+            id,
+            superseded: self.cut_lineage_back(lineage),
+        })
+    }
+
+    /// Cut `lineage` back to the two entries ADR 0029 lets a conversation
+    /// keep — its latest and its newest turn-opening one — and return the rest
+    /// for the caller to release (GitHub #187).
+    ///
+    /// Newest by id rather than by [`CheckpointEntry::use_tick`]: ids are
+    /// assigned in capture order, and what "latest" means here is *furthest
+    /// along the conversation*, which a claim refreshing an older entry's LRU
+    /// tick must not change.
+    fn cut_lineage_back(&mut self, lineage: LineageId) -> Vec<CheckpointEntry> {
+        let of_lineage = |e: &&CheckpointEntry| e.lineage == lineage;
+        let latest = self.entries.iter().filter(of_lineage).map(|e| e.id).max();
+        let opening = self
+            .entries
+            .iter()
+            .filter(of_lineage)
+            .filter(|e| e.turn_opening)
+            .map(|e| e.id)
+            .max();
+        let superseded: Vec<CheckpointId> = self
+            .entries
+            .iter()
+            .filter(of_lineage)
+            .filter(|e| Some(e.id) != latest && Some(e.id) != opening)
+            .map(|e| e.id)
+            .collect();
+        superseded
+            .into_iter()
+            .filter_map(|id| self.discard(id))
+            .collect()
     }
 
     /// The best retained checkpoint whose content is a prefix of `prompt`, or
@@ -856,8 +977,10 @@ mod tests {
             gdn: gdn_at(tokens.len()),
             identity: pool.identity(),
             tier: ReuseSource::Device,
+            claimed: None,
+            turn_opening: true,
         };
-        pool.retain(capture, tick)
+        pool.retain(capture, tick).map(|retained| retained.id)
     }
 
     /// The pool's answer for a text-only prompt.
@@ -1068,8 +1191,10 @@ mod tests {
                 gdn: gdn_at(tokens.len()),
                 identity: pool.identity(),
                 tier: ReuseSource::Device,
+                claimed: None,
+                turn_opening: true,
             };
-            pool.retain(capture, publisher).unwrap();
+            let _ = pool.retain(capture, publisher).unwrap();
         }
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
@@ -1133,6 +1258,8 @@ mod tests {
             gdn: gdn_at(100),
             identity: load(2),
             tier: ReuseSource::Device,
+            claimed: None,
+            turn_opening: true,
         };
         let refused = pool.retain(foreign, 1).expect_err("another artifact");
         assert_eq!(
@@ -1221,8 +1348,10 @@ mod tests {
             gdn: gdn_at(100),
             identity: pool.identity(),
             tier: ReuseSource::Device,
+            claimed: None,
+            turn_opening: true,
         };
-        pool.retain(capture, 1).unwrap();
+        let _ = pool.retain(capture, 1).unwrap();
         let longer: Vec<TokenId> = (1..=140).collect();
         assert!(
             pool.claim(&PromptContent::new(&longer, &yours), 2).is_none(),
@@ -1361,8 +1490,10 @@ mod tests {
                 gdn: gdn_at(tokens.len()),
                 identity: pool.identity(),
                 tier,
+                claimed: None,
+                turn_opening: true,
             };
-            pool.retain(capture, publisher).unwrap();
+            let _ = pool.retain(capture, publisher).unwrap();
         }
         let victim = pool.discard_victim().expect("a device victim");
         assert_eq!(
@@ -1392,10 +1523,12 @@ mod tests {
             gdn: gdn_at(100),
             identity: pool.identity(),
             tier: ReuseSource::KvRam,
+            claimed: None,
+            turn_opening: true,
         };
         assert_eq!(
-            pool.retain(capture, 1),
-            Err(RetainRefused::UnknownTier(ReuseSource::KvRam))
+            pool.retain(capture, 1).err(),
+            Some(RetainRefused::UnknownTier(ReuseSource::KvRam))
         );
         assert_eq!(pool.entry_count(), 0);
     }

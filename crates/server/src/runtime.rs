@@ -504,6 +504,7 @@ mod tests {
                 RequestInput {
                     multimodal: None,
                     opener_tokens: None,
+                    user_turn_tokens: None,
                     system_block_tokens: None,
                     model: "stub".into(),
                     tokens: vec![1],

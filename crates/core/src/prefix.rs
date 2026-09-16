@@ -54,11 +54,27 @@ pub struct PrefixEntry {
     pub publisher: RequestId,
     /// The cached prefix tokens (the shared prompt head, page-aligned).
     pub tokens: Vec<TokenId>,
-    /// Tokens in the cached prefix (= `pages * page_tokens`).
+    /// Tokens in the cached prefix (= `total_pages * page_tokens`).
     pub length_tokens: u32,
-    /// The KV pages the entry holds in the pool (the shared prefix pages;
-    /// charged to the pool exactly once, for every claimant).
+    /// The KV pages this entry itself holds in the pool — charged exactly
+    /// once, for every claimant.
+    ///
+    /// Its **own** pages, not its history's: a chained entry (GitHub #187)
+    /// covers its parent's pages too, and those are the parent's charge. So
+    /// this is what comes back when the entry drops, and
+    /// [`PrefixCache::total_pages_of`] is what a claimant shares.
     pub pages: u32,
+    /// The entry this one extends (GitHub #187), or `None` for one that
+    /// covers its whole head itself.
+    ///
+    /// A request that resumed from retained state and then prefilled past it
+    /// has no head of its own to publish: the pages below its generation
+    /// opener are partly the entry it claimed. So it publishes a **chained**
+    /// entry — its own new pages, plus the reference on its parent that it
+    /// was holding itself until the publish. That is what lets every
+    /// iteration of a tool loop leave a checkpoint instead of only the first
+    /// (ADR 0029; the leaf's `ignis_seq_prefix::parent` is the same idea).
+    pub parent: Option<PrefixId>,
     /// The GDN state at the prefix's end (the resumable boundary, core-02;
     /// a claimant seeds its recurrent state from this).
     pub gdn: GdnState,
@@ -91,8 +107,9 @@ pub struct PrefixClaim {
     pub publisher: RequestId,
     /// The leading prompt tokens skipped via the cached prefix.
     pub tokens: u32,
-    /// The entry's pages (the caller reduces its own reservation by these
-    /// — the entry now owns the shared pages).
+    /// The pages of the whole head the entry covers, its chain included
+    /// (GitHub #187) — the caller reduces its own reservation by these, since
+    /// every one of them is a page it now shares rather than reserves.
     pub pages: u32,
     /// The claimant's seeded GDN state (resumed at the cached boundary).
     pub gdn: GdnState,
@@ -149,16 +166,35 @@ impl PrefixCache {
     /// (GitHub #126) made that identity load-bearing rather than
     /// bookkeeping: the leaf's prefix — which actually owns the physical
     /// pages — is keyed by it, so every claim carries it to the backend.
+    /// `parent` (GitHub #187) is the entry the publisher was standing on, or
+    /// `None` for one publishing a head it warmed entirely itself. A chained
+    /// entry owns only the pages past its parent's end, and **inherits the
+    /// publisher's reference on the parent** rather than taking a new one:
+    /// from here on the publisher reaches the parent through this entry, so
+    /// the chain is held by exactly one reference per link and the pages
+    /// under it are still charged once. It is refused when it would cover
+    /// nothing its parent does not.
     pub fn register(
         &mut self,
         publisher: RequestId,
         tokens: &[TokenId],
         gdn: &GdnState,
+        parent: Option<PrefixId>,
     ) -> Option<(PrefixId, u32)> {
         let length = (tokens.len() / self.page_tokens as usize) * self.page_tokens as usize;
         if length == 0 {
             return None; // fewer than one page: nothing shareable
         }
+        let below = match parent {
+            Some(parent) => {
+                let pages = self.total_pages_of(parent);
+                if !self.contains(parent) || pages * self.page_tokens >= length as u32 {
+                    return None;
+                }
+                pages
+            }
+            None => 0,
+        };
         // core-02: a prefix is reusable only at a recorded GDN boundary
         // (a mid-prefill position is not resumable for GDN layers).
         if !gdn.is_valid_snapshot_point(gdn.position()) {
@@ -175,7 +211,8 @@ impl PrefixCache {
             publisher,
             tokens: tokens[..length].to_vec(),
             length_tokens: length as u32,
-            pages: (length / self.page_tokens as usize) as u32,
+            pages: (length / self.page_tokens as usize) as u32 - below,
+            parent,
             gdn: gdn.clone(),
             refcount: 1, // the registrant is the first claimant
             retained_at: None,
@@ -231,7 +268,10 @@ impl PrefixCache {
             id,
             publisher: match_entry.publisher,
             tokens: match_entry.length_tokens,
-            pages: match_entry.pages,
+            // The whole head, chain included (GitHub #187): what the claimant
+            // shares is every page below its own first, whichever entry of
+            // the chain happens to own each one.
+            pages: self.total_pages_of(id),
             gdn: match_entry.gdn.clone(),
         };
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
@@ -368,8 +408,13 @@ impl PrefixCache {
             .map_or(0, |e| e.refcount)
     }
 
-    /// The entry `id`'s pages, or 0 when it is gone (GitHub #186: what a
-    /// retained checkpoint records as the pages it holds).
+    /// The entry `id`'s **own** pages, or 0 when it is gone — the pages that
+    /// come back to the pool when it drops.
+    ///
+    /// Not what it covers: a chained entry's parent's pages come back only
+    /// when the parent does. The first-victim path reads this one, so that
+    /// giving up a retained entry never promises admission pages another link
+    /// of the chain is still holding (GitHub #186, #187).
     pub fn pages_of(&self, entry: PrefixId) -> u32 {
         self.entries
             .iter()
@@ -377,21 +422,52 @@ impl PrefixCache {
             .map_or(0, |e| e.pages)
     }
 
-    /// Release one reference to `entry` (the claimant completed or was
-    /// re-queued). When the last reference drops, the entry (and its
-    /// pages) is released: returns the pages freed **and the request that
-    /// published them** (so the caller can drop the backend's handle on the
-    /// leaf's prefix too, P4-10), `None` while the entry is still pinned by
-    /// other claimants.
-    pub fn release(&mut self, entry: PrefixId) -> Option<(u32, RequestId)> {
-        let pos = self.entries.iter().position(|e| e.id == entry)?;
-        self.entries[pos].refcount -= 1;
-        if self.entries[pos].refcount == 0 {
-            let dropped = self.entries.remove(pos);
-            Some((dropped.pages, dropped.publisher))
-        } else {
-            None
+    /// The pages of the whole head `entry` covers — its own and every
+    /// ancestor's (GitHub #187), or 0 when it is gone.
+    ///
+    /// This is what a claimant shares and what a retained checkpoint records
+    /// as the history below its opener: both are about *how much is warm*,
+    /// which the chain answers together, not about who gives what back.
+    pub fn total_pages_of(&self, entry: PrefixId) -> u32 {
+        let mut pages = 0;
+        let mut at = Some(entry);
+        while let Some(id) = at {
+            let Some(e) = self.entries.iter().find(|e| e.id == id) else {
+                break;
+            };
+            pages += e.pages;
+            at = e.parent;
         }
+        pages
+    }
+
+    /// Release one reference to `entry` (the claimant completed or was
+    /// re-queued). When the last reference drops, the entry (and its own
+    /// pages) is released.
+    ///
+    /// Returns every entry that dropped as a result — the pages each freed
+    /// **and the request that published them**, so the caller can drop the
+    /// backend's handle on the leaf's prefix too (P4-10) — innermost first,
+    /// and empty while the entry is still pinned by other claimants. It is a
+    /// list rather than one entry because a chained entry (GitHub #187) holds
+    /// its parent's reference: letting go of the child may let go of the
+    /// parent, and of its parent in turn.
+    pub fn release(&mut self, entry: PrefixId) -> Vec<(u32, RequestId)> {
+        let mut dropped = Vec::new();
+        let mut at = Some(entry);
+        while let Some(id) = at {
+            let Some(pos) = self.entries.iter().position(|e| e.id == id) else {
+                break;
+            };
+            self.entries[pos].refcount -= 1;
+            if self.entries[pos].refcount != 0 {
+                break;
+            }
+            let entry = self.entries.remove(pos);
+            dropped.push((entry.pages, entry.publisher));
+            at = entry.parent;
+        }
+        dropped
     }
 
     /// Whether the cache holds a live entry for `entry` (a claimant's
@@ -484,7 +560,7 @@ mod tests {
         // whole pages) — the half page is never split between requests.
         let mut cache = PrefixCache::new(16);
         let tokens: Vec<TokenId> = (1..=40).collect();
-        let (_, pages) = cache.register(7, &tokens, &gdn_boundary(0)).unwrap();
+        let (_, pages) = cache.register(7, &tokens, &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 2, "a 40-token prompt holds 2 shared pages");
         assert_eq!(cache.pinned_pages(), 2);
         // A sibling whose prompt starts with the cached prefix matches it
@@ -502,7 +578,7 @@ mod tests {
         let mut cache = PrefixCache::new(16);
         let tokens: Vec<TokenId> = (1..=15).collect();
         assert!(
-            cache.register(7, &tokens, &gdn_boundary(0)).is_none(),
+            cache.register(7, &tokens, &gdn_boundary(0), None).is_none(),
             "a sub-page prompt holds no shareable page"
         );
         assert_eq!(cache.entry_count(), 0);
@@ -516,13 +592,13 @@ mod tests {
         let mut cache = PrefixCache::new(16);
         let tokens = prompt64();
         assert_eq!(
-            cache.register(7, &tokens, &gdn_mid_prefill(128)),
+            cache.register(7, &tokens, &gdn_mid_prefill(128), None),
             None,
             "a mid-prefill position is not a reusable prefix"
         );
         assert_eq!(cache.entry_count(), 0);
         // The same prompt with a valid boundary registers fine.
-        let (id, pages) = cache.register(7, &tokens, &gdn_boundary(0)).unwrap();
+        let (id, pages) = cache.register(7, &tokens, &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
         let _ = id;
     }
@@ -534,10 +610,10 @@ mod tests {
         // entry — no second set of pages).
         let mut cache = PrefixCache::new(16);
         let tokens = prompt64();
-        let (_, pages) = cache.register(7, &tokens, &gdn_boundary(0)).unwrap();
+        let (_, pages) = cache.register(7, &tokens, &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
         assert!(
-            cache.register(7, &tokens, &gdn_boundary(0)).is_none(),
+            cache.register(7, &tokens, &gdn_boundary(0), None).is_none(),
             "a duplicate prompt is not re-registered"
         );
         assert_eq!(cache.entry_count(), 1);
@@ -552,8 +628,8 @@ mod tests {
         // Two cached prefixes, one a prefix of the other: a 96-token
         // prompt matches the longer (6-page) entry, not the shorter one.
         let mut cache = PrefixCache::new(16);
-        cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
-        cache.register(7, &prompt96(), &gdn_boundary(0)).unwrap();
+        cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.register(7, &prompt96(), &gdn_boundary(0), None).unwrap();
         let claim = cache.claim(&prompt96()).unwrap();
         assert_eq!(claim.tokens, 96, "the longest cached prefix matches");
         // A 64-token prompt matches only the shorter entry.
@@ -564,7 +640,7 @@ mod tests {
     #[test]
     fn claim_bumps_refcount_and_counts_reused_tokens() {
         let mut cache = PrefixCache::new(16);
-        cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         assert_eq!(cache.reused_tok(), 0, "registration is not a reuse");
         let claim = cache.claim(&prompt64()).unwrap();
         assert_eq!(claim.pages, 4);
@@ -580,21 +656,21 @@ mod tests {
     #[test]
     fn release_drops_the_entry_at_zero_refcount() {
         let mut cache = PrefixCache::new(16);
-        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
         cache.claim(&prompt64()).unwrap(); // refcount 2
         // Releases down to one claimant keep the entry pinned.
-        assert_eq!(cache.release(id), None, "other claimants still pin it");
+        assert_eq!(cache.release(id), vec![], "other claimants still pin it");
         assert_eq!(cache.pinned_pages(), 4);
         // The last release drops the entry, frees its pages and names the
         // request that published them (P4-10: the backend's own handle on
         // the leaf's prefix is dropped by that id).
-        assert_eq!(cache.release(id), Some((4, 7)));
+        assert_eq!(cache.release(id), vec![(4, 7)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert_eq!(cache.entry_count(), 0);
         // A dropped entry cannot be claimed or released again.
         assert!(cache.claim(&prompt64()).is_none());
-        assert_eq!(cache.release(id), None);
+        assert_eq!(cache.release(id), vec![]);
     }
 
     #[test]
@@ -603,7 +679,7 @@ mod tests {
         // owns the pages — is keyed by its publisher, so a claim that could
         // not name it would leave the backend unable to share anything.
         let mut cache = PrefixCache::new(16);
-        cache.register(42, &prompt64(), &gdn_boundary(0)).unwrap();
+        cache.register(42, &prompt64(), &gdn_boundary(0), None).unwrap();
         let claim = cache.claim(&prompt64()).unwrap();
         assert_eq!(claim.publisher, 42);
     }
@@ -632,8 +708,8 @@ mod tests {
         // covers 64 tokens gains nothing from a 64-token prefix, and claiming
         // it would pin an entry and count a skip that never happened.
         let mut cache = PrefixCache::new(16);
-        cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
-        cache.register(8, &prompt96(), &gdn_boundary(0)).unwrap();
+        cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.register(8, &prompt96(), &gdn_boundary(0), None).unwrap();
         assert!(
             cache.claim_longer_than(&prompt96(), 96).is_none(),
             "nothing reaches past the floor"
@@ -649,23 +725,85 @@ mod tests {
         // opener through this very entry, so the entry survives the request
         // that published it — and its pages are still charged exactly once.
         let mut cache = PrefixCache::new(16);
-        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
         assert!(cache.retain(id), "the checkpoint takes a reference");
         assert_eq!(cache.pages_of(id), 4);
         // The publisher completes: its own reference goes, the entry stays.
-        assert_eq!(cache.release(id), None, "the checkpoint still holds it");
+        assert_eq!(cache.release(id), vec![], "the checkpoint still holds it");
         assert_eq!(cache.pinned_pages(), 4);
         assert!(
             cache.claim(&prompt64()).is_some(),
             "a later sibling can still claim it"
         );
-        assert_eq!(cache.release(id), None);
+        assert_eq!(cache.release(id), vec![]);
         // The checkpoint is discarded last: now the pages come back.
-        assert_eq!(cache.release(id), Some((4, 7)));
+        assert_eq!(cache.release(id), vec![(4, 7)]);
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.retain(id), "a dropped entry cannot be retained");
         assert_eq!(cache.pages_of(id), 0);
+    }
+
+    // ── Chained prefixes (GitHub #187) ──────────────────────────────────
+
+    #[test]
+    fn a_chained_prefix_covers_the_head_its_publisher_claimed() {
+        // GitHub #187: a request standing on a 4-page prefix prefills past it
+        // and publishes the 6-page head it now covers. The new entry owns only
+        // the 2 pages it warmed itself — the 4 below stay the parent's, so the
+        // pool is charged for them exactly once — but what it *covers*, and
+        // what a claimant of it shares, is all 6.
+        let mut cache = PrefixCache::new(16);
+        let (parent, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        let (child, own) = cache
+            .register(8, &prompt96(), &gdn_boundary(0), Some(parent))
+            .unwrap();
+        assert_eq!(own, 2, "only the pages the publisher warmed itself");
+        assert_eq!(cache.total_pages_of(child), 6, "the whole head it covers");
+        assert_eq!(cache.pages_of(child), 2, "its own charge");
+        assert_eq!(cache.pinned_pages(), 6, "one charge per page, chain included");
+
+        let claim = cache.claim(&prompt96()).unwrap();
+        assert_eq!(claim.id, child, "the longer, chained head wins");
+        assert_eq!(claim.tokens, 96);
+        assert_eq!(claim.pages, 6, "a claimant shares every page below its own first");
+    }
+
+    #[test]
+    fn releasing_a_chained_prefix_cascades_to_its_parent() {
+        // The child inherits the publishing request's reference on the parent
+        // — from the publish on, that request reaches the parent *through*
+        // the child — so the parent outlives its own registrant and comes
+        // back exactly when the child does, never before.
+        let mut cache = PrefixCache::new(16);
+        let (parent, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        cache.claim(&prompt96()).expect("request 8 claims the parent");
+        let (child, _) = cache
+            .register(8, &prompt96(), &gdn_boundary(0), Some(parent))
+            .unwrap();
+        // The parent's own registrant completes. The child still holds it.
+        assert_eq!(cache.release(parent), vec![], "the child still holds the parent");
+        assert_eq!(cache.pinned_pages(), 6);
+        // Request 8 completes, releasing the child: both entries drop, and
+        // each names the request whose leaf prefix the backend must let go of.
+        assert_eq!(cache.release(child), vec![(2, 8), (4, 7)]);
+        assert_eq!(cache.pinned_pages(), 0);
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn a_chained_prefix_that_reaches_no_further_is_not_registered() {
+        // A publish point at or below what the publisher already shares would
+        // be a second entry over pages it does not own — no new history, and
+        // a parent reference nothing balances.
+        let mut cache = PrefixCache::new(16);
+        let (parent, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        assert_eq!(
+            cache.register(8, &prompt64(), &gdn_boundary(0), Some(parent)),
+            None,
+            "the child covers nothing the parent does not"
+        );
+        assert_eq!(cache.entry_count(), 1);
     }
 
     #[test]
@@ -676,12 +814,12 @@ mod tests {
         // prompt extends nothing of it but the block — claims it as if they
         // had been concurrent.
         let mut cache = PrefixCache::new(16);
-        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, pages) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         assert_eq!(pages, 4);
         assert!(cache.retain_published(id, 1), "the publish is retained");
         assert!(cache.is_retained(id));
         // The publisher completes. Its reference goes; the retention stays.
-        assert_eq!(cache.release(id), None, "the retention still holds it");
+        assert_eq!(cache.release(id), vec![], "the retention still holds it");
         assert_eq!(cache.pinned_pages(), 4);
         let claim = cache.claim(&prompt96()).expect("a later request claims it");
         assert_eq!(claim.tokens, 64, "it skips the whole retained block");
@@ -696,7 +834,7 @@ mod tests {
         // retention goes, and giving it up would cost the next burst its reuse
         // while buying this request nothing.
         let mut cache = PrefixCache::new(16);
-        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         cache.retain_published(id, 1);
         assert_eq!(
             cache.reclaimable_retained(),
@@ -719,7 +857,7 @@ mod tests {
         // twice would release a reference the cache never held and drop the
         // entry out from under a live claimant.
         let mut cache = PrefixCache::new(16);
-        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         cache.retain_published(id, 1);
         assert!(
             !cache.retain_published(id, 2),
@@ -729,7 +867,7 @@ mod tests {
         assert!(cache.unretain(id), "the caller now owes one release");
         assert!(!cache.is_retained(id));
         assert!(!cache.unretain(id), "and owes it exactly once");
-        assert_eq!(cache.release(id), Some((4, 7)), "that release frees the pages");
+        assert_eq!(cache.release(id), vec![(4, 7)], "that release frees the pages");
         assert_eq!(cache.pinned_pages(), 0);
         assert!(!cache.unretain(id), "a dropped entry is not retained");
         assert!(!cache.retain_published(id, 3), "nor can it be retained again");
@@ -741,9 +879,9 @@ mod tests {
         // block a burst is still arriving against must not be given up ahead
         // of one nothing has touched since the server started.
         let mut cache = PrefixCache::new(16);
-        let (old, _) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (old, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         let other: Vec<TokenId> = (500..=595).collect();
-        let (new, _) = cache.register(8, &other, &gdn_boundary(0)).unwrap();
+        let (new, _) = cache.register(8, &other, &gdn_boundary(0), None).unwrap();
         cache.retain_published(old, 1);
         cache.retain_published(new, 2);
         cache.release(old);
@@ -767,7 +905,7 @@ mod tests {
         // Every claim touches, because the claimant cannot tell a retained
         // entry from a live sibling's — and must not have to.
         let mut cache = PrefixCache::new(16);
-        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        let (id, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         cache.touch_retained(id, 5);
         assert!(!cache.is_retained(id), "touching does not retain");
         cache.touch_retained(999, 5); // a gone entry
@@ -780,7 +918,7 @@ mod tests {
         // (core-02): the claim hands over the entry's GDN state (a
         // recorded boundary the claimant can snapshot / resume at).
         let mut cache = PrefixCache::new(16);
-        cache.register(7, &prompt64(), &gdn_boundary(0)).unwrap();
+        cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
         let claim = cache.claim(&prompt64()).unwrap();
         assert!(claim.gdn.is_valid_snapshot_point(claim.gdn.position()));
     }

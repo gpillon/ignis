@@ -391,14 +391,23 @@ struct ignis_seq_prefix_stats {
  * pages for the head and its own pages for everything it writes from here
  * on, and it holds one reference to the prefix like any other claimant.
  *
+ * A sequence that *already* holds a prefix publishes a **chained** entry
+ * (GitHub #187): the entry owns only the pages past what `seq` already
+ * shares, and takes over the reference `seq` was holding on the head below
+ * it, so the chain keeps exactly one reference per link and every page is
+ * still charged to the pool once. `prefix_tokens` is the whole head the entry
+ * covers, and a claimant of it shares every page of that head. This is how a
+ * sequence resumed from retained state reaches the state
+ * ignis_seq_checkpoint_capture demands of its generation opener.
+ *
  * Returns 0 and a handle in `*out_prefix`, which the caller releases with
  * ignis_seq_prefix_release (that handle is one reference of its own, so the
  * prefix outlives `seq`). Returns -1 (see ignis_seq_last_error) on a null
  * argument, a sequence that is not `pool`'s, a `prefix_tokens` of zero, not
- * page-aligned, or beyond what `seq` has written, a sequence that already
- * holds a shared prefix, or an exhausted pool;
- * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq` is mid-chunk or its frontier is
- * not `prefix_tokens`. `seq` and the pool are unchanged on every failure. */
+ * page-aligned, beyond what `seq` has written, or at or below what `seq`
+ * already shares, or an exhausted pool; IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when
+ * `seq` is mid-chunk or its frontier is not `prefix_tokens`. `seq` and the
+ * pool are unchanged on every failure. */
 int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct ignis_seq *seq,
                                   uint32_t prefix_tokens,
                                   struct ignis_seq_prefix **out_prefix);

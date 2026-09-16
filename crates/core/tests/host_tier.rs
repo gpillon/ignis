@@ -29,6 +29,7 @@ fn input(max: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
         opener_tokens: None,
+        user_turn_tokens: None,
         system_block_tokens: None,
         model: "qwen3.8-27b".into(),
         tokens: vec![1, 2, 3, 4],
@@ -290,6 +291,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
                 RequestInput {
                     multimodal: None,
                     opener_tokens: None,
+                    user_turn_tokens: None,
                     system_block_tokens: None,
                     model: "qwen3.8-27b".into(),
                     tokens: (1..=16).collect(),
@@ -313,6 +315,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
@@ -345,6 +348,7 @@ fn a_half_prefilled_request_is_evicted_and_resumes_without_reprefilling() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),
@@ -460,6 +464,7 @@ fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=16).collect(),
@@ -480,6 +485,7 @@ fn a_request_holding_a_shared_prefix_is_never_an_eviction_victim() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1..=16).chain(100..104).collect(),
@@ -561,6 +567,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
                 RequestInput {
                     multimodal: None,
                     opener_tokens: None,
+                    user_turn_tokens: None,
                     system_block_tokens: None,
                     model: "qwen3.8-27b".into(),
                     tokens: (1..=16).collect(),
@@ -582,6 +589,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (1000..1004).collect(),
@@ -601,6 +609,7 @@ fn prefilling_eviction_prefers_agent_over_an_older_interactive_candidate() {
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (2000..2004).collect(),

@@ -35,6 +35,7 @@ fn input(tokens: &[u32], max: u32) -> RequestInput {
     RequestInput {
         multimodal: None,
         opener_tokens: None,
+        user_turn_tokens: None,
         system_block_tokens: None,
         model: "qwen3.8-27b".into(),
         tokens: tokens.to_vec(),
@@ -348,6 +349,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: full_prompt,
@@ -367,6 +369,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
             RequestInput {
                 multimodal: None,
                 opener_tokens: None,
+                user_turn_tokens: None,
                 system_block_tokens: None,
                 model: "qwen3.8-27b".into(),
                 tokens: (0..10).collect(),

@@ -14,10 +14,15 @@
 //   3. **a page is freed only when the last holder releases it.** Releasing
 //      one claimant returns its tail and nothing else, and the shared pages
 //      come back when the publisher's handle and every claimant are gone;
+//   3b. **a chained publish extends a claimed head** (GitHub #187): a
+//      sequence standing on a prefix publishes the pages it warmed past it,
+//      over the ones it claimed — one reference per link, the row in logical
+//      page order, and the whole chain freed in one cascade;
 //   4. **every refusal refuses**, leaving the sequence and the pool as they
 //      were: a partial page, a frontier that is not the prefix, a mid-chunk
-//      publisher, a second publish, a reservation with no page of its own,
-//      and a state transfer of a sequence whose history is not all its own.
+//      publisher, a chained publish that reaches no further than what is
+//      already shared, a reservation with no page of its own, and a state
+//      transfer of a sequence whose history is not all its own.
 //
 // It also reports the measured device-to-device clone cost at the real 27B
 // geometry -- the other half of ADR 0024's cost asymmetry, whose host-side
@@ -499,6 +504,116 @@ void check_the_last_holder_frees_the_pages() {
   ignis_seq_pool_free(pool);
 }
 
+// ---- 3b. a chained publish extends a claimed head (GitHub #187) -----------
+
+// Warm `own_pages` of `seq`'s own pages and put it at the boundary they end
+// on. Unlike `give_history` this writes only pages the sequence owns, which
+// is what a claimant standing on a prefix actually has to write.
+void extend_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint32_t own_pages,
+                    std::uint64_t tokens, std::uint32_t seed) {
+  set_frontier(seq, tokens);
+  seq.pending_token = static_cast<std::int32_t>(1000 + seed);
+  std::uint32_t salt = seed;
+  for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
+    const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
+    auto *base                  = static_cast<unsigned char *>(plane.data);
+    const auto page_ids         = seq.kv.page_ids();
+    for (std::uint32_t page = 0; page < own_pages && page < page_ids.size(); ++page) {
+      fill_device(base + static_cast<std::int64_t>(page_ids[page]) * plane.nb[3],
+                  static_cast<std::size_t>(plane.nb[3]), ++salt);
+    }
+  }
+}
+
+void check_a_chained_publish_extends_a_claimed_head() {
+  // GitHub #187. A sequence that resumed from retained state and prefilled
+  // past it has no head of its own to publish -- the pages below its own
+  // generation opener are partly the entry it claimed. It publishes a
+  // *chained* entry: the pages it warmed itself, over the ones it claimed.
+  // That is what puts its own opener inside a page it alone writes, which is
+  // exactly what ignis_seq_checkpoint_capture demands, and it is why every
+  // iteration of an agent's tool loop can leave a checkpoint instead of only
+  // the first.
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "chain: pool create");
+  struct ignis_seq_pool_stats empty{};
+  expect_rc(ignis_seq_pool_stats(pool, &empty), 0, "chain: pool stats empty");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "chain: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x71u);
+  ignis_seq_prefix *parent = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &parent), 0, "chain: publish parent");
+
+  // Turn N+1: it claims the parent, prefills one page past it, and publishes
+  // what it now covers -- three pages, only one of them its own.
+  ignis_seq *turn2 = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, parent, &turn2), 0, "chain: claim parent");
+  const std::vector<std::int32_t> parent_ids = row_of(*pool, turn2->slot, 2);
+  const std::uint32_t kChained               = 3 * kPageTokens;
+  extend_history(*pool, *turn2, 1, kChained, 0x72u);
+  const std::int32_t own_page = turn2->kv.page_ids()[0];
+
+  struct ignis_seq_pool_stats before{};
+  expect_rc(ignis_seq_pool_stats(pool, &before), 0, "chain: pool stats before");
+  ignis_seq_prefix *child = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, turn2, kChained, &child), 0, "chain: publish chained");
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "chain: pool stats after");
+  expect(after.kv_free_pages == before.kv_free_pages,
+         "chain: a chained publish charges the pool nothing new either");
+
+  const struct ignis_seq_prefix_stats child_stats = stats_of(child, "chain: child stats");
+  expect(child_stats.tokens == kChained, "chain: the entry covers the whole head");
+  expect(child_stats.pages == 1, "chain: but owns only the page it warmed itself");
+  expect(child_stats.refcount == 2, "chain: the handle and the publishing sequence");
+  const struct ignis_seq_prefix_stats parent_stats = stats_of(parent, "chain: parent stats");
+  expect(parent_stats.refcount == 3,
+         "chain: the publisher, the returned handle, and the child -- the claimant's own "
+         "reference moved to the child rather than a new one being taken");
+
+  const struct ignis_seq_stats turn2_stats = seq_stats_of(turn2, "chain: turn 2 seq stats");
+  expect(turn2_stats.shared_pages == 3, "chain: it now shares the whole three-page head");
+  expect(turn2_stats.mapped_pages == 6, "chain: and still maps its whole reservation");
+  // Logical page order: the parent's two pages, then the child's one, then
+  // the tail the publisher re-reserved. A row that put the child's page first
+  // would answer from history in the wrong order, silently.
+  const std::vector<std::int32_t> row = row_of(*pool, turn2->slot, 3);
+  expect(row[0] == parent_ids[0] && row[1] == parent_ids[1],
+         "chain: the parent's pages are still logical pages 0 and 1");
+  expect(row[2] == own_page, "chain: and the child's page is logical page 2");
+
+  // Turn N+2 claims the chained entry and shares all three pages, the
+  // parent's included.
+  ignis_seq *turn3 = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, child, &turn3), 0, "chain: claim the chain");
+  const struct ignis_seq_stats turn3_stats = seq_stats_of(turn3, "chain: turn 3 seq stats");
+  expect(turn3_stats.shared_pages == 3, "chain: a claimant shares the whole chain");
+  const std::vector<std::int32_t> claimed_row = row_of(*pool, turn3->slot, 3);
+  expect(claimed_row == row, "chain: over the same physical pages, in the same order");
+
+  // Lifetime: the parent outlives its own publisher, and the whole chain
+  // comes back in one release when the last holder of the child lets go.
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, parent);
+  ignis_seq_release(pool, turn2);
+  struct ignis_seq_pool_stats held{};
+  expect_rc(ignis_seq_pool_stats(pool, &held), 0, "chain: pool stats with the chain held");
+  expect(empty.kv_free_pages - held.kv_free_pages == 3 + 3,
+         "chain: the three shared pages and turn 3's tail are still out of the pool");
+  expect(row_of(*pool, turn3->slot, 3) == row,
+         "chain: and the survivor still addresses every page of the chain");
+
+  ignis_seq_release(pool, turn3);
+  ignis_seq_prefix_release(pool, child);
+  struct ignis_seq_pool_stats freed{};
+  expect_rc(ignis_seq_pool_stats(pool, &freed), 0, "chain: pool stats after");
+  expect(freed.kv_free_pages == freed.kv_page_group_count,
+         "chain: the last release returns the child's page and cascades to the parent's");
+  ignis_seq_pool_free(pool);
+}
+
 // ---- 4. the refusals ------------------------------------------------------
 
 void check_refusals() {
@@ -537,12 +652,14 @@ void check_refusals() {
          "refuse: a refused publish charges the pool nothing");
 
   expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &prefix), 0, "refuse: publish");
-  // A sequence claims at most one prefix, and a claimed head is not its own
-  // to publish.
+  // GitHub #187 made a second publish legal — as a *chained* entry over what
+  // the sequence already shares. One that reaches no further covers nothing of
+  // its own, and would be a second entry over pages it does not own, so it is
+  // refused where a second publish used to be refused outright.
   ignis_seq_prefix *second = nullptr;
   expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &second), -1,
-            "refuse: a second publish from a sequence that already shares its head");
-  expect(second == nullptr, "refuse: nothing is published on a second publish");
+            "refuse: a chained publish that reaches no further than what is already shared");
+  expect(second == nullptr, "refuse: nothing is published on it");
 
   // A reservation that leaves the claimant no page of its own is refused:
   // it would have nowhere to write without touching a shared page.
@@ -659,6 +776,7 @@ int main() {
   check_a_claimant_receives_the_mutable_state();
   check_a_claimant_receives_the_drafter_window();
   check_the_last_holder_frees_the_pages();
+  check_a_chained_publish_extends_a_claimed_head();
   check_refusals();
   report_clone_cost();
 

@@ -63,6 +63,7 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
         params: params(),
         multimodal: None,
         opener_tokens: None,
+        user_turn_tokens: None,
         system_block_tokens: None,
     }
 }
@@ -86,6 +87,7 @@ fn image_input(frontend: &FrontendSet, image: &[u8]) -> RequestInput {
         params: params(),
         multimodal: Some(Arc::new(multimodal)),
         opener_tokens: None,
+        user_turn_tokens: None,
         system_block_tokens: None,
     }
 }
