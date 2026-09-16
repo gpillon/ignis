@@ -104,6 +104,23 @@ correctness oracles.
   the shared pages instead of being refused.
 - **Amends ADR 0023.** Retained state goes first, on the device and in
   KV-RAM.
+- **Departure (#189): the "artifact content hash" above is a hash of the
+  container's *directory*, not of its payload.** The v2 container carries no
+  per-tensor digest by design (`ignis_artifact::checksum`'s module doc), and
+  hashing ~19 GB of weights at every startup is not a price a compatibility
+  check may charge. `Reader::content_hash` therefore digests everything the
+  container *declares*: its identity, its byte size, its payload start, and
+  every object's name, kind, numeric format, storage layout, shape, offset and
+  length. That catches a different model, a re-export, a re-layout, a renamed
+  or added object, and a format change. It does **not** catch an *in-place
+  re-quantization* that rewrote payload bytes while preserving every name,
+  format, shape and offset — a different model this identity would accept
+  blobs from, and the one hole left in user story 16. Recorded as a test
+  rather than a comment (`a_rewritten_payload_alone_is_the_proxys_known_limit`
+  in `crates/artifact/src/lib.rs`). Closing it needs a digest the *producer*
+  writes into the container: a change to the artifact format, not to this
+  feature. **Open for the owner** — whether the proxy is enough, or whether
+  the v2 container should start carrying a payload digest.
 - **Vision (#180)** builds its media-aware prefix identity on the match key
   defined here, instead of adding its own.
 - **Rendering must be stable.** The chat template has to render history the

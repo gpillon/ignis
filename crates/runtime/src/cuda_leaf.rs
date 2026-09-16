@@ -178,6 +178,32 @@ impl CudaLeafConfig {
             self.max_context_tokens,
         )
     }
+
+    /// The compatibility identity of state a load with these options
+    /// produces, given the `artifact` it runs on and the blob
+    /// `layout_version` its leaf writes (GitHub #189, ADR 0029).
+    ///
+    /// **This is where a load option becomes part of the identity or does
+    /// not.** Two of this struct's seven fields do: `kv_format`, which
+    /// decides what a KV page *is*, and `speculation`, whose presence and
+    /// draft window decide whether the sequence pool carries the drafter's
+    /// per-slot sections. The other five — `max_context_tokens`,
+    /// `kv_pool_bytes`, `slot_count`, `prefill_chunk_tokens` and `vision` —
+    /// decide how much work fits and how fast it goes, never what the bytes
+    /// of a sequence mean, so state produced under one value must still be
+    /// usable under another. `kv_pool_bytes` is the sharpest of them: the
+    /// retained pool's own budget beside it is derived from the VRAM left
+    /// after load, a number that differs from one start of the same server to
+    /// the next, and an identity that moved with any of this would refuse
+    /// every blob after a reboot for no reason at all.
+    ///
+    /// The operator's other flags — the bind address, the API key, the
+    /// request timeout, `--prompt-reuse`, `--retained-pool-bytes` — are not
+    /// fields here at all: `ignis_server::runtime::cuda_scheduler` builds
+    /// this struct out of an `EngineShape`, which never carried them.
+    pub fn blob_identity(&self, artifact: ArtifactHash, layout_version: u32) -> BlobIdentity {
+        BlobIdentity::of_load(artifact, self.kv_format, self.speculation, layout_version)
+    }
 }
 
 /// The leaf's model handle: the loaded weights plus the sequence-state
@@ -509,18 +535,12 @@ impl StepLeaf for CudaLeaf {
     /// the container this leaf opened, and the blob layout version comes from
     /// the leaf's own state-section table (ADR 0024 keeps that table
     /// internal, so a version restated in Rust would not move when the table
-    /// did). The other two are this load's options, taken from the config
-    /// they were fixed in rather than re-derived.
-    ///
-    /// Nothing about how *much* is retained reaches it: the pool budget, the
-    /// chunk width, the slot count and `--prompt-reuse` are all absent, which
-    /// is what keeps a derived-from-free-VRAM budget from refusing yesterday's
-    /// blobs after a reboot.
+    /// did). Which of the load's *options* join them is
+    /// [`CudaLeafConfig::blob_identity`]'s decision, so that it can be put
+    /// under test without a card.
     fn blob_identity(&self) -> BlobIdentity {
-        BlobIdentity::of_load(
+        self.config.blob_identity(
             ArtifactHash::from_bytes(self.reader.content_hash()),
-            self.config.kv_format,
-            self.config.speculation,
             snapshot_format_version(),
         )
     }
@@ -670,6 +690,123 @@ mod tests {
 
     // Pure arithmetic, no device — compiled (and run) whenever the `cuda`
     // feature is built, without needing the GPU profile (ADR 0006).
+
+    /// A stand-in artifact hash and blob layout version — held fixed so the
+    /// only thing varying below is the operator's load options.
+    fn artifact() -> ArtifactHash {
+        ArtifactHash::from_bytes([7; 32])
+    }
+    const LAYOUT: u32 = 2;
+
+    #[test]
+    fn the_load_options_that_do_not_change_state_do_not_change_the_identity() {
+        // GitHub #189, ADR 0029, on the struct production actually assembles
+        // the identity from (`cuda_scheduler` builds one of these out of the
+        // operator's `EngineShape`, and `CudaLeaf::blob_identity` reads it).
+        // Every field varied here moves how much work fits or how fast it
+        // goes; none of them changes what a sequence's bytes mean, so a blob
+        // taken under one must still be usable under the other.
+        let lean = CudaLeafConfig::default();
+        let generous = CudaLeafConfig {
+            max_context_tokens: lean.max_context_tokens / 2,
+            kv_pool_bytes: lean.kv_pool_bytes * 2,
+            slot_count: lean.slot_count * 2,
+            prefill_chunk_tokens: 512,
+            vision: Some(ignis_core::Vision::default()),
+            ..lean
+        };
+        assert_ne!(
+            (generous.max_context_tokens, generous.slot_count),
+            (lean.max_context_tokens, lean.slot_count),
+            "the two configs really do differ"
+        );
+        assert_eq!(
+            lean.blob_identity(artifact(), LAYOUT),
+            generous.blob_identity(artifact(), LAYOUT),
+            "context, budget, concurrency, chunk width and vision stay out of it"
+        );
+    }
+
+    #[test]
+    fn the_load_options_that_change_state_do_change_the_identity() {
+        let shape = CudaLeafConfig::default();
+        let baseline = shape.blob_identity(artifact(), LAYOUT);
+
+        let other_format = CudaLeafConfig {
+            kv_format: match shape.kv_format {
+                KvFormat::Bf16 => KvFormat::HqE8_2b,
+                KvFormat::HqE8_2b => KvFormat::Bf16,
+            },
+            ..shape
+        };
+        assert_eq!(
+            baseline
+                .accepts(&other_format.blob_identity(artifact(), LAYOUT))
+                .expect_err("another KV format")
+                .field,
+            ignis_core::IdentityField::KvFormat
+        );
+
+        let drafter = CudaLeafConfig {
+            speculation: Some(
+                ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 4).unwrap(),
+            ),
+            ..shape
+        };
+        assert_eq!(
+            baseline
+                .accepts(&drafter.blob_identity(artifact(), LAYOUT))
+                .expect_err("a drafter this load has not bound")
+                .field,
+            ignis_core::IdentityField::Drafter
+        );
+        // And the window at equal presence: a wider draft window is a
+        // different per-slot section, not a different speed.
+        let wider = CudaLeafConfig {
+            speculation: Some(
+                ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 6).unwrap(),
+            ),
+            ..shape
+        };
+        assert_eq!(
+            drafter
+                .blob_identity(artifact(), LAYOUT)
+                .accepts(&wider.blob_identity(artifact(), LAYOUT))
+                .expect_err("another draft window")
+                .field,
+            ignis_core::IdentityField::Drafter
+        );
+
+        // GitHub #195 landed `--vision` and `--spec dflash2` as independently
+        // resolvable load options, so both can be present at once — and the
+        // drafter half of the identity has to stay the drafter's, not a mode.
+        let both = CudaLeafConfig {
+            vision: Some(ignis_core::Vision::default()),
+            ..drafter
+        };
+        assert_eq!(
+            drafter.blob_identity(artifact(), LAYOUT),
+            both.blob_identity(artifact(), LAYOUT),
+            "vision rides beside the drafter without disturbing it"
+        );
+
+        // The artifact and the leaf's blob layout are the load's too.
+        let elsewhere = ArtifactHash::from_bytes([9; 32]);
+        assert_eq!(
+            baseline
+                .accepts(&shape.blob_identity(elsewhere, LAYOUT))
+                .expect_err("another artifact")
+                .field,
+            ignis_core::IdentityField::Artifact
+        );
+        assert_eq!(
+            baseline
+                .accepts(&shape.blob_identity(artifact(), LAYOUT + 1))
+                .expect_err("another blob layout")
+                .field,
+            ignis_core::IdentityField::LayoutVersion
+        );
+    }
 
     #[test]
     fn the_pool_plan_reports_whole_pages_of_the_configured_format() {

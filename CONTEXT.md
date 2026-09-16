@@ -128,7 +128,13 @@ When output names a domain concept, use the term as defined here.
   request id, and never an operator knob that does not change state — the bind
   address, the prefill chunk, the concurrency and every byte budget are outside
   it, because a budget derived from free VRAM differs from one start to the next
-  (ADR 0029).
+  (ADR 0029). Its artifact hash is **structural**: a digest of what the container
+  declares — its identity, its size, and every object's name, kind, numeric
+  format, storage layout, shape, offset and length — not of the weight bytes,
+  which the v2 container carries no digest of. So it catches another model, a
+  re-export, a re-layout, a renamed object or a format change, and it does *not*
+  catch an in-place re-quantization that left the whole directory untouched
+  (ADR 0029, §Consequences: departure).
 - **Residency tier** — where sequence state lives, in three levels: **Tier 0 —
   device** (VRAM), **Tier 1 — KV-RAM**, **Tier 2 — KV-disk**. State moves down a
   tier when the one above needs the room, and back up to be served. Each tier

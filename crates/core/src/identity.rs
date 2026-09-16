@@ -29,11 +29,16 @@
 //! **Why not a cryptographic hash.** The chain runs once per token of every
 //! admitted prompt, on the scheduler thread; SHA-256 per token would cost tens
 //! of milliseconds on a 60K-token conversation, against a 128-bit mix's
-//! fraction of one. A false match needs a *preimage* on a key the asker can
-//! never observe — the keys are internal, and to compute a colliding prompt
-//! one would first have to know the tokens one is trying to collide with, at
-//! which point one already has the history. Accidental collision over the few
-//! dozen entries a pool holds is nil at 128 bits. The algorithm is versioned
+//! fraction of one. What that costs, stated plainly: the chain is **unkeyed**,
+//! so anyone can compute it offline and its strength is not secrecy. Reaching
+//! another conversation's state needs a *second preimage* — a different token
+//! sequence whose key equals the key of a prefix of that conversation — and
+//! constructing one means first knowing the tokens being collided with, at
+//! which point one already has the history the attack was for. Accidental
+//! collision over the few dozen entries a pool holds is nil at 128 bits. A
+//! cryptographic chain would close the gap between "needs the victim's tokens"
+//! and "needs nothing at all", and that is not worth tens of milliseconds of
+//! every TTFT. The algorithm is versioned
 //! ([`MATCH_KEY_VERSION`]) and the version is mixed into the chain's seed, so
 //! changing it turns every old key into a **miss**, never a wrong hit.
 //!

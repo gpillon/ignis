@@ -57,34 +57,6 @@ pub struct EngineShape {
     pub vision: Option<ignis_core::Vision>,
 }
 
-impl EngineShape {
-    /// The compatibility identity retained state produced under this shape
-    /// carries (GitHub #189, ADR 0029), for an `artifact` whose leaf writes
-    /// blob `layout_version`.
-    ///
-    /// Two of this struct's nine fields reach it. The other seven —
-    /// `prefill_chunk`, `max_context`, `kv_pool_bytes`, `host_pool_bytes`,
-    /// `prompt_reuse`, `retained_pool_bytes` and `vision` — decide how fast
-    /// state is produced, how much of it is kept and what else the load can
-    /// do, never what the bytes of a sequence mean. `retained_pool_bytes` is
-    /// the sharpest case: its default is derived from the VRAM left after
-    /// load, a number that differs from one start to the next, and an
-    /// identity that moved with it would refuse every blob after a reboot for
-    /// no reason at all.
-    pub fn blob_identity(
-        &self,
-        artifact: ignis_core::ArtifactHash,
-        layout_version: u32,
-    ) -> ignis_core::BlobIdentity {
-        ignis_core::BlobIdentity::of_load(
-            artifact,
-            self.kv_format,
-            self.speculation,
-            layout_version,
-        )
-    }
-}
-
 impl Default for EngineShape {
     /// The configured defaults, taken from [`ignis_runtime`] rather than
     /// restated here — one source of truth for what `ignis-server` runs
@@ -274,103 +246,34 @@ mod tests {
         assert_eq!(EngineShape::from(&config), EngineShape::default());
     }
 
-    /// A stand-in artifact hash and blob layout version: what a load reports,
-    /// held fixed so the only thing varying below is the operator's knobs.
-    fn artifact() -> ignis_core::ArtifactHash {
-        ignis_core::ArtifactHash::from_bytes([7; 32])
-    }
-    const LAYOUT: u32 = 2;
-
     #[test]
-    fn the_knobs_that_do_not_change_state_do_not_change_the_identity() {
-        // GitHub #189, ADR 0029. Every flag below moves how fast state is
-        // produced, how much of it is kept or what else the load can do —
-        // none of them changes what a sequence's bytes mean, so a blob taken
-        // under one must still be usable under the other. `retained_pool_bytes`
-        // is the one that makes this a rule and not a nicety: its default is
-        // derived from free VRAM after load, so it differs from one start of
-        // the same server to the next.
-        let lean = EngineShape::default();
-        let generous = EngineShape {
-            prefill_chunk: 512,
-            max_context: 65_536,
-            kv_pool_bytes: lean.kv_pool_bytes * 2,
-            host_pool_bytes: lean.host_pool_bytes * 2,
-            prompt_reuse: !lean.prompt_reuse,
-            retained_pool_bytes: Some(3 * 1024 * 1024 * 1024),
-            vision: Some(ignis_core::Vision::new(4_096).unwrap()),
-            ..lean
+    fn the_serving_flags_never_reach_the_load_the_identity_names() {
+        // GitHub #189, ADR 0029, upstream half. A blob's compatibility
+        // identity is assembled by `CudaLeafConfig::blob_identity` (which
+        // tests which of *its* fields count), and `cuda_scheduler` builds
+        // that struct out of nothing but an `EngineShape`. So the operator
+        // flags below cannot change a blob's identity for a reason stronger
+        // than a rule someone remembers: they do not survive the step into
+        // the only value the load is configured from.
+        let crate::config::ConfigOutcome::Config(base) =
+            crate::config::resolve(&[], |_| None).expect("resolve")
+        else {
+            panic!("expected a runnable config");
         };
-        assert_ne!(lean, generous, "the shapes really do differ");
-        assert_eq!(
-            lean.blob_identity(artifact(), LAYOUT),
-            generous.blob_identity(artifact(), LAYOUT),
-            "no operator knob outside the load's state reaches the identity"
-        );
-    }
-
-    #[test]
-    fn the_load_options_that_change_state_do_change_the_identity() {
-        let shape = EngineShape::default();
-        let baseline = shape.blob_identity(artifact(), LAYOUT);
-
-        let other_format = EngineShape {
-            kv_format: match shape.kv_format {
-                ignis_core::KvFormat::Bf16 => ignis_core::KvFormat::HqE8_2b,
-                ignis_core::KvFormat::HqE8_2b => ignis_core::KvFormat::Bf16,
-            },
-            ..shape
+        let elsewhere = crate::config::Config {
+            bind: "0.0.0.0:9999".into(),
+            request_timeout_secs: base.request_timeout_secs + 7,
+            ui: !base.ui,
+            metrics: Some("127.0.0.1:9101".into()),
+            api_key: Some(crate::config::ApiKeySetting::Generate),
+            ..base.clone()
         };
+        assert_ne!(base, elsewhere, "the two configs really do differ");
         assert_eq!(
-            baseline
-                .accepts(&other_format.blob_identity(artifact(), LAYOUT))
-                .expect_err("another KV format")
-                .field,
-            ignis_core::IdentityField::KvFormat
-        );
-
-        let drafter = EngineShape {
-            speculation: Some(
-                ignis_core::Speculation::new(ignis_core::SpeculativeBackend::Dflash2, 4).unwrap(),
-            ),
-            ..shape
-        };
-        assert_eq!(
-            baseline
-                .accepts(&drafter.blob_identity(artifact(), LAYOUT))
-                .expect_err("a drafter this load has not bound")
-                .field,
-            ignis_core::IdentityField::Drafter
-        );
-
-        // #195 landed `--vision` and `--spec dflash2` as independently
-        // resolvable load options, so both can be present at once — and the
-        // drafter half of the identity has to stay the drafter's, not a mode.
-        let both = EngineShape {
-            vision: Some(ignis_core::Vision::new(4_096).unwrap()),
-            ..drafter
-        };
-        assert_eq!(
-            drafter.blob_identity(artifact(), LAYOUT),
-            both.blob_identity(artifact(), LAYOUT),
-            "vision rides beside the drafter without disturbing it"
-        );
-
-        // The artifact and the leaf's blob layout are the load's too.
-        let elsewhere = ignis_core::ArtifactHash::from_bytes([9; 32]);
-        assert_eq!(
-            baseline
-                .accepts(&shape.blob_identity(elsewhere, LAYOUT))
-                .expect_err("another artifact")
-                .field,
-            ignis_core::IdentityField::Artifact
-        );
-        assert_eq!(
-            baseline
-                .accepts(&shape.blob_identity(artifact(), LAYOUT + 1))
-                .expect_err("another blob layout")
-                .field,
-            ignis_core::IdentityField::LayoutVersion
+            EngineShape::from(&base),
+            EngineShape::from(&elsewhere),
+            "the bind address, the timeout, the UI, the metrics listener and \
+             the API key are not part of what the engine is loaded as"
         );
     }
 

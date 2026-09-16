@@ -1928,6 +1928,16 @@ impl Scheduler for ConcreteScheduler {
                     // GitHub #189: what makes two capture points the same is
                     // their content, so the duplicate check is over the key —
                     // and the key is what the entry will carry anyway.
+                    //
+                    // Known cost, filed as a follow-up rather than fixed here:
+                    // the chain is walked to `at` on every advance a capture is
+                    // possible on, not only on the chunk that lands on it — a
+                    // claimant whose opener floors to `shared_pages` pays it
+                    // every tick. The narrowing is to evaluate this only while
+                    // `start < at <= start + take`, and the `take` it has to
+                    // test is the **pre-cut** one: the cut below is computed
+                    // *from* this answer, so testing the cut width would make
+                    // the guard true by construction.
                     let media = media_keys(&r.input);
                     let head = PromptContent::new(&r.input.tokens, &media).key_at(at);
                     if self.checkpoints.holds(head) { 0 } else { at }
