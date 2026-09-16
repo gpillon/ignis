@@ -52,8 +52,8 @@ use std::path::Path;
 
 use ignis_artifact::vision::VisionProcessor;
 use ignis_artifact::{
-    bind_model_scope_27b_with, materialize, ChatMessage, ContentPart, CudaDevice, DraftModule,
-    FrontendSet, MessageContent, ModelScope, Reader, Role,
+    bind_model_scope_27b_with, materialize, ChatMessage, ChatRenderOptions, ContentPart, CudaDevice,
+    DraftModule, FrontendSet, MessageContent, ModelScope, Reader, Role,
 };
 use ignis_bench::oracle::{
     meets_g1_floor, overall_teacher_forced_agreement, score_teacher_forced, TeacherForcedResult,
@@ -128,8 +128,21 @@ fn prompt_for(
         tool_calls: Vec::new(),
         reasoning_content: None,
     }];
+    // GitHub #185 folded the render flags into `ChatRenderOptions`. These must
+    // stay the options `vision_canary_gpu.rs` renders with, because the
+    // fixture this test scores against was recorded with thinking off and a
+    // different prompt would move the agreement without failing to compile:
+    // `enable_thinking: false` (the fixture's own condition), and the two
+    // defaults `reasoning_effort: None` and `preserve_thinking: false`, which
+    // are what the pre-#185 `false, None, None` rendered.
     let prepared = frontend
-        .prepare_prompt(processor, &messages, &[&canary.image], false, None, None)
+        .prepare_prompt(
+            processor,
+            &messages,
+            &[&canary.image],
+            ChatRenderOptions { enable_thinking: false, ..Default::default() },
+            None,
+        )
         .unwrap_or_else(|e| panic!("{}: prepare prompt: {e}", canary.id));
     let (token_ids, multimodal) = Multimodal::from_prepared(prepared);
     assert_eq!(multimodal.media.len(), 1, "{}: one image per canary", canary.id);
