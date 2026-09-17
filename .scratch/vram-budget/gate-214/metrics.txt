@@ -1,0 +1,91 @@
+# HELP ignis_build_info Constant build identity with value 1.
+# TYPE ignis_build_info gauge
+ignis_build_info{version="0.1.0"} 1
+# HELP ignis_scheduler_requests Current requests by observable scheduler state.
+# TYPE ignis_scheduler_requests gauge
+ignis_scheduler_requests{state="waiting"} 0
+ignis_scheduler_requests{state="running"} 1
+# HELP ignis_requests_accepted_total Accepted submissions.
+# TYPE ignis_requests_accepted_total counter
+ignis_requests_accepted_total 289
+# HELP ignis_requests_completed_total Completed requests.
+# TYPE ignis_requests_completed_total counter
+ignis_requests_completed_total 288
+# HELP ignis_requests_cancelled_total Accepted requests cancelled before completion.
+# TYPE ignis_requests_cancelled_total counter
+ignis_requests_cancelled_total 0
+# HELP ignis_generated_tokens_total Generated tokens on completed requests.
+# TYPE ignis_generated_tokens_total counter
+ignis_generated_tokens_total 153959
+# HELP ignis_decoded_tokens_total Tokens generated so far, counted as each one is emitted.
+# TYPE ignis_decoded_tokens_total counter
+ignis_decoded_tokens_total 156166
+# HELP ignis_kv_cache_evictions_total Cumulative host-tier evictions.
+# TYPE ignis_kv_cache_evictions_total counter
+ignis_kv_cache_evictions_total 65
+# HELP ignis_prefix_reused_tokens_total Cumulative tokens skipped through sibling-prefix reuse.
+# TYPE ignis_prefix_reused_tokens_total counter
+ignis_prefix_reused_tokens_total 407040
+# HELP ignis_retained_reused_tokens_total Cumulative tokens skipped through retained state, by residency tier.
+# TYPE ignis_retained_reused_tokens_total counter
+ignis_retained_reused_tokens_total{tier="device"} 3688114
+ignis_retained_reused_tokens_total{tier="kv_ram"} 10134354
+# HELP ignis_retained_state_hits_total Retained state chosen to resume from or brought back, by residency tier.
+# TYPE ignis_retained_state_hits_total counter
+ignis_retained_state_hits_total{tier="device"} 27
+ignis_retained_state_hits_total{tier="kv_ram"} 168
+# HELP ignis_retained_state_misses_total First prefill chunks with no retained checkpoint matching in the tier.
+# TYPE ignis_retained_state_misses_total counter
+ignis_retained_state_misses_total{tier="device"} 261
+ignis_retained_state_misses_total{tier="kv_ram"} 94
+# HELP ignis_retained_state_spills_total Retained checkpoints and prefixes spilled into the tier.
+# TYPE ignis_retained_state_spills_total counter
+ignis_retained_state_spills_total{tier="device"} 0
+ignis_retained_state_spills_total{tier="kv_ram"} 225
+# HELP ignis_retained_state_discards_total Retained checkpoints and prefixes discarded from the tier.
+# TYPE ignis_retained_state_discards_total counter
+ignis_retained_state_discards_total{tier="device"} 19
+ignis_retained_state_discards_total{tier="kv_ram"} 216
+# HELP ignis_retained_state_restores_total Retained state restored from the tier.
+# TYPE ignis_retained_state_restores_total counter
+ignis_retained_state_restores_total{tier="device"} 27
+ignis_retained_state_restores_total{tier="kv_ram"} 168
+# HELP ignis_requests_rejected_total Rejected submissions by fixed reason.
+# TYPE ignis_requests_rejected_total counter
+ignis_requests_rejected_total{reason="full"} 20
+ignis_requests_rejected_total{reason="unknown_model"} 0
+ignis_requests_rejected_total{reason="oversized"} 0
+# HELP ignis_request_ttft_seconds Submission-to-first-token latency.
+# TYPE ignis_request_ttft_seconds histogram
+ignis_request_ttft_seconds_bucket{le="0.05"} 0
+ignis_request_ttft_seconds_bucket{le="0.1"} 1
+ignis_request_ttft_seconds_bucket{le="0.25"} 24
+ignis_request_ttft_seconds_bucket{le="0.5"} 100
+ignis_request_ttft_seconds_bucket{le="1"} 141
+ignis_request_ttft_seconds_bucket{le="2.5"} 153
+ignis_request_ttft_seconds_bucket{le="5"} 171
+ignis_request_ttft_seconds_bucket{le="10"} 195
+ignis_request_ttft_seconds_bucket{le="30"} 272
+ignis_request_ttft_seconds_bucket{le="60"} 288
+ignis_request_ttft_seconds_bucket{le="120"} 289
+ignis_request_ttft_seconds_bucket{le="300"} 289
+ignis_request_ttft_seconds_bucket{le="+Inf"} 289
+ignis_request_ttft_seconds_sum 2444.321
+ignis_request_ttft_seconds_count 289
+# HELP ignis_request_duration_seconds Submission-to-completion latency.
+# TYPE ignis_request_duration_seconds histogram
+ignis_request_duration_seconds_bucket{le="0.1"} 1
+ignis_request_duration_seconds_bucket{le="0.25"} 2
+ignis_request_duration_seconds_bucket{le="0.5"} 2
+ignis_request_duration_seconds_bucket{le="1"} 2
+ignis_request_duration_seconds_bucket{le="2.5"} 6
+ignis_request_duration_seconds_bucket{le="5"} 19
+ignis_request_duration_seconds_bucket{le="10"} 108
+ignis_request_duration_seconds_bucket{le="30"} 193
+ignis_request_duration_seconds_bucket{le="60"} 272
+ignis_request_duration_seconds_bucket{le="120"} 285
+ignis_request_duration_seconds_bucket{le="300"} 287
+ignis_request_duration_seconds_bucket{le="600"} 287
+ignis_request_duration_seconds_bucket{le="+Inf"} 288
+ignis_request_duration_seconds_sum 7691.415
+ignis_request_duration_seconds_count 288

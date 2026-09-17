@@ -1,0 +1,4 @@
+GPU guard: card is free
+started ignis-server pid 64796: target/x86_64-pc-windows-msvc/release/ignis-server.exe --bind 127.0.0.1:8000 --artifact F:/ai/opencode/inference/models/qwen3_8_27b_nvfp4full-v2.ninfer --kv-format hq-e8-2b --max-context 262144 --prefill-chunk 1024 --kv-host-pool-bytes 8G --request-timeout 1800 --spec dflash2 --draft-tokens 7 --ui --metrics --system-message-policy merge --developer-message-policy inplace --vision
+log .scratch/serve/ignis-server.log ; waiting up to 600s for http://127.0.0.1:8000/v1/models
+ready: http://127.0.0.1:8000 (pid 64796, 11.2s)
