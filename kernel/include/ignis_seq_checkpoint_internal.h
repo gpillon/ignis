@@ -56,11 +56,11 @@ struct ignis_seq_checkpoint {
   ignis_seq_prefix *prefix = nullptr;
   /* The device image of every device-resident CLONE section, at the opener
    * rather than at the prefix's page boundary. */
-  ninfer::DeviceBuffer image;
+  ignis_counted_device_buffer image{IGNIS_ALLOC_CHECKPOINT_IMAGE};
   /* A copy of the physical KV page the opener ends inside, packed plane by
    * plane the way `pack_paged_kv_allocation_to_host` packs one page -- so
    * this image and a snapshot blob's KV section lay a page out the same way. */
-  ninfer::DeviceBuffer tail_page;
+  ignis_counted_device_buffer tail_page{IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE};
   /* The IGNIS_SEQ_SECTION_PROGRESS payload: host scalars, so they live here
    * rather than in a device image (the snapshot path does the same). */
   ignis_seq_progress_image progress{};

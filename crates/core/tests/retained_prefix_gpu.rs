@@ -198,6 +198,7 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

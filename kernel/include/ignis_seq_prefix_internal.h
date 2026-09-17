@@ -77,7 +77,7 @@ struct ignis_seq_prefix {
   /* The device-resident image of every device-resident CLONE section, laid
    * out by `ignis_seq_prefix_clone_layout`. One copy per prefix, not per
    * claimant. */
-  ninfer::DeviceBuffer clone_image;
+  ignis_counted_device_buffer clone_image{IGNIS_ALLOC_PREFIX_IMAGE};
   /* The IGNIS_SEQ_SECTION_PROGRESS payload: host scalars, so they live here
    * rather than in the device image above (the snapshot path writes them
    * with a plain memcpy for the same reason). */

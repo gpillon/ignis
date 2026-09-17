@@ -95,6 +95,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
                 kv_page_group_count: 8,
                 max_context_tokens: max_context,
                 slot_count: 1,
+                retained_slot_count: 0,
             },
         )
         .unwrap_or_else(|e| panic!("seq pool create: {e}"));

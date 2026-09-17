@@ -64,6 +64,7 @@ fn new_pool(slot_count: u32) -> Result<SeqPool, String> {
             kv_page_group_count: pages_for(MAX_CONTEXT) * slot_count,
             max_context_tokens: MAX_CONTEXT,
             slot_count,
+            retained_slot_count: 0,
         },
     )
 }

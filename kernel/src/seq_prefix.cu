@@ -204,7 +204,8 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     // pool exactly as they were.
     auto entry                = std::make_unique<ignis_seq_prefix>();
     const std::uint64_t bytes = ignis_seq_prefix_clone_bytes(ignis_seq_prefix_clone_layout(*pool));
-    entry->clone_image        = ninfer::DeviceBuffer(static_cast<std::size_t>(bytes));
+    entry->clone_image =
+        ignis_counted_device_buffer(IGNIS_ALLOC_PREFIX_IMAGE, static_cast<std::size_t>(bytes));
     entry->tokens             = prefix_tokens;
     timed_transfer(*pool, *entry, *seq, IGNIS_SEQ_PREFIX_CAPTURE);
 

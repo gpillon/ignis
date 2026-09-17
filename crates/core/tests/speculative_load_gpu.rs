@@ -82,6 +82,7 @@ fn a_dflash2_load_reports_the_drafters_vram_and_a_plain_load_reports_todays() {
                 kv_page_group_count: 8,
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,
+                retained_slot_count: 0,
             },
             speculation.map(|s| s.backend()),
         )

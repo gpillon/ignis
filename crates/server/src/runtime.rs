@@ -164,6 +164,7 @@ pub fn vram_lines(
         verify_round: reserved.verify_round,
         drafter_round: reserved.drafter_round,
         lane_state: reserved.lane_state,
+        retained_slots: reserved.retained_slots,
         retained: retained_bytes,
         residual: ignis_runtime::LOAD_RESIDUAL_BYTES,
     }
@@ -195,6 +196,7 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
                 verify_round_bytes = lines.verify_round,
                 drafter_round_bytes = lines.drafter_round,
                 lane_state_bytes = lines.lane_state,
+                retained_slots_bytes = lines.retained_slots,
                 retained_bytes = lines.retained,
                 residual_bytes = lines.residual,
                 kv_pool_bytes = plan.kv_pool_bytes,
@@ -587,6 +589,7 @@ mod tests {
             verify_round: 6,
             drafter_round: 7,
             lane_state: 8,
+            retained_slots: 10,
             kv_pool: 1 << 40,
         };
         let lines = vram_lines(100, reserved, 9);
@@ -603,6 +606,7 @@ mod tests {
                 6,
                 7,
                 8,
+                10,
                 9,
                 ignis_runtime::LOAD_RESIDUAL_BYTES,
             ],

@@ -192,6 +192,7 @@ fn capture_hq_kv_fixture_from_a_real_prefill() {
             kv_page_group_count: MAX_CONTEXT / 64,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 1,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("seq pool: {e}"));

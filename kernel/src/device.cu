@@ -14,10 +14,12 @@
 // `CudaDevice` skips unless `IGNIS_TEST_CUDA=1` and the GPU is free).
 
 #include "ignis_device.h"
+#include "ignis_seq.h"
 
 #include <cuda_runtime.h>
 #include <nvml.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -52,6 +54,9 @@ bool ensure_device(struct ignis_device *d) {
 }
 
 }  // namespace
+
+// GitHub #211: kernel/src/seq.cu keeps the allocation counter.
+void ignis_alloc_count_record(std::int32_t kind, bool alloc, std::uint64_t bytes);
 
 extern "C" struct ignis_device *ignis_device_create(int device_id) {
   int count = 0;
@@ -118,6 +123,7 @@ extern "C" int32_t ignis_device_alloc(struct ignis_device *d, uint64_t bytes, vo
   if (err != cudaSuccess) {
     return log_cuda_error(-1, "cudaMalloc", err);
   }
+  ignis_alloc_count_record(IGNIS_ALLOC_DEVICE, true, bytes);
   *out_ptr = ptr;
   return 0;
 }
@@ -242,6 +248,7 @@ extern "C" void ignis_device_free(struct ignis_device *d, void *ptr) {
   if (!ensure_device(d)) {
     return;
   }
+  ignis_alloc_count_record(IGNIS_ALLOC_DEVICE, false, 0);
   cudaError_t err = cudaFree(ptr);
   if (err != cudaSuccess) {
     log_cuda_error(0, "cudaFree", err);

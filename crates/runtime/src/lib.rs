@@ -99,6 +99,8 @@ pub struct ReservedBytes {
     pub drafter_round: u64,
     /// Every lane's state in the sequence pool.
     pub lane_state: u64,
+    /// The sequence pool's retained slots (GitHub #211).
+    pub retained_slots: u64,
     /// The KV pool's arena, planes and block tables.
     pub kv_pool: u64,
 }

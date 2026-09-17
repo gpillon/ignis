@@ -54,6 +54,7 @@ fn pool_from_budget(format: KvFormat, budget_bytes: u64, slot_count: u32) -> Seq
             kv_page_group_count: plan.page_count,
             max_context_tokens: TARGET_CONTEXT,
             slot_count,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create ({format}): {e}"))

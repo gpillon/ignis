@@ -147,6 +147,7 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
             kv_page_group_count: 48,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -333,6 +334,7 @@ fn publishing_is_refused_unless_the_sequence_stands_on_the_prefix() {
             kv_page_group_count: 24,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

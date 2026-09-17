@@ -160,6 +160,7 @@ fn token_zero_top_k_logits_for_the_divergent_canaries() {
                 kv_page_group_count: 8,
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: 1,
+                retained_slot_count: 0,
             },
         )
         .unwrap_or_else(|e| panic!("{}: seq pool create: {e}", canary.id));

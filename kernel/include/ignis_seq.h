@@ -152,7 +152,8 @@ struct ignis_seq_pool_spec {
    * block-table's logical-page capacity (ninfer::pages_for_tokens). */
   uint32_t max_context_tokens;
   /* Max concurrent sequences: the KV pool's block-table row count and the
-   * GDN pool's slot count (the same number addresses both). */
+   * lanes of the GDN pool (the same number addresses both). The GDN pool
+   * holds `retained_slot_count` more slots past them. */
   uint32_t slot_count;
   uint32_t gdn_num_layers;
   uint32_t gdn_conv_channels;
@@ -174,6 +175,13 @@ struct ignis_seq_pool_spec {
    * match the speculative backend of the model the pool's sequences are
    * stepped with. */
   int32_t speculative_backend;
+  /* Retained slots beside the lanes (GitHub #211, ADR 0030): places for one
+   * mutable-state image each -- a lane's own state, GDN conv and recurrent
+   * state, penalty counts and, under DFLASH2, the drafter's window and
+   * checkpoint -- with no KV block-table row. `ignis_seq_alloc` never hands
+   * one to a sequence; `ignis_seq_retained_store` / `_load` move a lane's
+   * state in and out. 0 reserves none. */
+  uint32_t retained_slot_count;
 };
 
 struct ignis_seq_pool_stats {
@@ -200,10 +208,15 @@ struct ignis_seq_pool_stats {
   /* The KV arena's device bytes: every plane and the block tables
    * (GitHub #210). */
   uint64_t kv_arena_bytes;
-  /* Every slot's mutable state on the device: the GDN state arena, the
+  /* Every lane's mutable state on the device: the GDN state arena, the
    * penalty counts and, under DFLASH2, the drafter's window and checkpoint
-   * (GitHub #210). */
+   * (GitHub #210) -- the retained slots' share of those arenas excluded. */
   uint64_t lane_state_bytes;
+  /* The retained slots (GitHub #211): how many, what one slot's state
+   * occupies, and `retained_slot_count * slot_state_bytes`. */
+  uint32_t retained_slot_count;
+  uint64_t slot_state_bytes;
+  uint64_t retained_state_bytes;
 };
 
 /* What a pool built from a spec occupies, planned without building it
@@ -216,6 +229,10 @@ struct ignis_seq_pool_plan {
   /* = ignis_seq_checkpoint_image_bytes of the built pool: the device bytes
    * one checkpoint capture allocates. */
   uint64_t checkpoint_image_bytes;
+  /* = ignis_seq_pool_stats::slot_state_bytes and ::retained_state_bytes of
+   * the built pool (GitHub #211). */
+  uint64_t slot_state_bytes;
+  uint64_t retained_state_bytes;
 };
 
 struct ignis_seq_stats {
@@ -599,6 +616,66 @@ int32_t ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
 int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *pool,
                                        const struct ignis_seq_checkpoint *checkpoint, void *dst,
                                        uint64_t dst_bytes);
+
+/* --- retained slots (GitHub #211, ADR 0030) -------------------------------
+ *
+ * A retained slot is a lane's mutable state without a lane: the same
+ * sections a prefix clone carries (GDN conv and recurrent state, penalty
+ * counts, the drafter's window and checkpoint), at a slot index past every
+ * lane's, reserved when the pool is built. The progress scalars and the KV
+ * pages are not part of it. Which retained slot is free is the caller's
+ * bookkeeping (`ignis_core::RetainedSlots`); these two calls only move state.
+ * Both are device-to-device and return with the copies complete.
+ */
+
+/* Copy `seq`'s mutable state into retained slot `retained_slot` (0-based,
+ * below the pool's `retained_slot_count`), overwriting what it held. `seq` is
+ * read, never changed. Returns 0; -1 on a null argument, a sequence that is
+ * not `pool`'s, a retained slot out of range, or a failed device copy;
+ * IGNIS_SEQ_ERR_NOT_AT_BOUNDARY when `seq` is mid-chunk. */
+int32_t ignis_seq_retained_store(struct ignis_seq_pool *pool, const struct ignis_seq *seq,
+                                 uint32_t retained_slot);
+
+/* Copy retained slot `retained_slot`'s state into `seq`'s own slot. The
+ * retained slot keeps it. Only the mutable sections move: `seq`'s progress
+ * and KV pages are untouched. Returns and refuses as ignis_seq_retained_store
+ * does. */
+int32_t ignis_seq_retained_load(struct ignis_seq_pool *pool, uint32_t retained_slot,
+                                struct ignis_seq *seq);
+
+/* --- device allocation counter (GitHub #211, ADR 0030) --------------------
+ *
+ * Every allocation and free the leaf makes while serving, by what made it:
+ * a test reads the counts around a request mix to show where serving
+ * allocates. Process-wide and never reset; a reader takes the difference of
+ * two reads. The load's own reservations (the pool's and the model's arenas)
+ * are not counted.
+ */
+enum ignis_alloc_kind {
+  /* A shared prefix's mutable-state image (ignis_seq_prefix_publish). */
+  IGNIS_ALLOC_PREFIX_IMAGE = 0,
+  /* A prompt checkpoint's mutable-state image (ignis_seq_checkpoint_capture). */
+  IGNIS_ALLOC_CHECKPOINT_IMAGE = 1,
+  /* A prompt checkpoint's copy of its partial tail page. */
+  IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE = 2,
+  /* A pinned host region: a KV-RAM blob (ignis_host_pinned_alloc). */
+  IGNIS_ALLOC_KV_RAM_BLOB = 3,
+  /* A device region from ignis_device_alloc (ignis_device.h). */
+  IGNIS_ALLOC_DEVICE = 4,
+  IGNIS_ALLOC_KIND_COUNT = 5
+};
+
+struct ignis_alloc_count {
+  uint64_t allocs;
+  uint64_t frees;
+  /* Bytes of every counted allocation. A free is counted, not sized:
+   * ignis_host_pinned_free and ignis_device_free are not told the size. */
+  uint64_t alloc_bytes;
+};
+
+/* The counts of `kind` (enum ignis_alloc_kind) since the process started.
+ * Returns 0; -1 on a null `out` or an unknown kind. */
+int32_t ignis_alloc_counts(int32_t kind, struct ignis_alloc_count *out);
 
 /* --- pinned host memory (P4-07, GitHub #125) ------------------------------
  *

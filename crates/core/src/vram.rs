@@ -71,6 +71,9 @@ pub struct VramLines {
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
     /// conv state, penalty counts, the drafter's window and checkpoint.
     pub lane_state: u64,
+    /// The sequence pool's retained slots (GitHub #211): a lane's state each,
+    /// reserved at load beside the lanes.
+    pub retained_slots: u64,
     /// The retained checkpoint budget (0 with `--prompt-reuse off`). A ledger
     /// the scheduler charges checkpoint images to, reserved here so the KV
     /// pool never takes the memory those images are allocated from.
@@ -84,7 +87,7 @@ pub struct VramLines {
 impl VramLines {
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
-    pub fn entries(&self) -> [(&'static str, u64); 12] {
+    pub fn entries(&self) -> [(&'static str, u64); 13] {
         [
             ("weights", self.weights),
             ("cuda_context", self.cuda_context),
@@ -96,6 +99,7 @@ impl VramLines {
             ("verify_round", self.verify_round),
             ("drafter_round", self.drafter_round),
             ("lane_state", self.lane_state),
+            ("retained_slots", self.retained_slots),
             ("retained", self.retained),
             ("residual", self.residual),
         ]
@@ -362,6 +366,7 @@ mod tests {
             verify_round: 100 * MIB,
             drafter_round: 150 * MIB,
             lane_state: 1800 * MIB,
+            retained_slots: 450 * MIB,
             retained: 1800 * MIB,
             residual: 280 * MIB,
         }
@@ -549,6 +554,7 @@ mod tests {
                 "verify_round",
                 "drafter_round",
                 "lane_state",
+                "retained_slots",
                 "retained",
                 "residual",
             ]

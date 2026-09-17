@@ -1,7 +1,8 @@
 //! GPU coverage for the load's VRAM plan (GitHub #210, ADR 0030): what the
 //! leaf says a load will reserve, asked before the weights are on the device,
 //! is to the byte what the loaded model and pool then hold -- every workspace,
-//! every lane's state, the KV arena, and what one checkpoint capture costs.
+//! every lane's state, the retained slots, the KV arena, and what one
+//! checkpoint capture costs.
 //!
 //! Run at the Makefile's serving shape (262K hq-e8-2b, DFlash2 with a
 //! 7-token window, vision), where every line is nonzero. Its own test binary:
@@ -50,6 +51,8 @@ fn the_planned_reservations_are_what_the_load_holds() {
         kv_pool_bytes: u64::from(pages) * page_bytes,
         speculation: Some(speculation),
         vision: Some(vision),
+        // GitHub #211: retained slots are a line of their own.
+        retained_slots: 2,
         ..CudaLeafConfig::default()
     };
     // Planned before any device memory exists, as the server does.
@@ -66,6 +69,7 @@ fn the_planned_reservations_are_what_the_load_holds() {
         ("verify_round", planned.reserved.verify_round),
         ("drafter_round", planned.reserved.drafter_round),
         ("lane_state", planned.reserved.lane_state),
+        ("retained_slots", planned.reserved.retained_slots),
     ] {
         assert!(bytes > 0, "{line} is planned at 0 bytes on a load that reserves it");
     }

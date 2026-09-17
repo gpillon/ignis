@@ -88,6 +88,7 @@ fn pool_for(backend: Option<SpeculativeBackend>, slot_count: u32) -> SeqPool {
             kv_page_group_count: MAX_CONTEXT.div_ceil(64) * slot_count,
             max_context_tokens: MAX_CONTEXT,
             slot_count,
+            retained_slot_count: 0,
         },
         backend,
     )

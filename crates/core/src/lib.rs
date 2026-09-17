@@ -47,6 +47,7 @@ pub mod mock;
 pub mod model_load;
 pub mod prefix;
 pub mod request;
+pub mod retained_slot;
 pub mod scheduler;
 #[cfg(feature = "cuda")]
 pub mod seq;
@@ -83,6 +84,7 @@ pub use kv_format::{
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
+pub use retained_slot::{NotTaken, RetainedSlot, RetainedSlots};
 pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler};
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use vision::{

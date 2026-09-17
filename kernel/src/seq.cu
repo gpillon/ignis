@@ -49,6 +49,8 @@ static_assert(kIgnisHqMetaRowBytes == ninfer::ops::kHqMetaBytes,
 static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
               "kIgnisHqHeadDim has drifted from the vendored kHqHeadDim");
 
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -456,11 +458,25 @@ struct PoolLayout {
   ninfer::CyclicKVCacheLayout dflash2_window_layout;
   ninfer::CyclicKVCacheLayout dflash2_checkpoint_layout;
   std::size_t dflash2_bytes = 0;
+  /* One slot's share of the GDN arena, the penalty counts and the drafter
+   * arena (GitHub #211). */
+  std::uint64_t slot_state_bytes = 0;
 };
+
+// Every slot the state arenas hold: the lanes, then the retained slots past
+// them (GitHub #211). The KV block tables hold the lanes' rows only.
+std::uint32_t state_slot_count(const struct ignis_seq_pool_spec &spec) {
+  return spec.slot_count + spec.retained_slot_count;
+}
+
+std::uint64_t per_slot_bytes(const std::vector<ninfer::LayoutRegion> &regions,
+                             std::uint32_t slots);
+std::uint64_t cyclic_lane_bytes(const ninfer::CyclicKVCacheLayout &layout);
 
 PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   PoolLayout out;
   const auto logical_page_capacity = ninfer::pages_for_tokens(spec.max_context_tokens);
+  const std::uint32_t state_slots  = state_slot_count(spec);
 
   ninfer::LayoutBuilder kv_builder;
   ninfer::PagedKVPoolSpec kv_spec;
@@ -492,13 +508,13 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   gdn_spec.value_heads    = static_cast<std::int32_t>(spec.gdn_value_heads);
   gdn_spec.value_head_dim = static_cast<std::int32_t>(spec.gdn_head_dim);
   gdn_spec.key_head_dim   = static_cast<std::int32_t>(spec.gdn_head_dim);
-  gdn_spec.slot_count     = static_cast<std::int32_t>(spec.slot_count);
+  gdn_spec.slot_count     = static_cast<std::int32_t>(state_slots);
   gdn_spec.conv_dtype     = ninfer::DType::BF16;
   out.gdn_layout = ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_spec);
   out.gdn_bytes  = gdn_builder.finish(256);
 
   // P3-03 (GitHub #99): one int32 penalty count per vocab entry, per slot.
-  out.sampling_counts_bytes = static_cast<std::size_t>(spec.slot_count) *
+  out.sampling_counts_bytes = static_cast<std::size_t>(state_slots) *
                               static_cast<std::size_t>(spec.vocab) * sizeof(std::int32_t);
 
   // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint,
@@ -506,7 +522,7 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
   // lane layout the drafter's kernels address is the one sized here.
   if (spec.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
     ninfer::LayoutBuilder dflash2_builder;
-    const auto lanes = static_cast<std::int32_t>(spec.slot_count);
+    const auto lanes = static_cast<std::int32_t>(state_slots);
     out.dflash2 = true;
     out.dflash2_window_layout = ninfer::plan_cyclic_kv_cache(
         dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
@@ -516,7 +532,22 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
         kIgnisDflash2HeadDim, lanes);
     out.dflash2_bytes = dflash2_builder.finish(256);
   }
+  out.slot_state_bytes = per_slot_bytes(out.gdn_layout.conv, state_slots) +
+                         per_slot_bytes(out.gdn_layout.recurrent, state_slots) +
+                         static_cast<std::uint64_t>(spec.vocab) * sizeof(std::int32_t);
+  if (out.dflash2) {
+    out.slot_state_bytes += cyclic_lane_bytes(out.dflash2_window_layout) +
+                            cyclic_lane_bytes(out.dflash2_checkpoint_layout);
+  }
   return out;
+}
+
+// The state arenas' bytes the lanes hold: every arena less the retained
+// slots' share (GitHub #210, #211).
+std::uint64_t lane_state_bytes_of(const PoolLayout &layout,
+                                  const struct ignis_seq_pool_spec &spec) {
+  return layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes -
+         spec.retained_slot_count * layout.slot_state_bytes;
 }
 
 // One slot's share of every region in `regions`.
@@ -546,8 +577,8 @@ std::uint64_t cyclic_lane_bytes(const ninfer::CyclicKVCacheLayout &layout) {
 std::uint64_t planned_checkpoint_image_bytes(const PoolLayout &layout,
                                              const struct ignis_seq_pool_spec &spec) {
   std::vector<std::uint64_t> sections{
-      per_slot_bytes(layout.gdn_layout.conv, spec.slot_count),
-      per_slot_bytes(layout.gdn_layout.recurrent, spec.slot_count),
+      per_slot_bytes(layout.gdn_layout.conv, state_slot_count(spec)),
+      per_slot_bytes(layout.gdn_layout.recurrent, state_slot_count(spec)),
       static_cast<std::uint64_t>(spec.vocab) * sizeof(std::int32_t),
   };
   if (layout.dflash2) {
@@ -578,8 +609,10 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
   try {
     const PoolLayout layout = plan_pool_layout(*spec);
     out->kv_bytes = layout.kv_bytes;
-    out->lane_state_bytes = layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes;
+    out->lane_state_bytes = lane_state_bytes_of(layout, *spec);
     out->checkpoint_image_bytes = planned_checkpoint_image_bytes(layout, *spec);
+    out->slot_state_bytes = layout.slot_state_bytes;
+    out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_pool_plan: ") + e.what());
@@ -624,6 +657,8 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     // backend owns no per-slot state, but the program entry points still pair
     // a pool with a model of the same backend, one rule for every backend.
     pool->speculative_backend = spec->speculative_backend;
+    pool->retained_slot_count = spec->retained_slot_count;
+    pool->slot_state_bytes    = layout.slot_state_bytes;
 
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
@@ -663,8 +698,12 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   // GitHub #210: the device bytes the pool holds, read off its arenas, for
   // the load to check against its VRAM plan.
   out_stats->kv_arena_bytes = pool->kv_arena.capacity();
+  out_stats->retained_slot_count  = pool->retained_slot_count;
+  out_stats->slot_state_bytes     = pool->slot_state_bytes;
+  out_stats->retained_state_bytes = pool->retained_slot_count * pool->slot_state_bytes;
   out_stats->lane_state_bytes = pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
-                                (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0);
+                                (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0) -
+                                out_stats->retained_state_bytes;
   return 0;
 }
 
@@ -1001,6 +1040,195 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
   }
 }
 
+// ---- retained slots (GitHub #211, ADR 0030) ------------------------------
+
+namespace {
+
+// Copy every mutable state section of slot `src` over slot `dst`, device to
+// device, and synchronize.
+//
+// Walks the same CLONE sections a prefix clone does
+// (`ignis_seq_prefix_clone_layout`), so a section added to the table without
+// a case here throws rather than being silently left behind -- ADR 0024's
+// "carried by all or by none".
+void copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
+  const auto copy = [](void *to, const void *from, std::size_t bytes, const char *what) {
+    const cudaError_t err = cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, nullptr);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemcpyAsync(") + what +
+                               ", slot to slot) failed: " + cudaGetErrorString(err));
+    }
+  };
+  // One 2D copy per GDN section: a slot's state is the same region of every
+  // layer's tensor, at the pool's own layer pitch on both sides (see
+  // ignis_seq_state_transfer for why one copy rather than one per layer).
+  const auto copy_gdn = [&](bool recurrent, const char *what) {
+    const std::uint32_t layers = pool.gdn_pool.layer_count();
+    const std::size_t per_layer =
+        recurrent ? pool.gdn_pool.recurrent_slot_bytes() : pool.gdn_pool.conv_slot_bytes();
+    const std::vector<ninfer::Tensor> &planes =
+        recurrent ? pool.gdn_pool.recurrent : pool.gdn_pool.conv;
+    const auto slot_at = [&](std::int32_t slot) {
+      return recurrent ? pool.gdn_pool.recurrent_slot(0, slot).data
+                       : pool.gdn_pool.conv_slot(0, slot).data;
+    };
+    if (layers <= 1) {
+      copy(slot_at(dst), slot_at(src), per_layer, what);
+      return;
+    }
+    const std::size_t pitch = static_cast<std::size_t>(
+        static_cast<const unsigned char *>(planes[1].data) -
+        static_cast<const unsigned char *>(planes[0].data));
+    const cudaError_t err = cudaMemcpy2DAsync(slot_at(dst), pitch, slot_at(src), pitch, per_layer,
+                                              layers, cudaMemcpyDeviceToDevice, nullptr);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what +
+                               ", slot to slot) failed: " + cudaGetErrorString(err));
+    }
+  };
+
+  for (const ignis_seq_section &section : ignis_seq_prefix_clone_layout(pool)) {
+    const char *what = ignis_seq_section_name(section.kind);
+    switch (section.kind) {
+    case IGNIS_SEQ_SECTION_GDN_CONV:
+      copy_gdn(false, what);
+      break;
+    case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+      copy_gdn(true, what);
+      break;
+    case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+      copy(pool.token_counts_for(dst), pool.token_counts_for(src),
+           static_cast<std::size_t>(section.bytes), what);
+      break;
+    case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT: {
+      const ninfer::CyclicKVCache &cache = section.kind == IGNIS_SEQ_SECTION_DFLASH_WINDOW
+                                               ? *pool.dflash2_window
+                                               : *pool.dflash2_checkpoint;
+      for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
+        const ninfer::CyclicKVCacheLayerView view = cache.layer_view(layer);
+        for (const ninfer::Tensor *plane : {&view.k, &view.v}) {
+          const ninfer::Tensor from = plane->slice(3, src, 1);
+          const ninfer::Tensor to   = plane->slice(3, dst, 1);
+          copy(to.data, from.data, from.bytes(), what);
+        }
+      }
+      break;
+    }
+    default:
+      throw std::logic_error(std::string("state section ") + what +
+                             " has no slot-to-slot copy implementation");
+    }
+  }
+  const cudaError_t err = cudaStreamSynchronize(nullptr);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaStreamSynchronize after a slot copy failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+// The checks ignis_seq_retained_store and _load share, naming `fn` in the
+// message. 0 when the call may proceed.
+int32_t retained_refusal(const ignis_seq_pool *pool, const ignis_seq *seq,
+                         std::uint32_t retained_slot, const char *fn) {
+  if (pool == nullptr || seq == nullptr) {
+    set_error(std::string(fn) + ": null argument");
+    return -1;
+  }
+  if (!ignis_seq_belongs_to(*pool, *seq)) {
+    set_error(std::string(fn) + ": the sequence was not drawn from this pool");
+    return -1;
+  }
+  if (retained_slot >= pool->retained_slot_count) {
+    set_error(std::string(fn) + ": retained slot " + std::to_string(retained_slot) +
+              " is out of range; this pool holds " + std::to_string(pool->retained_slot_count));
+    return -1;
+  }
+  if (!ignis_seq_at_chunk_boundary(*seq)) {
+    set_error(std::string(fn) + ": sequence slot " + std::to_string(seq->slot) +
+              " is mid-chunk (program frontier " + std::to_string(seq->position) +
+              "); its state sections are not consistent with one another");
+    return IGNIS_SEQ_ERR_NOT_AT_BOUNDARY;
+  }
+  return 0;
+}
+
+// The pool slot index of retained slot `retained_slot`: past every lane.
+std::int32_t retained_pool_slot(const ignis_seq_pool &pool, std::uint32_t retained_slot) {
+  return pool.kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot);
+}
+
+} // namespace
+
+extern "C" int32_t ignis_seq_retained_store(struct ignis_seq_pool *pool,
+                                             const struct ignis_seq *seq,
+                                             uint32_t retained_slot) {
+  const char *const fn = "ignis_seq_retained_store";
+  if (const int32_t rc = retained_refusal(pool, seq, retained_slot, fn); rc != 0) {
+    return rc;
+  }
+  try {
+    copy_slot_state(*pool, seq->slot, retained_pool_slot(*pool, retained_slot));
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string(fn) + ": " + e.what());
+    return -1;
+  }
+}
+
+extern "C" int32_t ignis_seq_retained_load(struct ignis_seq_pool *pool, uint32_t retained_slot,
+                                            struct ignis_seq *seq) {
+  const char *const fn = "ignis_seq_retained_load";
+  if (const int32_t rc = retained_refusal(pool, seq, retained_slot, fn); rc != 0) {
+    return rc;
+  }
+  try {
+    copy_slot_state(*pool, retained_pool_slot(*pool, retained_slot), seq->slot);
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string(fn) + ": " + e.what());
+    return -1;
+  }
+}
+
+// ---- device allocation counter (GitHub #211) -----------------------------
+
+namespace {
+
+struct alloc_counter {
+  std::atomic<std::uint64_t> allocs{0};
+  std::atomic<std::uint64_t> frees{0};
+  std::atomic<std::uint64_t> alloc_bytes{0};
+};
+
+std::array<alloc_counter, IGNIS_ALLOC_KIND_COUNT> g_alloc_counters;
+
+} // namespace
+
+void ignis_alloc_count_record(std::int32_t kind, bool alloc, std::uint64_t bytes) {
+  if (kind < 0 || kind >= IGNIS_ALLOC_KIND_COUNT) {
+    return;
+  }
+  alloc_counter &counter = g_alloc_counters[static_cast<std::size_t>(kind)];
+  if (alloc) {
+    counter.allocs.fetch_add(1, std::memory_order_relaxed);
+    counter.alloc_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  } else {
+    counter.frees.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+extern "C" int32_t ignis_alloc_counts(int32_t kind, struct ignis_alloc_count *out) {
+  if (out == nullptr || kind < 0 || kind >= IGNIS_ALLOC_KIND_COUNT) {
+    return -1;
+  }
+  const alloc_counter &counter = g_alloc_counters[static_cast<std::size_t>(kind)];
+  out->allocs      = counter.allocs.load(std::memory_order_relaxed);
+  out->frees       = counter.frees.load(std::memory_order_relaxed);
+  out->alloc_bytes = counter.alloc_bytes.load(std::memory_order_relaxed);
+  return 0;
+}
+
 extern "C" int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr) {
   if (out_ptr == nullptr) {
     set_error("ignis_host_pinned_alloc: null out_ptr");
@@ -1013,12 +1241,14 @@ extern "C" int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr) {
     set_error(std::string("ignis_host_pinned_alloc: cudaHostAlloc failed: ") + cudaGetErrorString(err));
     return -1;
   }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, true, bytes);
   *out_ptr = ptr;
   return 0;
 }
 
 extern "C" void ignis_host_pinned_free(void *ptr) {
   if (ptr != nullptr) {
+    ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, false, 0);
     cudaFreeHost(ptr);
   }
 }

@@ -196,6 +196,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

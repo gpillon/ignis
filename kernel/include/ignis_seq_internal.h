@@ -125,7 +125,14 @@ struct ignis_seq_pool {
    * extent is the codec's row budget, not head_dim. */
   std::int32_t kv_head_dim     = 0;
   std::int32_t kv_num_kv_heads = 0;
+  /* Lane slots only, `0..slot_count`: the retained slots past them are never
+   * listed here (GitHub #211). */
   std::vector<std::int32_t> free_slots;
+  /* Retained slots, at slot indices `slot_count..slot_count +
+   * retained_slot_count` of the GDN pool, the penalty counts and the drafter
+   * lanes (GitHub #211), and what one slot's state occupies. */
+  std::uint32_t retained_slot_count = 0;
+  std::uint64_t slot_state_bytes = 0;
 
   // P3-03 (GitHub #99): one int32 occurrence count per vocab entry, per slot
   // -- device-side presence/frequency penalties read and atomically update
@@ -257,11 +264,57 @@ struct ignis_seq {
  * Every call that hands a sequence and a pool to the vendored pools together
  * needs this first: the vendored side's own mismatch check aborts the
  * process (CUDA_CHECK / std::invalid_argument out of a noexcept path), so
- * the pairing is refused here as a plain bad argument instead. */
+ * the pairing is refused here as a plain bad argument instead.
+ *
+ * A sequence's slot is a lane's, below the KV block-table rows: the GDN pool
+ * holds the retained slots past them (GitHub #211), and no sequence stands on
+ * one. */
 inline bool ignis_seq_belongs_to(const ignis_seq_pool &pool, const ignis_seq &seq) {
   return seq.kv.valid() && seq.kv.belongs_to(pool.kv_pool) && seq.slot >= 0 &&
-         seq.slot < pool.gdn_pool.slot_count();
+         seq.slot < pool.kv_pool.table_row_count();
 }
+
+/* Count one allocation of `bytes` (`alloc`) or one free of `kind` (enum
+ * ignis_alloc_kind), for ignis_alloc_counts (GitHub #211). Defined in
+ * kernel/src/seq.cu. */
+void ignis_alloc_count_record(std::int32_t kind, bool alloc, std::uint64_t bytes);
+
+/* A `ninfer::DeviceBuffer` whose allocation and free are counted under one
+ * ignis_alloc_kind (GitHub #211): the retained state images the leaf
+ * allocates while serving. A moved-from buffer holds nothing and counts
+ * nothing, so every path an entry takes -- released, replaced, or unwound
+ * by a failed call -- is counted once. */
+struct ignis_counted_device_buffer : ninfer::DeviceBuffer {
+  std::int32_t kind;
+
+  explicit ignis_counted_device_buffer(std::int32_t kind_) noexcept : kind(kind_) {}
+
+  ignis_counted_device_buffer(std::int32_t kind_, std::size_t size_bytes)
+      : ninfer::DeviceBuffer(size_bytes), kind(kind_) {
+    if (p != nullptr) {
+      ignis_alloc_count_record(kind, true, bytes);
+    }
+  }
+
+  ~ignis_counted_device_buffer() {
+    if (p != nullptr) {
+      ignis_alloc_count_record(kind, false, bytes);
+    }
+  }
+
+  ignis_counted_device_buffer(ignis_counted_device_buffer &&other) noexcept = default;
+
+  ignis_counted_device_buffer &operator=(ignis_counted_device_buffer &&other) noexcept {
+    if (this != &other) {
+      if (p != nullptr) {
+        ignis_alloc_count_record(kind, false, bytes);
+      }
+      ninfer::DeviceBuffer::operator=(std::move(other));
+      kind = other.kind;
+    }
+    return *this;
+  }
+};
 
 /* The leaf's thread-local last-error slot -- the one `ignis_seq_last_error`
  * reports. Defined in kernel/src/seq.cu and written by kernel/src/seq_prefix.cu

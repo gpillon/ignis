@@ -20,6 +20,12 @@
 //! of the mutable state. Neither direction crosses PCIe, which is what
 //! separates it from the snapshot path above.
 //!
+//! A pool can hold **retained slots** past its lanes (GitHub #211, ADR 0030):
+//! [`SeqPool::retained_store`] copies a lane's mutable state into one and
+//! [`SeqPool::retained_load`] copies it back, device to device;
+//! [`crate::RetainedSlots`] says which slot is free. [`alloc_count`] reads the
+//! leaf's count of what it allocates while serving.
+//!
 //! `Seq<'a>` borrows the [`SeqPool`] it came from: the borrow checker
 //! rejects a pool drop while any sequence drawn from it is still alive,
 //! which the flat C ABI cannot enforce on its own (the leaf's pools are
@@ -33,6 +39,7 @@ use std::os::raw::c_void;
 
 use crate::compute::ModelConfig;
 use crate::kv_format::KvFormat;
+use crate::retained_slot::RetainedSlot;
 
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_void};
@@ -76,6 +83,8 @@ pub(crate) mod ffi {
         /// pool without a drafter; under DFlash2 every slot also owns the
         /// drafter's window and its checkpoint (80 MiB).
         pub speculative_backend: i32,
+        /// Retained slots past the lanes (GitHub #211).
+        pub retained_slot_count: u32,
     }
 
     /// 1:1 with `struct ignis_seq_pool_stats`.
@@ -99,8 +108,14 @@ pub(crate) mod ffi {
         pub kv_token_capacity: u64,
         /// The KV arena's device bytes, planes and block tables (GitHub #210).
         pub kv_arena_bytes: u64,
-        /// Every slot's mutable state on the device (GitHub #210).
+        /// Every lane's mutable state on the device (GitHub #210), the
+        /// retained slots' excluded.
         pub lane_state_bytes: u64,
+        /// The retained slots (GitHub #211): how many, one slot's state, and
+        /// all of theirs.
+        pub retained_slot_count: u32,
+        pub slot_state_bytes: u64,
+        pub retained_state_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
@@ -111,6 +126,18 @@ pub(crate) mod ffi {
         pub kv_bytes: u64,
         pub lane_state_bytes: u64,
         pub checkpoint_image_bytes: u64,
+        /// One slot's state and every retained slot's (GitHub #211).
+        pub slot_state_bytes: u64,
+        pub retained_state_bytes: u64,
+    }
+
+    /// 1:1 with `struct ignis_alloc_count` (GitHub #211).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct IgnisAllocCount {
+        pub allocs: u64,
+        pub frees: u64,
+        pub alloc_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_stats`.
@@ -279,6 +306,20 @@ pub(crate) mod ffi {
             dst_bytes: u64,
         ) -> i32;
 
+        pub fn ignis_seq_retained_store(
+            pool: *mut IgnisSeqPool,
+            seq: *const IgnisSeq,
+            retained_slot: u32,
+        ) -> i32;
+
+        pub fn ignis_seq_retained_load(
+            pool: *mut IgnisSeqPool,
+            retained_slot: u32,
+            seq: *mut IgnisSeq,
+        ) -> i32;
+
+        pub fn ignis_alloc_counts(kind: i32, out: *mut IgnisAllocCount) -> i32;
+
         pub fn ignis_seq_last_error() -> *const c_char;
 
         /// Pinned (page-locked) host memory (P4-07, GitHub #125): the host
@@ -432,6 +473,7 @@ fn pool_spec(
         gdn_head_dim: cfg.gdn_head_dim as u32,
         vocab: cfg.vocab as u32,
         speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
+        retained_slot_count: budget.retained_slot_count,
     }
 }
 
@@ -449,8 +491,11 @@ pub struct SeqPoolBudget {
     pub kv_page_group_count: u32,
     /// The largest single sequence's KV reservation, in tokens.
     pub max_context_tokens: u32,
-    /// Max concurrent sequences (KV block-table rows == GDN slots).
+    /// Max concurrent sequences (KV block-table rows == GDN lane slots).
     pub slot_count: u32,
+    /// Retained slots past the lanes (GitHub #211): a lane's mutable state
+    /// each, no KV block-table row, never handed to a sequence.
+    pub retained_slot_count: u32,
 }
 
 /// A device-resident pool of sequence state (paged KV pages + GDN slots).
@@ -614,10 +659,100 @@ impl SeqPool {
         })
     }
 
+    /// Copy `seq`'s mutable state — GDN conv and recurrent state, penalty
+    /// counts, the drafter's window and checkpoint — into retained slot
+    /// `slot`, device to device (GitHub #211). `seq` is read, never changed;
+    /// its progress and KV pages are not part of a retained slot.
+    ///
+    /// `Err` for a sequence not drawn from this pool, a slot past the pool's
+    /// retained slots, or a sequence mid-chunk
+    /// ([`NOT_AT_BOUNDARY`](SeqTransferError::is_not_at_boundary)).
+    pub fn retained_store(&self, seq: &Seq<'_>, slot: &RetainedSlot) -> Result<(), SeqTransferError> {
+        let rc = unsafe { ffi::ignis_seq_retained_store(self.handle, seq.handle, slot.index()) };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
+    /// Copy retained slot `slot`'s state into `seq`'s own, device to device
+    /// (GitHub #211). The slot keeps it. Refuses as
+    /// [`SeqPool::retained_store`] does.
+    pub fn retained_load(&self, slot: &RetainedSlot, seq: &mut Seq<'_>) -> Result<(), SeqTransferError> {
+        let rc = unsafe { ffi::ignis_seq_retained_load(self.handle, slot.index(), seq.handle) };
+        if rc == 0 { Ok(()) } else { Err(transfer_error(rc)) }
+    }
+
     /// The raw handle (for the GDN layer ABI, GitHub #58). `pub(crate)`: never
     /// exposed outside this crate (mirrors the handle's C-ABI opacity).
     pub(crate) fn handle(&self) -> *mut ffi::IgnisSeqPool {
         self.handle
+    }
+}
+
+/// What the leaf allocates while serving, by what made it (GitHub #211,
+/// `enum ignis_alloc_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AllocKind {
+    /// A shared prefix's mutable-state image, per prefix publish.
+    PrefixImage,
+    /// A prompt checkpoint's mutable-state image, per checkpoint capture.
+    CheckpointImage,
+    /// A prompt checkpoint's copy of its partial tail page.
+    CheckpointTailPage,
+    /// A pinned host region, per KV-RAM blob.
+    KvRamBlob,
+    /// A device region from `ignis_device_alloc`.
+    Device,
+}
+
+impl AllocKind {
+    pub const ALL: [AllocKind; 5] = [
+        AllocKind::PrefixImage,
+        AllocKind::CheckpointImage,
+        AllocKind::CheckpointTailPage,
+        AllocKind::KvRamBlob,
+        AllocKind::Device,
+    ];
+
+    fn abi_code(self) -> i32 {
+        match self {
+            AllocKind::PrefixImage => 0,
+            AllocKind::CheckpointImage => 1,
+            AllocKind::CheckpointTailPage => 2,
+            AllocKind::KvRamBlob => 3,
+            AllocKind::Device => 4,
+        }
+    }
+}
+
+/// Allocations and frees of one [`AllocKind`], counted by the leaf.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocCount {
+    pub allocs: u64,
+    pub frees: u64,
+    /// Bytes of every counted allocation (a free is counted, not sized).
+    pub alloc_bytes: u64,
+}
+
+impl AllocCount {
+    /// What happened between `earlier` and this read.
+    pub fn since(&self, earlier: &AllocCount) -> AllocCount {
+        AllocCount {
+            allocs: self.allocs - earlier.allocs,
+            frees: self.frees - earlier.frees,
+            alloc_bytes: self.alloc_bytes - earlier.alloc_bytes,
+        }
+    }
+}
+
+/// The leaf's counts of `kind` since the process started (GitHub #211).
+/// Process-wide: a reader takes the difference of two reads.
+pub fn alloc_count(kind: AllocKind) -> AllocCount {
+    let mut out = ffi::IgnisAllocCount::default();
+    let rc = unsafe { ffi::ignis_alloc_counts(kind.abi_code(), &mut out) };
+    assert_eq!(rc, 0, "ignis_alloc_counts: every AllocKind is a kind the leaf counts");
+    AllocCount {
+        allocs: out.allocs,
+        frees: out.frees,
+        alloc_bytes: out.alloc_bytes,
     }
 }
 

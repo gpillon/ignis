@@ -117,6 +117,7 @@ fn prefill_wall_time_across_the_load_shapes() {
                 kv_page_group_count: pages_for(kv_pool_tokens),
                 max_context_tokens: max_context,
                 slot_count,
+                retained_slot_count: 0,
             },
         )
         .unwrap_or_else(|e| panic!("{label}: seq pool create: {e}"));

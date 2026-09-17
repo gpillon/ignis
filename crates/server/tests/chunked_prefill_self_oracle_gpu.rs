@@ -185,6 +185,7 @@ fn self_oracle(vision: Option<Vision>) {
             kv_page_group_count: pages_per_slot * 2,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("seq pool create: {e}"));

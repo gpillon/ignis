@@ -51,6 +51,7 @@ fn alloc_release_realloc_cycles_balance_the_pools() {
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 2,
+        retained_slot_count: 0,
     };
     let pool =
         SeqPool::create(&cfg, &budget).unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -107,6 +108,7 @@ fn zero_context_tokens_is_rejected() {
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 1,
+        retained_slot_count: 0,
     };
     let pool =
         SeqPool::create(&cfg, &budget).unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -133,6 +135,7 @@ fn a_fresh_sequence_snapshots_to_its_state_floor() {
         kv_page_group_count: 4,
         max_context_tokens: 128,
         slot_count: 1,
+        retained_slot_count: 0,
     };
     let pool =
         SeqPool::create(&cfg, &budget).unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

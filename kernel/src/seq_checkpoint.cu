@@ -241,8 +241,10 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     auto entry            = std::make_unique<ignis_seq_checkpoint>();
     const std::uint64_t state_bytes =
         ignis_seq_prefix_clone_bytes(ignis_seq_prefix_clone_layout(*pool));
-    entry->image     = ninfer::DeviceBuffer(static_cast<std::size_t>(state_bytes));
-    entry->tail_page = ninfer::DeviceBuffer(
+    entry->image     = ignis_counted_device_buffer(IGNIS_ALLOC_CHECKPOINT_IMAGE,
+                                                   static_cast<std::size_t>(state_bytes));
+    entry->tail_page = ignis_counted_device_buffer(
+        IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE,
         static_cast<std::size_t>(ignis_seq_checkpoint_page_bytes(*pool)));
     entry->tokens    = opener_tokens;
 

@@ -188,6 +188,7 @@ fn prefill_chunk_and_traversal_sweeps() {
         kv_page_group_count: pages_for(MAX_CONTEXT) * 2,
         max_context_tokens: MAX_CONTEXT,
         slot_count: 2,
+        retained_slot_count: 0,
     };
     let longest = spans.iter().copied().max().unwrap_or(SPAN_TOKENS).max(SPAN_TOKENS);
     let corpus = token_span(&frontend, longest);

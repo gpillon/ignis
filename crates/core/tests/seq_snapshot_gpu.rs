@@ -165,6 +165,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
             kv_page_group_count: 24,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
+            retained_slot_count: 0,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));

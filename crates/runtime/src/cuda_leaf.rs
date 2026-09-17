@@ -60,6 +60,10 @@ pub struct CudaLeafConfig {
     pub kv_pool_bytes: u64,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
+    /// Retained slots the sequence pool holds past the lanes (GitHub #211):
+    /// a lane's mutable state each, reserved at load. An internal load option
+    /// until #215 puts retained state in them; 0 reserves none.
+    pub retained_slots: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
     /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
     /// nonzero multiple of 128, validated by the server's config module
@@ -105,6 +109,7 @@ impl Default for CudaLeafConfig {
                 crate::DEFAULT_MAX_CONTEXT,
             ),
             slot_count: N_DECODE_LANES as u32,
+            retained_slots: 0,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
             speculation: None,
             vision: None,
@@ -186,11 +191,12 @@ impl CudaLeafConfig {
     /// `layout_version` its leaf writes (GitHub #189, ADR 0029).
     ///
     /// **This is where a load option becomes part of the identity or does
-    /// not.** Two of this struct's seven fields do: `kv_format`, which
+    /// not.** Two of this struct's eight fields do: `kv_format`, which
     /// decides what a KV page *is*, and `speculation`, whose presence and
     /// draft window decide whether the sequence pool carries the drafter's
-    /// per-slot sections. The other five — `max_context_tokens`,
-    /// `kv_pool_bytes`, `slot_count`, `prefill_chunk_tokens` and `vision` —
+    /// per-slot sections. The other six — `max_context_tokens`,
+    /// `kv_pool_bytes`, `slot_count`, `retained_slots`,
+    /// `prefill_chunk_tokens` and `vision` —
     /// decide how much work fits and how fast it goes, never what the bytes
     /// of a sequence mean, so state produced under one value must still be
     /// usable under another. `kv_pool_bytes` is the sharpest of them: the
@@ -229,7 +235,7 @@ impl CudaLeafConfig {
         )?;
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
-            reserved: reserved_bytes(model, pool.lane_state_bytes, 0),
+            reserved: reserved_bytes(model, pool.lane_state_bytes, pool.retained_state_bytes, 0),
             checkpoint_image_bytes: pool.checkpoint_image_bytes,
         })
     }
@@ -254,14 +260,17 @@ impl CudaLeafConfig {
             kv_page_group_count: pages,
             max_context_tokens: self.max_context_tokens,
             slot_count: self.slot_count,
+            retained_slot_count: self.retained_slots,
         }
     }
 }
 
-/// The plan lines of a model's reservations and its pool's (GitHub #210).
+/// The plan lines of a model's reservations and its pool's (GitHub #210,
+/// #211).
 fn reserved_bytes(
     model: model_load::IgnisModelReservations,
     lane_state: u64,
+    retained_slots: u64,
     kv_pool: u64,
 ) -> ReservedBytes {
     ReservedBytes {
@@ -273,6 +282,7 @@ fn reserved_bytes(
         verify_round: model.verify_round_bytes,
         drafter_round: model.drafter_round_bytes,
         lane_state,
+        retained_slots,
         kv_pool,
     }
 }
@@ -513,6 +523,7 @@ impl StepLeaf for CudaLeaf {
             reserved: reserved_bytes(
                 reserved,
                 pool_stats.lane_state_bytes,
+                pool_stats.retained_state_bytes,
                 pool_stats.kv_arena_bytes,
             ),
         })
