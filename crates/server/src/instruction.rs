@@ -16,8 +16,17 @@
 //! No policy reorders messages across roles. Joining and gathering re-render
 //! earlier history when a new message arrives mid-conversation, which is why
 //! [`DeveloperMessagePolicy::rerenders_history`] exists: `main` warns about it.
+//!
+//! A block joined from several messages is carried as **text parts, one per
+//! message**, every part but the last ending in `"\n"`. The reference's part
+//! join (`template_text_parts`) adds one more `"\n"` between adjacent text
+//! parts, so the block renders as the texts joined by `"\n\n"` — and the
+//! provider can still see where the first message ends. That is where a
+//! retained prefix is cut (`artifact_template.rs`): a qwen-code hook line that
+//! changes between requests then leaves every page before the one it starts in
+//! shared.
 
-use crate::template::{ChatMessage, MessageContent, TemplateRejection};
+use crate::template::{ChatMessage, ContentPart, MessageContent, TemplateRejection};
 
 /// What the engine does with a `system` message that is not the first
 /// message (`--system-message-policy`).
@@ -178,17 +187,25 @@ impl InstructionPolicy {
     }
 }
 
-/// One `system` message carrying `messages`' texts, trimmed and joined.
+/// One `system` message carrying `messages`' texts, trimmed and joined: a
+/// plain string for one text, text parts (module docs) for more.
 fn instruction_block(messages: &[&ChatMessage]) -> ChatMessage {
     let texts: Vec<String> = messages
         .iter()
         .map(|m| m.content.text().trim().to_owned())
         .filter(|text| !text.is_empty())
         .collect();
-    ChatMessage {
-        content: MessageContent::Text(texts.join("\n\n")),
-        ..ChatMessage::text("system", "")
-    }
+    let content = match texts.as_slice() {
+        [] => MessageContent::Text(String::new()),
+        [only] => MessageContent::Text(only.clone()),
+        [.., last] => {
+            let part = |text: String| ContentPart { kind: Some("text".to_owned()), text: Some(text), url: None };
+            let mut parts: Vec<ContentPart> = texts[..texts.len() - 1].iter().map(|t| part(format!("{t}\n"))).collect();
+            parts.push(part(last.clone()));
+            MessageContent::Parts(parts)
+        }
+    };
+    ChatMessage { content, ..ChatMessage::text("system", "") }
 }
 
 fn system_position(index: usize) -> TemplateRejection {
@@ -273,6 +290,18 @@ mod tests {
         let p = InstructionPolicy::default();
         let messages = [("system", "  A.\n"), ("system", "   "), ("system", "\nB "), ("user", "q")];
         assert_eq!(normalized(p, &messages), ["system:A.\n\nB", "user:q"]);
+    }
+
+    #[test]
+    fn a_joined_block_keeps_one_text_part_per_message() {
+        let messages = [("system", "A"), ("system", "B"), ("system", "C"), ("user", "q")];
+        let out = InstructionPolicy::default().normalize(&list(&messages)).unwrap();
+        let MessageContent::Parts(parts) = &out[0].content else {
+            panic!("a joined block is parts: {:?}", out[0]);
+        };
+        let texts: Vec<_> = parts.iter().map(|p| (p.kind.as_deref(), p.text.as_deref())).collect();
+        assert_eq!(texts, [(Some("text"), Some("A\n")), (Some("text"), Some("B\n")), (Some("text"), Some("C"))]);
+        assert_eq!(out[0].content.text(), "A\n\nB\n\nC", "the part join puts \\n\\n between them");
     }
 
     #[test]

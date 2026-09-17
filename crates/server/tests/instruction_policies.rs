@@ -177,7 +177,15 @@ fn every_policy_renders_every_shape_as_the_reference_rules_say() {
                     let block_end = ChatTemplate::system_block_offset(&text).expect(&case);
                     let opener = ChatTemplate::generation_opener_offset(&text).expect(&case);
                     let query = ChatTemplate::last_user_query_offset(&text).expect(&case);
-                    assert_eq!(rendered.system_block_tokens, Some(count(&text[..block_end])), "{case}");
+                    // A system prompt joined from several messages is cut where
+                    // the second begins; a single one at the block end.
+                    let prompt = expected_list[0].1;
+                    let content_start = block_end - "<|im_end|>
+".len() - prompt.len();
+                    let cut = prompt.find("
+
+").map_or(block_end, |at| content_start + at + 2);
+                    assert_eq!(rendered.system_block_tokens, Some(count(&text[..cut])), "{case}");
                     assert_eq!(rendered.opener_tokens, Some(count(&text[..opener])), "{case}");
                     assert_eq!(rendered.user_turn_tokens, Some(count(&text[..query])), "{case}");
                     assert!(text[..block_end].ends_with(&format!("{}<|im_end|>\n", expected_list[0].1)), "{case}");
@@ -248,20 +256,14 @@ fn a_client_sending_the_stand_in_text_is_refused_not_misrendered() {
 }
 
 /// GitHub #209: under `merge`, a qwen-code hook line joins the system prompt,
-/// so the retained prefix (published at the system block end's page floor)
-/// covers it. What a hook that changes between requests leaves reusable:
-///
-/// - every whole page before the page the hook starts in is keyed the same for
-///   both requests, whatever the agent prompt's length;
-/// - the prefix actually published is claimed by the next request **only when
-///   the hook and the block's closer fit in the page the hook starts in**. When
-///   they straddle a page boundary, the published length reaches past the hook's
-///   start and the next request matches nothing there. ninfer renders the hook
-///   as a block of its own and publishes before it, so it never loses this.
-///   Recorded on #191; this test pins both cases over every alignment of the
-///   hook within a page.
+/// and the retained prefix is cut where the hook line begins rather than at the
+/// system block end. A hook that changes between requests then leaves the
+/// prefix the first request published claimable by the next, over every
+/// alignment of the hook within a KV page — including the ones where the hook
+/// and the block closer straddle a page boundary, which a cut at the block end
+/// lost (17 of these 64 alignments).
 #[test]
-fn a_changing_hook_line_keeps_the_pages_before_it_keyed_alike() {
+fn a_changing_hook_line_keeps_the_retained_prefix_up_to_the_page_it_starts_in() {
     let Some((provider, _frontend)) = frontend_or_skip() else {
         return;
     };
@@ -281,29 +283,21 @@ fn a_changing_hook_line_keeps_the_pages_before_it_keyed_alike() {
     };
     let floor = |tokens: u32| (tokens / KV_PAGE_TOKENS) * KV_PAGE_TOKENS;
 
-    let (mut claimed, mut straddled) = (0, 0);
     for pad in 0..KV_PAGE_TOKENS as usize {
         let a = request(pad, "CAVEMAN MODE ACTIVE (full) — session ruleset applies.");
         let b = request(pad, "PLAN MODE ACTIVE — read-only tools only.");
         // Where the hook starts: the first token the two prompts disagree on.
         let diverge = a.tokens.iter().zip(&b.tokens).position(|(x, y)| x != y).expect("the hooks differ") as u32;
-        let block = a.system_block_tokens.expect("a's system block");
-        assert!(diverge < block.min(b.system_block_tokens.expect("b's system block")), "pad {pad}");
-        let (a_keys, b_keys) = (PromptContent::text(&a.tokens), PromptContent::text(&b.tokens));
+        let cut = a.system_block_tokens.expect("a's retained prefix boundary");
+        assert_eq!(cut, diverge, "pad {pad}: the boundary is where the hook starts");
+        assert_eq!(b.system_block_tokens, Some(cut), "pad {pad}: both requests cut at the same token");
 
-        let hook_page = floor(diverge);
-        assert!(hook_page > 0, "pad {pad}");
-        assert_eq!(a_keys.key_at(hook_page), b_keys.key_at(hook_page), "pad {pad}: the pages before the hook's");
-
-        let published = floor(block);
-        let matches = a_keys.key_at(published) == b_keys.key_at(published);
-        assert_eq!(matches, published <= diverge, "pad {pad}: B claims A's prefix iff it ends before the hook");
-        if matches {
-            claimed += 1;
-        } else {
-            straddled += 1;
-        }
+        let published = floor(cut);
+        assert!(published > 0, "pad {pad}");
+        assert_eq!(
+            PromptContent::text(&a.tokens).key_at(published),
+            PromptContent::text(&b.tokens).key_at(published),
+            "pad {pad}: B claims the retained prefix A published"
+        );
     }
-    println!("hook line: {claimed} alignments claim the retained prefix, {straddled} straddle a page and do not");
-    assert!(claimed > 0 && straddled > 0, "both cases occur over a page of alignments");
 }

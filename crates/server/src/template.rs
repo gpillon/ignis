@@ -372,6 +372,11 @@ pub struct RenderedPrompt {
     /// *unrelated* requests share, and it is what a burst of subagents
     /// publishes a **retained prefix** at.
     ///
+    /// When the system prompt joins several instruction messages (GitHub #209,
+    /// `crate::instruction`), it ends where the second of them begins instead,
+    /// inside the block: a qwen-code hook line that changes between requests
+    /// then costs only the pages from the one it starts in.
+    ///
     /// `None`, and no prefix is retained, when the render does not open with a
     /// system block, or when the block's byte offset does not tokenize to an
     /// exact token prefix of the whole prompt — a boundary the tokenizer

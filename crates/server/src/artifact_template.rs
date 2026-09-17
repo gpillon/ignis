@@ -91,8 +91,8 @@ impl ArtifactTemplateProvider {
     /// conversation its own near-miss; a *retained prefix* is claimed by
     /// requests that have nothing else in common, so the same slip would hand
     /// a subagent KV pages warmed from a block that is not the one it sent.
-    fn system_block_tokens(&self, prompt: &str, tokens: &[TokenId]) -> Option<u32> {
-        self.exact_token_prefix(prompt, ChatTemplate::system_block_offset(prompt)?, tokens)
+    fn system_block_tokens(&self, messages: &[ChatMessage], prompt: &str, tokens: &[TokenId]) -> Option<u32> {
+        self.exact_token_prefix(prompt, retained_prefix_offset(messages, prompt)?, tokens)
     }
 
     /// How many leading tokens of `tokens` end at `prompt`'s byte offset `at`,
@@ -252,7 +252,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         };
         let opener_tokens = self.opener_tokens(&prompt, &tokens);
         let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
-        let system_block_tokens = self.system_block_tokens(&prompt, &tokens);
+        let system_block_tokens = self.system_block_tokens(messages, &prompt, &tokens);
         Ok(RenderedPrompt {
             tokens,
             opener_tokens,
@@ -321,7 +321,7 @@ impl TemplateProvider for ArtifactTemplateProvider {
         let user_query = ChatTemplate::last_user_query_offset(&rendered);
         let offsets = [
             ChatTemplate::generation_opener_offset(&rendered),
-            ChatTemplate::system_block_offset(&rendered),
+            retained_prefix_offset(messages, &rendered),
             user_query,
         ];
         let boundaries: Vec<usize> = offsets.iter().flatten().copied().collect();
@@ -375,6 +375,40 @@ impl TokenDecoder for ArtifactTokenDecoder {
             }
         }
     }
+}
+
+/// The byte offset in `rendered` a retained prefix is cut at (GitHub #188,
+/// #209): the end of the first system block, or — when the system prompt joins
+/// several instruction messages (`crate::instruction`, one text part each) —
+/// just past the `"\n\n"` that ends the first of them.
+///
+/// qwen-code's leading run is an agent prompt then a hook line, and the hook
+/// line may change between requests. Cut at the block end, a hook that
+/// straddles a KV page boundary puts some of its own tokens under the published
+/// page floor, and a request with another hook matches nothing there; cut where
+/// the hook starts, every page before the one it starts in stays shared.
+///
+/// The joined text is located inside the rendered block rather than assumed:
+/// when it is not where the block ends, the block end is used, as before.
+fn retained_prefix_offset(messages: &[ChatMessage], rendered: &str) -> Option<usize> {
+    let block_end = ChatTemplate::system_block_offset(rendered)?;
+    let first = match messages.first() {
+        Some(ChatMessage { role, content: MessageContent::Parts(parts), .. }) if role == "system" && parts.len() > 1 => {
+            parts[0].text.as_deref().filter(|text| text.ends_with('\n'))
+        }
+        _ => None,
+    };
+    let Some(first) = first else {
+        return Some(block_end);
+    };
+    let joined = messages[0].content.text();
+    let content_end = block_end - ChatTemplate::BLOCK_CLOSER.len();
+    let cut = content_end
+        .checked_sub(joined.trim().len())
+        .filter(|&start| rendered.get(start..content_end) == Some(joined.trim()))
+        .map(|start| start + first.len() + 1)
+        .filter(|&cut| rendered.get(..cut).is_some_and(|head| head.ends_with("\n\n")));
+    Some(cut.unwrap_or(block_end))
 }
 
 /// What the request resolved, in the shape the template seam takes it
