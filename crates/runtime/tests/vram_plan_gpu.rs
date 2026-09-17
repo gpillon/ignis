@@ -54,8 +54,7 @@ fn the_planned_reservations_are_what_the_load_holds() {
         .unwrap_or_else(|e| panic!("plan the reservations: {e}"));
     let kv_arena = config.kv_pool_arena_bytes(pages).unwrap_or_else(|e| panic!("plan the pool: {e}"));
     for (line, bytes) in [
-        ("prefill_scratch", planned.reserved.prefill_scratch),
-        ("vision_workspace", planned.reserved.vision_workspace),
+        ("workspace", planned.reserved.workspace),
         ("media_embedding", planned.reserved.media_embedding),
         ("sampling", planned.reserved.sampling),
         ("decode_graph", planned.reserved.decode_graph),

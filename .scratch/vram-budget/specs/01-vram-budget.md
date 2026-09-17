@@ -330,6 +330,48 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
 - **Expected saving:** ~1.25 GiB (the prefill scratch). Record the measured
   value in `vram_plan`.
 
+**As built (#212), where it departs from or sharpens the above:**
+
+- **The arena is `model->scratch`, and an encode checks it is free.** Media
+  encode takes its bytes from the prefill scratch under a scope it holds until
+  its own synchronize. It refuses to run while the scratch is in use, so
+  "never live at the same time" is checked rather than assumed. Every
+  prefill step already releases its scope before it returns.
+- **One plan line for every load.** `prefill_scratch` and `vision_workspace`
+  are replaced by one `workspace` line (`workspace_bytes` in `vram_plan`,
+  `ignis_model_reservations.workspace_bytes` in the ABI). A text load keeps
+  its bytes, but its `vram_plan` event changes shape too.
+- **`vision_reserved_bytes` means what vision adds.** In
+  `ignis.runtime.kv_pool` and `ignis_model_stats` it is now the media
+  embedding plus how far the encoder's workspace grows the scratch past the
+  prefill scratch. Where the prefill scratch is the larger (small contexts,
+  e.g. `vision_dflash2_gpu`), it is the media embedding alone.
+- **A scratch that does not fit names what sized it.** When the encoder's
+  workspace is the larger, the load error names `--vision-max-tokens`
+  instead of the prefill chunk width.
+- **Measured at `make start` defaults + `--vision`** (DFlash2/7, 262K,
+  hq-e8-2b), 2026-09-17:
+  - Before: `prefill_scratch` 1,481,902,336 B (the DFlash2 taps included,
+    hence more than the ~1.25 GiB estimate) + `vision_workspace`
+    2,219,837,184 B.
+  - After: `workspace` 2,219,837,184 B. The saving is the whole prefill
+    scratch, 1,481,902,336 B (1.38 GiB).
+  - KV pool: 5,234 → 7,744 pages (3,087,269,888 → 4,567,728,128 B). The
+    after run started with 1.3 MiB less free.
+  - WDDM dedicated after load: 30,393,864,192 → 30,391,767,040 B, within
+    1.4 MiB of `allocated_at_load_bytes` both times. Three parallel image
+    requests and one three-image request added 2 MiB (#210's first-request
+    growth). Shared stayed at 77,594,624 B.
+- **Exactness is against recorded tokens.**
+  `crates/runtime/tests/vision_shared_workspace_gpu.rs` recorded every
+  request's greedy tokens on the build before the change, on a DFlash2 + BF16
+  load. It has three legs: an image request alone; an image prefill in
+  64-token chunks between three decoding text lanes; and a three-image prompt
+  whose encodes land between prefill chunks. The recording was confirmed
+  deterministic by a second run before the change. The allocation counter
+  reads zero over all three legs; it covers the leaf's own allocation
+  points, not vendored arena construction.
+
 ### Slice 7 — KV-RAM as one pinned arena
 
 - **One arena for the tier.** Use the vendored `HostPinnedArena`

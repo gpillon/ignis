@@ -671,7 +671,7 @@ bool validate_span_multimodal(const ignis_model *model, int32_t route, const Spa
     return (span.media == nullptr && span.count == 0) ||
            refuse("media columns need the span's multimodal positions");
   }
-  if (model->vision_workspace == nullptr) {
+  if (model->vision_output == nullptr) {
     return refuse("a multimodal span on a model loaded without vision");
   }
   if (route != IGNIS_PREFILL_ROUTE_CHUNKED) {
@@ -1881,9 +1881,11 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->verify != nullptr) {
     out_stats->vram_bytes += model->verify->device_bytes();
   }
-  // GitHub #177: the vision encoder workspace and output transient (its
-  // weights are already in `model->vram_bytes`).
-  out_stats->vram_bytes += model->vision_reserved_bytes();
+  // GitHub #177: the vision output transient (its weights are already in
+  // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212).
+  if (model->vision_output != nullptr) {
+    out_stats->vram_bytes += model->vision_output->bytes;
+  }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
   out_stats->graph_launches = model->last_step_graph_launches;

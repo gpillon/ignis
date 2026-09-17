@@ -210,8 +210,9 @@ fn load() -> Option<Loaded> {
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     let compute = Arc::new(RuntimeCompute::new(model.clone(), eos));
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
-    let pages = model.stats().expect("stats").kv_page_count;
-    Some(Loaded { compute, frontend, pages })
+    let stats = model.stats().expect("stats");
+    eprintln!("reserved beside the weights: {:#?}", stats.reserved);
+    Some(Loaded { compute, frontend, pages: stats.kv_page_count })
 }
 
 #[test]

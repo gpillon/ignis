@@ -173,7 +173,9 @@ struct ignis_prefill_options {
  *
  * The load's vision reservation holds one embedding at a time: an encode
  * while one is live is refused (release it first), and so is an item wider
- * than the load's envelope. Returns 0 and the handle, or -1 (see
+ * than the load's envelope. The encoder runs out of the load's scratch
+ * arena, which prefill steps share (GitHub #212), so it is never called
+ * from inside one. Returns 0 and the handle, or -1 (see
  * ignis_media_last_error) on a load without vision or any invalid input. */
 struct ignis_media_encode_input {
   uint32_t size; /* sizeof(struct ignis_media_encode_input) */

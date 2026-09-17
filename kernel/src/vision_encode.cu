@@ -8,9 +8,12 @@
 // 0010 vendored one, called in the reference's order
 // (`impl/runtime/vision_context_impl.h`, `VisionContext::encode`).
 //
-// Everything runs out of the reservation `ignis_model_load` made for the
-// envelope: the workspace for the scratch, the output transient for the
-// result. No allocation happens here.
+// Everything runs out of the reservations `ignis_model_load` made for the
+// envelope: the load's scratch arena for the intermediates, the output
+// transient for the result. No allocation happens here. GitHub #212: that
+// arena is the one prefill steps use, sized for the larger of the two; an
+// encode runs between prefill steps, never inside one, so the two never
+// hold it at once.
 
 #include "ignis_step.h"
 
@@ -134,20 +137,13 @@ void copy_host(const void *src, ninfer::Tensor &dst, cudaStream_t stream, const 
 }
 
 // The encoder over one item, enqueued on the model's stream into
-// `model->vision_output` (VisionContext::encode).
-void encode(ignis_model &model, const ignis_media_encode_input &input, std::int32_t patches,
-            std::int32_t tokens, std::int32_t segments) {
-  const VisionWorkspaceLayout layout = build_workspace_layout(patches, tokens, segments);
-  if (layout.bytes > model.vision_workspace->capacity()) {
-    throw std::runtime_error("the item needs " + std::to_string(layout.bytes) +
-                             " workspace bytes, the load reserved " +
-                             std::to_string(model.vision_workspace->capacity()));
-  }
+// `model->vision_output`, its intermediates in `backing` as `layout` places
+// them (VisionContext::encode).
+void encode(ignis_model &model, const ignis_media_encode_input &input,
+            const VisionWorkspaceLayout &layout, const ninfer::DeviceSpan &backing,
+            std::int32_t patches, std::int32_t tokens) {
   const VisionWeights &w = model.vision;
   const cudaStream_t stream = model.stream;
-  model.vision_workspace->reset();
-  const ninfer::DeviceSpan backing =
-      model.vision_workspace->alloc_bytes(layout.bytes, kVisionWorkspaceAlignment);
 
   ninfer::Tensor position_ids = layout.position_ids.bind(backing);
   ninfer::Tensor cu_seqlens = layout.cu_seqlens.bind(backing);
@@ -261,8 +257,14 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
               std::to_string(input->size));
     return -1;
   }
-  if (model->vision_workspace == nullptr || model->vision_output == nullptr) {
+  if (model->vision_output == nullptr) {
     set_error("ignis_media_encode: the model was loaded without vision");
+    return -1;
+  }
+  // GitHub #212: the scratch is shared with prefill steps, which release it
+  // before they return.
+  if (model->scratch->used() != 0) {
+    set_error("ignis_media_encode: a prefill step's scratch is live; encode between steps");
     return -1;
   }
   if (model->vision_output_live) {
@@ -294,10 +296,21 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     return -1;
   }
   try {
-    encode(*model, *input, static_cast<std::int32_t>(tokens * kVisionMergeUnit),
-           static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(t));
+    const auto patches = static_cast<std::int32_t>(tokens * kVisionMergeUnit);
+    const VisionWorkspaceLayout layout = build_workspace_layout(
+        patches, static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(t));
+    if (layout.bytes > model->scratch->capacity()) {
+      throw std::runtime_error("the item needs " + std::to_string(layout.bytes) +
+                               " workspace bytes, the load reserved " +
+                               std::to_string(model->scratch->capacity()));
+    }
+    // Held until the stream has drained: nothing else may take these bytes
+    // while the encoder's kernels still run on them.
+    ninfer::DeviceArena::Scope scope = model->scratch->scope();
+    const ninfer::DeviceSpan backing =
+        model->scratch->alloc_bytes(layout.bytes, kVisionWorkspaceAlignment);
+    encode(*model, *input, layout, backing, patches, static_cast<std::int32_t>(tokens));
     const cudaError_t err = cudaStreamSynchronize(model->stream);
-    model->vision_workspace->reset();
     if (err != cudaSuccess) {
       set_error(std::string("ignis_media_encode: cudaStreamSynchronize failed: ") +
                 cudaGetErrorString(err));
@@ -310,7 +323,6 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     *out_embedding = embedding.release();
     return 0;
   } catch (const std::exception &e) {
-    model->vision_workspace->reset();
     set_error(std::string("ignis_media_encode: ") + e.what());
     return -1;
   }

@@ -143,7 +143,10 @@ struct ignis_model_load_options {
    * 0 = no vision. Nonzero binds every `vision/*` tensor and reserves, at
    * load, the encoder workspace and the per-item `[5120, V]` output
    * transient for V = min(max_context_tokens, vision_max_tokens) -- before
-   * the caller builds its sequence pool. At most
+   * the caller builds its sequence pool. The workspace is not an arena of
+   * its own (GitHub #212): the load's scratch arena is sized for the larger
+   * of a prefill chunk's scratch and the encoder's workspace, and media
+   * encode runs out of it between prefill steps. At most
    * IGNIS_VISION_MAX_TOKENS_LIMIT. Independent of the backend above
    * (GitHub #195): a load may ask for both, and then the verify round
    * rotates its columns at `position + rope_delta` the way a decode round
@@ -161,11 +164,11 @@ struct ignis_model_load_options {
  * from what a load actually holds, so a caller can plan with the first and
  * check the second. */
 struct ignis_model_reservations {
-  /* The program scratch arena for one `prefill_chunk_tokens` chunk (with
-   * the drafter's context append under DFLASH2). */
-  uint64_t prefill_scratch_bytes;
-  /* The vision encoder workspace; 0 without vision. */
-  uint64_t vision_workspace_bytes;
+  /* The one scratch arena prefill chunks and media encode share (GitHub
+   * #212): the program scratch for one `prefill_chunk_tokens` chunk (with
+   * the drafter's context append under DFLASH2), or with vision the encoder
+   * workspace when that is larger. The two are never live at once. */
+  uint64_t workspace_bytes;
   /* One media item's `[hidden, V]` encoder output; 0 without vision. */
   uint64_t media_embedding_bytes;
   /* Device sampling's staging buffers and candidate-selection workspace. */
@@ -184,8 +187,10 @@ struct ignis_model_reservations {
 struct ignis_model_stats {
   uint64_t vram_bytes;        /* sum of every bound tensor's payload bytes */
   uint64_t bound_tensor_count;
-  /* The vision reservation beside the weights (GitHub #177): the encoder
-   * workspace plus the per-item output transient. 0 without vision. */
+  /* What vision reserves beside the weights (GitHub #177, #212): the
+   * per-item output transient, plus whatever the encoder workspace grows
+   * the shared scratch arena past a prefill chunk's own scratch. 0 without
+   * vision. */
   uint64_t vision_reserved_bytes;
   /* What this load holds beside the weights, read off its own buffers
    * (GitHub #210). */

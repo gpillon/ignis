@@ -55,10 +55,11 @@ pub struct VramLines {
     pub weights: u64,
     /// The CUDA context: the budget, like Task Manager, counts it.
     pub cuda_context: u64,
-    /// The prefill scratch arena, sized for one `--prefill-chunk` span.
-    pub prefill_scratch: u64,
-    /// The vision encoder workspace (0 without `--vision`).
-    pub vision_workspace: u64,
+    /// The one scratch arena prefill chunks and media encode share (GitHub
+    /// #212): one `--prefill-chunk` span's scratch, or with `--vision` the
+    /// encoder's workspace when that is larger. The two are never live at
+    /// once.
+    pub workspace: u64,
     /// One media item's encoder output (0 without `--vision`).
     pub media_embedding: u64,
     /// Device sampling's staging buffers and workspace.
@@ -85,12 +86,11 @@ pub struct VramLines {
 impl VramLines {
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
-    pub fn entries(&self) -> [(&'static str, u64); 12] {
+    pub fn entries(&self) -> [(&'static str, u64); 11] {
         [
             ("weights", self.weights),
             ("cuda_context", self.cuda_context),
-            ("prefill_scratch", self.prefill_scratch),
-            ("vision_workspace", self.vision_workspace),
+            ("workspace", self.workspace),
             ("media_embedding", self.media_embedding),
             ("sampling", self.sampling),
             ("decode_graph", self.decode_graph),
@@ -364,8 +364,8 @@ mod tests {
         VramLines {
             weights: 17 * GIB,
             cuda_context: 300 * MIB,
-            prefill_scratch: 1300 * MIB,
-            vision_workspace: 2 * GIB,
+            // max(1300 MiB of prefill scratch, 2 GiB of vision encoder).
+            workspace: 2 * GIB,
             media_embedding: 320 * MIB,
             sampling: 10 * MIB,
             decode_graph: 200 * MIB,
@@ -577,8 +577,7 @@ mod tests {
             [
                 "weights",
                 "cuda_context",
-                "prefill_scratch",
-                "vision_workspace",
+                "workspace",
                 "media_embedding",
                 "sampling",
                 "decode_graph",

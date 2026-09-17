@@ -135,8 +135,7 @@ pub fn vram_lines(
     ignis_core::VramLines {
         weights: weights_bytes,
         cuda_context: ignis_runtime::CUDA_CONTEXT_BYTES,
-        prefill_scratch: reserved.prefill_scratch,
-        vision_workspace: reserved.vision_workspace,
+        workspace: reserved.workspace,
         media_embedding: reserved.media_embedding,
         sampling: reserved.sampling,
         decode_graph: reserved.decode_graph,
@@ -166,8 +165,7 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
                 budget_bytes = plan.budget_bytes,
                 weights_bytes = lines.weights,
                 cuda_context_bytes = lines.cuda_context,
-                prefill_scratch_bytes = lines.prefill_scratch,
-                vision_workspace_bytes = lines.vision_workspace,
+                workspace_bytes = lines.workspace,
                 media_embedding_bytes = lines.media_embedding,
                 sampling_bytes = lines.sampling,
                 decode_graph_bytes = lines.decode_graph,
@@ -551,8 +549,7 @@ mod tests {
     #[test]
     fn the_plan_lines_carry_every_reservation_the_leaf_planned() {
         let reserved = ignis_runtime::ReservedBytes {
-            prefill_scratch: 1,
-            vision_workspace: 2,
+            workspace: 1,
             media_embedding: 3,
             sampling: 4,
             decode_graph: 5,
@@ -569,7 +566,6 @@ mod tests {
                 100,
                 ignis_runtime::CUDA_CONTEXT_BYTES,
                 1,
-                2,
                 3,
                 4,
                 5,
@@ -597,7 +593,7 @@ mod tests {
 
     fn plan_for(mode: ignis_core::VramMode, free: u64) -> ignis_core::VramPlan {
         let reserved = ignis_runtime::ReservedBytes {
-            prefill_scratch: 1 << 30,
+            workspace: 1 << 30,
             lane_state: 1 << 30,
             retained_slots: u64::from(crate::config::DEFAULT_RETAINED_SLOTS) * 238_823_424,
             ..Default::default()

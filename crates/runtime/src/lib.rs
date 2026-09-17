@@ -90,8 +90,8 @@ pub const LOAD_RESIDUAL_BYTES: u64 = 88_028_656;
 /// the loaded model and pool after it, and compared.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReservedBytes {
-    pub prefill_scratch: u64,
-    pub vision_workspace: u64,
+    /// The scratch arena prefill chunks and media encode share (GitHub #212).
+    pub workspace: u64,
     pub media_embedding: u64,
     pub sampling: u64,
     pub decode_graph: u64,

@@ -344,9 +344,16 @@ Vision is a load option too (GitHub #177): `--vision` (with
 objects in their stored Q4/Q5/Q6/W8/BF16 formats and reserves, inside
 `ignis_model_load` and so before the sequence pool is built, the encoder
 workspace and one item's `[5120, V]` output transient for
-`V = min(max_context, N)`. `ignis.runtime.kv_pool` reports it as
-`vision_reserved_bytes` beside the pool's `token_capacity`; the KV byte budget
-itself is the operator's and is not shrunk. Absent, nothing vision-related is
+`V = min(max_context, N)`. The encoder workspace is not an arena of its own
+(GitHub #212): the prefill scratch is sized for the larger of the two, and
+the VRAM plan shows it as one `workspace` line. `ignis.runtime.kv_pool`
+reports what vision adds — the output transient plus the scratch's growth —
+as `vision_reserved_bytes` beside the pool's `token_capacity`.
+`crates/runtime/tests/vision_shared_workspace_gpu.rs` checks, on a DFlash2
+load, that an image request, an image prefill interleaved with decoding text
+lanes and a three-image prompt whose encodes land between prefill chunks
+generate the tokens recorded before the arena was shared
+(`IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1` re-records them). Absent, nothing vision-related is
 bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
 (weights plus the reported reservation) and prints the reservation at the
 default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the

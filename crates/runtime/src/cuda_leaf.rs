@@ -275,8 +275,7 @@ fn reserved_bytes(
     kv_pool: u64,
 ) -> ReservedBytes {
     ReservedBytes {
-        prefill_scratch: model.prefill_scratch_bytes,
-        vision_workspace: model.vision_workspace_bytes,
+        workspace: model.workspace_bytes,
         media_embedding: model.media_embedding_bytes,
         sampling: model.sampling_bytes,
         decode_graph: model.decode_graph_bytes,

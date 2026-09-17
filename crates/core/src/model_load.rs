@@ -100,8 +100,7 @@ pub(crate) mod ffi {
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct IgnisModelReservations {
-        pub prefill_scratch_bytes: u64,
-        pub vision_workspace_bytes: u64,
+        pub workspace_bytes: u64,
         pub media_embedding_bytes: u64,
         pub sampling_bytes: u64,
         pub decode_graph_bytes: u64,
@@ -115,7 +114,9 @@ pub(crate) mod ffi {
     pub struct IgnisModelStats {
         pub vram_bytes: u64,
         pub bound_tensor_count: u64,
-        /// GitHub #177: the encoder workspace plus the output transient.
+        /// GitHub #177, #212: what vision adds beside a text load -- the
+        /// output transient, and whatever the encoder's workspace grows the
+        /// shared scratch past the prefill scratch.
         pub vision_reserved_bytes: u64,
         /// GitHub #210: what the load holds beside the weights, read off its
         /// own buffers.

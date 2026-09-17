@@ -1016,12 +1016,17 @@ struct LoadSizes {
   std::size_t drafter_scratch = 0;
   std::size_t sampling_logits = 0;
 
+  // GitHub #212: the one arena prefill chunks and media encode share. A
+  // media encode runs between prefill steps, never inside one, so the two
+  // are never live at once -- ninfer sizes its single workspace the same
+  // way.
+  std::size_t workspace() const { return std::max(prefill_scratch, vision_workspace); }
+
   ignis_model_reservations reservations() const {
     const std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
     const bool vision = media_embedding > 0;
     ignis_model_reservations out{};
-    out.prefill_scratch_bytes = prefill_scratch;
-    out.vision_workspace_bytes = vision_workspace;
+    out.workspace_bytes = workspace();
     out.media_embedding_bytes = media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
@@ -1108,8 +1113,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
     return arena != nullptr ? arena->capacity() : 0;
   };
   ignis_model_reservations out{};
-  out.prefill_scratch_bytes = capacity(model.scratch);
-  out.vision_workspace_bytes = capacity(model.vision_workspace);
+  out.workspace_bytes = capacity(model.scratch);
   out.media_embedding_bytes = bytes(model.vision_output);
   out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
                        bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
@@ -1225,19 +1229,27 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
 
   // P2-01 (GitHub #83): reserve the scratch once, sized for a
   // `prefill_chunk_tokens`-wide chunk (see compute_program_scratch_bytes
-  // above) -- never at the first long prompt. A chunk whose reservation
-  // does not fit the device's free memory fails the load right here, with
-  // a message naming the shortfall.
-  const std::size_t scratch_bytes = sizes.prefill_scratch;
+  // above) -- never at the first long prompt. GitHub #212: with vision, the
+  // same arena is the encoder's workspace, so it is sized for the larger of
+  // the two. A reservation that does not fit the device's free memory fails
+  // the load right here, with a message naming the shortfall and whichever
+  // of the two sized it.
+  const std::size_t scratch_bytes = sizes.workspace();
+  const auto vision_tokens = std::min(vision_max_tokens, max_context_tokens);
+  const bool encoder_sized = sizes.vision_workspace > sizes.prefill_scratch;
 
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
   const cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
   if (mem_err == cudaSuccess && scratch_bytes > free_bytes) {
-    set_error("ignis_model_load: a " + std::to_string(prefill_chunk_tokens) +
-              "-token prefill chunk needs a " + std::to_string(scratch_bytes) +
+    const std::string sized_by =
+        encoder_sized ? "the vision encoder's workspace for a " + std::to_string(vision_tokens) +
+                            "-token envelope"
+                      : "a " + std::to_string(prefill_chunk_tokens) + "-token prefill chunk";
+    set_error("ignis_model_load: " + sized_by + " needs a " + std::to_string(scratch_bytes) +
               "-byte scratch reservation, but only " + std::to_string(free_bytes) +
-              " bytes are free -- pick a smaller prefill chunk width");
+              " bytes are free -- " +
+              (encoder_sized ? "lower --vision-max-tokens" : "pick a smaller prefill chunk width"));
     cudaStreamDestroy(model->stream);
     model->stream = nullptr;
     return -1;
@@ -1245,6 +1257,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
 
   try {
     model->scratch = std::make_unique<ninfer::DeviceArena>(scratch_bytes);
+    model->prefill_scratch_bytes = sizes.prefill_scratch;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: scratch arena allocation failed: ") + e.what());
     cudaStreamDestroy(model->stream);
@@ -1254,25 +1267,23 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
 
   // GitHub #177: the vision reservation, taken here at load -- before the
   // caller builds its sequence pool -- so enabling vision can never OOM a
-  // later request: the encoder workspace for the envelope's merged tokens
-  // (capped by the context) and one item's output transient. A reservation
-  // that does not fit the free memory fails the load naming it.
+  // later request: one item's output transient for the envelope's merged
+  // tokens (capped by the context), beside the scratch above that already
+  // fits the encoder's workspace (GitHub #212). A reservation that does not
+  // fit the free memory fails the load naming it.
   if (vision_max_tokens > 0) {
     model->vision_max_tokens = vision_max_tokens;
     try {
-      const auto tokens = static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens));
-      const std::size_t workspace_bytes = sizes.vision_workspace;
       const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;
-      if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess &&
-          workspace_bytes + output_bytes > vision_free) {
-        throw std::runtime_error("a " + std::to_string(tokens) + "-token vision envelope needs " +
-                                 std::to_string(workspace_bytes + output_bytes) +
-                                 " bytes, but only " + std::to_string(vision_free) +
+      if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess && output_bytes > vision_free) {
+        throw std::runtime_error("a " + std::to_string(vision_tokens) +
+                                 "-token vision envelope's output needs " +
+                                 std::to_string(output_bytes) + " bytes, but only " +
+                                 std::to_string(vision_free) +
                                  " are free -- lower --vision-max-tokens");
       }
-      model->vision_workspace = std::make_unique<ninfer::DeviceArena>(workspace_bytes);
       model->vision_output = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());

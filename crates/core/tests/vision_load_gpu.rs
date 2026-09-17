@@ -31,9 +31,9 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 /// rounds' rotation positions (`position + rope_delta`) in a model-owned
 /// buffer at a stable address, so the decode graphs read them at replay.
 /// `ignis_program_stats` counts that buffer; `vision_reserved_bytes` does
-/// not, and should not — that number is the encoder workspace plus the
-/// per-item output transient, which is what the startup capacity line
-/// reports. One I32 per lane over the leaf's `IGNIS_DECODE_MAX_BATCH`
+/// not, and should not — that number is the per-item output transient plus
+/// what the encoder workspace grows the prefill scratch by (GitHub #212: the
+/// two share one arena), which is what the startup capacity line reports. One I32 per lane over the leaf's `IGNIS_DECODE_MAX_BATCH`
 /// (8, `ignis_step.h`).
 ///
 /// #177 wrote this test before #178 added the buffer, and no GPU profile ran
@@ -116,7 +116,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     assert_eq!(vision_bound, plain_bound + VISION_OBJECTS as u64, "every vision object crosses the ABI");
     assert!(
         vision_reserved > vision.output_transient_bytes(SMALL_CONTEXT),
-        "the reservation is the workspace plus the output transient"
+        "the reservation is the output transient plus the encoder's growth of the shared scratch"
     );
     assert_eq!(
         vision_vram - plain_vram,

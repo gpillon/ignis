@@ -256,7 +256,12 @@ struct ignis_model {
   uint64_t vocab = 0;
   float rms_norm_eps = 0.0F;
   cudaStream_t stream = nullptr;
+  // GitHub #212: with vision, media encode runs out of this arena too,
+  // between prefill steps; it is sized for the larger of the two.
   std::unique_ptr<ninfer::DeviceArena> scratch;
+  // GitHub #212: what one prefill chunk alone needs of `scratch` -- its
+  // capacity without vision.
+  uint64_t prefill_scratch_bytes = 0;
   uint64_t last_step_micros = 0;
   uint64_t last_step_kernel_count = 0;
 
@@ -348,12 +353,11 @@ struct ignis_model {
   Dflash2Weights dflash2{};
 
   // GitHub #177: the vision tower, bound in its stored formats when the load
-  // names a vision envelope (`vision_max_tokens > 0`), and its fixed device
-  // reservation -- the encoder workspace and one item's output transient,
-  // sized once for the envelope. Nothing runs on them yet (#178).
+  // names a vision envelope (`vision_max_tokens > 0`), and one item's output
+  // transient, sized once for the envelope. The encoder's workspace is
+  // `scratch` above, grown to fit it (GitHub #212).
   uint32_t vision_max_tokens = 0;
   VisionWeights vision{};
-  std::unique_ptr<ninfer::DeviceArena> vision_workspace;
   std::unique_ptr<ninfer::DeviceBuffer> vision_output;
   // GitHub #178: whether `vision_output` holds a live media embedding. One
   // item at a time, like the reference's single output transient.
@@ -364,8 +368,11 @@ struct ignis_model {
   // address. Only a vision load has one: a text load's rounds rotate at the
   // positions themselves, exactly as before.
   std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
+  // What vision adds beside a text load: the output transient, and what the
+  // encoder's workspace grew `scratch` by.
   uint64_t vision_reserved_bytes() const {
-    return (vision_workspace ? vision_workspace->capacity() : 0) +
+    const uint64_t shared = scratch ? scratch->capacity() : 0;
+    return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) +
            (vision_output ? vision_output->bytes : 0);
   }
 
