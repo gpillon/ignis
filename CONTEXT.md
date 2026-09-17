@@ -298,7 +298,9 @@ When output names a domain concept, use the term as defined here.
   call and keeps the loop itself.
 - **Prefill chunk** — the number of tokens one traversal of the model
   processes during chunked prefill: a model-load option, default 1024, a
-  multiple of 128. The unit the prefill scratch is sized for.
+  multiple of 128. The unit the prefill scratch is sized for; with vision,
+  that scratch is also the vision encoder's workspace and is sized for the
+  larger of the two (the VRAM plan's `workspace` line).
 - **Per-token prefill route** — the G1 prefill path that runs the program one
   token at a time (recurrent GDN, small-T attention). Retained after G2 as a
   test-only, per-call route: the self-oracle chunked prefill is checked

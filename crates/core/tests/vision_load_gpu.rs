@@ -116,6 +116,9 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
     assert_eq!(plain_reserved, 0, "a load without vision reserves nothing for it");
     assert_eq!(plain_again, plain_vram, "a load without the option reports today's figure");
     assert_eq!(vision_bound, plain_bound + VISION_OBJECTS as u64, "every vision object crosses the ABI");
+    // Strictly more than the output transient because at a 128-token chunk the
+    // encoder's workspace for 1024 tokens is larger than the prefill scratch
+    // it shares (GitHub #212); where the scratch is the larger, it grows by 0.
     assert!(
         vision_reserved > vision.output_transient_bytes(SMALL_CONTEXT),
         "the reservation is the output transient plus the encoder's growth of the shared scratch"
