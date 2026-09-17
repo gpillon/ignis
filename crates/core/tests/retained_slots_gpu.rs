@@ -10,10 +10,12 @@
 //! - a lane's state copied into a retained slot and back is bit-exact, for
 //!   every section, and two retained slots never alias each other or a lane.
 //!
-//! The state copied is a pattern written through `ignis_seq_restore` rather
-//! than a prefilled sequence's: every byte of every section is distinct from
-//! its neighbours and from the other pattern, which a copy that dropped,
-//! shifted or aliased any region cannot reproduce.
+//! The copy is checked twice. Once on a pattern written through
+//! `ignis_seq_restore`: every byte of every section is distinct from its
+//! neighbours and from the other pattern, which a copy that dropped, shifted
+//! or aliased any region cannot reproduce. And once on a real DFlash2 load,
+//! whose sequence has prefilled and drafted, so the drafter's window and
+//! checkpoint hold what the drafter wrote.
 //!
 //! Explicit GPU profile (ADR 0006): outside `IGNIS_GPU_PROFILE=1` a missing
 //! GPU is a skip; under the profile it is a hard failure.
@@ -23,11 +25,17 @@
 #[path = "support/snapshot_blob.rs"]
 mod snapshot_blob;
 
-use ignis_artifact::CudaDevice;
+use std::path::Path;
+
+use ignis_artifact::{CudaDevice, DraftModule, FrontendSet, Reader, bind_model_scope_27b, materialize};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
+use ignis_core::model_load::load_qwen38_27b_with_speculation;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
-use ignis_core::{KvFormat, RetainedSlots, SpeculativeBackend};
+use ignis_core::step::{SamplingParams, VerifyLane, decode_program_verify_runs, prefill_program_sampled};
+use ignis_core::{KvFormat, RetainedSlots, Speculation, SpeculativeBackend};
+
+const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
 /// The mutable-state sections a retained slot carries: GDN conv, GDN
 /// recurrent, penalty counts, the drafter's window and its checkpoint.
@@ -189,4 +197,102 @@ fn a_lane_state_copied_into_a_retained_slot_and_back_is_bit_exact() {
     let lone = plain.alloc(64).unwrap_or_else(|e| panic!("alloc: {e}"));
     let err = plain.retained_store(&lone, &r0).expect_err("no retained slots");
     assert!(err.message.contains("out of range"), "{err}");
+}
+
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dflash2_load() {
+    const MAX_CONTEXT: u32 = 256;
+    const WINDOW: u32 = 7;
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    assert_eq!(snapshot_format_version(), 3, "support/snapshot_blob.rs reads format 3");
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let prompt: Vec<i32> = frontend
+        .tokenizer()
+        .encode(
+            "<|im_start|>user\nList five Rust crates for parsing command-line arguments, one per \
+             line.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+        .unwrap_or_else(|e| panic!("tokenize: {e}"))
+        .into_iter()
+        .map(|id| i32::try_from(id).expect("token id fits i32"))
+        .collect();
+    let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
+        .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
+    let Some(mut device) = cuda_device_or_skip() else { return };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    {
+        let speculation = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
+        let model = load_qwen38_27b_with_speculation(
+            &reader,
+            &artifact,
+            &handles,
+            MAX_CONTEXT,
+            MAX_CONTEXT,
+            KvFormat::Bf16,
+            Some(speculation),
+        )
+        .unwrap_or_else(|e| panic!("model load (dflash2): {e}"));
+        let pool = SeqPool::create_with_speculation(
+            &ModelConfig::qwen38_27b(),
+            &SeqPoolBudget {
+                kv_format: KvFormat::Bf16,
+                kv_page_group_count: MAX_CONTEXT.div_ceil(64),
+                max_context_tokens: MAX_CONTEXT,
+                slot_count: 1,
+                retained_slot_count: 1,
+            },
+            Some(SpeculativeBackend::Dflash2),
+        )
+        .unwrap_or_else(|e| panic!("create: {e}"));
+        let mut retained = RetainedSlots::new(1);
+        let slot = retained.take().unwrap();
+
+        let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
+        prefill_program_sampled(&model, &pool, &mut seq, &prompt, 0, SamplingParams::greedy(), None)
+            .unwrap_or_else(|e| panic!("prefill: {e}"));
+        let mut rounds = |seq: &mut Seq<'_>, count: usize| {
+            for _ in 0..count {
+                let lanes = [VerifyLane {
+                    remaining_tokens: 64,
+                    ..VerifyLane::greedy(&[])
+                }];
+                decode_program_verify_runs(&model, &pool, &mut [&mut *seq], &lanes, WINDOW)
+                    .unwrap_or_else(|e| panic!("verify round: {e}"));
+            }
+        };
+        rounds(&mut seq, 2);
+
+        let drafted = state_of(&seq);
+        let written: Vec<(i32, bool)> = STATE_SECTIONS
+            .iter()
+            .zip(&drafted)
+            .map(|(&kind, section)| (kind, section.iter().any(|&b| b != 0)))
+            .collect();
+        // Greedy rounds with no penalty leave the penalty counts at zero; the
+        // pattern test above carries that section.
+        assert_eq!(
+            written,
+            [(1, true), (2, true), (3, false), (5, true), (6, true)],
+            "the GDN state and the drafter's window and checkpoint hold what the load wrote"
+        );
+        pool.retained_store(&seq, &slot).unwrap_or_else(|e| panic!("store: {e}"));
+        rounds(&mut seq, 2);
+        assert_ne!(state_of(&seq), drafted, "two more rounds moved the lane's state");
+        pool.retained_load(&slot, &mut seq).unwrap_or_else(|e| panic!("load: {e}"));
+        assert_eq!(state_of(&seq), drafted, "the retained slot gives back the drafted state bit for bit");
+    }
+    let _ = artifact.release_arena(&mut device);
 }

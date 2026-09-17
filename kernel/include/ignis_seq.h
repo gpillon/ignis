@@ -645,11 +645,12 @@ int32_t ignis_seq_retained_load(struct ignis_seq_pool *pool, uint32_t retained_s
 
 /* --- device allocation counter (GitHub #211, ADR 0030) --------------------
  *
- * Every allocation and free the leaf makes while serving, by what made it:
- * a test reads the counts around a request mix to show where serving
+ * Every allocation and free the leaf's own allocation points make, by what
+ * made it: a test reads the counts around a request mix to show where serving
  * allocates. Process-wide and never reset; a reader takes the difference of
- * two reads. The load's own reservations (the pool's and the model's arenas)
- * are not counted.
+ * two reads, since IGNIS_ALLOC_DEVICE counts the weights' arena at load too.
+ * The pool's and the model's arenas, built once at load by the vendored
+ * allocator, are not counted.
  */
 enum ignis_alloc_kind {
   /* A shared prefix's mutable-state image (ignis_seq_prefix_publish). */
