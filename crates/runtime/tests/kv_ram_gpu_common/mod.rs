@@ -25,6 +25,11 @@ const MAX_CONTEXT: u32 = 2048;
 const CHUNK: u32 = 1024;
 const GENERATED: u32 = 24;
 const GIB: u64 = 1024 * 1024 * 1024;
+/// The KV-RAM tier these legs run on: the leaf pins exactly this as its
+/// arena (GitHub #213) and the scheduler budgets exactly this in bytes, so
+/// the ledger and the arena are two views of one region — which is what lets
+/// a leg assert they agree.
+pub const HOST_POOL_BYTES: u64 = 16 * GIB;
 
 pub struct Loaded {
     model: Arc<Model<CudaLeaf>>,
@@ -73,7 +78,9 @@ pub fn load(speculation: Option<Speculation>) -> Option<Loaded> {
         speculation,
         ..CudaLeafConfig::default()
     };
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, config);
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
+        .with_kv_ram_arena(HOST_POOL_BYTES)
+        .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     Some(Loaded { model, eos, frontend })
 }
@@ -109,7 +116,7 @@ impl Loaded {
                 kv_capacity_pages: MAX_CONTEXT / KV_PAGE_TOKENS + 1,
                 resident_slot_capacity: resident_slots,
                 serving_chunk_tokens: CHUNK,
-                host_capacity_bytes: 16 * GIB,
+                host_capacity_bytes: HOST_POOL_BYTES,
                 retained_slots,
                 ..SchedulerConfig::default()
             },

@@ -197,7 +197,11 @@ fn load() -> Option<Loaded> {
         vision: Some(Vision::default()),
         ..CudaLeafConfig::default()
     };
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, config);
+    // GitHub #213: the eviction leg below pushes a sequence to KV-RAM, which
+    // is placed in this arena. The same figure its scheduler budgets.
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
+        .with_kv_ram_arena(4 << 30)
+        .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     let compute = Arc::new(RuntimeCompute::new(model.clone(), eos));
     // The leaf's errors are `tracing::error!` events; without a subscriber a

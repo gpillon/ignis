@@ -184,7 +184,9 @@ When output names a domain concept, use the term as defined here.
   evicted live sequences (so they resume instead of re-prefilling) and of
   retained state (**prompt checkpoints**, **retained prefixes**) that left the
   device. Bounded by a byte budget held whole from the start rather than grown
-  blob by blob, two-tier (probation → protected), and
+  blob by blob — one page-locked arena, blobs placed first-fit inside it, so
+  room for a blob is a free *span* and not a count of free bytes — two-tier
+  (probation → protected), and
   written only at a **chunk boundary**. State reaches it lazily — only when the
   device is about to discard it, never as a copy of what is still resident.
 - **KV-disk** — Tier 2: the disk tier below KV-RAM, meant to outlive a server

@@ -258,6 +258,17 @@ impl DecodeOutcome {
     }
 }
 
+/// The [`ComputeError::Kernel`] code a backend reports when KV-RAM has no
+/// free span long enough for a blob (GitHub #213): the leaf's
+/// `IGNIS_SEQ_ERR_NO_HOST_ROOM`, restated here because the scheduler and its
+/// mock are CPU-only and the leaf's ABI constants are not.
+///
+/// The scheduler asks [`Compute::host_blob_fits`] before it spills or
+/// evicts, so it does not branch on this — it is what a backend returns when
+/// the arena changed hands between the probe and the call, and the refusal
+/// path is the same one every other failed spill takes.
+pub const NO_HOST_ROOM: i32 = -6;
+
 /// The compute seam the scheduler drives for actual token generation.
 ///
 /// This is the *only* GPU-coupled step in the engine. The scheduler's logic —
@@ -319,6 +330,24 @@ pub trait Compute: Send + Sync {
     /// than an infallible query since the leaf's ABI is.
     fn snapshot_size(&self, _request: RequestId) -> Result<u64, ComputeError> {
         Ok(0)
+    }
+
+    /// Whether KV-RAM has anywhere to put a blob of `bytes` right now
+    /// (GitHub #213, ADR 0030). See [`NO_HOST_ROOM`], the code a backend
+    /// that was asked anyway reports.
+    ///
+    /// [`HostTier`](crate::host::HostTier)'s byte ledger says whether the
+    /// tier may *hold* the blob; this says whether the one pinned arena the
+    /// blobs live in has a free span long enough to *place* it, which a
+    /// ledger's worth of free bytes scattered across holes does not. The
+    /// scheduler asks before it spills or evicts, so a refusal costs no
+    /// device work — and when the answer is no, the tier's victim order runs
+    /// exactly as it does for a full budget.
+    ///
+    /// A backend whose blobs are ordinary allocations has no arena to
+    /// fragment and always fits, which is the default.
+    fn host_blob_fits(&self, _bytes: u64) -> bool {
+        true
     }
 
     /// Snapshot `request`'s device state into pinned host memory and

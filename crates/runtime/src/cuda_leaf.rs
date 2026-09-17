@@ -26,7 +26,9 @@ use ignis_artifact::{
 };
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{
-    PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix, snapshot_format_version,
+    HostPinnedPool, PinnedAllocError, PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget,
+    SeqPrefix,
+    snapshot_format_version,
 };
 use ignis_core::step;
 use ignis_core::{
@@ -133,6 +135,15 @@ pub struct CudaLeaf {
     artifact: MaterializedArtifact,
     handles: Vec<ObjectHandle>,
     config: CudaLeafConfig,
+    /// The pinned KV-RAM arena every snapshot blob is placed in (GitHub
+    /// #213), or `None` before [`CudaLeaf::with_kv_ram_arena`] pins one —
+    /// which is what a leaf built for a test that never spills wants.
+    ///
+    /// Declared last on purpose: fields drop in declaration order, so this
+    /// one goes after everything above it. What it must outlive is not in
+    /// this struct at all but in `RuntimeCompute`'s snapshot maps, whose
+    /// `Drop` frees them before it lets go of the model.
+    host_pool: Option<HostPinnedPool>,
 }
 
 impl CudaLeaf {
@@ -154,7 +165,22 @@ impl CudaLeaf {
             artifact,
             handles,
             config,
+            host_pool: None,
         }
+    }
+
+    /// Pin `bytes` of KV-RAM as the one arena every snapshot blob is placed
+    /// in (GitHub #213, ADR 0030), and hold it for as long as this leaf
+    /// lives. `bytes` of 0 pins nothing and leaves the tier disabled.
+    ///
+    /// A load calls this before it serves anything: the pinning happens once
+    /// here rather than per blob, which is what keeps `cudaHostAlloc` off the
+    /// serving path and the process's shared GPU memory fixed on Windows.
+    /// `Err` when the region cannot be pinned — the start is refused, since a
+    /// leaf that cannot hold KV-RAM is not the engine the operator asked for.
+    pub fn with_kv_ram_arena(mut self, bytes: u64) -> Result<Self, String> {
+        self.host_pool = Some(HostPinnedPool::create(bytes)?);
+        Ok(self)
     }
 }
 
@@ -766,7 +792,18 @@ impl StepLeaf for CudaLeaf {
     }
 
     fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32> {
-        PinnedBuffer::new(bytes).map_err(|e| leaf_error("snapshot alloc", e))
+        PinnedBuffer::new(bytes).map_err(|e| match e {
+            // GitHub #213: a fragmented arena is a refusal, not a failure.
+            // The scheduler probed with `host_blob_fits` before asking, so
+            // reaching this means blobs changed hands in between — the caller
+            // turns the spill away, and there is no error to report.
+            PinnedAllocError::NoRoom => ignis_core::seq::NO_HOST_ROOM,
+            PinnedAllocError::Failed(message) => leaf_error("snapshot alloc", message),
+        })
+    }
+
+    fn host_blob_fits(&self, bytes: u64) -> bool {
+        ignis_core::seq::host_blob_fits(bytes)
     }
 
     fn snapshot_bytes(&self, _model: &Self::Model, sequence: &Self::Sequence) -> Result<u64, i32> {

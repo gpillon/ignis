@@ -88,6 +88,13 @@ extern "C" {
  * the arguments, that cannot accept the transfer. */
 #define IGNIS_SEQ_ERR_SHARED_PREFIX (-5)
 
+/* ignis_host_pinned_alloc only: the KV-RAM arena holds no free span long
+ * enough for the request (GitHub #213). Distinct from -1 because nothing is
+ * wrong -- the arena is merely full or fragmented, and the same call
+ * succeeds once the host tier has given blobs back. A caller that cannot
+ * free any turns the spill or evict away instead of failing the request. */
+#define IGNIS_SEQ_ERR_NO_HOST_ROOM (-6)
+
 /* Opaque device-resident pool of sequence state (never dereferenced across
  * the boundary). Allocated by ignis_seq_pool_create, destroyed by
  * ignis_seq_pool_free. */
@@ -670,7 +677,10 @@ enum ignis_alloc_kind {
   /* A prompt checkpoint's copy of its partial tail page; zero since GitHub
    * #215, which takes a KV page of the pool instead. */
   IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE = 2,
-  /* A pinned host region: a KV-RAM blob (ignis_host_pinned_alloc). */
+  /* A pinned host region. Since GitHub #213 that is the KV-RAM arena itself
+   * (ignis_host_pinned_pool_create), counted once at load; the blobs placed
+   * inside it are not CUDA allocations and count nothing, so this reads zero
+   * over a request mix. */
   IGNIS_ALLOC_KV_RAM_BLOB = 3,
   /* A device region from ignis_device_alloc (ignis_device.h). */
   IGNIS_ALLOC_DEVICE = 4,
@@ -689,23 +699,61 @@ struct ignis_alloc_count {
  * Returns 0; -1 on a null `out` or an unknown kind. */
 int32_t ignis_alloc_counts(int32_t kind, struct ignis_alloc_count *out);
 
-/* --- pinned host memory (P4-07, GitHub #125) ------------------------------
+/* --- pinned host memory (P4-07, GitHub #125; GitHub #213) -----------------
  *
  * The host tier's snapshot transport: a page-locked (`cudaHostAlloc`)
  * region, which is what makes the D2H capture and H2D restore run at
- * pinned PCIe rates rather than the pageable-memory path. Two calls, no
- * options struct -- there is nothing to modulate, only a size to allocate
- * and a pointer to free, the same shape as every other allocate/free pair
- * in this ABI (`ignis_device_alloc` / `ignis_device_free`).
+ * pinned PCIe rates rather than the pageable-memory path.
+ *
+ * Since GitHub #213 the page-locking happens once. The whole KV-RAM tier is
+ * one arena of `--kv-host-pool-bytes`, pinned at load and held for the life
+ * of the process (`ninfer::HostPinnedArena`, ADR 0030): blobs are placed
+ * first-fit inside it and freed back to it, and no `cudaHostAlloc` or
+ * `cudaFreeHost` happens while serving. Windows registers the arena with the
+ * GPU driver, so the process's "shared GPU memory" is the arena's size and
+ * does not move under load.
+ *
+ * The arena is process-wide, like the allocation counters above -- there is
+ * one host tier, so a handle would only be a pointer every caller passes
+ * back unchanged. It is created once, before any blob is allocated from it,
+ * and its lock makes it safe to free a blob from whichever thread drops it.
  */
 
-/* Allocate `bytes` of pinned host memory; `out_ptr` receives the host
- * pointer. Returns 0 on success, -1 on a null `out_ptr` or a CUDA
- * allocation failure (see ignis_seq_last_error) -- most commonly the host's
- * pinned-memory budget, not device VRAM. */
+/* Pin the KV-RAM arena of `bytes`, before any blob is allocated from it.
+ * `bytes` of 0 pins nothing and disables the tier: ignis_host_pinned_alloc
+ * then refuses every request. Returns 0 on success, -1 when the pinned
+ * allocation fails or an arena already exists (see ignis_seq_last_error).
+ * Calling it is what a failed start reports on. */
+int32_t ignis_host_pinned_pool_create(uint64_t bytes);
+
+/* Release the arena and its pinned memory. Every blob taken from it must
+ * already be freed; a live blob outliving this call is a use-after-free.
+ * A no-op when no arena exists. */
+void ignis_host_pinned_pool_destroy(void);
+
+/* The arena's capacity and the bytes its live blobs hold (excluding the
+ * padding first-fit alignment leaves behind, so this is exactly what the
+ * host tier's own byte ledger counts). Both are 0 when no arena exists.
+ * Returns 0; -1 on a null argument. */
+int32_t ignis_host_pinned_pool_stats(uint64_t *out_capacity, uint64_t *out_used);
+
+/* Whether a blob of `bytes` would find a free span in the arena right now.
+ * `out_fits` receives 0 or 1 -- 0 both when the arena is too full and when
+ * it is merely fragmented, which is the same refusal either way. Returns 0;
+ * -1 on a null `out_fits` or a `bytes` of 0. A caller probes before it
+ * captures, so a refusal costs no device work. */
+int32_t ignis_host_pinned_can_alloc(uint64_t bytes, int32_t *out_fits);
+
+/* Place `bytes` in the arena; `out_ptr` receives the host pointer. Returns
+ * 0 on success, IGNIS_SEQ_ERR_NO_HOST_ROOM when no free span is long enough,
+ * and -1 on a null `out_ptr`, a `bytes` of 0, or no arena at all (see
+ * ignis_seq_last_error). */
 int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr);
 
-/* Free a region returned by ignis_host_pinned_alloc. NULL is a no-op. */
+/* Return a region ignis_host_pinned_alloc gave out to the arena. NULL is a
+ * no-op. A pointer the arena never handed out is a caller bug: it is
+ * reported on stderr and ignored, since a free has nowhere to return a
+ * code. */
 void ignis_host_pinned_free(void *ptr);
 
 /* The message from the most recent failing call on this thread

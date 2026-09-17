@@ -50,6 +50,16 @@
 //! moves those bytes itself — it only accounts for them, keeping the tier
 //! CPU-testable without a GPU (see the module-level note above on the
 //! `Compute` seam).
+//!
+//! **The byte budget is not the whole admission test** (GitHub #213, ADR
+//! 0030). Those bytes live in one pinned arena, so a blob also needs a free
+//! *span* long enough — which free bytes scattered between live blobs are
+//! not. That question belongs to whoever holds the bytes, so the scheduler
+//! asks it through
+//! [`Compute::host_blob_fits`](crate::scheduler::Compute::host_blob_fits)
+//! and not here. This ledger stays the tier's *policy* — what may be held,
+//! and what goes first when something must — and knows nothing about where
+//! any blob sits.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};

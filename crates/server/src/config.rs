@@ -216,6 +216,9 @@ impl std::fmt::Debug for ApiKey {
 /// GitHub #125): comfortably holds several full-context snapshots (each
 /// ~528 MB per ADR 0024's estimate) without an operator having to reason
 /// about the format's per-snapshot cost just to start the server.
+///
+/// Since GitHub #213 (ADR 0030) it is page-locked whole at start rather than
+/// blob by blob while serving, so it is RAM the process holds even idle.
 pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `--prompt-reuse`'s default (GitHub #186, ADR 0029): on. Cross-request
@@ -975,7 +978,7 @@ fn help_text() -> String {
          \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_gib} GiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
          \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
          \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
-         \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
+         \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; page-locked whole at start and held for the life of the load, so it is RAM the process holds even idle and the figure Windows reports as its shared GPU memory; 0 disables the host KV-RAM tier)\n\
          \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared unless --retained-slots gives slots for it)\n\
          \x20       --retained-slots <n>      env: IGNIS_RETAINED_SLOTS (default: {DEFAULT_RETAINED_SLOTS}, one per decode lane; 0 with --prompt-reuse off, where a count shares heads between live siblings only; the images of retained checkpoints and shared prefixes, reserved in the VRAM plan)\n\
          \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\

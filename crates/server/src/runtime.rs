@@ -304,7 +304,13 @@ pub fn cuda_scheduler(
         .map_err(|e| e.to_string())?
         .page_count;
 
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config);
+    // GitHub #213: the whole KV-RAM tier, pinned once here and held for the
+    // life of the load — the same figure the scheduler's host tier budgets in
+    // bytes, so the ledger and the arena describe one region. A size the host
+    // cannot page-lock refuses the start rather than surfacing as a spill
+    // that quietly never happens.
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config)
+        .with_kv_ram_arena(shape.host_pool_bytes)?;
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
 
     // GitHub #98 (P3-02): do not just trust that formula — ask the leaf

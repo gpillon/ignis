@@ -111,7 +111,11 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
         speculation: None,
         ..CudaLeafConfig::default()
     };
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, config);
+    // GitHub #213: this leg evicts, so the leaf needs the arena its blob is
+    // placed in. A gibibyte is many times one snapshot of this geometry.
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
+        .with_kv_ram_arena(1024 * 1024 * 1024)
+        .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model =
         Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     let compute = RuntimeCompute::new(model, eos);

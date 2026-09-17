@@ -949,6 +949,11 @@ impl ConcreteScheduler {
         for victim in victims {
             self.discard_kv_ram_blob(victim, events);
         }
+        // As in `spill_checkpoint`: free bytes are not a free span, and the
+        // arena is asked before the copy (GitHub #213).
+        if !self.compute.host_blob_fits(bytes) {
+            return false;
+        }
         let Ok(bytes) = self.compute.spill_prefix(publisher, tokens) else {
             return false;
         };
@@ -1091,6 +1096,13 @@ impl ConcreteScheduler {
         };
         for victim in victims {
             self.discard_kv_ram_blob(victim, events);
+        }
+        // The budget has the bytes; the arena still has to have a hole for
+        // them (GitHub #213). The plan above only takes entries ranking below
+        // this one, so a fragmented arena is where the spill stops — asking
+        // before the copy is what keeps that costing no device work.
+        if !self.compute.host_blob_fits(bytes) {
+            return false;
         }
         let Ok(bytes) = self.compute.spill_checkpoint(entry.publisher) else {
             return false;
@@ -1850,8 +1862,17 @@ impl ConcreteScheduler {
     /// lost — it re-prefills from the start) and freeing its pinned buffer
     /// at the leaf (`Compute::discard_snapshot`). Returns `true` when the
     /// tier can hold `bytes` (there is room, or it was made).
+    ///
+    /// Room is a *hole*, not a count of free bytes (GitHub #213, ADR 0030):
+    /// KV-RAM is one pinned arena, so free bytes scattered between live
+    /// blobs are bytes a blob still cannot be placed in.
+    /// [`Compute::host_blob_fits`] is what knows the difference, and the same
+    /// victim order runs for a fragmented arena as for a full budget — down
+    /// to an empty tier, whose `false` is how the evict does not happen.
     fn make_host_room_for_bytes(&mut self, bytes: u64, events: &mut Vec<SchedEvent>) -> bool {
-        while self.host.used_bytes() + bytes > self.host.capacity_bytes() {
+        while self.host.used_bytes() + bytes > self.host.capacity_bytes()
+            || !self.compute.host_blob_fits(bytes)
+        {
             let now = self.now();
             match self.host.evict_for_live(now) {
                 Some(KvRamVictim::Retained(discarded)) => {
@@ -3308,5 +3329,105 @@ impl Scheduler for ConcreteScheduler {
         } else {
             EngineMode::Idle
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gdn::GdnState;
+    use crate::host::{HostEntry, ResumePhase, Tier};
+    use crate::mock::MockCompute;
+
+    /// A live snapshot of `bytes`, captured by `owner` at tick `tick`. The
+    /// fields the host tier's own order reads are the only ones that matter
+    /// here; the rest is a well-formed resting request.
+    fn entry(request: RequestId, bytes: u64, owner: RequestClass, tick: u64) -> HostEntry {
+        let mut gdn = GdnState::new();
+        gdn.checkpoint(0);
+        HostEntry {
+            request,
+            resume_phase: ResumePhase::Running,
+            lane: Some(0),
+            owner,
+            pages: 1,
+            bytes,
+            tokens: 0,
+            prefill_progress: 0,
+            remaining_work: 8,
+            gdn,
+            tier: Tier::Probation,
+            use_tick: tick,
+        }
+    }
+
+    /// A tier and an arena of four bytes each, holding three one-byte
+    /// snapshots placed in order — so the arena is
+    /// `[r1][r2][r3][free]` and the ledger reads 3 of 4 used.
+    ///
+    /// `r2`, in the middle, is the Agent: the tier discards by class first
+    /// (ADR 0023), so it is the first victim, and giving it up leaves the
+    /// free bytes in two one-byte holes rather than one span of two.
+    fn three_blobs() -> (ConcreteScheduler, Arc<MockCompute>) {
+        let compute = Arc::new(MockCompute::with_host_arena(4));
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                host_capacity_bytes: 4,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        for (request, owner) in [
+            (1, RequestClass::Interactive),
+            (2, RequestClass::Agent),
+            (3, RequestClass::Interactive),
+        ] {
+            compute.evict(request).expect("the arena has room for a byte");
+            sched
+                .host
+                .capture(entry(request, 1, owner, request))
+                .expect("the tier has room for a byte");
+        }
+        assert_eq!(sched.host.used_bytes(), 3);
+        assert_eq!(compute.host_arena_used(), 3);
+        (sched, compute)
+    }
+
+    #[test]
+    fn making_room_keeps_going_until_a_hole_fits_not_until_the_bytes_do() {
+        let (mut sched, compute) = three_blobs();
+        let mut events = Vec::new();
+
+        assert!(
+            sched.make_host_room_for_bytes(2, &mut events),
+            "two of the four bytes can be freed"
+        );
+
+        // The Agent in the middle goes first and takes the ledger to 2 of 4,
+        // which is where a byte budget alone would stop -- and the arena
+        // would still have nowhere to put a two-byte blob. Room means a hole.
+        assert!(
+            compute.host_blob_fits(2),
+            "the loop stopped on free bytes, not on a free span"
+        );
+        assert_eq!(
+            sched.host.used_bytes(),
+            compute.host_arena_used(),
+            "the ledger and the arena agree after every step"
+        );
+    }
+
+    #[test]
+    fn a_blob_no_victim_order_can_fit_leaves_the_tier_empty_and_refuses() {
+        let (mut sched, compute) = three_blobs();
+        let mut events = Vec::new();
+
+        assert!(
+            !sched.make_host_room_for_bytes(5, &mut events),
+            "nothing the tier can give up makes a five-byte hole in a four-byte arena"
+        );
+        assert_eq!(sched.host.entry_count(), 0, "it gave up everything trying");
+        assert_eq!(sched.host.used_bytes(), 0);
+        assert_eq!(compute.host_arena_used(), 0, "and every blob went back to the arena");
     }
 }

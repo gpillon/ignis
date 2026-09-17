@@ -621,19 +621,106 @@ void check_both_formats() {
 
 // ---- 5. the measured transfer cost -----------------------------------------
 
+// The KV-RAM arena itself (GitHub #213, ADR 0030): one pinned region, blobs
+// placed first-fit inside it and freed back to it. Every check is against
+// the ABI the host tier calls, and the arena's own `used` is what the tier's
+// byte ledger is asserted against on the Rust side -- so this pins that
+// `used` counts exactly the bytes asked for, the padding first-fit leaves
+// behind going back to the free list rather than onto the figure.
+void check_host_pinned_arena() {
+  std::uint64_t capacity = 1;
+  std::uint64_t used     = 1;
+
+  // No arena: the tier is off, nothing fits, and an alloc says so rather
+  // than quietly pinning a region of its own.
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats with no arena");
+  expect(capacity == 0 && used == 0, "arena: no arena reads 0 capacity and 0 used");
+  void *none = nullptr;
+  expect_rc(ignis_host_pinned_alloc(4096, &none), -1, "arena: alloc with no arena refused");
+  int32_t fits = 1;
+  expect_rc(ignis_host_pinned_can_alloc(4096, &fits), 0, "arena: can_alloc with no arena");
+  expect(fits == 0, "arena: nothing fits with no arena");
+
+  // 0 disables the tier: a create that succeeds and still pins nothing.
+  expect_rc(ignis_host_pinned_pool_create(0), 0, "arena: a 0-byte create disables the tier");
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats after a 0-byte create");
+  expect(capacity == 0, "arena: a 0-byte create pins nothing");
+
+  // Four blocks of a quarter each, so the arena is exactly full and the
+  // shape of every hole below is known.
+  const std::uint64_t block = 64 * 1024;
+  expect_rc(ignis_host_pinned_pool_create(4 * block), 0, "arena: create");
+  expect_rc(ignis_host_pinned_pool_create(block), -1, "arena: a second create is refused");
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats after create");
+  expect(capacity == 4 * block && used == 0, "arena: a fresh arena holds nothing");
+
+  void *blocks[4] = {nullptr, nullptr, nullptr, nullptr};
+  for (int i = 0; i < 4; ++i) {
+    expect_rc(ignis_host_pinned_alloc(block, &blocks[i]), 0, "arena: alloc a quarter");
+  }
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats when full");
+  expect(used == 4 * block, "arena: used is the sum of what the blobs asked for");
+  expect(blocks[0] != nullptr && blocks[1] > blocks[0] && blocks[2] > blocks[1] &&
+             blocks[3] > blocks[2],
+         "arena: first-fit hands out ascending addresses in one region");
+
+  // A full arena refuses, and says so as a refusal rather than an error: the
+  // caller turns the spill away and keeps serving.
+  void *overflow = nullptr;
+  expect_rc(ignis_host_pinned_alloc(block, &overflow), IGNIS_SEQ_ERR_NO_HOST_ROOM,
+            "arena: a full arena has no room");
+  expect(overflow == nullptr, "arena: a refused alloc hands back no pointer");
+  expect_rc(ignis_host_pinned_can_alloc(block, &fits), 0, "arena: can_alloc when full");
+  expect(fits == 0, "arena: nothing fits when full");
+
+  // Fragmentation: two non-adjacent quarters come back, so half the arena is
+  // free and no hole is longer than a quarter.
+  ignis_host_pinned_free(blocks[0]);
+  ignis_host_pinned_free(blocks[2]);
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats after two frees");
+  expect(used == 2 * block, "arena: a free gives its bytes back");
+  expect_rc(ignis_host_pinned_can_alloc(2 * block, &fits), 0, "arena: can_alloc a half");
+  expect(fits == 0, "arena: half the arena free is not a half-arena hole");
+  expect_rc(ignis_host_pinned_can_alloc(block, &fits), 0, "arena: can_alloc a quarter");
+  expect(fits == 1, "arena: a quarter still fits between the live blobs");
+  void *refill = nullptr;
+  expect_rc(ignis_host_pinned_alloc(2 * block, &refill), IGNIS_SEQ_ERR_NO_HOST_ROOM,
+            "arena: a blob longer than every hole is refused");
+  expect_rc(ignis_host_pinned_alloc(block, &refill), 0, "arena: the first hole takes a quarter");
+  expect(refill == blocks[0], "arena: first-fit refills the lowest hole");
+
+  // Adjacent frees coalesce, so the arena comes back whole.
+  ignis_host_pinned_free(refill);
+  ignis_host_pinned_free(blocks[1]);
+  ignis_host_pinned_free(blocks[3]);
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats when empty");
+  expect(used == 0, "arena: an empty arena holds nothing");
+  expect_rc(ignis_host_pinned_can_alloc(4 * block, &fits), 0, "arena: can_alloc the whole arena");
+  expect(fits == 1, "arena: freed neighbours coalesce back into one span");
+
+  ignis_host_pinned_free(nullptr); // a no-op, must not crash
+  ignis_host_pinned_pool_destroy();
+  expect_rc(ignis_host_pinned_pool_stats(&capacity, &used), 0, "arena: stats after destroy");
+  expect(capacity == 0, "arena: destroy releases the pinned region");
+  ignis_host_pinned_pool_destroy(); // a no-op, must not crash
+}
+
 // The host tier's own allocator (P4-07, GitHub #125): a round trip through
 // ignis_host_pinned_alloc / ignis_host_pinned_free rather than the test's
 // own cudaMallocHost (used above only because it predates this ABI) --
 // proving the entry point the host tier actually calls, not a stand-in for
-// it.
+// it. Since GitHub #213 that entry point places the blob in the arena this
+// test pins around the round trip.
 void check_pinned_alloc() {
   expect_rc(ignis_host_pinned_alloc(4096, nullptr), -1, "pinned alloc: null out_ptr refused");
+  expect_rc(ignis_host_pinned_pool_create(256 * 1024 * 1024), 0, "pinned alloc: arena create");
 
   const ignis_seq_pool_spec spec = small_spec();
   ignis_seq_pool *pool           = nullptr;
   if (ignis_seq_pool_create(&spec, &pool) != 0) {
     std::fprintf(stderr, "FAIL: pinned alloc: pool create: %s\n", ignis_seq_last_error());
     ++failures;
+    ignis_host_pinned_pool_destroy();
     return;
   }
   ignis_seq *source = nullptr;
@@ -650,6 +737,7 @@ void check_pinned_alloc() {
     ++failures;
     ignis_seq_release(pool, source);
     ignis_seq_pool_free(pool);
+    ignis_host_pinned_pool_destroy();
     return;
   }
   expect_rc(ignis_seq_snapshot(pool, source, pinned, bytes), 0, "pinned alloc: snapshot into pinned");
@@ -667,6 +755,7 @@ void check_pinned_alloc() {
   ignis_host_pinned_free(nullptr); // a no-op, must not crash
   ignis_seq_release(pool, target);
   ignis_seq_pool_free(pool);
+  ignis_host_pinned_pool_destroy();
 }
 
 // A full sequence's worth of restore/re-prefill cost comparison: restore is
@@ -929,6 +1018,7 @@ int main() {
                    "hq-e8-2b, 27B geometry, dflash2");
   check_refusals();
   check_both_formats();
+  check_host_pinned_arena();
   check_pinned_alloc();
   check_drafter_sections();
   // 128 tokens is the "short sequence" the spec prices at the snapshot's

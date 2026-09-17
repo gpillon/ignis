@@ -319,14 +319,38 @@ pub(crate) mod ffi {
 
         pub fn ignis_seq_last_error() -> *const c_char;
 
-        /// Pinned (page-locked) host memory (P4-07, GitHub #125): the host
-        /// tier's snapshot transport. Returns 0 and the host pointer in
-        /// `out_ptr`, or -1 on a null `out_ptr` or a CUDA allocation
-        /// failure (see `ignis_seq_last_error`).
+        /// Pin the KV-RAM arena of `bytes` (GitHub #213), before any blob is
+        /// allocated from it. `bytes` of 0 pins nothing and disables the
+        /// tier. Returns 0, or -1 when the pinned allocation fails or an
+        /// arena already exists (see `ignis_seq_last_error`).
+        pub fn ignis_host_pinned_pool_create(bytes: u64) -> i32;
+
+        /// Release the arena and its pinned memory. Every blob taken from it
+        /// must already be freed. A no-op when no arena exists.
+        pub fn ignis_host_pinned_pool_destroy();
+
+        /// The arena's capacity and the bytes its live blobs hold, both 0
+        /// when no arena exists. Returns 0; -1 on a null argument.
+        pub fn ignis_host_pinned_pool_stats(
+            out_capacity: *mut u64,
+            out_used: *mut u64,
+        ) -> i32;
+
+        /// Whether a blob of `bytes` would find a free span right now;
+        /// `out_fits` receives 0 or 1. Returns 0; -1 on a null `out_fits` or
+        /// a `bytes` of 0.
+        pub fn ignis_host_pinned_can_alloc(bytes: u64, out_fits: *mut i32) -> i32;
+
+        /// Place `bytes` in the KV-RAM arena (P4-07, GitHub #125; the arena
+        /// since GitHub #213): the host tier's snapshot transport. Returns 0
+        /// and the host pointer in `out_ptr`,
+        /// [`IGNIS_SEQ_ERR_NO_HOST_ROOM`](super::IGNIS_SEQ_ERR_NO_HOST_ROOM)
+        /// when no free span is long enough, or -1 on a null `out_ptr`, a
+        /// `bytes` of 0, or no arena at all (see `ignis_seq_last_error`).
         pub fn ignis_host_pinned_alloc(bytes: u64, out_ptr: *mut *mut c_void) -> i32;
 
-        /// Free a region [`ignis_host_pinned_alloc`] returned. NULL is a
-        /// no-op.
+        /// Return a region [`ignis_host_pinned_alloc`] gave out to the
+        /// arena. NULL is a no-op.
         pub fn ignis_host_pinned_free(ptr: *mut c_void);
     }
 
@@ -383,6 +407,17 @@ pub const SHARED_PREFIX: i32 = -5;
 /// the target does not match). The target sequence is left untouched, so
 /// the right response is to discard the blob and re-prefill.
 pub const BAD_SNAPSHOT: i32 = -4;
+
+/// `IGNIS_SEQ_ERR_NO_HOST_ROOM` (GitHub #213): the KV-RAM arena holds no
+/// free span long enough for the blob — it is full, or merely fragmented.
+/// Nothing is wrong, so the right response is to give blobs back and try
+/// again, or to turn the spill away; [`host_blob_fits`] is the probe that
+/// asks before anything device-side happens.
+///
+/// The same value as [`crate::scheduler::NO_HOST_ROOM`], which is where the
+/// CPU side of the engine names it — defined from it so the two cannot
+/// drift.
+pub const NO_HOST_ROOM: i32 = crate::scheduler::NO_HOST_ROOM;
 
 /// The snapshot blob format version this leaf writes and accepts (ADR
 /// 0024). A caller that persists blobs beyond one process records this
@@ -1202,25 +1237,131 @@ impl Drop for Seq<'_> {
     }
 }
 
+/// The KV-RAM arena (GitHub #213, ADR 0030): the one pinned region every
+/// [`PinnedBuffer`] is placed in, held from the load to the end of the
+/// process.
+///
+/// One `cudaHostAlloc` of `--kv-host-pool-bytes` and no other while serving,
+/// which is what fixes the process's shared GPU memory on Windows. The arena
+/// is process-wide in the leaf — there is one host tier — so this is a guard
+/// over that global, not a handle to one of many.
+///
+/// **It must outlive every buffer taken from it.** A [`PinnedBuffer`] freed
+/// after the guard drops has nowhere to return to; the leaf reports that on
+/// stderr rather than corrupting a free list, but it is a bug in the drop
+/// order of whatever holds them.
+#[derive(Debug)]
+pub struct HostPinnedPool {
+    capacity_bytes: u64,
+}
+
+impl HostPinnedPool {
+    /// Pin `bytes` for the tier. `bytes` of 0 pins nothing and leaves the
+    /// tier disabled: [`PinnedBuffer::new`] then refuses every request, which
+    /// is what a scheduler configured with a zero host budget never asks for.
+    ///
+    /// The error names the size and `--kv-host-pool-bytes`, because refusing
+    /// the start is the only thing a caller can do with it.
+    pub fn create(bytes: u64) -> Result<Self, String> {
+        let rc = unsafe { ffi::ignis_host_pinned_pool_create(bytes) };
+        if rc != 0 {
+            return Err(format!(
+                "could not pin {bytes} bytes of KV-RAM: {} \
+                 (--kv-host-pool-bytes sets this size; 0 disables the tier)",
+                last_error()
+            ));
+        }
+        Ok(Self {
+            capacity_bytes: bytes,
+        })
+    }
+
+    /// What [`Self::create`] was asked for. 0 means the tier is disabled.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+}
+
+impl Drop for HostPinnedPool {
+    fn drop(&mut self) {
+        unsafe { ffi::ignis_host_pinned_pool_destroy() };
+    }
+}
+
+/// The arena's capacity and the bytes its live blobs hold, both 0 when no
+/// arena exists. `used` counts what the blobs asked for, not the padding
+/// first-fit leaves between them — the same figure the host tier's own byte
+/// ledger keeps, so a test can assert the two are equal.
+pub fn host_pool_stats() -> (u64, u64) {
+    let mut capacity = 0u64;
+    let mut used = 0u64;
+    let rc = unsafe { ffi::ignis_host_pinned_pool_stats(&mut capacity, &mut used) };
+    assert_eq!(rc, 0, "ignis_host_pinned_pool_stats: neither argument is null");
+    (capacity, used)
+}
+
+/// Whether a blob of `bytes` would find a free span in the arena right now
+/// (GitHub #213).
+///
+/// The probe the scheduler asks before it spills or evicts: `false` both
+/// when the arena is too full and when it is merely fragmented, which is the
+/// same refusal either way. Asking first is what keeps a refused spill free
+/// of device work — the alternative is to snapshot and then discover there
+/// is nowhere to put it. `false` for a `bytes` of 0 and when the tier is
+/// disabled, neither of which a caller reaches.
+pub fn host_blob_fits(bytes: u64) -> bool {
+    let mut fits = 0i32;
+    let rc = unsafe { ffi::ignis_host_pinned_can_alloc(bytes, &mut fits) };
+    rc == 0 && fits != 0
+}
+
+/// Why [`PinnedBuffer::new`] could not place a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedAllocError {
+    /// The arena holds no free span long enough — full, or fragmented
+    /// ([`NO_HOST_ROOM`]). Not a failure: the caller gives blobs back and
+    /// asks again, or turns the spill away.
+    NoRoom,
+    /// Anything else, with the leaf's own message: no arena at all, or a
+    /// request the ABI refuses.
+    Failed(String),
+}
+
+impl std::fmt::Display for PinnedAllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRoom => f.write_str("no free span in the KV-RAM arena"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Pinned (page-locked) host memory (P4-07, GitHub #125): what
 /// [`Seq::snapshot_into`] writes into and [`Seq::restore`] reads from when
 /// the host tier evicts a sequence. Pinned rather than a plain `Vec<u8>` is
 /// what makes the D2H capture and H2D restore run at pinned PCIe rates
 /// (`ignis_seq.h`'s own doc comment on `ignis_seq_snapshot`).
+///
+/// Since GitHub #213 a buffer is a span of the [`HostPinnedPool`] rather than
+/// an allocation of its own, so it costs no `cudaHostAlloc` — and must not
+/// outlive that pool.
 pub struct PinnedBuffer {
     ptr: *mut c_void,
     len: usize,
 }
 
 impl PinnedBuffer {
-    /// Allocate `bytes` of pinned host memory, zeroed by neither this call
-    /// nor the leaf — a snapshot always overwrites every byte before it is
-    /// read back, so zeroing would only cost time.
-    pub fn new(bytes: u64) -> Result<Self, String> {
+    /// Place `bytes` in the KV-RAM arena, zeroed by neither this call nor
+    /// the leaf — a snapshot always overwrites every byte before it is read
+    /// back, so zeroing would only cost time.
+    pub fn new(bytes: u64) -> Result<Self, PinnedAllocError> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe { ffi::ignis_host_pinned_alloc(bytes, &mut ptr) };
+        if rc == NO_HOST_ROOM {
+            return Err(PinnedAllocError::NoRoom);
+        }
         if rc != 0 || ptr.is_null() {
-            return Err(last_error());
+            return Err(PinnedAllocError::Failed(last_error()));
         }
         Ok(Self {
             ptr,

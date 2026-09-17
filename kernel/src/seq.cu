@@ -19,10 +19,12 @@
 //
 // P4-07 (GitHub #125) adds the transfer's own host-side memory: a pinned
 // (page-locked) alloc/free pair the host KV-RAM tier calls to get the
-// region ignis_seq_snapshot writes into and ignis_seq_restore reads from --
-// plain cudaHostAlloc/cudaFreeHost, no pool of its own (unlike the vendored
-// arena.h staging allocator, this is a per-sequence-lifetime allocation, not
-// a churn-heavy scratch region worth pooling).
+// region ignis_seq_snapshot writes into and ignis_seq_restore reads from.
+// GitHub #213 (ADR 0030) moves the page-locking to the load: the pair now
+// places blobs in one process-wide vendored HostPinnedArena of
+// --kv-host-pool-bytes, pinned once and held for the life of the process,
+// so nothing calls cudaHostAlloc while serving and Windows reports a fixed
+// shared-GPU-memory figure for the process.
 //
 // Style follows model.cu: explicit pointers + sizes, int32 return codes (0
 // = ok, -1 = error, IGNIS_SEQ_ERR_NOT_AT_BOUNDARY / _BAD_SNAPSHOT for the
@@ -34,6 +36,7 @@
 #include "ignis_seq_prefix_internal.h"
 #include "ignis_seq_sections.h"
 
+#include "core/arena.h"
 #include "ops/kernel/hq_codec.cuh"
 
 #include <cuda_runtime.h>
@@ -51,8 +54,10 @@ static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
 
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1235,27 +1240,139 @@ extern "C" int32_t ignis_alloc_counts(int32_t kind, struct ignis_alloc_count *ou
   return 0;
 }
 
+// ---- the KV-RAM arena (GitHub #213, ADR 0030) ----------------------------
+
+namespace {
+
+// The one pinned region the host tier places every blob in. Process-wide
+// because the tier is: a handle would only be a pointer every caller hands
+// back unchanged. Absent when --kv-host-pool-bytes is 0, which disables the
+// tier, and absent before the load creates it.
+//
+// The vendored arena carries no lock of its own, and blobs are freed from
+// whichever thread drops the map that held them (the three snapshot maps in
+// RuntimeCompute lock independently), so every entry point below takes this
+// one. Only the create makes a CUDA call under it; the rest is a free-list
+// walk.
+std::mutex g_host_pool_mutex;
+std::unique_ptr<ninfer::HostPinnedArena> g_host_pool;
+
+} // namespace
+
+extern "C" int32_t ignis_host_pinned_pool_create(uint64_t bytes) {
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  if (g_host_pool) {
+    set_error("ignis_host_pinned_pool_create: a KV-RAM arena of " +
+              std::to_string(g_host_pool->capacity()) +
+              " bytes already exists; destroy it before creating another");
+    return -1;
+  }
+  if (bytes == 0) {
+    // The tier is off. The arena's constructor refuses a zero capacity, and
+    // there would be nothing to place in it anyway.
+    return 0;
+  }
+  try {
+    g_host_pool = std::make_unique<ninfer::HostPinnedArena>(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error("ignis_host_pinned_pool_create: pinning " + std::to_string(bytes) +
+              " bytes of KV-RAM failed: " + e.what());
+    return -1;
+  }
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, true, bytes);
+  return 0;
+}
+
+extern "C" void ignis_host_pinned_pool_destroy(void) {
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  if (g_host_pool) {
+    ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, false, 0);
+    g_host_pool.reset();
+  }
+}
+
+extern "C" int32_t ignis_host_pinned_pool_stats(uint64_t *out_capacity, uint64_t *out_used) {
+  if (out_capacity == nullptr || out_used == nullptr) {
+    set_error("ignis_host_pinned_pool_stats: null argument");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  *out_capacity = g_host_pool ? static_cast<uint64_t>(g_host_pool->capacity()) : 0;
+  *out_used     = g_host_pool ? static_cast<uint64_t>(g_host_pool->used()) : 0;
+  return 0;
+}
+
+extern "C" int32_t ignis_host_pinned_can_alloc(uint64_t bytes, int32_t *out_fits) {
+  if (out_fits == nullptr) {
+    set_error("ignis_host_pinned_can_alloc: null out_fits");
+    return -1;
+  }
+  *out_fits = 0;
+  if (bytes == 0) {
+    set_error("ignis_host_pinned_can_alloc: bytes must be positive");
+    return -1;
+  }
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  if (!g_host_pool) {
+    return 0;
+  }
+  try {
+    *out_fits = g_host_pool->can_alloc(static_cast<std::size_t>(bytes)) ? 1 : 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_pinned_can_alloc: ") + e.what());
+    return -1;
+  }
+  return 0;
+}
+
 extern "C" int32_t ignis_host_pinned_alloc(uint64_t bytes, void **out_ptr) {
   if (out_ptr == nullptr) {
     set_error("ignis_host_pinned_alloc: null out_ptr");
     return -1;
   }
   *out_ptr = nullptr;
-  void *ptr = nullptr;
-  const cudaError_t err = cudaHostAlloc(&ptr, static_cast<std::size_t>(bytes), cudaHostAllocDefault);
-  if (err != cudaSuccess) {
-    set_error(std::string("ignis_host_pinned_alloc: cudaHostAlloc failed: ") + cudaGetErrorString(err));
+  if (bytes == 0) {
+    set_error("ignis_host_pinned_alloc: bytes must be positive");
     return -1;
   }
-  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, true, bytes);
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  if (!g_host_pool) {
+    set_error("ignis_host_pinned_alloc: no KV-RAM arena -- --kv-host-pool-bytes 0 disables the "
+              "tier, and the load pins the arena otherwise");
+    return -1;
+  }
+  void *ptr = nullptr;
+  try {
+    ptr = g_host_pool->try_alloc(static_cast<std::size_t>(bytes));
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_host_pinned_alloc: ") + e.what());
+    return -1;
+  }
+  if (ptr == nullptr) {
+    set_error("ignis_host_pinned_alloc: no free span of " + std::to_string(bytes) +
+              " bytes in the " + std::to_string(g_host_pool->capacity()) +
+              "-byte KV-RAM arena (" + std::to_string(g_host_pool->used()) + " bytes held)");
+    return IGNIS_SEQ_ERR_NO_HOST_ROOM;
+  }
   *out_ptr = ptr;
   return 0;
 }
 
 extern "C" void ignis_host_pinned_free(void *ptr) {
-  if (ptr != nullptr) {
-    ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, false, 0);
-    cudaFreeHost(ptr);
+  if (ptr == nullptr) {
+    return;
+  }
+  const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
+  if (!g_host_pool) {
+    std::fprintf(stderr, "ignis_host_pinned_free: no KV-RAM arena to return %p to\n", ptr);
+    return;
+  }
+  try {
+    g_host_pool->free(ptr);
+  } catch (const std::exception &e) {
+    // A free has nowhere to return a code, and the arena refuses a pointer it
+    // never handed out rather than corrupting its own free list.
+    std::fprintf(stderr, "ignis_host_pinned_free: %s\n", e.what());
   }
 }
 

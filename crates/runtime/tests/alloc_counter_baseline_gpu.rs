@@ -54,16 +54,21 @@ fn serving_allocates_no_retained_state_image_and_a_blob_per_kv_ram_spill() {
     assert_eq!(of(AllocKind::Device), AllocCount::default(), "no device arena while serving");
 
     // GitHub #215: the same mix publishes and captures, and allocates for
-    // neither.
-    for kind in [AllocKind::PrefixImage, AllocKind::CheckpointImage, AllocKind::CheckpointTailPage] {
+    // neither. GitHub #213: it still spills to KV-RAM the same four times,
+    // and now places each blob in the arena the load pinned, so the last
+    // kind that moved here reads zero as well.
+    for kind in AllocKind::ALL {
         assert_eq!(of(kind), AllocCount::default(), "{kind:?} allocated while serving");
     }
-    // What is left is #213's: the mix still spills to KV-RAM, blob by blob --
-    // which is also what shows it is the mix #211 recorded.
-    assert_eq!(of(AllocKind::KvRamBlob).allocs, EXPECTED_KV_RAM_BLOBS, "{:?}", of(AllocKind::KvRamBlob));
-}
 
-/// Recorded on the RTX 5090, 2026-09-17 (#211): 4 KV-RAM blobs (981,839,872 B
-/// together). #211's 9 prefix images and 1 checkpoint image with its tail page
-/// are 0 since #215.
-const EXPECTED_KV_RAM_BLOBS: u64 = 4;
+    // Zero because the blobs are placed in the arena, not because the mix
+    // stopped spilling: each leg asserts its own KV-RAM spill and restore, so
+    // a mix that spilled nothing fails above this line, not here.
+    let (capacity, used) = ignis_core::seq::host_pool_stats();
+    assert_eq!(
+        capacity,
+        kv_ram_gpu_common::HOST_POOL_BYTES,
+        "the arena the load pinned is the tier's whole budget"
+    );
+    assert_eq!(used, 0, "every blob the mix placed went back to the arena");
+}

@@ -404,9 +404,22 @@ pub trait StepLeaf: Send + Sync + 'static {
 
     // ── state transfer (P4-07, GitHub #125, ADR 0024) ────────────────────
 
-    /// Allocate a snapshot buffer of at least `bytes` (pinned host memory
-    /// in production).
+    /// Allocate a snapshot buffer of at least `bytes` (a span of the pinned
+    /// KV-RAM arena in production, GitHub #213). `Err` with
+    /// `ignis_core::seq::NO_HOST_ROOM` when the arena has no free span long
+    /// enough, which [`StepLeaf::host_blob_fits`] is the way to ask first.
     fn alloc_snapshot_buf(&self, bytes: u64) -> Result<Self::SnapshotBuf, i32>;
+    /// Whether [`StepLeaf::alloc_snapshot_buf`] would find room for `bytes`
+    /// right now (GitHub #213).
+    ///
+    /// The host tier's byte ledger says whether the tier may hold the blob;
+    /// this says whether the arena has anywhere to put it, which a full
+    /// ledger's worth of free bytes scattered across holes does not. A
+    /// backend whose buffers are ordinary allocations always fits.
+    fn host_blob_fits(&self, bytes: u64) -> bool {
+        let _ = bytes;
+        true
+    }
     /// Bytes a snapshot of `sequence` would need right now. `Err` with
     /// `ignis_core::seq::NOT_AT_BOUNDARY` while mid-chunk.
     fn snapshot_bytes(&self, model: &Self::Model, sequence: &Self::Sequence) -> Result<u64, i32>;
@@ -1166,6 +1179,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             .map_err(|code| RuntimeError::Leaf(code).into())
     }
 
+    fn host_blob_fits(&self, bytes: u64) -> bool {
+        self.model.leaf.host_blob_fits(bytes)
+    }
+
     fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
         let mut sequences = self.sequences.lock().unwrap();
         let Some(live) = sequences.remove(&request) else {
@@ -1287,8 +1304,17 @@ impl<L: StepLeaf> Drop for RuntimeCompute<L> {
                 .leaf
                 .release_checkpoint(self.model.handle(), checkpoint);
         }
-        // Retained checkpoint buffers own only host memory and free it on
-        // drop; there is no leaf device handle left after spill.
+        // Every snapshot blob, freed here rather than left to the fields'
+        // own drop. They own only host memory — there is no leaf device
+        // handle left after a spill — but since GitHub #213 that memory is a
+        // span of the leaf's KV-RAM arena, and `model` is this struct's
+        // *first* field, so it would let go of the leaf (and the arena with
+        // it) before any of these dropped. Freeing them while the leaf is
+        // still here is what keeps that a return rather than a dangling one.
+        self.evicted
+            .get_mut()
+            .expect("RuntimeCompute is not dropped while its evicted lock is held")
+            .clear();
         self.retained
             .get_mut()
             .expect("RuntimeCompute is not dropped while its retained lock is held")
