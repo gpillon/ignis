@@ -5,6 +5,10 @@
 Accepted (2026-09-16) — GitHub #183 (absorbs #168). Spec:
 `.scratch/kv-reuse/specs/01-cross-request-reuse.md`. Builds on ADR 0024
 (sequence state transfer) and ADR 0023 (eviction priority), and amends both.
+Clarified by ADR 0030 (2026-09-17): the device pool of retained images below
+is physical — **retained slots** reserved at load, holding every shared
+prefix image as well as checkpoint images — not a byte ledger over
+request-time allocations.
 
 ## Context
 
@@ -52,7 +56,7 @@ match once history drops the earlier thinking.
 
 **Retained state is free until the room is needed.** On the device it is
 always the first victim, and it never delays or refuses an admission. Its
-mutable images live in a byte-budgeted device pool; when that pool is
+mutable images live in a device pool reserved at load (retained slots, ADR 0030); when that pool is
 exhausted, a checkpoint is simply not taken. KV-RAM receives it lazily, only
 when the device would otherwise discard it, and discards it before any
 evicted live sequence.

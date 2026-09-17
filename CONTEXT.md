@@ -31,6 +31,21 @@ When output names a domain concept, use the term as defined here.
   **prefill/decode interleaving**, not by this term (ADR 0018).
 - **Admission state machine** — the fairness machinery (protection, backfill class,
   temporal credit, frontier distance) deciding which request gets which lane.
+- **VRAM budget** — the device memory the whole ignis process may hold,
+  weights included: the number Task Manager shows. Either explicit (the
+  operator names it) or derived (the memory free at start minus the **VRAM
+  headroom**). Every device reservation is carved from it at load, and serving
+  allocates nothing on the device beyond it. A budget that cannot hold the
+  minimum — weights, workspaces, every lane, and one sequence at the maximum
+  context — refuses the start.
+- **VRAM headroom** — the device memory a derived **VRAM budget** leaves to
+  everything else on the card: the desktop and other processes.
+- **VRAM oversubscription** — holding more device memory than the card has
+  free. Windows serves it by paging device allocations to system RAM (Task
+  Manager's "Shared GPU memory") instead of failing, which slows every step;
+  other systems fail the allocation. ignis refuses it unless the operator
+  explicitly accepts it for an explicit budget.
+  _Avoid_: shared memory, spill (a spill is KV-RAM's).
 - **Hot reload** — in-place model reload without restarting the server; the model
   lifecycle is decoupled from the server lifecycle.
 - **Performance-first** — the organizing principle: correctness (a self-check
@@ -86,6 +101,29 @@ When output names a domain concept, use the term as defined here.
   *derived* from the format rather than configured (ADR 0022). The CLI default
   is `hq-e8-2b` since #123 wired its prefill and decode attention routes and
   captured its decode graphs; a correctness oracle asks for `bf16` by name.
+
+## Prompt rendering
+
+- **Instruction message** — a chat message addressed to the model rather than
+  said in the conversation: role `system`, or role `developer`. The model was
+  trained on neither more than one of them nor on `developer` at all, so every
+  instruction message the engine accepts reaches the model as a system block.
+- **System prompt** — the instruction the rendered prompt opens with, where
+  the tools block and the reasoning instructions attach and a **retained
+  prefix** is cut: the leading run of `system` messages joined into one, or a
+  leading `developer` message when no `system` precedes it.
+- **System message policy** — what the engine does with a `system` message
+  that is not the first message. By default a run of them at the start joins
+  the **system prompt** and a later one is rendered in place as a block of its
+  own; strict refuses the request instead, as the model's template would.
+- **Developer message policy** — what the engine does with a `developer`
+  message: render it in place (the default), join it into the **system
+  prompt**, gather every one into a single block after it, accept only one
+  right after it, or refuse it. Joining and gathering re-render earlier
+  history when a new one arrives mid-conversation, so they trade **prefix
+  reuse** for fewer system blocks; the others never move a message.
+- **Render refusal** — a request whose messages cannot be rendered into a
+  prompt. It is refused before admission, never served as an empty prompt.
 
 ## Sequence state
 
@@ -144,7 +182,8 @@ When output names a domain concept, use the term as defined here.
 - **KV-RAM** — Tier 1: the host-RAM tier that holds **snapshot blobs** of
   evicted live sequences (so they resume instead of re-prefilling) and of
   retained state (**prompt checkpoints**, **retained prefixes**) that left the
-  device. Bounded by a byte budget, two-tier (probation → protected), and
+  device. Bounded by a byte budget held whole from the start rather than grown
+  blob by blob, two-tier (probation → protected), and
   written only at a **chunk boundary**. State reaches it lazily — only when the
   device is about to discard it, never as a copy of what is still resident.
 - **KV-disk** — Tier 2: the disk tier below KV-RAM, meant to outlive a server
@@ -183,7 +222,15 @@ When output names a domain concept, use the term as defined here.
 - **Retained state** — prompt checkpoints and retained prefixes: state no live
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any
-  evicted live sequence.
+  evicted live sequence. On the device its mutable state lives only in
+  **retained slots**, never beside them.
+- **Retained slot** — a place reserved at load for one mutable-state image of
+  a **shared prefix** (retained, chained or still claimed) or of a **prompt
+  checkpoint**, the same size as a **lane**'s own state. There is one per lane
+  unless the operator says otherwise. When none is free, the lowest-ranked
+  **retained state** gives its slot up; when nothing can, the publish or
+  capture is skipped and the request runs without leaving reuse behind.
+  _Avoid_: retained pool (a ledger of bytes, not a place).
 - **Match key** — what a piece of **retained state**, and every **shared
   prefix**, is addressed by: a hash
   chain over the prompt tokens it covers, with each media item's identity (its
