@@ -35,6 +35,12 @@ API_KEY ?=
 # cloudflare-quick = a public https://*.trycloudflare.com URL, printed when
 # ready. An exposed server always requires a key (auto when API_KEY is empty).
 EXPOSE ?=
+# Where system and developer messages go before the chat template (#209).
+# merge = a leading run of system messages (qwen-code's agent prompt + hook
+# line) joins the system prompt; strict = 400 for any system message not first.
+SYSTEM_MESSAGE_POLICY ?= merge
+# inplace (server default), into-system, after-system, one-after-system, reject.
+DEVELOPER_MESSAGE_POLICY ?=
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults are the G5 gate legs (.scratch/runtime/specs/05, the g5-run driver):

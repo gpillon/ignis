@@ -173,6 +173,29 @@ fn a_bind_conflict_emits_a_server_failed_event() {
 }
 
 #[test]
+fn a_developer_policy_that_rerenders_history_warns_at_start() {
+    // GitHub #209: joining or gathering developer messages loses prefix reuse
+    // when one arrives mid-conversation, and the operator is told so once.
+    for (policy, via_env) in [("into-system", false), ("after-system", true)] {
+        let records = if via_env {
+            run_until(&[], &[("IGNIS_DEVELOPER_MESSAGE_POLICY", policy)], &["ignis.process.started"])
+        } else {
+            run_until(&["--developer-message-policy", policy], &[], &["ignis.process.started"])
+        };
+        let warning = find(&records, "ignis.config.developer_policy_rerenders");
+        assert_eq!(warning["severity_text"], "WARN");
+        assert_eq!(warning["attributes"]["developer_message_policy"], policy);
+    }
+    for policy in ["inplace", "one-after-system", "reject"] {
+        let records = run_until(&["--developer-message-policy", policy], &[], &["ignis.process.started"]);
+        assert!(
+            !records.iter().any(|r| r["event_name"] == "ignis.config.developer_policy_rerenders"),
+            "{policy} moves no message and warns about nothing"
+        );
+    }
+}
+
+#[test]
 fn no_artifact_emits_placeholder_template_then_process_started() {
     let records = run_until(&[], &[], &["ignis.process.started"]);
 

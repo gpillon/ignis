@@ -25,6 +25,7 @@ pub mod config;
 pub mod decoder;
 pub mod engine;
 pub mod expose;
+pub mod instruction;
 pub mod loader;
 pub mod media;
 pub mod metrics;
@@ -76,6 +77,10 @@ pub struct Server {
     /// Acquires and prepares a request's images before admission (GitHub
     /// #179); `None` on a load without `--vision`.
     pub media: Option<std::sync::Arc<media::MediaAcquirer>>,
+    /// Where `system` and `developer` messages go before the conversation is
+    /// templated (`--system-message-policy` / `--developer-message-policy`,
+    /// GitHub #209).
+    pub instruction_policy: instruction::InstructionPolicy,
 }
 
 impl Server {
@@ -91,6 +96,7 @@ impl Server {
             metrics: None,
             api_key: None,
             media: None,
+            instruction_policy: instruction::InstructionPolicy::default(),
         }
     }
 
@@ -161,6 +167,14 @@ impl Server {
     /// Acquire image parts with `acquirer` (a `--vision` load, GitHub #179).
     pub fn with_media(mut self, acquirer: std::sync::Arc<media::MediaAcquirer>) -> Self {
         self.media = Some(acquirer);
+        self
+    }
+
+    /// Place instruction messages under `policy` (`main` wires this to
+    /// `--system-message-policy` / `--developer-message-policy`, GitHub #209;
+    /// the default is merge / inplace).
+    pub fn with_instruction_policy(mut self, policy: instruction::InstructionPolicy) -> Self {
+        self.instruction_policy = policy;
         self
     }
 

@@ -252,6 +252,9 @@ async fn prepare_request(
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
 ) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
+    // GitHub #209: instruction messages are placed under the server's
+    // policies before any template sees the conversation, on both paths.
+    let messages = &server.instruction_policy.normalize(messages).map_err(template_rejection)?;
     let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
         let (input, model, prompt_tokens) =
             build_request(server, model, messages, params, thinking, tools).map_err(template_rejection)?;

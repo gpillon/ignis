@@ -127,19 +127,55 @@ impl ArtifactTemplateProvider {
         tokens.starts_with(&head).then(|| head.len() as u32)
     }
 
+    /// The prompt text [`TemplateProvider::apply_chat_template`] tokenizes for
+    /// `messages`, or the refusal it would answer with — what a test pins the
+    /// rendering by (GitHub #209).
+    pub fn render_text(
+        &self,
+        messages: &[ChatMessage],
+        options: &ThinkingOptions,
+        tools: &[JsonValue],
+    ) -> Result<String, TemplateRejection> {
+        Self::validate_roles(messages)?;
+        self.render(messages, options, tools)
+            .map_err(|message| TemplateRejection { code: "render_failed", message })
+    }
+
     /// The chat template's text for `messages`, image parts rendered as
     /// their placeholders.
+    ///
+    /// A `system` message past index 0 is an instruction rendered as a system
+    /// block of its own, in place (GitHub #209) — the reference's rendering,
+    /// which the Qwen 3.8 template refuses ("System message must be at the
+    /// beginning"). The template still renders the whole conversation: each
+    /// such message reaches it as a **stand-in** user message whose content is
+    /// a `<tool_response>` block, and the stand-in's rendered block is then
+    /// swapped for the system block. A stand-in keeps every message index, so
+    /// what the template decides by index (whose reasoning survives) is
+    /// unchanged; it is skipped by the template's last-user-query scan exactly
+    /// as the reference skips an instruction message; and it opens and closes
+    /// a run of tool results exactly as any non-tool message does.
     fn render(
         &self,
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<String, String> {
+        let mut blocks = Vec::new();
         let templated: Vec<ignis_artifact::ChatMessage> = messages
             .iter()
-            .map(|message| {
+            .enumerate()
+            .map(|(index, message)| {
                 let role = Role::parse(&message.role)
                     .ok_or_else(|| format!("unknown message role '{}'", message.role))?;
+                if index > 0 && role == Role::System {
+                    let stand_in = format!("<tool_response>\u{1}ignis:instruction:{index}\u{1}</tool_response>");
+                    blocks.push((
+                        format!("<|im_start|>user\n{stand_in}<|im_end|>\n"),
+                        format!("<|im_start|>system\n{}<|im_end|>\n", message.content.text().trim()),
+                    ));
+                    return Ok(ignis_artifact::ChatMessage::text(Role::User, stand_in));
+                }
                 let mut templated = ignis_artifact::ChatMessage::text(role, "");
                 templated.content = artifact_content(&message.content);
                 // Prior assistant reasoning is handed to the template
@@ -161,17 +197,40 @@ impl ArtifactTemplateProvider {
                 Ok(templated)
             })
             .collect::<Result<_, String>>()?;
-        self.set
+        let mut rendered = self
+            .set
             .chat_template()
             .render_with_thinking_and_tools(&templated, render_options(options), Some(tools))
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        for (stand_in, block) in blocks {
+            // Exactly one: anything else means the template did not render the
+            // stand-in as a plain user block, or a client sent its exact text.
+            if rendered.matches(&stand_in).count() != 1 {
+                return Err("an in-place system message could not be rendered".to_owned());
+            }
+            rendered = rendered.replacen(&stand_in, &block, 1);
+        }
+        Ok(rendered)
     }
 
-    /// Refuse unknown wire roles instead of silently rendering them as a
-    /// user message. Kept ahead of both text and multimodal rendering so the
-    /// HTTP error code is stable regardless of a request's content parts.
+    /// Refuse a role the template cannot take instead of silently rendering
+    /// it as a user message. Kept ahead of both text and multimodal rendering
+    /// so the HTTP error code is stable regardless of a request's content
+    /// parts. A `developer` message is refused here too: the server places it
+    /// under its developer message policy (`crate::instruction`) before any
+    /// provider sees the conversation.
     fn validate_roles(messages: &[ChatMessage]) -> Result<(), TemplateRejection> {
-        check_roles(messages)
+        check_roles(messages)?;
+        match messages.iter().position(|m| Role::parse(&m.role).is_none()) {
+            None => Ok(()),
+            Some(index) => Err(TemplateRejection {
+                code: "invalid_role",
+                message: format!(
+                    "message at index {index} has role '{}', which the chat template cannot render",
+                    messages[index].role
+                ),
+            }),
+        }
     }
 }
 

@@ -226,6 +226,7 @@ async fn main() {
         prompt_reuse: _,
         retained_pool_bytes: _,
         retained_interactive_ttl_secs: _,
+        instruction_policy,
         speculation: _,
         vision,
         media,
@@ -337,7 +338,18 @@ async fn main() {
         let engine = Engine::with_clock(mock_scheduler(&model), Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     }
-    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64));
+    .with_request_timeout(std::time::Duration::from_secs(request_timeout_secs as u64))
+    .with_instruction_policy(instruction_policy);
+
+    // GitHub #209: joining or gathering developer messages trades prefix
+    // reuse for fewer system blocks; the operator is told once, at start.
+    if instruction_policy.developer.rerenders_history() {
+        tracing::warn!(
+            name: "ignis.config.developer_policy_rerenders",
+            developer_message_policy = instruction_policy.developer.as_str(),
+            "re-renders history when a developer message arrives mid-conversation; prefix reuse is lost from that point"
+        );
+    }
 
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the

@@ -100,6 +100,8 @@ SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(METRICS)),--metrics $(if $(METRICS_BIND),--metrics-bind $(METRICS_BIND))) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
   $(if $(EXPOSE),--expose $(EXPOSE)) \
+  $(if $(SYSTEM_MESSAGE_POLICY),--system-message-policy $(SYSTEM_MESSAGE_POLICY)) \
+  $(if $(DEVELOPER_MESSAGE_POLICY),--developer-message-policy $(DEVELOPER_MESSAGE_POLICY)) \
   $(ARGS)
 SERVER_ENV = $(if $(LOG_LEVEL),IGNIS_LOG_LEVEL=$(LOG_LEVEL)) $(if $(LOG_FORMAT),IGNIS_LOG_FORMAT=$(LOG_FORMAT))
 SMOKE_MODEL := $(or $(MODEL),qwen3.8-27b)
@@ -174,6 +176,7 @@ config: ## Print the resolved knobs and paths
 	@echo "LOG_FORMAT      $(or $(LOG_FORMAT),(server default))"
 	@echo "API_KEY         $(if $(API_KEY),$(if $(filter auto,$(API_KEY)),auto (generated and printed at start),set),$(if $(EXPOSE),(none: auto, required by EXPOSE),(none: /v1 is open)))"
 	@echo "EXPOSE          $(or $(EXPOSE),(none: reachable at BIND only))"
+	@echo "MESSAGES        system=$(or $(SYSTEM_MESSAGE_POLICY),(server default: merge)) developer=$(or $(DEVELOPER_MESSAGE_POLICY),(server default: inplace))"
 	@echo "ARGS            $(ARGS)"
 	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"
 	@echo "server binary   $(SERVER_BIN)"

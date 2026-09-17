@@ -20,6 +20,7 @@ use ignis_core::{
     RequestId, SchedulerConfig,
 };
 use ignis_server::engine::Engine;
+use ignis_server::instruction::{DeveloperMessagePolicy, InstructionPolicy, SystemMessagePolicy};
 use ignis_server::template::{
     ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection,
 };
@@ -249,7 +250,7 @@ async fn a_template_refusal_is_a_400_before_admission() {
 #[tokio::test]
 async fn an_unknown_role_is_a_400_before_admission() {
     let h = harness();
-    for role in ["bogus", "developer"] {
+    for role in ["bogus", "Developer"] {
         let req = serde_json::json!({
             "model": MODEL,
             "messages": [
@@ -263,6 +264,151 @@ async fn an_unknown_role_is_a_400_before_admission() {
         assert_eq!(body["error"]["code"], "invalid_role");
         assert!(body["error"]["message"].as_str().unwrap().contains(role));
         assert!(body["error"]["message"].as_str().unwrap().contains("index 1"));
+    }
+}
+
+/// A template double that records the messages it was handed (GitHub #209):
+/// what the instruction policies deliver is what a provider renders.
+#[derive(Default)]
+struct RecordingTemplate {
+    seen: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+}
+
+impl TemplateProvider for RecordingTemplate {
+    fn apply_chat_template(
+        &self,
+        messages: &[ChatMessage],
+        options: &ignis_server::thinking::ThinkingOptions,
+        tools: &[serde_json::Value],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        let shape = messages.iter().map(|m| (m.role.clone(), m.content.text())).collect();
+        self.seen.lock().unwrap().push(shape);
+        SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+    }
+
+    fn render_tokens(&self, tokens: &[u32]) -> String {
+        SimpleTemplateProvider.render_tokens(tokens)
+    }
+
+    fn thinking_capabilities(&self) -> ignis_server::thinking::ThinkingCapabilities {
+        SimpleTemplateProvider.thinking_capabilities()
+    }
+
+    fn token_decoder(&self) -> Box<dyn ignis_server::decoder::TokenDecoder> {
+        SimpleTemplateProvider.token_decoder()
+    }
+}
+
+fn policy_harness(policy: InstructionPolicy) -> (Harness, Arc<RecordingTemplate>) {
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
+    let template = Arc::new(RecordingTemplate::default());
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(support::SharedTemplate(template.clone())))
+        .with_instruction_policy(policy);
+    (Harness { app: server.app() }, template)
+}
+
+#[tokio::test]
+async fn by_default_a_leading_system_run_joins_and_a_developer_stays_in_place() {
+    let (h, template) = policy_harness(InstructionPolicy::default());
+    let req = serde_json::json!({
+        "model": MODEL,
+        "max_tokens": 1,
+        "messages": [
+            { "role": "system", "content": "agent prompt" },
+            { "role": "system", "content": "hook line" },
+            { "role": "user", "content": "first" },
+            { "role": "developer", "content": "be terse" },
+            { "role": "user", "content": "second" }
+        ]
+    });
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        let mut req = req.clone();
+        if path == "/v1/responses" {
+            req["input"] = req.as_object_mut().unwrap().remove("messages").unwrap();
+        }
+        let (status, body) = call(&h.app, "POST", path, Some(req)).await;
+        assert_eq!(status, 200, "{path}: {body}");
+    }
+    let expected: Vec<(String, String)> = [
+        ("system", "agent prompt
+
+hook line"),
+        ("user", "first"),
+        ("system", "be terse"),
+        ("user", "second"),
+    ]
+    .iter()
+    .map(|(r, t)| (r.to_string(), t.to_string()))
+    .collect();
+    assert_eq!(*template.seen.lock().unwrap(), [expected.clone(), expected]);
+}
+
+#[tokio::test]
+async fn strict_refuses_a_system_message_that_is_not_first_naming_its_index() {
+    let policy = InstructionPolicy { system: SystemMessagePolicy::Strict, ..InstructionPolicy::default() };
+    let (h, template) = policy_harness(policy);
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [
+            { "role": "system", "content": "agent prompt" },
+            { "role": "system", "content": "hook line" },
+            { "role": "user", "content": "first" }
+        ]
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 400, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "system_message_position");
+    assert!(body["error"]["message"].as_str().unwrap().contains("index 1"), "{body}");
+    assert!(template.seen.lock().unwrap().is_empty(), "refused before any render");
+}
+
+#[tokio::test]
+async fn reject_and_one_after_system_refuse_a_misplaced_developer_message() {
+    for developer in [DeveloperMessagePolicy::Reject, DeveloperMessagePolicy::OneAfterSystem] {
+        let (h, _template) = policy_harness(InstructionPolicy { developer, ..InstructionPolicy::default() });
+        let req = serde_json::json!({
+            "model": MODEL,
+            "messages": [
+                { "role": "system", "content": "agent prompt" },
+                { "role": "user", "content": "first" },
+                { "role": "developer", "content": "be terse" }
+            ]
+        });
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+        assert_eq!(status, 400, "{developer:?}: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "developer_message_position", "{developer:?}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("index 2"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_instruction_message_carrying_media_is_still_refused() {
+    let (h, _template) = policy_harness(InstructionPolicy::default());
+    for role in ["system", "developer"] {
+        let req = serde_json::json!({
+            "model": MODEL,
+            "messages": [
+                { "role": role, "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+                ] },
+                { "role": "user", "content": "first" }
+            ]
+        });
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+        assert_eq!(status, 400, "{role}: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_media", "{role}");
+        assert!(body["error"]["message"].as_str().unwrap().contains(role), "{body}");
     }
 }
 

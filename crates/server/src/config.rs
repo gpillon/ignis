@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use crate::instruction::{DeveloperMessagePolicy, InstructionPolicy, SystemMessagePolicy};
 use crate::thinking::{self, ReasoningEffort};
 
 /// The default loaded-model id (the v1 specialization: Qwen 3.8-27B —
@@ -95,6 +96,10 @@ pub struct Config {
     /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
     /// an Agent's would.
     pub retained_interactive_ttl_secs: u32,
+    /// Where `system` and `developer` messages go before the conversation is
+    /// templated (`--system-message-policy` / `--developer-message-policy`,
+    /// GitHub #209).
+    pub instruction_policy: InstructionPolicy,
     /// Speculative decoding, chosen at load (`--spec`/`--draft-tokens`, P5-02
     /// GitHub #150). `None` loads nothing of the drafter.
     pub speculation: Option<Speculation>,
@@ -268,6 +273,8 @@ pub fn resolve(
     let mut prompt_reuse = None;
     let mut retained_pool_bytes = None;
     let mut retained_interactive_ttl = None;
+    let mut system_message_policy = None;
+    let mut developer_message_policy = None;
     let mut request_timeout = None;
     let mut spec = None;
     let mut draft_tokens = None;
@@ -301,6 +308,10 @@ pub fn resolve(
             }
             "--retained-interactive-ttl" => {
                 retained_interactive_ttl = Some(take_value(args, &mut i, flag)?)
+            }
+            "--system-message-policy" => system_message_policy = Some(take_value(args, &mut i, flag)?),
+            "--developer-message-policy" => {
+                developer_message_policy = Some(take_value(args, &mut i, flag)?)
             }
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
@@ -356,6 +367,22 @@ pub fn resolve(
         resolve_retained_pool_bytes(retained_pool_bytes, &env, prompt_reuse)?;
     let retained_interactive_ttl_secs =
         resolve_retained_interactive_ttl(retained_interactive_ttl, &env, prompt_reuse)?;
+    let instruction_policy = InstructionPolicy {
+        system: resolve_policy(
+            system_message_policy,
+            &env,
+            "--system-message-policy",
+            "IGNIS_SYSTEM_MESSAGE_POLICY",
+            SystemMessagePolicy::ALL.map(|p| (p.as_str(), p)),
+        )?,
+        developer: resolve_policy(
+            developer_message_policy,
+            &env,
+            "--developer-message-policy",
+            "IGNIS_DEVELOPER_MESSAGE_POLICY",
+            DeveloperMessagePolicy::ALL.map(|p| (p.as_str(), p)),
+        )?,
+    };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
@@ -409,6 +436,7 @@ pub fn resolve(
         prompt_reuse,
         retained_pool_bytes,
         retained_interactive_ttl_secs,
+        instruction_policy,
         speculation,
         vision,
         media,
@@ -700,6 +728,28 @@ fn resolve_prompt_reuse(
     }
 }
 
+/// An instruction-message policy (GitHub #209): the flag, else the env var,
+/// else the first of `values` (the default). An unknown value is a usage
+/// error naming every allowed one.
+fn resolve_policy<P: Copy, const N: usize>(
+    flag_value: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+    flag: &str,
+    var: &str,
+    values: [(&'static str, P); N],
+) -> Result<P, ConfigError> {
+    let Some(raw) = non_empty(flag_value.or_else(|| env(var))) else {
+        return Ok(values[0].1);
+    };
+    match values.iter().find(|(name, _)| *name == raw.trim()) {
+        Some((_, policy)) => Ok(*policy),
+        None => {
+            let allowed: Vec<&str> = values.iter().map(|(name, _)| *name).collect();
+            Err(ConfigError(format!("`{flag}` must be one of {}, got `{raw}`", allowed.join(", "))))
+        }
+    }
+}
+
 /// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` (GitHub #186).
 /// Unset is `None`: the budget is then derived from the VRAM left after the
 /// model lands, which only the loader can know.
@@ -817,6 +867,8 @@ fn help_text() -> String {
          \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused)\n\
          \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: derived from the VRAM left after load; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
          \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
+         \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
+         \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
@@ -1290,6 +1342,66 @@ mod tests {
         let a = args(&["--prompt-reuse", "on"]);
         let config = expect_config(resolve(&a, env).expect("resolve"));
         assert!(config.prompt_reuse, "flag must win over env");
+    }
+
+    // ── GitHub #209: instruction-message policies ──────────────────────
+
+    #[test]
+    fn instruction_policies_default_to_merge_and_inplace() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(
+            config.instruction_policy,
+            InstructionPolicy { system: SystemMessagePolicy::Merge, developer: DeveloperMessagePolicy::Inplace }
+        );
+    }
+
+    #[test]
+    fn every_instruction_policy_value_is_named_by_flag_or_env_and_the_flag_wins() {
+        for system in SystemMessagePolicy::ALL {
+            let a = args(&["--system-message-policy", system.as_str()]);
+            let config = expect_config(resolve(&a, no_env).expect("resolve"));
+            assert_eq!(config.instruction_policy.system, system);
+            let env = move |key: &str| (key == "IGNIS_SYSTEM_MESSAGE_POLICY").then(|| system.as_str().to_owned());
+            let config = expect_config(resolve(&[], env).expect("resolve"));
+            assert_eq!(config.instruction_policy.system, system);
+        }
+        for developer in DeveloperMessagePolicy::ALL {
+            let a = args(&["--developer-message-policy", developer.as_str()]);
+            let config = expect_config(resolve(&a, no_env).expect("resolve"));
+            assert_eq!(config.instruction_policy.developer, developer);
+            let env = move |key: &str| (key == "IGNIS_DEVELOPER_MESSAGE_POLICY").then(|| developer.as_str().to_owned());
+            let config = expect_config(resolve(&[], env).expect("resolve"));
+            assert_eq!(config.instruction_policy.developer, developer);
+        }
+        let env = env_map(&[
+            ("IGNIS_SYSTEM_MESSAGE_POLICY", "strict"),
+            ("IGNIS_DEVELOPER_MESSAGE_POLICY", "reject"),
+        ]);
+        let a = args(&["--system-message-policy", "merge", "--developer-message-policy", "into-system"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(
+            config.instruction_policy,
+            InstructionPolicy { system: SystemMessagePolicy::Merge, developer: DeveloperMessagePolicy::IntoSystem },
+            "flags win over env"
+        );
+    }
+
+    #[test]
+    fn an_unknown_instruction_policy_names_the_allowed_values() {
+        let err = resolve(&args(&["--system-message-policy", "inplace"]), no_env).expect_err("not a system policy");
+        assert!(err.0.contains("--system-message-policy"), "{}", err.0);
+        assert!(err.0.contains("`inplace`"), "names the value: {}", err.0);
+        assert!(err.0.contains("merge, strict"), "names the allowed ones: {}", err.0);
+
+        let env = env_map(&[("IGNIS_DEVELOPER_MESSAGE_POLICY", "drop")]);
+        let err = resolve(&[], env).expect_err("not a developer policy");
+        assert!(err.0.contains("--developer-message-policy"), "{}", err.0);
+        assert!(err.0.contains("`drop`"), "names the value: {}", err.0);
+        assert!(
+            err.0.contains("inplace, into-system, after-system, one-after-system, reject"),
+            "names the allowed ones: {}",
+            err.0
+        );
     }
 
     #[test]

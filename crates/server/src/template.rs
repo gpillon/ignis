@@ -193,11 +193,12 @@ pub struct TemplateRejection {
     pub message: String,
 }
 
-/// Refuse a role the loaded Qwen frontend cannot render. `developer` remains
-/// deliberately absent until Slice 2 supplies its rendering policy.
+/// Refuse a role no chat message can have. `developer` is accepted: the
+/// developer message policy (`crate::instruction`, GitHub #209) places it
+/// before the conversation is templated.
 pub fn check_roles(messages: &[ChatMessage]) -> Result<(), TemplateRejection> {
     for (index, message) in messages.iter().enumerate() {
-        if Role::parse(&message.role).is_none() {
+        if message.role != "developer" && Role::parse(&message.role).is_none() {
             return Err(TemplateRejection {
                 code: "invalid_role",
                 message: format!("message at index {index} has unknown role '{}'", message.role),
@@ -275,10 +276,10 @@ pub fn check_content_parts(messages: &[ChatMessage], vision: bool) -> Result<(),
                 Some("video_url") => true,
                 _ => continue,
             };
-            if message.role == "system" {
+            if matches!(message.role.as_str(), "system" | "developer") {
                 return refuse(
                     "invalid_media",
-                    format!("{at}: system messages cannot contain images or videos"),
+                    format!("{at}: {} messages cannot contain images or videos", message.role),
                 );
             }
             if video {
