@@ -29,7 +29,11 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// arena (GitHub #213) and the scheduler budgets exactly this in bytes, so
 /// the ledger and the arena are two views of one region — which is what lets
 /// a leg assert they agree.
-pub const HOST_POOL_BYTES: u64 = 16 * GIB;
+///
+/// Four gibibytes rather than the sixteen this was before the arena: the
+/// budget is now RAM actually page-locked for the run, and no leg here holds
+/// more than a handful of blobs of a 2048-token geometry.
+pub const HOST_POOL_BYTES: u64 = 4 * GIB;
 
 pub struct Loaded {
     model: Arc<Model<CudaLeaf>>,
