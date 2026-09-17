@@ -176,8 +176,28 @@ function ToolsSetting({
             label="Date and time"
             on={tools.dateTime}
             onChange={(dateTime) => onChange({ ...tools, dateTime })}
-            description="The day, date and time, in this browser's time zone, go into the ignis system prompt."
+            description="The day, date and time this session began, in this browser's time zone, go into the ignis system prompt."
           />
+          {tools.dateTime && (
+            <div className="-mt-2 flex flex-col gap-1.5 border-l-2 border-line pl-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex flex-col gap-0.5">
+                  <span id="tool-date-live-label" className="font-display text-xs font-semibold text-ink">
+                    Update every prompt
+                  </span>
+                  <span className="text-xs leading-snug text-ash">
+                    Each turn carries the moment it was sent, as a developer message after the conversation, instead of the session's
+                    moment in the system prompt.
+                  </span>
+                </div>
+                <Switch
+                  on={tools.dateTimeLive}
+                  onChange={(dateTimeLive) => onChange({ ...tools, dateTimeLive })}
+                  labelledBy="tool-date-live-label"
+                />
+              </div>
+            </div>
+          )}
           <ToolRow
             id="run-js"
             label="Run JavaScript"

@@ -145,6 +145,13 @@ describe("exchanges and log", () => {
     expect(forkSession(list, 1, 99, 9)).toBe(list);
   });
 
+  it("gives a fork the moment its source began, so both still open with the same tokens", () => {
+    const started = new Date("2026-09-15T01:52:00+02:00");
+    const sessions = addExchange([createSession(1, started)], 1, message(1, "user", "q1"), message(2, "assistant", "a1"));
+    const next = forkSession({ sessions, activeId: 1 }, 1, 2, 9);
+    expect(next.sessions[0].startedAt).toBe(started);
+  });
+
   it("numbers log rows per session", () => {
     const row = { at: "12:00", laneTag: "interactive" as const, reasoningEffort: "xhigh" as const, figures: null };
     let sessions = [createSession(1), createSession(2)];

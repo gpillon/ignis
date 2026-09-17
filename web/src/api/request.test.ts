@@ -38,6 +38,13 @@ describe("conversationTurns", () => {
     ]);
   });
 
+  it("keeps the moment each turn was sent with, rather than the moment of this request", () => {
+    expect(conversationTurns([{ ...user("a"), dateTime: "It is now 01:52." }, reply("b")])).toEqual([
+      { role: "user", content: "a", dateTime: "It is now 01:52." },
+      { role: "assistant", content: "b" },
+    ]);
+  });
+
   it("drops a reply stopped before its first token, and keeps one stopped part-way", () => {
     expect(conversationTurns([user("a"), reply(""), user("b"), reply("half")])).toEqual([
       { role: "user", content: "b" },
@@ -114,6 +121,40 @@ describe("buildChatRequest", () => {
       { role: "assistant", content: "", tool_calls: [{ id: "call_0", type: "function", function: { name: "agent", arguments: '{"prompt":"x"}' } }] },
       { role: "tool", content: "done", tool_call_id: "call_0" },
     ]);
+  });
+
+  it("puts a turn's moment in a developer message ahead of it, and leaves the other turns alone", () => {
+    const body = buildChatRequest({ ...settings, systemPrompt: "" }, [
+      { role: "user", content: "a", dateTime: "It is now 01:52." },
+      { role: "assistant", content: "b" },
+      { role: "user", content: "c", dateTime: "It is now 02:04." },
+    ]);
+    expect(body.messages).toEqual([
+      { role: "developer", content: "It is now 01:52." },
+      { role: "user", content: "a" },
+      { role: "assistant", content: "b" },
+      { role: "developer", content: "It is now 02:04." },
+      { role: "user", content: "c" },
+    ]);
+  });
+
+  /**
+   * The property the date and time tool's live option rests on: a turn's
+   * moment never moves a token of what went before it, so a request finds the
+   * last one whole at its head and the engine prefills only the new tail.
+   * Rewriting the earlier moments to the present instead would diverge at the
+   * first of them and cost a full prefill — 25 s of it at 98K tokens.
+   */
+  it("grows a conversation by appending, leaving one request a prefix of the next", () => {
+    const turns = [
+      { role: "user" as const, content: "a", dateTime: "It is now 01:52." },
+      { role: "assistant" as const, content: "b" },
+      { role: "user" as const, content: "c", dateTime: "It is now 02:04." },
+      { role: "assistant" as const, content: "d" },
+    ];
+    const before = buildChatRequest(settings, turns.slice(0, 2)).messages;
+    const after = buildChatRequest(settings, turns).messages;
+    expect(after.slice(0, before.length)).toEqual(before);
   });
 
   it("leaves max_tokens out when unset, so the engine's own cap applies", () => {

@@ -37,6 +37,13 @@ export type Message = {
   questions?: Question[];
   /** The local tool calls an assistant reply made: code, plan, memory, files. */
   local?: LocalRun[];
+  /**
+   * The moment this turn was sent, as the date and time tool writes it, while
+   * the tool updates every prompt. Kept with the turn rather than written
+   * fresh on each request: the history a later request repeats has to be the
+   * one it sent, or the engine is left no prefix to reuse.
+   */
+  dateTime?: string;
 };
 
 export type LogRow = {
@@ -57,6 +64,12 @@ export type Session = {
   log: LogRow[];
   /** Files the user attached, for read_file. */
   attachments: Attachment[];
+  /**
+   * When this conversation began: the moment the date and time tool writes
+   * into its system prompt, the same for every turn. A fork inherits it, so
+   * the fork and its source still open with the same tokens.
+   */
+  startedAt: Date;
 };
 
 export type SessionList = { sessions: Session[]; activeId: number };
@@ -65,8 +78,8 @@ export const UNTITLED = "New session";
 
 const TITLE_LENGTH = 48;
 
-export function createSession(id: number): Session {
-  return { id, title: UNTITLED, messages: [], log: [], attachments: [] };
+export function createSession(id: number, startedAt = new Date()): Session {
+  return { id, title: UNTITLED, messages: [], log: [], attachments: [], startedAt };
 }
 
 /** Files attached to a session. */
@@ -159,6 +172,7 @@ export function forkSession(list: SessionList, sessionId: number, messageId: num
     messages: source.messages.slice(0, index + 1).map((m) => ({ ...m, streaming: false })),
     log: [],
     attachments: source.attachments,
+    startedAt: source.startedAt,
   };
   return { sessions: [fork, ...list.sessions], activeId: newId };
 }

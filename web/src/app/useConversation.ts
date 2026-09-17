@@ -26,7 +26,7 @@ import { askToolResult, parseAskCall } from "../tools/ask/ask.ts";
 import { unknownCall } from "../tools/errors.ts";
 import { type Attachment, attachmentFromFile } from "../tools/local/attachments.ts";
 import { type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../tools/local/local.ts";
-import { agentExtras, routeCall, toolExtras, type ToolsState } from "../tools/index.ts";
+import { agentExtras, routeCall, toolExtras, type ToolsState, turnDateTime } from "../tools/index.ts";
 import { getTavilyKey } from "../tools/web/tavilyKey.ts";
 import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
 
@@ -42,6 +42,7 @@ const exchangeOf = (m: Message): Exchange => ({
   failed: m.error !== undefined,
   toolCalls: m.toolCalls,
   toolCallId: m.toolCallId,
+  dateTime: m.dateTime,
 });
 
 export function useConversation({ model, settings, tools }: { model: ModelState; settings: PlaygroundSettings; tools: ToolsState }) {
@@ -92,9 +93,13 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   async function exchange(sessionId: number, history: Message[], prompt: string | null) {
     if (busy || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
-    // The date and time the tools write into the prompt are when the turn started; the notes and files, as they were then.
-    const attachments = list.sessions.find((s) => s.id === sessionId)?.attachments ?? [];
-    const promptContext = { now: new Date(), attachments };
+    // The notes and files the tools write into the prompt are as they were when the turn started. The date and
+    // time is the session's, not this turn's: it sits ahead of the whole conversation, so a moment that moved
+    // between two turns would change the prompt's first tokens and cost a prefill of everything (GitHub #186).
+    // The tool's "update every prompt" option is what sends this turn's own moment, from behind the history.
+    const session = list.sessions.find((s) => s.id === sessionId);
+    const attachments = session?.attachments ?? [];
+    const promptContext = { now: session?.startedAt ?? new Date(), attachments };
     const extras = toolExtras(tools, promptContext);
     const agentTools = agentExtras(tools, promptContext);
     const local: Omit<LocalContext, "settings" | "signal"> = {
@@ -111,7 +116,15 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
 
     let conversation = history;
     if (prompt !== null) {
-      const user: Message = { id: newId(), role: "user", content: prompt, reasoning: "", streaming: false };
+      const stamp = turnDateTime(tools, new Date());
+      const user: Message = {
+        id: newId(),
+        role: "user",
+        content: prompt,
+        reasoning: "",
+        streaming: false,
+        ...(stamp ? { dateTime: stamp } : {}),
+      };
       setList((l) => ({ ...l, sessions: addMessages(l.sessions, sessionId, [user]) }));
       conversation = [...conversation, user];
     }

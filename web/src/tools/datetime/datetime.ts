@@ -1,6 +1,15 @@
-// The date and time "tool": nothing to call. While it is on, every request's
-// ignis system prompt starts with the current day, date and time in the
-// browser's time zone, taken when the turn starts.
+// The date and time "tool": nothing to call. While it is on, the current day,
+// date and time in the browser's time zone go into the prompt — by default the
+// moment the session started, written once into the ignis system prompt.
+//
+// The moment is frozen on purpose. A prompt reuses the engine's state for the
+// tokens it shares with the last one, and this block sits ahead of the whole
+// conversation: a clock that ticks between two turns changes the prompt's very
+// first tokens, nothing is shared, and a long conversation prefills again from
+// zero (~25 s at 98K tokens). The cost of freezing is that the time is the
+// session's, so it goes stale over hours; the date and time tool's "update
+// every prompt" option buys the current moment back by sending it as a
+// developer message *after* the history instead, where a change costs nothing.
 
 /** The browser's IANA time zone, `Europe/Rome`. */
 export function browserTimeZone(): string {

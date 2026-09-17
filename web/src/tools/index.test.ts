@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents/agents.ts";
 import { ASK_USER_IGNIS_PROMPT, ASK_USER_TOOL } from "./ask/ask.ts";
 import { dateTimePrompt } from "./datetime/datetime.ts";
-import { agentExtras, ALL_TOOLS, ignisPrompt, NO_TOOLS, routeCall, setAllTools, toolExtras, toolsInUse } from "./index.ts";
+import { agentExtras, ALL_TOOLS, ignisPrompt, NO_TOOLS, routeCall, setAllTools, toolExtras, toolsInUse, turnDateTime } from "./index.ts";
 import type { Attachment } from "./local/attachments.ts";
 import {
   attachmentsPrompt,
@@ -29,6 +29,7 @@ const all = {
   web: true,
   askUser: true,
   dateTime: true,
+  dateTimeLive: false,
   runJs: true,
   jsSafetyCheck: true,
   plan: true,
@@ -51,6 +52,31 @@ describe("tools", () => {
 
   it("writes the date and time into the prompt without declaring a tool", () => {
     expect(toolExtras({ ...NO_TOOLS, dateTime: true }, ctx)).toEqual({ ignisPrompt: dateTimePrompt(now), tools: [] });
+    expect(turnDateTime({ ...NO_TOOLS, dateTime: true }, now)).toBeUndefined();
+  });
+
+  /**
+   * Updating every prompt moves the moment out of the system prompt: the two
+   * together would say two different times, and the point of the option is to
+   * leave the prompt's head — where the system prompt is — still.
+   */
+  it("sends the moment as a turn's own developer message once it updates every prompt", () => {
+    const live = { ...NO_TOOLS, dateTime: true, dateTimeLive: true };
+    expect(ignisPrompt(live, ctx)).toBe("");
+    expect(turnDateTime(live, now)).toBe(dateTimePrompt(now));
+    expect(turnDateTime({ ...live, enabled: false }, now)).toBeUndefined();
+    expect(turnDateTime({ ...NO_TOOLS, dateTimeLive: true }, now)).toBeUndefined();
+  });
+
+  /**
+   * An agent answers one prompt and is gone: it has no history to put a
+   * developer message after, so it keeps taking the session's moment in its
+   * system prompt — which is also what has every agent of a session open with
+   * the same tokens.
+   */
+  it("keeps the date in an agent's system prompt even while the conversation updates every prompt", () => {
+    const extras = agentExtras({ ...NO_TOOLS, dateTime: true, dateTimeLive: true }, ctx);
+    expect(extras.ignisPrompt).toBe(dateTimePrompt(now));
   });
 
   it("puts every tool in a fixed order, the date first", () => {

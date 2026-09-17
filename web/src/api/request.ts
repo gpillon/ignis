@@ -28,7 +28,20 @@ export type Settings = {
 };
 
 /** A turn of the conversation: an assistant turn may call tools, a tool turn answers one call. */
-export type Turn = { role: "user" | "assistant" | "tool"; content: string; toolCalls?: ToolCall[]; toolCallId?: string };
+export type Turn = {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  toolCalls?: ToolCall[];
+  toolCallId?: string;
+  /**
+   * What the date and time tool wrote for the moment this turn was sent, when
+   * it updates every prompt: a developer message goes in ahead of the turn.
+   * Each turn keeps the one it was sent with, so a later request repeats them
+   * unchanged and only appends — which is what leaves the engine a prefix to
+   * reuse. Rewriting them to the present moment would cost the whole prefill.
+   */
+  dateTime?: string;
+};
 
 /** An OpenAI function tool, as `tools[]` declares it. */
 export type ToolDefinition = {
@@ -37,7 +50,7 @@ export type ToolDefinition = {
 };
 
 type WireMessage = {
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "developer" | "user" | "assistant" | "tool";
   content: string;
   tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
   tool_call_id?: string;
@@ -83,13 +96,15 @@ export function conversationTurns(entries: Exchange[]): Turn[] {
       content: entry.content,
       ...(entry.toolCalls?.length ? { toolCalls: entry.toolCalls } : {}),
       ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}),
+      ...(entry.dateTime ? { dateTime: entry.dateTime } : {}),
     });
   }
   return turns;
 }
 
-function wireMessage(turn: Turn): WireMessage {
-  return {
+/** A turn on the wire, behind the developer message carrying its moment when it has one. */
+function wireMessages(turn: Turn): WireMessage[] {
+  const message: WireMessage = {
     role: turn.role,
     content: turn.content,
     ...(turn.toolCalls?.length
@@ -103,6 +118,7 @@ function wireMessage(turn: Turn): WireMessage {
       : {}),
     ...(turn.toolCallId ? { tool_call_id: turn.toolCallId } : {}),
   };
+  return turn.dateTime ? [{ role: "developer", content: turn.dateTime }, message] : [message];
 }
 
 /** What the enabled tools add to a request: their prompt, ahead of the owner's, and their definitions. */
@@ -112,7 +128,7 @@ export function buildChatRequest(settings: Settings, turns: Turn[], extras: Tool
   const system = [extras.ignisPrompt ?? "", settings.systemPrompt].filter((part) => part.trim() !== "").join("\n\n");
   return {
     model: settings.model,
-    messages: [...(system ? [{ role: "system" as const, content: system }] : []), ...turns.map(wireMessage)],
+    messages: [...(system ? [{ role: "system" as const, content: system }] : []), ...turns.flatMap(wireMessages)],
     ...(extras.tools?.length ? { tools: extras.tools } : {}),
     stream: true,
     stream_options: { include_usage: true },
