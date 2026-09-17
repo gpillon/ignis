@@ -71,10 +71,6 @@ struct Inner {
     /// decline (`refuse_capture`) — a leaf with no room in its own image
     /// pool, or a sequence it will not capture.
     capture_refusals: std::collections::HashSet<RequestId>,
-    /// Per-request snapshot sizes, overriding the nominal one byte
-    /// (`snapshot_size`): what a test uses to give KV-RAM blobs different
-    /// lengths, which is the only way an arena fragments.
-    snapshot_bytes: HashMap<RequestId, u64>,
     /// The leaf's KV-RAM arena, modelled (GitHub #213), or `None` for a
     /// backend whose blobs are ordinary allocations — today's default, and
     /// what every scenario that is not about placement wants.
@@ -103,6 +99,11 @@ enum MockBlob {
 /// asked for, and a blob that finds no long-enough span refused even while
 /// the tier's byte ledger says the bytes are free. The real arena's own
 /// placement is pinned in `kernel/tests/test_seq_snapshot.cpp`.
+///
+/// It packs with no alignment, where the real one rounds each blob's start
+/// up and gives the padding back to the free list. That is where the two
+/// first-fits can diverge, and it is deliberate: a scenario here says how
+/// many blobs of what size, never where the bytes land.
 #[derive(Debug)]
 struct MockHostArena {
     capacity: u64,
@@ -207,21 +208,14 @@ impl MockCompute {
     /// places them.
     ///
     /// Give it the same figure as `SchedulerConfig::host_capacity_bytes` and
-    /// the ledger and the arena start out saying the same thing; what makes
-    /// them differ afterwards is [`Self::snapshot_bytes`], since blobs all
-    /// of one length leave holes that always fit the next one.
+    /// the two start out saying the same thing. Every blob here is the
+    /// nominal byte, so what fragments the arena is asking it for a blob
+    /// longer than any one hole — two free bytes in two holes are not two
+    /// bytes of room.
     pub fn with_host_arena(capacity_bytes: u64) -> Self {
         let mock = Self::new();
         mock.inner.lock().unwrap().arena = Some(MockHostArena::new(capacity_bytes));
         mock
-    }
-
-    /// Price `request`'s live snapshot at `bytes` instead of the nominal
-    /// one. Both the tier's byte ledger and the arena see this, which is
-    /// what lets a test build an arena that has free bytes and nowhere to
-    /// put them.
-    pub fn snapshot_bytes(&self, request: RequestId, bytes: u64) {
-        self.inner.lock().unwrap().snapshot_bytes.insert(request, bytes);
     }
 
     /// The bytes the modelled arena's live blobs hold — the figure
@@ -389,38 +383,36 @@ impl Compute for MockCompute {
 
     // GitHub #190: a materialized checkpoint blob is one nominal byte, so
     // `host_capacity_bytes` counts how many spilled checkpoints KV-RAM holds.
-    fn checkpoint_snapshot_size(&self, publisher: RequestId) -> Result<u64, ComputeError> {
-        Ok(self.blob_bytes(publisher))
+    fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
+        Ok(1)
     }
 
     fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
         if self.inner.lock().unwrap().spill_failures.remove(&publisher) {
             return Err(ComputeError::Kernel(-1));
         }
-        let bytes = self.blob_bytes(publisher);
         // Placed before it is recorded: a spill the arena turns away is one
         // that did not happen, and a test reading `spilled_checkpoints()`
         // must not see it.
-        if !self.place_blob(MockBlob::Checkpoint(publisher), bytes) {
+        if !self.place_blob(MockBlob::Checkpoint(publisher), 1) {
             return Err(ComputeError::Kernel(NO_HOST_ROOM));
         }
         self.inner.lock().unwrap().checkpoints_spilled.push(publisher);
-        Ok(bytes)
+        Ok(1)
     }
 
     // GitHub #190: a retained prefix's blob is one nominal byte too.
-    fn prefix_snapshot_size(&self, publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
-        Ok(self.blob_bytes(publisher))
+    fn prefix_snapshot_size(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+        Ok(1)
     }
 
     fn spill_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
-        let bytes = self.blob_bytes(publisher);
         // Placed before it is recorded, as in `spill_checkpoint`.
-        if !self.place_blob(MockBlob::Prefix(publisher, tokens), bytes) {
+        if !self.place_blob(MockBlob::Prefix(publisher, tokens), 1) {
             return Err(ComputeError::Kernel(NO_HOST_ROOM));
         }
         self.inner.lock().unwrap().prefixes_spilled.push((publisher, tokens));
-        Ok(bytes)
+        Ok(1)
     }
 
     fn restore_prefix(&self, publisher: RequestId, tokens: u32, _slot: u32) -> Result<u64, ComputeError> {
@@ -508,11 +500,8 @@ impl Compute for MockCompute {
     // request, is exactly what the existing page-based scenarios already
     // assumed before this ticket's byte-budget rewrite: a fixed per-entry
     // cost that scales purely with entry *count*.
-    ///
-    /// [`MockCompute::snapshot_bytes`] overrides it per request, for the
-    /// scenarios that need blobs of different lengths (GitHub #213).
-    fn snapshot_size(&self, request: RequestId) -> Result<u64, ComputeError> {
-        Ok(self.blob_bytes(request))
+    fn snapshot_size(&self, _request: RequestId) -> Result<u64, ComputeError> {
+        Ok(1)
     }
 
     fn host_blob_fits(&self, bytes: u64) -> bool {
@@ -524,10 +513,9 @@ impl Compute for MockCompute {
     }
 
     fn evict(&self, request: RequestId) -> Result<u64, ComputeError> {
-        let bytes = self.blob_bytes(request);
         let mut g = self.inner.lock().unwrap();
         if let Some(arena) = g.arena.as_mut() {
-            if !arena.place(MockBlob::Live(request), bytes) {
+            if !arena.place(MockBlob::Live(request), 1) {
                 // What the leaf reports when no span is long enough
                 // (`crate::seq::NO_HOST_ROOM`). The scheduler probes with
                 // `host_blob_fits` first, so reaching this means a test
@@ -535,7 +523,7 @@ impl Compute for MockCompute {
                 return Err(ComputeError::Kernel(NO_HOST_ROOM));
             }
         }
-        Ok(bytes)
+        Ok(1)
     }
 
     fn restore(&self, request: RequestId, _context_tokens: u32) -> Result<(), ComputeError> {
@@ -549,18 +537,6 @@ impl Compute for MockCompute {
 }
 
 impl MockCompute {
-    /// What `request`'s live snapshot is priced at: the nominal byte, or
-    /// whatever [`Self::snapshot_bytes`] set.
-    fn blob_bytes(&self, request: RequestId) -> u64 {
-        self.inner
-            .lock()
-            .unwrap()
-            .snapshot_bytes
-            .get(&request)
-            .copied()
-            .unwrap_or(1)
-    }
-
     /// Place `blob` of `bytes` in the modelled arena, if there is one.
     /// `false` when it is there and has no span long enough.
     fn place_blob(&self, blob: MockBlob, bytes: u64) -> bool {

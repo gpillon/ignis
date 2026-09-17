@@ -664,7 +664,9 @@ int32_t ignis_seq_retained_load(struct ignis_seq_pool *pool, uint32_t retained_s
  * allocates. Process-wide and never reset; a reader takes the difference of
  * two reads, since IGNIS_ALLOC_DEVICE counts the weights' arena at load too.
  * The pool's and the model's arenas, built once at load by the vendored
- * allocator, are not counted.
+ * allocator, are not counted; the KV-RAM arena is the one exception, counted
+ * once under IGNIS_ALLOC_KV_RAM_ARENA so a reader can tell a load that pinned
+ * it from one that was given nothing to pin.
  */
 enum ignis_alloc_kind {
   /* A shared prefix's mutable-state image (ignis_seq_prefix_publish). Since
@@ -681,7 +683,7 @@ enum ignis_alloc_kind {
    * (ignis_host_pinned_pool_create), counted once at load; the blobs placed
    * inside it are not CUDA allocations and count nothing, so this reads zero
    * over a request mix. */
-  IGNIS_ALLOC_KV_RAM_BLOB = 3,
+  IGNIS_ALLOC_KV_RAM_ARENA = 3,
   /* A device region from ignis_device_alloc (ignis_device.h). */
   IGNIS_ALLOC_DEVICE = 4,
   IGNIS_ALLOC_KIND_COUNT = 5

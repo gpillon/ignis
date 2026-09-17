@@ -11,9 +11,9 @@
 //! #211 recorded 9 prefix images, 1 checkpoint image with its tail page and 4
 //! KV-RAM blobs over this mix. Since #215 a publish and a capture put their
 //! images in retained slots reserved at load and a checkpoint's tail page in a
-//! KV page of the pool, so those counts are zero; the KV-RAM blobs are still
-//! `cudaHostAlloc`ed one by one until #213's arena. Nothing is allocated from
-//! `ignis_device_alloc` while serving.
+//! KV page of the pool; since #213 the four blobs are placed in the arena the
+//! load pinned. So every count here is now zero — the mix still does all of
+//! it, and none of it asks the driver for memory.
 //!
 //! Its own test binary: it materializes the artifact, and the card fits one
 //! at a time.
@@ -27,7 +27,7 @@ use ignis_core::{Speculation, SpeculativeBackend};
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn serving_allocates_no_retained_state_image_and_a_blob_per_kv_ram_spill() {
+fn serving_allocates_nothing_at_all_over_the_baseline_request_mix() {
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
     let Some(loaded) = kv_ram_gpu_common::load(Some(speculation)) else {
         return;

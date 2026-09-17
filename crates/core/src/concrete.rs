@@ -879,6 +879,53 @@ impl ConcreteScheduler {
         }
     }
 
+    /// Make room in KV-RAM for a retained blob of `bytes`, captured by
+    /// `owner` and last used at `used_at` (GitHub #190, #213). `true` when
+    /// the tier can both hold it and place it.
+    ///
+    /// Two questions, one order. The budget's is "which entries make `bytes`
+    /// free" ([`HostTier::plan_retained_room`]); the arena's is "is there a
+    /// span long enough", which free bytes scattered between live blobs do
+    /// not answer. So the same victim order keeps running past the byte
+    /// plan, one entry at a time, until the backend says the blob fits — and
+    /// stops, as the plan does, at the first entry ranking at or above this
+    /// one. A bet never displaces something the tier values more, however
+    /// badly it is fragmented, and a spill that cannot be placed simply does
+    /// not happen.
+    ///
+    /// Asked before any copy, so a refusal costs no device work. Whatever it
+    /// gave up on the way stays given up, exactly as a refused spill's
+    /// planned victims always did.
+    fn make_kv_ram_room_for_retained(
+        &mut self,
+        bytes: u64,
+        owner: RequestClass,
+        used_at: Instant,
+        events: &mut Vec<SchedEvent>,
+    ) -> bool {
+        let now = self.now();
+        let Some(victims) = self.host.plan_retained_room(bytes, owner, used_at, now) else {
+            return false;
+        };
+        for victim in victims {
+            self.discard_kv_ram_blob(victim, events);
+        }
+        while !self.compute.host_blob_fits(bytes) {
+            let now = self.now();
+            let Some(blob) = self.host.next_retained_victim_below(owner, used_at, now) else {
+                return false;
+            };
+            // Out of the tier first, then freed at the backend: the pair
+            // `make_host_room_for_bytes` uses for the same job, and what
+            // makes this loop shrink the tier on every turn.
+            let Some(entry) = self.host.discard_retained(blob) else {
+                return false;
+            };
+            self.forget_kv_ram_blob(entry, events);
+        }
+        true
+    }
+
     /// A KV-RAM entry already out of the tier's budget: drop what names it,
     /// free its blob, and report the discard.
     fn forget_kv_ram_blob(&mut self, entry: RetainedKvRamEntry, events: &mut Vec<SchedEvent>) {
@@ -939,19 +986,7 @@ impl ConcreteScheduler {
         let Ok(bytes) = self.compute.prefix_snapshot_size(publisher, tokens) else {
             return false;
         };
-        let now = self.now();
-        let Some(victims) =
-            self.host
-                .plan_retained_room(bytes, retention.class, retention.used_at, now)
-        else {
-            return false;
-        };
-        for victim in victims {
-            self.discard_kv_ram_blob(victim, events);
-        }
-        // As in `spill_checkpoint`: free bytes are not a free span, and the
-        // arena is asked before the copy (GitHub #213).
-        if !self.compute.host_blob_fits(bytes) {
+        if !self.make_kv_ram_room_for_retained(bytes, retention.class, retention.used_at, events) {
             return false;
         }
         let Ok(bytes) = self.compute.spill_prefix(publisher, tokens) else {
@@ -1075,11 +1110,16 @@ impl ConcreteScheduler {
     /// (GitHub #190), or report that it cannot go there and has to be
     /// discarded.
     ///
-    /// Room is planned before a byte moves: only retained entries ranking
-    /// below this one may be given up for it (`HostTier::plan_retained_room`),
-    /// and if even all of those are not enough, nothing is given up at all.
-    /// The one way a spill costs another entry for nothing is a leaf failure
-    /// after the room was made.
+    /// Room is made before a byte moves, and only out of retained entries
+    /// ranking below this one ([`Self::make_kv_ram_room_for_retained`]) — in
+    /// the tier's byte budget and in the arena the blob has to be placed in.
+    /// When those entries are not enough for either, the spill does not
+    /// happen.
+    ///
+    /// A spill can still cost another entry for nothing: the room may be
+    /// made and then the leaf fail, or the entries the newcomer outranks may
+    /// free the bytes and still leave no span long enough. Both leave what
+    /// was given up given up, and neither leaves this one half-spilled.
     fn spill_checkpoint(&mut self, entry: &CheckpointEntry, events: &mut Vec<SchedEvent>) -> bool {
         if self.checkpoints.tiers().below(ReuseSource::Device) != Some(ReuseSource::KvRam) {
             return false;
@@ -1087,21 +1127,7 @@ impl ConcreteScheduler {
         let Ok(bytes) = self.compute.checkpoint_snapshot_size(entry.publisher) else {
             return false;
         };
-        let now = self.now();
-        let Some(victims) = self
-            .host
-            .plan_retained_room(bytes, entry.class, entry.used_at, now)
-        else {
-            return false;
-        };
-        for victim in victims {
-            self.discard_kv_ram_blob(victim, events);
-        }
-        // The budget has the bytes; the arena still has to have a hole for
-        // them (GitHub #213). The plan above only takes entries ranking below
-        // this one, so a fragmented arena is where the spill stops — asking
-        // before the copy is what keeps that costing no device work.
-        if !self.compute.host_blob_fits(bytes) {
+        if !self.make_kv_ram_room_for_retained(bytes, entry.class, entry.used_at, events) {
             return false;
         }
         let Ok(bytes) = self.compute.spill_checkpoint(entry.publisher) else {
@@ -3336,7 +3362,7 @@ impl Scheduler for ConcreteScheduler {
 mod tests {
     use super::*;
     use crate::gdn::GdnState;
-    use crate::host::{HostEntry, ResumePhase, Tier};
+    use crate::host::{HostEntry, ResumePhase, RetainedKvRamEntry, Tier};
     use crate::mock::MockCompute;
 
     /// A live snapshot of `bytes`, captured by `owner` at tick `tick`. The
@@ -3412,6 +3438,11 @@ mod tests {
         );
         assert_eq!(
             sched.host.used_bytes(),
+            1,
+            "and stopped at the first hole that fits, not by emptying the tier"
+        );
+        assert_eq!(
+            sched.host.used_bytes(),
             compute.host_arena_used(),
             "the ledger and the arena agree after every step"
         );
@@ -3429,5 +3460,83 @@ mod tests {
         assert_eq!(sched.host.entry_count(), 0, "it gave up everything trying");
         assert_eq!(sched.host.used_bytes(), 0);
         assert_eq!(compute.host_arena_used(), 0, "and every blob went back to the arena");
+    }
+
+    /// Three spilled checkpoints of a byte each, placed in order in a
+    /// four-byte arena, with the middle one the Agent — the first the tier
+    /// gives up, and the one whose byte leaves the free bytes in two holes
+    /// rather than one span.
+    fn three_retained_blobs() -> (ConcreteScheduler, Arc<MockCompute>) {
+        let compute = Arc::new(MockCompute::with_host_arena(4));
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                host_capacity_bytes: 4,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        let used_at = sched.now();
+        for (publisher, owner) in [
+            (1, RequestClass::Interactive),
+            (2, RequestClass::Agent),
+            (3, RequestClass::Interactive),
+        ] {
+            compute
+                .spill_checkpoint(publisher)
+                .expect("the arena has room for a byte");
+            sched
+                .host
+                .capture_retained(RetainedKvRamEntry::new(
+                    RetainedBlob::Checkpoint(publisher),
+                    publisher,
+                    owner,
+                    1,
+                    used_at,
+                ))
+                .expect("the tier has room for a byte");
+        }
+        assert_eq!(sched.host.used_bytes(), 3);
+        assert_eq!(compute.host_arena_used(), 3);
+        (sched, compute)
+    }
+
+    #[test]
+    fn a_retained_spill_keeps_taking_victims_until_one_of_the_holes_fits() {
+        let (mut sched, compute) = three_retained_blobs();
+        let used_at = sched.now();
+        let mut events = Vec::new();
+
+        assert!(
+            sched.make_kv_ram_room_for_retained(2, RequestClass::Interactive, used_at, &mut events),
+            "two of the four bytes belong to entries this newcomer outranks"
+        );
+
+        // The byte plan needs one byte and takes the Agent in the middle,
+        // which leaves two free bytes in two holes. Stopping there is what
+        // the budget alone would do, and the blob would have nowhere to go.
+        assert!(compute.host_blob_fits(2), "the spill has a span to be placed in");
+        assert_eq!(sched.host.used_bytes(), 1, "and it took one more, not everything");
+        assert_eq!(sched.host.used_bytes(), compute.host_arena_used());
+    }
+
+    #[test]
+    fn a_retained_spill_no_entry_below_it_can_place_does_not_happen() {
+        let (mut sched, compute) = three_retained_blobs();
+        let used_at = sched.now();
+        let mut events = Vec::new();
+
+        // An Agent's bet: the two Interactive entries rank above it, so the
+        // only byte it may take is the other Agent's — which leaves two
+        // one-byte holes and nowhere to put two bytes.
+        assert!(
+            !sched.make_kv_ram_room_for_retained(2, RequestClass::Agent, used_at, &mut events),
+            "a bet does not displace what the tier values more, however fragmented"
+        );
+        assert_eq!(
+            sched.host.retained_count(),
+            2,
+            "the two it may not take are still there"
+        );
+        assert_eq!(sched.host.used_bytes(), compute.host_arena_used());
     }
 }

@@ -27,8 +27,10 @@
 // shared-GPU-memory figure for the process.
 //
 // Style follows model.cu: explicit pointers + sizes, int32 return codes (0
-// = ok, -1 = error, IGNIS_SEQ_ERR_NOT_AT_BOUNDARY / _BAD_SNAPSHOT for the
-// two refusals state transfer makes), no C++ types across the boundary.
+// = ok, -1 = error, and an IGNIS_SEQ_ERR_* code per refusal that is not a
+// caller mistake -- _NOT_AT_BOUNDARY, _BAD_SNAPSHOT and _SHARED_PREFIX for
+// state transfer, _NO_HOST_ROOM for a KV-RAM arena with no span long enough),
+// no C++ types across the boundary.
 
 #include "ignis_model.h"
 #include "ignis_seq.h"
@@ -1279,14 +1281,14 @@ extern "C" int32_t ignis_host_pinned_pool_create(uint64_t bytes) {
               " bytes of KV-RAM failed: " + e.what());
     return -1;
   }
-  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, true, bytes);
+  ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, true, bytes);
   return 0;
 }
 
 extern "C" void ignis_host_pinned_pool_destroy(void) {
   const std::lock_guard<std::mutex> guard(g_host_pool_mutex);
   if (g_host_pool) {
-    ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_BLOB, false, 0);
+    ignis_alloc_count_record(IGNIS_ALLOC_KV_RAM_ARENA, false, 0);
     g_host_pool.reset();
   }
 }

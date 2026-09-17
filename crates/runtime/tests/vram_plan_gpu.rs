@@ -88,7 +88,12 @@ fn the_planned_reservations_are_what_the_load_holds() {
             unreachable!();
         }
     };
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, config);
+    // GitHub #213: KV-RAM is one arena pinned at the load, so a leaf without
+    // one refuses every spill. A gibibyte costs this load nothing it notices
+    // and keeps a leg that starts spilling from failing for the wrong reason.
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, config)
+        .with_kv_ram_arena(1024 * 1024 * 1024)
+        .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model = Arc::new(Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")));
     let stats = model.stats().unwrap_or_else(|e| panic!("stats: {e:?}"));
     assert_eq!(stats.kv_page_count, pages);

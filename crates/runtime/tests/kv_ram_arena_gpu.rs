@@ -13,7 +13,10 @@
 
 #![cfg(feature = "cuda")]
 
-use ignis_core::seq::{HostPinnedPool, PinnedAllocError, PinnedBuffer, host_blob_fits, host_pool_stats};
+use ignis_core::seq::{
+    AllocCount, AllocKind, HostPinnedPool, PinnedAllocError, PinnedBuffer, alloc_count,
+    host_blob_fits, host_pool_stats,
+};
 
 /// Enough to be refused by any host, and not so large that the request
 /// overflows before the driver sees it: 8 EiB of page-locked RAM does not
@@ -60,12 +63,23 @@ fn a_zero_pool_reserves_nothing_and_a_pinned_one_reports_what_its_blobs_hold() {
     }
 
     let capacity = 64 * 1024 * 1024;
+    let before = alloc_count(AllocKind::KvRamArena);
     let _pool = HostPinnedPool::create(capacity).expect("64 MiB of pinned RAM");
     assert_eq!(host_pool_stats(), (capacity, 0));
+    assert_eq!(
+        alloc_count(AllocKind::KvRamArena).since(&before),
+        AllocCount { allocs: 1, frees: 0, alloc_bytes: capacity },
+        "pinning the tier is one allocation of the whole arena, not one per blob"
+    );
 
     // `used` is what the blobs asked for, not what first fit padded them to:
     // it is the figure `HostTier::used_bytes` is asserted against.
     let blob = PinnedBuffer::new(1_000_003).expect("a fresh arena has room");
+    assert_eq!(
+        alloc_count(AllocKind::KvRamArena).since(&before),
+        AllocCount { allocs: 1, frees: 0, alloc_bytes: capacity },
+        "a blob is placed in the arena, not allocated"
+    );
     assert_eq!(host_pool_stats(), (capacity, 1_000_003), "used is the bytes asked for");
     assert_eq!(blob.len(), 1_000_003);
 

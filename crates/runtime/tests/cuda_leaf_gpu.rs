@@ -56,7 +56,12 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
         }
     };
 
-    let leaf = CudaLeaf::new(device, reader, artifact, handles, CudaLeafConfig::default());
+    // GitHub #213: KV-RAM is one arena pinned at the load, so a leaf without
+    // one refuses every spill. A gibibyte costs this load nothing it notices
+    // and keeps a leg that starts spilling from failing for the wrong reason.
+    let leaf = CudaLeaf::new(device, reader, artifact, handles, CudaLeafConfig::default())
+        .with_kv_ram_arena(1024 * 1024 * 1024)
+        .unwrap_or_else(|e| panic!("pin KV-RAM: {e}"));
     let model = Arc::new(
         Model::load(Arc::new(leaf)).unwrap_or_else(|e| panic!("model load: {e:?}")),
     );

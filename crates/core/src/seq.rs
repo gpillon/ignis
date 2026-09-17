@@ -717,8 +717,11 @@ pub enum AllocKind {
     /// A prompt checkpoint's copy of its partial tail page; zero since GitHub
     /// #215, which takes a KV page of the pool instead.
     CheckpointTailPage,
-    /// A pinned host region, per KV-RAM blob.
-    KvRamBlob,
+    /// A pinned host region. Since GitHub #213 that is the KV-RAM arena
+    /// itself, counted once at the load; the blobs placed inside it are not
+    /// CUDA allocations and count nothing, so this reads zero over a request
+    /// mix.
+    KvRamArena,
     /// A device region from `ignis_device_alloc`.
     Device,
 }
@@ -728,7 +731,7 @@ impl AllocKind {
         AllocKind::PrefixImage,
         AllocKind::CheckpointImage,
         AllocKind::CheckpointTailPage,
-        AllocKind::KvRamBlob,
+        AllocKind::KvRamArena,
         AllocKind::Device,
     ];
 
@@ -737,7 +740,7 @@ impl AllocKind {
             AllocKind::PrefixImage => 0,
             AllocKind::CheckpointImage => 1,
             AllocKind::CheckpointTailPage => 2,
-            AllocKind::KvRamBlob => 3,
+            AllocKind::KvRamArena => 3,
             AllocKind::Device => 4,
         }
     }
@@ -1265,8 +1268,12 @@ impl HostPinnedPool {
     pub fn create(bytes: u64) -> Result<Self, String> {
         let rc = unsafe { ffi::ignis_host_pinned_pool_create(bytes) };
         if rc != 0 {
+            // The leaf's message carries the cause — a host that would not
+            // page-lock the region, or an arena already pinned. This adds
+            // only what a caller needs to act on it: the size, and what sets
+            // it.
             return Err(format!(
-                "could not pin {bytes} bytes of KV-RAM: {} \
+                "KV-RAM arena of {bytes} bytes: {} \
                  (--kv-host-pool-bytes sets this size; 0 disables the tier)",
                 last_error()
             ));
@@ -1284,7 +1291,12 @@ impl HostPinnedPool {
 
 impl Drop for HostPinnedPool {
     fn drop(&mut self) {
-        unsafe { ffi::ignis_host_pinned_pool_destroy() };
+        // A disabled tier pinned nothing, and the arena is process-wide: a
+        // zero-capacity guard that destroyed on drop would take down whatever
+        // arena a later load pinned, under its live blobs.
+        if self.capacity_bytes != 0 {
+            unsafe { ffi::ignis_host_pinned_pool_destroy() };
+        }
     }
 }
 

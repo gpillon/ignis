@@ -438,6 +438,18 @@ pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
             )
             .unwrap();
         events.extend(run_to_idle(&mut sched));
+        // GitHub #213: the tier's byte ledger and the arena the blobs are
+        // placed in are two views of one region, checked here rather than at
+        // an empty end state -- under pressure the block's blob is still in
+        // KV-RAM at this point.
+        let (capacity, used) = ignis_core::seq::host_pool_stats();
+        assert_eq!(capacity, HOST_POOL_BYTES, "the arena is the tier's whole budget");
+        assert_eq!(
+            sched.host().used_bytes(),
+            used,
+            "the ledger and the arena disagree about what KV-RAM holds"
+        );
+        assert_eq!(used > 0, pressure, "only the pressured run spills a blob");
         (generated(&events, second), events, second)
     };
 

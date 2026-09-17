@@ -518,6 +518,33 @@ impl HostTier {
         (free >= bytes).then_some(victims)
     }
 
+    /// The next retained entry a newcomer of `owner`/`used_at` may take,
+    /// lowest rank first, or `None` when nothing left ranks below it
+    /// (GitHub #213).
+    ///
+    /// [`Self::plan_retained_room`] answers "which entries make `bytes`
+    /// free"; this answers "which entry goes next", one at a time, under the
+    /// same strictly-below rule. KV-RAM is one arena, so free bytes are not
+    /// the whole question — a caller that has the bytes and still no span to
+    /// place the blob in keeps asking this until the backend says it fits.
+    /// The bytes cannot answer that, which is why this counts none.
+    pub fn next_retained_victim_below(
+        &self,
+        owner: RequestClass,
+        used_at: Instant,
+        now: Instant,
+    ) -> Option<RetainedBlob> {
+        let (class, tier) = self.rank_of(owner, Tier::Probation, used_at, now);
+        let newcomer = RetainedRank {
+            class,
+            tier,
+            used_at,
+            blob: RetainedBlob::Prefix(u64::MAX),
+        };
+        let (rank, pos) = self.discardable(now).into_iter().next()?;
+        (rank < newcomer).then(|| self.retained[pos].blob)
+    }
+
     /// Admit a materialized retained checkpoint. The caller made room first
     /// ([`Self::plan_retained_room`]).
     pub fn capture_retained(&mut self, entry: RetainedKvRamEntry) -> Result<(), HostError> {
