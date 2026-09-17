@@ -259,6 +259,61 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
 - **Chain accounting:** every link of a chained prefix is one slot, so a
   checkpoint and the prefix under it cost two slots. Tests pin that.
 
+**As built (#215), where it departs from or sharpens the above:**
+
+- **The tail page is charged exactly, and the plan pays for it.** A
+  retained checkpoint's tail page counts as a used KV page for as long as its
+  device image lives. It is still retained state:
+  - The page path gives a checkpoint up for its tail page even while a live
+    request stands on the prefix below it, because that page is the
+    checkpoint's alone.
+  - The only exception is a checkpoint an admitted request is about to be
+    built from. Its claimant cannot take that page back, so a pool of exactly
+    one context would leave a full-context claimant waiting forever.
+  - The plan's KV minimum is therefore `pages(max_context) + retained_slots`,
+    and the error names `--retained-slots`.
+  - A capture with no page for its tail is skipped with a third reason,
+    `capture_skipped_no_page`.
+  - An opener on a page boundary takes no tail page.
+- **A slot comes back when the backend handle drops.** The scheduler's slot
+  ledger is keyed like the handles. The kernel keeps an occupancy bit per
+  retained slot. It refuses a publish or capture into a held or out-of-range
+  slot, and it refuses a claim on a prefix whose handle is gone. A shared
+  prefix therefore holds its slot until its last reference goes. That is the
+  refcount above, with no second count.
+- **Victims on the slot path skip one more case.** A device checkpoint that an
+  admitted request has claimed but not yet built from keeps its slot, because
+  that request's first chunk copies the image out of it. A checkpoint standing
+  on a prefix that a live request holds *is* a candidate, since its own slot
+  comes back whatever the prefix does.
+- **The two victim orders differ.** The slot path uses ADR 0023's order:
+  checkpoints first, then class, then LRU. The page path
+  (`reclaim_retained_until`) keeps #188's LRU-only order for retained
+  prefixes.
+- **`--prompt-reuse off` also stops sibling prefix sharing.** A publish needs
+  a slot, and reuse off reserves none. Live siblings then no longer share a
+  published block either, where before #215 they did.
+- **Slots per conversation.** Each link of a chain costs one slot, so each turn
+  costs its link plus its checkpoint. A two-turn conversation holds 4 slots,
+  and a request with a system block before an image holds 3 (block, head,
+  checkpoint). At the default of `N_DECODE_LANES` slots, about two
+  conversations keep full reuse. A long tool loop plateaus: once its own
+  claimed chain holds every slot, further publishes and captures are skipped.
+  The #214 replay should read the skip lines with that in mind.
+- **One copy primitive.** The only device image copy is
+  `ignis_seq_copy_slot_state` (slot to slot). `ignis_seq_state_transfer`,
+  the prefix transfer, the image clone and `ignis_seq_checkpoint_image_bytes`
+  are removed, which answers #211's open question. The allocation counter's
+  `PrefixImage` / `CheckpointImage` / `CheckpointTailPage` kinds stay, and
+  over the baseline mix they read zero.
+- **Logs, no new metric.**
+  - `ignis.scheduler.retained_slots` (DEBUG) is emitted whenever the count
+    held changes.
+  - `ignis.request.retained_slot_skipped` (INFO) carries `reason` and
+    `retained_slots_in_use` / `retained_slots` as they were at the skip. It
+    is logged whenever prompt reuse is on, including `--retained-slots 0`.
+  - No Prometheus series was added.
+
 ### Slice 6 — vision encoder shares the prefill scratch
 
 - **One arena for both.** The vision encoder workspace and the prefill

@@ -23,7 +23,8 @@
 //! A pool can hold **retained slots** past its lanes (GitHub #211, ADR 0030):
 //! [`SeqPool::retained_store`] copies a lane's mutable state into one and
 //! [`SeqPool::retained_load`] copies it back, device to device;
-//! [`crate::RetainedSlots`] says which slot is free. [`alloc_count`] reads the
+//! [`crate::RetainedSlots`] says which slot is free, and the scheduler's
+//! [`crate::RetainedSlotLedger`] who holds it (GitHub #215). [`alloc_count`] reads the
 //! leaf's count of what it allocates while serving.
 //!
 //! `Seq<'a>` borrows the [`SeqPool`] it came from: the borrow checker
@@ -125,7 +126,6 @@ pub(crate) mod ffi {
     pub struct IgnisSeqPoolPlan {
         pub kv_bytes: u64,
         pub lane_state_bytes: u64,
-        pub checkpoint_image_bytes: u64,
         /// One slot's state and every retained slot's (GitHub #211).
         pub slot_state_bytes: u64,
         pub retained_state_bytes: u64,
@@ -234,6 +234,7 @@ pub(crate) mod ffi {
             pool: *mut IgnisSeqPool,
             seq: *mut IgnisSeq,
             prefix_tokens: u32,
+            retained_slot: u32,
             out_prefix: *mut *mut IgnisSeqPrefix,
         ) -> i32;
 
@@ -264,15 +265,11 @@ pub(crate) mod ffi {
             dst_bytes: u64,
         ) -> i32;
 
-        pub fn ignis_seq_checkpoint_image_bytes(
-            pool: *const IgnisSeqPool,
-            out_bytes: *mut u64,
-        ) -> i32;
-
         pub fn ignis_seq_checkpoint_capture(
             pool: *mut IgnisSeqPool,
             seq: *mut IgnisSeq,
             opener_tokens: u32,
+            retained_slot: u32,
             out_checkpoint: *mut *mut IgnisSeqCheckpoint,
         ) -> i32;
 
@@ -605,21 +602,6 @@ impl SeqPool {
         })
     }
 
-    /// Device bytes one prompt checkpoint of this pool would occupy (GitHub
-    /// #186, ADR 0029): the mutable-state image plus one KV page's copy.
-    ///
-    /// A pool property, not a per-checkpoint one, and constant for the
-    /// pool's life — so a byte-budgeted pool of checkpoints may ask once and
-    /// budget against the answer. Allocates nothing and moves nothing.
-    pub fn checkpoint_image_bytes(&self) -> Result<u64, String> {
-        let mut bytes: u64 = 0;
-        let rc = unsafe { ffi::ignis_seq_checkpoint_image_bytes(self.handle, &mut bytes) };
-        if rc != 0 {
-            return Err(last_error());
-        }
-        Ok(bytes)
-    }
-
     /// Reserve a slot that **claims `checkpoint`** (GitHub #186, ADR 0029):
     /// the whole pages below its generation opener are the shared prefix's
     /// own physical pages, the rest is a fresh zeroed reservation, the
@@ -691,11 +673,14 @@ impl SeqPool {
 /// `enum ignis_alloc_kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AllocKind {
-    /// A shared prefix's mutable-state image, per prefix publish.
+    /// A shared prefix's mutable-state image, per prefix publish. Nothing
+    /// counts here since GitHub #215: the image lives in a retained slot.
     PrefixImage,
-    /// A prompt checkpoint's mutable-state image, per checkpoint capture.
+    /// A prompt checkpoint's mutable-state image, per checkpoint capture;
+    /// zero since GitHub #215, as above.
     CheckpointImage,
-    /// A prompt checkpoint's copy of its partial tail page.
+    /// A prompt checkpoint's copy of its partial tail page; zero since GitHub
+    /// #215, which takes a KV page of the pool instead.
     CheckpointTailPage,
     /// A pinned host region, per KV-RAM blob.
     KvRamBlob,
@@ -758,13 +743,13 @@ pub fn alloc_count(kind: AllocKind) -> AllocCount {
 
 /// A captured **prompt checkpoint** (GitHub #186, ADR 0029): one reference
 /// to the shared prefix holding the whole pages below a generation opener,
-/// plus device images of the mutable state at the opener and of the partial
-/// page the opener ends inside.
+/// plus the mutable state at the opener in a retained slot and the partial
+/// page the opener ends inside in a page of the pool (GitHub #215).
 ///
 /// It outlives the request that captured it — that is the point: the next
-/// turn of a conversation arrives long after. Dropping the handle frees the
-/// images and lets go of the prefix, whose pages return to the pool only if
-/// nothing else is standing on them.
+/// turn of a conversation arrives long after. Dropping the handle gives back
+/// the slot and the page and lets go of the prefix, whose pages return to the
+/// pool only if nothing else is standing on them.
 ///
 /// Borrows its [`SeqPool`] for the same reason [`Seq`] and [`SeqPrefix`] do:
 /// the flat C ABI frees the pool regardless of what is still drawn from it.
@@ -1046,6 +1031,10 @@ impl<'a> Seq<'a> {
     /// it no longer has. So this is called at the chunk boundary that lands
     /// on the prefix, not at the end of a prompt.
     ///
+    /// The mutable state is captured into retained slot `retained_slot`
+    /// (GitHub #215), which must hold no other prefix's or checkpoint's image;
+    /// it is held until the returned handle is dropped.
+    ///
     /// The sequence keeps serving and becomes a holder of its own prefix.
     /// `Err` with [`NOT_AT_BOUNDARY`](SeqTransferError::is_not_at_boundary)
     /// when it is mid-chunk or standing anywhere else; `-1` for a prefix that
@@ -1058,10 +1047,17 @@ impl<'a> Seq<'a> {
     pub fn publish_prefix(
         &mut self,
         prefix_tokens: u32,
+        retained_slot: u32,
     ) -> Result<SeqPrefix<'a>, SeqTransferError> {
         let mut handle: *mut ffi::IgnisSeqPrefix = std::ptr::null_mut();
         let rc = unsafe {
-            ffi::ignis_seq_prefix_publish(self.pool, self.handle, prefix_tokens, &mut handle)
+            ffi::ignis_seq_prefix_publish(
+                self.pool,
+                self.handle,
+                prefix_tokens,
+                retained_slot,
+                &mut handle,
+            )
         };
         if rc != 0 || handle.is_null() {
             return Err(transfer_error(if rc == 0 { -1 } else { rc }));
@@ -1079,7 +1075,10 @@ impl<'a> Seq<'a> {
     ///
     /// The sequence must already hold a shared prefix whose pages are
     /// exactly the whole pages below the opener, and must stand exactly at
-    /// `opener_tokens`, at a chunk boundary. The capture reads the sequence
+    /// `opener_tokens`, at a chunk boundary. The state goes into retained slot
+    /// `retained_slot` (GitHub #215), which must hold no other image, and the
+    /// page the opener ends inside into one page of the pool: nothing is
+    /// allocated. The capture reads the sequence
     /// and changes nothing about it — not its reservation, not its
     /// block-table row — so it goes on prefilling and decoding as if it had
     /// not been asked, and a request cancelled after this keeps its
@@ -1097,10 +1096,17 @@ impl<'a> Seq<'a> {
     pub fn capture_checkpoint(
         &mut self,
         opener_tokens: u32,
+        retained_slot: u32,
     ) -> Result<SeqCheckpoint<'a>, SeqTransferError> {
         let mut handle: *mut ffi::IgnisSeqCheckpoint = std::ptr::null_mut();
         let rc = unsafe {
-            ffi::ignis_seq_checkpoint_capture(self.pool, self.handle, opener_tokens, &mut handle)
+            ffi::ignis_seq_checkpoint_capture(
+                self.pool,
+                self.handle,
+                opener_tokens,
+                retained_slot,
+                &mut handle,
+            )
         };
         if rc != 0 || handle.is_null() {
             return Err(transfer_error(if rc == 0 { -1 } else { rc }));

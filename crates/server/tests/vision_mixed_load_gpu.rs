@@ -113,10 +113,19 @@ impl Harness {
     }
 }
 
+/// The load's retained slots: few, so the pages the VRAM plan keeps beside one
+/// context for their checkpoints' tails are fewer than the Agent request's. A
+/// swatch sibling would hold three (its block, its head, its checkpoint), so
+/// its capture is skipped and its prefixes are still shared.
+const RETAINED_SLOTS: u32 = 2;
+
 /// The KV pool's byte budget: exactly one `MAX_CONTEXT` sequence of hq pages,
-/// so a request reserving the whole context can only run alone.
+/// so a request reserving the whole context can only run alone — plus the
+/// page each retained slot's checkpoint may keep, which the VRAM plan requires
+/// beside that sequence (GitHub #215).
 fn one_context_pool_bytes() -> u64 {
-    KvFormat::HqE8_2b.bytes_per_token(KvGeometry::qwen38_27b()) * u64::from(MAX_CONTEXT)
+    let tail_tokens = RETAINED_SLOTS * ignis_runtime::KV_PAGE_TOKENS;
+    KvFormat::HqE8_2b.bytes_per_token(KvGeometry::qwen38_27b()) * u64::from(MAX_CONTEXT + tail_tokens)
 }
 
 fn harness() -> Option<Harness> {
@@ -134,6 +143,7 @@ fn harness() -> Option<Harness> {
         kv_format: KvFormat::HqE8_2b,
         kv_pool_bytes: Some(one_context_pool_bytes()),
         prompt_reuse: true,
+        retained_slots: RETAINED_SLOTS,
         speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
         vision: Some(vision),
         ..EngineShape::default()

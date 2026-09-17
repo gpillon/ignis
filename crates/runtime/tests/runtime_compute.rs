@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use ignis_core::{
     Compute, ComputeError, ConcreteScheduler, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestClass, RequestInput, Scheduler,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestClass, RequestInput, RetainedAt, Scheduler,
     SchedulerConfig, SpecCounters,
 };
 use ignis_core::checkpoint::ReuseSource;
@@ -30,6 +30,10 @@ struct Calls {
     /// see that a claimant was allocated *against* a prefix rather than
     /// allocated normally and prefilled from a hole.
     prefixes_published: Vec<u32>,
+    /// GitHub #215: the retained slot each publish and each capture was named,
+    /// in call order — what the scheduler decided, reaching the leaf.
+    publish_slots: Vec<u32>,
+    capture_slots: Vec<u32>,
     shared_allocations: Vec<u32>,
     /// The prefix each shared allocation stood on (the stub's prefix is its
     /// token count), so a test can see *which* of a publisher's heads a
@@ -261,8 +265,11 @@ impl StepLeaf for StubLeaf {
         _model: &Self::Model,
         _sequence: &mut Self::Sequence,
         prefix_tokens: u32,
+        retained_slot: u32,
     ) -> Result<Self::Prefix, i32> {
-        self.calls.lock().unwrap().prefixes_published.push(prefix_tokens);
+        let mut calls = self.calls.lock().unwrap();
+        calls.prefixes_published.push(prefix_tokens);
+        calls.publish_slots.push(retained_slot);
         Ok(prefix_tokens)
     }
 
@@ -285,26 +292,19 @@ impl StepLeaf for StubLeaf {
         Ok(())
     }
 
-    fn checkpoint_image_bytes(&self, _model: &Self::Model) -> u64 {
-        // One nominal byte, the way `MockCompute` prices a snapshot: enough
-        // for a byte budget to be exercisable without a device.
-        1
-    }
-
     fn capture_checkpoint(
         &self,
         _model: &Self::Model,
         _sequence: &mut Self::Sequence,
         opener_tokens: u32,
+        retained_slot: u32,
     ) -> Result<Self::Checkpoint, i32> {
         if let Some(code) = self.capture_error {
             return Err(code);
         }
-        self.calls
-            .lock()
-            .unwrap()
-            .checkpoints_captured
-            .push(opener_tokens);
+        let mut calls = self.calls.lock().unwrap();
+        calls.checkpoints_captured.push(opener_tokens);
+        calls.capture_slots.push(retained_slot);
         Ok(opener_tokens)
     }
 
@@ -473,7 +473,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
         .prefill_step(&[
             PrefillJob {
                 checkpoint: None,
-                capture_checkpoint_tokens: None,
+                capture_checkpoint: None,
                 multimodal: None,
                 request: 1,
                 tokens: vec![4, 5],
@@ -481,11 +481,11 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 start_position: 0,
                 params: left,
                 shared_prefix: None,
-                publish_prefix_tokens: None,
+                publish_prefix: None,
             },
             PrefillJob {
                 checkpoint: None,
-                capture_checkpoint_tokens: None,
+                capture_checkpoint: None,
                 multimodal: None,
                 request: 2,
                 tokens: vec![4, 5],
@@ -493,7 +493,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 start_position: 0,
                 params: right,
                 shared_prefix: None,
-                publish_prefix_tokens: None,
+                publish_prefix: None,
             },
         ])
         .unwrap();
@@ -541,7 +541,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
 fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
     PrefillJob {
         checkpoint: None,
-        capture_checkpoint_tokens: None,
+        capture_checkpoint: None,
         multimodal: None,
         request,
         tokens: vec![4, 5],
@@ -552,7 +552,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
             ..DecodeParams::default()
         },
         shared_prefix: None,
-        publish_prefix_tokens: None,
+        publish_prefix: None,
     }
 }
 
@@ -1138,9 +1138,9 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             start_position: 0,
             params: DecodeParams::default(),
             shared_prefix: None,
-            publish_prefix_tokens: None,
+            publish_prefix: None,
             checkpoint: None,
-            capture_checkpoint_tokens: Some(6),
+            capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 0 }),
             multimodal: None,
         }])
         .unwrap();
@@ -1171,12 +1171,13 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             start_position: 0,
             params,
             shared_prefix: None,
-            publish_prefix_tokens: None,
+            publish_prefix: None,
             checkpoint: None,
-            capture_checkpoint_tokens: Some(6),
+            capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 2 }),
             multimodal: None,
         }])
         .unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
     compute.spill_checkpoint(1).unwrap();
 
     for request in [2, 3] {
@@ -1188,13 +1189,13 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 start_position: 6,
                 params,
                 shared_prefix: None,
-                publish_prefix_tokens: None,
+                publish_prefix: None,
                 checkpoint: Some(CheckpointClaim {
                     publisher: 1,
                     tokens: 6,
                     source: ReuseSource::KvRam,
                 }),
-                capture_checkpoint_tokens: None,
+                capture_checkpoint: None,
                 multimodal: None,
             }])
             .unwrap();
@@ -1440,9 +1441,9 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         start_position: start,
         params: DecodeParams::default(),
         shared_prefix: None,
-        publish_prefix_tokens: None,
+        publish_prefix: None,
         checkpoint: None,
-        capture_checkpoint_tokens: None,
+        capture_checkpoint: None,
         multimodal: Some(prompt.clone()),
     }
 }
@@ -1594,16 +1595,16 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
     let leaf = Arc::new(StubLeaf::with_tokens([]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
-    let job = |request, tokens: Vec<u32>, start, publish| PrefillJob {
+    let job = |request, tokens: Vec<u32>, start, publish: Option<u32>| PrefillJob {
         request,
         tokens,
         context_tokens: 32,
         start_position: start,
         params: DecodeParams::default(),
         shared_prefix: None,
-        publish_prefix_tokens: publish,
+        publish_prefix: publish.map(|tokens| RetainedAt { tokens, slot: tokens / 4 }),
         checkpoint: None,
-        capture_checkpoint_tokens: None,
+        capture_checkpoint: None,
         multimodal: None,
     };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
@@ -1640,23 +1641,28 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             start_position: 0,
             params: DecodeParams::default(),
             shared_prefix: None,
-            publish_prefix_tokens: Some(4),
+            publish_prefix: Some(RetainedAt { tokens: 4, slot: 3 }),
             checkpoint: None,
-            capture_checkpoint_tokens: None,
+            capture_checkpoint: None,
             multimodal: None,
         }])
         .unwrap();
     compute.release(1);
 
-    assert!(compute.restore_prefix(1, 4).is_err(), "nothing spilled yet");
+    assert!(compute.restore_prefix(1, 4, 5).is_err(), "nothing spilled yet");
     compute.spill_prefix(1, 4).unwrap();
     assert_eq!(compute.spilled_prefixes(), 1);
-    assert!(compute.restore_prefix(1, 4).is_err(), "it is still on the device");
+    assert!(compute.restore_prefix(1, 4, 5).is_err(), "it is still on the device");
     compute.release_prefix(1, 4);
     assert_eq!(compute.live_prefixes(), 0);
 
     let sequences_before = leaf.calls.lock().unwrap().sequences_released;
-    compute.restore_prefix(1, 4).unwrap();
+    compute.restore_prefix(1, 4, 5).unwrap();
+    assert_eq!(
+        leaf.calls.lock().unwrap().publish_slots,
+        vec![3, 5],
+        "the carrier publishes into the slot the scheduler named for the return (GitHub #215)"
+    );
     assert_eq!(compute.live_prefixes(), 1, "the prefix is back");
     assert_eq!(compute.live_sequences(), 0, "and its carrier is gone");
     assert_eq!(leaf.calls.lock().unwrap().sequences_released, sequences_before + 1);
@@ -1671,9 +1677,9 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             start_position: 4,
             params: DecodeParams::default(),
             shared_prefix: Some(ignis_core::scheduler::SharedPrefixClaim { publisher: 1, tokens: 4 }),
-            publish_prefix_tokens: None,
+            publish_prefix: None,
             checkpoint: None,
-            capture_checkpoint_tokens: None,
+            capture_checkpoint: None,
             multimodal: None,
         }])
         .unwrap();

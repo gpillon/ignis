@@ -172,7 +172,49 @@ void pack_logical_pages(const ignis_seq_pool &pool, const ignis_seq &seq, std::u
     throw std::logic_error("snapshot extent exceeds the sequence's logical pages");
   }
   pages.resize(count);
-  ignis_seq_pack_pages_to_host(pool, pages, nullptr, dst);
+  ignis_seq_pack_pages_to_host(pool, pages, dst);
+}
+
+// Write pool slot `slot`'s payload of the device-resident CLONE section
+// `section` into a blob at `base`, laid out by `sections`. False for a
+// section this does not write -- KV pages and progress, which the caller
+// writes for itself.
+//
+// Shared by a live sequence's snapshot (its lane) and a retained object's
+// materialized blob (its retained slot, GitHub #215), so the two cannot lay a
+// section out differently.
+bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
+                               const ignis_seq_section &section,
+                               const std::vector<ignis_seq_section> &sections,
+                               unsigned char *base) {
+  unsigned char *at = base + section.offset;
+  switch (section.kind) {
+  case IGNIS_SEQ_SECTION_GDN_CONV:
+    // The vendored state pool moves a slot's conv taps and recurrent
+    // matrices in one call into two destinations, so this case writes both
+    // sections and the recurrent case below writes none. They stay two rows
+    // of the table because they are separately sized and separately
+    // classified -- the table describes the state, not the memcpy that
+    // happens to move it.
+    pool.gdn_pool.pack_slot_to_host(
+        slot, at, base + ignis_seq_section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT),
+        nullptr);
+    return true;
+  case IGNIS_SEQ_SECTION_GDN_RECURRENT:
+    return true;
+  case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
+    checked_memcpy_async(at, pool.token_counts_for(slot), static_cast<std::size_t>(section.bytes),
+                         cudaMemcpyDeviceToHost, "penalty counts");
+    return true;
+  case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
+    pool.dflash2_window->copy_lane_to_host(slot, at, nullptr);
+    return true;
+  case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
+    pool.dflash2_checkpoint->copy_lane_to_host(slot, at, nullptr);
+    return true;
+  default:
+    return false;
+  }
 }
 
 } // namespace
@@ -235,13 +277,11 @@ std::vector<std::int32_t> ignis_seq_prefix_chain_page_ids(const ignis_seq_prefix
 }
 
 void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
-                                  const std::vector<std::int32_t> &pages, const void *tail_page,
-                                  void *dst) {
+                                  const std::vector<std::int32_t> &pages, void *dst) {
   if (pool.kv_pool.plane_order() != ninfer::PagedKVPlaneOrder::PageMajor) {
     throw std::logic_error("materialized snapshots require a PageMajor KV pool");
   }
   auto *out = static_cast<unsigned char *>(dst);
-  std::size_t tail_offset = 0;
   for (std::size_t plane_index = 0; plane_index < pool.kv_pool.plane_count(); ++plane_index) {
     const ninfer::Tensor &plane = pool.kv_pool.plane(plane_index);
     const std::size_t bytes     = static_cast<std::size_t>(plane.nb[3]);
@@ -261,12 +301,6 @@ void ignis_seq_pack_pages_to_host(const ignis_seq_pool &pool,
       out += (end - begin) * bytes;
       begin = end;
     }
-    if (tail_page != nullptr) {
-      checked_memcpy_async(out, static_cast<const unsigned char *>(tail_page) + tail_offset, bytes,
-                           cudaMemcpyDeviceToHost, "checkpoint tail page");
-      out += bytes;
-    }
-    tail_offset += bytes;
   }
 }
 
@@ -275,7 +309,7 @@ std::uint64_t ignis_seq_materialized_blob_bytes(const ignis_seq_pool &pool, std:
 }
 
 void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_seq_prefix *chain,
-                                       const void *tail_page, const void *image,
+                                       std::int32_t tail_page, std::uint32_t retained_slot,
                                        const ignis_seq_progress_image &progress,
                                        std::uint32_t pages, void *dst, std::uint64_t dst_bytes) {
   const std::vector<ignis_seq_section> sections = ignis_seq_section_table(pool, pages);
@@ -284,32 +318,41 @@ void ignis_seq_write_materialized_blob(const ignis_seq_pool &pool, const ignis_s
     throw std::invalid_argument("destination holds " + std::to_string(dst_bytes) +
                                 " bytes, this blob is " + std::to_string(header.total_bytes));
   }
-  const std::vector<std::int32_t> chain_pages = ignis_seq_prefix_chain_page_ids(chain);
-  if (pages != chain_pages.size() + (tail_page != nullptr ? 1U : 0U)) {
+  if (retained_slot >= pool.retained_slot_count) {
+    throw std::logic_error("materialization names retained slot " + std::to_string(retained_slot) +
+                           " of a pool holding " + std::to_string(pool.retained_slot_count));
+  }
+  // The chain's whole pages, then the checkpoint's own page -- the layout a
+  // sequence standing at the same point would have packed.
+  std::vector<std::int32_t> history = ignis_seq_prefix_chain_page_ids(chain);
+  if (tail_page >= 0) {
+    history.push_back(tail_page);
+  }
+  if (pages != history.size()) {
     throw std::logic_error("materialization extent does not match the chain and its tail");
   }
   auto *base = static_cast<unsigned char *>(dst);
   std::memcpy(base, &header, sizeof(header));
   std::memcpy(base + sizeof(header), sections.data(), sections.size() * sizeof(ignis_seq_section));
   ignis_seq_zero_blob_gaps(base, sections, header.total_bytes);
-  const std::vector<ignis_seq_section> clone = ignis_seq_prefix_clone_layout(pool);
+  const std::int32_t slot = ignis_seq_retained_pool_slot(pool, retained_slot);
   for (const ignis_seq_section &section : sections) {
     unsigned char *at = base + section.offset;
     switch (section.kind) {
     case IGNIS_SEQ_SECTION_KV_PAGES:
-      ignis_seq_pack_pages_to_host(pool, chain_pages, tail_page, at);
+      ignis_seq_pack_pages_to_host(pool, history, at);
       break;
     case IGNIS_SEQ_SECTION_PROGRESS:
       std::memcpy(at, &progress, sizeof(progress));
       break;
     default:
-      // Every other section is a device-resident CLONE section, laid out in
-      // the image by ignis_seq_prefix_clone_layout.
-      checked_memcpy_async(at,
-                           static_cast<const unsigned char *>(image) +
-                               ignis_seq_section_offset(clone, section.kind),
-                           static_cast<std::size_t>(section.bytes), cudaMemcpyDeviceToHost,
-                           "retained state image");
+      // Every other section is device-resident state, held in the retained
+      // slot exactly as a lane holds it.
+      if (!pack_slot_section_to_host(pool, slot, section, sections, base)) {
+        throw std::logic_error(std::string("state section ") +
+                               ignis_seq_section_name(section.kind) +
+                               " has no materialization implementation");
+      }
       break;
     }
   }
@@ -569,29 +612,6 @@ std::uint64_t cyclic_lane_bytes(const ninfer::CyclicKVCacheLayout &layout) {
   return bytes;
 }
 
-// What one `ignis_seq_checkpoint_capture` of a pool with this layout
-// allocates: the clone image of its CLONE sections, in section-table order
-// and alignment (`ignis_seq_prefix_clone_layout`), plus one KV page
-// (`ignis_seq_checkpoint_image_bytes_of`). Planned from the layout, before
-// any pool exists; a GPU test pins it against the built pool's own answer.
-std::uint64_t planned_checkpoint_image_bytes(const PoolLayout &layout,
-                                             const struct ignis_seq_pool_spec &spec) {
-  std::vector<std::uint64_t> sections{
-      per_slot_bytes(layout.gdn_layout.conv, state_slot_count(spec)),
-      per_slot_bytes(layout.gdn_layout.recurrent, state_slot_count(spec)),
-      static_cast<std::uint64_t>(spec.vocab) * sizeof(std::int32_t),
-  };
-  if (layout.dflash2) {
-    sections.push_back(cyclic_lane_bytes(layout.dflash2_window_layout));
-    sections.push_back(cyclic_lane_bytes(layout.dflash2_checkpoint_layout));
-  }
-  std::uint64_t cursor = 0;
-  for (const std::uint64_t bytes : sections) {
-    cursor = ignis_seq_align_up(cursor + bytes, kIgnisSeqSectionAlign);
-  }
-  return cursor + layout.kv_page_bytes;
-}
-
 } // namespace
 
 extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
@@ -610,7 +630,6 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
     const PoolLayout layout = plan_pool_layout(*spec);
     out->kv_bytes = layout.kv_bytes;
     out->lane_state_bytes = lane_state_bytes_of(layout, *spec);
-    out->checkpoint_image_bytes = planned_checkpoint_image_bytes(layout, *spec);
     out->slot_state_bytes = layout.slot_state_bytes;
     out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
     return 0;
@@ -659,6 +678,7 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     pool->speculative_backend = spec->speculative_backend;
     pool->retained_slot_count = spec->retained_slot_count;
     pool->slot_state_bytes    = layout.slot_state_bytes;
+    pool->retained_held.assign(spec->retained_slot_count, false);
 
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
@@ -875,35 +895,12 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
     std::memcpy(base + sizeof(header), sections.data(),
                 sections.size() * sizeof(ignis_seq_section));
     ignis_seq_zero_blob_gaps(base, sections, header.total_bytes);
-    const std::uint64_t recurrent_at = ignis_seq_section_offset(sections, IGNIS_SEQ_SECTION_GDN_RECURRENT);
 
     for (const ignis_seq_section &section : sections) {
       unsigned char *at = base + section.offset;
       switch (section.kind) {
       case IGNIS_SEQ_SECTION_KV_PAGES:
         pack_logical_pages(*pool, *seq, pages, at);
-        break;
-      case IGNIS_SEQ_SECTION_GDN_CONV:
-        // The vendored state pool moves a slot's conv taps and recurrent
-        // matrices in one call into two destinations, so this case writes
-        // both sections and the recurrent case below writes none. They stay
-        // two rows of the table because they are separately sized and
-        // separately classified -- the table describes the state, not the
-        // memcpy that happens to move it.
-        pool->gdn_pool.pack_slot_to_host(seq->slot, at, base + recurrent_at, nullptr);
-        break;
-      case IGNIS_SEQ_SECTION_GDN_RECURRENT:
-        break;
-      case IGNIS_SEQ_SECTION_PENALTY_COUNTS:
-        checked_memcpy_async(at, pool->token_counts_for(seq->slot),
-                             static_cast<std::size_t>(section.bytes), cudaMemcpyDeviceToHost,
-                             "penalty counts");
-        break;
-      case IGNIS_SEQ_SECTION_DFLASH_WINDOW:
-        pool->dflash2_window->copy_lane_to_host(seq->slot, at, nullptr);
-        break;
-      case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
-        pool->dflash2_checkpoint->copy_lane_to_host(seq->slot, at, nullptr);
         break;
       case IGNIS_SEQ_SECTION_PROGRESS: {
         const ignis_seq_progress_image image = ignis_seq_progress_of(*seq);
@@ -912,11 +909,14 @@ extern "C" int32_t ignis_seq_snapshot(const struct ignis_seq_pool *pool,
       }
       default:
         // ADR 0024's "carried by all three or by none": a section added to
-        // the table but not to this switch is a loud failure here rather
+        // the table but not to the slot packer is a loud failure here rather
         // than a silently unsnapshotted piece of a sequence.
-        throw std::logic_error(std::string("state section ") +
-                               ignis_seq_section_name(section.kind) +
-                               " has no snapshot implementation");
+        if (!pack_slot_section_to_host(*pool, seq->slot, section, sections, base)) {
+          throw std::logic_error(std::string("state section ") +
+                                 ignis_seq_section_name(section.kind) +
+                                 " has no snapshot implementation");
+        }
+        break;
       }
     }
 
@@ -1042,16 +1042,14 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
 
 // ---- retained slots (GitHub #211, ADR 0030) ------------------------------
 
-namespace {
-
-// Copy every mutable state section of slot `src` over slot `dst`, device to
-// device, and synchronize.
-//
-// Walks the same CLONE sections a prefix clone does
-// (`ignis_seq_prefix_clone_layout`), so a section added to the table without
-// a case here throws rather than being silently left behind -- ADR 0024's
-// "carried by all or by none".
-void copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
+// Walks the CLONE sections a retained slot carries
+// (`ignis_seq_prefix_clone_layout`), so a section added to the table without a
+// case here throws rather than being silently left behind -- ADR 0024's
+// "carried by all or by none". Since GitHub #215 this is the one
+// device-to-device move of a sequence's mutable state: a prefix publish and a
+// checkpoint capture copy a lane into a retained slot, and a claim copies it
+// back.
+void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
   const auto copy = [](void *to, const void *from, std::size_t bytes, const char *what) {
     const cudaError_t err = cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, nullptr);
     if (err != cudaSuccess) {
@@ -1060,8 +1058,13 @@ void copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
     }
   };
   // One 2D copy per GDN section: a slot's state is the same region of every
-  // layer's tensor, at the pool's own layer pitch on both sides (see
-  // ignis_seq_state_transfer for why one copy rather than one per layer).
+  // layer's tensor, at the pool's own layer pitch on both sides. It matters:
+  // at the 27B geometry the GDN sections are 96 layer-slots, and 96 separate
+  // copies of 3 MiB are launch-bound rather than bandwidth-bound (measured:
+  // 1.51 ms against ~0.25 ms for two 2D copies --
+  // docs/findings/2026-09-12-device-prefix-clone-cost.md). The pitch is read
+  // off the pool's own layer tensors, and a single-layer pool has none to
+  // read, which is why it takes the linear path.
   const auto copy_gdn = [&](bool recurrent, const char *what) {
     const std::uint32_t layers = pool.gdn_pool.layer_count();
     const std::size_t per_layer =
@@ -1127,6 +1130,8 @@ void copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst) {
   }
 }
 
+namespace {
+
 // The checks ignis_seq_retained_store and _load share, naming `fn` in the
 // message. 0 when the call may proceed.
 int32_t retained_refusal(const ignis_seq_pool *pool, const ignis_seq *seq,
@@ -1140,8 +1145,7 @@ int32_t retained_refusal(const ignis_seq_pool *pool, const ignis_seq *seq,
     return -1;
   }
   if (retained_slot >= pool->retained_slot_count) {
-    set_error(std::string(fn) + ": retained slot " + std::to_string(retained_slot) +
-              " is out of range; this pool holds " + std::to_string(pool->retained_slot_count));
+    set_error(std::string(fn) + ": " + ignis_seq_retained_slot_refusal(*pool, retained_slot));
     return -1;
   }
   if (!ignis_seq_at_chunk_boundary(*seq)) {
@@ -1153,11 +1157,6 @@ int32_t retained_refusal(const ignis_seq_pool *pool, const ignis_seq *seq,
   return 0;
 }
 
-// The pool slot index of retained slot `retained_slot`: past every lane.
-std::int32_t retained_pool_slot(const ignis_seq_pool &pool, std::uint32_t retained_slot) {
-  return pool.kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot);
-}
-
 } // namespace
 
 extern "C" int32_t ignis_seq_retained_store(struct ignis_seq_pool *pool,
@@ -1167,8 +1166,15 @@ extern "C" int32_t ignis_seq_retained_store(struct ignis_seq_pool *pool,
   if (const int32_t rc = retained_refusal(pool, seq, retained_slot, fn); rc != 0) {
     return rc;
   }
+  // GitHub #215: a slot a prefix or a checkpoint still holds is not written
+  // over -- a claimant of that object would clone this sequence instead.
+  if (const std::string refusal = ignis_seq_retained_slot_refusal(*pool, retained_slot);
+      !refusal.empty()) {
+    set_error(std::string(fn) + ": " + refusal);
+    return -1;
+  }
   try {
-    copy_slot_state(*pool, seq->slot, retained_pool_slot(*pool, retained_slot));
+    ignis_seq_copy_slot_state(*pool, seq->slot, ignis_seq_retained_pool_slot(*pool, retained_slot));
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string(fn) + ": " + e.what());
@@ -1183,7 +1189,7 @@ extern "C" int32_t ignis_seq_retained_load(struct ignis_seq_pool *pool, uint32_t
     return rc;
   }
   try {
-    copy_slot_state(*pool, retained_pool_slot(*pool, retained_slot), seq->slot);
+    ignis_seq_copy_slot_state(*pool, ignis_seq_retained_pool_slot(*pool, retained_slot), seq->slot);
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string(fn) + ": " + e.what());

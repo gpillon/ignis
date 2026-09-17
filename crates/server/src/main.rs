@@ -224,7 +224,7 @@ async fn main() {
         vram: _,
         host_pool_bytes: _,
         prompt_reuse: _,
-        retained_pool_bytes: _,
+        retained_slots: _,
         retained_interactive_ttl_secs: _,
         instruction_policy,
         speculation: _,

@@ -198,7 +198,8 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
-            retained_slot_count: 0,
+            // GitHub #215: the block's image goes into a retained slot.
+            retained_slot_count: 1,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -214,7 +215,7 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
     prefill_program(&model, &pool, &mut publisher, &first[..publish_at as usize], 0, None)
         .unwrap_or_else(|e| panic!("publisher head prefill: {e}"));
     let prefix = publisher
-        .publish_prefix(publish_at)
+        .publish_prefix(publish_at, 0)
         .unwrap_or_else(|e| panic!("publish: {e}"));
     assert_eq!(prefix.stats().tokens, publish_at, "the prefix covers the block");
     assert_eq!(prefix.stats().pages, publish_at / PAGE);

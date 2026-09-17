@@ -147,7 +147,8 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
             kv_page_group_count: 48,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
-            retained_slot_count: 0,
+            // GitHub #215: the prefix's image goes into a retained slot.
+            retained_slot_count: 1,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -173,7 +174,7 @@ fn a_claimant_decodes_what_a_sibling_that_prefilled_the_prefix_decodes() {
         .unwrap_or_else(|e| panic!("publisher head prefill: {e}"));
     let free_before_publish = pool.stats().kv_free_pages;
     let prefix = publisher
-        .publish_prefix(SHARED_TOKENS)
+        .publish_prefix(SHARED_TOKENS, 0)
         .unwrap_or_else(|e| panic!("publish: {e}"));
     let stats = prefix.stats();
     assert_eq!(stats.tokens, SHARED_TOKENS, "the prefix covers the head");
@@ -334,7 +335,7 @@ fn publishing_is_refused_unless_the_sequence_stands_on_the_prefix() {
             kv_page_group_count: 24,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 2,
-            retained_slot_count: 0,
+            retained_slot_count: 1,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
@@ -352,7 +353,7 @@ fn publishing_is_refused_unless_the_sequence_stands_on_the_prefix() {
     // A fresh sequence stands at 0, and 0 is not a publishable prefix — the
     // refusal names the boundary rather than silently publishing nothing.
     let refusal = publisher
-        .publish_prefix(SHARED_TOKENS)
+        .publish_prefix(SHARED_TOKENS, 0)
         .expect_err("a sequence that has written nothing cannot publish a 128-token head");
     assert!(
         refusal.is_not_at_boundary(),

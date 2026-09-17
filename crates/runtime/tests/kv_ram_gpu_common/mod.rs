@@ -12,9 +12,11 @@ use std::sync::Arc;
 use ignis_artifact::{bind_model_scope_27b, materialize, CudaDevice, DraftModule, FrontendSet, Reader};
 use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::gpu_profile;
+use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::{
-    ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId, RequestInput, SchedEvent,
-    Scheduler, SchedulerConfig, Speculation, TokenId,
+    Compute, ConcreteScheduler, DecodeJob, DecodeParams, KvFormat, N_DECODE_LANES, PrefillJob,
+    RequestClass, RequestId, RequestInput, RetainedAt, SchedEvent, Scheduler, SchedulerConfig,
+    Speculation, TokenId,
 };
 use ignis_runtime::{auto_kv_pool_bytes, CudaLeaf, CudaLeafConfig, Model, RuntimeCompute, KV_PAGE_TOKENS};
 
@@ -89,17 +91,26 @@ impl Loaded {
     /// needing all of it takes every retained page back; `resident_slots`
     /// bounds how many sequences may be on the card at once.
     fn scheduler(&self, resident_slots: u32) -> ConcreteScheduler {
+        self.scheduler_with_retained_slots(resident_slots, N_DECODE_LANES as u32)
+    }
+
+    /// [`Loaded::scheduler`] handing out `retained_slots` of the leaf's
+    /// retained slots (GitHub #215): fewer than the leaf holds is fine, more is
+    /// not.
+    fn scheduler_with_retained_slots(&self, resident_slots: u32, retained_slots: u32) -> ConcreteScheduler {
         let compute = Arc::new(RuntimeCompute::new(Arc::clone(&self.model), self.eos));
         ConcreteScheduler::with_config(
             SchedulerConfig {
                 model: "kv-ram-gpu".into(),
                 kv_page_tokens: KV_PAGE_TOKENS,
                 max_sequence_tokens: MAX_CONTEXT,
-                kv_capacity_pages: MAX_CONTEXT / KV_PAGE_TOKENS,
+                // And the page a claimed checkpoint's opener ends inside,
+                // which its claimant cannot take back (GitHub #215).
+                kv_capacity_pages: MAX_CONTEXT / KV_PAGE_TOKENS + 1,
                 resident_slot_capacity: resident_slots,
                 serving_chunk_tokens: CHUNK,
                 host_capacity_bytes: 16 * GIB,
-                retained_pool_bytes: 4 * GIB,
+                retained_slots,
                 ..SchedulerConfig::default()
             },
             compute,
@@ -114,16 +125,45 @@ impl Loaded {
 
     /// A system block of at least `tokens` tokens.
     fn block_of(&self, tokens: usize) -> Vec<TokenId> {
+        self.block_saying(
+            tokens,
+            "You are a careful coding assistant. You answer in short, precise sentences and you \
+             never invent APIs. When a question is about Rust, you name the crate and the \
+             function you rely on. ",
+        )
+    }
+
+    /// A system block of at least `tokens` tokens repeating `text`: another
+    /// burst's block when `text` differs.
+    fn block_saying(&self, tokens: usize, text: &str) -> Vec<TokenId> {
         let mut block = self.tokens("<|im_start|>system\n");
         while block.len() < tokens {
-            block.extend(self.tokens(
-                "You are a careful coding assistant. You answer in short, precise sentences and \
-                 you never invent APIs. When a question is about Rust, you name the crate and \
-                 the function you rely on. ",
-            ));
+            block.extend(self.tokens(text));
         }
         block.extend(self.tokens("<|im_end|>\n"));
         block
+    }
+
+    /// A short user turn after `block`, closed with the generation opener: its
+    /// opener lands at least a page past the block's last whole page and never
+    /// on a page boundary, so a request publishes the block, chains a link at
+    /// the opener's page and keeps a tail page with its checkpoint. Returns the
+    /// tokens and where the opener ends.
+    fn short_turn(&self, block: &[TokenId], question: &str) -> (Vec<TokenId>, u32) {
+        let page = KV_PAGE_TOKENS as usize;
+        let mut prompt = block.to_vec();
+        prompt.extend(self.tokens(&format!("<|im_start|>user\n{question}")));
+        loop {
+            let opener = prompt.len() + self.tokens("<|im_end|>\n<|im_start|>assistant\n").len();
+            if opener / page > block.len() / page && opener % page != 0 {
+                break;
+            }
+            prompt.extend(self.tokens(" Please."));
+        }
+        prompt.extend(self.tokens("<|im_end|>\n<|im_start|>assistant\n"));
+        let opener = prompt.len() as u32;
+        prompt.extend(self.tokens("<think>\n\n</think>\n\n"));
+        (prompt, opener)
     }
 
     /// A user turn padded past KV-RAM's restore floor, closed with the
@@ -420,4 +460,197 @@ pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
         "the second subagent claimed the block that came back"
     );
     assert_eq!(actual, expected, "a block brought back from KV-RAM must serve exactly");
+}
+
+/// Greedy decode of `request` on `compute` until `count` tokens are committed
+/// or it finishes: what a client would receive, round by round.
+fn decode_alone(compute: &RuntimeCompute<CudaLeaf>, request: RequestId, count: u32) -> Vec<TokenId> {
+    let params = DecodeParams {
+        max_tokens: Some(count),
+        ..DecodeParams::default()
+    };
+    let mut tokens = Vec::new();
+    while (tokens.len() as u32) < count {
+        let outcome = compute
+            .decode_step(&[DecodeJob {
+                request,
+                lane: 0,
+                params,
+                remaining_tokens: count - tokens.len() as u32,
+            }])
+            .unwrap_or_else(|e| panic!("decode {request}: {e:?}"))
+            .remove(0);
+        tokens.extend(outcome.tokens);
+        if outcome.finish.is_some() {
+            break;
+        }
+    }
+    tokens
+}
+
+/// GitHub #215, AC "bit-exact reuse": turn N+1 standing on turn N's
+/// checkpoint — its image in a retained slot, its tail page a page of the
+/// pool, the prefixes under it in slots of their own — generates exactly what
+/// a cold prefill of turn N+1 split at the same boundaries generates.
+///
+/// Driven through the compute adapter with the jobs the scheduler would build,
+/// so both sides are cut at exactly the same points: the block's page floor,
+/// the opener's page floor, the opener.
+#[allow(dead_code)] // not every binary that shares this module runs every leg
+pub fn a_turn_from_a_retained_slot_generates_what_a_split_cold_prefill_generates(loaded: &Loaded) {
+    let compute = RuntimeCompute::new(Arc::clone(&loaded.model), loaded.eos);
+    let page = KV_PAGE_TOKENS;
+    let block = loaded.block();
+    let block_page = block.len() as u32 / page * page;
+    let (turn_n, opener) = loaded.short_turn(&block, "Which crate parses TOML?");
+    let opener_page = opener / page * page;
+    let mut turn_n1 = turn_n[..opener as usize].to_vec();
+    turn_n1.extend(loaded.tokens("The `toml` crate.<|im_end|>\n<|im_start|>user\nAnd YAML?<|im_end|>\n"));
+    turn_n1.extend(loaded.tokens("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    let job = |request, tokens: &[TokenId], from: u32, to: u32| PrefillJob {
+        request,
+        tokens: tokens[from as usize..to as usize].to_vec(),
+        context_tokens: MAX_CONTEXT,
+        start_position: from,
+        params: DecodeParams {
+            max_tokens: Some(GENERATED),
+            ..DecodeParams::default()
+        },
+        shared_prefix: None,
+        publish_prefix: None,
+        checkpoint: None,
+        capture_checkpoint: None,
+        multimodal: None,
+    };
+
+    // Turn N: publish the block and the chained link, capture at the opener,
+    // each image in the retained slot the scheduler would name.
+    let turn_n_len = turn_n.len() as u32;
+    for (from, to, publish, capture) in [
+        (0, block_page, Some(RetainedAt { tokens: block_page, slot: 0 }), None),
+        (block_page, opener_page, Some(RetainedAt { tokens: opener_page, slot: 1 }), None),
+        (opener_page, opener, None, Some(RetainedAt { tokens: opener, slot: 2 })),
+        (opener, turn_n_len, None, None),
+    ] {
+        let outcome = compute
+            .prefill_step(&[PrefillJob {
+                publish_prefix: publish,
+                capture_checkpoint: capture,
+                ..job(1, &turn_n, from, to)
+            }])
+            .unwrap_or_else(|e| panic!("turn N prefill {from}..{to}: {e:?}"));
+        assert_eq!(outcome[0].checkpoint_captured, capture.is_some(), "turn N capture at {to}");
+    }
+    compute.release(1);
+
+    // Turn N+1 from the checkpoint.
+    let turn_n1_len = turn_n1.len() as u32;
+    compute
+        .prefill_step(&[PrefillJob {
+            checkpoint: Some(CheckpointClaim {
+                publisher: 1,
+                tokens: opener,
+                source: ReuseSource::Device,
+            }),
+            ..job(2, &turn_n1, opener, turn_n1_len)
+        }])
+        .unwrap_or_else(|e| panic!("turn N+1 from the checkpoint: {e:?}"));
+    let reused = decode_alone(&compute, 2, GENERATED);
+    compute.release(2);
+
+    // The control: turn N+1 cold, cut where turn N and the claim cut it.
+    for (from, to) in [
+        (0, block_page),
+        (block_page, opener_page),
+        (opener_page, opener),
+        (opener, turn_n1_len),
+    ] {
+        compute
+            .prefill_step(&[job(3, &turn_n1, from, to)])
+            .unwrap_or_else(|e| panic!("cold split prefill {from}..{to}: {e:?}"));
+    }
+    let cold = decode_alone(&compute, 3, GENERATED);
+    compute.release(3);
+
+    assert!(cold.len() > 1, "the control generated past its first token: {cold:?}");
+    assert_eq!(
+        reused, cold,
+        "a turn standing on retained slots must generate what the split cold prefill generates"
+    );
+    compute.release_checkpoint(1);
+    compute.release_prefix(1, opener_page);
+    compute.release_prefix(1, block_page);
+}
+
+/// GitHub #215, AC "spill": a conversation whose checkpoint loses its retained
+/// slot to another request — not its pages — is spilled to KV-RAM, and its
+/// next turn restored from there generates exactly what it generates from the
+/// device checkpoint that was never given up.
+#[allow(dead_code)] // not every binary that shares this module runs every leg
+pub fn a_checkpoint_given_up_for_a_slot_resumes_from_kv_ram_exactly(loaded: &Loaded) {
+    let block = loaded.block();
+    let block_tokens = block.len() as u32;
+    let (turn_n, opener) = loaded.long_turn(&block);
+    let mut turn_n1 = turn_n[..opener as usize].to_vec();
+    turn_n1.extend(loaded.tokens("Sure.<|im_end|>\n<|im_start|>user\nNow in one line.<|im_end|>\n"));
+    turn_n1.extend(loaded.tokens("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    // Another burst's short turn: few pages, so it needs no page turn N holds —
+    // only retained slots.
+    let other_block = loaded.block_saying(
+        3 * KV_PAGE_TOKENS as usize,
+        "You are a terse shell assistant. You answer with one command and nothing else. ",
+    );
+    let other_block_tokens = other_block.len() as u32;
+    let (other, other_opener) = loaded.short_turn(&other_block, "List hidden files.");
+
+    // The control: plenty of slots, turn N+1 from the device.
+    let mut sched = loaded.scheduler(8);
+    sched
+        .submit(loaded.request(turn_n.clone(), Some(opener), block_tokens, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    let control = sched
+        .submit(loaded.request(turn_n1.clone(), None, block_tokens, GENERATED), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuse(&events, control), Some((ReuseSource::Device, opener)));
+    let expected = generated(&events, control);
+    assert!(expected.len() > 1, "the control generated past its first token: {expected:?}");
+    drop(sched);
+
+    // Three slots: exactly turn N's block, link and checkpoint.
+    let mut sched = loaded.scheduler_with_retained_slots(8, 3);
+    sched
+        .submit(loaded.request(turn_n, Some(opener), block_tokens, 4), RequestClass::Interactive)
+        .unwrap();
+    run_to_idle(&mut sched);
+    assert_eq!(sched.retained_slots_in_use(), 3, "block, link and checkpoint");
+    let other = sched
+        .submit(loaded.request(other, Some(other_opener), other_block_tokens, 4), RequestClass::Agent)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert!(
+        !events.iter().any(|e| matches!(e, SchedEvent::RetainedSlotSkipped { request, .. } if *request == other)),
+        "the other burst found its slots by giving retained state up: {events:?}"
+    );
+    assert!(
+        sched
+            .checkpoint_pool()
+            .entries()
+            .iter()
+            .any(|e| e.tier == ReuseSource::KvRam && e.tokens == opener),
+        "turn N's checkpoint gave its slot up to KV-RAM: {:?}",
+        sched.checkpoint_pool().entries()
+    );
+
+    let restored = sched
+        .submit(loaded.request(turn_n1, None, block_tokens, GENERATED), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    assert_eq!(reuse(&events, restored), Some((ReuseSource::KvRam, opener)));
+    assert_eq!(
+        generated(&events, restored),
+        expected,
+        "a checkpoint spilled for a slot must restore exactly"
+    );
 }

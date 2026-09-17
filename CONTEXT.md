@@ -36,8 +36,9 @@ When output names a domain concept, use the term as defined here.
   operator names it) or derived (the memory free at start minus the **VRAM
   headroom**). Every device reservation is carved from it at load, and serving
   allocates nothing on the device beyond it. A budget that cannot hold the
-  minimum — weights, workspaces, every lane, and one sequence at the maximum
-  context — refuses the start.
+  minimum — weights, workspaces, every lane, every **retained slot**, and one
+  sequence at the maximum context with a KV page per retained slot beside
+  it — refuses the start.
 - **VRAM headroom** — the device memory a derived **VRAM budget** leaves to
   everything else on the card: the desktop and other processes.
 - **VRAM oversubscription** — holding more device memory than the card has
@@ -218,7 +219,8 @@ When output names a domain concept, use the term as defined here.
   taking over the reference it was holding rather than adding one, so every
   page is still charged to the pool exactly once and a claimant of the chain
   shares all of it. This is what lets every iteration of a tool loop leave a
-  **prompt checkpoint** instead of only the first.
+  **prompt checkpoint** instead of only the first — for as long as
+  **retained slots** can hold the chain, since every link takes one.
 - **Retained state** — prompt checkpoints and retained prefixes: state no live
   request needs. It never costs a live request anything — on the device it is
   always the first thing to go — and in KV-RAM it is discarded before any

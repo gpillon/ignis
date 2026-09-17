@@ -5,9 +5,11 @@
 // those same physical pages -- one charge to the pool, however many
 // claimants, and the pages come back when the last holder releases. The
 // **mutable sections are cloned device-to-device** -- the GDN recurrent
-// state, the conv taps, the penalty-count row -- from a device-resident image
-// the publish captured at the prefix's end. Nothing here crosses PCIe, which
-// is the difference between this and restoring a sibling's snapshot.
+// state, the conv taps, the penalty-count row -- from an image the publish
+// captured at the prefix's end into a retained slot of the pool (GitHub #215,
+// ADR 0030). Nothing here crosses PCIe, which is the difference between this
+// and restoring a sibling's snapshot, and nothing here allocates device
+// memory: the slot was reserved at load, and the caller names it.
 //
 // What each half is made of is not decided here: it comes from the leaf's one
 // state-section table (ignis_seq_sections.h), read through
@@ -26,6 +28,9 @@
 //     shared page -- the invariant the whole mechanism rests on.
 //   * a sequence claims at most one prefix, and a publisher cannot publish a
 //     head it does not own.
+//   * a publish never writes over a retained slot another prefix or
+//     checkpoint still holds, and a claim never reads one whose handle is
+//     gone (GitHub #215).
 
 #include "ignis_seq.h"
 #include "ignis_seq_checkpoint_internal.h"
@@ -86,10 +91,9 @@ void publish_shared_row(ignis_seq_pool &pool, const ignis_seq &seq) {
 // device work already complete. The synchronize is inside the measurement on
 // purpose: what a caller pays for a clone is the point at which the claimant
 // can be stepped, not the point at which the copies were enqueued.
-double timed_transfer(ignis_seq_pool &pool, ignis_seq_prefix &prefix, ignis_seq &seq,
-                      ignis_seq_prefix_direction direction) {
+template <typename Work> double timed(Work &&work) {
   const auto started = std::chrono::steady_clock::now();
-  ignis_seq_prefix_transfer(pool, prefix, seq, direction);
+  work();
   const cudaError_t err = cudaStreamSynchronize(nullptr);
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("cudaStreamSynchronize after a prefix transfer failed: ") +
@@ -118,7 +122,8 @@ void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
     // `kv`, so `~PagedKVAllocation` returns the shared pages and the
     // entitlement without being told where -- which is why a prefix's pages
     // are charged to the pool once and released once, whatever the claimant
-    // count did in between.
+    // count did in between. Its retained slot went back earlier, with its
+    // handle (ignis_seq_prefix_release).
     ignis_seq_prefix *parent = prefix->parent;
     delete prefix;
     prefix = parent;
@@ -126,7 +131,7 @@ void ignis_seq_prefix_drop_reference(ignis_seq_prefix *prefix) {
 }
 
 extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct ignis_seq *seq,
-                                             uint32_t prefix_tokens,
+                                             uint32_t prefix_tokens, uint32_t retained_slot,
                                              struct ignis_seq_prefix **out_prefix) {
   if (out_prefix != nullptr) {
     *out_prefix = nullptr;
@@ -197,17 +202,20 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
         std::to_string(seq->slot) + " is the prefix, leaving it no page of its own to write");
     return -1;
   }
+  if (const std::string refusal = ignis_seq_retained_slot_refusal(*pool, retained_slot);
+      !refusal.empty()) {
+    ignis_seq_set_last_error("ignis_seq_prefix_publish: " + refusal);
+    return -1;
+  }
 
   try {
-    // Fallible work first, while nothing the pool owns has moved: the image
-    // allocation and the capture. A failure here leaves the sequence and the
-    // pool exactly as they were.
-    auto entry                = std::make_unique<ignis_seq_prefix>();
-    const std::uint64_t bytes = ignis_seq_prefix_clone_bytes(ignis_seq_prefix_clone_layout(*pool));
-    entry->clone_image =
-        ignis_counted_device_buffer(IGNIS_ALLOC_PREFIX_IMAGE, static_cast<std::size_t>(bytes));
-    entry->tokens             = prefix_tokens;
-    timed_transfer(*pool, *entry, *seq, IGNIS_SEQ_PREFIX_CAPTURE);
+    // Fallible work first, while nothing the pool owns has moved: the
+    // capture into the retained slot. A failure here leaves the sequence and
+    // the pool exactly as they were, and the slot still free.
+    auto entry           = std::make_unique<ignis_seq_prefix>();
+    entry->tokens        = prefix_tokens;
+    entry->image_bytes   = pool->slot_state_bytes;
+    timed([&] { ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress); });
 
     // From here the steps are balanced against each other and cannot fail:
     // the tail entitlement handed back below is exactly the one re-reserved,
@@ -235,6 +243,8 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     seq->shared_pages = pages;
     publish_shared_row(*pool, *seq);
 
+    entry->retained_slot                 = static_cast<std::int32_t>(retained_slot);
+    pool->retained_held[retained_slot]   = true;
     // Two holders from the start: the handle this call returns, and the
     // publishing sequence, which is now a claimant of its own prefix.
     entry->refcount = 2;
@@ -265,6 +275,14 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
   }
   if (!prefix->kv.valid() || !prefix->kv.belongs_to(pool->kv_pool)) {
     ignis_seq_set_last_error(std::string(who) + ": the prefix was not published from this pool");
+    return -1;
+  }
+  if (clone_prefix_state && prefix->retained_slot < 0) {
+    // GitHub #215: the image went back with the publish handle, and its slot
+    // may hold something else by now.
+    ignis_seq_set_last_error(std::string(who) +
+                             ": the prefix's image was released with its handle; nothing can "
+                             "be cloned from it");
     return -1;
   }
   if (context_tokens == 0) {
@@ -311,16 +329,19 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
     seq->shared_pages = shared;
     publish_shared_row(*pool, *seq);
 
-    // The GDN slot, the conv taps and the penalty counts, device to device.
-    // No zeroing first and no cudaMemset of the count row either: the clone
-    // writes every byte of each, and a fresh zero would only be overwritten.
+    // The GDN slot, the conv taps and the penalty counts, device to device
+    // from the prefix's retained slot. No zeroing first and no cudaMemset of
+    // the count row either: the clone writes every byte of each, and a fresh
+    // zero would only be overwritten.
     //
     // GitHub #186: a prompt checkpoint's claimant skips this. Its own image
     // stands further along -- at the generation opener rather than at this
     // prefix's page boundary -- and is written over the slot the moment this
     // returns, so cloning the prefix's first would be bytes nothing reads.
     if (clone_prefix_state) {
-      prefix->last_clone_micros = timed_transfer(*pool, *prefix, *seq, IGNIS_SEQ_PREFIX_CLONE);
+      const auto retained = static_cast<std::uint32_t>(prefix->retained_slot);
+      prefix->last_clone_micros =
+          timed([&] { ignis_seq_clone_state(*pool, retained, prefix->progress, *seq); });
       ++prefix->clone_count;
     }
 
@@ -350,6 +371,13 @@ extern "C" void ignis_seq_prefix_release(struct ignis_seq_pool *pool,
     ignis_seq_set_last_error("ignis_seq_prefix_release: the prefix was not published from this "
                              "pool; nothing was released");
     return;
+  }
+  // GitHub #215: the handle is the only way to claim the prefix or read its
+  // image, so the image's retained slot comes back with it -- whatever
+  // sequences are still standing on the pages, which live on without it.
+  if (pool != nullptr && prefix != nullptr && prefix->retained_slot >= 0) {
+    pool->retained_held[static_cast<std::size_t>(prefix->retained_slot)] = false;
+    prefix->retained_slot                                                   = -1;
   }
   ignis_seq_prefix_drop_reference(prefix);
 }
@@ -389,8 +417,14 @@ extern "C" int32_t ignis_seq_prefix_snapshot(const struct ignis_seq_pool *pool,
     ignis_seq_set_last_error("ignis_seq_prefix_snapshot: the prefix was not published from this pool");
     return -1;
   }
+  if (prefix->retained_slot < 0) {
+    ignis_seq_set_last_error(
+        "ignis_seq_prefix_snapshot: the prefix's image was released with its handle");
+    return -1;
+  }
   try {
-    ignis_seq_write_materialized_blob(*pool, prefix, nullptr, prefix->clone_image.p,
+    ignis_seq_write_materialized_blob(*pool, prefix, -1,
+                                      static_cast<std::uint32_t>(prefix->retained_slot),
                                       prefix->progress, ignis_seq_prefix_total_pages(*prefix), dst,
                                       dst_bytes);
     return 0;
@@ -411,7 +445,7 @@ extern "C" int32_t ignis_seq_prefix_stats(const struct ignis_seq_prefix *prefix,
   // `tokens` is what the head as a whole covers.
   out_stats->pages             = prefix->kv.mapped_page_count();
   out_stats->refcount          = prefix->refcount;
-  out_stats->clone_image_bytes = prefix->clone_image.bytes;
+  out_stats->clone_image_bytes = prefix->retained_slot >= 0 ? prefix->image_bytes : 0;
   out_stats->clone_count       = prefix->clone_count;
   out_stats->last_clone_micros = prefix->last_clone_micros;
   return 0;

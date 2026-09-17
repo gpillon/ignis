@@ -60,9 +60,11 @@ pub struct CudaLeafConfig {
     pub kv_pool_bytes: u64,
     /// Max concurrent sequences (mirrors [`N_DECODE_LANES`]).
     pub slot_count: u32,
-    /// Retained slots the sequence pool holds past the lanes (GitHub #211):
-    /// a lane's mutable state each, reserved at load. An internal load option
-    /// until #215 puts retained state in them; 0 reserves none.
+    /// Retained slots the sequence pool holds past the lanes (GitHub #211,
+    /// #215): a lane's mutable state each, reserved at load, where every
+    /// published prefix's and captured checkpoint's image lives. The server's
+    /// `--retained-slots`; 0 reserves none, and then nothing can be published
+    /// or captured.
     pub retained_slots: u32,
     /// The prefill chunk width, in tokens: how wide a span the program's
     /// prefill scratch must serve (`--prefill-chunk`, GitHub #87). A
@@ -109,7 +111,8 @@ impl Default for CudaLeafConfig {
                 crate::DEFAULT_MAX_CONTEXT,
             ),
             slot_count: N_DECODE_LANES as u32,
-            retained_slots: 0,
+            // `--retained-slots`' own default: a slot per lane.
+            retained_slots: N_DECODE_LANES as u32,
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
             speculation: None,
             vision: None,
@@ -199,23 +202,22 @@ impl CudaLeafConfig {
     /// `prefill_chunk_tokens` and `vision` —
     /// decide how much work fits and how fast it goes, never what the bytes
     /// of a sequence mean, so state produced under one value must still be
-    /// usable under another. `kv_pool_bytes` is the sharpest of them: the
-    /// retained pool's own budget beside it is derived from the VRAM left
-    /// after load, a number that differs from one start of the same server to
-    /// the next, and an identity that moved with any of this would refuse
-    /// every blob after a reboot for no reason at all.
+    /// usable under another. `kv_pool_bytes` is the sharpest of them: it is
+    /// the rest of a VRAM budget derived from the memory free at start, a
+    /// number that differs from one start of the same server to the next, and
+    /// an identity that moved with any of this would refuse every blob after
+    /// a reboot for no reason at all.
     ///
     /// The operator's other flags — the bind address, the API key, the
-    /// request timeout, `--prompt-reuse`, `--retained-pool-bytes` — are not
-    /// fields here at all: `ignis_server::runtime::cuda_scheduler` builds
+    /// request timeout, `--prompt-reuse` — are not fields here at all: `ignis_server::runtime::cuda_scheduler` builds
     /// this struct out of an `EngineShape`, which never carried them.
     pub fn blob_identity(&self, artifact: ArtifactHash, layout_version: u32) -> BlobIdentity {
         BlobIdentity::of_load(artifact, self.kv_format, self.speculation, layout_version)
     }
 
     /// Every reservation a load with these options makes beside the weights
-    /// and the KV pool, and what one checkpoint of its pool costs, asked of
-    /// the leaf before anything is on the device (GitHub #210). `plan` and
+    /// and the KV pool, asked of the leaf before anything is on the device
+    /// (GitHub #210). `plan` and
     /// `handles` are the binder's, not yet materialized.
     pub fn plan_reservations(
         &self,
@@ -236,7 +238,6 @@ impl CudaLeafConfig {
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
             reserved: reserved_bytes(model, pool.lane_state_bytes, pool.retained_state_bytes, 0),
-            checkpoint_image_bytes: pool.checkpoint_image_bytes,
         })
     }
 
@@ -292,8 +293,6 @@ fn reserved_bytes(
 pub struct PlannedReservations {
     /// Every line but the KV pool's, which the VRAM plan sizes from the rest.
     pub reserved: ReservedBytes,
-    /// What one checkpoint capture of this load's pool allocates.
-    pub checkpoint_image_bytes: u64,
 }
 
 /// The leaf's model handle: the loaded weights plus the sequence-state
@@ -515,8 +514,7 @@ impl StepLeaf for CudaLeaf {
             // GitHub #186: what the device says is free right now. Read
             // rather than derived — the module doc above records what a
             // `total - weights` guess cost the last time one was made — and
-            // 0 when the query fails, which sizes the retained pool at
-            // nothing rather than at a number nobody measured.
+            // 0 when the query fails rather than a number nobody measured.
             free_vram_bytes: self.device.free_bytes().unwrap_or(0),
             // GitHub #210: read off the model's and the pool's own buffers,
             // for the load to check against its VRAM plan.
@@ -569,20 +567,14 @@ impl StepLeaf for CudaLeaf {
         _model: &Self::Model,
         sequence: &mut Self::Sequence,
         prefix_tokens: u32,
+        retained_slot: u32,
     ) -> Result<Self::Prefix, i32> {
         // A prefix borrows the pool, not the sequence — so publishing from a
         // `Seq<'static>` yields a `SeqPrefix<'static>` with no detaching
         // needed, and the publisher stays usable for its own tail.
         sequence
-            .publish_prefix(prefix_tokens)
+            .publish_prefix(prefix_tokens, retained_slot)
             .map_err(|e| leaf_error("prefix publish", e.to_string()))
-    }
-
-    /// GitHub #186: the leaf answers what a checkpoint of *this* pool costs
-    /// rather than the scheduler guessing from the geometry — the sections
-    /// are the pool's, and a drafter or a KV format changes them.
-    fn checkpoint_image_bytes(&self, model: &Self::Model) -> u64 {
-        model.pool.checkpoint_image_bytes().unwrap_or(0)
     }
 
     fn capture_checkpoint(
@@ -590,13 +582,14 @@ impl StepLeaf for CudaLeaf {
         _model: &Self::Model,
         sequence: &mut Self::Sequence,
         opener_tokens: u32,
+        retained_slot: u32,
     ) -> Result<Self::Checkpoint, i32> {
         // A checkpoint borrows the pool, not the sequence — capturing from a
         // `Seq<'static>` yields a `SeqCheckpoint<'static>` with no detaching
         // needed, exactly as `publish_prefix` above does, and the capturing
         // sequence stays usable for the rest of its prompt and its decode.
         sequence
-            .capture_checkpoint(opener_tokens)
+            .capture_checkpoint(opener_tokens, retained_slot)
             .map_err(|e| leaf_error("checkpoint capture", e.to_string()))
     }
 
@@ -618,8 +611,9 @@ impl StepLeaf for CudaLeaf {
     }
 
     fn release_checkpoint(&self, _model: &Self::Model, _checkpoint: Self::Checkpoint) {
-        // `SeqCheckpoint`'s own `Drop` frees the images and lets go of the
-        // prefix under it (`ignis_seq_checkpoint_release`).
+        // `SeqCheckpoint`'s own `Drop` gives back its retained slot and its
+        // tail page and lets go of the prefix under it
+        // (`ignis_seq_checkpoint_release`).
     }
 
     fn checkpoint_snapshot_bytes(

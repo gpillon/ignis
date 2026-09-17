@@ -1,8 +1,7 @@
 //! GPU coverage for the load's VRAM plan (GitHub #210, ADR 0030): what the
 //! leaf says a load will reserve, asked before the weights are on the device,
 //! is to the byte what the loaded model and pool then hold -- every workspace,
-//! every lane's state, the retained slots, the KV arena, and what one
-//! checkpoint capture costs.
+//! every lane's state, the retained slots and the KV arena.
 //!
 //! Run at the Makefile's serving shape (262K hq-e8-2b, DFlash2 with a
 //! 7-token window, vision), where every line is nonzero. Its own test binary:
@@ -13,12 +12,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ignis_artifact::{CudaDevice, FrontendSet, Reader, bind_model_scope_27b_with, materialize};
+use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
 use ignis_core::gpu_profile;
-use ignis_core::{
-    Compute, KvFormat, KvGeometry, Speculation, SpeculativeBackend, Vision, model_load,
-};
-use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes, RuntimeCompute};
+use ignis_core::{KvFormat, KvGeometry, Speculation, SpeculativeBackend, Vision, model_load};
+use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, ReservedBytes};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 262_144;
@@ -31,10 +28,6 @@ fn the_planned_reservations_are_what_the_load_holds() {
         return;
     }
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
-    let eos = FrontendSet::from_reader(&reader)
-        .unwrap_or_else(|e| panic!("frontend: {e}"))
-        .eos_token_id()
-        .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
     let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
     let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
     let scope = model_load::model_scope(Some(speculation), Some(vision));
@@ -107,12 +100,5 @@ fn the_planned_reservations_are_what_the_load_holds() {
             ..planned.reserved
         },
         "the load holds what its plan laid out"
-    );
-
-    let compute = RuntimeCompute::new(model, eos);
-    assert_eq!(
-        compute.checkpoint_image_bytes(),
-        planned.checkpoint_image_bytes,
-        "one checkpoint capture costs what the pool plan said"
     );
 }

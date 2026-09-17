@@ -441,8 +441,8 @@ its prefix and media caches, and ignis reports no cached tokens for the void
 rule to catch it. Restart the engine instead.
 
 **Watch the card's headroom.** Both ignis loads at 262,144 context with
-DFlash2 take ~29.8 GiB of their own (the retained pool is derived from what is
-free after load), so the desktop's own VRAM decides whether the card
+DFlash2 took ~29.8 GiB of their own when measured, before #215 (retained
+state was then sized from what was free after load), so the desktop's own VRAM decides whether the card
 oversubscribes; when it does, every cell comes back slower and erratic rather
 than failing. The script samples `nvidia-smi` beside every launch — distrust
 one whose peak reaches the total

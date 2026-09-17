@@ -47,13 +47,15 @@ fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
 
 /// A device pool of exactly one full sequence (80 pages = 1280 tokens), so a
 /// request needing all of it takes the retained pages back — and `host`
-/// KV-RAM entries below it.
+/// KV-RAM entries below it. Plus one page: the one a checkpoint's opener ends
+/// inside, which a request claiming that checkpoint cannot take back from it
+/// (GitHub #215; a real load's plan reserves one per retained slot).
 fn tight(host: u64) -> SchedulerConfig {
     SchedulerConfig {
         model: MODEL.into(),
         max_in_flight: 16,
         max_sequence_tokens: 1280,
-        kv_capacity_pages: 80,
+        kv_capacity_pages: 80 + 1,
         kv_page_tokens: PAGE,
         host_capacity_bytes: host,
         ..SchedulerConfig::default()
@@ -240,7 +242,7 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
     assert_eq!(reuses(&events, n2), vec![(ReuseSource::Device, 1240)]);
     assert_eq!(
         sched.kv_used_pages(),
-        sched.prefix_pinned_pages(),
+        sched.prefix_pinned_pages() + sched.retained_tail_pages(),
         "nothing is charged but the pages the retained chain still holds"
     );
 }
@@ -280,9 +282,13 @@ fn a_kv_ram_claimant_with_no_opener_to_capture_at_pays_no_chunk_split() {
 #[test]
 fn nothing_crosses_to_kv_ram_while_the_device_has_room() {
     let compute = Arc::new(MockCompute::new());
+    // Room means retained slots too (GitHub #215): a conversation of two turns
+    // holds four — two links of its chain and its two checkpoints — so three
+    // of them need twelve.
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
+            retained_slots: 12,
             ..SchedulerConfig::default()
         },
         compute.clone(),
@@ -624,7 +630,7 @@ fn a_burst_block_the_device_gave_up_comes_back_once_and_the_burst_shares_it() {
     assert_eq!(prefix_reuses(&events, fourth), vec![(BIG_BLOCK, true)]);
     assert_eq!(
         sched.kv_used_pages(),
-        sched.prefix_pinned_pages(),
+        sched.prefix_pinned_pages() + sched.retained_tail_pages(),
         "nothing is charged but the block on the device"
     );
 }

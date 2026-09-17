@@ -86,7 +86,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
     compute
         .prefill_step(&[PrefillJob {
             checkpoint: None,
-            capture_checkpoint_tokens: None,
+            capture_checkpoint: None,
             multimodal: None,
             request,
             tokens: prompt,
@@ -94,7 +94,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             start_position: 0,
             params,
             shared_prefix: None,
-            publish_prefix_tokens: None,
+            publish_prefix: None,
         }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

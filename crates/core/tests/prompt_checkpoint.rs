@@ -269,7 +269,7 @@ fn the_prefill_is_cut_at_the_publish_point_and_again_at_the_opener() {
         .iter()
         .flatten()
         .filter(|j| j.request == n)
-        .map(|j| j.capture_checkpoint_tokens)
+        .map(|j| j.capture_checkpoint.map(|c| c.tokens))
         .collect();
     assert_eq!(
         capture,
@@ -302,7 +302,7 @@ fn a_page_aligned_opener_is_captured_on_the_publish_chunk() {
         .iter()
         .flatten()
         .filter(|j| j.request == n)
-        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .map(|j| (j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens)))
         .collect();
     assert_eq!(
         jobs,
@@ -354,7 +354,7 @@ fn the_chunk_that_captures_is_always_greedy() {
         .filter(|j| j.request == n)
         .map(|j| {
             (
-                j.capture_checkpoint_tokens,
+                j.capture_checkpoint.map(|c| c.tokens),
                 j.params.temperature,
                 j.params.presence_penalty,
             )
@@ -456,7 +456,7 @@ fn a_checkpoint_claimant_publishes_a_chained_head_and_captures_its_own() {
         .iter()
         .flatten()
         .filter(|j| j.request == n1)
-        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .map(|j| (j.tokens.len(), j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens)))
         .collect();
     assert_eq!(
         jobs,
@@ -474,8 +474,14 @@ fn a_checkpoint_claimant_publishes_a_chained_head_and_captures_its_own() {
         "the turn opener, and turn N+1's own checkpoint beside it"
     );
     // The chained entry is charged only for the page it warmed: the two under
-    // it are still turn N's prefix, counted once for every holder.
-    assert_eq!(sched.kv_used_pages(), 3, "three pages, not five");
+    // it are still turn N's prefix, counted once for every holder. Beside them
+    // each checkpoint holds the page its opener ends inside (GitHub #215).
+    assert_eq!(sched.retained_tail_pages(), 2, "one tail page per checkpoint");
+    assert_eq!(
+        sched.kv_used_pages() - sched.retained_tail_pages(),
+        3,
+        "three pages of history, not five"
+    );
 }
 
 #[test]
@@ -513,9 +519,11 @@ fn the_cached_prefix_covers_exactly_the_head_the_backend_published() {
     );
     assert_eq!(
         sched.kv_used_pages(),
-        1,
-        "and the pool is charged for exactly that page once every live request is gone"
+        1 + sched.retained_tail_pages(),
+        "and the pool is charged for exactly that page once every live request is gone — and \
+         for the page the checkpoint's opener ends inside (GitHub #215)"
     );
+    assert_eq!(sched.retained_tail_pages(), 1);
 
     // A later request sharing the whole 40-token head resumes at the
     // checkpoint's 30-token opener, which reaches further than the 16-token
@@ -710,7 +718,7 @@ fn a_sibling_prefix_claimant_chains_past_it_and_captures_its_own() {
         .iter()
         .flatten()
         .filter(|j| j.request == b)
-        .map(|j| (j.tokens.len(), j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .map(|j| (j.tokens.len(), j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens)))
         .collect();
     assert_eq!(
         jobs,
@@ -757,7 +765,7 @@ fn an_opener_inside_the_shared_page_captures_without_a_chained_publish() {
         .iter()
         .flatten()
         .filter(|j| j.request == short)
-        .map(|j| (j.publish_prefix_tokens, j.capture_checkpoint_tokens))
+        .map(|j| (j.publish_prefix.map(|p| p.tokens), j.capture_checkpoint.map(|c| c.tokens)))
         .collect();
     assert_eq!(
         jobs,
@@ -802,71 +810,11 @@ fn a_prompt_that_ends_at_the_checkpoint_prefills_nothing_at_all() {
     );
 }
 
-// ── The byte budget ─────────────────────────────────────────────────────
-
-#[test]
-fn a_full_pool_skips_the_capture_and_evicts_nothing() {
-    // `MockCompute` prices a checkpoint image at one nominal byte, so a
-    // one-byte budget holds exactly one.
-    let compute = Arc::new(MockCompute::new());
-    let mut sched = scheduler(
-        compute.clone(),
-        SchedulerConfig {
-            retained_pool_bytes: 1,
-            ..config()
-        },
-    );
-    let first = sched.submit(turn_n(), RequestClass::Interactive).unwrap();
-    run_to_idle(&mut sched);
-    assert_eq!(sched.checkpoint_pool().entry_count(), 1);
-    assert_eq!(sched.checkpoint_pool().used_bytes(), 1);
-
-    // A second, unrelated conversation reaches its own opener with the pool
-    // already full.
-    let second = sched
-        .submit(
-            input([tokens(900, 37), tokens(950, 3)].concat(), Some(37), 4),
-            RequestClass::Interactive,
-        )
-        .unwrap();
-    run_to_idle(&mut sched);
-
-    assert_eq!(
-        sched.checkpoint_pool().entry_count(),
-        1,
-        "the capture was skipped, not made room for"
-    );
-    assert_eq!(
-        sched.checkpoint_pool().counters().discards,
-        0,
-        "nothing was evicted to take a checkpoint"
-    );
-    assert!(
-        compute.released_checkpoints().is_empty(),
-        "and no retained image was released"
-    );
-    assert!(
-        compute
-            .prefill_calls()
-            .iter()
-            .flatten()
-            .filter(|j| j.request == second)
-            .all(|j| j.capture_checkpoint_tokens.is_none()),
-        "a capture the budget cannot hold is never even asked for"
-    );
-    assert_eq!(
-        chunk_widths(&compute, second),
-        vec![32, 8],
-        "so its prefill is not cut at its opener either — a full pool is free"
-    );
-    // The entry that is there is still the first conversation's.
-    let later = sched
-        .submit(turn_n_plus_1(), RequestClass::Interactive)
-        .unwrap();
-    let events = run_to_idle(&mut sched);
-    assert_eq!(reuses(&events, later), vec![(ReuseSource::Device, 37, 1)]);
-    let _ = first;
-}
+// ── What bounds retention ───────────────────────────────────────────────
+//
+// The byte budget these tests used to pin is gone (GitHub #215): a checkpoint
+// takes one of the load's retained slots, and what a full set of slots gives
+// up or skips is pinned in `retained_slots.rs`.
 
 #[test]
 fn a_backend_that_declines_the_capture_retains_nothing() {
@@ -903,8 +851,8 @@ fn prompt_reuse_off_captures_and_reuses_nothing() {
     assert_eq!(sched.checkpoint_pool().entry_count(), 0, "nothing retained");
     assert_eq!(
         chunk_widths(&compute, n),
-        vec![32, 8],
-        "and the prefill is not cut at the opener: off costs nothing"
+        vec![40],
+        "and the prefill is not cut at all: off costs nothing (GitHub #215: no slot, no head)"
     );
 
     let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
@@ -982,9 +930,22 @@ fn tight_pool(prompt_reuse: bool) -> SchedulerConfig {
 
 /// Run turn N to completion, then the `hungry` request that needs the whole
 /// KV pool, and report every event the second one's admission produced.
-fn retained_then_hungry(prompt_reuse: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
+///
+/// `retain` false is the control: prompt reuse on, but a single retained slot
+/// (GitHub #215), which turn N's prefix takes while it runs and gives back
+/// when it ends, so nothing is left retained — and the hungry request still
+/// publishes its head, so its chunks are the same in both runs.
+fn retained_then_hungry(retain: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
     let compute = Arc::new(MockCompute::new());
-    let mut sched = scheduler(compute.clone(), tight_pool(prompt_reuse));
+    let config = if retain {
+        tight_pool(true)
+    } else {
+        SchedulerConfig {
+            retained_slots: 1,
+            ..tight_pool(true)
+        }
+    };
+    let mut sched = scheduler(compute.clone(), config);
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
     let retained = sched.checkpoint_pool().retained_pages();
@@ -1196,8 +1157,9 @@ fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
     run_to_idle(&mut sched);
     assert_eq!(
         sched.kv_used_pages(),
-        sched.checkpoint_pool().retained_pages(),
-        "once every live request is gone, the pool holds exactly the retained pages"
+        sched.checkpoint_pool().retained_pages() + 1,
+        "once every live request is gone, the pool holds exactly the retained pages, and the \
+         page the opener ends inside (GitHub #215)"
     );
     assert!(sched.kv_used_pages() > 0);
 
@@ -1209,7 +1171,7 @@ fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
     let events = run_to_idle(&mut sched);
     assert_eq!(sched.checkpoint_pool().entry_count(), 1, "retained below the device");
     assert_eq!(sched.checkpoint_pool().entries()[0].tier, ReuseSource::KvRam);
-    assert_eq!(sched.checkpoint_pool().used_bytes(), 0, "no device image remains");
+    assert_eq!(sched.retained_slots_in_use(), 0, "no device image remains");
     assert_eq!(sched.kv_used_pages(), 0, "and its pages came back");
     assert_eq!(compute.spilled_checkpoints(), vec![n], "spilled");
     assert!(compute.released_checkpoints().is_empty(), "not discarded");

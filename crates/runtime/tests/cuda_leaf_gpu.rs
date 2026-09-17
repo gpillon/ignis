@@ -66,7 +66,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
     compute
         .prefill_step(&[PrefillJob {
             checkpoint: None,
-            capture_checkpoint_tokens: None,
+            capture_checkpoint: None,
             multimodal: None,
             request,
             tokens: prompt,
@@ -77,7 +77,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
                 ..DecodeParams::default()
             },
             shared_prefix: None,
-            publish_prefix_tokens: None,
+            publish_prefix: None,
         }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

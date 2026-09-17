@@ -196,16 +196,20 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
-            retained_slot_count: 0,
+            // GitHub #215: every image below lives in a retained slot --
+            // turn N's prefix and checkpoint, turn N+1's chained link and
+            // checkpoint, and the two the equivalence run takes.
+            retained_slot_count: 6,
         },
     )
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
     let free_at_rest = pool.stats().kv_free_pages;
-    let image_bytes = pool
-        .checkpoint_image_bytes()
-        .unwrap_or_else(|e| panic!("checkpoint image bytes: {e}"));
-    println!("prompt_checkpoint_gpu: one checkpoint image is {image_bytes} bytes");
-    assert!(image_bytes > 0, "a real pool prices a checkpoint above zero");
+    let image_bytes = pool.stats().slot_state_bytes;
+    println!("prompt_checkpoint_gpu: one retained slot holds {image_bytes} bytes");
+    assert!(image_bytes > 0, "a real pool's slot holds state");
+    // A checkpoint keeps the page its opener ends inside as a page of the
+    // pool (GitHub #215).
+    let tail_page = |opener: u32| u32::from(opener % PAGE != 0);
 
     // ---- turn N: prefill to the publish point, publish, walk to the opener,
     //      capture. Exactly the decomposition the scheduler cuts.
@@ -215,7 +219,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     prefill_program(&model, &pool, &mut publisher, &head[..publish_at as usize], 0, None)
         .unwrap_or_else(|e| panic!("publisher head prefill: {e}"));
     let prefix = publisher
-        .publish_prefix(publish_at)
+        .publish_prefix(publish_at, 0)
         .unwrap_or_else(|e| panic!("publish: {e}"));
     prefill_program(
         &model,
@@ -227,7 +231,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     )
     .unwrap_or_else(|e| panic!("publisher opener prefill: {e}"));
     let checkpoint = publisher
-        .capture_checkpoint(opener)
+        .capture_checkpoint(opener, 1)
         .unwrap_or_else(|e| panic!("capture: {e}"));
     let mut kv_ram_blob = vec![
         0u8;
@@ -250,8 +254,9 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     let free_retained = pool.stats().kv_free_pages;
     assert_eq!(
         free_at_rest - free_retained,
-        publish_at / PAGE,
-        "the retained checkpoint holds exactly the shared pages, and nothing else"
+        publish_at / PAGE + tail_page(opener),
+        "the retained checkpoint holds exactly the shared pages and its own tail page, and \
+         nothing else"
     );
 
     // ---- the split control: turn N+1's prompt, cold, cut where turn N cut it.
@@ -418,7 +423,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     )
     .unwrap_or_else(|e| panic!("turn N+1 prefill to the chained publish point: {e}"));
     let chained = turn2
-        .publish_prefix(publish_at_2)
+        .publish_prefix(publish_at_2, 2)
         .unwrap_or_else(|e| panic!("chained publish: {e}"));
     assert_eq!(
         chained.stats().pages,
@@ -440,7 +445,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     )
     .unwrap_or_else(|e| panic!("turn N+1 prefill to its own opener: {e}"));
     let checkpoint_2 = turn2
-        .capture_checkpoint(opener_2)
+        .capture_checkpoint(opener_2, 3)
         .unwrap_or_else(|e| panic!("turn N+1 capture (the refusal #187 removed): {e}"));
     assert_eq!(checkpoint_2.stats().tokens, opener_2);
     assert_eq!(
@@ -460,8 +465,8 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     drop(turn2);
     assert_eq!(
         free_at_rest - pool.stats().kv_free_pages,
-        publish_at_2 / PAGE,
-        "two retained checkpoints over one chain hold each page once"
+        publish_at_2 / PAGE + tail_page(opener) + tail_page(opener_2),
+        "two retained checkpoints over one chain hold each page once, and a tail page each"
     );
 
     // The split control for turn N+2: its prompt, cold, cut at every boundary
@@ -535,7 +540,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         prefill_program(&model, &pool, &mut seq, &prompt[..publish_at as usize], 0, None)
             .unwrap_or_else(|e| panic!("{label}: head prefill: {e}"));
         let prefix = seq
-            .publish_prefix(publish_at)
+            .publish_prefix(publish_at, 4)
             .unwrap_or_else(|e| panic!("{label}: publish: {e}"));
         prefill_program(
             &model,
@@ -547,7 +552,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         )
         .unwrap_or_else(|e| panic!("{label}: opener prefill: {e}"));
         let taken = capture.then(|| {
-            seq.capture_checkpoint(opener)
+            seq.capture_checkpoint(opener, 5)
                 .unwrap_or_else(|e| panic!("{label}: capture: {e}"))
         });
         prefill_program(

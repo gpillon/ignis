@@ -23,7 +23,11 @@
 //      publisher, a chained publish that reaches no further than what is
 //      already shared, a reservation with no page of its own, and a state
 //      restore into a target whose history is still shared. A snapshot of a
-//      claimant materializes that history since GitHub #190.
+//      claimant materializes that history since GitHub #190;
+//   5. **the image lives in a retained slot the caller names** (GitHub #215):
+//      a publish into a slot out of range or still held is refused, the slot
+//      comes back with the publish handle, and a prefix whose handle is gone
+//      is never cloned from again.
 //
 // It also reports the measured device-to-device clone cost at the real 27B
 // geometry -- the other half of ADR 0024's cost asymmetry, whose host-side
@@ -221,6 +225,7 @@ ignis_seq_pool_spec small_spec() {
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
+  spec.retained_slot_count = 4;
   return spec;
 }
 
@@ -240,6 +245,7 @@ ignis_seq_pool_spec qwen38_27b_spec(std::uint32_t context_tokens, std::uint32_t 
   spec.gdn_value_heads     = 48;
   spec.gdn_head_dim        = 128;
   spec.vocab               = 248320;
+  spec.retained_slot_count = 1;
   return spec;
 }
 
@@ -266,7 +272,7 @@ void check_publish_shares_pages_and_charges_once() {
   expect_rc(ignis_seq_pool_stats(pool, &pool_before), 0, "share: pool stats before");
 
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "share: publish");
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 0, &prefix), 0, "share: publish");
 
   struct ignis_seq_pool_stats pool_after{};
   expect_rc(ignis_seq_pool_stats(pool, &pool_after), 0, "share: pool stats after");
@@ -281,8 +287,9 @@ void check_publish_shares_pages_and_charges_once() {
   expect(prefix_stats.pages == 2, "share: 128 tokens over 64-token pages is 2 pages");
   expect(prefix_stats.refcount == 2,
          "share: the returned handle and the publishing sequence both hold the prefix");
-  expect(prefix_stats.clone_image_bytes > 0,
-         "share: the prefix keeps a device image of the mutable sections");
+  expect(prefix_stats.clone_image_bytes == pool->slot_state_bytes,
+         "share: the prefix keeps an image of the mutable sections in one retained slot");
+  expect(pool->retained_held[0], "share: and holds that slot");
   expect(prefix_stats.clone_count == 0, "share: publishing is not a claim");
 
   // The publisher's own row is unchanged where it matters: the head still
@@ -350,7 +357,7 @@ void check_a_claimant_receives_the_mutable_state() {
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, publisher->slot);
 
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "clone: publish");
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 0, &prefix), 0, "clone: publish");
 
   // The publisher keeps going: its mutable state moves past the prefix, which
   // is exactly why the prefix had to capture its own copy.
@@ -436,7 +443,7 @@ void check_a_claimant_receives_the_drafter_window() {
   const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, publisher->slot);
 
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0,
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 0, &prefix), 0,
             "drafter clone: publish");
   const std::uint64_t lane_bytes = pool->dflash2_lane_bytes();
   expect(stats_of(prefix, "drafter clone: prefix stats").clone_image_bytes >= 2 * lane_bytes,
@@ -477,7 +484,7 @@ void check_the_last_holder_frees_the_pages() {
   expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "lifetime: alloc publisher");
   give_history(*pool, *publisher, kPrefix, 0x44u);
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "lifetime: publish");
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 0, &prefix), 0, "lifetime: publish");
   ignis_seq *claimant = nullptr;
   expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "lifetime: claim");
 
@@ -551,7 +558,7 @@ void check_a_chained_publish_extends_a_claimed_head() {
   expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "chain: alloc publisher");
   give_history(*pool, *publisher, kPrefix, 0x71u);
   ignis_seq_prefix *parent = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &parent), 0, "chain: publish parent");
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 0, &parent), 0, "chain: publish parent");
 
   // Turn N+1: it claims the parent, prefills one page past it, and publishes
   // what it now covers -- three pages, only one of them its own.
@@ -565,7 +572,7 @@ void check_a_chained_publish_extends_a_claimed_head() {
   struct ignis_seq_pool_stats before{};
   expect_rc(ignis_seq_pool_stats(pool, &before), 0, "chain: pool stats before");
   ignis_seq_prefix *child = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, turn2, kChained, &child), 0, "chain: publish chained");
+  expect_rc(ignis_seq_prefix_publish(pool, turn2, kChained, 1, &child), 0, "chain: publish chained");
   struct ignis_seq_pool_stats after{};
   expect_rc(ignis_seq_pool_stats(pool, &after), 0, "chain: pool stats after");
   expect(after.kv_free_pages == before.kv_free_pages,
@@ -637,19 +644,19 @@ void check_refusals() {
   ignis_seq_prefix *prefix = nullptr;
   // A prefix is whole pages: a partial page would be written by its owner
   // and read by its claimants.
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix + 1, &prefix), -1,
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix + 1, 0, &prefix), -1,
             "refuse: a partial page is not a prefix");
   expect(prefix == nullptr, "refuse: nothing is published on a refusal");
-  expect_rc(ignis_seq_prefix_publish(pool, seq, 0, &prefix), -1, "refuse: zero tokens");
+  expect_rc(ignis_seq_prefix_publish(pool, seq, 0, 0, &prefix), -1, "refuse: zero tokens");
   // The frontier must be exactly the prefix: the state a claimant gets is
   // the state at the prefix's end.
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPageTokens, &prefix),
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPageTokens, 0, &prefix),
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: a frontier past the prefix");
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix + kPageTokens, &prefix),
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix + kPageTokens, 0, &prefix),
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: a frontier short of the prefix");
   // Mid-chunk: one layer ahead of the rest.
   seq->gqa_positions[0] = static_cast<std::uint32_t>(kPrefix + 1);
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &prefix), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, 0, &prefix), IGNIS_SEQ_ERR_NOT_AT_BOUNDARY,
             "refuse: a mid-chunk publisher");
   seq->gqa_positions[0] = static_cast<std::uint32_t>(kPrefix);
 
@@ -658,13 +665,14 @@ void check_refusals() {
   expect(refused.kv_free_pages == empty.kv_free_pages - 6,
          "refuse: a refused publish charges the pool nothing");
 
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &prefix), 0, "refuse: publish");
+  expect(!pool->retained_held[0], "refuse: a refused publish holds no retained slot");
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, 0, &prefix), 0, "refuse: publish");
   // GitHub #187 made a second publish legal — as a *chained* entry over what
   // the sequence already shares. One that reaches no further covers nothing of
   // its own, and would be a second entry over pages it does not own, so it is
   // refused where a second publish used to be refused outright.
   ignis_seq_prefix *second = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, &second), -1,
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, 1, &second), -1,
             "refuse: a chained publish that reaches no further than what is already shared");
   expect(second == nullptr, "refuse: nothing is published on it");
 
@@ -709,7 +717,68 @@ void check_refusals() {
   ignis_seq_pool_free(pool);
 }
 
-// ---- 5. what the clone costs ---------------------------------------------
+// ---- 5. the image lives in a retained slot (GitHub #215) -----------------
+
+void check_the_image_lives_in_a_retained_slot() {
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "slot: pool create");
+
+  ignis_seq *first = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &first), 0, "slot: alloc first");
+  give_history(*pool, *first, kPrefix, 0xA1u);
+  ignis_seq *second = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &second), 0, "slot: alloc second");
+  give_history(*pool, *second, kPrefix, 0xA2u);
+
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix, spec.retained_slot_count, &prefix), -1,
+            "slot: a retained slot past the pool's is refused");
+  expect(prefix == nullptr && first->prefix == nullptr, "slot: and nothing was published");
+
+  // The image is the publisher's state, in the retained slot it was named.
+  const std::vector<unsigned char> at_boundary = mutable_image_of(*pool, first->slot);
+  expect_rc(ignis_seq_prefix_publish(pool, first, kPrefix, 3, &prefix), 0, "slot: publish");
+  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+         "slot: the image is the publisher's state, held in retained slot 3");
+
+  // A second publish may not write over it, nor may a plain store.
+  ignis_seq_prefix *other = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, second, kPrefix, 3, &other), -1,
+            "slot: a publish into a slot another prefix holds is refused");
+  expect(other == nullptr && second->prefix == nullptr, "slot: and changes nothing");
+  expect_rc(ignis_seq_retained_store(pool, second, 3), -1,
+            "slot: a store into a held slot is refused");
+  expect(mutable_image_of(*pool, ignis_seq_retained_pool_slot(*pool, 3)) == at_boundary,
+         "slot: the held image is untouched");
+
+  // The pages outlive the handle; the image does not.
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "slot: claim");
+  ignis_seq_release(pool, first);
+  ignis_seq_prefix_release(pool, prefix);
+  expect(!pool->retained_held[3], "slot: the slot came back with the handle");
+  expect(stats_of(prefix, "slot: stats after release").clone_image_bytes == 0,
+         "slot: the prefix holds no image any more");
+  ignis_seq *late = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &late), -1,
+            "slot: a prefix whose handle is gone is not cloned from");
+  expect(late == nullptr, "slot: and allocates nothing");
+  expect_rc(ignis_seq_prefix_publish(pool, second, kPrefix, 3, &other), 0,
+            "slot: the freed slot takes the next image");
+  expect(mutable_image_of(*pool, claimant->slot) == at_boundary,
+         "slot: the claimant built before the release kept its own copy");
+
+  ignis_seq_release(pool, claimant);
+  ignis_seq_release(pool, second);
+  ignis_seq_prefix_release(pool, other);
+  struct ignis_seq_pool_stats end{};
+  expect_rc(ignis_seq_pool_stats(pool, &end), 0, "slot: pool stats end");
+  expect(end.kv_free_pages == end.kv_page_group_count, "slot: every page is back");
+  ignis_seq_pool_free(pool);
+}
+
+// ---- 6. what the clone costs ---------------------------------------------
 
 void report_clone_cost() {
   // One publisher plus one claimant at full context. The clone's size does
@@ -731,7 +800,7 @@ void report_clone_cost() {
   publisher->pending_token = 7;
 
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kFullContext / 2, &prefix), 0,
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kFullContext / 2, 0, &prefix), 0,
             "cost: publish");
   const struct ignis_seq_prefix_stats published = stats_of(prefix, "cost: prefix stats");
 
@@ -804,7 +873,7 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
   give_history(*pool, *publisher, kPrefix, 0x91u);
   publisher->rope_delta = -77; // a multimodal publisher (GitHub #194)
   ignis_seq_prefix *prefix = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, &prefix), 0, "spill: publish");
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 2, &prefix), 0, "spill: publish");
 
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_prefix_snapshot_size(pool, prefix, &bytes), 0, "spill: size");
@@ -846,7 +915,8 @@ void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
   expect_rc(ignis_seq_alloc(pool, kPrefix + kPageTokens, &carrier), 0, "spill: alloc carrier");
   expect_rc(ignis_seq_restore(pool, carrier, blob.data(), bytes), 0, "spill: restore");
   ignis_seq_prefix *returned = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, carrier, kPrefix, &returned), 0,
+  // Into the very slot the original held: it came back with the handle.
+  expect_rc(ignis_seq_prefix_publish(pool, carrier, kPrefix, 2, &returned), 0,
             "spill: publish the restored head");
   ignis_seq_release(pool, carrier);
 
@@ -889,6 +959,7 @@ int main() {
   check_a_spilled_prefix_comes_back_as_the_same_prefix(false);
   check_a_spilled_prefix_comes_back_as_the_same_prefix(true);
   check_refusals();
+  check_the_image_lives_in_a_retained_slot();
   report_clone_cost();
 
   if (failures != 0) {

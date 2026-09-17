@@ -62,6 +62,10 @@ KV_POOL_BYTES ?=
 VRAM_HEADROOM ?=
 VRAM_BUDGET ?=
 ALLOW_VRAM_OVERSUBSCRIPTION ?=
+# Retained slots (--retained-slots, GitHub #215, ADR 0030): the images of
+# retained prompt checkpoints and shared prefixes, reserved at load. Empty =
+# the server's default, one per decode lane.
+RETAINED_SLOTS ?=
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G

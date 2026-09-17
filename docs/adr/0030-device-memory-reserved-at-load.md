@@ -80,8 +80,9 @@ The load lays out, in order:
 6. the KV pool, which takes the rest.
 
 The minimum is those fixed reservations plus the KV of one sequence at
-`--max-context`. Not fitting it refuses the start, naming the shortfall and
-the knobs that shrink it.
+`--max-context`, and one KV page per retained slot for a checkpoint's partial
+tail page (see Consequences). Not fitting it refuses the start, naming the
+shortfall and the knobs that shrink it.
 
 **Retained state lives in retained slots.** A retained slot is a place for
 one mutable-state image, the size of a lane's own state, reserved at load.
@@ -135,3 +136,12 @@ the whole `--kv-host-pool-bytes`, with blobs placed first-fit inside it.
   override that must fit the plan.
 - **ADR 0029's "byte-budgeted device pool" is realized as retained slots.**
   Its semantics (first victim, a full pool skips the capture) are unchanged.
+- **The KV pool's floor grows by one page per retained slot.** A retained
+  checkpoint's partial tail page is a KV page, and a claimant cannot take back
+  the page of the checkpoint it claimed. The plan therefore refuses a pool
+  smaller than one `max_context` sequence plus `retained_slots` pages
+  (GitHub #215).
+- **Retained slots bound reuse per conversation, not per byte.** Every link of
+  a chained prefix and every checkpoint holds a slot of its own. A long tool
+  loop stops leaving reuse once its chain holds every slot, and it runs on
+  without it.

@@ -184,7 +184,7 @@ fn siblings_in_one_batch_with_different_images_each_publish_their_own_head() {
             .iter()
             .flatten()
             .filter(|job| job.request == request)
-            .filter_map(|job| job.publish_prefix_tokens)
+            .filter_map(|job| job.publish_prefix.map(|p| p.tokens))
             .collect()
     };
     assert_eq!(published(a), [64]);
@@ -234,7 +234,7 @@ fn a_multimodal_prefix_is_never_published_inside_an_image() {
         .iter()
         .flatten()
         .filter(|job| job.request == main)
-        .filter_map(|job| job.publish_prefix_tokens)
+        .filter_map(|job| job.publish_prefix.map(|p| p.tokens))
         .collect();
     assert_eq!(published, [32]);
     assert_eq!(chunks(&compute, main)[0], (0, 32), "the chunk is cut there too");
@@ -244,7 +244,7 @@ fn a_multimodal_prefix_is_never_published_inside_an_image() {
     let events = run_to_idle(&mut sched);
     assert_eq!(prefix_reuses(&events, other), [32], "{events:?}");
     for job in compute.prefill_calls().iter().flatten() {
-        if let Some(at) = job.publish_prefix_tokens {
+        if let Some(at) = job.publish_prefix.map(|p| p.tokens) {
             assert!(!(40 < at && at < 70), "published inside the image: {job:?}");
         }
     }

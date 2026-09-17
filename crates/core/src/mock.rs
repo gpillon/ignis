@@ -245,7 +245,7 @@ impl Compute for MockCompute {
                 // you asked for happen?" — so the retained ledger is
                 // exercisable. `capture_failures` makes a backend that
                 // declines the bet testable too.
-                checkpoint_captured: job.capture_checkpoint_tokens.is_some()
+                checkpoint_captured: job.capture_checkpoint.is_some()
                     && !g.capture_refusals.remove(&job.request),
             })
             .collect())
@@ -253,15 +253,6 @@ impl Compute for MockCompute {
 
     fn release_prefix(&self, publisher: RequestId, _tokens: u32) {
         self.inner.lock().unwrap().prefixes_released.push(publisher);
-    }
-
-    // GitHub #186: the mock holds no device image, but the retained pool's
-    // byte budget has to be exercisable without one — the same reasoning
-    // `snapshot_size` below records. One nominal byte per checkpoint image,
-    // uniform across requests, so a test drives exhaustion by setting
-    // `retained_pool_bytes` to the number of checkpoints it wants to fit.
-    fn checkpoint_image_bytes(&self) -> u64 {
-        1
     }
 
     fn blob_identity(&self) -> crate::identity::BlobIdentity {
@@ -276,13 +267,12 @@ impl Compute for MockCompute {
             .push(publisher);
     }
 
+    // GitHub #190: a materialized checkpoint blob is one nominal byte, so
+    // `host_capacity_bytes` counts how many spilled checkpoints KV-RAM holds.
     fn checkpoint_snapshot_size(&self, _publisher: RequestId) -> Result<u64, ComputeError> {
-        Ok(self.checkpoint_image_bytes())
+        Ok(1)
     }
 
-    // GitHub #190: the materialized blob is priced like the image — one
-    // nominal byte — so `host_capacity_bytes` counts how many spilled
-    // checkpoints KV-RAM holds.
     fn spill_checkpoint(&self, publisher: RequestId) -> Result<u64, ComputeError> {
         let mut g = self.inner.lock().unwrap();
         if g.spill_failures.remove(&publisher) {
@@ -302,7 +292,7 @@ impl Compute for MockCompute {
         Ok(1)
     }
 
-    fn restore_prefix(&self, publisher: RequestId, tokens: u32) -> Result<u64, ComputeError> {
+    fn restore_prefix(&self, publisher: RequestId, tokens: u32, _slot: u32) -> Result<u64, ComputeError> {
         self.inner.lock().unwrap().prefixes_returned.push((publisher, tokens));
         Ok(1)
     }
@@ -505,13 +495,6 @@ impl Compute for GatedCompute {
 
     fn discard_snapshot(&self, request: RequestId) {
         self.inner.discard_snapshot(request);
-    }
-
-    fn checkpoint_image_bytes(&self) -> u64 {
-        // Forwarded explicitly, like every other method on this decorator: a
-        // silent default of 0 would make a gated test retain nothing at all
-        // and look as though checkpoints simply did not work under latency.
-        self.inner.checkpoint_image_bytes()
     }
 
     fn release_checkpoint(&self, publisher: RequestId) {

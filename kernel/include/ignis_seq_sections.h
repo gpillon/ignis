@@ -6,9 +6,10 @@
  * `ignis_seq_section_table` below with its size in bytes and whether it is
  * shareable read-only history or mutable state that must be cloned per
  * sequence. Every consumer reads that one description: snapshot to host,
- * restore from host, (P4-10, GitHub #126) the device-to-device clone behind
- * prefix reuse, and (GitHub #211) the slot-to-slot copy into a retained slot
- * -- so a section is carried by all of them or by none.
+ * restore from host, and (P4-10, GitHub #126) the device-to-device clone
+ * behind prefix reuse and prompt checkpoints -- since GitHub #211 and #215 a
+ * slot-to-slot copy into and out of a retained slot -- so a section is
+ * carried by all of them or by none.
  *
  * Not part of the public flat C ABI. ADR 0024 is explicit that the layout
  * does not cross the C boundary: `ignis_seq.h` exposes a snapshot *size*
@@ -145,7 +146,7 @@ struct ignis_seq_progress_image {
    * frontier advance, and every span of a multimodal prompt assigns the
    * same prompt-wide value, so a sequence evicted between its chunks
    * already holds the delta its later chunks would set. A clone's capture
-   * zeroes it (`ignis_seq_state_transfer`): a claimant takes its delta from
+   * zeroes it (`ignis_seq_capture_state`): a claimant takes its delta from
    * its own prefill span. */
   std::int32_t rope_delta;
   /* The drafter window's frontier (`ignis_seq::dflash2_position`); 0 on a

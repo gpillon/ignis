@@ -55,6 +55,20 @@ pub struct CheckpointClaim {
     pub source: crate::checkpoint::ReuseSource,
 }
 
+/// Where a prefill job leaves retained state (GitHub #215, ADR 0030): after
+/// `tokens` of the prompt, into retained slot `slot`.
+///
+/// The scheduler takes the slot before it builds the job, so the backend
+/// never allocates device memory for a publish or a capture: it copies the
+/// sequence's mutable state into the slot it is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedAt {
+    /// The prompt position the state is taken at.
+    pub tokens: u32,
+    /// The retained slot the image goes into (`0..retained_slots`).
+    pub slot: u32,
+}
+
 /// One prefill job handed to the compute backend (batched prefill groups
 /// several of these into one GPU batch to saturate the GPU and cut burst TTFT).
 #[derive(Debug, Clone)]
@@ -84,12 +98,12 @@ pub struct PrefillJob {
     /// place and clones the mutable state device-to-device, so the sequence
     /// begins at `start_position` with the publisher's state.
     pub shared_prefix: Option<SharedPrefixClaim>,
-    /// Publish this request's first N tokens as a shared prefix once this
-    /// chunk lands (P4-10, GitHub #126). Set only on the chunk that ends
-    /// exactly at N: the mutable state a claimant clones is the state at the
-    /// prefix's end, so the publish happens at that boundary and nowhere
-    /// else.
-    pub publish_prefix_tokens: Option<u32>,
+    /// Publish this request's first `tokens` tokens as a shared prefix once
+    /// this chunk lands (P4-10, GitHub #126), its image in the retained slot
+    /// named (GitHub #215). Set only on the chunk that ends exactly there: the
+    /// mutable state a claimant clones is the state at the prefix's end, so
+    /// the publish happens at that boundary and nowhere else.
+    pub publish_prefix: Option<RetainedAt>,
     /// The retained prompt checkpoint this request claims (GitHub #186), if
     /// any. Set on the request's **first** job, exactly as `shared_prefix` is:
     /// the backend allocates its sequence against the checkpoint, sharing the
@@ -102,15 +116,16 @@ pub struct PrefillJob {
     /// reuse wins between the two.
     pub checkpoint: Option<CheckpointClaim>,
     /// Capture this request's state as a prompt checkpoint once this chunk
-    /// lands (GitHub #186). Set only on the chunk that ends exactly at the
-    /// generation opener: the state a claimant receives is the state *there*,
-    /// and a chunk that overshot it would have moved that state on — the same
-    /// reason `publish_prefix_tokens` exists.
+    /// lands (GitHub #186), its image in the retained slot named (GitHub
+    /// #215). Set only on the chunk that ends exactly at the generation
+    /// opener: the state a claimant receives is the state *there*, and a chunk
+    /// that overshot it would have moved that state on — the same reason
+    /// `publish_prefix` exists.
     ///
     /// The capture is a pure read of the live sequence: it perturbs nothing,
     /// and the request goes on prefilling its last few prompt tokens and
     /// decoding as if it had not been asked.
-    pub capture_checkpoint_tokens: Option<u32>,
+    pub capture_checkpoint: Option<RetainedAt>,
     /// The request's multimodal part (GitHub #178), whole-prompt: the
     /// backend reads this job's span of it at `start_position`. The chunk
     /// holds at most one media item's placeholders
@@ -163,14 +178,14 @@ pub struct PrefillOutcome {
     /// `restore_ms` the request log reports, so the TTFT a reuse bought is
     /// attributable against what the reuse itself cost.
     pub restore_micros: u64,
-    /// Whether this job's `capture_checkpoint_tokens` actually produced a
-    /// retained image (GitHub #186).
+    /// Whether this job's `capture_checkpoint` actually produced a retained
+    /// image (GitHub #186).
     ///
     /// A capture is a **bet**, never certain work: a backend that cannot take
-    /// one — no room in its image pool, a sequence the leaf refuses to
-    /// capture — says so here and completes the chunk normally. The scheduler
-    /// records the retained entry only on `true`, so its ledger and the
-    /// device never disagree about what exists.
+    /// one — a sequence the leaf refuses to capture — says so here and
+    /// completes the chunk normally. The scheduler records the retained entry
+    /// only on `true`, and gives the slot back on `false`, so its ledger and
+    /// the device never disagree about what exists.
     pub checkpoint_captured: bool,
 }
 
@@ -336,28 +351,15 @@ pub trait Compute: Send + Sync {
 
     // ── Prompt checkpoints on the device (GitHub #186, ADR 0029) ─────────
     //
-    // The retained pool's *policy* — which checkpoints exist, what they cost,
-    // which one a prompt matches, and which one a live request takes back —
-    // is CPU bookkeeping in `crate::checkpoint`, testable without a GPU
-    // exactly as the host tier's is. The two methods below are where that
-    // bookkeeping meets device memory. Capture and claim are not here at all:
-    // they ride on [`PrefillJob`], because a claim has to happen at the moment
-    // the backend builds the sequence and a capture at the moment the chunk
-    // ending on the opener lands.
-
-    /// Device bytes one prompt checkpoint's image would occupy right now: the
-    /// mutable state sections plus the copy of the partial tail page.
-    ///
-    /// A cheap query with nothing allocated and nothing moved — the scheduler
-    /// asks it *before* it tells a job to capture, so a byte budget that
-    /// cannot hold an image never asks for one. Constant for the life of a
-    /// load (the sections are the pool's geometry), so a caller may treat two
-    /// answers as equal. `0` means this backend retains nothing, which is
-    /// what keeps a CPU-only `Compute` behaving exactly as it did before
-    /// checkpoints existed: a zero-byte image is never admitted by the pool.
-    fn checkpoint_image_bytes(&self) -> u64 {
-        0
-    }
+    // Retained state's *policy* — which checkpoints exist, which one a
+    // prompt matches, and which one a live request takes back — is CPU
+    // bookkeeping in `crate::checkpoint`, testable without a GPU exactly as
+    // the host tier's is, and what bounds it is the scheduler's retained slots
+    // (GitHub #215). The methods below are where that bookkeeping meets device
+    // memory. Capture and claim are not here at all: they ride on
+    // [`PrefillJob`], because a claim has to happen at the moment the backend
+    // builds the sequence and a capture at the moment the chunk ending on the
+    // opener lands.
 
     /// The compatibility identity of the state this backend produces
     /// (GitHub #189, ADR 0029): the artifact it loaded, the KV format its
@@ -418,9 +420,15 @@ pub trait Compute: Send + Sync {
     }
 
     /// Bring a spilled prefix back onto the device as a published prefix
-    /// under the same name, from its blob, which stays in KV-RAM. Returns the
-    /// restore's wall time in microseconds.
-    fn restore_prefix(&self, _publisher: RequestId, _tokens: u32) -> Result<u64, ComputeError> {
+    /// under the same name, its image in retained slot `slot` (GitHub #215),
+    /// from its blob, which stays in KV-RAM. Returns the restore's wall time
+    /// in microseconds.
+    fn restore_prefix(
+        &self,
+        _publisher: RequestId,
+        _tokens: u32,
+        _slot: u32,
+    ) -> Result<u64, ComputeError> {
         Err(ComputeError::Kernel(-1))
     }
 

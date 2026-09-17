@@ -45,11 +45,9 @@ pub struct EngineShape {
     pub host_pool_bytes: u64,
     /// Cross-request state reuse (`--prompt-reuse`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
-    /// The retained checkpoint pool's device budget, in bytes
-    /// (`--retained-pool-bytes`, GitHub #186). `None` reserves
-    /// [`DEFAULT_RETAINED_CHECKPOINT_IMAGES`] images in the VRAM plan (GitHub
-    /// #210).
-    pub retained_pool_bytes: Option<u64>,
+    /// The retained slots the load reserves (`--retained-slots`, GitHub #215,
+    /// ADR 0030): 0 with prompt reuse off.
+    pub retained_slots: u32,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority (`--retained-interactive-ttl`, GitHub #190).
     pub retained_interactive_ttl: std::time::Duration,
@@ -76,7 +74,7 @@ impl Default for EngineShape {
             },
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
-            retained_pool_bytes: None,
+            retained_slots: crate::config::DEFAULT_RETAINED_SLOTS,
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
@@ -94,7 +92,7 @@ impl From<&crate::config::Config> for EngineShape {
             vram: config.vram,
             host_pool_bytes: config.host_pool_bytes,
             prompt_reuse: config.prompt_reuse,
-            retained_pool_bytes: config.retained_pool_bytes,
+            retained_slots: config.retained_slots,
             retained_interactive_ttl: std::time::Duration::from_secs(u64::from(
                 config.retained_interactive_ttl_secs,
             )),
@@ -110,7 +108,6 @@ fn scheduler_config_for_shape(
     shape: EngineShape,
     kv_page_tokens: u32,
     capacity_pages: u32,
-    retained_pool_bytes: u64,
 ) -> SchedulerConfig {
     SchedulerConfig {
         model,
@@ -120,38 +117,20 @@ fn scheduler_config_for_shape(
         host_capacity_bytes: shape.host_pool_bytes,
         serving_chunk_tokens: shape.prefill_chunk,
         prompt_reuse: shape.prompt_reuse,
-        retained_pool_bytes,
+        // GitHub #215: the same count the leaf's pool reserved, so every slot
+        // the scheduler hands out is one the pool holds.
+        retained_slots: shape.retained_slots,
         retained_interactive_ttl: shape.retained_interactive_ttl,
         ..SchedulerConfig::default()
     }
 }
 
-/// Checkpoint images the retained budget holds when the operator names none
-/// (GitHub #210): what the budget derived from the VRAM left after load held
-/// at the Makefile defaults on 2026-09-17 (744,624,128 B, three images).
-/// Until #215 moves retained state into slots, the plan keeps today's budget
-/// rather than taking memory from the KV pool for more of them.
-pub const DEFAULT_RETAINED_CHECKPOINT_IMAGES: u64 = 3;
-
-/// The retained checkpoint budget a load reserves (GitHub #186, #210): none
-/// without prompt reuse, the operator's `--retained-pool-bytes`, or else
-/// [`DEFAULT_RETAINED_CHECKPOINT_IMAGES`] images -- a line of the VRAM plan,
-/// fixed before the KV pool takes the rest.
-pub fn retained_pool_bytes(shape: &EngineShape, checkpoint_image_bytes: u64) -> u64 {
-    match (shape.prompt_reuse, shape.retained_pool_bytes) {
-        (false, _) => 0,
-        (true, Some(bytes)) => bytes,
-        (true, None) => DEFAULT_RETAINED_CHECKPOINT_IMAGES * checkpoint_image_bytes,
-    }
-}
-
 /// The VRAM plan's lines for a load (GitHub #210): the weights' arena, the
-/// CUDA context, what the leaf planned beside them, the retained budget and
-/// the measured residual, in plan order.
+/// CUDA context, what the leaf planned beside them -- its retained slots
+/// included (GitHub #215) -- and the measured residual, in plan order.
 pub fn vram_lines(
     weights_bytes: u64,
     reserved: ignis_runtime::ReservedBytes,
-    retained_bytes: u64,
 ) -> ignis_core::VramLines {
     ignis_core::VramLines {
         weights: weights_bytes,
@@ -165,7 +144,6 @@ pub fn vram_lines(
         drafter_round: reserved.drafter_round,
         lane_state: reserved.lane_state,
         retained_slots: reserved.retained_slots,
-        retained: retained_bytes,
         residual: ignis_runtime::LOAD_RESIDUAL_BYTES,
     }
 }
@@ -197,12 +175,11 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
                 drafter_round_bytes = lines.drafter_round,
                 lane_state_bytes = lines.lane_state,
                 retained_slots_bytes = lines.retained_slots,
-                retained_bytes = lines.retained,
                 residual_bytes = lines.residual,
                 kv_pool_bytes = plan.kv_pool_bytes,
                 kv_page_count = plan.kv_page_count,
                 total_bytes = plan.total_bytes,
-                allocated_at_load_bytes = plan.total_bytes - lines.retained,
+                allocated_at_load_bytes = plan.total_bytes,
                 oversubscribed = plan.oversubscribed,
                 "vram plan"
             )
@@ -246,6 +223,7 @@ fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtim
         prefill_chunk_tokens: shape.prefill_chunk,
         speculation: shape.speculation,
         vision: shape.vision,
+        retained_slots: shape.retained_slots,
         ..ignis_runtime::CudaLeafConfig::default()
     }
 }
@@ -292,15 +270,15 @@ pub fn cuda_scheduler(
     // Asked once where its error can surface: the plan below reads a pool the
     // leaf refuses to plan as one that never fits.
     planning.kv_pool_arena_bytes(1)?;
-    let retained_pool_bytes = retained_pool_bytes(&shape, reservations.checkpoint_image_bytes);
     let kv_arena_bytes = |pages: u32| planning.kv_pool_arena_bytes(pages).unwrap_or(u64::MAX);
     let vram = ignis_core::plan_vram(&ignis_core::VramRequest {
         mode: shape.vram,
         free_at_start_bytes,
-        lines: vram_lines(plan.device_capacity_bytes, reservations.reserved, retained_pool_bytes),
+        lines: vram_lines(plan.device_capacity_bytes, reservations.reserved),
         kv_format: shape.kv_format,
         kv_geometry: geometry,
         max_context_tokens: shape.max_context,
+        retained_slots: shape.retained_slots,
         kv_pool_bytes: shape.kv_pool_bytes,
         kv_arena_bytes: &kv_arena_bytes,
         // Windows WDDM pages an oversubscribed device allocation to system
@@ -361,13 +339,14 @@ pub fn cuda_scheduler(
         ));
     }
     // What NVML says the load took, beside what the plan said it would
-    // (GitHub #210): every line but the retained one, which the load does not
-    // allocate. The delta also moves with anything else on the card.
+    // (GitHub #210): every line, the retained slots included -- since GitHub
+    // #215 serving allocates nothing more. The delta also moves with anything
+    // else on the card.
     if let Ok((free_after_load_bytes, _)) = CudaDevice::nvml_memory(0) {
         // hotpath-lint-allow: one line per model load.
         tracing::info!(
             name: "ignis.runtime.vram_loaded",
-            allocated_at_load_bytes = vram.total_bytes - vram.lines.retained,
+            allocated_at_load_bytes = vram.total_bytes,
             free_memory_delta_bytes = free_at_start_bytes.saturating_sub(free_after_load_bytes),
             free_after_load_bytes,
             "vram loaded"
@@ -375,13 +354,7 @@ pub fn cuda_scheduler(
     }
 
     Ok(scheduler(
-        scheduler_config_for_shape(
-            model_id,
-            shape,
-            KV_PAGE_TOKENS,
-            capacity_pages,
-            retained_pool_bytes,
-        ),
+        scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
         model,
         eos,
     ))
@@ -426,11 +399,12 @@ mod tests {
 
         // Every serving knob at once: the bind address, the timeout, the UI,
         // the metrics listener, the API key, the prefill chunk, the context,
-        // both pool budgets, `--prompt-reuse` and `--retained-pool-bytes`.
-        // `retained_pool_bytes` is the one that makes this a rule rather than
-        // a nicety: unset, its value is derived from the VRAM left after load,
-        // so it differs from one start of the same server to the next, and an
-        // identity that moved with it would refuse every blob after a reboot.
+        // both pool budgets, the VRAM budget, `--prompt-reuse` and
+        // `--retained-slots`. The KV pool is the one that makes this a rule
+        // rather than a nicety: unset, it is the rest of a budget derived from
+        // the VRAM free at start, so it differs from one start of the same
+        // server to the next, and an identity that moved with it would refuse
+        // every blob after a reboot.
         let elsewhere = crate::config::Config {
             bind: "0.0.0.0:9999".into(),
             request_timeout_secs: base.request_timeout_secs + 7,
@@ -446,7 +420,7 @@ mod tests {
             },
             host_pool_bytes: base.host_pool_bytes * 2,
             prompt_reuse: !base.prompt_reuse,
-            retained_pool_bytes: Some(3 * 1024 * 1024 * 1024),
+            retained_slots: 3,
             ..base.clone()
         };
         assert_ne!(base, elsewhere, "the two configs really do differ");
@@ -528,54 +502,50 @@ mod tests {
             vram: EngineShape::default().vram,
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             prompt_reuse: true,
-            retained_pool_bytes: None,
+            retained_slots: 5,
             retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,
         };
 
-        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 4_096);
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
 
         assert_eq!(config.serving_chunk_tokens, 512);
-        // GitHub #186: the reuse knobs reach the scheduler too — the budget
-        // as the number the caller resolved (the operator's, or the one
-        // derived from free VRAM), never re-derived here.
+        // GitHub #186: the reuse knobs reach the scheduler too -- and the
+        // retained slots as the count the leaf's pool reserves (GitHub #215).
         assert!(config.prompt_reuse);
-        assert_eq!(config.retained_pool_bytes, 4_096);
+        assert_eq!(config.retained_slots, 5);
         // GitHub #190: and so does the Interactive TTL.
         assert_eq!(config.retained_interactive_ttl, std::time::Duration::from_secs(60));
     }
 
     #[test]
     fn prompt_reuse_off_reaches_the_scheduler_config() {
-        let shape = EngineShape {
-            prompt_reuse: false,
-            ..EngineShape::default()
+        let crate::config::ConfigOutcome::Config(off) =
+            crate::config::resolve(&["--prompt-reuse".to_owned(), "off".to_owned()], |_| None)
+                .expect("resolve")
+        else {
+            panic!("expected a runnable config");
         };
-        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 0);
+        let shape = EngineShape::from(&off);
+        let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);
         assert!(!config.prompt_reuse);
-        assert_eq!(config.retained_pool_bytes, 0);
+        assert_eq!(config.retained_slots, 0, "reuse off reserves no retained slot");
     }
 
     // ── the VRAM plan (GitHub #210) ──────────────────────────────────────
 
-    const IMAGE: u64 = 238_823_424;
-
+    #[cfg(feature = "cuda")]
     #[test]
-    fn the_retained_budget_holds_todays_three_checkpoints_unless_named_or_off() {
-        let shape = EngineShape::default();
-        assert!(shape.prompt_reuse);
-        assert_eq!(retained_pool_bytes(&shape, IMAGE), 3 * IMAGE);
-        let named = EngineShape {
-            retained_pool_bytes: Some(3 * IMAGE),
-            ..shape
+    fn the_leaf_reserves_the_retained_slots_the_scheduler_hands_out() {
+        // GitHub #215: one count, from one flag, reaches both -- a slot the
+        // scheduler names is one the pool holds.
+        let shape = EngineShape {
+            retained_slots: 5,
+            ..EngineShape::default()
         };
-        assert_eq!(retained_pool_bytes(&named, IMAGE), 3 * IMAGE);
-        let off = EngineShape {
-            prompt_reuse: false,
-            ..shape
-        };
-        assert_eq!(retained_pool_bytes(&off, IMAGE), 0);
+        assert_eq!(leaf_config_for_shape(shape, 1 << 30).retained_slots, 5);
+        assert_eq!(scheduler_config_for_shape("m".into(), shape, 64, 1024).retained_slots, 5);
     }
 
     #[test]
@@ -592,7 +562,7 @@ mod tests {
             retained_slots: 10,
             kv_pool: 1 << 40,
         };
-        let lines = vram_lines(100, reserved, 9);
+        let lines = vram_lines(100, reserved);
         assert_eq!(
             lines.entries().map(|(_, bytes)| bytes),
             [
@@ -607,7 +577,6 @@ mod tests {
                 7,
                 8,
                 10,
-                9,
                 ignis_runtime::LOAD_RESIDUAL_BYTES,
             ],
             "every line in plan order, and never the KV pool the plan sizes itself"
@@ -630,6 +599,7 @@ mod tests {
         let reserved = ignis_runtime::ReservedBytes {
             prefill_scratch: 1 << 30,
             lane_state: 1 << 30,
+            retained_slots: 8 * 238_823_424,
             ..Default::default()
         };
         let page_bytes = ignis_core::KvFormat::HqE8_2b.page_bytes(ignis_core::KvGeometry::qwen38_27b());
@@ -637,10 +607,11 @@ mod tests {
         ignis_core::plan_vram(&ignis_core::VramRequest {
             mode,
             free_at_start_bytes: free,
-            lines: vram_lines(17 << 30, reserved, IMAGE * 8),
+            lines: vram_lines(17 << 30, reserved),
             kv_format: ignis_core::KvFormat::HqE8_2b,
             kv_geometry: ignis_core::KvGeometry::qwen38_27b(),
             max_context_tokens: 262_144,
+            retained_slots: 8,
             kv_pool_bytes: None,
             kv_arena_bytes: &arena,
             can_page: true,
@@ -673,8 +644,8 @@ mod tests {
         assert_eq!(field("total_bytes"), plan.total_bytes);
         assert_eq!(
             field("allocated_at_load_bytes"),
-            plan.total_bytes - plan.lines.retained,
-            "what Task Manager shows right after load: every line but the retained ledger"
+            plan.total_bytes,
+            "what Task Manager shows right after load: every line, the retained slots included"
         );
         assert_eq!(field("oversubscribed"), false);
     }
@@ -736,6 +707,7 @@ mod tests {
             _model: &Self::Model,
             _sequence: &mut Self::Sequence,
             _prefix_tokens: u32,
+            _retained_slot: u32,
         ) -> Result<Self::Prefix, i32> {
             Ok(())
         }

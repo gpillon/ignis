@@ -488,6 +488,20 @@ pub enum SchedEvent {
         operation: crate::checkpoint::RetainedStateOperation,
         source: crate::checkpoint::ReuseSource,
     },
+    /// A publish or a capture `request` would have left was not taken (GitHub
+    /// #215, ADR 0030): no retained slot was free and no retained state could
+    /// give one up, or a checkpoint's tail page found no KV page. The request
+    /// runs regardless; it only leaves no reuse behind.
+    RetainedSlotSkipped {
+        request: RequestId,
+        skip: crate::retained_slot::RetainedSkip,
+        /// The retained slots held when it was skipped, of `capacity`.
+        in_use: u32,
+        capacity: u32,
+    },
+    /// How many of the load's retained slots are held (GitHub #215), reported
+    /// on the step it changed.
+    RetainedSlots { in_use: u32, capacity: u32 },
     /// One chunked-prefill step landed for `request` (P3-01, ADR 0018;
     /// P3-06 request log): `chunk_tokens` is this chunk's width,
     /// `prefilled_tokens` the cumulative prompt tokens sent to the compute

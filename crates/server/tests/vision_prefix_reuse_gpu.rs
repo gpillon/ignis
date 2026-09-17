@@ -14,13 +14,12 @@
 //! - the second red sibling reuses past the image, and still answers "red";
 //! - the reused-token counter moves.
 //!
-//! Twice: with prompt reuse off, where the only door is the sibling prefix
-//! cache — the path that matched raw token ids before #193 — and the sibling
-//! counter has to move by exactly the second red's claim, since the blue one
-//! has nothing it may claim at all; then with it on, where the second red
-//! resumes from the first's retained checkpoint at its generation opener. Off
-//! first: a scheduler leaves its retained state behind in the leaf, and a
-//! later scheduler's request ids start over.
+//! Twice: with prompt reuse off, where no prefix image has a retained slot to
+//! live in (GitHub #215), so nobody shares anything and every answer is still
+//! its own image's; then with it on, where the second red resumes from the
+//! first's retained checkpoint at its generation opener. Off first: a
+//! scheduler leaves its retained state behind in the leaf, and a later
+//! scheduler's request ids start over.
 //!
 //! Each answer is also taken alone first, reusing nothing, to show the model
 //! tells the two swatches apart at all — otherwise "blue" after reuse would
@@ -38,7 +37,7 @@ use std::sync::Arc;
 use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, FrontendSet, ModelScope, Reader};
 use ignis_core::gpu_profile;
 use ignis_core::{
-    auto_retained_pool_bytes, ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId,
+    ConcreteScheduler, DecodeParams, KvFormat, RequestClass, RequestId,
     RequestInput, SchedEvent, Scheduler, SchedulerConfig, TokenId, Vision,
 };
 use ignis_runtime::{CudaLeaf, CudaLeafConfig, Model, RuntimeCompute};
@@ -218,7 +217,6 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
         kv_page_tokens: ignis_runtime::KV_PAGE_TOKENS,
         kv_capacity_pages: stats.kv_page_count,
         prompt_reuse,
-        retained_pool_bytes: if prompt_reuse { auto_retained_pool_bytes(stats.free_vram_bytes) } else { 0 },
         ..SchedulerConfig::default()
     };
 
@@ -256,12 +254,10 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
 
     for prompt_reuse in [false, true] {
         // The siblings: red publishes, then blue and red again arrive. With
-        // prompt reuse off nothing outlives the first red, and a one-word
-        // answer is a single decode run, so they arrive the advance after its
-        // first chunk published the whole-page head. With it on, the head is
-        // cut at the block, then the opener's page, then the checkpoint is
-        // captured at the opener: three chunks, and whatever is retained
-        // stays for them.
+        // prompt reuse on, the head is cut at the block, then the opener's
+        // page, then the checkpoint is captured at the opener: three chunks,
+        // and whatever is retained stays for them. With it off nothing is
+        // published, and they arrive the advance after red's one chunk.
         let lead = if prompt_reuse { 3 } else { 1 };
         let siblings = run(
             &compute,
@@ -289,21 +285,19 @@ fn siblings_sending_same_size_images_share_only_what_their_images_agree_on() {
             "the blue sibling shares nothing of the red image: reused {blue_reused}, image begins at {}",
             item.begin
         );
-        assert!(
-            same_reused as usize >= item.begin + item.count,
-            "the red sibling reuses past its image: reused {same_reused}"
-        );
         if prompt_reuse {
+            assert!(
+                same_reused as usize >= item.begin + item.count,
+                "the red sibling reuses past its image: reused {same_reused}"
+            );
             assert!(blue_reused > 0, "the blue sibling shares the system block");
+            assert!(siblings.sibling_reused_tok > 0, "the reused-token counter moves");
         } else {
-            // No block, no checkpoint: the whole-prompt head covers the image,
-            // so the blue sibling claims nothing, and the counter is the red
-            // sibling's claim alone.
-            assert_eq!(blue_reused, 0);
-            assert_eq!(siblings.prefix_reused.get(&same).copied(), Some(same_reused));
-            assert_eq!(siblings.sibling_reused_tok, u64::from(same_reused), "the counter moves by it");
+            // GitHub #215: reuse off reserves no retained slot, so no head is
+            // published for a sibling to claim.
+            assert_eq!((blue_reused, same_reused), (0, 0), "nothing is shared with prompt reuse off");
+            assert_eq!(siblings.sibling_reused_tok, 0);
         }
-        assert!(siblings.sibling_reused_tok > 0, "the reused-token counter moves");
         assert!(answer(other).to_lowercase().contains("blue"), "{:?}", answer(other));
         assert!(answer(same).to_lowercase().contains("red"), "{:?}", answer(same));
         assert!(answer(first).to_lowercase().contains("red"), "{:?}", answer(first));

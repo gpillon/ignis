@@ -16,6 +16,10 @@
 //      capturing sequence's row, reservation and state are what they were,
 //      and N claimants all succeed — a retry, a regenerate and two forks of
 //      one history all hit.
+//   4. **nothing is allocated** (GitHub #215): the image goes into the
+//      retained slot the caller names and the partial page into one KV page
+//      of the pool — none for an opener on a page boundary — and both come
+//      back with the checkpoint.
 //
 // It also asserts the acceptance criterion the ABI is the only place to check
 // it: **the penalty-count row captured at the opener is all zeros**, because
@@ -207,6 +211,7 @@ ignis_seq_pool_spec small_spec(int32_t kv_format = IGNIS_KV_FORMAT_BF16) {
   spec.gdn_value_heads     = 2;
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
+  spec.retained_slot_count = 4;
   return spec;
 }
 
@@ -217,6 +222,10 @@ constexpr std::uint32_t kContext    = 384;
 // the opener is wherever `<|im_start|>assistant\n` happens to end.
 constexpr std::uint32_t kPrefix = 2 * kPageTokens;
 constexpr std::uint32_t kOpener = kPrefix + 40;
+// The retained slots the publisher's prefix and its checkpoint take (GitHub
+// #215).
+constexpr std::uint32_t kPrefixSlot     = 0;
+constexpr std::uint32_t kCheckpointSlot = 1;
 
 // A publisher standing at the opener, with a prefix of `kPrefix` under it and
 // a known pattern everywhere. `*out_prefix` receives the publish handle.
@@ -230,7 +239,7 @@ ignis_seq *publisher_at_opener(ignis_seq_pool *pool, ignis_seq_prefix **out_pref
   // short chunk that lands on the opener.
   set_frontier(*seq, kPrefix);
   dirty_state(*pool, *seq, 2, 0x31u);
-  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, out_prefix), 0, label);
+  expect_rc(ignis_seq_prefix_publish(pool, seq, kPrefix, kPrefixSlot, out_prefix), 0, label);
   set_frontier(*seq, kOpener);
   seq->pending_token = 4242;
   seq->rope_delta    = -42;
@@ -259,7 +268,7 @@ void check_capture_perturbs_nothing() {
   expect_rc(ignis_seq_pool_stats(pool, &pool_before), 0, "capture: pool stats before");
 
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &checkpoint), 0,
             "capture: capture at the opener");
 
   expect(row_of(*pool, publisher->slot, 6) == row_before,
@@ -269,17 +278,16 @@ void check_capture_perturbs_nothing() {
   expect(publisher->position == kOpener, "capture: and its frontier");
   struct ignis_seq_pool_stats pool_after{};
   expect_rc(ignis_seq_pool_stats(pool, &pool_after), 0, "capture: pool stats after");
-  expect(pool_after.kv_free_pages == pool_before.kv_free_pages,
-         "capture: a capture costs the KV pool no page");
+  expect(pool_after.kv_free_pages == pool_before.kv_free_pages - 1,
+         "capture: a capture costs the KV pool the one page its opener ends inside");
+  expect(pool->retained_held[kCheckpointSlot], "capture: and holds its retained slot");
 
   const struct ignis_seq_checkpoint_stats stats = stats_of(checkpoint, "capture: stats");
   expect(stats.tokens == kOpener, "capture: the checkpoint reaches the opener, not the page");
   expect(stats.pages == 2, "capture: over the two whole pages the prefix holds");
   expect(stats.claim_count == 0, "capture: capturing is not a claim");
-  std::uint64_t image_bytes = 0;
-  expect_rc(ignis_seq_checkpoint_image_bytes(pool, &image_bytes), 0, "capture: image bytes query");
-  expect(stats.image_bytes == image_bytes,
-         "capture: a checkpoint costs exactly what the pool said one costs");
+  expect(stats.image_bytes == pool->slot_state_bytes + ignis_seq_checkpoint_page_bytes(*pool),
+         "capture: a checkpoint holds one slot's state and one page");
 
   // The prefix now has three holders: the publish handle, the publishing
   // sequence, and the checkpoint. That third one is what keeps the pages
@@ -288,6 +296,64 @@ void check_capture_perturbs_nothing() {
   expect_rc(ignis_seq_prefix_stats(prefix, &prefix_stats), 0, "capture: prefix stats");
   expect(prefix_stats.refcount == 3, "capture: the checkpoint holds the prefix too");
 
+  ignis_seq_checkpoint_release(pool, checkpoint);
+  expect(!pool->retained_held[kCheckpointSlot], "capture: the release gives the slot back");
+  struct ignis_seq_pool_stats pool_released{};
+  expect_rc(ignis_seq_pool_stats(pool, &pool_released), 0, "capture: pool stats released");
+  expect(pool_released.kv_free_pages == pool_before.kv_free_pages,
+         "capture: and the page");
+  ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_release(pool, publisher);
+  ignis_seq_pool_free(pool);
+}
+
+// An opener on a page boundary ends inside no page: the capture copies none
+// and costs none, and a claimant stands on the prefix's pages alone.
+void check_a_page_aligned_opener_takes_no_page() {
+  const ignis_seq_pool_spec spec = small_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "aligned: pool create");
+
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "aligned: alloc");
+  set_frontier(*publisher, kPrefix);
+  dirty_state(*pool, *publisher, 2, 0x21u);
+  publisher->pending_token = 99;
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, kPrefixSlot, &prefix), 0,
+            "aligned: publish");
+  const std::vector<unsigned char> state = mutable_image_of(*pool, publisher->slot);
+
+  struct ignis_seq_pool_stats before{};
+  expect_rc(ignis_seq_pool_stats(pool, &before), 0, "aligned: pool stats before");
+  ignis_seq_checkpoint *checkpoint = nullptr;
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kPrefix, kCheckpointSlot, &checkpoint),
+            0, "aligned: capture on the publish point");
+  struct ignis_seq_pool_stats after{};
+  expect_rc(ignis_seq_pool_stats(pool, &after), 0, "aligned: pool stats after");
+  expect(after.kv_free_pages == before.kv_free_pages, "aligned: no page is taken");
+  expect(stats_of(checkpoint, "aligned: stats").image_bytes == pool->slot_state_bytes,
+         "aligned: the checkpoint holds one slot's state and nothing else");
+
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_from_checkpoint(pool, kContext, checkpoint, &claimant), 0,
+            "aligned: claim");
+  expect(claimant->position == kPrefix && claimant->pending_token == 99,
+         "aligned: the claimant stands at the opener");
+  expect(mutable_image_of(*pool, claimant->slot) == state, "aligned: with the capture's state");
+
+  std::uint64_t bytes = 0;
+  expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0, "aligned: size");
+  std::vector<unsigned char> blob(static_cast<std::size_t>(bytes));
+  expect_rc(ignis_seq_checkpoint_snapshot(pool, checkpoint, blob.data(), bytes), 0,
+            "aligned: snapshot");
+  std::uint64_t own_bytes = 0;
+  expect_rc(ignis_seq_snapshot_size(pool, claimant, &own_bytes), 0, "aligned: claimant size");
+  std::vector<unsigned char> own(static_cast<std::size_t>(own_bytes));
+  expect_rc(ignis_seq_snapshot(pool, claimant, own.data(), own_bytes), 0, "aligned: claimant snapshot");
+  expect(own == blob, "aligned: the checkpoint's blob is its claimant's, standing on it");
+
+  ignis_seq_release(pool, claimant);
   ignis_seq_checkpoint_release(pool, checkpoint);
   ignis_seq_prefix_release(pool, prefix);
   ignis_seq_release(pool, publisher);
@@ -311,7 +377,7 @@ void check_claim_reproduces_the_state_at_the_opener(int32_t kv_format) {
   const std::vector<unsigned char> tail_page = page_image_of(*pool, publisher_own_page);
 
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &checkpoint), 0,
             "claim: capture");
 
   // The capturing request goes on and moves its state on -- including
@@ -388,7 +454,7 @@ void check_penalty_counts_are_zero_at_the_opener() {
          "counts: a sequence standing at its opener has sampled nothing");
 
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &checkpoint), 0,
             "counts: capture");
   // The capturing request now samples, which is what a real one does the
   // moment its prompt is warm: the checkpoint must not have picked that up.
@@ -422,7 +488,7 @@ void check_lifetime() {
   ignis_seq_prefix *prefix = nullptr;
   ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "lifetime: publisher");
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &checkpoint), 0,
             "lifetime: capture");
 
   // The request ends: its sequence and the publish handle both go. The
@@ -431,8 +497,9 @@ void check_lifetime() {
   ignis_seq_prefix_release(pool, prefix);
   struct ignis_seq_pool_stats retained{};
   expect_rc(ignis_seq_pool_stats(pool, &retained), 0, "lifetime: pool stats retained");
-  expect(retained.kv_free_pages == empty.kv_free_pages - 2,
-         "lifetime: the two shared pages are still held, and nothing else is");
+  expect(retained.kv_free_pages == empty.kv_free_pages - 3,
+         "lifetime: the two shared pages and the checkpoint's own page are still held, and "
+         "nothing else is");
 
   // And a claimant long after the request is gone still stands up on them.
   ignis_seq *late = nullptr;
@@ -463,7 +530,7 @@ void check_materialized_blob_outlives_every_device_handle(bool dflash2) {
   ignis_seq_prefix *prefix = nullptr;
   ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "materialize: publisher");
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &checkpoint), 0,
             "materialize: capture");
 
   std::uint64_t bytes = 0;
@@ -520,7 +587,7 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
   set_frontier(*turn1, kPrefix);
   dirty_state(*pool, *turn1, 2, 0x61u);
   ignis_seq_prefix *block = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, turn1, kPrefix, &block), 0, "chain blob: publish block");
+  expect_rc(ignis_seq_prefix_publish(pool, turn1, kPrefix, 0, &block), 0, "chain blob: publish block");
 
   // Turn 2 claims it, warms a page of its own, chains it over the block, and
   // walks on to an opener inside the page after.
@@ -531,13 +598,13 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
   set_frontier(*turn2, chained);
   dirty_state(*pool, *turn2, 1, 0x62u);
   ignis_seq_prefix *link = nullptr;
-  expect_rc(ignis_seq_prefix_publish(pool, turn2, chained, &link), 0, "chain blob: publish link");
+  expect_rc(ignis_seq_prefix_publish(pool, turn2, chained, 1, &link), 0, "chain blob: publish link");
   set_frontier(*turn2, opener);
   turn2->pending_token = 777;
   dirty_state(*pool, *turn2, 1, 0x63u);
 
   ignis_seq_checkpoint *checkpoint = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(pool, turn2, opener, &checkpoint), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, turn2, opener, 2, &checkpoint), 0,
             "chain blob: capture on the chain");
   std::uint64_t bytes = 0;
   expect_rc(ignis_seq_checkpoint_snapshot_size(pool, checkpoint, &bytes), 0, "chain blob: size");
@@ -579,7 +646,7 @@ void check_refusals() {
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "refuse: pool create");
 
   ignis_seq_checkpoint *out = nullptr;
-  expect_rc(ignis_seq_checkpoint_capture(nullptr, nullptr, kOpener, &out), -1,
+  expect_rc(ignis_seq_checkpoint_capture(nullptr, nullptr, kOpener, kCheckpointSlot, &out), -1,
             "refuse: null arguments");
 
   // A sequence with no shared prefix under it: the opener would fall inside a
@@ -588,7 +655,7 @@ void check_refusals() {
   ignis_seq *bare = nullptr;
   expect_rc(ignis_seq_alloc(pool, kContext, &bare), 0, "refuse: alloc bare");
   set_frontier(*bare, kOpener);
-  expect_rc(ignis_seq_checkpoint_capture(pool, bare, kOpener, &out), -1,
+  expect_rc(ignis_seq_checkpoint_capture(pool, bare, kOpener, kCheckpointSlot, &out), -1,
             "refuse: a sequence holding no shared prefix");
   expect(out == nullptr, "refuse: and hands back no handle");
 
@@ -596,15 +663,15 @@ void check_refusals() {
   ignis_seq *publisher     = publisher_at_opener(pool, &prefix, "refuse: publisher");
 
   // Off the frontier, in both directions.
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener - 1, &out),
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener - 1, kCheckpointSlot, &out),
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: an opener behind the frontier");
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener + 1, &out),
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener + 1, kCheckpointSlot, &out),
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: an opener ahead of the frontier");
 
   // Mid-chunk: the sections are not consistent with one another.
   const std::uint32_t gqa0 = publisher->gqa_positions[0];
   publisher->gqa_positions[0] = gqa0 - 1;
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &out),
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &out),
             IGNIS_SEQ_ERR_NOT_AT_BOUNDARY, "refuse: a mid-chunk sequence");
   publisher->gqa_positions[0] = gqa0;
 
@@ -612,13 +679,26 @@ void check_refusals() {
   // #187 lineage case — a request that resumed from an earlier checkpoint and
   // prefilled past it. Its own first page is not the opener's.
   set_frontier(*publisher, 4 * kPageTokens + 8);
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, 4 * kPageTokens + 8, &out), -1,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, 4 * kPageTokens + 8, kCheckpointSlot, &out), -1,
             "refuse: an opener outside the sequence's own first page");
   set_frontier(*publisher, kOpener);
 
+  // GitHub #215: a slot out of range, or one the prefix under it holds.
+  struct ignis_seq_pool_stats before_slots{};
+  expect_rc(ignis_seq_pool_stats(pool, &before_slots), 0, "refuse: pool stats before slots");
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, spec.retained_slot_count, &out),
+            -1, "refuse: a retained slot past the pool's");
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kPrefixSlot, &out), -1,
+            "refuse: the retained slot the prefix's image is in");
+  expect(out == nullptr, "refuse: and hands back no handle");
+  struct ignis_seq_pool_stats after_slots{};
+  expect_rc(ignis_seq_pool_stats(pool, &after_slots), 0, "refuse: pool stats after slots");
+  expect(after_slots.kv_free_pages == before_slots.kv_free_pages,
+         "refuse: a refused capture takes no page");
+
   // A capture still works afterwards: every refusal above left the sequence
   // and the pool exactly as they were.
-  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, &out), 0,
+  expect_rc(ignis_seq_checkpoint_capture(pool, publisher, kOpener, kCheckpointSlot, &out), 0,
             "refuse: a valid capture after every refusal");
   ignis_seq_checkpoint_release(pool, out);
 
@@ -641,6 +721,7 @@ int main() {
     return 1;
   }
   check_capture_perturbs_nothing();
+  check_a_page_aligned_opener_takes_no_page();
   // Both KV formats: BF16 is the oracle (ADR 0022), hq-e8-2b is what the
   // owner actually serves, and only hq exercises the four-plane page layout
   // the tail-page copy walks.

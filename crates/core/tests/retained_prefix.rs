@@ -232,8 +232,18 @@ fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() 
 fn a_whole_burst_of_subagents_claims_the_one_retained_block() {
     // The shape the feature exists for: one parent spawns a burst, and the
     // members neither overlap in time nor extend one another's prompts.
+    //
+    // Five members keep eleven images on the device — the block, and each
+    // member's chained link and checkpoint — so the load has room for them
+    // (GitHub #215: every one takes a retained slot).
     let compute = Arc::new(MockCompute::new());
-    let mut sched = scheduler(compute.clone(), config());
+    let mut sched = scheduler(
+        compute.clone(),
+        SchedulerConfig {
+            retained_slots: 11,
+            ..config()
+        },
+    );
     sched.submit(subagent(500), RequestClass::Agent).unwrap();
     run_to_idle(&mut sched);
 
@@ -328,7 +338,7 @@ fn the_prefill_is_cut_at_the_system_block_and_again_at_the_opener() {
         .iter()
         .flatten()
         .filter(|j| j.request == id)
-        .map(|j| j.publish_prefix_tokens)
+        .map(|j| j.publish_prefix.map(|p| p.tokens))
         .collect();
     assert_eq!(
         published,
@@ -340,7 +350,7 @@ fn the_prefill_is_cut_at_the_system_block_and_again_at_the_opener() {
         .iter()
         .flatten()
         .filter(|j| j.request == id)
-        .map(|j| j.capture_checkpoint_tokens)
+        .map(|j| j.capture_checkpoint.map(|c| c.tokens))
         .collect();
     assert_eq!(
         captured,
@@ -649,9 +659,11 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
         },
     );
     // The conversation: no block reported, so it publishes at its opener's
-    // page (32 = two pages) and captures a checkpoint at 37.
+    // page (32 = two pages) and captures a checkpoint there. The opener sits
+    // on the page boundary, so the checkpoint holds no page of its own
+    // (GitHub #215) and the arithmetic below is the prefixes' alone.
     sched
-        .submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive)
+        .submit(input(tokens(1, 40), None, Some(32), 4), RequestClass::Interactive)
         .unwrap();
     // The burst member: a one-page block, so it publishes at 16 — a different
     // head, so the one-publisher-per-head rule does not silence it. It reports
@@ -765,9 +777,10 @@ fn a_retained_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
 
 #[test]
 fn prompt_reuse_off_retains_no_prefix() {
-    // A cold bench measures a cold engine: nothing is retained, so the head
-    // goes back to the whole prompt's pages and a later subagent pays its
-    // block again.
+    // A cold bench measures a cold engine: nothing is retained, and since
+    // GitHub #215 nothing is shared either — a prefix's image takes a retained
+    // slot, and reuse off reserves none — so the prompt is not cut for a head
+    // and a later subagent pays its block again.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(
         compute.clone(),
@@ -780,8 +793,8 @@ fn prompt_reuse_off_retains_no_prefix() {
     run_to_idle(&mut sched);
     assert_eq!(
         chunk_widths(&compute, id),
-        vec![48, 12],
-        "cut at the whole prompt's pages, the way it was before #186"
+        vec![60],
+        "one chunk: no head is published for anybody"
     );
     assert_eq!(
         sched.prefix_pinned_pages(),

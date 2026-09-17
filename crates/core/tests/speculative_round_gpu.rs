@@ -114,7 +114,8 @@ fn pool_for(kv_format: KvFormat, slot_count: u32, backend: Option<SpeculativeBac
             kv_page_group_count: MAX_CONTEXT.div_ceil(64) * slot_count,
             max_context_tokens: MAX_CONTEXT,
             slot_count,
-            retained_slot_count: 0,
+            // One retained slot, for the prefix a test publishes (GitHub #215).
+            retained_slot_count: 1,
         },
         backend,
     )
@@ -524,7 +525,7 @@ fn the_verify_round_commits_the_spec_off_text_under_any_drafter() {
         assert_eq!(publisher.stats().position, 64, "the cut lands on the page boundary");
         // A prefix published at the cut: the claimant stands exactly where
         // the publisher stands, so the two continue with the same text.
-        let prefix = publisher.publish_prefix(64).unwrap_or_else(|e| panic!("publish the prefix at the cut: {e}"));
+        let prefix = publisher.publish_prefix(64, 0).unwrap_or_else(|e| panic!("publish the prefix at the cut: {e}"));
         let mut claimant = pool.alloc_shared(MAX_CONTEXT, &prefix).unwrap_or_else(|e| panic!("claim: {e}"));
         let from_publisher = continue_greedy(&model, &pool, &mut publisher, 8);
         let from_claimant = continue_greedy(&model, &pool, &mut claimant, 8);

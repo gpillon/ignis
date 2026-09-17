@@ -3,10 +3,17 @@
 //! lane slots, that hold one mutable-state image each — a lane's own state
 //! size — reserved at load.
 //!
-//! This is the allocator only: which retained slot is free, handed out, and
-//! taken back. It knows nothing about devices, so its rules are pinned on the
-//! CPU; the leaf's `ignis_seq_retained_store` / `ignis_seq_retained_load`
-//! move the state in and out of the slot it names.
+//! This is the allocator — which retained slot is free, handed out, and taken
+//! back — and, since GitHub #215, the ledger of **who holds each one**
+//! ([`RetainedSlotLedger`]). It knows nothing about devices, so its rules are
+//! pinned on the CPU; the leaf's prefix publish and checkpoint capture move
+//! the state into the slot the scheduler names.
+//!
+//! **A slot lives exactly as long as the backend's handle on what fills it.**
+//! A holder is named the way the backend names that handle — a shared prefix
+//! by its publisher and its length, a prompt checkpoint by its publisher — so
+//! the scheduler gives a slot back at the one call that drops the handle, and
+//! the two can never disagree about what still owns device state.
 
 /// One retained slot handed out by [`RetainedSlots::take`]: an index in
 /// `0..capacity`, never a lane's slot.
@@ -87,6 +94,116 @@ impl RetainedSlots {
     }
 }
 
+/// What holds a retained slot (GitHub #215): the image of a shared prefix or
+/// of a prompt checkpoint, named as the backend names its handle on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedHolder {
+    /// A shared prefix — retained, chained or claimed by live siblings — named
+    /// by the request that published it and the head's length (one request
+    /// may publish two heads, #187 x #188).
+    Prefix {
+        publisher: crate::types::RequestId,
+        tokens: u32,
+    },
+    /// A prompt checkpoint, named by the request that captured it (one per
+    /// request).
+    Checkpoint { publisher: crate::types::RequestId },
+}
+
+/// Why a publish or a capture was not taken (GitHub #215): retention is a
+/// bet, and when the room for it is not there the request runs without
+/// leaving reuse behind — it never waits and is never refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedSkip {
+    /// No retained slot was free and no retained state could give one up.
+    PublishNoSlot,
+    /// The same, for a prompt checkpoint.
+    CaptureNoSlot,
+    /// A checkpoint's partial tail page is a KV page of the pool, and the pool
+    /// had none spare.
+    CaptureNoPage,
+}
+
+impl RetainedSkip {
+    /// The log's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetainedSkip::PublishNoSlot => "publish_skipped_no_slot",
+            RetainedSkip::CaptureNoSlot => "capture_skipped_no_slot",
+            RetainedSkip::CaptureNoPage => "capture_skipped_no_page",
+        }
+    }
+}
+
+/// The retained slots of a load and who holds each (GitHub #215, ADR 0030).
+///
+/// The one bound on retained state on the device: a publish or a capture
+/// takes a slot here before the backend is asked for it, and gives it back
+/// when the backend's handle goes.
+#[derive(Debug)]
+pub struct RetainedSlotLedger {
+    slots: RetainedSlots,
+    held: Vec<(RetainedHolder, RetainedSlot)>,
+}
+
+impl RetainedSlotLedger {
+    /// A ledger over `capacity` retained slots, none held.
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            slots: RetainedSlots::new(capacity),
+            held: Vec::new(),
+        }
+    }
+
+    /// How many retained slots the load reserved.
+    pub fn capacity(&self) -> u32 {
+        self.slots.capacity()
+    }
+
+    /// How many are held.
+    pub fn in_use(&self) -> u32 {
+        self.slots.in_use()
+    }
+
+    /// A free slot for `holder`, as the index the leaf takes, or `None` when
+    /// every one is held.
+    ///
+    /// Panics when `holder` already holds one: a second image under one name
+    /// is a slot nothing would ever give back.
+    pub fn take(&mut self, holder: RetainedHolder) -> Option<u32> {
+        assert!(
+            self.index_of(holder).is_none(),
+            "{holder:?} already holds a retained slot"
+        );
+        let slot = self.slots.take()?;
+        let index = slot.index();
+        self.held.push((holder, slot));
+        Some(index)
+    }
+
+    /// Give back the slot `holder` holds. `false`, with nothing changed, when
+    /// it holds none — a handle whose image lives in KV-RAM, or one never
+    /// given a slot.
+    pub fn give_back(&mut self, holder: RetainedHolder) -> bool {
+        let Some(pos) = self.held.iter().position(|(h, _)| *h == holder) else {
+            return false;
+        };
+        let (_, slot) = self.held.swap_remove(pos);
+        self.slots
+            .give_back(slot)
+            .expect("a held slot is taken from this allocator");
+        true
+    }
+
+    /// The slot `holder` holds, if any.
+    fn index_of(&self, holder: RetainedHolder) -> Option<u32> {
+        self.held
+            .iter()
+            .find(|(h, _)| *h == holder)
+            .map(|(_, slot)| slot.index())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +267,53 @@ mod tests {
         let mut slots = RetainedSlots::new(0);
         assert_eq!(slots.capacity(), 0);
         assert_eq!(slots.take(), None);
+    }
+
+    const BLOCK: RetainedHolder = RetainedHolder::Prefix {
+        publisher: 1,
+        tokens: 32,
+    };
+    const CHAIN: RetainedHolder = RetainedHolder::Prefix {
+        publisher: 1,
+        tokens: 48,
+    };
+    const OPENER: RetainedHolder = RetainedHolder::Checkpoint { publisher: 1 };
+
+    #[test]
+    fn a_ledger_hands_each_holder_its_own_slot_until_none_is_left() {
+        let mut ledger = RetainedSlotLedger::new(2);
+        let block = ledger.take(BLOCK).expect("a free slot");
+        let chain = ledger.take(CHAIN).expect("another");
+        assert_ne!(block, chain, "one request's two heads are two slots");
+        assert_eq!(ledger.take(OPENER), None, "the third holder finds none");
+        assert_eq!(ledger.in_use(), 2);
+        assert_eq!(ledger.index_of(CHAIN), Some(chain));
+        assert_eq!(ledger.index_of(OPENER), None);
+    }
+
+    #[test]
+    fn giving_a_slot_back_frees_it_for_the_next_holder() {
+        let mut ledger = RetainedSlotLedger::new(1);
+        let index = ledger.take(BLOCK).unwrap();
+        assert!(ledger.give_back(BLOCK));
+        assert!(!ledger.give_back(BLOCK), "given back once");
+        assert!(!ledger.give_back(OPENER), "a holder with no slot gives nothing back");
+        assert_eq!(ledger.take(OPENER), Some(index));
+        assert_eq!(ledger.in_use(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "already holds a retained slot")]
+    fn a_holder_takes_one_slot_at_most() {
+        let mut ledger = RetainedSlotLedger::new(2);
+        ledger.take(OPENER);
+        ledger.take(OPENER);
+    }
+
+    #[test]
+    fn a_skip_is_spelled_as_the_log_names_it() {
+        assert_eq!(RetainedSkip::PublishNoSlot.as_str(), "publish_skipped_no_slot");
+        assert_eq!(RetainedSkip::CaptureNoSlot.as_str(), "capture_skipped_no_slot");
+        assert_eq!(RetainedSkip::CaptureNoPage.as_str(), "capture_skipped_no_page");
     }
 }

@@ -94,13 +94,12 @@ pub struct Config {
     /// claims none, so a cold bench measures a cold engine and a correctness
     /// oracle prefills every prompt it is given.
     pub prompt_reuse: bool,
-    /// The retained checkpoint pool's device budget, in bytes
-    /// (`--retained-pool-bytes`, GitHub #186). `0` retains nothing. A byte
-    /// budget for the reason [`Config::host_pool_bytes`] is one: an image is
-    /// dominated by a fixed state floor a short conversation pays exactly as
-    /// a long one does. Unset reserves three checkpoint images in the VRAM
-    /// plan (GitHub #210); `None` means "that default".
-    pub retained_pool_bytes: Option<u64>,
+    /// The load's retained slots (`--retained-slots`, GitHub #215, ADR 0030):
+    /// places for one mutable-state image each, reserved at load, where every
+    /// prompt checkpoint and shared prefix keeps its image. The only bound on
+    /// retained state on the device. [`DEFAULT_RETAINED_SLOTS`] with prompt
+    /// reuse on, 0 with it off.
+    pub retained_slots: u32,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it, in seconds
     /// (`--retained-interactive-ttl`, GitHub #190). Past it the entry ranks as
@@ -225,6 +224,10 @@ pub const DEFAULT_HOST_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// to.
 pub const DEFAULT_PROMPT_REUSE: bool = true;
 
+/// `--retained-slots`' default with prompt reuse on (GitHub #215, ADR 0030): a
+/// slot per decode lane. With `--prompt-reuse off` the default is 0.
+pub const DEFAULT_RETAINED_SLOTS: u32 = ignis_core::N_DECODE_LANES as u32;
+
 /// `--retained-interactive-ttl`'s default, in seconds (GitHub #190): the
 /// scheduler's own starting value, restated as a flag default rather than
 /// chosen twice.
@@ -285,6 +288,7 @@ pub fn resolve(
     let mut allow_vram_oversubscription = false;
     let mut prompt_reuse = None;
     let mut retained_pool_bytes = None;
+    let mut retained_slots = None;
     let mut retained_interactive_ttl = None;
     let mut system_message_policy = None;
     let mut developer_message_policy = None;
@@ -322,6 +326,7 @@ pub fn resolve(
             "--retained-pool-bytes" => {
                 retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
             }
+            "--retained-slots" => retained_slots = Some(take_value(args, &mut i, flag)?),
             "--retained-interactive-ttl" => {
                 retained_interactive_ttl = Some(take_value(args, &mut i, flag)?)
             }
@@ -385,8 +390,8 @@ pub fn resolve(
     )?;
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
-    let retained_pool_bytes =
-        resolve_retained_pool_bytes(retained_pool_bytes, &env, prompt_reuse)?;
+    refuse_retained_pool_bytes(retained_pool_bytes, &env)?;
+    let retained_slots = resolve_retained_slots(retained_slots, &env, prompt_reuse)?;
     let retained_interactive_ttl_secs =
         resolve_retained_interactive_ttl(retained_interactive_ttl, &env, prompt_reuse)?;
     let instruction_policy = InstructionPolicy {
@@ -457,7 +462,7 @@ pub fn resolve(
         vram,
         host_pool_bytes,
         prompt_reuse,
-        retained_pool_bytes,
+        retained_slots,
         retained_interactive_ttl_secs,
         instruction_policy,
         speculation,
@@ -841,27 +846,46 @@ fn resolve_policy<P: Copy, const N: usize>(
     }
 }
 
-/// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` (GitHub #186).
-/// Unset is `None`: the VRAM plan then reserves three checkpoint images, a
-/// size only the loader can ask the leaf for (GitHub #210).
+/// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` is gone (GitHub
+/// #215): retained state lives in retained slots, and the byte ledger this
+/// sized went with it. Named anyway, it is a configuration error pointing at
+/// what replaced it, rather than a budget silently ignored.
+fn refuse_retained_pool_bytes(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    match non_empty(flag.or_else(|| env("IGNIS_RETAINED_POOL_BYTES"))) {
+        None => Ok(()),
+        Some(raw) => Err(ConfigError(format!(
+            "`--retained-pool-bytes {raw}` (IGNIS_RETAINED_POOL_BYTES) was removed: retained state \
+             lives in retained slots now; size them with `--retained-slots <n>` \
+             (IGNIS_RETAINED_SLOTS, default {DEFAULT_RETAINED_SLOTS})"
+        ))),
+    }
+}
+
+/// `--retained-slots` / `IGNIS_RETAINED_SLOTS` (GitHub #215, ADR 0030):
+/// [`DEFAULT_RETAINED_SLOTS`] with prompt reuse on, 0 with it off. `0` is a
+/// legal choice with reuse on: nothing is published or captured, and the VRAM
+/// plan reserves no slot.
 ///
-/// Naming a budget with `--prompt-reuse off` is refused rather than ignored,
-/// the house rule every other sub-flag follows: a pool that will never hold
-/// anything is not what the operator meant to size.
-fn resolve_retained_pool_bytes(
+/// Naming a count with `--prompt-reuse off` is refused rather than ignored,
+/// the house rule every other sub-flag follows: slots nothing will ever fill
+/// are not what the operator meant to reserve.
+fn resolve_retained_slots(
     flag: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
     prompt_reuse: bool,
-) -> Result<Option<u64>, ConfigError> {
-    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_POOL_BYTES"))) else {
-        return Ok(None);
+) -> Result<u32, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_SLOTS"))) else {
+        return Ok(if prompt_reuse { DEFAULT_RETAINED_SLOTS } else { 0 });
     };
     if !prompt_reuse {
         return Err(ConfigError(format!(
-            "`--retained-pool-bytes {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
+            "`--retained-slots {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
         )));
     }
-    parse_bytes("--retained-pool-bytes", &raw).map(Some)
+    parse_count("--retained-slots", "slot count", &raw)
 }
 
 /// `--kv-host-pool-bytes` / `IGNIS_KV_HOST_POOL_BYTES` / [`DEFAULT_HOST_POOL_BYTES`]
@@ -958,8 +982,8 @@ fn help_text() -> String {
          \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
          \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
-         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused)\n\
-         \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: three checkpoint images, reserved in the VRAM plan; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
+         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared, since no retained slot is reserved)\n\
+         \x20       --retained-slots <n>      env: IGNIS_RETAINED_SLOTS (default: {DEFAULT_RETAINED_SLOTS}, one per decode lane; 0 with --prompt-reuse off; the images of retained checkpoints and shared prefixes, reserved in the VRAM plan)\n\
          \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
          \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
@@ -1525,13 +1549,14 @@ mod tests {
         let config = expect_config(resolve(&[], no_env).expect("resolve"));
         assert!(config.prompt_reuse, "on by default (ADR 0029)");
         assert_eq!(
-            config.retained_pool_bytes, None,
-            "no budget named: the VRAM plan reserves the default"
+            config.retained_slots, DEFAULT_RETAINED_SLOTS,
+            "a retained slot per decode lane by default"
         );
 
         let config =
             expect_config(resolve(&args(&["--prompt-reuse", "off"]), no_env).expect("resolve"));
         assert!(!config.prompt_reuse);
+        assert_eq!(config.retained_slots, 0, "reuse off reserves no slot");
 
         let env = env_map(&[("IGNIS_PROMPT_REUSE", "off")]);
         let config = expect_config(resolve(&[], env).expect("resolve"));
@@ -1618,24 +1643,36 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_retained_pool_budget_overrides_the_derived_one() {
-        let config = expect_config(
-            resolve(&args(&["--retained-pool-bytes", "512M"]), no_env).expect("resolve"),
-        );
-        assert_eq!(config.retained_pool_bytes, Some(512 * 1024 * 1024));
+    fn retained_slots_are_configurable_by_flag_or_env() {
+        let config =
+            expect_config(resolve(&args(&["--retained-slots", "3"]), no_env).expect("resolve"));
+        assert_eq!(config.retained_slots, 3);
 
-        let env = env_map(&[("IGNIS_RETAINED_POOL_BYTES", "1G")]);
+        let env = env_map(&[("IGNIS_RETAINED_SLOTS", "12")]);
         let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.retained_pool_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(config.retained_slots, 12);
+
+        let env = env_map(&[("IGNIS_RETAINED_SLOTS", "12")]);
+        let a = args(&["--retained-slots", "0"]);
+        let config = expect_config(resolve(&a, env).expect("resolve"));
+        assert_eq!(config.retained_slots, 0, "flag must win over env, and zero is legal");
+
+        let err = resolve(&args(&["--retained-slots", "8G"]), no_env).expect_err("not a count");
+        assert!(err.0.contains("--retained-slots"), "{}", err.0);
+    }
+
+    #[test]
+    fn the_removed_retained_pool_budget_is_an_error_naming_retained_slots() {
+        // GitHub #215: the byte ledger is gone. A start script still passing it
+        // is told what replaced it rather than silently running without it.
+        let err = resolve(&args(&["--retained-pool-bytes", "512M"]), no_env)
+            .expect_err("the flag was removed");
+        assert!(err.0.contains("--retained-pool-bytes"), "{}", err.0);
+        assert!(err.0.contains("--retained-slots"), "points to the new flag: {}", err.0);
 
         let env = env_map(&[("IGNIS_RETAINED_POOL_BYTES", "1G")]);
-        let a = args(&["--retained-pool-bytes", "256M"]);
-        let config = expect_config(resolve(&a, env).expect("resolve"));
-        assert_eq!(
-            config.retained_pool_bytes,
-            Some(256 * 1024 * 1024),
-            "flag must win over env"
-        );
+        let err = resolve(&[], env).expect_err("the env var was removed too");
+        assert!(err.0.contains("IGNIS_RETAINED_SLOTS"), "{}", err.0);
     }
 
     #[test]
@@ -1662,12 +1699,12 @@ mod tests {
     }
 
     #[test]
-    fn a_retained_pool_budget_without_reuse_is_refused_not_ignored() {
-        // The house rule every other sub-flag follows: sizing a pool that
-        // will never hold anything is not what the operator meant.
-        let a = args(&["--prompt-reuse", "off", "--retained-pool-bytes", "512M"]);
-        let err = resolve(&a, no_env).expect_err("a budget with reuse off");
-        assert!(err.0.contains("--retained-pool-bytes"), "{}", err.0);
+    fn retained_slots_without_reuse_are_refused_not_ignored() {
+        // The house rule every other sub-flag follows: reserving slots nothing
+        // will ever fill is not what the operator meant.
+        let a = args(&["--prompt-reuse", "off", "--retained-slots", "4"]);
+        let err = resolve(&a, no_env).expect_err("slots with reuse off");
+        assert!(err.0.contains("--retained-slots"), "{}", err.0);
         assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
     }
 

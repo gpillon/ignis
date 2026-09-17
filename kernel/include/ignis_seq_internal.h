@@ -133,6 +133,11 @@ struct ignis_seq_pool {
    * lanes (GitHub #211), and what one slot's state occupies. */
   std::uint32_t retained_slot_count = 0;
   std::uint64_t slot_state_bytes = 0;
+  /* Which retained slots hold a published prefix's or a captured checkpoint's
+   * image (GitHub #215), one flag per slot. The caller decides which slot a
+   * publish or a capture takes (`ignis_core::RetainedSlotLedger`); this is the
+   * leaf refusing to write an image over one that is still claimable. */
+  std::vector<bool> retained_held;
 
   // P3-03 (GitHub #99): one int32 occurrence count per vocab entry, per slot
   // -- device-side presence/frequency penalties read and atomically update
@@ -279,42 +284,38 @@ inline bool ignis_seq_belongs_to(const ignis_seq_pool &pool, const ignis_seq &se
  * kernel/src/seq.cu. */
 void ignis_alloc_count_record(std::int32_t kind, bool alloc, std::uint64_t bytes);
 
-/* A `ninfer::DeviceBuffer` whose allocation and free are counted under one
- * ignis_alloc_kind (GitHub #211): the retained state images the leaf
- * allocates while serving. A moved-from buffer holds nothing and counts
- * nothing, so every path an entry takes -- released, replaced, or unwound
- * by a failed call -- is counted once. */
-struct ignis_counted_device_buffer : ninfer::DeviceBuffer {
-  std::int32_t kind;
+/* --- retained slots (GitHub #211, #215, ADR 0030) -------------------------- */
 
-  explicit ignis_counted_device_buffer(std::int32_t kind_) noexcept : kind(kind_) {}
+/* The pool slot index of retained slot `retained_slot`: past every lane. */
+inline std::int32_t ignis_seq_retained_pool_slot(const ignis_seq_pool &pool,
+                                                 std::uint32_t retained_slot) {
+  return pool.kv_pool.table_row_count() + static_cast<std::int32_t>(retained_slot);
+}
 
-  ignis_counted_device_buffer(std::int32_t kind_, std::size_t size_bytes)
-      : ninfer::DeviceBuffer(size_bytes), kind(kind_) {
-    if (p != nullptr) {
-      ignis_alloc_count_record(kind, true, bytes);
-    }
+/* Why an image cannot be written into retained slot `retained_slot`, or an
+ * empty string when it can: a slot past the pool's retained slots, or one
+ * still holding a claimable image. */
+inline std::string ignis_seq_retained_slot_refusal(const ignis_seq_pool &pool,
+                                                   std::uint32_t retained_slot) {
+  if (retained_slot >= pool.retained_slot_count) {
+    return "retained slot " + std::to_string(retained_slot) + " is out of range; this pool holds " +
+           std::to_string(pool.retained_slot_count);
   }
-
-  ~ignis_counted_device_buffer() {
-    if (p != nullptr) {
-      ignis_alloc_count_record(kind, false, bytes);
-    }
+  if (pool.retained_held[retained_slot]) {
+    return "retained slot " + std::to_string(retained_slot) +
+           " still holds a prefix's or a checkpoint's image; it comes back when that handle is "
+           "released";
   }
+  return {};
+}
 
-  ignis_counted_device_buffer(ignis_counted_device_buffer &&other) noexcept = default;
-
-  ignis_counted_device_buffer &operator=(ignis_counted_device_buffer &&other) noexcept {
-    if (this != &other) {
-      if (p != nullptr) {
-        ignis_alloc_count_record(kind, false, bytes);
-      }
-      ninfer::DeviceBuffer::operator=(std::move(other));
-      kind = other.kind;
-    }
-    return *this;
-  }
-};
+/* Copy every mutable state section of pool slot `src` over pool slot `dst`,
+ * device to device, and synchronize: a lane into a retained slot, a retained
+ * slot into a lane. Walks the CLONE sections of the state-section table, so a
+ * section added there without a case here throws rather than being silently
+ * left behind (ADR 0024's "carried by all or by none"). Defined in
+ * kernel/src/seq.cu. */
+void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst);
 
 /* The leaf's thread-local last-error slot -- the one `ignis_seq_last_error`
  * reports. Defined in kernel/src/seq.cu and written by kernel/src/seq_prefix.cu

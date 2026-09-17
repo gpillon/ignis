@@ -10,6 +10,10 @@
 // it, so it can never be shared), and one reference to the prefix holding
 // every whole page below it.
 //
+// Since GitHub #215 (ADR 0030) none of the three allocates: the state goes
+// into a retained slot the caller names, reserved at load, and the partial
+// page into one KV page of the pool.
+//
 // What is moved and what it is made of are not decided here. The sections
 // come from the leaf's one state-section table through
 // ignis_seq_prefix_internal.h, and the pages from the vendored paged pool.
@@ -73,22 +77,13 @@ bool checkpoint_belongs_to(const ignis_seq_pool &pool,
   return checkpoint.prefix != nullptr && checkpoint.prefix->kv.belongs_to(pool.kv_pool);
 }
 
-} // namespace
-
-extern "C" int32_t ignis_seq_checkpoint_image_bytes(const struct ignis_seq_pool *pool,
-                                                     uint64_t *out_bytes) {
-  if (pool == nullptr || out_bytes == nullptr) {
-    ignis_seq_set_last_error("ignis_seq_checkpoint_image_bytes: null argument");
-    return -1;
-  }
-  try {
-    *out_bytes = ignis_seq_checkpoint_image_bytes_of(*pool);
-    return 0;
-  } catch (const std::exception &e) {
-    ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_image_bytes: ") + e.what());
-    return -1;
-  }
+// The pool page holding the checkpoint's copy of its partial page, or -1 for
+// an opener on a page boundary.
+std::int32_t tail_page_of(const ignis_seq_checkpoint &checkpoint) {
+  return checkpoint.tail.valid() ? checkpoint.tail.page_ids()[0] : -1;
 }
+
+} // namespace
 
 extern "C" int32_t
 ignis_seq_checkpoint_snapshot_size(const struct ignis_seq_pool *pool,
@@ -132,11 +127,10 @@ extern "C" int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *po
     // The prefix chain's whole pages, then the opener's partial page from the
     // checkpoint's own copy -- the layout a sequence standing at the opener
     // would have packed. A checkpoint on a page boundary has no partial page.
-    const std::uint32_t pages = ninfer::pages_for_tokens(checkpoint->tokens);
-    const bool partial = pages > ignis_seq_prefix_total_pages(*checkpoint->prefix);
-    ignis_seq_write_materialized_blob(*pool, checkpoint->prefix,
-                                      partial ? checkpoint->tail_page.p : nullptr,
-                                      checkpoint->image.p, checkpoint->progress, pages, dst,
+    ignis_seq_write_materialized_blob(*pool, checkpoint->prefix, tail_page_of(*checkpoint),
+                                      static_cast<std::uint32_t>(checkpoint->retained_slot),
+                                      checkpoint->progress,
+                                      ninfer::pages_for_tokens(checkpoint->tokens), dst,
                                       dst_bytes);
     return 0;
   } catch (const std::exception &e) {
@@ -146,7 +140,7 @@ extern "C" int32_t ignis_seq_checkpoint_snapshot(const struct ignis_seq_pool *po
 }
 
 extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, struct ignis_seq *seq,
-                                                 uint32_t opener_tokens,
+                                                 uint32_t opener_tokens, uint32_t retained_slot,
                                                  struct ignis_seq_checkpoint **out_checkpoint) {
   if (out_checkpoint != nullptr) {
     *out_checkpoint = nullptr;
@@ -232,29 +226,41 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
                              std::to_string(seq->slot) + " maps no page of its own to capture");
     return -1;
   }
+  if (const std::string refusal = ignis_seq_retained_slot_refusal(*pool, retained_slot);
+      !refusal.empty()) {
+    ignis_seq_set_last_error("ignis_seq_checkpoint_capture: " + refusal);
+    return -1;
+  }
+  // GitHub #215: an opener on a page boundary ends inside no page, so only
+  // one that does not takes a page of the pool for its copy.
+  const bool partial = opener_tokens % page_size != 0;
+  if (partial && !pool->kv_pool.can_reserve(1)) {
+    ignis_seq_set_last_error("ignis_seq_checkpoint_capture: the KV pool has no page left for the "
+                             "copy of the page the opener ends inside");
+    return -1;
+  }
 
   try {
-    // Every fallible step happens here, against buffers of this call's own.
-    // The sequence is read and never touched, so a failure -- an allocation,
-    // a copy, a synchronize -- leaves it exactly as it was and the caller
-    // simply did not get a checkpoint.
-    auto entry            = std::make_unique<ignis_seq_checkpoint>();
-    const std::uint64_t state_bytes =
-        ignis_seq_prefix_clone_bytes(ignis_seq_prefix_clone_layout(*pool));
-    entry->image     = ignis_counted_device_buffer(IGNIS_ALLOC_CHECKPOINT_IMAGE,
-                                                   static_cast<std::size_t>(state_bytes));
-    entry->tail_page = ignis_counted_device_buffer(
-        IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE,
-        static_cast<std::size_t>(ignis_seq_checkpoint_page_bytes(*pool)));
-    entry->tokens    = opener_tokens;
+    // Every fallible step happens here, against the entry's own page and a
+    // slot nothing holds. The sequence is read and never touched, so a
+    // failure -- a copy, a synchronize -- leaves it exactly as it was, the
+    // page goes back with the entry, and the caller simply did not get a
+    // checkpoint.
+    auto entry         = std::make_unique<ignis_seq_checkpoint>();
+    entry->tokens      = opener_tokens;
+    entry->image_bytes = pool->slot_state_bytes;
+    if (partial) {
+      entry->tail = pool->kv_pool.reserve(1);
+      entry->tail.materialize_pages(1);
+      entry->image_bytes += ignis_seq_checkpoint_page_bytes(*pool);
+    }
 
     const std::int32_t own_page = seq->kv.page_ids()[0];
     timed([&] {
-      ignis_seq_state_transfer(*pool, static_cast<unsigned char *>(entry->image.p),
-                               entry->progress, *seq, IGNIS_SEQ_PREFIX_CAPTURE);
-      ignis_seq_checkpoint_page_transfer(*pool, own_page,
-                                         static_cast<unsigned char *>(entry->tail_page.p),
-                                         IGNIS_SEQ_PREFIX_CAPTURE);
+      ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress);
+      if (partial) {
+        ignis_seq_copy_kv_page(*pool, own_page, tail_page_of(*entry));
+      }
     });
 
     // Nothing below can fail. The checkpoint takes one reference to the
@@ -262,7 +268,9 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     // outlives the request that warmed them.
     entry->prefix = seq->prefix;
     ++entry->prefix->refcount;
-    *out_checkpoint = entry.release();
+    entry->retained_slot               = static_cast<std::int32_t>(retained_slot);
+    pool->retained_held[retained_slot] = true;
+    *out_checkpoint                    = entry.release();
     return 0;
   } catch (const std::exception &e) {
     ignis_seq_set_last_error(std::string("ignis_seq_checkpoint_capture: ") + e.what());
@@ -294,15 +302,15 @@ extern "C" int32_t ignis_seq_alloc_from_checkpoint(struct ignis_seq_pool *pool,
   try {
     const std::int32_t own_page = seq->kv.page_ids()[0];
     checkpoint->last_claim_micros = timed([&] {
-      ignis_seq_state_transfer(*pool, static_cast<unsigned char *>(checkpoint->image.p),
-                               checkpoint->progress, *seq, IGNIS_SEQ_PREFIX_CLONE);
+      ignis_seq_clone_state(*pool, static_cast<std::uint32_t>(checkpoint->retained_slot),
+                            checkpoint->progress, *seq);
       // The partial page the opener ends inside, into the first page this
       // sequence owns. `ignis_seq_alloc_against_prefix` zeroed that page a
-      // moment ago; this overwrites the part of it that is history, and the
-      // rest stays zero for the tail the claimant prefills itself.
-      ignis_seq_checkpoint_page_transfer(*pool, own_page,
-                                         static_cast<unsigned char *>(checkpoint->tail_page.p),
-                                         IGNIS_SEQ_PREFIX_CLONE);
+      // moment ago; this writes the capture's copy over it, which carries the
+      // history and nothing past the opener.
+      if (checkpoint->tail.valid()) {
+        ignis_seq_copy_kv_page(*pool, tail_page_of(*checkpoint), own_page);
+      }
     });
     ++checkpoint->claim_count;
     return 0;
@@ -332,8 +340,12 @@ extern "C" void ignis_seq_checkpoint_release(struct ignis_seq_pool *pool,
                              "this pool; nothing was released");
     return;
   }
-  // The device images go with the entry; the prefix under it loses one
-  // holder, and its pages come back only if that was the last.
+  // The retained slot comes back, and the tail page goes with the entry; the
+  // prefix under it loses one holder, and its pages come back only if that
+  // was the last.
+  if (pool != nullptr && checkpoint->retained_slot >= 0) {
+    pool->retained_held[static_cast<std::size_t>(checkpoint->retained_slot)] = false;
+  }
   ignis_seq_prefix_drop_reference(checkpoint->prefix);
   delete checkpoint;
 }
@@ -349,8 +361,7 @@ extern "C" int32_t ignis_seq_checkpoint_stats(const struct ignis_seq_checkpoint 
   out_stats->pages = checkpoint->prefix == nullptr
                          ? 0
                          : ignis_seq_prefix_total_pages(*checkpoint->prefix);
-  out_stats->image_bytes =
-      static_cast<std::uint64_t>(checkpoint->image.bytes) + checkpoint->tail_page.bytes;
+  out_stats->image_bytes       = checkpoint->image_bytes;
   out_stats->claim_count       = checkpoint->claim_count;
   out_stats->last_claim_micros = checkpoint->last_claim_micros;
   return 0;

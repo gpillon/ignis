@@ -63,9 +63,7 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use checkpoint::{
-    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool,
-    MAX_AUTO_RETAINED_POOL_BYTES, RETAINED_POOL_RESERVE_BYTES, ReuseSource,
-    auto_retained_pool_bytes,
+    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool, ReuseSource,
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{
@@ -84,8 +82,12 @@ pub use kv_format::{
 pub use mock::MockCompute;
 pub use prefix::{PrefixCache, PrefixClaim, PrefixEntry, PrefixId};
 pub use request::{Request, admit_candidates, basic_admission};
-pub use retained_slot::{NotTaken, RetainedSlot, RetainedSlots};
-pub use scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, Scheduler};
+pub use retained_slot::{
+    NotTaken, RetainedHolder, RetainedSkip, RetainedSlot, RetainedSlotLedger, RetainedSlots,
+};
+pub use scheduler::{
+    Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
+};
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,

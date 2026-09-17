@@ -23,13 +23,14 @@
 //! - **Reuse copies, never consumes.** [`CheckpointPool::claim`] hands out a
 //!   match and leaves the entry in place, so a retry, a regenerate and two
 //!   forks from the same history all hit (ADR 0029).
-//! - **Retained state is free until the room is needed.** The pool has a byte
-//!   budget ([`CheckpointPool::admits`]); when it is full a capture is simply
-//!   **not taken** — [`CheckpointPool::retain`] never evicts to make room for
-//!   itself. What *does* remove an entry is a live request needing the pages
-//!   ([`CheckpointPool::discard_victim`]): retained state is the first victim
-//!   on the device, always, and it never delays or refuses an admission (ADR
-//!   0023 as amended by ADR 0029).
+//! - **Retained state is free until the room is needed.** What bounds it on
+//!   the device is the load's **retained slots** (GitHub #215, ADR 0030),
+//!   which the scheduler hands out before it asks the backend to capture;
+//!   this ledger counts no bytes of its own. What removes an entry is a live
+//!   request needing the pages ([`CheckpointPool::discard_victim`]), or
+//!   another publish or capture needing a slot: retained state is the first
+//!   victim on the device, always, and it never delays or refuses an
+//!   admission (ADR 0023 as amended by ADR 0029).
 //! - **Entries are addressed by content, never by session.** The match is the
 //!   longest retained entry whose [`MatchKey`] — a hash chain over the token
 //!   ids, with each media item's identity mixed in (GitHub #189,
@@ -336,9 +337,10 @@ impl TierList {
 /// it ([`CheckpointEntry::prefix`]), held by the same refcount every
 /// concurrent sibling uses — so the pages are charged to the pool exactly
 /// once whether a live sibling, a retained checkpoint, or both are holding
-/// them. What the entry itself costs is [`CheckpointEntry::bytes`]: the
-/// device image of the mutable sections plus the copy of the partial tail
-/// page, which is what the pool's byte budget bounds.
+/// them. What the entry itself holds on the device is one retained slot for
+/// the image of the mutable sections, and one KV page for the partial tail
+/// page when the opener ends inside one (GitHub #215) — the scheduler's to
+/// account, since it hands both out.
 #[derive(Debug, Clone)]
 pub struct CheckpointEntry {
     /// The entry's opaque id.
@@ -376,8 +378,6 @@ pub struct CheckpointEntry {
     pub prefix: PrefixId,
     /// Whole KV pages that shared prefix holds (`tokens` floored to pages).
     pub pages: u32,
-    /// Device bytes the entry's own image occupies in the retained pool.
-    pub bytes: u64,
     /// The GDN state at the opener (core-02: a claimant resumes its recurrent
     /// state from a recorded boundary).
     pub gdn: GdnState,
@@ -442,8 +442,6 @@ pub struct CheckpointCapture {
     pub prefix: PrefixId,
     /// Whole KV pages that shared prefix holds.
     pub pages: u32,
-    /// Device bytes the entry's own image occupies.
-    pub bytes: u64,
     /// The GDN state at the opener.
     pub gdn: GdnState,
     /// What the state was produced under.
@@ -488,10 +486,6 @@ pub struct Retained {
 /// Why the pool would not take a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetainRefused {
-    /// The byte budget cannot hold the image. The ordinary, expected answer:
-    /// retention is a bet, and a full pool simply does not take one (ADR
-    /// 0029). Nothing is evicted to make room.
-    Budget,
     /// The state was produced under an identity this load cannot accept — a
     /// blob from another artifact, KV format, blob layout or drafter. It is
     /// refused here, before a single byte is written into a sequence.
@@ -503,7 +497,6 @@ pub enum RetainRefused {
 impl std::fmt::Display for RetainRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RetainRefused::Budget => write!(f, "the retained pool's byte budget is full"),
             RetainRefused::Identity(mismatch) => write!(f, "{mismatch}"),
             RetainRefused::UnknownTier(source) => {
                 write!(f, "this load has no {} tier", source.as_str())
@@ -569,18 +562,15 @@ impl CheckpointLookup {
     }
 }
 
-/// The byte-budgeted device pool of retained prompt checkpoints (ADR 0029,
-/// `--retained-pool-bytes`).
+/// The ledger of retained prompt checkpoints across the residency tiers (ADR
+/// 0029).
 ///
-/// A byte budget rather than an entry count for the reason the KV-RAM tier
-/// uses one (`crate::host`): a checkpoint's image is dominated by the GDN
-/// recurrent state and the drafter window, a fixed floor that a short
-/// conversation pays exactly as a long one does, so counting entries would
-/// misprice the thing being bounded.
+/// It bounds nothing on the device itself. Since GitHub #215 a device entry's
+/// image lives in one of the load's retained slots, which the scheduler hands
+/// out before it lets the backend capture — so the slot count is the one
+/// bound, and a pool with no slot to spare is simply never offered a capture.
 #[derive(Debug)]
 pub struct CheckpointPool {
-    capacity_bytes: u64,
-    used_bytes: u64,
     identity: BlobIdentity,
     tiers: TierList,
     entries: Vec<CheckpointEntry>,
@@ -588,30 +578,31 @@ pub struct CheckpointPool {
     next_lineage: LineageId,
     reused_tok: u64,
     captures: u64,
-    skipped_captures: u64,
     refused_blobs: u64,
     discards: u64,
 }
 
+impl Default for CheckpointPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CheckpointPool {
-    /// A pool bounded by `capacity_bytes` of device image, holding state
-    /// produced under [`BlobIdentity::UNSET`] on the device alone. `0`
-    /// disables retention entirely (every capture is skipped) — a legal,
-    /// explicit choice, the way a `0` KV-RAM budget disables the host tier.
-    pub fn new(capacity_bytes: u64) -> Self {
-        Self::with_identity(capacity_bytes, BlobIdentity::UNSET)
+    /// A pool holding state produced under [`BlobIdentity::UNSET`] on the
+    /// device alone.
+    pub fn new() -> Self {
+        Self::with_identity(BlobIdentity::UNSET)
     }
 
     /// A pool for state produced under `identity`, on the device alone.
-    pub fn with_identity(capacity_bytes: u64, identity: BlobIdentity) -> Self {
-        Self::with_tiers(capacity_bytes, identity, TierList::device_only())
+    pub fn with_identity(identity: BlobIdentity) -> Self {
+        Self::with_tiers(identity, TierList::device_only())
     }
 
     /// A pool for state produced under `identity`, across `tiers`.
-    pub fn with_tiers(capacity_bytes: u64, identity: BlobIdentity, tiers: TierList) -> Self {
+    pub fn with_tiers(identity: BlobIdentity, tiers: TierList) -> Self {
         Self {
-            capacity_bytes,
-            used_bytes: 0,
             identity,
             tiers,
             entries: Vec::new(),
@@ -619,15 +610,9 @@ impl CheckpointPool {
             next_lineage: 0,
             reused_tok: 0,
             captures: 0,
-            skipped_captures: 0,
             refused_blobs: 0,
             discards: 0,
         }
-    }
-
-    /// The pool's byte budget.
-    pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
     }
 
     /// The identity state retained here was produced under: what a blob has
@@ -639,18 +624,6 @@ impl CheckpointPool {
     /// The residency tiers this pool retains state across, cheapest first.
     pub fn tiers(&self) -> &TierList {
         &self.tiers
-    }
-
-    /// Image bytes the retained entries occupy.
-    ///
-    /// **One budget, the device's** — [`CheckpointPool::capacity_bytes`] is
-    /// `--retained-pool-bytes`, and every entry is charged to it whatever tier
-    /// it names. That is right while the device is the only tier that holds
-    /// anything, and it is the first thing #190 has to split: KV-RAM has its
-    /// own budget, and an entry that left the card must give its device bytes
-    /// back or the pool will refuse captures for room nothing is using.
-    pub fn used_bytes(&self) -> u64 {
-        self.used_bytes
     }
 
     /// Retained entries.
@@ -717,21 +690,12 @@ impl CheckpointPool {
     /// retained.
     ///
     /// A second capture at the same point would be a second image of the same
-    /// state: the same skip for a claimant, paid for twice out of the byte
-    /// budget. The caller checks this before it asks the backend to capture,
+    /// state: the same skip for a claimant, paid for with a second retained
+    /// slot. The caller checks this before it asks the backend to capture,
     /// the way [`crate::prefix::PrefixCache::register`] declines a duplicate
     /// prompt head.
     pub fn holds(&self, key: MatchKey) -> bool {
         self.entries.iter().any(|e| e.key == key)
-    }
-
-    /// Whether the byte budget can take one more image of `bytes`.
-    ///
-    /// This is the whole of "a full pool skips the capture": a capture that
-    /// does not fit is **not taken**, and nothing is evicted to make room for
-    /// it. Retention is a bet; a bet never costs certain work (ADR 0029).
-    pub fn admits(&self, bytes: u64) -> bool {
-        bytes > 0 && self.used_bytes.saturating_add(bytes) <= self.capacity_bytes
     }
 
     /// A content key this load may match against — one whose state was
@@ -747,11 +711,8 @@ impl CheckpointPool {
     /// blob adopted from a tier that outlives it.
     ///
     /// Returns the new entry's id, or why the pool would not take it. A
-    /// [`RetainRefused::Budget`] is the ordinary answer to a full pool — the
-    /// caller must have asked [`CheckpointPool::admits`] before it let the
-    /// backend capture anything, so it means the capture raced its own budget
-    /// rather than that something went wrong. A [`RetainRefused::Identity`] is
-    /// the Tier 2 refusal: the bytes exist and this load cannot use them.
+    /// [`RetainRefused::Identity`] is the Tier 2 refusal: the bytes exist and
+    /// this load cannot use them.
     pub fn retain(
         &mut self,
         capture: CheckpointCapture,
@@ -764,10 +725,6 @@ impl CheckpointPool {
         if self.tiers.rank(capture.tier).is_none() {
             self.refused_blobs += 1;
             return Err(RetainRefused::UnknownTier(capture.tier));
-        }
-        if capture.tier == ReuseSource::Device && !self.admits(capture.bytes) {
-            self.skipped_captures += 1;
-            return Err(RetainRefused::Budget);
         }
         // GitHub #187. A claimed entry that is already gone — taken by the
         // first-victim path, or superseded by a sibling that finished first —
@@ -788,9 +745,6 @@ impl CheckpointPool {
         };
         let id = self.next_id;
         self.next_id += 1;
-        if capture.tier == ReuseSource::Device {
-            self.used_bytes += capture.bytes;
-        }
         self.captures += 1;
         self.entries.push(CheckpointEntry {
             id,
@@ -801,7 +755,6 @@ impl CheckpointPool {
             tier: capture.tier,
             prefix: capture.prefix,
             pages: capture.pages,
-            bytes: capture.bytes,
             gdn: capture.gdn,
             lineage,
             turn_opening: capture.turn_opening,
@@ -1023,12 +976,36 @@ impl CheckpointPool {
         tier: ReuseSource,
         prefixes: Option<&[PrefixId]>,
     ) -> Option<CheckpointEntry> {
+        self.victim_where(tier, |e| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
+    }
+
+    /// [`CheckpointPool::victim_in`] over the entries `candidate` accepts.
+    pub fn victim_where(
+        &self,
+        tier: ReuseSource,
+        candidate: impl Fn(&CheckpointEntry) -> bool,
+    ) -> Option<CheckpointEntry> {
         self
             .entries
             .iter()
-            .filter(|e| e.tier == tier)
-            .filter(|e| prefixes.is_none_or(|allowed| allowed.contains(&e.prefix)))
+            .filter(|e| e.tier == tier && candidate(e))
             .min_by_key(|e| (e.use_tick, e.id))
+            .cloned()
+    }
+
+    /// The device checkpoint a publish or a capture short of a retained slot
+    /// gives up (GitHub #215, ADR 0030), or `None`: the lowest class first
+    /// (`Agent` before `Interactive`, ADR 0023), then the least recently used,
+    /// never one of `claimed` — a request's image copy still to come out of
+    /// its slot.
+    ///
+    /// [`CheckpointPool::victim_in`] keeps the page path's least recently used
+    /// alone.
+    pub fn retained_slot_victim(&self, claimed: &[CheckpointId]) -> Option<CheckpointEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.tier == ReuseSource::Device && !claimed.contains(&e.id))
+            .min_by_key(|e| (e.class.eviction_rank(), e.use_tick, e.id))
             .cloned()
     }
 
@@ -1041,27 +1018,17 @@ impl CheckpointPool {
     /// Move an existing entry down the configured residency order.
     ///
     /// The metadata stays in this pool so content matching and lineage do not
-    /// change when the bytes move. Device accounting is returned immediately;
-    /// the lower tier owns and budgets the materialized blob separately. A
-    /// move is not a use: the entry's LRU tick and idle time stay what its
-    /// last capture or claim made them.
-    pub fn move_to_tier(
-        &mut self,
-        id: CheckpointId,
-        tier: ReuseSource,
-        bytes: u64,
-    ) -> Result<(), RetainRefused> {
+    /// change when the bytes move. The lower tier owns and budgets the
+    /// materialized blob separately, and the retained slot the device image
+    /// held is the scheduler's to give back. A move is not a use: the entry's
+    /// LRU tick and idle time stay what its last capture or claim made them.
+    pub fn move_to_tier(&mut self, id: CheckpointId, tier: ReuseSource) -> Result<(), RetainRefused> {
         if self.tiers.rank(tier).is_none() {
             return Err(RetainRefused::UnknownTier(tier));
         }
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
-            return Ok(());
-        };
-        if entry.tier == ReuseSource::Device {
-            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.tier = tier;
         }
-        entry.tier = tier;
-        entry.bytes = bytes;
         Ok(())
     }
 
@@ -1072,13 +1039,13 @@ impl CheckpointPool {
         self.reused_tok
     }
 
-    /// Checkpoints taken, checkpoints the byte budget refused, blobs refused
-    /// on their identity, and checkpoints discarded — the counters #190's
-    /// per-tier hit / miss / spill / discard reporting is built from.
+    /// Checkpoints taken, blobs refused on their identity, and checkpoints
+    /// discarded — the counters #190's per-tier hit / miss / spill / discard
+    /// reporting is built from. A capture skipped for want of a retained slot
+    /// never reaches this pool; the scheduler reports it (GitHub #215).
     pub fn counters(&self) -> CheckpointCounters {
         CheckpointCounters {
             captures: self.captures,
-            skipped_captures: self.skipped_captures,
             refused_blobs: self.refused_blobs,
             discards: self.discards,
             reused_tok: self.reused_tok,
@@ -1087,9 +1054,6 @@ impl CheckpointPool {
 
     fn remove_at(&mut self, pos: usize) -> CheckpointEntry {
         let entry = self.entries.remove(pos);
-        if entry.tier == ReuseSource::Device {
-            self.used_bytes = self.used_bytes.saturating_sub(entry.bytes);
-        }
         self.discards += 1;
         entry
     }
@@ -1103,8 +1067,6 @@ impl CheckpointPool {
 pub struct CheckpointCounters {
     /// Checkpoints captured and retained.
     pub captures: u64,
-    /// Captures the byte budget refused (nothing was evicted for them).
-    pub skipped_captures: u64,
     /// Blobs refused on their compatibility identity (GitHub #189): state
     /// produced under another artifact, KV format, blob layout or drafter.
     /// Zero for the life of a process that adopts nothing from outside it,
@@ -1114,44 +1076,6 @@ pub struct CheckpointCounters {
     pub discards: u64,
     /// Prompt tokens skipped through a retained checkpoint.
     pub reused_tok: u64,
-}
-
-/// Device bytes held back from the retained pool's derived default: what
-/// the leaf must still be able to allocate at serving time (GitHub #186).
-///
-/// Retention is a bet, and a bet must never be the reason certain work
-/// fails. The leaf allocates out of the same free device memory while it
-/// serves — a media encode transient, a graph capture, the scratch a wider
-/// chunk needs — so the derived budget starts by giving that back.
-pub const RETAINED_POOL_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// The most the retained pool's default ever claims (GitHub #186).
-///
-/// Past a few dozen checkpoints the marginal one buys little — a
-/// conversation keeps at most two (ADR 0029) and a burst shares one prefix —
-/// while the headroom it costs buys a lot. An operator who wants more says
-/// so with `--retained-pool-bytes`.
-pub const MAX_AUTO_RETAINED_POOL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
-/// The retained pool's default byte budget, derived from the device memory
-/// still free once the model, its KV pool and every other reservation have
-/// landed (GitHub #186, ADR 0029; the operator's `--retained-pool-bytes`
-/// overrides it).
-///
-/// Half of what is left after [`RETAINED_POOL_RESERVE_BYTES`], capped at
-/// [`MAX_AUTO_RETAINED_POOL_BYTES`]. Half rather than all, because "free"
-/// is measured once, at startup, and the number it returns is not a promise
-/// about the rest of the run.
-///
-/// A caller that cannot measure free memory passes 0 and gets 0: nothing is
-/// retained, which is the same engine that existed before checkpoints did.
-/// That is deliberate — an earlier attempt at sizing the *KV* pool from a
-/// naive free-VRAM guess OOM'd on the real artifact
-/// (`crates/runtime/src/cuda_leaf.rs`'s module doc), and the lesson taken
-/// from it is that a derived device budget guesses downwards or not at all.
-pub fn auto_retained_pool_bytes(free_device_bytes: u64) -> u64 {
-    (free_device_bytes.saturating_sub(RETAINED_POOL_RESERVE_BYTES) / 2)
-        .min(MAX_AUTO_RETAINED_POOL_BYTES)
 }
 
 #[cfg(test)]
@@ -1168,9 +1092,6 @@ mod tests {
         gdn
     }
 
-    /// One image's worth of device bytes, for a pool sized in whole images.
-    const IMAGE: u64 = 1_000;
-
     /// A load's identity, distinguishable from another by `byte`.
     fn load(byte: u8) -> BlobIdentity {
         BlobIdentity::of_load(
@@ -1181,8 +1102,8 @@ mod tests {
         )
     }
 
-    fn pool_of(images: u64) -> CheckpointPool {
-        CheckpointPool::with_identity(IMAGE * images, load(1))
+    fn pool() -> CheckpointPool {
+        CheckpointPool::with_identity(load(1))
     }
 
     /// Retain a checkpoint over `tokens`, at `tick`, holding `pages` pages.
@@ -1199,7 +1120,6 @@ mod tests {
             tokens: tokens.len() as u32,
             prefix: publisher, // one prefix per publisher in these tests
             pages,
-            bytes: IMAGE,
             gdn: gdn_at(tokens.len()),
             identity: pool.identity(),
             tier: ReuseSource::Device,
@@ -1225,7 +1145,7 @@ mod tests {
         // The whole point: turn N leaves a checkpoint at its opener, and turn
         // N+1 — whose prompt is turn N's prompt plus the assistant's reply and
         // the new user message — starts with it.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let turn_n: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &turn_n, 1, 1).unwrap();
         let turn_n_plus_1: Vec<TokenId> = (1..=160).collect();
@@ -1242,7 +1162,7 @@ mod tests {
         // common prefix (ADR 0029): GDN state exists only where it was
         // captured. A prompt that diverges *before* the checkpoint's opener
         // has no state to resume from.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let retained: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &retained, 1, 1).unwrap();
         let mut divergent: Vec<TokenId> = (1..=99).collect();
@@ -1259,7 +1179,7 @@ mod tests {
     fn the_longest_retained_checkpoint_wins() {
         // A conversation leaves a checkpoint per turn; the newest one is the
         // longest, and it is the one that saves the most prefill.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let turn1: Vec<TokenId> = (1..=100).collect();
         let turn2: Vec<TokenId> = (1..=180).collect();
         retain(&mut pool, 1, &turn1, 1, 1).unwrap();
@@ -1275,7 +1195,7 @@ mod tests {
     fn a_claim_does_not_consume_the_entry() {
         // Retry, regenerate and two forks from one history all hit (ADR
         // 0029): the entry survives every claimant.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let retained: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &retained, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
@@ -1287,42 +1207,10 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pool_skips_the_capture_and_evicts_nothing() {
-        // The byte budget is a hard stop, not a pressure signal: when it is
-        // full the checkpoint is simply not taken, and the entries already in
-        // it are untouched.
-        let mut pool = pool_of(2);
-        let a: Vec<TokenId> = (1..=100).collect();
-        let b: Vec<TokenId> = (500..=600).collect();
-        let c: Vec<TokenId> = (900..=1000).collect();
-        retain(&mut pool, 1, &a, 1, 1).unwrap();
-        retain(&mut pool, 2, &b, 1, 2).unwrap();
-        assert!(!pool.admits(IMAGE), "the budget is spent");
-        assert_eq!(
-            retain(&mut pool, 3, &c, 1, 3),
-            Err(RetainRefused::Budget),
-            "the capture is skipped"
-        );
-        assert_eq!(pool.entry_count(), 2, "nothing was evicted to take it");
-        assert_eq!(pool.used_bytes(), 2 * IMAGE);
-        assert_eq!(pool.counters().skipped_captures, 1);
-        assert_eq!(pool.counters().discards, 0, "a skipped capture discards nothing");
-    }
-
-    #[test]
-    fn a_zero_budget_retains_nothing() {
-        let mut pool = pool_of(0);
-        let a: Vec<TokenId> = (1..=100).collect();
-        assert!(!pool.admits(IMAGE));
-        assert_eq!(retain(&mut pool, 1, &a, 1, 1), Err(RetainRefused::Budget));
-        assert_eq!(pool.entry_count(), 0);
-    }
-
-    #[test]
     fn the_first_victim_is_the_least_recently_used_entry() {
         // A live request that needs the pages takes them back from the entry
         // whose conversation has been quiet longest.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let a: Vec<TokenId> = (1..=100).collect();
         let b: Vec<TokenId> = (500..=600).collect();
         retain(&mut pool, 1, &a, 3, 1).unwrap();
@@ -1334,16 +1222,14 @@ mod tests {
         let victim = pool.discard_victim().expect("a victim");
         assert_eq!(victim.publisher, 2, "the least recently used entry goes");
         assert_eq!(victim.pages, 5, "the caller gets its pages back to release");
-        assert_eq!(pool.used_bytes(), IMAGE, "its image bytes came back");
         assert_eq!(pool.retained_pages(), 3);
         assert_eq!(pool.discard_victim().map(|e| e.publisher), Some(1));
         assert!(pool.discard_victim().is_none(), "an empty pool has no victim");
-        assert_eq!(pool.used_bytes(), 0);
     }
 
     #[test]
     fn a_discarded_entry_is_no_longer_matched() {
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let a: Vec<TokenId> = (1..=100).collect();
         let id = retain(&mut pool, 1, &a, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
@@ -1357,7 +1243,7 @@ mod tests {
     fn a_claim_seeds_the_claimant_gdn_state_at_the_opener() {
         // core-02: the claimant resumes its recurrent state at a recorded
         // boundary — the opener, not a page boundary.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let a: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 1, &a, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
@@ -1372,7 +1258,7 @@ mod tests {
         // match before it takes either. A checkpoint that loses that
         // comparison must not have moved in the LRU order or counted itself
         // as reuse — which is why `best_match` is a pure query.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let older: Vec<TokenId> = (1..=100).collect();
         let newer: Vec<TokenId> = (500..=600).collect();
         retain(&mut pool, 1, &older, 1, 1).unwrap();
@@ -1391,8 +1277,8 @@ mod tests {
     fn a_duplicate_capture_point_is_already_held() {
         // Two requests with the same prompt reach the same opener. The second
         // has nothing new to retain, and a second image of the same state
-        // would cost the byte budget twice for the same skip.
-        let mut pool = pool_of(4);
+        // would cost a second retained slot for the same skip.
+        let mut pool = pool();
         let a: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 1, &a, 1, 1).unwrap();
         let key_at = |at: u32| PromptContent::text(&a).key_at(at);
@@ -1405,7 +1291,7 @@ mod tests {
         // Two checkpoints taken inside the same prompt head hold the same
         // shared prefix, whose pages the KV pool is charged for exactly once.
         // Summing per entry would promise admission pages it cannot get back.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let early: Vec<TokenId> = (1..=100).collect();
         let late: Vec<TokenId> = (1..=120).collect();
         for (publisher, tokens) in [(1, early), (2, late)] {
@@ -1415,7 +1301,6 @@ mod tests {
                 tokens: tokens.len() as u32,
                 prefix: 42, // both checkpoints stand on one prompt head
                 pages: 6,
-                bytes: IMAGE,
                 gdn: gdn_at(tokens.len()),
                 identity: pool.identity(),
                 tier: ReuseSource::Device,
@@ -1428,38 +1313,6 @@ mod tests {
         }
         assert_eq!(pool.entry_count(), 2);
         assert_eq!(pool.retained_pages(), 6, "one prefix, one charge");
-    }
-
-    #[test]
-    fn the_derived_budget_gives_back_the_reserve_and_halves_the_rest() {
-        // The shape of a real load: a 32 GiB card with the 27B artifact,
-        // its KV pool and its reservations already down leaves single-digit
-        // gigabytes. 5 GiB free holds 1 GiB back for the leaf's own
-        // serving-time allocations and retains half of the remaining 4.
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(auto_retained_pool_bytes(5 * GIB), 2 * GIB);
-        // At ~150 MiB an image (the 27B geometry's mutable sections plus one
-        // KV page), that is a few dozen live conversations.
-        assert!(auto_retained_pool_bytes(5 * GIB) / (150 * 1024 * 1024) >= 10);
-    }
-
-    #[test]
-    fn the_derived_budget_is_capped_and_never_negative() {
-        // A card with room to spare does not get a proportionally huge bet:
-        // the cap binds well before half of it.
-        assert_eq!(
-            auto_retained_pool_bytes(u64::MAX),
-            MAX_AUTO_RETAINED_POOL_BYTES
-        );
-        assert_eq!(
-            auto_retained_pool_bytes(64 * 1024 * 1024 * 1024),
-            MAX_AUTO_RETAINED_POOL_BYTES
-        );
-        // Less free than the reserve, or a backend that cannot measure free
-        // memory at all: retain nothing, which is the engine that existed
-        // before checkpoints did.
-        assert_eq!(auto_retained_pool_bytes(RETAINED_POOL_RESERVE_BYTES), 0);
-        assert_eq!(auto_retained_pool_bytes(0), 0);
     }
 
     #[test]
@@ -1476,7 +1329,7 @@ mod tests {
         // restart under `--kv-format bf16`, or a disk tier handing back what
         // yesterday's artifact left. Nothing is retained, so nothing can be
         // matched, so no byte of it ever reaches a sequence.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         let foreign = CheckpointCapture {
             publisher: 7,
@@ -1484,7 +1337,6 @@ mod tests {
             tokens: 100,
             prefix: 7,
             pages: 1,
-            bytes: IMAGE,
             gdn: gdn_at(100),
             identity: load(2),
             tier: ReuseSource::Device,
@@ -1503,13 +1355,7 @@ mod tests {
             )
         );
         assert_eq!(pool.entry_count(), 0, "nothing was retained");
-        assert_eq!(pool.used_bytes(), 0, "and nothing was charged for");
         assert_eq!(pool.counters().refused_blobs, 1);
-        assert_eq!(
-            pool.counters().skipped_captures,
-            0,
-            "a refusal is not a full pool"
-        );
         let prompt: Vec<TokenId> = (1..=140).collect();
         assert!(claim(&mut pool, &prompt, 2).is_none());
     }
@@ -1520,7 +1366,7 @@ mod tests {
         // entry in the ledger without going through `retain`, the match
         // filters on the entry's own identity — the field exists on the entry
         // exactly so that being in the pool is not the same as being usable.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &tokens, 1, 1).unwrap();
         let prompt: Vec<TokenId> = (1..=140).collect();
@@ -1538,7 +1384,7 @@ mod tests {
         // ADR 0029: keys never contain a `RequestId`. Two requests that
         // reached the same opener leave the same key, and the publisher stays
         // what it is — the backend's handle on the device image.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &tokens, 1, 1).unwrap();
         retain(&mut pool, 99, &tokens, 1, 2).unwrap();
@@ -1558,7 +1404,7 @@ mod tests {
         // Spec §11 (ADR 0029): "I am never answered about a picture I did not
         // send." The two prompts are the same token ids — the placeholders are
         // one token repeated — and differ only in the images behind them.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         let mine = [MediaKey {
             begin: 10,
@@ -1576,7 +1422,6 @@ mod tests {
             tokens: 100,
             prefix: 7,
             pages: 1,
-            bytes: IMAGE,
             gdn: gdn_at(100),
             identity: pool.identity(),
             tier: ReuseSource::Device,
@@ -1603,7 +1448,7 @@ mod tests {
 
     #[test]
     fn a_device_only_load_has_nothing_below_the_device() {
-        let pool = pool_of(4);
+        let pool = pool();
         let tiers = pool.tiers();
         assert_eq!(tiers.tiers().len(), 1);
         assert_eq!(tiers.rank(ReuseSource::Device), Some(0));
@@ -1712,7 +1557,7 @@ mod tests {
                 restore_floor_tokens: 1024,
             },
         ]);
-        let mut pool = CheckpointPool::with_tiers(IMAGE * 4, load(1), tiers);
+        let mut pool = CheckpointPool::with_tiers(load(1), tiers);
         let spilled: Vec<TokenId> = (1..=100).collect();
         let resident: Vec<TokenId> = (500..=600).collect();
         for (publisher, tokens, tier) in [
@@ -1725,7 +1570,6 @@ mod tests {
                 tokens: tokens.len() as u32,
                 prefix: publisher,
                 pages: 1,
-                bytes: IMAGE,
                 gdn: gdn_at(tokens.len()),
                 identity: pool.identity(),
                 tier,
@@ -1752,7 +1596,7 @@ mod tests {
 
     #[test]
     fn a_tier_this_load_does_not_carry_is_refused() {
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         let capture = CheckpointCapture {
             publisher: 7,
@@ -1760,7 +1604,6 @@ mod tests {
             tokens: 100,
             prefix: 7,
             pages: 1,
-            bytes: IMAGE,
             gdn: gdn_at(100),
             identity: pool.identity(),
             tier: ReuseSource::KvRam,
@@ -1780,7 +1623,7 @@ mod tests {
     fn an_entry_names_itself_to_a_tier_that_does_not_hold_its_history() {
         // The Tier 2 seam: sixteen bytes of key and the identity it was taken
         // under, and nothing that names a request or a process.
-        let mut pool = pool_of(4);
+        let mut pool = pool();
         let tokens: Vec<TokenId> = (1..=100).collect();
         retain(&mut pool, 7, &tokens, 1, 1).unwrap();
         let header = pool.entries[0].header();
@@ -1796,18 +1639,17 @@ mod tests {
     }
 
     #[test]
-    fn spilling_an_entry_returns_its_device_budget_without_forgetting_it() {
-        let mut pool = CheckpointPool::with_tiers(IMAGE, load(1), TierList::device_and_kv_ram());
+    fn spilling_an_entry_moves_it_down_without_forgetting_it() {
+        let mut pool = CheckpointPool::with_tiers(load(1), TierList::device_and_kv_ram());
         let prompt: Vec<TokenId> = (1..=2048).collect();
         let id = retain(&mut pool, 1, &prompt, 1, 1).unwrap();
 
-        pool.move_to_tier(id, ReuseSource::KvRam, IMAGE * 8)
+        pool.move_to_tier(id, ReuseSource::KvRam)
             .expect("KV-RAM is in this pool's tier list");
 
-        assert_eq!(pool.used_bytes(), 0, "the image left the device");
         let entry = pool.entries().iter().find(|entry| entry.id == id).unwrap();
         assert_eq!(entry.tier, ReuseSource::KvRam);
-        assert_eq!(entry.bytes, IMAGE * 8, "the lower tier charges the materialized blob");
+        assert!(pool.retained_prefixes().is_empty(), "it stands on no device prefix");
         assert_eq!(entry.use_tick, 1, "a move is not a use");
         assert_eq!(
             pool.best_match(&pool.keys(PromptContent::text(&prompt))).unwrap().source,
@@ -1821,10 +1663,10 @@ mod tests {
         // GitHub #190: the floor is the price of the bus crossing, and a
         // device *prefix* saves that crossing as surely as a device
         // checkpoint does.
-        let mut pool = CheckpointPool::with_tiers(IMAGE * 4, load(1), TierList::device_and_kv_ram());
+        let mut pool = CheckpointPool::with_tiers(load(1), TierList::device_and_kv_ram());
         let prompt: Vec<TokenId> = (1..=4_000).collect();
         let spilled = retain(&mut pool, 1, &prompt[..2_100], 1, 1).unwrap();
-        pool.move_to_tier(spilled, ReuseSource::KvRam, IMAGE).unwrap();
+        pool.move_to_tier(spilled, ReuseSource::KvRam).unwrap();
         let lookup = pool.lookup(&pool.keys(PromptContent::text(&prompt)));
 
         assert_eq!(

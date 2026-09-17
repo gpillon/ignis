@@ -31,7 +31,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
-use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, SpecCounters};
+use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, RetainedSkip, SpecCounters};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
@@ -485,6 +485,34 @@ impl Telemetry {
         if let Some(metrics) = &self.metrics {
             metrics.record_retained_state(operation, source);
         }
+    }
+
+    /// The scheduler held a different number of retained slots after a step
+    /// (GitHub #215): emit the change-driven `ignis.scheduler.retained_slots`
+    /// DEBUG event, as the interval event reports its own counters (ADR 0025).
+    pub fn on_retained_slots(&mut self, in_use: u32, capacity: u32) {
+        tracing::debug!(
+            name: "ignis.scheduler.retained_slots",
+            retained_slots_in_use = in_use,
+            retained_slots = capacity,
+            "retained slots held"
+        );
+    }
+
+    /// A publish or a capture `id` would have left was skipped (GitHub #215):
+    /// emit the `retained_slot_skipped` line, naming why and how many of the
+    /// `capacity` retained slots were held then. The request itself runs
+    /// regardless.
+    pub fn on_retained_slot_skipped(&mut self, id: RequestId, skip: RetainedSkip, in_use: u32, capacity: u32) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.retained_slot_skipped",
+            request_id = id,
+            reason = skip.as_str(),
+            retained_slots_in_use = in_use,
+            retained_slots = capacity,
+            "retained state skipped: no retained slot or page to hold it"
+        );
     }
 
     /// A request was restored from the host tier onto a decode lane: emit
@@ -1089,6 +1117,38 @@ mod tests {
             .find(|e| e["event_name"] == "ignis.request.restored")
             .unwrap();
         assert_eq!(restored["attributes"]["restore_micros"], 44_500);
+    }
+
+    /// GitHub #215: how many retained slots are held is logged when it
+    /// changes, and a skipped publish or capture is logged on the request it
+    /// happened to, with why and what was held.
+    #[test]
+    fn retained_slots_in_use_and_skips_are_logged() {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(4, 40, RequestClass::Agent);
+            telemetry.on_retained_slots(3, 3);
+            telemetry.on_retained_slot_skipped(4, RetainedSkip::CaptureNoSlot, 3, 3);
+            telemetry.on_retained_slot_skipped(4, RetainedSkip::PublishNoSlot, 2, 3);
+        });
+        let slots = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.scheduler.retained_slots")
+            .expect("the held count is logged");
+        assert_eq!(slots["severity_text"], "DEBUG");
+        assert_eq!(slots["attributes"]["retained_slots_in_use"], 3);
+        assert_eq!(slots["attributes"]["retained_slots"], 3);
+        let skips: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| e["event_name"] == "ignis.request.retained_slot_skipped")
+            .collect();
+        assert_eq!(skips.len(), 2, "{events:?}");
+        assert_eq!(skips[0]["attributes"]["reason"], "capture_skipped_no_slot");
+        assert_eq!(skips[1]["attributes"]["reason"], "publish_skipped_no_slot");
+        assert_eq!(skips[0]["attributes"]["request_id"], 4);
+        assert_eq!(skips[0]["attributes"]["retained_slots_in_use"], 3);
+        assert_eq!(skips[1]["attributes"]["retained_slots_in_use"], 2);
+        assert_eq!(skips[1]["attributes"]["retained_slots"], 3);
     }
 
     #[test]

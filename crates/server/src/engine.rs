@@ -378,8 +378,11 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::Requeued { request }
         | SchedEvent::PrefixReused { request, .. }
         | SchedEvent::StateReused { request, .. }
-        | SchedEvent::PrefillChunk { request, .. } => Some(*request),
-        SchedEvent::Protected { .. } | SchedEvent::RetainedState { .. } => None,
+        | SchedEvent::PrefillChunk { request, .. }
+        | SchedEvent::RetainedSlotSkipped { request, .. } => Some(*request),
+        SchedEvent::Protected { .. }
+        | SchedEvent::RetainedState { .. }
+        | SchedEvent::RetainedSlots { .. } => None,
     }
 }
 
@@ -442,6 +445,15 @@ async fn telemetry_task(
                 SchedEvent::RetainedState { operation, source } => {
                     telemetry.on_retained_state(operation, source)
                 }
+                SchedEvent::RetainedSlots { in_use, capacity } => {
+                    telemetry.on_retained_slots(in_use, capacity)
+                }
+                SchedEvent::RetainedSlotSkipped {
+                    request,
+                    skip,
+                    in_use,
+                    capacity,
+                } => telemetry.on_retained_slot_skipped(request, skip, in_use, capacity),
                 _ => {}
             },
             TelemetryFact::Tick => {

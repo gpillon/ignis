@@ -9,11 +9,12 @@
  *
  *   - one reference to the shared prefix holding the whole pages below the
  *     opener (shared in place, charged to the pool once, as always);
- *   - its own image of the mutable state **at the opener**, laid out by the
- *     same `ignis_seq_prefix_clone_layout` a prefix's image is -- the
- *     prefix's own image stands up to 63 tokens short of it;
+ *   - its own image of the mutable state **at the opener**, in a retained
+ *     slot of its own (GitHub #215) -- the prefix's image stands up to 63
+ *     tokens short of it;
  *   - a copy of the partial page the opener ends inside, which the capturing
- *     sequence is still writing and so can never share.
+ *     sequence is still writing and so can never share, in one KV page of
+ *     the pool (GitHub #215).
  *
  * Nothing here decides *what* a sequence is made of: that is the one
  * state-section table (`ignis_seq_sections.h`), read through
@@ -24,7 +25,7 @@
  *
  * Not part of the public flat C ABI: `ignis_seq.h` keeps
  * `ignis_seq_checkpoint` opaque and exposes only capture / claim / release /
- * stats / image-bytes.
+ * stats / snapshot.
  */
 #ifndef IGNIS_SEQ_CHECKPOINT_INTERNAL_H
 #define IGNIS_SEQ_CHECKPOINT_INTERNAL_H
@@ -54,15 +55,19 @@ struct ignis_seq_checkpoint {
    * reference, taken at capture and dropped at release: it is what keeps
    * those pages alive once every live request has gone. */
   ignis_seq_prefix *prefix = nullptr;
-  /* The device image of every device-resident CLONE section, at the opener
-   * rather than at the prefix's page boundary. */
-  ignis_counted_device_buffer image{IGNIS_ALLOC_CHECKPOINT_IMAGE};
-  /* A copy of the physical KV page the opener ends inside, packed plane by
-   * plane the way `pack_paged_kv_allocation_to_host` packs one page -- so
-   * this image and a snapshot blob's KV section lay a page out the same way. */
-  ignis_counted_device_buffer tail_page{IGNIS_ALLOC_CHECKPOINT_TAIL_PAGE};
+  /* The retained slot holding the image of every device-resident CLONE
+   * section, at the opener rather than at the prefix's page boundary (GitHub
+   * #215). Held from the capture until the release. */
+  std::int32_t retained_slot = -1;
+  /* What that image occupies: one slot's state. */
+  std::uint64_t image_bytes = 0;
+  /* The page the opener ends inside, copied into one KV page of the pool this
+   * entry owns (GitHub #215) -- never bound to a block-table row, and not
+   * shared. Empty (`valid()` false) for an opener on a page boundary, which
+   * ends inside no page. */
+  ninfer::PagedKVAllocation tail;
   /* The IGNIS_SEQ_SECTION_PROGRESS payload: host scalars, so they live here
-   * rather than in a device image (the snapshot path does the same). */
+   * rather than in a retained slot (the snapshot path does the same). */
   ignis_seq_progress_image progress{};
   /* The generation opener, in tokens. NOT a whole number of pages. */
   std::uint32_t tokens = 0;
@@ -81,16 +86,8 @@ inline std::uint64_t ignis_seq_checkpoint_page_bytes(const ignis_seq_pool &pool)
   return static_cast<std::uint64_t>(ninfer::paged_kv_host_image_bytes(pool.kv_pool, 1));
 }
 
-/* Device bytes one checkpoint of `pool` occupies: the mutable-state image
- * plus one page's copy. A pool property, not a per-checkpoint one -- every
- * checkpoint of one pool costs exactly this. */
-inline std::uint64_t ignis_seq_checkpoint_image_bytes_of(const ignis_seq_pool &pool) {
-  return ignis_seq_prefix_clone_bytes(ignis_seq_prefix_clone_layout(pool)) +
-         ignis_seq_checkpoint_page_bytes(pool);
-}
-
-/* Copy one physical KV page between the pool's planes and a packed device
- * image, in `direction`.
+/* Copy physical KV page `src_page` over `dst_page`, every plane, device to
+ * device.
  *
  * The pool's plane order is PageMajor (`kernel/src/seq.cu`'s
  * `ignis_seq_pool_create` fixes it), which is what makes a page one
@@ -100,54 +97,25 @@ inline std::uint64_t ignis_seq_checkpoint_image_bytes_of(const ignis_seq_pool &p
  * being one this throws instead of silently shuffling bytes.
  *
  * The copies are issued on the default stream; the caller synchronizes. */
-inline void ignis_seq_checkpoint_page_transfer(ignis_seq_pool &pool, std::int32_t page_id,
-                                               unsigned char *image,
-                                               ignis_seq_prefix_direction direction) {
+inline void ignis_seq_copy_kv_page(ignis_seq_pool &pool, std::int32_t src_page,
+                                   std::int32_t dst_page) {
   if (pool.kv_pool.plane_order() != ninfer::PagedKVPlaneOrder::PageMajor) {
     throw std::logic_error(
         "prompt checkpoints require a PageMajor paged-KV pool: a page is one contiguous run "
         "per plane there, and nothing else in this leaf builds one any other way");
   }
-  const bool capture      = direction == IGNIS_SEQ_PREFIX_CAPTURE;
-  unsigned char *packed   = image;
-  const std::size_t count = pool.kv_pool.plane_count();
-  // The bound is checked *before* each copy is enqueued, not after the loop:
-  // an out-of-bounds `cudaMemcpyAsync` that has already been issued is not
-  // something a later throw can take back. The sizing function and this loop
-  // agree today by construction -- both read the PageMajor page stride off
-  // each plane -- so this is here for the day one of them stops, and a
-  // refused capture is a bet not taken where an overrun is someone else's
-  // memory.
-  const std::uint64_t budget = ignis_seq_checkpoint_page_bytes(pool);
-  for (std::size_t index = 0; index < count; ++index) {
+  for (std::size_t index = 0; index < pool.kv_pool.plane_count(); ++index) {
     const ninfer::Tensor &plane = pool.kv_pool.plane(index);
-    const std::size_t bytes     = static_cast<std::size_t>(plane.nb[3]);
-    if (static_cast<std::uint64_t>(packed - image) + bytes > budget) {
-      throw std::logic_error("prompt checkpoint tail page: plane " + std::to_string(index) +
-                             " would move past the " + std::to_string(budget) +
-                             " bytes the pool prices a page at; the page layout and its "
-                             "sizing have drifted apart");
-    }
-    unsigned char *page =
-        static_cast<unsigned char *>(plane.data) + static_cast<std::int64_t>(page_id) * plane.nb[3];
-    void *dst             = capture ? static_cast<void *>(packed) : static_cast<void *>(page);
-    const void *src       = capture ? static_cast<const void *>(page)
-                                    : static_cast<const void *>(packed);
-    const cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, nullptr);
+    auto *base                  = static_cast<unsigned char *>(plane.data);
+    const cudaError_t err       = cudaMemcpyAsync(
+        base + static_cast<std::int64_t>(dst_page) * plane.nb[3],
+        base + static_cast<std::int64_t>(src_page) * plane.nb[3],
+        static_cast<std::size_t>(plane.nb[3]), cudaMemcpyDeviceToDevice, nullptr);
     if (err != cudaSuccess) {
       throw std::runtime_error(std::string("cudaMemcpyAsync(KV tail page, device to device) "
                                            "failed: ") +
                                cudaGetErrorString(err));
     }
-    packed += bytes;
-  }
-  // And the whole page has to have been moved, not only part of one: a plane
-  // set that shrank would otherwise leave the rest of the image stale.
-  const std::uint64_t moved = static_cast<std::uint64_t>(packed - image);
-  if (moved != budget) {
-    throw std::logic_error("prompt checkpoint tail page: moved " + std::to_string(moved) +
-                           " bytes for a page the pool prices at " + std::to_string(budget) +
-                           "; the page layout and its sizing have drifted apart");
   }
 }
 

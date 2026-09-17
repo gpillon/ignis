@@ -496,6 +496,23 @@ impl PrefixCache {
             .map(|e| e.id)
     }
 
+    /// The retained prefix a publish or a capture short of a retained slot
+    /// gives up (GitHub #215, ADR 0030), or `None`: among those whose
+    /// retention is their only holder — the ones whose slot actually comes
+    /// back — the lowest class first (`Agent` before `Interactive`, ADR 0023),
+    /// then the least recently used.
+    ///
+    /// The page path's [`PrefixCache::lru_retained`] keeps #188's order, least
+    /// recently used alone.
+    pub fn retained_slot_victim(&self) -> Option<PrefixId> {
+        self.entries
+            .iter()
+            .filter(|e| e.refcount == 1)
+            .filter_map(|e| e.retained.map(|r| (e.id, r)))
+            .min_by_key(|&(id, r)| (r.class.eviction_rank(), r.at, id))
+            .map(|(id, _)| id)
+    }
+
     /// The entry `id`'s live holders, or 0 when it is gone (GitHub #186).
     ///
     /// The pages come back only at zero, so this is what answers "would
@@ -1100,6 +1117,33 @@ mod tests {
         assert!(cache.unretain(old));
         cache.release(old);
         assert_eq!(cache.lru_retained(), None, "nothing else can be given up");
+    }
+
+    #[test]
+    fn a_retained_slot_goes_from_an_agent_prefix_before_an_older_interactive_one() {
+        // GitHub #215: the slot path ranks by class before recency (ADR 0023),
+        // where the page path above stays least recently used alone.
+        let mut cache = PrefixCache::new(16);
+        let (interactive, _) = cache.register(7, &prompt64(), &gdn_boundary(0), None).unwrap();
+        let other: Vec<TokenId> = (500..=595).collect();
+        let (agent, _) = cache.register(8, &other, &gdn_boundary(0), None).unwrap();
+        cache.retain_published(
+            interactive,
+            Retention {
+                class: RequestClass::Interactive,
+                ..retention(1)
+            },
+        );
+        cache.retain_published(agent, retention(2));
+        cache.release(interactive);
+        cache.release(agent);
+        assert_eq!(cache.lru_retained(), Some(interactive), "the page path: the older one");
+        assert_eq!(cache.retained_slot_victim(), Some(agent), "the slot path: the Agent one");
+        // Only a retention that is its entry's sole holder is offered.
+        cache.claim(&cache.keys(&other)).unwrap();
+        assert_eq!(cache.retained_slot_victim(), Some(interactive));
+        cache.claim(&cache.keys(&prompt64())).unwrap();
+        assert_eq!(cache.retained_slot_victim(), None, "nothing else can be given up");
     }
 
     #[test]

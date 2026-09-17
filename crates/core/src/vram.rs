@@ -5,7 +5,8 @@
 //! leaf for: what was free at start, what each fixed reservation costs, and
 //! what one KV pool of `n` pages occupies. It decides the budget, gives the
 //! KV pool the rest, and refuses a start that cannot hold one sequence at
-//! the maximum context — before a byte of the plan is allocated. Nothing
+//! the maximum context beside every retained slot's tail page — before a byte
+//! of the plan is allocated. Nothing
 //! here touches a device, so every refusal and warning is pinned on the CPU.
 
 use crate::kv_format::{KV_PAGE_TOKENS, KvFormat, KvGeometry, plan_kv_pool};
@@ -71,13 +72,10 @@ pub struct VramLines {
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
     /// conv state, penalty counts, the drafter's window and checkpoint.
     pub lane_state: u64,
-    /// The sequence pool's retained slots (GitHub #211): a lane's state each,
-    /// reserved at load beside the lanes.
+    /// The sequence pool's retained slots (GitHub #211, #215): a lane's state
+    /// each, reserved at load beside the lanes, holding every retained prompt
+    /// checkpoint's and shared prefix's image.
     pub retained_slots: u64,
-    /// The retained checkpoint budget (0 with `--prompt-reuse off`). A ledger
-    /// the scheduler charges checkpoint images to, reserved here so the KV
-    /// pool never takes the memory those images are allocated from.
-    pub retained: u64,
     /// What a load holds beyond every line above: allocator rounding, the
     /// decode graph captures, the kernel's lazily created handles. Measured,
     /// not derived.
@@ -87,7 +85,7 @@ pub struct VramLines {
 impl VramLines {
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
-    pub fn entries(&self) -> [(&'static str, u64); 13] {
+    pub fn entries(&self) -> [(&'static str, u64); 12] {
         [
             ("weights", self.weights),
             ("cuda_context", self.cuda_context),
@@ -100,7 +98,6 @@ impl VramLines {
             ("drafter_round", self.drafter_round),
             ("lane_state", self.lane_state),
             ("retained_slots", self.retained_slots),
-            ("retained", self.retained),
             ("residual", self.residual),
         ]
     }
@@ -123,6 +120,12 @@ pub struct VramRequest<'a> {
     pub kv_geometry: KvGeometry,
     /// `--max-context`: the plan must hold one sequence this long.
     pub max_context_tokens: u32,
+    /// `--retained-slots` (GitHub #215). The KV pool must also hold one page
+    /// per slot: a prompt checkpoint keeps the page its opener ends inside,
+    /// and a request claiming it cannot take that page back while it stands
+    /// on the checkpoint — so a lone `--max-context` sequence has to fit
+    /// beside every one.
+    pub retained_slots: u32,
     /// `--kv-pool-bytes`, when the operator named it: the pool's payload
     /// budget, as [`plan_kv_pool`] reads it. `None` gives the pool the rest.
     pub kv_pool_bytes: Option<u64>,
@@ -206,7 +209,7 @@ impl std::fmt::Display for VramPlanError {
                     "the VRAM plan needs {needed_bytes} bytes for the weights, workspaces, lanes, \
                      retained state and {} KV, {} bytes more than the {budget_bytes}-byte VRAM \
                      budget; shrink it with a smaller --max-context (now {max_context_tokens}), \
-                     without --vision, or with ",
+                     without --vision, with fewer --retained-slots, or with ",
                     if kv_pool_named {
                         "the --kv-pool-bytes"
                     } else {
@@ -261,7 +264,10 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
     };
 
     let page_bytes = request.kv_format.page_bytes(request.kv_geometry);
-    let min_pages = request.max_context_tokens.div_ceil(KV_PAGE_TOKENS);
+    let min_pages = request
+        .max_context_tokens
+        .div_ceil(KV_PAGE_TOKENS)
+        .saturating_add(request.retained_slots);
     let fixed = request.lines.total();
     let arena = request.kv_arena_bytes;
 
@@ -366,8 +372,7 @@ mod tests {
             verify_round: 100 * MIB,
             drafter_round: 150 * MIB,
             lane_state: 1800 * MIB,
-            retained_slots: 450 * MIB,
-            retained: 1800 * MIB,
+            retained_slots: 1800 * MIB,
             residual: 280 * MIB,
         }
     }
@@ -380,6 +385,7 @@ mod tests {
             kv_format: FORMAT,
             kv_geometry: QWEN,
             max_context_tokens: 262_144,
+            retained_slots: SLOTS,
             kv_pool_bytes: None,
             kv_arena_bytes: &arena,
             can_page: true,
@@ -389,6 +395,9 @@ mod tests {
     const DERIVED: VramMode = VramMode::Derived {
         headroom_bytes: GIB,
     };
+
+    /// Retained slots, each one tail page on top of the full context.
+    const SLOTS: u32 = 8;
 
     #[test]
     fn a_derived_budget_is_free_memory_less_the_headroom_and_kv_takes_the_rest() {
@@ -470,8 +479,9 @@ mod tests {
 
     #[test]
     fn a_plan_that_cannot_hold_one_full_context_refuses_naming_the_shortfall_and_the_knobs() {
-        // Enough for every fixed line, a few pages short of a 262K sequence.
-        let min_pages = 262_144u32.div_ceil(64);
+        // Enough for every fixed line, a few pages short of a 262K sequence
+        // and a tail page per retained slot.
+        let min_pages = 262_144u32.div_ceil(64) + SLOTS;
         let free = GIB + lines().total() + arena(min_pages) - 5 * page_bytes();
         let err = plan_vram(&request(DERIVED, free)).expect_err("below the minimum");
         let VramPlanError::BelowMinimum {
@@ -486,9 +496,30 @@ mod tests {
         assert_eq!(needed_bytes, lines().total() + arena(min_pages));
         let message = err.to_string();
         assert!(message.contains(&(5 * page_bytes()).to_string()), "{message}");
-        for knob in ["--max-context", "--vision", "--vram-headroom-bytes"] {
+        for knob in ["--max-context", "--vision", "--retained-slots", "--vram-headroom-bytes"] {
             assert!(message.contains(knob), "{knob} missing: {message}");
         }
+    }
+
+    #[test]
+    fn the_minimum_holds_a_tail_page_for_every_retained_slot() {
+        // Exactly one full context: enough before GitHub #215, one page per
+        // retained slot short of it now.
+        let full_context = 262_144u32.div_ceil(64);
+        let free = GIB + lines().total() + arena(full_context);
+        assert!(
+            plan_vram(&VramRequest {
+                retained_slots: 0,
+                ..request(DERIVED, free)
+            })
+            .is_ok(),
+            "no slot, no tail page"
+        );
+        let err = plan_vram(&request(DERIVED, free)).expect_err("a page short per slot");
+        let VramPlanError::BelowMinimum { needed_bytes, .. } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(needed_bytes, lines().total() + arena(full_context + SLOTS));
     }
 
     #[test]
@@ -499,7 +530,7 @@ mod tests {
 
     #[test]
     fn below_the_minimum_with_oversubscription_warns_and_plans_one_full_context() {
-        let min_pages = 262_144u32.div_ceil(64);
+        let min_pages = 262_144u32.div_ceil(64) + SLOTS;
         let budget = lines().total() + arena(min_pages) - page_bytes();
         let mode = VramMode::Explicit {
             budget_bytes: budget,
@@ -555,7 +586,6 @@ mod tests {
                 "drafter_round",
                 "lane_state",
                 "retained_slots",
-                "retained",
                 "residual",
             ]
         );

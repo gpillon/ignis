@@ -403,12 +403,12 @@ fn a_publishing_request_is_cut_at_the_page_boundary_it_publishes() {
         "the prompt is cut at the page boundary it publishes, then the tail"
     );
     assert_eq!(
-        jobs[0].publish_prefix_tokens,
+        jobs[0].publish_prefix.map(|p| p.tokens),
         Some(32),
         "the chunk that lands on the prefix is the one that publishes it"
     );
     assert_eq!(
-        jobs[1].publish_prefix_tokens, None,
+        jobs[1].publish_prefix.map(|p| p.tokens), None,
         "the tail publishes nothing: the state has already moved past the prefix"
     );
     assert!(
@@ -447,7 +447,7 @@ fn a_claimant_is_allocated_against_the_publisher_s_prefix() {
         "a claimant starts where the prefix ends, which is where its clone put it"
     );
     assert!(
-        jobs.iter().all(|j| j.publish_prefix_tokens.is_none()),
+        jobs.iter().all(|j| j.publish_prefix.map(|p| p.tokens).is_none()),
         "a claimant never publishes: the head it would offer is the entry it holds"
     );
 }
@@ -537,7 +537,7 @@ fn two_identical_prompts_in_one_batch_leave_exactly_one_prefix_behind() {
         .prefill_calls()
         .into_iter()
         .flatten()
-        .filter(|job| job.publish_prefix_tokens.is_some())
+        .filter(|job| job.publish_prefix.map(|p| p.tokens).is_some())
         .map(|job| job.request)
         .collect();
     assert_eq!(
@@ -583,7 +583,7 @@ fn a_publish_the_cache_declines_is_released_immediately() {
         .prefill_calls()
         .into_iter()
         .flatten()
-        .filter(|job| job.publish_prefix_tokens.is_some())
+        .filter(|job| job.publish_prefix.map(|p| p.tokens).is_some())
         .count();
     assert_eq!(publishes, 1, "a claimant publishes nothing");
     assert_eq!(

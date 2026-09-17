@@ -123,7 +123,6 @@ fn retained_slots_reserve_one_lane_state_each_and_are_never_a_lane() {
         "a lane's state is one slot's"
     );
     assert_eq!(with.kv_bytes, without.kv_bytes, "a retained slot has no KV block-table row");
-    assert_eq!(with.checkpoint_image_bytes, without.checkpoint_image_bytes);
 
     let pool = SeqPool::create_with_speculation(&cfg, &budget(RETAINED), backend)
         .unwrap_or_else(|e| panic!("create: {e}"));
@@ -263,7 +262,7 @@ fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dfla
         let mut seq = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"));
         prefill_program_sampled(&model, &pool, &mut seq, &prompt, 0, SamplingParams::greedy(), None)
             .unwrap_or_else(|e| panic!("prefill: {e}"));
-        let mut rounds = |seq: &mut Seq<'_>, count: usize| {
+        let rounds = |seq: &mut Seq<'_>, count: usize| {
             for _ in 0..count {
                 let lanes = [VerifyLane {
                     remaining_tokens: 64,
