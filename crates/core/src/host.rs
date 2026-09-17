@@ -58,8 +58,10 @@
 //! asks it through
 //! [`Compute::host_blob_fits`](crate::scheduler::Compute::host_blob_fits)
 //! and not here. This ledger stays the tier's *policy* — what may be held,
-//! and what goes first when something must — and knows nothing about where
-//! any blob sits.
+//! and what goes first when something must. It hands out the next victim
+//! ([`HostTier::next_retained_victim_below`]) and the scheduler asks the
+//! backend whether giving it up made a span; where any blob sits is never
+//! this module's to know.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
