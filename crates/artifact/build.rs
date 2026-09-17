@@ -126,6 +126,9 @@ fn main() {
         println!("cargo:rustc-link-search={}", cuda_lib.display());
         println!("cargo:rustc-link-lib=dylib=cudart");
         println!("cargo:rustc-link-lib=dylib=cuda");
+        // GitHub #210: `ignis_device_nvml_mem_info`; the DLL ships with the
+        // driver.
+        println!("cargo:rustc-link-lib=dylib=nvml");
     }
 
     println!("cargo:rerun-if-env-changed=CUDA_PATH");

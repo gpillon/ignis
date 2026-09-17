@@ -267,7 +267,7 @@ pub fn cuda_scheduler(
     eos: TokenId,
     shape: EngineShape,
 ) -> Result<ConcreteScheduler, String> {
-    use ignis_artifact::{CudaDevice, Device, Reader, bind_model_scope_27b_with, materialize};
+    use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
     use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
 
     let reader = Reader::open(artifact_path).map_err(|e| format!("open artifact: {e}"))?;
@@ -277,14 +277,13 @@ pub fn cuda_scheduler(
     let scope = ignis_core::model_load::model_scope(shape.speculation, shape.vision);
     let (plan, handles) =
         bind_model_scope_27b_with(&reader, scope).map_err(|e| format!("bind model scope: {e}"))?;
+    // GitHub #210: what is free before this process holds anything, as NVML
+    // (and so nvidia-smi and Task Manager) reports it, read before the context
+    // exists; the context is a plan line. Not `cudaMemGetInfo`, which on
+    // Windows ignores the caller's context and reads ~400 MiB optimistic.
+    let (free_at_start_bytes, _) = CudaDevice::nvml_memory(0)
+        .map_err(|e| format!("VRAM budget: free memory is unreadable: {e}"))?;
     let mut device = CudaDevice::create(0).map_err(|e| format!("CUDA device: {e}"))?;
-
-    // GitHub #210: what is free before the first reservation. The query needs
-    // the context, which it does not count (`CUDA_CONTEXT_BYTES`' doc): the
-    // context is a plan line instead.
-    let free_at_start_bytes = device
-        .free_bytes()
-        .ok_or("CUDA device: free memory is unreadable, so no VRAM budget can be planned")?;
     let geometry = ignis_core::KvGeometry::qwen38_27b();
     let planning = leaf_config_for_shape(shape, 0);
     let reservations = planning.plan_reservations(&reader, &plan, &handles)?;
@@ -359,20 +358,19 @@ pub fn cuda_scheduler(
             stats.reserved, planned
         ));
     }
-    // What the device says the load took, beside what the plan said it would
-    // (GitHub #210). Both leave out the context, which `cudaMemGetInfo` does
-    // not count, and the retained line, which the load does not allocate; the
-    // figure a plan is held to is Task Manager's, not this one
-    // (`ignis_runtime::CUDA_CONTEXT_BYTES`' doc).
-    let free_after_load_bytes = stats.free_vram_bytes;
-    // hotpath-lint-allow: one line per model load.
-    tracing::info!(
-        name: "ignis.runtime.vram_loaded",
-        planned_bytes = vram.total_bytes - vram.lines.retained - vram.lines.cuda_context,
-        free_memory_delta_bytes = free_at_start_bytes.saturating_sub(free_after_load_bytes),
-        free_after_load_bytes,
-        "vram loaded"
-    );
+    // What NVML says the load took, beside what the plan said it would
+    // (GitHub #210): every line but the retained one, which the load does not
+    // allocate. The delta also moves with anything else on the card.
+    if let Ok((free_after_load_bytes, _)) = CudaDevice::nvml_memory(0) {
+        // hotpath-lint-allow: one line per model load.
+        tracing::info!(
+            name: "ignis.runtime.vram_loaded",
+            allocated_at_load_bytes = vram.total_bytes - vram.lines.retained,
+            free_memory_delta_bytes = free_at_start_bytes.saturating_sub(free_after_load_bytes),
+            free_after_load_bytes,
+            "vram loaded"
+        );
+    }
 
     Ok(scheduler(
         scheduler_config_for_shape(

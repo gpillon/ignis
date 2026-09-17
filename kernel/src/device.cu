@@ -16,6 +16,7 @@
 #include "ignis_device.h"
 
 #include <cuda_runtime.h>
+#include <nvml.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -175,6 +176,43 @@ extern "C" int32_t ignis_device_sync(struct ignis_device *d) {
   if (err != cudaSuccess) {
     return log_cuda_error(-1, "cudaEventSynchronize", err);
   }
+  return 0;
+}
+
+extern "C" int32_t ignis_device_nvml_mem_info(int device_id, uint64_t *free_bytes,
+                                              uint64_t *total_bytes) {
+  if (free_bytes == nullptr || total_bytes == nullptr) {
+    return -1;
+  }
+  // The PCI bus id names the same card in both APIs, whatever order each
+  // enumerates devices in; asking for it creates no context.
+  char bus_id[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {};
+  cudaError_t err = cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device_id);
+  if (err != cudaSuccess) {
+    return log_cuda_error(-1, "cudaDeviceGetPCIBusId", err);
+  }
+  nvmlReturn_t rc = nvmlInit_v2();
+  if (rc != NVML_SUCCESS) {
+    std::fprintf(stderr, "[ignis-device] NVML error in nvmlInit_v2: %s\n", nvmlErrorString(rc));
+    return -1;
+  }
+  nvmlDevice_t device = nullptr;
+  nvmlMemory_t memory{};
+  rc = nvmlDeviceGetHandleByPciBusId_v2(bus_id, &device);
+  const char *op = "nvmlDeviceGetHandleByPciBusId_v2";
+  if (rc == NVML_SUCCESS) {
+    rc = nvmlDeviceGetMemoryInfo(device, &memory);
+    op = "nvmlDeviceGetMemoryInfo";
+  }
+  if (rc != NVML_SUCCESS) {
+    std::fprintf(stderr, "[ignis-device] NVML error in %s: %s\n", op, nvmlErrorString(rc));
+  }
+  nvmlShutdown();
+  if (rc != NVML_SUCCESS) {
+    return -1;
+  }
+  *free_bytes = memory.free;
+  *total_bytes = memory.total;
   return 0;
 }
 

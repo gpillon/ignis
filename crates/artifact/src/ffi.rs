@@ -58,6 +58,14 @@ unsafe extern "C" {
         total_bytes: *mut u64,
     ) -> i32;
 
+    /// Free / total memory of CUDA device `device_id` as NVML reports it,
+    /// read without creating a CUDA context (GitHub #210).
+    pub fn ignis_device_nvml_mem_info(
+        device_id: i32,
+        free_bytes: *mut u64,
+        total_bytes: *mut u64,
+    ) -> i32;
+
     /// Free a device allocation returned by [`ignis_device_alloc`]. NULL
     /// device or pointer is a no-op.
     pub fn ignis_device_free(d: *mut IgnisDevice, ptr: *mut c_void);

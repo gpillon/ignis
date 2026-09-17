@@ -287,6 +287,9 @@ set_target_properties(ignis_kernel PROPERTIES
 )
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
+# GitHub #210: device memory as NVML reports it, read before a context exists
+# (ignis_device_nvml_mem_info). nvml.dll ships with the driver.
+target_link_libraries(ignis_kernel PUBLIC CUDA::nvml)
 
 # NOTE: ignis_kernel itself still does not resolve cudart here — a static
 # archive carries unresolved cudart symbols, which the final Rust binary

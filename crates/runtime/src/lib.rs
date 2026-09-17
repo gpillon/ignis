@@ -69,11 +69,9 @@ pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64
 /// counter `\GPU Process Memory(pid_*)\Dedicated Usage` (Task Manager's
 /// figure) on the RTX 5090, 2026-09-17.
 ///
-/// A plan line, never added to the free memory the budget starts from: on
-/// Windows `cudaMemGetInfo` does not count the calling process's own context
-/// (a context-only process read the same free memory a loaded server did),
-/// and it already reads about 400 MiB more free than the adapter's dedicated
-/// usage leaves, so adding the context back would spend the headroom twice.
+/// A plan line: the budget starts from the free memory NVML reports before
+/// the context exists (`CudaDevice::nvml_memory`), so the context is one more
+/// thing the process holds inside it.
 pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
 
 /// What a load holds beyond every reservation the VRAM plan names (GitHub

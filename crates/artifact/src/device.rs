@@ -201,6 +201,24 @@ impl CudaDevice {
         }
         Ok(CudaDevice { handle })
     }
+
+    /// Free and total memory of device `device_id` as NVML reports it -- what
+    /// nvidia-smi and Task Manager show -- read without creating a CUDA
+    /// context (GitHub #210). Unlike [`Device::free_bytes`], it is meaningful
+    /// before this process holds anything: on Windows `cudaMemGetInfo` does
+    /// not count the caller's own context and reads about 400 MiB more free
+    /// memory than the adapter has.
+    pub fn nvml_memory(device_id: i32) -> Result<(u64, u64)> {
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let rc = unsafe { crate::ffi::ignis_device_nvml_mem_info(device_id, &mut free, &mut total) };
+        if rc != 0 {
+            return Err(fail(format!(
+                "ignis_device_nvml_mem_info({device_id}) failed; is NVML (nvml.dll, shipped with the driver) available?"
+            )));
+        }
+        Ok((free, total))
+    }
 }
 
 #[cfg(feature = "cuda")]

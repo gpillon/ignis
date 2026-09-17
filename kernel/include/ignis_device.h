@@ -52,6 +52,15 @@ int32_t ignis_device_sync(struct ignis_device *d);
 int32_t ignis_device_mem_info(struct ignis_device *d, uint64_t *free_bytes,
                               uint64_t *total_bytes);
 
+/* Free / total memory of CUDA device `device_id` as NVML reports it -- the
+ * figure nvidia-smi and Task Manager show -- read without creating a CUDA
+ * context (GitHub #210). A VRAM budget is derived from this rather than from
+ * ignis_device_mem_info: on Windows WDDM cudaMemGetInfo does not count the
+ * calling process's own context and reads about 400 MiB more free memory
+ * than the adapter has. Needs no ignis_device. Returns 0 on success, -1 on a
+ * CUDA or NVML error (logged to stderr) or a bad argument. */
+int32_t ignis_device_nvml_mem_info(int device_id, uint64_t *free_bytes, uint64_t *total_bytes);
+
 /* Free a device allocation returned by ignis_device_alloc. NULL device or
  * pointer is a no-op. */
 void ignis_device_free(struct ignis_device *d, void *ptr);
