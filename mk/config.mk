@@ -40,7 +40,12 @@ EXPOSE ?=
 # line) joins the system prompt; strict = 400 for any system message not first.
 SYSTEM_MESSAGE_POLICY ?= merge
 # inplace (server default), into-system, after-system, one-after-system, reject.
-DEVELOPER_MESSAGE_POLICY ?=
+# Pinned rather than left to the default: the Playground's date and time tool,
+# set to update every prompt, sends each turn's moment as a developer message
+# after the history, so the prompt's head stays byte-identical and a long
+# conversation keeps its prefix. into-system and after-system hoist that message
+# into the head instead, and every turn then prefills from scratch, silently.
+DEVELOPER_MESSAGE_POLICY ?= inplace
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
 # Defaults are the G5 gate legs (.scratch/runtime/specs/05, the g5-run driver):
