@@ -353,7 +353,8 @@ as `vision_reserved_bytes` beside the pool's `token_capacity`.
 load, that an image request, an image prefill interleaved with decoding text
 lanes and a three-image prompt whose encodes land between prefill chunks
 generate the tokens recorded before the arena was shared
-(`IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1` re-records them). Absent, nothing vision-related is
+(`IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1` re-records them).
+Absent, nothing vision-related is
 bound or allocated. `crates/core/tests/vision_load_gpu.rs` pins the VRAM delta
 (weights plus the reported reservation) and prints the reservation at the
 default envelope; `kernel/tests/test_model_load_vision_options.cpp` pins the

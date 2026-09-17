@@ -332,11 +332,12 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
 
 **As built (#212), where it departs from or sharpens the above:**
 
-- **The arena is `model->scratch`, and an encode checks it is free.** Media
-  encode takes its bytes from the prefill scratch under a scope it holds until
-  its own synchronize. It refuses to run while the scratch is in use, so
-  "never live at the same time" is checked rather than assumed. Every
-  prefill step already releases its scope before it returns.
+- **The arena is `model->scratch`.** Media encode takes its bytes from the
+  prefill scratch under a scope it holds until its own synchronize. "Never
+  live at the same time" holds by construction: every user of the scratch
+  takes a scope inside one step ABI call and releases it before returning,
+  all on the model's one stream, and the runtime encodes before a chunk's
+  prefill call, never inside it.
 - **One plan line for every load.** `prefill_scratch` and `vision_workspace`
   are replaced by one `workspace` line (`workspace_bytes` in `vram_plan`,
   `ignis_model_reservations.workspace_bytes` in the ABI). A text load keeps
@@ -364,13 +365,26 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
     growth). Shared stayed at 77,594,624 B.
 - **Exactness is against recorded tokens.**
   `crates/runtime/tests/vision_shared_workspace_gpu.rs` recorded every
-  request's greedy tokens on the build before the change, on a DFlash2 + BF16
-  load. It has three legs: an image request alone; an image prefill in
-  64-token chunks between three decoding text lanes; and a three-image prompt
-  whose encodes land between prefill chunks. The recording was confirmed
-  deterministic by a second run before the change. The allocation counter
-  reads zero over all three legs; it covers the leaf's own allocation
-  points, not vendored arena construction.
+  request's greedy tokens on efdcf58's sources, on a DFlash2 + BF16 load, and
+  a second run there confirmed them deterministic.
+  - It runs on two loads, one for each side of the `max`. At a 128-token
+    prefill chunk the encoder's workspace is the larger (138,741,504 B against
+    55,051,008 B); at 1024 the prefill scratch is (436,782,080 B).
+  - Each load runs three legs: an image request alone; an image prefill in
+    64-token chunks while three text lanes decode long answers, with at least
+    two verify rounds committing text between its chunks (3 measured); and a
+    three-image prompt whose encodes land between prefill chunks.
+  - The allocation counter reads zero over the legs. It covers the leaf's own
+    allocation points, not vendored arena construction.
+- **The `max` is pinned on the plan.** `vram_plan_gpu` asks the leaf's plan,
+  with no device memory: at the serving context the chunk width moves a text
+  load's workspace (1,481,902,336 B at 1024, 1,119,927,808 B at 128) and not
+  a vision load's (2,219,837,184 B at both). At a 2048-token context vision
+  leaves the workspace as it is. A text load's workspace equals the
+  `prefill_scratch` it had before.
+- **Untested:** the load error that names `--vision-max-tokens` needs a card
+  with less free memory than the scratch, and since #210 the plan refuses
+  that start first.
 
 ### Slice 7 — KV-RAM as one pinned arena
 

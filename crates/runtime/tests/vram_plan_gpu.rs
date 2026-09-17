@@ -101,3 +101,63 @@ fn the_planned_reservations_are_what_the_load_holds() {
         "the load holds what its plan laid out"
     );
 }
+
+/// GitHub #212: the prefill scratch and the vision encoder's workspace are one
+/// arena sized for the larger of the two, not two arenas added up. Asked of
+/// the leaf's plan only, so nothing here touches the device.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let speculation = Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7");
+    let vision = Vision::new(ignis_core::DEFAULT_VISION_MAX_TOKENS).expect("default envelope");
+    let reserved = |prefill_chunk_tokens: u32, max_context_tokens: u32, vision: Option<Vision>| {
+        let scope = model_load::model_scope(Some(speculation), vision);
+        let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
+        let config = CudaLeafConfig {
+            max_context_tokens,
+            kv_format: KvFormat::HqE8_2b,
+            prefill_chunk_tokens,
+            speculation: Some(speculation),
+            vision,
+            ..CudaLeafConfig::default()
+        };
+        config
+            .plan_reservations(&reader, &plan, &handles)
+            .unwrap_or_else(|e| panic!("plan the reservations: {e}"))
+            .reserved
+    };
+
+    // The serving context, where the encoder's 32,768-token workspace is the
+    // larger: the chunk width moves a text load's scratch and not a vision
+    // load's. Added up, both would move by the same amount.
+    let text = reserved(1024, MAX_CONTEXT, None);
+    let narrow_text = reserved(128, MAX_CONTEXT, None);
+    let with_vision = reserved(1024, MAX_CONTEXT, Some(vision));
+    let narrow_with_vision = reserved(128, MAX_CONTEXT, Some(vision));
+    eprintln!(
+        "workspace: text {} (128-token chunk {}), vision {} (128-token chunk {})",
+        text.workspace, narrow_text.workspace, with_vision.workspace, narrow_with_vision.workspace
+    );
+    assert!(narrow_text.workspace < text.workspace, "the chunk width sizes a text load's scratch");
+    assert!(with_vision.workspace > text.workspace, "the encoder's workspace is the larger here");
+    assert_eq!(with_vision.workspace, narrow_with_vision.workspace, "one arena, sized by the encoder alone");
+    // A text load reserves what it did before #212: the `prefill_scratch`
+    // line the plan logged at these options on 2026-09-17.
+    assert_eq!(text.workspace, 1_481_902_336);
+    assert_eq!(text.media_embedding, 0);
+    assert!(with_vision.media_embedding > 0, "the media embedding keeps its own reservation");
+
+    // A short context caps the envelope below the prefill scratch: vision
+    // then grows the arena not at all.
+    const SHORT_CONTEXT: u32 = 2048;
+    assert_eq!(
+        reserved(1024, SHORT_CONTEXT, Some(vision)).workspace,
+        reserved(1024, SHORT_CONTEXT, None).workspace,
+        "the prefill scratch already fits the encoder"
+    );
+}

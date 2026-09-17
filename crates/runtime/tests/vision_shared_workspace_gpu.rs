@@ -3,19 +3,23 @@
 //! an arena of its own, on a DFlash2 load through the production `CudaLeaf`
 //! and the scheduler.
 //!
-//! One load carries every leg, because the card fits one artifact at a time:
+//! The legs run on two loads, one after the other, one for each side of the
+//! arena's `max`: at a 128-token prefill chunk the encoder's workspace is the
+//! larger, at 1024 the prefill scratch is. Each load runs:
 //!
 //! 1. **An image request alone.**
-//! 2. **A mixed load.** Three text lanes are decoding when an image request
-//!    arrives; its prefill, in 64-token chunks, runs between their verify
-//!    rounds.
-//! 3. **Encodes between chunks.** One prompt with three images, each image's
-//!    196-token placeholder run wider than a chunk: every encode after the
-//!    first lands between two prefill chunks of the same request.
+//! 2. **A mixed load.** Three text lanes are decoding long answers when an
+//!    image request arrives; its 196-token placeholder run prefills in
+//!    64-token chunks, and the test counts the verify rounds that commit text
+//!    tokens between those chunks.
+//! 3. **Encodes between chunks.** One prompt with three images. A chunk never
+//!    crosses a media boundary, so every encode after the first lands between
+//!    two prefill chunks of the same request, and the first image's run spans
+//!    several chunks.
 //!
 //! Every request's greedy tokens must equal the ones recorded on the build
 //! before the change (`fixtures/vision_shared_workspace_tokens.json`, recorded
-//! at efdcf58 with `IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1`). The runs are
+//! on efdcf58's sources with `IGNIS_RECORD_VISION_WORKSPACE_TOKENS=1`). The runs are
 //! single-threaded `ConcreteScheduler::advance` loops, so the same build
 //! gives the same tokens run after run; a shared arena that let an encode
 //! and a prefill chunk overlap would move them.
@@ -49,7 +53,7 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 const MODEL: &str = "qwen3.8-27b";
 const MAX_CONTEXT: u32 = 2048;
 const MAX_TOKENS: u32 = 32;
-/// The serving chunk: narrower than an image's 196-token placeholder run.
+/// The serving chunk: narrower than number.png's 196-token placeholder run.
 const SERVING_CHUNK: u32 = 64;
 const RECORD_ENV: &str = "IGNIS_RECORD_VISION_WORKSPACE_TOKENS";
 
@@ -79,13 +83,13 @@ fn options() -> ChatRenderOptions {
     ChatRenderOptions { enable_thinking: false, ..Default::default() }
 }
 
-fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
+fn text_input(frontend: &FrontendSet, question: &str, max_tokens: u32) -> RequestInput {
     let messages = [ChatMessage::text(Role::User, question)];
     let rendered = frontend.chat_template().render_with_thinking_and_tools(&messages, options(), None).expect("render");
     RequestInput {
         model: MODEL.into(),
         tokens: frontend.tokenizer().encode(&rendered).expect("tokenize"),
-        params: params(),
+        params: DecodeParams { max_tokens: Some(max_tokens), ..DecodeParams::default() },
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -130,15 +134,25 @@ fn generated(events: &[SchedEvent], id: RequestId) -> Vec<TokenId> {
         .collect()
 }
 
+/// What one [`run`] generated.
+struct Ran {
+    /// Every request's generated tokens, in submission order.
+    tokens: Vec<Vec<TokenId>>,
+    /// Ticks after `then` arrived, before any of it emitted a token, in which
+    /// a request of `first` committed one: decode rounds that ran between
+    /// `then`'s prefill chunks.
+    interleaved_ticks: usize,
+}
+
 /// Run `first` (given `lead` advances to start decoding) and then `then` to
-/// idle; every request's generated tokens, in submission order.
+/// idle.
 fn run(
     compute: &Arc<RuntimeCompute<CudaLeaf>>,
     pages: u32,
     first: Vec<RequestInput>,
     lead: usize,
     then: Vec<RequestInput>,
-) -> Vec<Vec<TokenId>> {
+) -> Ran {
     let config = SchedulerConfig {
         model: MODEL.into(),
         max_sequence_tokens: MAX_CONTEXT,
@@ -154,13 +168,33 @@ fn run(
     for _ in 0..lead {
         events.extend(sched.advance());
     }
+    let leading = ids.len();
     ids.extend(then.into_iter().map(|input| sched.submit(input, RequestClass::Agent).expect("submit")));
+    let committed = |tick: &[SchedEvent], among: &[RequestId]| {
+        tick.iter().any(|event| matches!(event, SchedEvent::Token { request, .. } if among.contains(request)))
+    };
+    let mut later_started = ids.len() == leading;
+    let mut interleaved_ticks = 0;
     while !sched.is_idle() {
-        events.extend(sched.advance());
+        let tick = sched.advance();
         assert!(sched.last_error().is_none(), "compute error: {:?}", sched.last_error());
+        if !later_started {
+            if committed(&tick, &ids[leading..]) {
+                later_started = true;
+            } else if committed(&tick, &ids[..leading]) {
+                interleaved_ticks += 1;
+            }
+        }
+        events.extend(tick);
     }
     assert_eq!(compute.live_media(), 0, "every media embedding released");
-    ids.into_iter().map(|id| generated(&events, id)).collect()
+    Ran { tokens: ids.into_iter().map(|id| generated(&events, id)).collect(), interleaved_ticks }
+}
+
+/// The widest media item's placeholder run in `input`.
+fn widest_item(input: &RequestInput) -> usize {
+    let multimodal = input.multimodal.as_ref().expect("multimodal");
+    multimodal.media.iter().map(|item| item.token_span.count).max().expect("a media item")
 }
 
 struct Loaded {
@@ -169,8 +203,9 @@ struct Loaded {
     pages: u32,
 }
 
-/// The vision + DFlash2 load, or `None` where the profile allows a skip.
-fn load() -> Option<Loaded> {
+/// The vision + DFlash2 load at `prefill_chunk_tokens`, or `None` where the
+/// profile allows a skip.
+fn load(prefill_chunk_tokens: u32) -> Option<Loaded> {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return None;
@@ -202,6 +237,7 @@ fn load() -> Option<Loaded> {
         max_context_tokens: MAX_CONTEXT,
         kv_format: KvFormat::Bf16,
         kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(KvFormat::Bf16, MAX_CONTEXT),
+        prefill_chunk_tokens,
         speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
         vision: Some(Vision::default()),
         ..CudaLeafConfig::default()
@@ -215,41 +251,37 @@ fn load() -> Option<Loaded> {
     Some(Loaded { compute, frontend, pages: stats.kv_page_count })
 }
 
-#[test]
-#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn media_encode_out_of_the_prefill_scratch_generates_the_recorded_tokens() {
-    let Some(Loaded { compute, frontend, pages }) = load() else {
-        return;
-    };
+/// Every leg on one load, keyed `{shape}/{leg}`, each request's tokens in
+/// submission order.
+fn legs(loaded: &Loaded, shape: &str) -> BTreeMap<String, Vec<Vec<TokenId>>> {
+    let Loaded { compute, frontend, pages } = loaded;
+    let (compute, frontend, pages) = (compute, frontend, *pages);
     let number = canary_image("number.png");
     let colour = canary_image("colour.png");
     let circles = canary_image("circles.png");
     let before = AllocKind::ALL.map(alloc_count);
 
     let mut runs: BTreeMap<String, Vec<Vec<TokenId>>> = BTreeMap::new();
-    runs.insert(
-        "image_alone".into(),
-        run(&compute, pages, vec![image_question(&frontend, &number, "What number is shown in the image?")], 0, Vec::new()),
-    );
+    let alone = run(compute, pages, vec![image_question(&frontend, &number, "What number is shown in the image?")], 0, Vec::new());
+    runs.insert(format!("{shape}/image_alone"), alone.tokens);
 
     let texts = [
-        "What is 2 + 2? Answer with a number only.",
-        "What is the capital of Italy? Answer with one word.",
-        "What colour is a ripe banana? Answer with one word.",
+        "Write a paragraph about the history of Rome.",
+        "Explain how a bicycle gear works.",
+        "Describe the water cycle step by step.",
     ]
-    .map(|q| text_input(&frontend, q));
-    // The text lanes decode first; the image prompt then prefills in 64-token
-    // chunks between their verify rounds.
-    runs.insert(
-        "mixed".into(),
-        run(
-            &compute,
-            pages,
-            texts.to_vec(),
-            6,
-            vec![image_question(&frontend, &colour, "What colour is the square in the image?")],
-        ),
-    );
+    .map(|q| text_input(&frontend, q, 128));
+    // The text lanes are prefilled and decoding after one tick; the image
+    // prompt then prefills in 64-token chunks between their verify rounds.
+    let picture = image_question(&frontend, &number, "Describe this image in detail.");
+    assert!(widest_item(&picture) > SERVING_CHUNK as usize, "the image's run spans several chunks");
+    let mixed = run(compute, pages, texts.to_vec(), 1, vec![picture]);
+    eprintln!("mixed: {} verify rounds committed text between the image's prefill chunks", mixed.interleaved_ticks);
+    assert!(mixed.interleaved_ticks >= 2, "the image prefill interleaved with decoding text lanes");
+    for (n, tokens) in mixed.tokens[..texts.len()].iter().enumerate() {
+        assert!(tokens.len() > 32, "text lane {n} was still decoding when the image arrived: {} tokens", tokens.len());
+    }
+    runs.insert(format!("{shape}/mixed"), mixed.tokens);
 
     let parts = vec![
         ContentPart::Text("First image:".into()),
@@ -263,13 +295,14 @@ fn media_encode_out_of_the_prefill_scratch_generates_the_recorded_tokens() {
     let three = multimodal_input(&frontend, parts, &[&number, &colour, &circles]);
     let items = three.multimodal.as_ref().expect("multimodal").media.len();
     assert_eq!(items, 3, "three media items");
-    runs.insert("encodes_between_chunks".into(), run(&compute, pages, vec![three], 0, Vec::new()));
+    assert!(widest_item(&three) > SERVING_CHUNK as usize, "an image's run spans several chunks");
+    runs.insert(format!("{shape}/encodes_between_chunks"), run(compute, pages, vec![three], 0, Vec::new()).tokens);
 
     let counts: Vec<(AllocKind, AllocCount)> =
         AllocKind::ALL.iter().zip(&before).map(|(&kind, earlier)| (kind, alloc_count(kind).since(earlier))).collect();
-    eprintln!("allocation counts over the legs: {counts:#?}");
+    eprintln!("{shape}: allocation counts over the legs: {counts:#?}");
     for (kind, count) in &counts {
-        assert_eq!(*count, AllocCount::default(), "{kind:?} allocated while serving images");
+        assert_eq!(*count, AllocCount::default(), "{shape}: {kind:?} allocated while serving images");
     }
 
     let decode = |tokens: &[TokenId]| frontend.tokenizer().decode(tokens).expect("decode");
@@ -278,6 +311,23 @@ fn media_encode_out_of_the_prefill_scratch_generates_the_recorded_tokens() {
             assert!(!tokens.is_empty(), "{leg} request {n} generated nothing");
             eprintln!("{leg} request {n}: {:?}", decode(tokens));
         }
+    }
+    runs
+}
+
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn media_encode_out_of_the_prefill_scratch_generates_the_recorded_tokens() {
+    // Both sides of the `max`, one load at a time: at a 128-token chunk the
+    // encoder's workspace is the larger, so prefill runs in an arena sized
+    // for the encoder; at 1024 the prefill scratch is, and the encode runs in
+    // bytes a prefill chunk sized.
+    let mut runs = BTreeMap::new();
+    for (prefill_chunk_tokens, shape) in [(128, "encoder_sized"), (1024, "prefill_sized")] {
+        let Some(loaded) = load(prefill_chunk_tokens) else {
+            return;
+        };
+        runs.extend(legs(&loaded, shape));
     }
 
     let path = fixture_path();

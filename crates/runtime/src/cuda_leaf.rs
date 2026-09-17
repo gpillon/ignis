@@ -84,8 +84,8 @@ pub struct CudaLeafConfig {
     /// Vision, fixed for the life of the model handle (GitHub #177). With it,
     /// `handles` must carry the `vision/*` objects
     /// (`ignis_artifact::bind_model_scope_27b_with`) and the load reserves the
-    /// encoder workspace and output transient before the pool is built;
-    /// `None` is today's load.
+    /// encoder workspace (inside the prefill scratch, GitHub #212) and output
+    /// transient before the pool is built; `None` is today's load.
     pub vision: Option<ignis_core::Vision>,
 }
 

@@ -261,12 +261,6 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
     set_error("ignis_media_encode: the model was loaded without vision");
     return -1;
   }
-  // GitHub #212: the scratch is shared with prefill steps, which release it
-  // before they return.
-  if (model->scratch->used() != 0) {
-    set_error("ignis_media_encode: a prefill step's scratch is live; encode between steps");
-    return -1;
-  }
   if (model->vision_output_live) {
     set_error("ignis_media_encode: a media embedding is already live; release it first");
     return -1;

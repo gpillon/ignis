@@ -3,8 +3,9 @@
 //!
 //! Like speculation, vision is engine residency, chosen at load and frozen for
 //! the life of that load: with a [`Vision`], the `vision/*` objects are bound
-//! in their stored formats and the leaf reserves the encoder workspace and one
-//! item's output transient for the envelope, before the sequence pool exists.
+//! in their stored formats and the leaf reserves the encoder workspace (inside
+//! the prefill scratch, GitHub #212) and one item's output transient for the
+//! envelope, before the sequence pool exists.
 //! `None` is today's engine — nothing vision-related is bound or allocated.
 //!
 //! GitHub #178 adds what a multimodal request carries through the scheduler

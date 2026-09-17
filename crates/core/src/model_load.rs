@@ -591,9 +591,10 @@ pub fn load_qwen38_27b_with_speculation(
 /// [`load_qwen38_27b_with_speculation`] with vision chosen at load too
 /// (GitHub #177). With `Some`, `handles` must be the handles
 /// [`ignis_artifact::bind_model_scope_27b_with`] returned for [`model_scope`]
-/// of the same options: the leaf binds every `vision/*` weight from them and
-/// reserves the encoder workspace and output transient for the envelope,
-/// reported as [`IgnisModelStats::vision_reserved_bytes`]. With neither
+/// of the same options: the leaf binds every `vision/*` weight from them,
+/// sizes its prefill scratch to fit the encoder workspace too (GitHub #212)
+/// and reserves the output transient for the envelope, reported as
+/// [`IgnisModelStats::vision_reserved_bytes`]. With neither
 /// option the options pointer crosses as NULL and the load is exactly today's.
 #[allow(clippy::too_many_arguments)]
 pub fn load_qwen38_27b_with_options(

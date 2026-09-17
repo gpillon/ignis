@@ -1,9 +1,10 @@
 //! GPU test for vision as a load option (GitHub #177): a load with a vision
 //! envelope binds every `vision/*` object and reports, beside its weights,
-//! the encoder workspace and output transient it reserved — and a load
-//! without it binds and reserves nothing of vision, reporting today's figure.
-//! Its device footprint is those two plus the decode round's rope staging
-//! (`DECODE_ROPE_STAGING_BYTES`, GitHub #178) and nothing else.
+//! what it reserved for vision — the output transient, and whatever the
+//! encoder workspace grew the shared prefill scratch by (GitHub #212) — and a
+//! load without it binds and reserves nothing of vision, reporting today's
+//! figure. Its device footprint is that reservation plus the decode round's
+//! rope staging (`DECODE_ROPE_STAGING_BYTES`, GitHub #178) and nothing else.
 //!
 //! One upload of the vision-bearing plan serves every load: the text scope is
 //! its first handles (`bind_model_scope_27b_with` places the vision tensors
@@ -33,8 +34,9 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 /// `ignis_program_stats` counts that buffer; `vision_reserved_bytes` does
 /// not, and should not — that number is the per-item output transient plus
 /// what the encoder workspace grows the prefill scratch by (GitHub #212: the
-/// two share one arena), which is what the startup capacity line reports. One I32 per lane over the leaf's `IGNIS_DECODE_MAX_BATCH`
-/// (8, `ignis_step.h`).
+/// two share one arena), which is what the startup capacity line reports.
+/// One I32 per lane over the leaf's `IGNIS_DECODE_MAX_BATCH` (8,
+/// `ignis_step.h`).
 ///
 /// #177 wrote this test before #178 added the buffer, and no GPU profile ran
 /// on a branch carrying both until #195 — which is why the delta below is 32
