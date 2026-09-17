@@ -5,9 +5,10 @@
  * of.** Every section of a sequence's state is listed in
  * `ignis_seq_section_table` below with its size in bytes and whether it is
  * shareable read-only history or mutable state that must be cloned per
- * sequence. Three consumers read that one description: snapshot to host,
- * restore from host, and (P4-10, GitHub #126) the device-to-device clone
- * behind prefix reuse -- so a section is carried by all three or by none.
+ * sequence. Every consumer reads that one description: snapshot to host,
+ * restore from host, (P4-10, GitHub #126) the device-to-device clone behind
+ * prefix reuse, and (GitHub #211) the slot-to-slot copy into a retained slot
+ * -- so a section is carried by all of them or by none.
  *
  * Not part of the public flat C ABI. ADR 0024 is explicit that the layout
  * does not cross the C boundary: `ignis_seq.h` exposes a snapshot *size*

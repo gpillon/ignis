@@ -276,18 +276,14 @@ fn a_drafting_sequence_state_comes_back_from_a_retained_slot_bit_exact_on_a_dfla
         rounds(&mut seq, 2);
 
         let drafted = state_of(&seq);
-        let written: Vec<(i32, bool)> = STATE_SECTIONS
-            .iter()
-            .zip(&drafted)
-            .map(|(&kind, section)| (kind, section.iter().any(|&b| b != 0)))
-            .collect();
-        // Greedy rounds with no penalty leave the penalty counts at zero; the
-        // pattern test above carries that section.
-        assert_eq!(
-            written,
-            [(1, true), (2, true), (3, false), (5, true), (6, true)],
-            "the GDN state and the drafter's window and checkpoint hold what the load wrote"
-        );
+        // The GDN state and the drafter's window and checkpoint hold what the
+        // load wrote. The penalty counts are left out: greedy rounds with no
+        // penalty keep them at zero, and the pattern test above carries them.
+        for (&kind, section) in STATE_SECTIONS.iter().zip(&drafted) {
+            if kind != 3 {
+                assert!(section.iter().any(|&b| b != 0), "section {kind} holds no state");
+            }
+        }
         pool.retained_store(&seq, &slot).unwrap_or_else(|e| panic!("store: {e}"));
         rounds(&mut seq, 2);
         assert_ne!(state_of(&seq), drafted, "two more rounds moved the lane's state");

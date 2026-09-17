@@ -275,9 +275,9 @@ inline void ignis_seq_state_transfer(ignis_seq_pool &pool, unsigned char *image,
       break;
     }
     default:
-      /* ADR 0024's "carried by all three or by none", for the third
-       * consumer. A CLONE section added to the table without a case here is
-       * state a claimant would silently not receive. */
+      /* ADR 0024's "carried by all or by none", for the clone. A CLONE
+       * section added to the table without a case here is state a claimant
+       * would silently not receive. */
       throw std::logic_error(std::string("state section ") +
                              ignis_seq_section_name(section.kind) +
                              " has no device-to-device clone implementation");
