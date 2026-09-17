@@ -159,6 +159,28 @@ mod tests {
         assert_eq!(value["attributes"]["authorization"], "[REDACTED]");
     }
 
+    /// The other half of that rule: the KV pool's own arithmetic is not a
+    /// secret, and the #214 gate could not read it because it is counted in
+    /// tokens (GitHub #218). This is the line an operator reads to size a
+    /// load, so it is asserted where it is rendered, not only at the key
+    /// predicate.
+    #[test]
+    fn the_kv_pool_line_reports_its_capacity_in_tokens() {
+        let line = one_line(|| {
+            tracing::info!(
+                name: "ignis.runtime.kv_pool",
+                token_capacity = 447_296u64,
+                bytes_per_token = 9_216u64,
+                max_context_tokens = 262_144u64,
+                "kv pool"
+            );
+        });
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(value["attributes"]["token_capacity"], 447_296u64);
+        assert_eq!(value["attributes"]["bytes_per_token"], 9_216u64);
+        assert_eq!(value["attributes"]["max_context_tokens"], 262_144u64);
+    }
+
     #[test]
     fn structured_attributes_retain_their_native_type() {
         let line = one_line(|| {

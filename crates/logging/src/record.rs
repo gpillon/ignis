@@ -49,13 +49,35 @@ pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `token`/`bearer_token` (a credential) just because one contains the
 /// other's letters.
 const SENSITIVE_KEY_WORDS: &[&str] =
-    &["password", "secret", "token", "authorization", "bearer", "cookie", "credential"];
+    &["password", "secret", "authorization", "bearer", "cookie", "credential"];
+
+/// Keys that are a credential when they stand alone, whatever this engine
+/// also uses the word for. `token` is the unit this whole service is built
+/// on — `token_capacity`, `bytes_per_token`, `token_id` — so flagging it as a
+/// whole word wherever it appears redacted the engine's own arithmetic
+/// (GitHub #218, found by the #214 gate: `ignis.runtime.kv_pool` logged its
+/// capacity as `[REDACTED]`). A field named exactly `token` is still a
+/// credential, and a qualified one is caught by
+/// [`SENSITIVE_KEY_WORD_PAIRS`].
+const SENSITIVE_KEY_EXACT: &[&str] = &["token"];
 
 /// Adjacent-word pairs (after splitting on `_`/`-`/`.`, joined without the
 /// separator) that mark a key as sensitive even though neither word alone
 /// is in [`SENSITIVE_KEY_WORDS`] — `api_key`/`private_key` are credentials;
-/// `key` alone is too common a word (e.g. a cache or map key) to blanket-flag.
-const SENSITIVE_KEY_WORD_PAIRS: &[&str] = &["apikey", "privatekey"];
+/// `key` alone is too common a word (e.g. a cache or map key) to blanket-flag,
+/// and `token` is the same case (see [`SENSITIVE_KEY_EXACT`]). A credential's
+/// qualifier comes before the word it qualifies, so `access_token` is a pair
+/// while `token_capacity` is not — except `token_secret`, which `secret`
+/// already catches as a whole word.
+const SENSITIVE_KEY_WORD_PAIRS: &[&str] = &[
+    "apikey",
+    "privatekey",
+    "accesstoken",
+    "refreshtoken",
+    "authtoken",
+    "idtoken",
+    "sessiontoken",
+];
 
 /// The text a redacted attribute value is replaced with.
 const REDACTED: &str = "[REDACTED]";
@@ -64,6 +86,9 @@ fn is_sensitive_key(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
     if words.iter().any(|word| SENSITIVE_KEY_WORDS.contains(word)) {
+        return true;
+    }
+    if words.len() == 1 && SENSITIVE_KEY_EXACT.contains(&words[0]) {
         return true;
     }
     words.windows(2).any(|pair| {
@@ -369,6 +394,22 @@ mod tests {
         }
         for key in ["model", "duration_ms", "artifact_path"] {
             assert!(!is_sensitive_key(key), "{key} should not be flagged sensitive");
+        }
+    }
+
+    /// A credential named `token` stays redacted whatever it is qualified
+    /// with, while the engine's own unit of work — which is also called a
+    /// token — keeps its value (GitHub #218). The two the #214 gate needed,
+    /// `token_capacity` and `bytes_per_token` (`ignis.runtime.kv_pool`), came
+    /// out as `[REDACTED]` because `token` was flagged as a whole word
+    /// wherever it appeared.
+    #[test]
+    fn a_token_count_is_logged_and_a_token_credential_is_not() {
+        for key in ["token", "Token", "access_token", "refresh_token", "auth-token", "id.token", "bearer_token", "session_token", "token_secret"] {
+            assert!(is_sensitive_key(key), "{key} is a credential and should be redacted");
+        }
+        for key in ["token_capacity", "bytes_per_token", "tokens", "prompt_tokens", "max_context_tokens", "draft_tokens", "committed_tokens", "token_id"] {
+            assert!(!is_sensitive_key(key), "{key} is a token count or id, not a credential");
         }
     }
 
