@@ -599,7 +599,7 @@ mod tests {
         let reserved = ignis_runtime::ReservedBytes {
             prefill_scratch: 1 << 30,
             lane_state: 1 << 30,
-            retained_slots: 8 * 238_823_424,
+            retained_slots: u64::from(crate::config::DEFAULT_RETAINED_SLOTS) * 238_823_424,
             ..Default::default()
         };
         let page_bytes = ignis_core::KvFormat::HqE8_2b.page_bytes(ignis_core::KvGeometry::qwen38_27b());
@@ -611,7 +611,7 @@ mod tests {
             kv_format: ignis_core::KvFormat::HqE8_2b,
             kv_geometry: ignis_core::KvGeometry::qwen38_27b(),
             max_context_tokens: 262_144,
-            retained_slots: 8,
+            retained_slots: crate::config::DEFAULT_RETAINED_SLOTS,
             kv_pool_bytes: None,
             kv_arena_bytes: &arena,
             can_page: true,
