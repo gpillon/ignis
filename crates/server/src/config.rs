@@ -729,8 +729,8 @@ fn resolve_prompt_reuse(
 }
 
 /// An instruction-message policy (GitHub #209): the flag, else the env var,
-/// else the first of `values` (the default). An unknown value is a usage
-/// error naming every allowed one.
+/// else the first of `values` (the default), matched case-insensitively. An
+/// unknown value is a usage error naming every allowed one.
 fn resolve_policy<P: Copy, const N: usize>(
     flag_value: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
@@ -741,11 +741,15 @@ fn resolve_policy<P: Copy, const N: usize>(
     let Some(raw) = non_empty(flag_value.or_else(|| env(var))) else {
         return Ok(values[0].1);
     };
-    match values.iter().find(|(name, _)| *name == raw.trim()) {
+    let wanted = raw.trim().to_ascii_lowercase();
+    match values.iter().find(|(name, _)| *name == wanted) {
         Some((_, policy)) => Ok(*policy),
         None => {
             let allowed: Vec<&str> = values.iter().map(|(name, _)| *name).collect();
-            Err(ConfigError(format!("`{flag}` must be one of {}, got `{raw}`", allowed.join(", "))))
+            Err(ConfigError(format!(
+                "`{flag}` / {var} must be one of {}, got `{raw}`",
+                allowed.join(", ")
+            )))
         }
     }
 }
@@ -1397,6 +1401,11 @@ mod tests {
         let err = resolve(&[], env).expect_err("not a developer policy");
         assert!(err.0.contains("--developer-message-policy"), "{}", err.0);
         assert!(err.0.contains("`drop`"), "names the value: {}", err.0);
+        assert!(err.0.contains("IGNIS_DEVELOPER_MESSAGE_POLICY"), "names the env var it came from: {}", err.0);
+
+        let a = args(&["--developer-message-policy", " One-After-System "]);
+        let config = expect_config(resolve(&a, no_env).expect("case and padding do not matter"));
+        assert_eq!(config.instruction_policy.developer, DeveloperMessagePolicy::OneAfterSystem);
         assert!(
             err.0.contains("inplace, into-system, after-system, one-after-system, reject"),
             "names the allowed ones: {}",

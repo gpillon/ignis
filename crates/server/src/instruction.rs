@@ -42,11 +42,6 @@ impl SystemMessagePolicy {
             Self::Strict => "strict",
         }
     }
-
-    /// The value named `raw` (exact, lowercase), or `None`.
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == raw)
-    }
 }
 
 /// What the engine does with a `developer` message
@@ -85,11 +80,6 @@ impl DeveloperMessagePolicy {
             Self::OneAfterSystem => "one-after-system",
             Self::Reject => "reject",
         }
-    }
-
-    /// The value named `raw` (exact, lowercase), or `None`.
-    pub fn parse(raw: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == raw)
     }
 
     /// Whether a `developer` message arriving mid-conversation changes the
@@ -147,6 +137,9 @@ impl InstructionPolicy {
             _ => {}
         }
         let has_prompt = !prompt.is_empty();
+        // `one-after-system` accepts exactly one developer message: a leading
+        // one that is the system prompt already is it.
+        let developer_prompt = messages.first().is_some_and(|m| m.role == "developer");
 
         let mut gathered: Vec<&ChatMessage> = Vec::new();
         let mut body = Vec::with_capacity(messages.len() - head);
@@ -160,7 +153,7 @@ impl InstructionPolicy {
                     DeveloperMessagePolicy::Inplace => body.push(instruction_block(&[message])),
                     DeveloperMessagePolicy::IntoSystem => prompt.push(message),
                     DeveloperMessagePolicy::AfterSystem => gathered.push(message),
-                    DeveloperMessagePolicy::OneAfterSystem if has_prompt && index == head => {
+                    DeveloperMessagePolicy::OneAfterSystem if has_prompt && !developer_prompt && index == head => {
                         body.push(instruction_block(&[message]))
                     }
                     DeveloperMessagePolicy::OneAfterSystem | DeveloperMessagePolicy::Reject => {
@@ -362,7 +355,8 @@ mod tests {
             ["system:S", "system:D", "system:T", "user:q"]
         );
         let rejection = refused(p(D::Reject), INTERLEAVED);
-        assert_eq!((rejection.code, rejection.message.contains("index 1")), ("developer_message_position", true));
+        assert_eq!(rejection.code, "developer_message_position");
+        assert!(rejection.message.contains("index 1"), "{}", rejection.message);
         // Strict: the developer is fine where it is, the second system is not.
         let rejection = refused(policy(S::Strict, D::Inplace), INTERLEAVED);
         assert_eq!(rejection.code, "system_message_position");
@@ -395,6 +389,12 @@ mod tests {
         assert!(rejection.message.contains("index 2"), "{}", rejection.message);
         let no_prompt = [("user", "q"), ("developer", "D")];
         assert!(refused(p, &no_prompt).message.contains("index 1"));
+        // A leading developer is the system prompt and the one developer
+        // message this policy accepts; a second is refused wherever it stands.
+        let two = [("developer", "D1"), ("developer", "D2"), ("user", "q")];
+        let rejection = refused(p, &two);
+        assert_eq!(rejection.code, "developer_message_position");
+        assert!(rejection.message.contains("index 1"), "{}", rejection.message);
     }
 
     #[test]
@@ -422,17 +422,5 @@ mod tests {
     fn only_rerendering_developer_policies_warn() {
         let warned: Vec<_> = D::ALL.into_iter().filter(|d| d.rerenders_history()).collect();
         assert_eq!(warned, [D::IntoSystem, D::AfterSystem]);
-    }
-
-    #[test]
-    fn values_round_trip_through_their_names() {
-        for p in S::ALL {
-            assert_eq!(S::parse(p.as_str()), Some(p));
-        }
-        for p in D::ALL {
-            assert_eq!(D::parse(p.as_str()), Some(p));
-        }
-        assert_eq!(S::parse("inplace"), None);
-        assert_eq!(D::parse("Inplace"), None);
     }
 }

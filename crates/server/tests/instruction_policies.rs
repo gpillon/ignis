@@ -267,7 +267,7 @@ fn a_changing_hook_line_keeps_the_pages_before_it_keyed_alike() {
     };
     // qwen-code's shape (every request of the #191 trace): a long agent
     // prompt, then a short hook line that differs between requests.
-    let agent_prompt = "You are a coding agent working in a Rust workspace. Read before you edit, keep diffs                         small, and run the tests the change touches. "
+    let agent_prompt = "You are a coding agent working in a Rust workspace. Read before you edit, keep diffs small, and run the tests the change touches. "
         .repeat(12);
     let request = |pad: usize, hook: &str| {
         let prompt = format!("{}{}", agent_prompt.trim(), " ok".repeat(pad));
