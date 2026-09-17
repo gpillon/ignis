@@ -25,7 +25,15 @@ fixed-cardinality counter families for retained state, each split by
 they are projected from (see Decision). The proposed widening of
 `ignis_prefix_reused_tokens_total` (#188), at the end of this document, was
 **not** taken: the counter keeps its sibling-prefix meaning, and retained
-reuse is counted in its own family instead.
+reuse is counted in its own family instead. Amended 2026-09-18 (owner
+request): the KV usage and capacity values this ADR leaves out, pending "a
+future ADR that preserves this ADR's zero-work invariant", are taken by
+ADR 0030 §Observability, which also adds the VRAM plan, the KV-RAM arena and
+the retained slots as gauges (#216, #217). The same amendment splits the six
+retained-state families by `kind="checkpoint|prefix"` as well as by `tier`,
+so the six rows below read "by tier and kind"; a prompt checkpoint and a
+shared prefix are no longer counted as one thing. Lane and sequence labels
+stay forbidden.
 
 ## Context
 

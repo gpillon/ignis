@@ -5,7 +5,11 @@
 Accepted (2026-09-17). Spec: `.scratch/vram-budget/specs/01-vram-budget.md`.
 Clarifies ADR 0029 (its device pool of retained images is physical: retained
 slots) and absorbs GitHub #204. Measurement and code analysis:
-`.scratch/vram-analysis/REPORT.md`.
+`.scratch/vram-analysis/REPORT.md`. Amended 2026-09-18 (owner request):
+§Observability names the memory series, their sources and their performance
+classes. It is the future ADR that ADR 0017 required before KV usage and
+capacity could be exported, and it preserves that ADR's zero-work invariant.
+Built by GitHub #216 (the exposition) and #217 (the Playground's Monitor).
 
 ## Context
 
@@ -103,6 +107,127 @@ the whole `--kv-host-pool-bytes`, with blobs placed first-fit inside it.
 - Windows counts the arena as the process's shared GPU memory, which is what
   makes that figure fixed.
 
+## Observability
+
+ADR 0017 left KV usage and capacity out of the Prometheus contract because
+the only values available were the interval line's placeholder zeros, and it
+required "a future ADR that preserves this ADR's zero-work invariant" before
+they could be exported. This is that ADR. Reserving every line at load makes
+the plan a set of load-time constants, and the scheduler's own host-side
+accounting — not the leaf — is the authoritative source for what is occupied.
+
+Every series below is a **gauge in bytes, pages or slots**. No percentage is
+exported: a ratio hides which of its two terms moved, and both terms are
+themselves series here.
+
+### Load-time constants
+
+Computed once during the load that already builds the plan, then never read
+again. They add no serving work of any kind.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|residual` | the plan's eleven lines, the same set and spelling the `ignis.runtime.vram_plan` event carries |
+| `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
+| `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
+| `ignis_kv_page_bytes` | gauge | none | one page's bytes |
+| `ignis_kv_ram_arena_bytes` | gauge | `state="capacity"` | `--kv-host-pool-bytes`, pinned whole at start |
+| `ignis_retained_slots` | gauge | `state="capacity"` | `--retained-slots` |
+
+A load that refuses to start exports nothing: there is no process to scrape.
+
+### Projections of facts that already cross
+
+The model thread already emits these, unconditionally, with metrics off. Only
+the projection is new, which is exactly the exemption #190 took for the
+retained-state families.
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `ignis_retained_slots` | gauge | `state="in_use"` | `SchedEvent::RetainedSlots` |
+| `ignis_retained_slot_skips_total` | counter | `reason=publish_skipped_no_slot\|capture_skipped_no_slot\|capture_skipped_no_page` | `SchedEvent::RetainedSlotSkipped`, the same bounded spellings the log uses |
+
+The skip counter is the one that says a load has run out of room to leave
+reuse behind. Consequences already names that state ("a long tool loop stops
+leaving reuse once its chain holds every slot, and it runs on without it");
+until now it was invisible.
+
+### The retained-state families say which kind of state moved
+
+ADR 0017's six retained-state families are split by `tier` alone. A
+**prompt checkpoint** and a **shared prefix** are therefore counted together,
+although they are retained for different reasons, are given up in a different
+order, and cost differently to bring back. An operator reading ten spills into
+KV-RAM cannot tell which of the two the load is shedding.
+
+**The six families gain `kind="checkpoint"|"prefix"`**, beside the `tier`
+they already carry:
+
+`ignis_retained_reused_tokens_total`, `ignis_retained_state_hits_total`,
+`ignis_retained_state_misses_total`, `ignis_retained_state_spills_total`,
+`ignis_retained_state_discards_total`, `ignis_retained_state_restores_total`.
+
+Six families across two tiers and two kinds is twenty-four series: bounded,
+constant, and the same order of magnitude the contract already carries.
+
+`SchedEvent::RetainedState` widens to name the kind. Every site that emits it
+already knows which it is holding — the type is `RetainedBlob`'s two variants,
+and the emitting call has a checkpoint entry or a prefix id in hand. Like the
+tick, this is a wider fact and not a new one: it is sent unconditionally, with
+metrics on or off, so flag-off and flag-on stay structurally identical.
+
+Without this split the surface would be inconsistent with itself, because
+`ignis_retained_slot_skips_total` already separates the two: a publish that
+found no slot is a prefix, and a capture that found no slot or no page is a
+checkpoint.
+
+`ignis_prefix_reused_tokens_total` is untouched and keeps the sibling-prefix
+meaning #190 gave it: a live sibling's claim is not retained state and takes
+no `kind`.
+
+### The interval tick carries what is occupied
+
+The model thread sends one `TelemetryFact::Tick` after every `advance()`.
+**That tick widens** to carry the scheduler's live occupancy, read from
+fields it already maintains for admission:
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `ignis_kv_pool_used_pages` | gauge | none | the main pool's pages reserved by running requests |
+| `ignis_kv_ram_arena_bytes` | gauge | `state="used"` | the host tier's used bytes |
+
+Both are plain field reads of state the admission machine keeps anyway. The
+tick is already sent, already unconditional, and its payload is the same
+whether metrics are on or off — so this adds no branch, atomic, clock read,
+allocation, task wake or channel operation to the inference path, and
+flag-off and flag-on remain structurally identical. That is the invariant
+ADR 0017 asked a future ADR to preserve.
+
+The same widening retires the interval line's `kv_used_pct` placeholder: the
+line reports the real figure, and `prefilling` stays a placeholder and stays
+unexported.
+
+### Not taken
+
+- **Polling the leaf while serving.** `ignis_seq_pool_stats` and
+  `ignis_seq_stats` report page-exact occupancy, per pool and per sequence,
+  and the load already reads the pool's once to verify the plan. Reading
+  either again is an FFI call on the model thread, for a number the scheduler
+  already has host-side. The leaf stays a load-time oracle.
+- **A live free-VRAM gauge.** It is a driver call, and on Windows the reading
+  cannot see paging — the fact this ADR's Context is built on. What the plan
+  reserved is the honest figure; what the driver reports while serving is
+  not.
+- **A `lane` label.** ADR 0017 forbids sequence and lane IDs as labels by
+  name, and this ADR does not reopen that.
+- **KV pages per request class.** `class` is a bounded set of two and would
+  be legal cardinality, but the pool's charge is one counter for the whole
+  load. Splitting it means new per-class accounting on the admission path,
+  which is not a free read and not in this ADR's scope.
+- **A prefix or checkpoint entry-count gauge.** On the device every retained
+  image holds a slot by construction, so `ignis_retained_slots{state="in_use"}`
+  already is that count. A second series would restate it and could disagree.
+
 ## Considered options
 
 - **Keep request-time allocation and charge every image to a hard byte
@@ -148,3 +273,14 @@ the whole `--kv-host-pool-bytes`, with blobs placed first-fit inside it.
   a chained prefix and every checkpoint holds a slot of its own. A long tool
   loop stops leaving reuse once its chain holds every slot, and it runs on
   without it.
+- **The metric surface grows by ten series and one label set.** Every one is
+  bounded and constant in cardinality: eleven plan lines, three skip reasons,
+  and two `state` values reused across two families.
+- **The six retained-state families double**, from twelve series to
+  twenty-four, and a dashboard that sums them without aggregating away `kind`
+  now double-counts nothing but reads two lines where it read one.
+- **`TelemetryFact::Tick` gains a payload.** It was a bare signal; it now
+  carries occupancy. Anything that widens it again pays the same structural
+  proof that the inference path is unchanged.
+- **`kv_used_pct` stops being a placeholder**, so the interval line's
+  documented caveat about it narrows to `prefilling` alone.
