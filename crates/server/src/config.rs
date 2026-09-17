@@ -866,12 +866,11 @@ fn refuse_retained_pool_bytes(
 
 /// `--retained-slots` / `IGNIS_RETAINED_SLOTS` (GitHub #215, ADR 0030):
 /// [`DEFAULT_RETAINED_SLOTS`] with prompt reuse on, 0 with it off. `0` is a
-/// legal choice with reuse on: nothing is published or captured, and the VRAM
-/// plan reserves no slot.
+/// legal choice: nothing is published or captured, and the VRAM plan reserves
+/// no slot.
 ///
-/// Naming a count with `--prompt-reuse off` is refused rather than ignored,
-/// the house rule every other sub-flag follows: slots nothing will ever fill
-/// are not what the operator meant to reserve.
+/// A count named with `--prompt-reuse off` is honoured: nothing is retained
+/// then, but live siblings share a published head, as before #186.
 fn resolve_retained_slots(
     flag: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
@@ -880,11 +879,6 @@ fn resolve_retained_slots(
     let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_RETAINED_SLOTS"))) else {
         return Ok(if prompt_reuse { DEFAULT_RETAINED_SLOTS } else { 0 });
     };
-    if !prompt_reuse {
-        return Err(ConfigError(format!(
-            "`--retained-slots {raw}` requires `--prompt-reuse on` (nothing is retained without it)"
-        )));
-    }
     parse_count("--retained-slots", "slot count", &raw)
 }
 
@@ -982,8 +976,8 @@ fn help_text() -> String {
          \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
          \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
-         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared, since no retained slot is reserved)\n\
-         \x20       --retained-slots <n>      env: IGNIS_RETAINED_SLOTS (default: {DEFAULT_RETAINED_SLOTS}, one per decode lane; 0 with --prompt-reuse off; the images of retained checkpoints and shared prefixes, reserved in the VRAM plan)\n\
+         \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused, and no prefix is shared unless --retained-slots gives slots for it)\n\
+         \x20       --retained-slots <n>      env: IGNIS_RETAINED_SLOTS (default: {DEFAULT_RETAINED_SLOTS}, one per decode lane; 0 with --prompt-reuse off, where a count shares heads between live siblings only; the images of retained checkpoints and shared prefixes, reserved in the VRAM plan)\n\
          \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
          \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
@@ -1699,13 +1693,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_slots_without_reuse_are_refused_not_ignored() {
-        // The house rule every other sub-flag follows: reserving slots nothing
-        // will ever fill is not what the operator meant.
+    fn retained_slots_with_reuse_off_are_accepted_for_live_siblings() {
+        // With reuse off nothing outlives a request, but live siblings still
+        // share a head when slots are given for it — the engine before #186.
         let a = args(&["--prompt-reuse", "off", "--retained-slots", "4"]);
-        let err = resolve(&a, no_env).expect_err("slots with reuse off");
-        assert!(err.0.contains("--retained-slots"), "{}", err.0);
-        assert!(err.0.contains("--prompt-reuse"), "names what it needs: {}", err.0);
+        let config = expect_config(resolve(&a, no_env).expect("slots with reuse off"));
+        assert!(!config.prompt_reuse);
+        assert_eq!(config.retained_slots, 4);
     }
 
     #[test]

@@ -290,9 +290,12 @@ Term: **retained slot**. Builds on slice 4's pool slots and counter.
   checkpoints first, then class, then LRU. The page path
   (`reclaim_retained_until`) keeps #188's LRU-only order for retained
   prefixes.
-- **`--prompt-reuse off` also stops sibling prefix sharing.** A publish needs
-  a slot, and reuse off reserves none. Live siblings then no longer share a
-  published block either, where before #215 they did.
+- **`--prompt-reuse off` shares between live siblings only when given slots.**
+  A publish needs a slot, and reuse off defaults to none, so by default live
+  siblings no longer share a published head, where before #215 they did.
+  `--retained-slots N` with reuse off is accepted (owner's choice,
+  2026-09-17) and restores exactly that: heads shared while their publisher
+  runs, no checkpoint captured, nothing retained.
 - **Slots per conversation.** Each link of a chain costs one slot, so each turn
   costs its link plus its checkpoint. A two-turn conversation holds 4 slots,
   and a request with a system block before an image holds 3 (block, head,

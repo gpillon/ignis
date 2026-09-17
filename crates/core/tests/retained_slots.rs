@@ -455,12 +455,47 @@ fn a_load_with_no_retained_slots_and_prompt_reuse_on_says_what_it_skipped() {
 }
 
 #[test]
-fn prompt_reuse_off_reserves_no_slots() {
+fn prompt_reuse_off_with_slots_shares_live_siblings_and_retains_nothing() {
+    // The slots a load gives with prompt reuse off are for live siblings
+    // alone: a head is published and claimed while its publisher runs, no
+    // checkpoint is captured, and the slot comes back when the head goes.
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             prompt_reuse: false,
+            retained_slots: 2,
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    );
+    let a = sched.submit(input(tokens(1, 40), None, Some(37), 50), RequestClass::Interactive).unwrap();
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        events.extend(sched.advance());
+    }
+    let b = sched.submit(input(tokens(1, 40), None, Some(37), 4), RequestClass::Interactive).unwrap();
+    events.extend(run_to_idle(&mut sched));
+    assert!(
+        events.iter().any(|e| matches!(e, SchedEvent::PrefixReused { request, .. } if *request == b)),
+        "the sibling claims the live head: {events:?}"
+    );
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    assert!(jobs.iter().any(|j| j.request == a && j.publish_prefix.is_some()));
+    assert!(jobs.iter().all(|j| j.capture_checkpoint.is_none()), "no checkpoint with reuse off");
+    assert!(device_checkpoints(&sched).is_empty());
+    assert_eq!(sched.retained_slots_in_use(), 0, "nothing retained once both are done");
+}
+
+#[test]
+fn prompt_reuse_off_reserves_no_slots() {
+    // What the server resolves `--prompt-reuse off` to by default.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            prompt_reuse: false,
+            retained_slots: 0,
             ..SchedulerConfig::default()
         },
         compute.clone(),

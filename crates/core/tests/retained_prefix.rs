@@ -777,10 +777,9 @@ fn a_retained_prefix_a_live_request_stands_on_is_not_given_up_for_nothing() {
 
 #[test]
 fn prompt_reuse_off_retains_no_prefix() {
-    // A cold bench measures a cold engine: nothing is retained, and since
-    // GitHub #215 nothing is shared either — a prefix's image takes a retained
-    // slot, and reuse off reserves none — so the prompt is not cut for a head
-    // and a later subagent pays its block again.
+    // A cold bench measures a cold engine: nothing is retained, so the head
+    // goes back to the whole prompt's pages and a later subagent pays its
+    // block again.
     let compute = Arc::new(MockCompute::new());
     let mut sched = scheduler(
         compute.clone(),
@@ -793,8 +792,8 @@ fn prompt_reuse_off_retains_no_prefix() {
     run_to_idle(&mut sched);
     assert_eq!(
         chunk_widths(&compute, id),
-        vec![60],
-        "one chunk: no head is published for anybody"
+        vec![48, 12],
+        "cut at the whole prompt's pages, the way it was before #186"
     );
     assert_eq!(
         sched.prefix_pinned_pages(),

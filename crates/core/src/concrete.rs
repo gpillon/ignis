@@ -208,9 +208,10 @@ pub struct SchedulerConfig {
     /// may hold on the device, prompt checkpoints and shared prefixes alike —
     /// the pool's `retained_slot_count` in production. Every publish and every
     /// capture takes one; when none is free, retained state gives one up, and
-    /// when nothing can, the publish or capture is skipped. Ignored, and no
-    /// slot is reserved, with `prompt_reuse` off. Tests pass small values to
-    /// drive exhaustion.
+    /// when nothing can, the publish or capture is skipped. With
+    /// `prompt_reuse` off only live siblings' heads take one (the server
+    /// resolves that to 0 unless the operator names a count). Tests pass small
+    /// values to drive exhaustion.
     pub retained_slots: u32,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it (GitHub #190; the
@@ -467,15 +468,10 @@ impl ConcreteScheduler {
             // GitHub #189: the pool holds what this backend's state was
             // produced under, so an entry it could not write into a sequence
             // is never offered to one.
-            // `--prompt-reuse off` is not a slot count of zero that something
-            // might later grow: it is retained state that never exists. No
-            // slot means no publish and no capture is ever asked for, without
-            // a second flag check at each site (GitHub #215).
-            retained: RetainedSlotLedger::new(if config.prompt_reuse {
-                config.retained_slots
-            } else {
-                0
-            }),
+            // GitHub #215: no slot means no publish and no capture is ever
+            // asked for, without a second flag check at each site. With prompt
+            // reuse off the slots given are for live siblings' heads alone.
+            retained: RetainedSlotLedger::new(config.retained_slots),
             reported_slots: 0,
             tail_pages: Vec::new(),
             checkpoints: CheckpointPool::with_tiers(
@@ -799,10 +795,10 @@ impl ConcreteScheduler {
     }
 
     /// Tell `request` its publish or capture was not taken (GitHub #215), with
-    /// the slots held right then. With prompt reuse off nothing was asked for
-    /// — its heads go unpublished by design — so nothing is said.
+    /// the slots held right then. With prompt reuse off and no slots nothing
+    /// was asked for — its heads go unpublished by design — so nothing is said.
     fn skip_retained(&self, request: RequestId, skip: RetainedSkip, events: &mut Vec<SchedEvent>) {
-        if self.config.prompt_reuse {
+        if self.config.prompt_reuse || self.retained.capacity() > 0 {
             events.push(SchedEvent::RetainedSlotSkipped {
                 request,
                 skip,
@@ -2646,6 +2642,11 @@ impl Scheduler for ConcreteScheduler {
                 .iter()
                 .enumerate()
                 .map(|(n, &i)| {
+                    // `--prompt-reuse off` captures nothing, whatever slots the
+                    // load gives live siblings (GitHub #215).
+                    if !self.config.prompt_reuse {
+                        return 0;
+                    }
                     let r = &self.requests[i];
                     let at = match r.checkpoint_point(self.config.kv_page_tokens) {
                         // A **page-aligned** opener falls exactly on the

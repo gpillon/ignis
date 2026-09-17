@@ -851,8 +851,8 @@ fn prompt_reuse_off_captures_and_reuses_nothing() {
     assert_eq!(sched.checkpoint_pool().entry_count(), 0, "nothing retained");
     assert_eq!(
         chunk_widths(&compute, n),
-        vec![40],
-        "and the prefill is not cut at all: off costs nothing (GitHub #215: no slot, no head)"
+        vec![32, 8],
+        "and the prefill is not cut at the opener: off costs nothing"
     );
 
     let n1 = sched.submit(turn_n_plus_1(), RequestClass::Interactive).unwrap();
@@ -930,22 +930,9 @@ fn tight_pool(prompt_reuse: bool) -> SchedulerConfig {
 
 /// Run turn N to completion, then the `hungry` request that needs the whole
 /// KV pool, and report every event the second one's admission produced.
-///
-/// `retain` false is the control: prompt reuse on, but a single retained slot
-/// (GitHub #215), which turn N's prefix takes while it runs and gives back
-/// when it ends, so nothing is left retained — and the hungry request still
-/// publishes its head, so its chunks are the same in both runs.
-fn retained_then_hungry(retain: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
+fn retained_then_hungry(prompt_reuse: bool) -> (Vec<SchedEvent>, Arc<MockCompute>, u32) {
     let compute = Arc::new(MockCompute::new());
-    let config = if retain {
-        tight_pool(true)
-    } else {
-        SchedulerConfig {
-            retained_slots: 1,
-            ..tight_pool(true)
-        }
-    };
-    let mut sched = scheduler(compute.clone(), config);
+    let mut sched = scheduler(compute.clone(), tight_pool(prompt_reuse));
     sched.submit(turn_n(), RequestClass::Interactive).unwrap();
     run_to_idle(&mut sched);
     let retained = sched.checkpoint_pool().retained_pages();

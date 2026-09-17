@@ -141,6 +141,9 @@ the whole `--kv-host-pool-bytes`, with blobs placed first-fit inside it.
   the page of the checkpoint it claimed. The plan therefore refuses a pool
   smaller than one `max_context` sequence plus `retained_slots` pages
   (GitHub #215).
+- **`--prompt-reuse off` reserves no slot by default**, so live siblings share
+  no head either. Naming `--retained-slots` with reuse off gives slots to those
+  siblings alone, as before #215.
 - **Retained slots bound reuse per conversation, not per byte.** Every link of
   a chained prefix and every checkpoint holds a slot of its own. A long tool
   loop stops leaving reuse once its chain holds every slot, and it runs on
