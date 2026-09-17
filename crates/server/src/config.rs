@@ -1318,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_pool_budget_overrides_the_auto_default() {
+    fn a_named_pool_budget_resolves_from_the_flag_and_the_env() {
         let config =
             expect_config(resolve(&args(&["--kv-pool-bytes", "8G"]), no_env).expect("resolve"));
         assert_eq!(config.kv_pool_bytes, Some(8 * 1024 * 1024 * 1024));

@@ -229,17 +229,7 @@ impl CudaLeafConfig {
         )?;
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
-            reserved: ReservedBytes {
-                prefill_scratch: model.prefill_scratch_bytes,
-                vision_workspace: model.vision_workspace_bytes,
-                media_embedding: model.media_embedding_bytes,
-                sampling: model.sampling_bytes,
-                decode_graph: model.decode_graph_bytes,
-                verify_round: model.verify_round_bytes,
-                drafter_round: model.drafter_round_bytes,
-                lane_state: pool.lane_state_bytes,
-                kv_pool: 0,
-            },
+            reserved: reserved_bytes(model, pool.lane_state_bytes, 0),
             checkpoint_image_bytes: pool.checkpoint_image_bytes,
         })
     }
@@ -265,6 +255,25 @@ impl CudaLeafConfig {
             max_context_tokens: self.max_context_tokens,
             slot_count: self.slot_count,
         }
+    }
+}
+
+/// The plan lines of a model's reservations and its pool's (GitHub #210).
+fn reserved_bytes(
+    model: model_load::IgnisModelReservations,
+    lane_state: u64,
+    kv_pool: u64,
+) -> ReservedBytes {
+    ReservedBytes {
+        prefill_scratch: model.prefill_scratch_bytes,
+        vision_workspace: model.vision_workspace_bytes,
+        media_embedding: model.media_embedding_bytes,
+        sampling: model.sampling_bytes,
+        decode_graph: model.decode_graph_bytes,
+        verify_round: model.verify_round_bytes,
+        drafter_round: model.drafter_round_bytes,
+        lane_state,
+        kv_pool,
     }
 }
 
@@ -501,17 +510,11 @@ impl StepLeaf for CudaLeaf {
             free_vram_bytes: self.device.free_bytes().unwrap_or(0),
             // GitHub #210: read off the model's and the pool's own buffers,
             // for the load to check against its VRAM plan.
-            reserved: ReservedBytes {
-                prefill_scratch: reserved.prefill_scratch_bytes,
-                vision_workspace: reserved.vision_workspace_bytes,
-                media_embedding: reserved.media_embedding_bytes,
-                sampling: reserved.sampling_bytes,
-                decode_graph: reserved.decode_graph_bytes,
-                verify_round: reserved.verify_round_bytes,
-                drafter_round: reserved.drafter_round_bytes,
-                lane_state: pool_stats.lane_state_bytes,
-                kv_pool: pool_stats.kv_arena_bytes,
-            },
+            reserved: reserved_bytes(
+                reserved,
+                pool_stats.lane_state_bytes,
+                pool_stats.kv_arena_bytes,
+            ),
         })
     }
 

@@ -360,13 +360,16 @@ pub fn cuda_scheduler(
         ));
     }
     // What the device says the load took, beside what the plan said it would
-    // (GitHub #210): the number the residual line is measured from.
+    // (GitHub #210). Both leave out the context, which `cudaMemGetInfo` does
+    // not count, and the retained line, which the load does not allocate; the
+    // figure a plan is held to is Task Manager's, not this one
+    // (`ignis_runtime::CUDA_CONTEXT_BYTES`' doc).
     let free_after_load_bytes = stats.free_vram_bytes;
     // hotpath-lint-allow: one line per model load.
     tracing::info!(
         name: "ignis.runtime.vram_loaded",
-        planned_total_bytes = vram.total_bytes,
-        measured_total_bytes = free_at_start_bytes.saturating_sub(free_after_load_bytes),
+        planned_bytes = vram.total_bytes - vram.lines.retained - vram.lines.cuda_context,
+        free_memory_delta_bytes = free_at_start_bytes.saturating_sub(free_after_load_bytes),
         free_after_load_bytes,
         "vram loaded"
     );

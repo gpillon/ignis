@@ -568,18 +568,6 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
 }
 
 // ---------------------------------------------------------------------------
-// P5-04 (GitHub #153): the verify round's substrate (model_internal.h's
-// `IgnisVerifyRound`) at window `k`, for `IGNIS_DECODE_MAX_BATCH` lanes. The
-// ReplaySSM record geometry is the model's GDN geometry -- the layer count
-// from the topology's kinds, the head counts from the state widths -- and
-// the vendored planner (`plan_gdn_replay_records`) lays the four planes out;
-// the fold only admits its registered all-layer geometries, so a wrong
-// count here fails at the first round, by name, not silently.
-//
-// GitHub #195: `vision` adds the round's rope-position staging, so a
-// multimodal sequence's verify columns rotate at `position + rope_delta` the
-// way its decode rounds do. A load without vision allocates nothing for it
-// and every round rotates at `positions` itself, exactly as before.
 // The ReplaySSM record geometry of the verify round at window `k`.
 ninfer::GdnReplayRecordSpec verify_record_spec(const ignis_topology &topology, uint32_t window) {
   std::int32_t gdn_layers = 0;
@@ -634,6 +622,18 @@ std::size_t verify_round_bytes(const ignis_topology &topology, uint32_t window, 
   return bytes;
 }
 
+// P5-04 (GitHub #153): the verify round's substrate (model_internal.h's
+// `IgnisVerifyRound`) at window `k`, for `IGNIS_DECODE_MAX_BATCH` lanes. The
+// ReplaySSM record geometry is the model's GDN geometry -- the layer count
+// from the topology's kinds, the head counts from the state widths -- and
+// the vendored planner (`plan_gdn_replay_records`) lays the four planes out;
+// the fold only admits its registered all-layer geometries, so a wrong
+// count here fails at the first round, by name, not silently.
+//
+// GitHub #195: `vision` adds the round's rope-position staging, so a
+// multimodal sequence's verify columns rotate at `position + rope_delta` the
+// way its decode rounds do. A load without vision allocates nothing for it
+// and every round rotates at `positions` itself, exactly as before.
 std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology,
                                                      uint32_t window, bool vision) {
   auto verify = std::make_unique<IgnisVerifyRound>();
@@ -1014,6 +1014,7 @@ struct LoadSizes {
   std::size_t verify_round = 0;
   std::size_t drafter_features = 0;
   std::size_t drafter_scratch = 0;
+  std::size_t sampling_logits = 0;
 
   ignis_model_reservations reservations() const {
     const std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1036,8 +1037,6 @@ struct LoadSizes {
         drafter_scratch == 0 ? 0 : drafter_features + sizeof(std::int32_t) * lanes + drafter_scratch;
     return out;
   }
-
-  std::size_t sampling_logits = 0;
 };
 
 LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topology,

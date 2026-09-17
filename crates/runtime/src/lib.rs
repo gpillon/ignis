@@ -80,9 +80,11 @@ pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
 /// #210): allocator rounding, the decode graph captures, handles the kernel
 /// creates lazily. Measured on the RTX 5090 on 2026-09-17 at the Makefile
 /// defaults with `--vision` (262K hq-e8-2b, DFlash2/7): the server's WDDM
-/// dedicated usage right after load (30,047,830,016 B) minus the context and
-/// every line the load allocates (the plan's total less the retained line,
-/// which the load does not allocate).
+/// dedicated usage right after load minus the context and every line the load
+/// allocates (the plan's total less the retained line, which the load does not
+/// allocate) -- 30,047,830,016 B held against a 4,653,252,608 B KV pool, in a
+/// run planned with no context or residual line. The confirming run, with
+/// both lines, held 30,704,246,784 B against 30,704,304,128 B planned.
 pub const LOAD_RESIDUAL_BYTES: u64 = 88_028_656;
 
 /// Device bytes a load holds beside its weights, line by line as the VRAM
