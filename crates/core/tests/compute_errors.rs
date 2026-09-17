@@ -170,6 +170,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
 /// A compute that always faults on `decode_step`.
 struct DecodeFaultCompute {
     inner: MockCompute,
+    faults: Mutex<u32>,
 }
 
 impl Compute for DecodeFaultCompute {
@@ -178,14 +179,16 @@ impl Compute for DecodeFaultCompute {
     }
 
     fn decode_step(&self, _jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        *self.faults.lock().unwrap() += 1;
         Err(ComputeError::Kernel(-9))
     }
 }
 
 #[test]
-fn failed_decode_keeps_the_request_running() {
+fn failed_decode_ends_the_request_and_releases_its_lane() {
     let compute = Arc::new(DecodeFaultCompute {
         inner: MockCompute::new(),
+        faults: Mutex::new(0),
     });
     let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute.clone());
     let id: RequestId = sched
@@ -202,19 +205,48 @@ fn failed_decode_keeps_the_request_running() {
             ignis_core::types::RequestClass::Agent,
         )
         .unwrap();
+    let sibling: RequestId = sched
+        .submit(
+            ignis_core::types::RequestInput {
+                multimodal: None,
+                opener_tokens: None,
+                user_turn_tokens: None,
+                system_block_tokens: None,
+                model: "qwen3.8-27b".into(),
+                tokens: vec![3, 4],
+                params: Default::default(),
+            },
+            ignis_core::types::RequestClass::Agent,
+        )
+        .unwrap();
 
-    // Advance #1: prefill + lane deal succeed; decode faults.
+    // Advance #1: prefill + lane deal succeed.
     let ev = sched.advance();
     assert!(
-        ev.iter()
+        ev
+            .iter()
             .any(|e| matches!(e, SchedEvent::Admitted { request, .. } if *request == id))
     );
-    assert_eq!(
-        sched.last_error(),
-        Some(&ComputeError::Kernel(-9)),
-        "the decode fault must be surfaced"
+    assert_eq!(sched.last_error(), Some(&ComputeError::Kernel(-9)));
+    // The request ends with Error; it is neither retried nor left holding a
+    // decode lane.
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, reason: FinishReason::Error, .. } if *request == id
+        )),
+        "the failed decode ends its request: {ev:?}"
     );
-    // The request still holds its lane (Running) — nothing is dropped or
-    // re-queued, the step is simply retried.
-    assert!(!sched.is_idle());
+    assert!(
+        ev.iter().any(|e| matches!(
+            e,
+            SchedEvent::Done { request, reason: FinishReason::Error, .. } if *request == sibling
+        )),
+        "the failed decode ends every request in its batch: {ev:?}"
+    );
+    assert!(sched.is_idle(), "the failed decode releases its lane");
+    assert_eq!(sched.kv_used_pages(), 0, "its reservation is released");
+
+    sched.advance();
+    assert_eq!(*compute.faults.lock().unwrap(), 1);
 }

@@ -181,7 +181,7 @@ fn a_new_user_message_after_a_tool_loop_reuses_the_turn_opening_checkpoint() {
 
     let rendered: Vec<RenderedPrompt> = [&it1, &it2, &it3, &next_turn]
         .into_iter()
-        .map(|m| render(m))
+        .map(|m| render(m).expect("the fixture template renders"))
         .collect();
     for (n, r) in rendered.iter().enumerate() {
         assert!(

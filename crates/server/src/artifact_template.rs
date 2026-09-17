@@ -21,8 +21,8 @@ use serde_json::Value as JsonValue;
 
 use crate::decoder::TokenDecoder;
 use crate::template::{
-    processor_rejection, ChatMessage, ContentRejection, MessageContent, RenderedPrompt,
-    TemplateProvider,
+    check_roles, processor_rejection, ChatMessage, ContentRejection, MessageContent, RenderedPrompt,
+    TemplateProvider, TemplateRejection,
 };
 use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 
@@ -138,7 +138,8 @@ impl ArtifactTemplateProvider {
         let templated: Vec<ignis_artifact::ChatMessage> = messages
             .iter()
             .map(|message| {
-                let role = Role::parse(&message.role).unwrap_or(Role::User);
+                let role = Role::parse(&message.role)
+                    .ok_or_else(|| format!("unknown message role '{}'", message.role))?;
                 let mut templated = ignis_artifact::ChatMessage::text(role, "");
                 templated.content = artifact_content(&message.content);
                 // Prior assistant reasoning is handed to the template
@@ -157,13 +158,20 @@ impl ArtifactTemplateProvider {
                 if let Some(calls) = &message.tool_calls {
                     templated.tool_calls = calls.iter().map(artifact_tool_call).collect();
                 }
-                templated
+                Ok(templated)
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         self.set
             .chat_template()
             .render_with_thinking_and_tools(&templated, render_options(options), Some(tools))
             .map_err(|err| err.to_string())
+    }
+
+    /// Refuse unknown wire roles instead of silently rendering them as a
+    /// user message. Kept ahead of both text and multimodal rendering so the
+    /// HTTP error code is stable regardless of a request's content parts.
+    fn validate_roles(messages: &[ChatMessage]) -> Result<(), TemplateRejection> {
+        check_roles(messages)
     }
 }
 
@@ -173,30 +181,25 @@ impl TemplateProvider for ArtifactTemplateProvider {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> RenderedPrompt {
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        Self::validate_roles(messages)?;
         let prompt = match self.render(messages, options, tools) {
             Ok(prompt) => prompt,
-            Err(err) => {
-                eprintln!("ignis-server: chat template render failed: {err}");
-                return RenderedPrompt::default();
-            }
+            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err }),
         };
         let tokens = match self.set.tokenizer().encode(&prompt) {
             Ok(ids) => ids,
-            Err(err) => {
-                eprintln!("ignis-server: tokenizer encode failed: {err}");
-                return RenderedPrompt::default();
-            }
+            Err(err) => return Err(TemplateRejection { code: "render_failed", message: err.to_string() }),
         };
         let opener_tokens = self.opener_tokens(&prompt, &tokens);
         let user_turn_tokens = self.user_turn_tokens(&prompt, &tokens);
         let system_block_tokens = self.system_block_tokens(&prompt, &tokens);
-        RenderedPrompt {
+        Ok(RenderedPrompt {
             tokens,
             opener_tokens,
             user_turn_tokens,
             system_block_tokens,
-        }
+        })
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -244,8 +247,12 @@ impl TemplateProvider for ArtifactTemplateProvider {
                 message: "vision is disabled for this server".to_owned(),
             });
         };
+        Self::validate_roles(messages).map_err(|rejection| ContentRejection {
+            code: rejection.code,
+            message: rejection.message,
+        })?;
         let rendered = self.render(messages, options, tools).map_err(|err| ContentRejection {
-            code: "invalid_media",
+            code: "render_failed",
             message: format!("chat template render failed: {err}"),
         })?;
         // GitHub #193: the boundaries cross-request reuse is cut at, carried
@@ -542,7 +549,8 @@ mod tests {
             &[ChatMessage::text("user", "hello world")],
             &opts(),
             no_tools(),
-        );
+        )
+        .expect("render");
         assert!(!rendered.tokens.is_empty());
         assert_eq!(rendered.opener_tokens, None);
     }
@@ -554,7 +562,8 @@ mod tests {
             &[ChatMessage::text("user", "hello world")],
             &opts(),
             no_tools(),
-        );
+        )
+        .expect("render");
         let opener = rendered.opener_tokens.expect("the render has an opener");
         assert!(opener > 0);
         assert!(
@@ -594,7 +603,8 @@ You are a careful assistant.<|im_end|>
             &[ChatMessage::text("user", "hello world")],
             &opts(),
             no_tools(),
-        );
+        )
+        .expect("render");
         assert!(!rendered.tokens.is_empty());
         assert_eq!(rendered.system_block_tokens, None);
         // Nor does a render that has an opener but opens on the conversation:
@@ -604,7 +614,8 @@ You are a careful assistant.<|im_end|>
             &[ChatMessage::text("user", "hello world")],
             &opts(),
             no_tools(),
-        );
+        )
+        .expect("render");
         assert!(rendered.opener_tokens.is_some(), "this render has an opener");
         assert_eq!(rendered.system_block_tokens, None);
     }
@@ -613,7 +624,9 @@ You are a careful assistant.<|im_end|>
     fn the_system_block_is_reported_as_an_exact_token_prefix_before_the_opener() {
         let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
         let messages = [ChatMessage::text("user", "hello world")];
-        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let rendered = provider
+            .apply_chat_template(&messages, &opts(), no_tools())
+            .expect("render");
         let block = rendered
             .system_block_tokens
             .expect("the render opens with a system block");
@@ -639,13 +652,15 @@ You are a careful assistant.<|im_end|>
         // block, not about the query behind it, so two subagents that differ
         // only in their question report the same count over the same ids.
         let (_fixture, _reader, provider) = build_provider_with(TEMPLATE_WITH_SYSTEM_BLOCK);
-        let first =
-            provider.apply_chat_template(&[ChatMessage::text("user", "one")], &opts(), no_tools());
+        let first = provider
+            .apply_chat_template(&[ChatMessage::text("user", "one")], &opts(), no_tools())
+            .expect("render first prompt");
         let second = provider.apply_chat_template(
             &[ChatMessage::text("user", "a quite different question")],
             &opts(),
             no_tools(),
-        );
+        )
+        .expect("render second prompt");
         let block = first.system_block_tokens.expect("a block");
         assert_eq!(second.system_block_tokens, Some(block));
         assert_eq!(
@@ -663,11 +678,18 @@ You are a careful assistant.<|im_end|>
             ChatMessage::text("user", "hello world"),
             ChatMessage::text("assistant", "hi there"),
         ];
-        let rendered = provider.apply_chat_template(&messages, &opts(), no_tools());
+        let rendered = provider
+            .apply_chat_template(&messages, &opts(), no_tools())
+            .expect("render");
         assert!(!rendered.tokens.is_empty(), "the rendered prompt must tokenize");
         // Determinism: the same conversation templates identically (the
         // trait's contract).
-        assert_eq!(rendered, provider.apply_chat_template(&messages, &opts(), no_tools()));
+        assert_eq!(
+            rendered,
+            provider
+                .apply_chat_template(&messages, &opts(), no_tools())
+                .expect("render again")
+        );
         // Property assertion (not an exact string): the templated prompt
         // contains the user's message text, decoded by the same tokenizer.
         let text = provider.render_tokens(&rendered.tokens);
@@ -683,15 +705,12 @@ You are a careful assistant.<|im_end|>
     }
 
     #[test]
-    fn unknown_roles_fall_back_to_user_without_panicking() {
+    fn unknown_roles_are_refused_before_the_template_renders() {
         let (_fixture, _reader, provider) = build_provider();
         let messages = [ChatMessage::text("bogus", "hello")];
-        // The foreign role must not panic: it templates as `user` (the
-        // documented v1 fallback), and the prompt still renders.
-        let tokens = provider.apply_chat_template(&messages, &opts(), no_tools()).tokens;
-        assert!(!tokens.is_empty());
-        let text = provider.render_tokens(&tokens);
-        assert!(text.contains("hello"), "{text}");
+        let rejection = provider.apply_chat_template(&messages, &opts(), no_tools()).unwrap_err();
+        assert_eq!(rejection.code, "invalid_role");
+        assert!(rejection.message.contains("bogus"), "{}", rejection.message);
     }
 
     /// GitHub #175: a text-parts message renders exactly as the string its
@@ -708,8 +727,14 @@ You are a careful assistant.<|im_end|>
                 .expect("parts deserialize");
         let mut parts_form = ChatMessage::text("user", "");
         parts_form.content = parts;
-        let string_tokens = provider.apply_chat_template(&string_form, &opts(), no_tools()).tokens;
-        let parts_tokens = provider.apply_chat_template(&[parts_form], &opts(), no_tools()).tokens;
+        let string_tokens = provider
+            .apply_chat_template(&string_form, &opts(), no_tools())
+            .expect("render string content")
+            .tokens;
+        let parts_tokens = provider
+            .apply_chat_template(&[parts_form], &opts(), no_tools())
+            .expect("render text parts")
+            .tokens;
         assert_eq!(parts_tokens, string_tokens);
         assert!(provider.render_tokens(&parts_tokens).contains("hello world"));
     }
@@ -771,27 +796,31 @@ You are a careful assistant.<|im_end|>
             reasoning_effort: Some(ignis_artifact::ReasoningEffort::Low),
             preserve_thinking: false,
         };
-        let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
+        let tokens = provider
+            .apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools())
+            .expect("render")
+            .tokens;
         let text = provider.render_tokens(&tokens);
         assert!(text.contains("true"), "{text}");
         assert!(text.contains("low"), "{text}");
     }
 
     #[test]
-    fn apply_chat_template_disabled_raises_and_yields_no_tokens() {
+    fn apply_chat_template_disabled_reports_the_template_failure() {
         // `THINKING_TEMPLATE` raises when asked to disable thinking; the
-        // provider logs and degrades to an empty token list rather than
-        // panicking (the documented v1 render-failure contract).
+        // failure must be returned to the API rather than becoming a prompt
+        // with zero tokens.
         let (_fixture, _reader, provider) = build_thinking_provider(THINKING_TEMPLATE);
         let options = ThinkingOptions {
             enable_thinking: false,
             reasoning_effort: None,
             preserve_thinking: false,
         };
-        let tokens =
-            provider.apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools()).tokens;
-        assert!(tokens.is_empty(), "a raising render must degrade to no tokens");
+        let rejection = provider
+            .apply_chat_template(&[ChatMessage::text("user", "hi")], &options, no_tools())
+            .unwrap_err();
+        assert_eq!(rejection.code, "render_failed");
+        assert!(rejection.message.contains("cannot disable"), "{}", rejection.message);
     }
 
     #[test]
@@ -813,7 +842,10 @@ You are a careful assistant.<|im_end|>
         message.reasoning_content = Some("scratch work".to_owned());
 
         for options in [opts(), ThinkingOptions { preserve_thinking: true, ..opts() }] {
-            let tokens = provider.apply_chat_template(&[message.clone()], &options, no_tools()).tokens;
+            let tokens = provider
+                .apply_chat_template(&[message.clone()], &options, no_tools())
+                .expect("render")
+                .tokens;
             let text = provider.render_tokens(&tokens);
             assert!(
                 text.contains("scratch") && text.contains("work"),
@@ -1036,7 +1068,10 @@ You are a careful assistant.<|im_end|>
         // Must not panic; `TEMPLATE` has no `tool_calls` branch of its own,
         // so this only proves the degrade happens before the render call —
         // the real dialect is exercised in the round-trip test above.
-        let tokens = provider.apply_chat_template(&[message], &opts(), no_tools()).tokens;
+        let tokens = provider
+            .apply_chat_template(&[message], &opts(), no_tools())
+            .expect("render")
+            .tokens;
         assert!(!tokens.is_empty(), "the render must still complete");
     }
 }

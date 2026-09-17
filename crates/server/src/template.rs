@@ -18,6 +18,7 @@
 //! natural text.
 
 use ignis_artifact::vision::{layout, MediaItem, PreparedMedia, ProcessorError, IMAGE_PAD_ID};
+use ignis_artifact::Role;
 use ignis_core::vision::Multimodal;
 use ignis_core::TokenId;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,33 @@ pub struct ContentRejection {
     pub code: &'static str,
     /// The human-readable message.
     pub message: String,
+}
+
+/// Why the chat template could not turn a conversation into a prompt.
+///
+/// This is distinct from [`ContentRejection`]: malformed media remains an
+/// `invalid_media` response, while a text template or tokenizer failure is a
+/// `render_failed` request rejection before the engine sees any tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateRejection {
+    /// The OpenAI-compatible error code (`render_failed` or `invalid_role`).
+    pub code: &'static str,
+    /// The human-readable cause supplied to the client.
+    pub message: String,
+}
+
+/// Refuse a role the loaded Qwen frontend cannot render. `developer` remains
+/// deliberately absent until Slice 2 supplies its rendering policy.
+pub fn check_roles(messages: &[ChatMessage]) -> Result<(), TemplateRejection> {
+    for (index, message) in messages.iter().enumerate() {
+        if Role::parse(&message.role).is_none() {
+            return Err(TemplateRejection {
+                code: "invalid_role",
+                message: format!("message at index {index} has unknown role '{}'", message.role),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate every message's content parts. Text parts pass; media parts are
@@ -389,7 +417,7 @@ pub trait TemplateProvider: Send + Sync {
         messages: &[ChatMessage],
         options: &ThinkingOptions,
         tools: &[JsonValue],
-    ) -> RenderedPrompt;
+    ) -> Result<RenderedPrompt, TemplateRejection>;
 
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
@@ -453,7 +481,11 @@ pub trait TemplateProvider: Send + Sync {
 /// A prepared prompt's refusal as a content rejection: the processor's own
 /// wire code (`invalid_media` or `media_budget_exceeded`).
 pub fn processor_rejection(error: ProcessorError) -> ContentRejection {
-    ContentRejection { code: error.code(), message: error.to_string() }
+    let code = match &error {
+        ProcessorError::Tokenize(_) | ProcessorError::Render(_) => "render_failed",
+        _ => error.code(),
+    };
+    ContentRejection { code, message: error.to_string() }
 }
 
 /// The minimal built-in provider (v1 placeholder, replaced by artifact-02):
@@ -473,13 +505,13 @@ impl TemplateProvider for SimpleTemplateProvider {
         messages: &[ChatMessage],
         _options: &ThinkingOptions,
         _tools: &[JsonValue],
-    ) -> RenderedPrompt {
+    ) -> Result<RenderedPrompt, TemplateRejection> {
         // The placeholder has no jinja template to bind thinking variables
         // or tools into — it ignores both (a test-only `TemplateProvider`
         // that wants to observe them records them itself; see
         // `openai_http_thinking.rs`'s / `openai_http_toolcalls.rs`'s
         // recording doubles).
-        messages
+        Ok(messages
             .iter()
             .flat_map(|m| {
                 let text = m.content.text();
@@ -491,7 +523,7 @@ impl TemplateProvider for SimpleTemplateProvider {
             // It renders no chat markers at all, so it has no generation
             // opener to report and nothing it produces is ever reused
             // (GitHub #186).
-            .into()
+            .into())
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -630,30 +662,41 @@ mod tests {
     fn template_is_deterministic() {
         let p = SimpleTemplateProvider;
         let messages = [msg("user", "hello world"), msg("assistant", "hi")];
-        let a = p.apply_chat_template(&messages, &opts(), no_tools()).tokens;
-        let b = p.apply_chat_template(&messages, &opts(), no_tools()).tokens;
+        let a = p.apply_chat_template(&messages, &opts(), no_tools()).expect("render").tokens;
+        let b = p.apply_chat_template(&messages, &opts(), no_tools()).expect("render").tokens;
         assert_eq!(a, b, "the same conversation must template identically");
     }
 
     #[test]
     fn one_token_per_word_and_role_scoped() {
         let p = SimpleTemplateProvider;
-        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts(), no_tools()).tokens;
+        let tokens = p.apply_chat_template(&[msg("user", "a b c")], &opts(), no_tools()).expect("render").tokens;
         assert_eq!(tokens.len(), 3, "one token per whitespace word");
         // The same word under a different role is a different token (the
         // role is part of the hashed key).
-        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts(), no_tools()).tokens;
-        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts(), no_tools()).tokens;
+        let other = p.apply_chat_template(&[msg("assistant", "a")], &opts(), no_tools()).expect("render").tokens;
+        let user_a = p.apply_chat_template(&[msg("user", "a")], &opts(), no_tools()).expect("render").tokens;
         assert_ne!(other, user_a);
     }
 
     #[test]
     fn empty_conversation_has_no_tokens() {
         let p = SimpleTemplateProvider;
-        assert!(p.apply_chat_template(&[], &opts(), no_tools()).tokens.is_empty());
+        assert!(p.apply_chat_template(&[], &opts(), no_tools()).expect("render").tokens.is_empty());
         assert!(p
-            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools()).tokens
+            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools()).expect("render").tokens
             .is_empty());
+    }
+
+    #[test]
+    fn a_multimodal_tokenizer_or_template_failure_is_not_reported_as_bad_media() {
+        for error in [ProcessorError::Tokenize("bad token".to_owned()), ProcessorError::Render("bad template".to_owned())] {
+            assert_eq!(processor_rejection(error).code, "render_failed");
+        }
+        assert_eq!(
+            processor_rejection(ProcessorError::PlaceholderMismatch("wrong image count")).code,
+            "invalid_media"
+        );
     }
 
     #[test]

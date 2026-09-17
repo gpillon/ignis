@@ -142,6 +142,7 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
     for canary in &fixture.prompts {
         let prompt_tokens: Vec<i32> = provider
             .apply_chat_template(&[ChatMessage::text("user", canary.prompt.clone())], &thinking, &[])
+            .expect("render canary prompt")
             .tokens
             .into_iter()
             .map(|id| i32::try_from(id).expect("token id fits i32"))

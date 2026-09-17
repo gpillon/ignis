@@ -54,7 +54,9 @@ fn a_multimodal_prompt_reports_its_boundaries_over_the_expanded_tokens() {
 
     // The same conversation on the text path renders the image as its one
     // placeholder token: the reference layout the expansion moves.
-    let unexpanded = text.apply_chat_template(&messages, &options, &[]);
+    let unexpanded = text
+        .apply_chat_template(&messages, &options, &[])
+        .expect("render the text prompt");
     let media = processor.prepare_media(0, &media::png(256, 256)).expect("prepare");
     let (rendered, multimodal) = provider
         .prepare_multimodal(&messages, &options, &[], vec![media])

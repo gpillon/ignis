@@ -20,7 +20,9 @@ use ignis_core::{
     RequestId, SchedulerConfig,
 };
 use ignis_server::engine::Engine;
-use ignis_server::template::{SimpleTemplateProvider, TemplateProvider};
+use ignis_server::template::{
+    ChatMessage, RenderedPrompt, SimpleTemplateProvider, TemplateProvider, TemplateRejection,
+};
 use ignis_server::Server;
 
 #[path = "support/mod.rs"]
@@ -62,6 +64,48 @@ fn harness_over(compute: Arc<dyn Compute>) -> Harness {
 
 fn harness() -> Harness {
     harness_over(Arc::new(MockCompute::new()))
+}
+
+/// A template failure at the provider seam. Its HTTP test proves the request
+/// is refused before the engine can admit an empty or mis-rendered prompt.
+struct RejectingTemplateProvider;
+
+impl TemplateProvider for RejectingTemplateProvider {
+    fn apply_chat_template(
+        &self,
+        _messages: &[ChatMessage],
+        _options: &ignis_server::thinking::ThinkingOptions,
+        _tools: &[serde_json::Value],
+    ) -> Result<RenderedPrompt, TemplateRejection> {
+        Err(TemplateRejection {
+            code: "render_failed",
+            message: "unknown message role 'bogus'".to_owned(),
+        })
+    }
+
+    fn render_tokens(&self, tokens: &[u32]) -> String {
+        SimpleTemplateProvider.render_tokens(tokens)
+    }
+
+    fn thinking_capabilities(&self) -> ignis_server::thinking::ThinkingCapabilities {
+        SimpleTemplateProvider.thinking_capabilities()
+    }
+
+    fn token_decoder(&self) -> Box<dyn ignis_server::decoder::TokenDecoder> {
+        SimpleTemplateProvider.token_decoder()
+    }
+}
+
+fn rejecting_template_harness() -> Harness {
+    let scheduler = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: MODEL.into(),
+            ..SchedulerConfig::default()
+        },
+        Arc::new(MockCompute::new()),
+    );
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(RejectingTemplateProvider));
+    Harness { app: server.app() }
 }
 
 /// A harness whose compute is gated (GitHub #69): lets a test hold one
@@ -185,6 +229,55 @@ async fn chat_completions_non_streaming_returns_the_completion() {
     let expected = rendered(&mock_tokens(0, 4));
     assert_eq!(v["choices"][0]["message"]["content"], expected);
     assert_eq!(v["usage"]["completion_tokens"], 4);
+}
+
+#[tokio::test]
+async fn a_template_refusal_is_a_400_before_admission() {
+    let h = rejecting_template_harness();
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 400, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "render_failed");
+    assert!(body["error"]["message"].as_str().unwrap().contains("bogus"));
+}
+
+#[tokio::test]
+async fn an_unknown_role_is_a_400_before_admission() {
+    let h = harness();
+    for role in ["bogus", "developer"] {
+        let req = serde_json::json!({
+            "model": MODEL,
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": role, "content": "hello" }
+            ]
+        });
+        let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+        assert_eq!(status, 400, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_role");
+        assert!(body["error"]["message"].as_str().unwrap().contains(role));
+        assert!(body["error"]["message"].as_str().unwrap().contains("index 1"));
+    }
+}
+
+#[tokio::test]
+async fn a_zero_token_prompt_is_refused_before_admission() {
+    let h = harness();
+    let req = serde_json::json!({
+        "model": MODEL,
+        "messages": [{ "role": "user", "content": "   " }]
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
+    assert_eq!(status, 400, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["code"], "render_failed");
+    assert!(body["error"]["message"].as_str().unwrap().contains("empty prompt"));
 }
 
 // ── POST /v1/chat/completions (streaming / SSE) ──────────────────────────
@@ -499,6 +592,25 @@ async fn empty_messages_is_a_400() {
     });
     let (status, _body) = call(&h.app, "POST", "/v1/chat/completions", Some(req)).await;
     assert_eq!(status, 400, "empty messages should be 400");
+}
+
+#[tokio::test]
+async fn responses_api_refuses_an_unknown_role_with_its_message_index() {
+    let h = harness();
+    let req = serde_json::json!({
+        "model": MODEL,
+        "input": [
+            { "role": "user", "content": "first" },
+            { "role": "bogus", "content": "second" }
+        ]
+    });
+    let (status, body) = call(&h.app, "POST", "/v1/responses", Some(req)).await;
+    assert_eq!(status, 400, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_role");
+    assert!(body["error"]["message"].as_str().unwrap().contains("bogus"));
+    assert!(body["error"]["message"].as_str().unwrap().contains("index 1"));
 }
 
 #[tokio::test]

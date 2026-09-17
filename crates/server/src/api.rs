@@ -42,7 +42,8 @@ use crate::decoder::{Channel, OutputDecoder};
 use crate::engine::{Engine, EventStream, collect_tokens};
 use crate::media::{has_media, MediaRejection, MediaStats};
 use crate::template::{
-    check_content_parts, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
+    check_content_parts, check_roles, ChatMessage, ContentRejection, RenderedPrompt, TemplateProvider,
+    TemplateRejection,
 };
 use crate::thinking::{
     self, ThinkingDefaults, ThinkingError, ThinkingOptions, ThinkingRequestFields,
@@ -192,14 +193,14 @@ fn build_request(
     params: DecodeParams,
     thinking: &ThinkingOptions,
     tools: &[JsonValue],
-) -> (RequestInput, String, u32) {
+) -> Result<(RequestInput, String, u32), TemplateRejection> {
     // `model` is the model the request names; `None` (or a blank) falls
     // back to the loaded model. A model the engine does not load is
     // rejected at submit with a 404 (OpenAI's `model_not_found`).
     // The template seam: the artifact's frontend object set (artifact-02)
     // replaces this built-in provider through the same constructor
     // injection (v1 placeholder: deterministic word-hash tokens).
-    let rendered = server.template.apply_chat_template(messages, thinking, tools);
+    let rendered = server.template.apply_chat_template(messages, thinking, tools)?;
     request_input(server, model, rendered, params, None)
 }
 
@@ -210,11 +211,17 @@ fn request_input(
     rendered: RenderedPrompt,
     params: DecodeParams,
     multimodal: Option<ignis_core::vision::Multimodal>,
-) -> (RequestInput, String, u32) {
+) -> Result<(RequestInput, String, u32), TemplateRejection> {
     let model = model
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| server.engine.model_id());
     let prompt_tokens = rendered.tokens.len() as u32;
+    if prompt_tokens == 0 {
+        return Err(TemplateRejection {
+            code: "render_failed",
+            message: "chat template rendered an empty prompt".to_owned(),
+        });
+    }
     // GitHub #193: a prompt carrying images reports its boundaries like any
     // other. Retained state is keyed by the images inside it as well as the
     // token ids (the #189 match key), so a request that sent another picture
@@ -228,7 +235,7 @@ fn request_input(
         user_turn_tokens: rendered.user_turn_tokens,
         system_block_tokens: rendered.system_block_tokens,
     };
-    (input, model, prompt_tokens)
+    Ok((input, model, prompt_tokens))
 }
 
 /// [`build_request`] for any conversation: one carrying image parts on a
@@ -246,7 +253,8 @@ async fn prepare_request(
     tools: &[JsonValue],
 ) -> Result<(RequestInput, String, u32, Option<MediaStats>), Response> {
     let Some(acquirer) = server.media.as_ref().filter(|_| has_media(messages)) else {
-        let (input, model, prompt_tokens) = build_request(server, model, messages, params, thinking, tools);
+        let (input, model, prompt_tokens) =
+            build_request(server, model, messages, params, thinking, tools).map_err(template_rejection)?;
         return Ok((input, model, prompt_tokens, None));
     };
     let deadline = std::time::Instant::now() + server.request_timeout;
@@ -255,7 +263,8 @@ async fn prepare_request(
         .template
         .prepare_multimodal(messages, thinking, tools, acquired.media)
         .map_err(content_rejection)?;
-    let (input, model, prompt_tokens) = request_input(server, model, rendered, params, Some(multimodal));
+    let (input, model, prompt_tokens) =
+        request_input(server, model, rendered, params, Some(multimodal)).map_err(template_rejection)?;
     Ok((input, model, prompt_tokens, Some(acquired.stats)))
 }
 
@@ -684,6 +693,17 @@ fn content_rejection(rejection: ContentRejection) -> Response {
     )
 }
 
+/// The 400 for a text-template/tokenizer/role refusal, before any request is
+/// admitted to the engine (GitHub #208).
+fn template_rejection(rejection: TemplateRejection) -> Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        rejection.code,
+        rejection.message,
+    )
+}
+
 /// The OpenAI error body (`{"error": {message, type, code}}`).
 fn error_response(
     status: StatusCode,
@@ -885,6 +905,9 @@ async fn chat_completions(
 ) -> Response {
     if req.messages.is_empty() {
         return bad_request("messages must not be empty");
+    }
+    if let Err(rejection) = check_roles(&req.messages) {
+        return template_rejection(rejection);
     }
     if let Err(rejection) = check_content_parts(&req.messages, server.media.is_some()) {
         return content_rejection(rejection);
@@ -1486,6 +1509,9 @@ async fn responses_api(
     };
     if messages.is_empty() {
         return bad_request("input must not be empty");
+    }
+    if let Err(rejection) = check_roles(&messages) {
+        return template_rejection(rejection);
     }
     if let Err(rejection) = check_content_parts(&messages, server.media.is_some()) {
         return content_rejection(rejection);

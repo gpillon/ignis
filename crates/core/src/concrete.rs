@@ -1097,11 +1097,10 @@ impl ConcreteScheduler {
     /// The last hard compute error the most recent advance reported, if
     /// any.
     ///
-    /// A failed step is not swallowed: it emits no events, the state is
-    /// left retryable (a failed prefill leaves the batch in `Admitted`, a
-    /// failed decode leaves the lanes running), and the next advance
-    /// retries the same step. A successful advance clears it; callers
-    /// poll this to surface the fault.
+    /// A failed step is not swallowed: a failed prefill is retryable (until
+    /// its bounded attempt limit), while a decode failure emits `Done(Error)`
+    /// and releases every affected lane. A successful later advance clears
+    /// this field; callers poll it to surface the fault.
     pub fn last_error(&self) -> Option<&ComputeError> {
         self.last_error.as_ref()
     }
@@ -2971,7 +2970,21 @@ impl Scheduler for ConcreteScheduler {
                         }
                     }
                 }
-                Err(e) => self.last_error = Some(e),
+                Err(e) => {
+                    // A decode or verify failure has no safe retry: every
+                    // request in this leaf batch still holds a live lane,
+                    // so retrying it on the next tick would spin the model
+                    // thread and keep that lane unavailable forever.
+                    for &i in &to_decode {
+                        tracing::debug!(
+                            request_id = self.requests[i].id,
+                            error = %e,
+                            "ignis.decode.error"
+                        );
+                        self.mark_done(i, &mut events, FinishReason::Error);
+                    }
+                    self.last_error = Some(e);
+                }
             }
         }
 
