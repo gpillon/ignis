@@ -56,10 +56,10 @@ const SERVER_TIMEOUT: Duration = Duration::from_secs(900);
 fn gate_shape() -> EngineShape {
     EngineShape {
         max_context: MAX_CONTEXT,
-        kv_pool_bytes: ignis_runtime::auto_kv_pool_bytes(
+        kv_pool_bytes: Some(ignis_runtime::auto_kv_pool_bytes(
             ignis_core::KvFormat::default(),
             MAX_CONTEXT,
-        ),
+        )),
         ..EngineShape::default()
     }
 }

@@ -55,6 +55,7 @@ pub mod speculation;
 pub mod step;
 pub mod types;
 pub mod vision;
+pub mod vram;
 
 pub use admission::{
     ActiveAdmissionSnapshot, AdmissionError, AdmissionProtection, AdmissionResources,
@@ -88,6 +89,7 @@ pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
     VisionEnvelopeOutOfRange,
 };
+pub use vram::{VramLines, VramMode, VramPlan, VramPlanError, VramRequest, plan_vram};
 pub use types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SpecCounters, SubmitError,

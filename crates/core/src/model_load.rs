@@ -22,8 +22,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
 use ignis_artifact::{
-    model_scope_27b_with, DraftModule, MaterializedArtifact, ModelScope, NumericFormat,
-    ObjectHandle, Reader, StorageLayout,
+    model_scope_27b_with, DraftModule, InventoryEntry, MaterializationPlan, MaterializedArtifact,
+    ModelScope, NumericFormat, ObjectHandle, Reader, StorageLayout,
 };
 
 use crate::compute::{LayerKind, ModelConfig};
@@ -94,6 +94,21 @@ pub(crate) mod ffi {
         pub vision_max_tokens: u32,
     }
 
+    /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
+    /// device reservation a load makes beside the weights, one field per
+    /// VRAM plan line.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct IgnisModelReservations {
+        pub prefill_scratch_bytes: u64,
+        pub vision_workspace_bytes: u64,
+        pub media_embedding_bytes: u64,
+        pub sampling_bytes: u64,
+        pub decode_graph_bytes: u64,
+        pub verify_round_bytes: u64,
+        pub drafter_round_bytes: u64,
+    }
+
     /// 1:1 with `struct ignis_model_stats`.
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
@@ -102,6 +117,9 @@ pub(crate) mod ffi {
         pub bound_tensor_count: u64,
         /// GitHub #177: the encoder workspace plus the output transient.
         pub vision_reserved_bytes: u64,
+        /// GitHub #210: what the load holds beside the weights, read off its
+        /// own buffers.
+        pub reserved: IgnisModelReservations,
     }
 
     unsafe extern "C" {
@@ -116,6 +134,17 @@ pub(crate) mod ffi {
             out_model: *mut *mut IgnisModel,
         ) -> i32;
 
+        pub fn ignis_model_plan_reservations(
+            tensors: *const IgnisBoundTensor,
+            count: u64,
+            topology: *const IgnisTopology,
+            prefill_chunk_tokens: u32,
+            max_context_tokens: u32,
+            kv_format: i32,
+            options: *const IgnisModelLoadOptions,
+            out: *mut IgnisModelReservations,
+        ) -> i32;
+
         pub fn ignis_model_stats(model: *const IgnisModel, out_stats: *mut IgnisModelStats) -> i32;
 
         pub fn ignis_model_free(model: *mut IgnisModel);
@@ -124,7 +153,7 @@ pub(crate) mod ffi {
     }
 }
 
-pub use ffi::IgnisModelStats;
+pub use ffi::{IgnisModelReservations, IgnisModelStats};
 
 /// A loaded model handle (releases via `ignis_model_free` on [`Drop`]).
 pub struct Model {
@@ -306,18 +335,71 @@ fn read_input_scale_divisor(reader: &Reader, name: &str) -> Result<f32, String> 
     Ok(f32::from_le_bytes(bytes))
 }
 
+/// Where one bound tensor's bytes are, as a descriptor carries them.
+struct TensorPlacement {
+    shape: Vec<u64>,
+    bytes: u64,
+    qdata: *const c_void,
+    qhigh: *const c_void,
+    scales: *const c_void,
+}
+
+/// The placements of a materialized artifact: its device views.
+fn device_placement(
+    artifact: &MaterializedArtifact,
+) -> impl Fn(ObjectHandle, &InventoryEntry) -> Result<TensorPlacement, String> + '_ {
+    move |handle, _entry| {
+        let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
+        Ok(TensorPlacement {
+            shape: view.shape.clone(),
+            bytes: view.bytes,
+            qdata: view.base as *const c_void,
+            qhigh: view
+                .high_plane()
+                .map_or(std::ptr::null(), |p| p as *const c_void),
+            scales: view
+                .scale_plane()
+                .map_or(std::ptr::null(), |p| p as *const c_void),
+        })
+    }
+}
+
+/// The placements a materialization plan will make, before any device
+/// memory exists (GitHub #210): each tensor's inventory shape and planned
+/// bytes, with no data pointers -- enough for the leaf to size a load, which
+/// is all `ignis_model_plan_reservations` reads.
+fn planned_placement(
+    plan: &MaterializationPlan,
+) -> impl Fn(ObjectHandle, &InventoryEntry) -> Result<TensorPlacement, String> + '_ {
+    move |handle, entry| {
+        let placed = plan
+            .device_objects
+            .iter()
+            .find(|placed| placed.handle == handle)
+            .ok_or_else(|| format!("{}: not a device object of the materialization plan", entry.name))?;
+        Ok(TensorPlacement {
+            shape: entry.shape.to_vec(),
+            bytes: placed.bytes,
+            qdata: std::ptr::null(),
+            qhigh: std::ptr::null(),
+            scales: std::ptr::null(),
+        })
+    }
+}
+
 /// Build the bound-tensor descriptors for every tensor
 /// [`ignis_artifact::bind_model_scope_27b_with`] placed on the device for
-/// `scope`, in [`model_scope_27b_with`] order.
+/// `scope`, in [`model_scope_27b_with`] order, at the addresses `placement`
+/// gives.
 ///
 /// Returns the descriptors alongside the [`CString`] names they point
 /// into: the caller must keep both alive across the `ignis_model_load`
 /// call (the leaf only reads `name` for the duration of that call).
 fn build_bound_tensors(
     reader: &Reader,
-    artifact: &MaterializedArtifact,
     handles: &[ObjectHandle],
     scope: ModelScope,
+    placement: impl Fn(ObjectHandle, &InventoryEntry) -> Result<TensorPlacement, String>,
 ) -> Result<(Vec<CString>, Vec<ffi::IgnisBoundTensor>), String> {
     let entries = model_scope_27b_with(scope);
     if entries.len() != handles.len() {
@@ -334,7 +416,7 @@ fn build_bound_tensors(
         if !crosses_the_abi(entry.name) {
             continue;
         }
-        let view = artifact.device_view(handle).map_err(|e| e.to_string())?;
+        let view = placement(handle, entry)?;
 
         let (weight_scale_divisor, input_scale_divisor) = if entry.format == NumericFormat::Nvfp4
             && is_weight_only_nvfp4(entry.name)
@@ -383,13 +465,9 @@ fn build_bound_tensors(
             name: name.as_ptr(),
             qtype: qtype_code(entry.format),
             layout: layout_code(entry.layout),
-            qdata: view.base as *const c_void,
-            qhigh: view
-                .high_plane()
-                .map_or(std::ptr::null(), |p| p as *const c_void),
-            scales: view
-                .scale_plane()
-                .map_or(std::ptr::null(), |p| p as *const c_void),
+            qdata: view.qdata,
+            qhigh: view.qhigh,
+            scales: view.scales,
             bytes: view.bytes,
             shape,
             padded_shape,
@@ -528,8 +606,12 @@ pub fn load_qwen38_27b_with_options(
     vision: Option<Vision>,
 ) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
-    let (_names, tensors) =
-        build_bound_tensors(reader, artifact, handles, model_scope(speculation, vision))?;
+    let (_names, tensors) = build_bound_tensors(
+        reader,
+        handles,
+        model_scope(speculation, vision),
+        device_placement(artifact),
+    )?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
     let options = load_options(speculation, vision);
@@ -554,6 +636,56 @@ pub fn load_qwen38_27b_with_options(
         return Err(message.to_string_lossy().into_owned());
     }
     Ok(Model { handle })
+}
+
+/// What [`load_qwen38_27b_with_options`] would reserve beside the weights for
+/// the same options, asked before the weights are on the device (GitHub
+/// #210): `plan` and `handles` are what
+/// [`ignis_artifact::bind_model_scope_27b_with`] returned, not yet
+/// materialized. The leaf binds the descriptors and sizes every reservation
+/// exactly as the load would, and allocates nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_qwen38_27b_reservations(
+    reader: &Reader,
+    plan: &MaterializationPlan,
+    handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    speculation: Option<Speculation>,
+    vision: Option<Vision>,
+) -> Result<IgnisModelReservations, String> {
+    validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
+    let (_names, tensors) = build_bound_tensors(
+        reader,
+        handles,
+        model_scope(speculation, vision),
+        planned_placement(plan),
+    )?;
+    let mut layer_kinds_buf = Vec::new();
+    let topology = qwen38_27b_topology(&mut layer_kinds_buf);
+    let options = load_options(speculation, vision);
+
+    let mut reservations = IgnisModelReservations::default();
+    let rc = unsafe {
+        ffi::ignis_model_plan_reservations(
+            tensors.as_ptr(),
+            tensors.len() as u64,
+            &topology,
+            prefill_chunk_tokens,
+            max_context_tokens,
+            kv_format.abi_code(),
+            options
+                .as_ref()
+                .map_or(std::ptr::null(), |o| o as *const ffi::IgnisModelLoadOptions),
+            &mut reservations,
+        )
+    };
+    if rc != 0 {
+        let message = unsafe { CStr::from_ptr(ffi::ignis_model_last_error()) };
+        return Err(message.to_string_lossy().into_owned());
+    }
+    Ok(reservations)
 }
 
 // ---------------------------------------------------------------------------

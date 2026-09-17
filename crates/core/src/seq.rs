@@ -97,6 +97,20 @@ pub(crate) mod ffi {
         /// Resident sequence-tokens the pool holds — the derived capacity
         /// the byte budget bought (GitHub #122).
         pub kv_token_capacity: u64,
+        /// The KV arena's device bytes, planes and block tables (GitHub #210).
+        pub kv_arena_bytes: u64,
+        /// Every slot's mutable state on the device (GitHub #210).
+        pub lane_state_bytes: u64,
+    }
+
+    /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
+    /// built from a spec occupies, planned without building it.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct IgnisSeqPoolPlan {
+        pub kv_bytes: u64,
+        pub lane_state_bytes: u64,
+        pub checkpoint_image_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_stats`.
@@ -148,6 +162,11 @@ pub(crate) mod ffi {
         pub fn ignis_seq_pool_stats(
             pool: *const IgnisSeqPool,
             out_stats: *mut IgnisSeqPoolStats,
+        ) -> i32;
+
+        pub fn ignis_seq_pool_plan(
+            spec: *const IgnisSeqPoolSpec,
+            out: *mut IgnisSeqPoolPlan,
         ) -> i32;
 
         pub fn ignis_seq_pool_free(pool: *mut IgnisSeqPool);
@@ -299,7 +318,9 @@ pub(crate) mod ffi {
     }
 }
 
-pub use ffi::{IgnisSeqCheckpointStats, IgnisSeqPoolStats, IgnisSeqPrefixStats, IgnisSeqStats};
+pub use ffi::{
+    IgnisSeqCheckpointStats, IgnisSeqPoolPlan, IgnisSeqPoolStats, IgnisSeqPrefixStats, IgnisSeqStats,
+};
 
 /// `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` (`kernel/include/ignis_seq.h`): the
 /// leaf's return code for an entry point that is declared but not built
@@ -392,6 +413,28 @@ fn kv_capture_last_error() -> String {
     msg.to_string_lossy().into_owned()
 }
 
+/// The leaf's pool spec for `cfg`, `budget` and a speculative backend.
+fn pool_spec(
+    cfg: &ModelConfig,
+    budget: &SeqPoolBudget,
+    speculative_backend: Option<crate::SpeculativeBackend>,
+) -> ffi::IgnisSeqPoolSpec {
+    ffi::IgnisSeqPoolSpec {
+        num_kv_heads: cfg.num_kv_heads as u32,
+        head_dim: cfg.head_dim as u32,
+        kv_format: budget.kv_format.abi_code(),
+        kv_page_group_count: budget.kv_page_group_count,
+        max_context_tokens: budget.max_context_tokens,
+        slot_count: budget.slot_count,
+        gdn_num_layers: cfg.gdn_num_layers as u32,
+        gdn_conv_channels: cfg.gdn_conv_channels() as u32,
+        gdn_value_heads: cfg.gdn_value_heads as u32,
+        gdn_head_dim: cfg.gdn_head_dim as u32,
+        vocab: cfg.vocab as u32,
+        speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
+    }
+}
+
 /// The geometry a [`SeqPool`] is built from — everything
 /// `ignis_seq_pool_create` needs beyond what [`ModelConfig`] already
 /// carries.
@@ -438,26 +481,31 @@ impl SeqPool {
         budget: &SeqPoolBudget,
         speculative_backend: Option<crate::SpeculativeBackend>,
     ) -> Result<Self, String> {
-        let spec = ffi::IgnisSeqPoolSpec {
-            num_kv_heads: cfg.num_kv_heads as u32,
-            head_dim: cfg.head_dim as u32,
-            kv_format: budget.kv_format.abi_code(),
-            kv_page_group_count: budget.kv_page_group_count,
-            max_context_tokens: budget.max_context_tokens,
-            slot_count: budget.slot_count,
-            gdn_num_layers: cfg.gdn_num_layers as u32,
-            gdn_conv_channels: cfg.gdn_conv_channels() as u32,
-            gdn_value_heads: cfg.gdn_value_heads as u32,
-            gdn_head_dim: cfg.gdn_head_dim as u32,
-            vocab: cfg.vocab as u32,
-            speculative_backend: speculative_backend.map_or(0, |b| b.abi_code()),
-        };
+        let spec = pool_spec(cfg, budget, speculative_backend);
         let mut handle: *mut ffi::IgnisSeqPool = std::ptr::null_mut();
         let rc = unsafe { ffi::ignis_seq_pool_create(&spec, &mut handle) };
         if rc != 0 || handle.is_null() {
             return Err(last_error());
         }
         Ok(Self { handle })
+    }
+
+    /// What [`SeqPool::create_with_speculation`] would build from the same
+    /// arguments, planned without allocating (GitHub #210): the KV arena,
+    /// every slot's state, and what one checkpoint capture costs. The load's
+    /// VRAM plan sizes the KV pool from this before any pool exists.
+    pub fn plan(
+        cfg: &ModelConfig,
+        budget: &SeqPoolBudget,
+        speculative_backend: Option<crate::SpeculativeBackend>,
+    ) -> Result<IgnisSeqPoolPlan, String> {
+        let spec = pool_spec(cfg, budget, speculative_backend);
+        let mut plan = IgnisSeqPoolPlan::default();
+        let rc = unsafe { ffi::ignis_seq_pool_plan(&spec, &mut plan) };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(plan)
     }
 
     /// Pool-wide geometry + live usage.

@@ -216,6 +216,7 @@ impl StepLeaf for StubLeaf {
             kernel_count: 7,
             graph_launches: 0,
             free_vram_bytes: 0,
+            reserved: Default::default(),
         })
     }
 

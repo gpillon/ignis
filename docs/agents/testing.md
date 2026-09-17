@@ -302,8 +302,9 @@ own env var, each validated before any loader work starts): `--prefill-chunk`
 40960 — a 32K prompt plus an 8K generation budget), `--kv-format` (`bf16`
 or `hq-e8-2b`, default `hq-e8-2b` since GitHub #123 wired its attention
 routes — ADR 0022's serving default) and
-`--kv-pool-bytes` (default auto: 4 GiB, raised if one `--max-context`
-sequence would not fit). The paged-KV pool is sized in **bytes**; the
+`--kv-pool-bytes` (default: whatever the VRAM budget leaves, GitHub #210;
+the plan, logged as `ignis.runtime.vram_plan`, refuses a start that cannot
+hold one `--max-context` sequence). The paged-KV pool is sized in **bytes**; the
 resident-token capacity that budget buys is derived from the format and
 logged at load as `ignis.runtime.kv_pool`, so a run's KV profile is read off
 that event rather than computed from a flag.
@@ -485,8 +486,8 @@ nvidia-smi --format=csv,noheader -l 1 `
   --query-gpu=timestamp,utilization.gpu,utilization.memory,power.draw,clocks.sm,clocks.mem,temperature.gpu `
   > .scratch/gpu-<leg>.csv
 
-# ignis, hq-e8-2b / BF16 (--kv-format bf16, and drop --kv-pool-bytes: BF16's
-# 4 GiB default already lands on 65,536 tokens)
+# ignis, hq-e8-2b / BF16 (--kv-format bf16 --kv-pool-bytes 4G: 65,536 BF16
+# tokens; with no --kv-pool-bytes the pool is the rest of the VRAM budget)
 .\target\x86_64-pc-windows-msvc\release\ignis-server.exe --artifact $Artifact `
   --bind 127.0.0.1:8000 --kv-format hq-e8-2b --max-context 40960 `
   --kv-pool-bytes 576M --prefill-chunk 1024 --request-timeout 900

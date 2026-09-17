@@ -42,7 +42,11 @@ pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 // to be kept in sync by hand across the crate boundary.
 pub use ignis_runtime::{DEFAULT_MAX_CONTEXT, DEFAULT_PREFILL_CHUNK, PREFILL_CHUNK_ALIGNMENT};
 
-pub use ignis_core::KvFormat;
+pub use ignis_core::{KvFormat, VramMode};
+
+/// `--vram-headroom-bytes`' default: what a derived VRAM budget leaves to the
+/// desktop and every other process on the card (GitHub #210).
+pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
 
@@ -64,14 +68,20 @@ pub struct Config {
     /// The KV storage format this load runs on (ADR 0022, GitHub #122),
     /// fixed for the life of the load.
     pub kv_format: KvFormat,
-    /// The paged-KV pool budget, in **bytes**. Never in tokens: what the
-    /// budget is worth in tokens is derived from [`Config::kv_format`] and
-    /// reported at load. When the operator names none, this is
-    /// [`ignis_runtime::auto_kv_pool_bytes`] for the resolved format and
-    /// context — never smaller than one full context, since a pool the
-    /// per-sequence cap cannot fit inside would admit a request the leaf
-    /// can never allocate.
-    pub kv_pool_bytes: u64,
+    /// The paged-KV pool budget, in **bytes** (`--kv-pool-bytes`). Never in
+    /// tokens: what the budget is worth in tokens is derived from
+    /// [`Config::kv_format`] and reported at load. Named, it is never smaller
+    /// than one full context, since a pool the per-sequence cap cannot fit
+    /// inside would admit a request the leaf can never allocate. `None` (the
+    /// default) gives the pool whatever the VRAM plan leaves once every other
+    /// reservation is placed (GitHub #210); the plan refuses a start where
+    /// that is less than one full context.
+    pub kv_pool_bytes: Option<u64>,
+    /// How the load's **VRAM budget** is chosen (GitHub #210, ADR 0030):
+    /// derived from `--vram-headroom-bytes` (the default, with
+    /// [`DEFAULT_VRAM_HEADROOM_BYTES`]) or named by `--vram-budget-bytes`,
+    /// with `--allow-vram-oversubscription` only beside the latter.
+    pub vram: VramMode,
     /// The KV-RAM host tier's budget, in bytes (P4-07, GitHub #125): pinned
     /// host memory for evicted (suspended) request snapshots. `0` disables
     /// the tier (admission refuses instead of evicting once the resident
@@ -88,8 +98,8 @@ pub struct Config {
     /// (`--retained-pool-bytes`, GitHub #186). `0` retains nothing. A byte
     /// budget for the reason [`Config::host_pool_bytes`] is one: an image is
     /// dominated by a fixed state floor a short conversation pays exactly as
-    /// a long one does. Unset derives a default from the VRAM left after
-    /// load; this is what the operator asked for, `None` meaning "derive it".
+    /// a long one does. Unset reserves three checkpoint images in the VRAM
+    /// plan (GitHub #210); `None` means "that default".
     pub retained_pool_bytes: Option<u64>,
     /// How long a retained Interactive checkpoint in KV-RAM keeps its class's
     /// priority after its conversation last used it, in seconds
@@ -270,6 +280,9 @@ pub fn resolve(
     let mut kv_format = None;
     let mut kv_pool_bytes = None;
     let mut host_pool_bytes = None;
+    let mut vram_headroom_bytes = None;
+    let mut vram_budget_bytes = None;
+    let mut allow_vram_oversubscription = false;
     let mut prompt_reuse = None;
     let mut retained_pool_bytes = None;
     let mut retained_interactive_ttl = None;
@@ -302,6 +315,9 @@ pub fn resolve(
             "--kv-format" => kv_format = Some(take_value(args, &mut i, flag)?),
             "--kv-pool-bytes" => kv_pool_bytes = Some(take_value(args, &mut i, flag)?),
             "--kv-host-pool-bytes" => host_pool_bytes = Some(take_value(args, &mut i, flag)?),
+            "--vram-headroom-bytes" => vram_headroom_bytes = Some(take_value(args, &mut i, flag)?),
+            "--vram-budget-bytes" => vram_budget_bytes = Some(take_value(args, &mut i, flag)?),
+            "--allow-vram-oversubscription" => allow_vram_oversubscription = true,
             "--prompt-reuse" => prompt_reuse = Some(take_value(args, &mut i, flag)?),
             "--retained-pool-bytes" => {
                 retained_pool_bytes = Some(take_value(args, &mut i, flag)?)
@@ -361,6 +377,12 @@ pub fn resolve(
     // it (GitHub #122).
     let kv_format = resolve_kv_format(kv_format, &env)?;
     let kv_pool_bytes = resolve_kv_pool_bytes(kv_pool_bytes, &env, kv_format, max_context)?;
+    let vram = resolve_vram(
+        vram_headroom_bytes,
+        vram_budget_bytes,
+        allow_vram_oversubscription,
+        &env,
+    )?;
     let host_pool_bytes = resolve_host_pool_bytes(host_pool_bytes, &env)?;
     let prompt_reuse = resolve_prompt_reuse(prompt_reuse, &env)?;
     let retained_pool_bytes =
@@ -432,6 +454,7 @@ pub fn resolve(
         max_context,
         kv_format,
         kv_pool_bytes,
+        vram,
         host_pool_bytes,
         prompt_reuse,
         retained_pool_bytes,
@@ -679,22 +702,21 @@ fn parse_bytes(flag: &str, raw: &str) -> Result<u64, ConfigError> {
         .ok_or_else(bad)
 }
 
-/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES` / the auto default for the
-/// resolved format and context ([`ignis_runtime::auto_kv_pool_bytes`]).
+/// `--kv-pool-bytes` / `IGNIS_KV_POOL_BYTES`, or `None`: the VRAM plan gives
+/// the pool the rest (GitHub #210).
 ///
 /// An explicit budget is *not* raised to fit the context: if the operator
 /// names one too small, that is a usage error caught here, before any
-/// loader work — the auto default is what "big enough by construction"
-/// means, and silently overriding an explicit number would make the flag a
-/// suggestion.
+/// loader work — silently overriding an explicit number would make the flag
+/// a suggestion.
 fn resolve_kv_pool_bytes(
     flag: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
     format: KvFormat,
     max_context: u32,
-) -> Result<u64, ConfigError> {
+) -> Result<Option<u64>, ConfigError> {
     let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_KV_POOL_BYTES"))) else {
-        return Ok(ignis_runtime::auto_kv_pool_bytes(format, max_context));
+        return Ok(None);
     };
     let bytes = parse_bytes("--kv-pool-bytes", &raw)?;
     ignis_core::plan_kv_pool_for_context(
@@ -704,7 +726,72 @@ fn resolve_kv_pool_bytes(
         max_context,
     )
     .map_err(|e| ConfigError(format!("`--kv-pool-bytes`: {e}")))?;
-    Ok(bytes)
+    Ok(Some(bytes))
+}
+
+/// The VRAM budget's mode (GitHub #210, ADR 0030): `--vram-headroom-bytes` /
+/// `IGNIS_VRAM_HEADROOM_BYTES` derives it, `--vram-budget-bytes` /
+/// `IGNIS_VRAM_BUDGET_BYTES` names it, and `--allow-vram-oversubscription` /
+/// `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` accepts a named one above free memory.
+///
+/// A headroom and a budget are two answers to one question, so naming both
+/// — whichever came from a flag and whichever from the environment — is
+/// refused rather than one silently winning. Oversubscription alone is
+/// refused too: a derived budget is below free memory by construction.
+fn resolve_vram(
+    headroom_flag: Option<String>,
+    budget_flag: Option<String>,
+    allow_oversubscription_flag: bool,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<VramMode, ConfigError> {
+    let headroom = non_empty(headroom_flag.or_else(|| env("IGNIS_VRAM_HEADROOM_BYTES")));
+    let budget = non_empty(budget_flag.or_else(|| env("IGNIS_VRAM_BUDGET_BYTES")));
+    let allow_oversubscription = allow_oversubscription_flag
+        || match non_empty(env("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION")) {
+            None => false,
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => {
+                    return Err(ConfigError(format!(
+                        "`IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` must be true or false, got `{raw}`"
+                    )));
+                }
+            },
+        };
+    match (headroom, budget) {
+        (Some(headroom), Some(budget)) => Err(ConfigError(format!(
+            "`--vram-headroom-bytes {headroom}` and `--vram-budget-bytes {budget}` (as flags or as \
+             IGNIS_VRAM_HEADROOM_BYTES / IGNIS_VRAM_BUDGET_BYTES) are mutually exclusive: a \
+             headroom derives the VRAM budget, a budget names it"
+        ))),
+        (headroom, None) => {
+            if allow_oversubscription {
+                return Err(ConfigError(
+                    "`--allow-vram-oversubscription` requires `--vram-budget-bytes` (a budget \
+                     derived from free memory never exceeds it)"
+                        .to_owned(),
+                ));
+            }
+            let headroom_bytes = match headroom {
+                Some(raw) => parse_bytes("--vram-headroom-bytes", &raw)?,
+                None => DEFAULT_VRAM_HEADROOM_BYTES,
+            };
+            Ok(VramMode::Derived { headroom_bytes })
+        }
+        (None, Some(raw)) => {
+            let budget_bytes = parse_bytes("--vram-budget-bytes", &raw)?;
+            if budget_bytes == 0 {
+                return Err(ConfigError(
+                    "`--vram-budget-bytes` must be positive, got `0`".to_owned(),
+                ));
+            }
+            Ok(VramMode::Explicit {
+                budget_bytes,
+                allow_oversubscription,
+            })
+        }
+    }
 }
 
 /// `--prompt-reuse on|off` / `IGNIS_PROMPT_REUSE` / [`DEFAULT_PROMPT_REUSE`]
@@ -755,8 +842,8 @@ fn resolve_policy<P: Copy, const N: usize>(
 }
 
 /// `--retained-pool-bytes` / `IGNIS_RETAINED_POOL_BYTES` (GitHub #186).
-/// Unset is `None`: the budget is then derived from the VRAM left after the
-/// model lands, which only the loader can know.
+/// Unset is `None`: the VRAM plan then reserves three checkpoint images, a
+/// size only the loader can ask the leaf for (GitHub #210).
 ///
 /// Naming a budget with `--prompt-reuse off` is refused rather than ignored,
 /// the house rule every other sub-flag follows: a pool that will never hold
@@ -850,7 +937,7 @@ fn version_text() -> String {
 
 fn help_text() -> String {
     let default_kv_format = KvFormat::default().as_str();
-    let default_kv_pool_gib = ignis_core::DEFAULT_KV_POOL_BYTES / (1024 * 1024 * 1024);
+    let default_vram_headroom_gib = DEFAULT_VRAM_HEADROOM_BYTES / (1024 * 1024 * 1024);
     let default_host_pool_gib = DEFAULT_HOST_POOL_BYTES / (1024 * 1024 * 1024);
     format!(
         "ignis-server: the OpenAI-compatible HTTP entrypoint\n\
@@ -866,10 +953,13 @@ fn help_text() -> String {
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
          \x20       --max-context <tokens>    env: IGNIS_MAX_CONTEXT    (default: {DEFAULT_MAX_CONTEXT}; max per-sequence prompt + generation)\n\
          \x20       --kv-format <fmt>         env: IGNIS_KV_FORMAT      (default: {default_kv_format}; bf16 or hq-e8-2b)\n\
-         \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: auto, {default_kv_pool_gib} GiB; accepts a K/M/G suffix)\n\
+         \x20       --kv-pool-bytes <bytes>   env: IGNIS_KV_POOL_BYTES  (default: the rest of the VRAM budget; accepts a K/M/G suffix)\n\
+         \x20       --vram-headroom-bytes <b> env: IGNIS_VRAM_HEADROOM_BYTES (default: {default_vram_headroom_gib} GiB; the VRAM budget is the memory free at start minus this; not with --vram-budget-bytes)\n\
+         \x20       --vram-budget-bytes <b>   env: IGNIS_VRAM_BUDGET_BYTES (default: unset — derived; the device memory the whole process may hold, weights included; refused above free memory)\n\
+         \x20       --allow-vram-oversubscription env: IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION (default: off; needs --vram-budget-bytes; start above free memory with a warning)\n\
          \x20       --kv-host-pool-bytes <b>  env: IGNIS_KV_HOST_POOL_BYTES (default: {default_host_pool_gib} GiB; 0 disables the host KV-RAM tier)\n\
          \x20       --prompt-reuse <on|off>   env: IGNIS_PROMPT_REUSE   (default: on; off = no prompt checkpoint is captured or reused)\n\
-         \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: derived from the VRAM left after load; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
+         \x20       --retained-pool-bytes <b> env: IGNIS_RETAINED_POOL_BYTES (default: three checkpoint images, reserved in the VRAM plan; needs --prompt-reuse on; accepts a K/M/G suffix)\n\
          \x20       --retained-interactive-ttl <secs> env: IGNIS_RETAINED_INTERACTIVE_TTL (default: {DEFAULT_RETAINED_INTERACTIVE_TTL_SECS}; idle seconds after which a main-conversation checkpoint in KV-RAM ranks as a subagent's; needs --prompt-reuse on)\n\
          \x20       --system-message-policy <p> env: IGNIS_SYSTEM_MESSAGE_POLICY (default: merge; merge = a leading run of system messages joins the system prompt, a later one is its own block in place; strict = 400 for a system message that is not first)\n\
          \x20       --developer-message-policy <p> env: IGNIS_DEVELOPER_MESSAGE_POLICY (default: inplace; inplace, into-system, after-system, one-after-system or reject; a leading developer message is the system prompt except under reject)\n\
@@ -931,9 +1021,10 @@ mod tests {
         assert_eq!(config.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert_eq!(config.max_context, DEFAULT_MAX_CONTEXT);
         assert_eq!(config.kv_format, KvFormat::HqE8_2b);
+        assert_eq!(config.kv_pool_bytes, None, "the rest of the VRAM budget");
         assert_eq!(
-            config.kv_pool_bytes,
-            ignis_runtime::auto_kv_pool_bytes(KvFormat::HqE8_2b, DEFAULT_MAX_CONTEXT)
+            config.vram,
+            VramMode::Derived { headroom_bytes: DEFAULT_VRAM_HEADROOM_BYTES }
         );
         assert_eq!(config.host_pool_bytes, DEFAULT_HOST_POOL_BYTES);
         assert_eq!(config.speculation, None);
@@ -1098,13 +1189,9 @@ mod tests {
             "the default per-sequence context ({}) must admit a 32K prompt plus a generation budget",
             config.max_context
         );
-        // The pool the leaf builds must be able to hold one such sequence.
-        let plan = ignis_core::plan_kv_pool(
-            config.kv_format,
-            ignis_core::KvGeometry::qwen38_27b(),
-            config.kv_pool_bytes,
-        );
-        assert!(plan.token_capacity >= u64::from(config.max_context));
+        // The pool is the rest of the VRAM budget, which the load's plan
+        // refuses when it cannot hold one such sequence (GitHub #210).
+        assert_eq!(config.kv_pool_bytes, None);
     }
 
     #[test]
@@ -1161,28 +1248,15 @@ mod tests {
     }
 
     #[test]
-    fn the_auto_pool_budget_always_grows_to_hold_the_configured_cap() {
-        // A cap above the default budget raises the budget with it,
-        // automatically, so admission can never promise a context the pool
-        // cannot hold. The cap at which that happens is format-dependent --
-        // 4 GiB buys 65,536 BF16 tokens and 465,984 hq ones -- so each arm
-        // names a context past its own format's default capacity rather than
-        // one number that only stresses whichever format happens to be the
-        // default (GitHub #123 made that hq).
+    fn an_unnamed_pool_is_left_to_the_vram_plan_at_any_context() {
+        // No auto budget to outgrow any more (GitHub #210): the pool is what
+        // the VRAM budget leaves, in either format and at any cap, and the
+        // plan — not this config — refuses a start where that is short.
         for (format, context) in [("bf16", 200_000u32), ("hq-e8-2b", 600_000)] {
             let a = args(&["--kv-format", format, "--max-context", &context.to_string()]);
             let config = expect_config(resolve(&a, no_env).expect("resolve"));
             assert_eq!(config.max_context, context);
-            assert!(
-                config.kv_pool_bytes > ignis_core::DEFAULT_KV_POOL_BYTES,
-                "{format} at {context}: the budget did not grow past the default"
-            );
-            let plan = ignis_core::plan_kv_pool(
-                config.kv_format,
-                ignis_core::KvGeometry::qwen38_27b(),
-                config.kv_pool_bytes,
-            );
-            assert!(plan.token_capacity >= u64::from(context), "{format} at {context}");
+            assert_eq!(config.kv_pool_bytes, None, "{format} at {context}");
         }
     }
 
@@ -1225,17 +1299,19 @@ mod tests {
     }
 
     #[test]
-    fn the_same_default_budget_buys_more_tokens_under_hq() {
+    fn the_same_named_budget_buys_more_tokens_under_hq() {
         // The format is a real option: one budget, two capacities. This is
         // the whole reason the pool is described in bytes.
         let geometry = ignis_core::KvGeometry::qwen38_27b();
-        let bf16 = expect_config(resolve(&args(&["--kv-format", "bf16"]), no_env).expect("resolve"));
-        let hq = expect_config(resolve(&args(&["--kv-format", "hq-e8-2b"]), no_env).expect("resolve"));
+        let named = |format| {
+            let a = args(&["--kv-format", format, "--kv-pool-bytes", "4G"]);
+            expect_config(resolve(&a, no_env).expect("resolve"))
+        };
+        let (bf16, hq) = (named("bf16"), named("hq-e8-2b"));
         assert_eq!(bf16.kv_pool_bytes, hq.kv_pool_bytes);
-        let bf16_capacity =
-            ignis_core::plan_kv_pool(bf16.kv_format, geometry, bf16.kv_pool_bytes).token_capacity;
-        let hq_capacity =
-            ignis_core::plan_kv_pool(hq.kv_format, geometry, hq.kv_pool_bytes).token_capacity;
+        let bytes = hq.kv_pool_bytes.expect("named");
+        let bf16_capacity = ignis_core::plan_kv_pool(bf16.kv_format, geometry, bytes).token_capacity;
+        let hq_capacity = ignis_core::plan_kv_pool(hq.kv_format, geometry, bytes).token_capacity;
         assert!(hq_capacity > bf16_capacity * 7, "{hq_capacity} vs {bf16_capacity}");
         // And it clears the standard target profile: 8 lanes x 40,960.
         assert!(hq_capacity >= 8 * 40_960);
@@ -1245,17 +1321,17 @@ mod tests {
     fn an_explicit_pool_budget_overrides_the_auto_default() {
         let config =
             expect_config(resolve(&args(&["--kv-pool-bytes", "8G"]), no_env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(config.kv_pool_bytes, Some(8 * 1024 * 1024 * 1024));
 
         let env = env_map(&[("IGNIS_KV_POOL_BYTES", "6144MiB")]);
         let config = expect_config(resolve(&[], env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, 6144 * 1024 * 1024);
+        assert_eq!(config.kv_pool_bytes, Some(6144 * 1024 * 1024));
 
         // A bare count is still a byte count.
         let config = expect_config(
             resolve(&args(&["--kv-pool-bytes", "4294967296"]), no_env).expect("resolve"),
         );
-        assert_eq!(config.kv_pool_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.kv_pool_bytes, Some(4 * 1024 * 1024 * 1024));
     }
 
     #[test]
@@ -1283,7 +1359,7 @@ mod tests {
 
         let under_hq = args(&["--kv-pool-bytes", "512M", "--kv-format", "hq-e8-2b"]);
         let config = expect_config(resolve(&under_hq, no_env).expect("resolve"));
-        assert_eq!(config.kv_pool_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.kv_pool_bytes, Some(512 * 1024 * 1024));
     }
 
     #[test]
@@ -1297,6 +1373,126 @@ mod tests {
                 Ok(_) => panic!("`{raw}` must not parse as a byte count"),
                 Err(err) => assert!(err.0.contains("--kv-pool-bytes"), "{}", err.0),
             }
+        }
+    }
+
+    // ── the VRAM budget (GitHub #210, ADR 0030) ──────────────────────────
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn no_memory_flag_derives_the_budget_with_a_one_gib_headroom() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: GIB });
+    }
+
+    #[test]
+    fn the_headroom_and_the_budget_resolve_from_flags_and_env() {
+        let config = expect_config(
+            resolve(&args(&["--vram-headroom-bytes", "2G"]), no_env).expect("resolve"),
+        );
+        assert_eq!(config.vram, VramMode::Derived { headroom_bytes: 2 * GIB });
+
+        let env = env_map(&[("IGNIS_VRAM_HEADROOM_BYTES", "512M")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(
+            config.vram,
+            VramMode::Derived { headroom_bytes: 512 * 1024 * 1024 }
+        );
+
+        let config = expect_config(
+            resolve(&args(&["--vram-budget-bytes", "28G"]), no_env).expect("resolve"),
+        );
+        assert_eq!(
+            config.vram,
+            VramMode::Explicit { budget_bytes: 28 * GIB, allow_oversubscription: false }
+        );
+
+        let env = env_map(&[
+            ("IGNIS_VRAM_BUDGET_BYTES", "30G"),
+            ("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "true"),
+        ]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(
+            config.vram,
+            VramMode::Explicit { budget_bytes: 30 * GIB, allow_oversubscription: true }
+        );
+
+        let a = args(&["--vram-budget-bytes", "30G", "--allow-vram-oversubscription"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert_eq!(
+            config.vram,
+            VramMode::Explicit { budget_bytes: 30 * GIB, allow_oversubscription: true }
+        );
+    }
+
+    #[test]
+    fn a_headroom_with_a_budget_is_refused_from_any_mix_of_flags_and_env() {
+        let flags = args(&["--vram-headroom-bytes", "1G", "--vram-budget-bytes", "28G"]);
+        let cases: [(Vec<String>, &'static [(&'static str, &'static str)]); 4] = [
+            (flags, &[]),
+            (args(&["--vram-budget-bytes", "28G"]), &[("IGNIS_VRAM_HEADROOM_BYTES", "1G")]),
+            (args(&["--vram-headroom-bytes", "1G"]), &[("IGNIS_VRAM_BUDGET_BYTES", "28G")]),
+            (
+                vec![],
+                &[("IGNIS_VRAM_HEADROOM_BYTES", "1G"), ("IGNIS_VRAM_BUDGET_BYTES", "28G")],
+            ),
+        ];
+        for (a, env) in cases {
+            let err = resolve(&a, env_map(env)).expect_err("mutually exclusive");
+            assert!(err.0.contains("--vram-headroom-bytes"), "{}", err.0);
+            assert!(err.0.contains("--vram-budget-bytes"), "{}", err.0);
+            assert!(err.0.contains("mutually exclusive"), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn oversubscription_without_a_budget_is_refused() {
+        let cases: [(Vec<String>, &'static [(&'static str, &'static str)]); 3] = [
+            (args(&["--allow-vram-oversubscription"]), &[]),
+            (vec![], &[("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "1")]),
+            (args(&["--allow-vram-oversubscription", "--vram-headroom-bytes", "2G"]), &[]),
+        ];
+        for (a, env) in cases {
+            let err = resolve(&a, env_map(env)).expect_err("needs a budget");
+            assert!(err.0.contains("--allow-vram-oversubscription"), "{}", err.0);
+            assert!(err.0.contains("--vram-budget-bytes"), "{}", err.0);
+        }
+    }
+
+    #[test]
+    fn malformed_vram_values_are_usage_errors() {
+        for (flag, raw) in [
+            ("--vram-headroom-bytes", "lots"),
+            ("--vram-budget-bytes", "28 GiB please"),
+            ("--vram-budget-bytes", "0"),
+        ] {
+            let err = resolve(&args(&[flag, raw]), no_env).expect_err("malformed");
+            assert!(err.0.contains(flag), "{}", err.0);
+        }
+        let env = env_map(&[
+            ("IGNIS_VRAM_BUDGET_BYTES", "28G"),
+            ("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION", "maybe"),
+        ]);
+        let err = resolve(&[], env).expect_err("not a bool");
+        assert!(err.0.contains("IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION"), "{}", err.0);
+    }
+
+    #[test]
+    fn help_documents_the_vram_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        for flag in [
+            "--vram-headroom-bytes",
+            "IGNIS_VRAM_HEADROOM_BYTES",
+            "--vram-budget-bytes",
+            "IGNIS_VRAM_BUDGET_BYTES",
+            "--allow-vram-oversubscription",
+            "IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION",
+        ] {
+            assert!(text.contains(flag), "help must document {flag}:\n{text}");
         }
     }
 
@@ -1330,7 +1526,7 @@ mod tests {
         assert!(config.prompt_reuse, "on by default (ADR 0029)");
         assert_eq!(
             config.retained_pool_bytes, None,
-            "no budget named: derived from the VRAM left after load"
+            "no budget named: the VRAM plan reserves the default"
         );
 
         let config =

@@ -54,6 +54,14 @@ REQUEST_TIMEOUT ?= 1800
 SPEC ?= dflash2
 DRAFT_TOKENS ?= 7
 KV_POOL_BYTES ?=
+# The VRAM budget (GitHub #210, ADR 0030). Empty = the server's default: the
+# memory free at start minus a 1G headroom. VRAM_HEADROOM derives it with
+# another headroom; VRAM_BUDGET names it (the whole process, weights
+# included) and cannot be combined with VRAM_HEADROOM. ALLOW_VRAM_OVERSUBSCRIPTION=1
+# starts an explicit budget above free memory with a warning.
+VRAM_HEADROOM ?=
+VRAM_BUDGET ?=
+ALLOW_VRAM_OVERSUBSCRIPTION ?=
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G

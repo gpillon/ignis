@@ -197,6 +197,25 @@ struct ignis_seq_pool_stats {
    * pool with and the format in force, which is the number a load reports
    * (GitHub #122). */
   uint64_t kv_token_capacity;
+  /* The KV arena's device bytes: every plane and the block tables
+   * (GitHub #210). */
+  uint64_t kv_arena_bytes;
+  /* Every slot's mutable state on the device: the GDN state arena, the
+   * penalty counts and, under DFLASH2, the drafter's window and checkpoint
+   * (GitHub #210). */
+  uint64_t lane_state_bytes;
+};
+
+/* What a pool built from a spec occupies, planned without building it
+ * (GitHub #210): the same layout `ignis_seq_pool_create` allocates. */
+struct ignis_seq_pool_plan {
+  /* = ignis_seq_pool_stats::kv_arena_bytes of the built pool. */
+  uint64_t kv_bytes;
+  /* = ignis_seq_pool_stats::lane_state_bytes of the built pool. */
+  uint64_t lane_state_bytes;
+  /* = ignis_seq_checkpoint_image_bytes of the built pool: the device bytes
+   * one checkpoint capture allocates. */
+  uint64_t checkpoint_image_bytes;
 };
 
 struct ignis_seq_stats {
@@ -225,6 +244,13 @@ struct ignis_seq_stats {
  * or an unknown speculative backend. */
 int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
                                struct ignis_seq_pool **out_pool);
+
+/* Plan the pool `spec` describes without allocating anything (GitHub #210):
+ * the load's VRAM plan sizes the KV pool from it before any pool exists.
+ * Refuses exactly the specs `ignis_seq_pool_create` refuses. Returns 0 and
+ * fills `*out` on success, -1 otherwise (see ignis_seq_last_error). */
+int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
+                            struct ignis_seq_pool_plan *out);
 
 /* Pool-wide geometry + live usage (the "runtime reports page geometry"
  * surface the scheduler's KV pool sizes from). Returns 0 on success, -1 on

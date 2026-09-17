@@ -155,13 +155,59 @@ struct ignis_model_load_options {
  * raw patches must fit the encoder's int32 extents with room to spare. */
 #define IGNIS_VISION_MAX_TOKENS_LIMIT (1u << 20)
 
+/* Every device reservation a load makes beside the weights, in bytes, one
+ * field per VRAM plan line (GitHub #210, ADR 0030). Filled by
+ * `ignis_model_plan_reservations` before a load and by `ignis_model_stats`
+ * from what a load actually holds, so a caller can plan with the first and
+ * check the second. */
+struct ignis_model_reservations {
+  /* The program scratch arena for one `prefill_chunk_tokens` chunk (with
+   * the drafter's context append under DFLASH2). */
+  uint64_t prefill_scratch_bytes;
+  /* The vision encoder workspace; 0 without vision. */
+  uint64_t vision_workspace_bytes;
+  /* One media item's `[hidden, V]` encoder output; 0 without vision. */
+  uint64_t media_embedding_bytes;
+  /* Device sampling's staging buffers and candidate-selection workspace. */
+  uint64_t sampling_bytes;
+  /* The decode round's scratch arena and staging (token ids, slots, and
+   * with vision the rope positions). */
+  uint64_t decode_graph_bytes;
+  /* The verify round's staging, replay records and accept workspace; 0
+   * without a draft window. */
+  uint64_t verify_round_bytes;
+  /* The DFlash2 drafter's feature taps, append counts and round scratch; 0
+   * without the drafter. */
+  uint64_t drafter_round_bytes;
+};
+
 struct ignis_model_stats {
   uint64_t vram_bytes;        /* sum of every bound tensor's payload bytes */
   uint64_t bound_tensor_count;
   /* The vision reservation beside the weights (GitHub #177): the encoder
    * workspace plus the per-item output transient. 0 without vision. */
   uint64_t vision_reserved_bytes;
+  /* What this load holds beside the weights, read off its own buffers
+   * (GitHub #210). */
+  struct ignis_model_reservations reserved;
 };
+
+/* What `ignis_model_load` would reserve beside the weights for the same
+ * arguments, without allocating anything (GitHub #210): the argument checks
+ * and tensor binding run as they would for the load, so an invalid call
+ * fails here with the load's own message. Only the descriptors of `tensors`
+ * are read -- name, qtype, layout, shape, bytes -- never their data, so a
+ * caller can plan before the weights are on the device and pass null
+ * pointers for `qdata`, `qhigh` and `scales`.
+ *
+ * Returns 0 and fills `*out` on success, -1 otherwise (see
+ * ignis_model_last_error). */
+int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors, uint64_t count,
+                                      const struct ignis_topology *topology,
+                                      uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
+                                      int32_t kv_format,
+                                      const struct ignis_model_load_options *options,
+                                      struct ignis_model_reservations *out);
 
 /* Build the leaf's per-layer weight structures from `tensors` (`count`
  * entries) against `topology`. `prefill_chunk_tokens` is the widest prefill

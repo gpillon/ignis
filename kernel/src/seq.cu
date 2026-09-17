@@ -404,6 +404,189 @@ void ignis_seq_set_last_error(std::string message) {
   g_last_error = std::move(message);
 }
 
+namespace {
+
+// The spec checks `ignis_seq_pool_create` and `ignis_seq_pool_plan` share
+// (GitHub #210), naming the entry point `fn` in the message. False (error
+// set) on a refusal.
+bool validate_pool_spec(const struct ignis_seq_pool_spec &spec, const std::string &fn) {
+  if (!positive(spec.num_kv_heads) || !positive(spec.head_dim) ||
+      !positive(spec.kv_page_group_count) || !positive(spec.max_context_tokens) ||
+      !positive(spec.slot_count) || !positive(spec.gdn_num_layers) ||
+      !positive(spec.gdn_conv_channels) || !positive(spec.gdn_value_heads) ||
+      !positive(spec.gdn_head_dim) || !positive(spec.vocab)) {
+    set_error(fn + ": every geometry field must be positive");
+    return false;
+  }
+  if (!known_kv_format(spec.kv_format)) {
+    set_error(fn + ": kv_format " + std::to_string(spec.kv_format) +
+              " is not an ignis_kv_format");
+    return false;
+  }
+  // The codec's row budget is defined for a 256-dimension row only
+  // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
+  // append path cannot write.
+  if (spec.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B &&
+      spec.head_dim != static_cast<std::uint32_t>(kIgnisHqHeadDim)) {
+    set_error(fn + ": hq-e8-2b KV requires head_dim " + std::to_string(kIgnisHqHeadDim) +
+              ", got " + std::to_string(spec.head_dim));
+    return false;
+  }
+  if (spec.speculative_backend != IGNIS_SPECULATIVE_NONE &&
+      spec.speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
+      spec.speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
+    set_error(fn + ": speculative_backend " + std::to_string(spec.speculative_backend) +
+              " is not an ignis_speculative_backend");
+    return false;
+  }
+  return true;
+}
+
+// Every layout a pool is built from, and the bytes each arena takes: planned
+// once, allocated by `ignis_seq_pool_create`, reported by
+// `ignis_seq_pool_plan` (GitHub #210). Throws on a planning failure.
+struct PoolLayout {
+  ninfer::PagedKVPoolLayout kv_layout;
+  std::size_t kv_bytes = 0;
+  std::uint64_t kv_page_bytes = 0;
+  ninfer::LinearAttentionStatePoolLayout gdn_layout;
+  std::size_t gdn_bytes = 0;
+  std::size_t sampling_counts_bytes = 0;
+  bool dflash2 = false;
+  ninfer::CyclicKVCacheLayout dflash2_window_layout;
+  ninfer::CyclicKVCacheLayout dflash2_checkpoint_layout;
+  std::size_t dflash2_bytes = 0;
+};
+
+PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
+  PoolLayout out;
+  const auto logical_page_capacity = ninfer::pages_for_tokens(spec.max_context_tokens);
+
+  ninfer::LayoutBuilder kv_builder;
+  ninfer::PagedKVPoolSpec kv_spec;
+  kv_spec.page_group_count      = spec.kv_page_group_count;
+  kv_spec.logical_page_capacity = logical_page_capacity;
+  kv_spec.table_rows            = static_cast<std::int32_t>(spec.slot_count);
+  kv_spec.plane_order           = ninfer::PagedKVPlaneOrder::PageMajor;
+  // One K/V plane run per full-attention layer. The GQA layer program
+  // selects its own run (`ignis_kv_plane_index`), so a layer's K/V history
+  // never aliases another layer's pages.
+  kv_spec.planes.reserve(static_cast<std::size_t>(ignis_kv_planes_per_layer(spec.kv_format)) *
+                         kIgnisGqaLayerCount);
+  for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+    push_layer_planes(kv_spec, spec.kv_format, spec.num_kv_heads, spec.head_dim);
+  }
+  out.kv_layout     = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
+  out.kv_bytes      = kv_builder.finish(256);
+  out.kv_page_bytes = static_cast<std::uint64_t>(out.kv_layout.payload_bytes()) /
+                      spec.kv_page_group_count;
+
+  ninfer::LayoutBuilder gdn_builder;
+  ninfer::LinearAttentionStatePoolSpec gdn_spec;
+  gdn_spec.layers         = spec.gdn_num_layers;
+  gdn_spec.conv_channels  = static_cast<std::int32_t>(spec.gdn_conv_channels);
+  // The conv STATE (history) is width-1 = 3 taps, not the kernel width: the
+  // conv_snapshot op's slot stride is `channels * 3` and the reference's
+  // state pool requires conv_width == 3 (GitHub #58, GDN layer).
+  gdn_spec.conv_width     = kIgnisGdnConvStateWidth;
+  gdn_spec.value_heads    = static_cast<std::int32_t>(spec.gdn_value_heads);
+  gdn_spec.value_head_dim = static_cast<std::int32_t>(spec.gdn_head_dim);
+  gdn_spec.key_head_dim   = static_cast<std::int32_t>(spec.gdn_head_dim);
+  gdn_spec.slot_count     = static_cast<std::int32_t>(spec.slot_count);
+  gdn_spec.conv_dtype     = ninfer::DType::BF16;
+  out.gdn_layout = ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_spec);
+  out.gdn_bytes  = gdn_builder.finish(256);
+
+  // P3-03 (GitHub #99): one int32 penalty count per vocab entry, per slot.
+  out.sampling_counts_bytes = static_cast<std::size_t>(spec.slot_count) *
+                              static_cast<std::size_t>(spec.vocab) * sizeof(std::int32_t);
+
+  // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint,
+  // one cyclic lane per slot, planned by the vendored cache itself so the
+  // lane layout the drafter's kernels address is the one sized here.
+  if (spec.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+    ninfer::LayoutBuilder dflash2_builder;
+    const auto lanes = static_cast<std::int32_t>(spec.slot_count);
+    out.dflash2 = true;
+    out.dflash2_window_layout = ninfer::plan_cyclic_kv_cache(
+        dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
+        kIgnisDflash2HeadDim, lanes);
+    out.dflash2_checkpoint_layout = ninfer::plan_cyclic_kv_cache(
+        dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
+        kIgnisDflash2HeadDim, lanes);
+    out.dflash2_bytes = dflash2_builder.finish(256);
+  }
+  return out;
+}
+
+// One slot's share of every region in `regions`.
+std::uint64_t per_slot_bytes(const std::vector<ninfer::LayoutRegion> &regions,
+                             std::uint32_t slots) {
+  std::uint64_t bytes = 0;
+  for (const auto &region : regions) {
+    bytes += region.bytes / slots;
+  }
+  return bytes;
+}
+
+std::uint64_t cyclic_lane_bytes(const ninfer::CyclicKVCacheLayout &layout) {
+  std::uint64_t bytes = 0;
+  const auto lanes = static_cast<std::uint64_t>(layout.lane_capacity);
+  for (std::size_t layer = 0; layer < layout.k.size(); ++layer) {
+    bytes += layout.k[layer].region.bytes / lanes + layout.v[layer].region.bytes / lanes;
+  }
+  return bytes;
+}
+
+// What one `ignis_seq_checkpoint_capture` of a pool with this layout
+// allocates: the clone image of its CLONE sections, in section-table order
+// and alignment (`ignis_seq_prefix_clone_layout`), plus one KV page
+// (`ignis_seq_checkpoint_image_bytes_of`). Planned from the layout, before
+// any pool exists; a GPU test pins it against the built pool's own answer.
+std::uint64_t planned_checkpoint_image_bytes(const PoolLayout &layout,
+                                             const struct ignis_seq_pool_spec &spec) {
+  std::vector<std::uint64_t> sections{
+      per_slot_bytes(layout.gdn_layout.conv, spec.slot_count),
+      per_slot_bytes(layout.gdn_layout.recurrent, spec.slot_count),
+      static_cast<std::uint64_t>(spec.vocab) * sizeof(std::int32_t),
+  };
+  if (layout.dflash2) {
+    sections.push_back(cyclic_lane_bytes(layout.dflash2_window_layout));
+    sections.push_back(cyclic_lane_bytes(layout.dflash2_checkpoint_layout));
+  }
+  std::uint64_t cursor = 0;
+  for (const std::uint64_t bytes : sections) {
+    cursor = ignis_seq_align_up(cursor + bytes, kIgnisSeqSectionAlign);
+  }
+  return cursor + layout.kv_page_bytes;
+}
+
+} // namespace
+
+extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
+                                        struct ignis_seq_pool_plan *out) {
+  if (out != nullptr) {
+    *out = {};
+  }
+  if (spec == nullptr || out == nullptr) {
+    set_error("ignis_seq_pool_plan: null argument");
+    return -1;
+  }
+  if (!validate_pool_spec(*spec, "ignis_seq_pool_plan")) {
+    return -1;
+  }
+  try {
+    const PoolLayout layout = plan_pool_layout(*spec);
+    out->kv_bytes = layout.kv_bytes;
+    out->lane_state_bytes = layout.gdn_bytes + layout.sampling_counts_bytes + layout.dflash2_bytes;
+    out->checkpoint_image_bytes = planned_checkpoint_image_bytes(layout, *spec);
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_seq_pool_plan: ") + e.what());
+    return -1;
+  }
+}
+
 extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
                                           struct ignis_seq_pool **out_pool) {
   if (out_pool != nullptr) {
@@ -413,107 +596,29 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     set_error("ignis_seq_pool_create: null argument");
     return -1;
   }
-  if (!positive(spec->num_kv_heads) || !positive(spec->head_dim) ||
-      !positive(spec->kv_page_group_count) || !positive(spec->max_context_tokens) ||
-      !positive(spec->slot_count) || !positive(spec->gdn_num_layers) ||
-      !positive(spec->gdn_conv_channels) || !positive(spec->gdn_value_heads) ||
-      !positive(spec->gdn_head_dim) || !positive(spec->vocab)) {
-    set_error("ignis_seq_pool_create: every geometry field must be positive");
-    return -1;
-  }
-  if (!known_kv_format(spec->kv_format)) {
-    set_error("ignis_seq_pool_create: kv_format " + std::to_string(spec->kv_format) +
-              " is not an ignis_kv_format");
-    return -1;
-  }
-  // The codec's row budget is defined for a 256-dimension row only
-  // (kHqHeadDim); a pool of any other head_dim would plan planes the hq
-  // append path cannot write.
-  if (spec->kv_format == IGNIS_KV_FORMAT_HQ_E8_2B &&
-      spec->head_dim != static_cast<std::uint32_t>(kIgnisHqHeadDim)) {
-    set_error("ignis_seq_pool_create: hq-e8-2b KV requires head_dim " +
-              std::to_string(kIgnisHqHeadDim) + ", got " + std::to_string(spec->head_dim));
-    return -1;
-  }
-  if (spec->speculative_backend != IGNIS_SPECULATIVE_NONE &&
-      spec->speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
-      spec->speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
-    set_error("ignis_seq_pool_create: speculative_backend " +
-              std::to_string(spec->speculative_backend) + " is not an ignis_speculative_backend");
+  if (!validate_pool_spec(*spec, "ignis_seq_pool_create")) {
     return -1;
   }
 
   try {
-    const auto logical_page_capacity = ninfer::pages_for_tokens(spec->max_context_tokens);
-
-    ninfer::LayoutBuilder kv_builder;
-    ninfer::PagedKVPoolSpec kv_spec;
-    kv_spec.page_group_count      = spec->kv_page_group_count;
-    kv_spec.logical_page_capacity = logical_page_capacity;
-    kv_spec.table_rows            = static_cast<std::int32_t>(spec->slot_count);
-    kv_spec.plane_order           = ninfer::PagedKVPlaneOrder::PageMajor;
-    // One K/V plane run per full-attention layer. The GQA layer program
-    // selects its own run (`ignis_kv_plane_index`), so a layer's K/V history
-    // never aliases another layer's pages.
-    kv_spec.planes.reserve(static_cast<std::size_t>(ignis_kv_planes_per_layer(spec->kv_format)) *
-                           kIgnisGqaLayerCount);
-    for (int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
-      push_layer_planes(kv_spec, spec->kv_format, spec->num_kv_heads, spec->head_dim);
-    }
-    const ninfer::PagedKVPoolLayout kv_layout = ninfer::plan_paged_kv_pool(kv_builder, kv_spec);
-    const std::size_t kv_bytes                = kv_builder.finish(256);
-    const std::uint64_t kv_page_bytes = static_cast<std::uint64_t>(kv_layout.payload_bytes()) /
-                                        spec->kv_page_group_count;
-
-    ninfer::LayoutBuilder gdn_builder;
-    ninfer::LinearAttentionStatePoolSpec gdn_spec;
-    gdn_spec.layers         = spec->gdn_num_layers;
-    gdn_spec.conv_channels  = static_cast<std::int32_t>(spec->gdn_conv_channels);
-    // The conv STATE (history) is width-1 = 3 taps, not the kernel width: the
-    // conv_snapshot op's slot stride is `channels * 3` and the reference's
-    // state pool requires conv_width == 3 (GitHub #58, GDN layer).
-    gdn_spec.conv_width     = kIgnisGdnConvStateWidth;
-    gdn_spec.value_heads    = static_cast<std::int32_t>(spec->gdn_value_heads);
-    gdn_spec.value_head_dim = static_cast<std::int32_t>(spec->gdn_head_dim);
-    gdn_spec.key_head_dim   = static_cast<std::int32_t>(spec->gdn_head_dim);
-    gdn_spec.slot_count     = static_cast<std::int32_t>(spec->slot_count);
-    gdn_spec.conv_dtype     = ninfer::DType::BF16;
-    const ninfer::LinearAttentionStatePoolLayout gdn_layout =
-        ninfer::plan_linear_attention_state_pool(gdn_builder, gdn_spec);
-    const std::size_t gdn_bytes = gdn_builder.finish(256);
-
-    // P3-03 (GitHub #99): one int32 penalty count per vocab entry, per slot.
-    const std::size_t sampling_counts_bytes = static_cast<std::size_t>(spec->slot_count) *
-                                              static_cast<std::size_t>(spec->vocab) *
-                                              sizeof(std::int32_t);
-
-    auto pool = std::make_unique<ignis_seq_pool>(kv_bytes, kv_layout, gdn_bytes, gdn_layout,
-                                                 sampling_counts_bytes,
+    const PoolLayout layout = plan_pool_layout(*spec);
+    auto pool = std::make_unique<ignis_seq_pool>(layout.kv_bytes, layout.kv_layout,
+                                                 layout.gdn_bytes, layout.gdn_layout,
+                                                 layout.sampling_counts_bytes,
                                                  static_cast<std::int32_t>(spec->vocab));
-    pool->kv_page_bytes   = kv_page_bytes;
+    pool->kv_page_bytes   = layout.kv_page_bytes;
     pool->kv_format       = spec->kv_format;
     pool->kv_head_dim     = static_cast<std::int32_t>(spec->head_dim);
     pool->kv_num_kv_heads = static_cast<std::int32_t>(spec->num_kv_heads);
 
-    // P5-03 (GitHub #152): the drafter's window and its rewrite checkpoint,
-    // one cyclic lane per slot, planned by the vendored cache itself so the
-    // lane layout the drafter's kernels address is the one sized here.
-    if (spec->speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
-      ninfer::LayoutBuilder dflash2_builder;
-      const auto lanes = static_cast<std::int32_t>(spec->slot_count);
-      const ninfer::CyclicKVCacheLayout window_layout = ninfer::plan_cyclic_kv_cache(
-          dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
-          kIgnisDflash2HeadDim, lanes);
-      const ninfer::CyclicKVCacheLayout checkpoint_layout = ninfer::plan_cyclic_kv_cache(
-          dflash2_builder, kIgnisDflash2Layers, kIgnisDflash2WindowTokens, kIgnisDflash2KvHeads,
-          kIgnisDflash2HeadDim, lanes);
-      const std::size_t dflash2_bytes = dflash2_builder.finish(256);
-      pool->dflash2_arena = std::make_unique<ninfer::DeviceArena>(dflash2_bytes);
+    if (layout.dflash2) {
+      pool->dflash2_arena = std::make_unique<ninfer::DeviceArena>(layout.dflash2_bytes);
       const ninfer::DeviceSpan backing{pool->dflash2_arena->base(),
                                        pool->dflash2_arena->capacity()};
-      pool->dflash2_window     = std::make_unique<ninfer::CyclicKVCache>(backing, window_layout);
+      pool->dflash2_window =
+          std::make_unique<ninfer::CyclicKVCache>(backing, layout.dflash2_window_layout);
       pool->dflash2_checkpoint =
-          std::make_unique<ninfer::CyclicKVCache>(backing, checkpoint_layout);
+          std::make_unique<ninfer::CyclicKVCache>(backing, layout.dflash2_checkpoint_layout);
     }
     // Named on every pool, VERIFY_ONLY included (P5-04, GitHub #153): that
     // backend owns no per-slot state, but the program entry points still pair
@@ -555,6 +660,11 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
       pool->kv_page_bytes / static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
   out_stats->kv_token_capacity = static_cast<std::uint64_t>(pool->kv_pool.page_group_count()) *
                                  static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
+  // GitHub #210: the device bytes the pool holds, read off its arenas, for
+  // the load to check against its VRAM plan.
+  out_stats->kv_arena_bytes = pool->kv_arena.capacity();
+  out_stats->lane_state_bytes = pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
+                                (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0);
   return 0;
 }
 

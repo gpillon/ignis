@@ -21,7 +21,9 @@
 
 #![cfg(feature = "cuda")]
 
-use ignis_artifact::{CudaDevice, Device, MaterializedArtifact, ObjectHandle, Reader};
+use ignis_artifact::{
+    CudaDevice, Device, MaterializationPlan, MaterializedArtifact, ObjectHandle, Reader,
+};
 use ignis_core::model_load::{self, Model as CoreModel};
 use ignis_core::seq::{
     PinnedBuffer, Seq, SeqCheckpoint, SeqPool, SeqPoolBudget, SeqPrefix, snapshot_format_version,
@@ -34,7 +36,7 @@ use ignis_core::{
 
 use ignis_core::vision::MediaItem;
 
-use crate::{DecodeLane, LaneRun, MultimodalSpan, RuntimeStats, StepLeaf};
+use crate::{DecodeLane, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf};
 
 /// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +206,75 @@ impl CudaLeafConfig {
     pub fn blob_identity(&self, artifact: ArtifactHash, layout_version: u32) -> BlobIdentity {
         BlobIdentity::of_load(artifact, self.kv_format, self.speculation, layout_version)
     }
+
+    /// Every reservation a load with these options makes beside the weights
+    /// and the KV pool, and what one checkpoint of its pool costs, asked of
+    /// the leaf before anything is on the device (GitHub #210). `plan` and
+    /// `handles` are the binder's, not yet materialized.
+    pub fn plan_reservations(
+        &self,
+        reader: &Reader,
+        plan: &MaterializationPlan,
+        handles: &[ObjectHandle],
+    ) -> Result<PlannedReservations, String> {
+        let model = model_load::plan_qwen38_27b_reservations(
+            reader,
+            plan,
+            handles,
+            self.prefill_chunk_tokens,
+            self.max_context_tokens,
+            self.kv_format,
+            self.speculation,
+            self.vision,
+        )?;
+        let pool = self.pool_plan(1)?;
+        Ok(PlannedReservations {
+            reserved: ReservedBytes {
+                prefill_scratch: model.prefill_scratch_bytes,
+                vision_workspace: model.vision_workspace_bytes,
+                media_embedding: model.media_embedding_bytes,
+                sampling: model.sampling_bytes,
+                decode_graph: model.decode_graph_bytes,
+                verify_round: model.verify_round_bytes,
+                drafter_round: model.drafter_round_bytes,
+                lane_state: pool.lane_state_bytes,
+                kv_pool: 0,
+            },
+            checkpoint_image_bytes: pool.checkpoint_image_bytes,
+        })
+    }
+
+    /// The device bytes a KV pool of `pages` pages occupies under these
+    /// options, block tables included (GitHub #210).
+    pub fn kv_pool_arena_bytes(&self, pages: u32) -> Result<u64, String> {
+        self.pool_plan(pages).map(|plan| plan.kv_bytes)
+    }
+
+    fn pool_plan(&self, pages: u32) -> Result<ignis_core::seq::IgnisSeqPoolPlan, String> {
+        SeqPool::plan(
+            &ModelConfig::qwen38_27b(),
+            &self.pool_budget(pages),
+            self.speculation.map(|s| s.backend()),
+        )
+    }
+
+    fn pool_budget(&self, pages: u32) -> SeqPoolBudget {
+        SeqPoolBudget {
+            kv_format: self.kv_format,
+            kv_page_group_count: pages,
+            max_context_tokens: self.max_context_tokens,
+            slot_count: self.slot_count,
+        }
+    }
+}
+
+/// What [`CudaLeafConfig::plan_reservations`] found (GitHub #210).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedReservations {
+    /// Every line but the KV pool's, which the VRAM plan sizes from the rest.
+    pub reserved: ReservedBytes,
+    /// What one checkpoint capture of this load's pool allocates.
+    pub checkpoint_image_bytes: u64,
 }
 
 /// The leaf's model handle: the loaded weights plus the sequence-state
@@ -332,12 +403,7 @@ impl StepLeaf for CudaLeaf {
         // so a speculative load's pool carries it for every slot.
         let pool = SeqPool::create_with_speculation(
             &cfg,
-            &SeqPoolBudget {
-                kv_format: self.config.kv_format,
-                kv_page_group_count: plan.page_count,
-                max_context_tokens: self.config.max_context_tokens,
-                slot_count: self.config.slot_count,
-            },
+            &self.config.pool_budget(plan.page_count),
             self.config.speculation.map(|s| s.backend()),
         )
         .map_err(|e| leaf_error("seq pool create", e))?;
@@ -412,6 +478,7 @@ impl StepLeaf for CudaLeaf {
         let program = step::program_stats(&model.model, &model.pool)
             .map_err(|e| leaf_error("program stats", e))?;
         let pool_stats = model.pool.stats();
+        let reserved = model.model.stats().reserved;
         Ok(RuntimeStats {
             vram_bytes: program.vram_bytes,
             // The leaf's paged KV page size is fixed at 64 tokens
@@ -432,6 +499,19 @@ impl StepLeaf for CudaLeaf {
             // 0 when the query fails, which sizes the retained pool at
             // nothing rather than at a number nobody measured.
             free_vram_bytes: self.device.free_bytes().unwrap_or(0),
+            // GitHub #210: read off the model's and the pool's own buffers,
+            // for the load to check against its VRAM plan.
+            reserved: ReservedBytes {
+                prefill_scratch: reserved.prefill_scratch_bytes,
+                vision_workspace: reserved.vision_workspace_bytes,
+                media_embedding: reserved.media_embedding_bytes,
+                sampling: reserved.sampling_bytes,
+                decode_graph: reserved.decode_graph_bytes,
+                verify_round: reserved.verify_round_bytes,
+                drafter_round: reserved.drafter_round_bytes,
+                lane_state: pool_stats.lane_state_bytes,
+                kv_pool: pool_stats.kv_arena_bytes,
+            },
         })
     }
 

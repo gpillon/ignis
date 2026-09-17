@@ -132,7 +132,7 @@ fn harness() -> Option<Harness> {
         prefill_chunk: PREFILL_CHUNK,
         max_context: MAX_CONTEXT,
         kv_format: KvFormat::HqE8_2b,
-        kv_pool_bytes: one_context_pool_bytes(),
+        kv_pool_bytes: Some(one_context_pool_bytes()),
         prompt_reuse: true,
         speculation: Some(Speculation::new(SpeculativeBackend::Dflash2, 7).expect("dflash2-7")),
         vision: Some(vision),

@@ -17,7 +17,7 @@ use ignis_core::{
 #[cfg(feature = "cuda")]
 mod cuda_leaf;
 #[cfg(feature = "cuda")]
-pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel};
+pub use cuda_leaf::{CudaLeaf, CudaLeafConfig, CudaModel, PlannedReservations};
 
 /// Tokens held by one physical KV page, in either format
 /// (`kPagedKVPageSize`). Re-exported from `ignis-core` so the server's
@@ -64,6 +64,45 @@ pub fn auto_kv_pool_bytes(format: ignis_core::KvFormat, max_context: u32) -> u64
     ignis_core::auto_kv_pool_bytes(format, ignis_core::KvGeometry::qwen38_27b(), max_context)
 }
 
+/// The CUDA context's device bytes (GitHub #210): the dedicated usage of a
+/// process that has only run `ignis_device_create`, read from the WDDM
+/// counter `\GPU Process Memory(pid_*)\Dedicated Usage` (Task Manager's
+/// figure) on the RTX 5090, 2026-09-17.
+///
+/// A plan line, never added to the free memory the budget starts from: on
+/// Windows `cudaMemGetInfo` does not count the calling process's own context
+/// (a context-only process read the same free memory a loaded server did),
+/// and it already reads about 400 MiB more free than the adapter's dedicated
+/// usage leaves, so adding the context back would spend the headroom twice.
+pub const CUDA_CONTEXT_BYTES: u64 = 452_595_712;
+
+/// What a load holds beyond every reservation the VRAM plan names (GitHub
+/// #210): allocator rounding, the decode graph captures, handles the kernel
+/// creates lazily. Measured on the RTX 5090 on 2026-09-17 at the Makefile
+/// defaults with `--vision` (262K hq-e8-2b, DFlash2/7): the server's WDDM
+/// dedicated usage right after load (30,047,830,016 B) minus the context and
+/// every line the load allocates (the plan's total less the retained line,
+/// which the load does not allocate).
+pub const LOAD_RESIDUAL_BYTES: u64 = 88_028_656;
+
+/// Device bytes a load holds beside its weights, line by line as the VRAM
+/// plan lays them out (GitHub #210): planned before the load, read back off
+/// the loaded model and pool after it, and compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReservedBytes {
+    pub prefill_scratch: u64,
+    pub vision_workspace: u64,
+    pub media_embedding: u64,
+    pub sampling: u64,
+    pub decode_graph: u64,
+    pub verify_round: u64,
+    pub drafter_round: u64,
+    /// Every lane's state in the sequence pool.
+    pub lane_state: u64,
+    /// The KV pool's arena, planes and block tables.
+    pub kv_pool: u64,
+}
+
 /// A failure returned by the step ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -100,6 +139,9 @@ pub struct RuntimeStats {
     /// that failed — which the retained pool's derived default reads as
     /// "retain nothing" rather than as "retain everything".
     pub free_vram_bytes: u64,
+    /// What the loaded model and its pool hold beside the weights (GitHub
+    /// #210); all zero for a leaf with no device.
+    pub reserved: ReservedBytes,
 }
 
 impl From<RuntimeError> for ComputeError {

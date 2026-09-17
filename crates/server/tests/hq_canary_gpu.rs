@@ -89,7 +89,7 @@ fn harness(vision: Option<Vision>) -> Option<Harness> {
 
     let shape = EngineShape {
         kv_format: KvFormat::HqE8_2b,
-        kv_pool_bytes: KV_POOL_BYTES,
+        kv_pool_bytes: Some(KV_POOL_BYTES),
         vision,
         ..EngineShape::default()
     };

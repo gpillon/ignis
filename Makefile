@@ -89,7 +89,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
   $(if $(KV_FORMAT),--kv-format $(KV_FORMAT)) \
   $(if $(MAX_CONTEXT),--max-context $(MAX_CONTEXT)) \
   $(if $(PREFILL_CHUNK),--prefill-chunk $(PREFILL_CHUNK)) \
-  $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES)) \
+  $(if $(KV_POOL_BYTES),--kv-pool-bytes $(KV_POOL_BYTES))   $(if $(VRAM_HEADROOM),--vram-headroom-bytes $(VRAM_HEADROOM))   $(if $(VRAM_BUDGET),--vram-budget-bytes $(VRAM_BUDGET))   $(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)),--allow-vram-oversubscription) \
   $(if $(KV_HOST_POOL_BYTES),--kv-host-pool-bytes $(KV_HOST_POOL_BYTES)) \
   $(if $(REQUEST_TIMEOUT),--request-timeout $(REQUEST_TIMEOUT)) \
   $(if $(SPEC),--spec $(SPEC) $(if $(DRAFT_TOKENS),--draft-tokens $(DRAFT_TOKENS)))
@@ -169,7 +169,8 @@ config: ## Print the resolved knobs and paths
 	@echo "UI              $(UI)"
 	@echo "METRICS         $(METRICS)  $(if $(filter 1,$(METRICS)),(Prometheus: $(METRICS_URL)/metrics; Playground: /ui/metrics$(if $(or $(API_KEY),$(EXPOSE)), behind the API key)),(off))"
 	@echo "ARTIFACT        $(ARTIFACT)"
-	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),auto) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
+	@echo "engine (CUDA=1) context=$(or $(MAX_CONTEXT),default) kv=$(or $(KV_FORMAT),default) chunk=$(or $(PREFILL_CHUNK),default) pool=$(or $(KV_POOL_BYTES),rest of the VRAM budget) host_pool=$(or $(KV_HOST_POOL_BYTES),default) timeout=$(or $(REQUEST_TIMEOUT),default) spec=$(or $(SPEC),off)$(if $(SPEC),/$(DRAFT_TOKENS))"
+	@echo "VRAM (CUDA=1)   $(if $(VRAM_BUDGET),budget=$(VRAM_BUDGET)$(if $(filter 1,$(ALLOW_VRAM_OVERSUBSCRIPTION)), (oversubscription allowed)),headroom=$(or $(VRAM_HEADROOM),(server default: 1G)))"
 	@echo "MODEL           $(or $(MODEL),(server default))"
 	@echo "BIND            $(BIND)"
 	@echo "LOG_LEVEL       $(or $(LOG_LEVEL),(server default))"

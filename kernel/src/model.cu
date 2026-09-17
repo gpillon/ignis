@@ -580,6 +580,60 @@ std::size_t compute_program_scratch_bytes(const ignis_model &model, const ignis_
 // multimodal sequence's verify columns rotate at `position + rope_delta` the
 // way its decode rounds do. A load without vision allocates nothing for it
 // and every round rotates at `positions` itself, exactly as before.
+// The ReplaySSM record geometry of the verify round at window `k`.
+ninfer::GdnReplayRecordSpec verify_record_spec(const ignis_topology &topology, uint32_t window) {
+  std::int32_t gdn_layers = 0;
+  for (uint32_t i = 0; i < topology.num_layers; ++i) {
+    if (static_cast<ignis_layer_kind>(topology.layer_kinds[i]) == IGNIS_LAYER_GDN) {
+      ++gdn_layers;
+    }
+  }
+  ninfer::GdnReplayRecordSpec spec{};
+  spec.layers = gdn_layers;
+  spec.record_capacity = IGNIS_DECODE_MAX_BATCH;
+  spec.width = static_cast<std::int32_t>(window) + 1;
+  spec.conv_channels =
+      static_cast<std::int32_t>(topology.gdn_q_width + topology.gdn_state_cols + topology.gdn_state_rows);
+  spec.qk_heads = static_cast<std::int32_t>(topology.gdn_q_width / kGdnHeadDim);
+  spec.value_heads = static_cast<std::int32_t>(topology.gdn_state_rows / kGdnHeadDim);
+  spec.key_dim = static_cast<std::int32_t>(kGdnHeadDim);
+  spec.value_dim = static_cast<std::int32_t>(kGdnHeadDim);
+  return spec;
+}
+
+// GitHub #210: every byte `build_verify_round` below allocates, without
+// allocating -- the VRAM plan's verify line. `IgnisVerifyRound::device_bytes`
+// reads the same total back off a built round, and the load checks the two
+// agree.
+std::size_t verify_round_bytes(const ignis_topology &topology, uint32_t window, bool vision) {
+  const auto k = static_cast<std::size_t>(window);
+  const std::size_t columns = k + 1;
+  const std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
+  const auto hidden = static_cast<std::size_t>(topology.hidden);
+  const auto vocab = static_cast<std::size_t>(topology.vocab);
+  const std::size_t i32 = sizeof(int32_t);
+  const std::size_t bf16 = sizeof(std::uint16_t);
+
+  std::size_t bytes = 0;
+  // anchors, base_positions, extents, valid_columns, lengths,
+  // licensed_counts, accepted, selectors
+  bytes += 8 * lanes * i32;
+  bytes += k * lanes * i32;                          // drafts
+  bytes += (vision ? 5 : 4) * columns * lanes * i32; // verify_ids, positions, target_tokens,
+                                                     // licensed_tokens, rope_positions
+  bytes += vocab * columns * lanes * bf16;           // logits
+  bytes += hidden * columns * lanes * bf16;          // hidden
+  bytes += hidden * lanes * bf16;                    // selected_hidden
+  ninfer::LayoutBuilder builder;
+  (void)ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, window));
+  bytes += builder.finish(kArenaAlign, "GDN replay records");
+  bytes += std::max<std::size_t>(ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                     static_cast<std::int32_t>(vocab), static_cast<std::int32_t>(k),
+                                     static_cast<std::int32_t>(k), 1, static_cast<std::int32_t>(lanes)),
+                                 kArenaAlign);
+  return bytes;
+}
+
 std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology,
                                                      uint32_t window, bool vision) {
   auto verify = std::make_unique<IgnisVerifyRound>();
@@ -629,24 +683,9 @@ std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topol
   const std::vector<std::int32_t> anchor_only(static_cast<std::size_t>(lanes), 1);
   verify->valid_columns->copy_from_host(anchor_only.data(), anchor_only.size() * sizeof(std::int32_t));
 
-  std::int32_t gdn_layers = 0;
-  for (uint32_t i = 0; i < topology.num_layers; ++i) {
-    if (static_cast<ignis_layer_kind>(topology.layer_kinds[i]) == IGNIS_LAYER_GDN) {
-      ++gdn_layers;
-    }
-  }
-  ninfer::GdnReplayRecordSpec spec{};
-  spec.layers = gdn_layers;
-  spec.record_capacity = lanes;
-  spec.width = columns;
-  spec.conv_channels =
-      static_cast<std::int32_t>(topology.gdn_q_width + topology.gdn_state_cols + topology.gdn_state_rows);
-  spec.qk_heads = static_cast<std::int32_t>(topology.gdn_q_width / kGdnHeadDim);
-  spec.value_heads = static_cast<std::int32_t>(topology.gdn_state_rows / kGdnHeadDim);
-  spec.key_dim = static_cast<std::int32_t>(kGdnHeadDim);
-  spec.value_dim = static_cast<std::int32_t>(kGdnHeadDim);
   ninfer::LayoutBuilder builder;
-  verify->records_layout = ninfer::plan_gdn_replay_records(builder, spec);
+  verify->records_layout =
+      ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, window));
   const std::size_t record_bytes = builder.finish(kArenaAlign, "GDN replay records");
   verify->records_backing = std::make_unique<ninfer::DeviceBuffer>(record_bytes);
   verify->records = ninfer::GdnReplayRecords(
@@ -789,7 +828,335 @@ std::size_t vision_output_transient_bytes(std::int64_t hidden, std::int32_t toke
   return layout.finish(kVisionWorkspaceAlignment, "vision item output transient layout");
 }
 
+// The load options `ignis_model_load` and `ignis_model_plan_reservations`
+// both run under, once validated.
+struct LoadOptions {
+  ninfer::DType cache_dtype = ninfer::DType::BF16;
+  int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
+  uint32_t draft_tokens = 0;
+  uint32_t vision_max_tokens = 0;
+};
+
+// The argument checks and the tensor binding of a load, shared by the load
+// itself and by its plan (GitHub #210) so the two refuse the same calls with
+// the same messages. Allocates nothing on the device. Null (error set) on
+// any refusal.
+std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *tensors,
+                                               uint64_t count, const struct ignis_topology *topology,
+                                               uint32_t prefill_chunk_tokens,
+                                               uint32_t max_context_tokens, int32_t kv_format,
+                                               const struct ignis_model_load_options *options,
+                                               LoadOptions &out) {
+  if (topology->num_layers > 0 && topology->layer_kinds == nullptr) {
+    set_error("ignis_model_load: topology.layer_kinds is null");
+    return nullptr;
+  }
+  if (topology->gdn_num_layers == 0) {
+    set_error("ignis_model_load: topology.gdn_num_layers must be positive");
+    return nullptr;
+  }
+  if (topology->gdn_state_rows % topology->gdn_num_layers != 0) {
+    set_error("ignis_model_load: gdn_state_rows is not a multiple of gdn_num_layers");
+    return nullptr;
+  }
+  // P2-01 (GitHub #83): the prefill chunk width the caller will hand
+  // ignis_program_prefill, validated against the reference's own alignment
+  // rule (also the alignment the GDN chunked kernels' 64-token chunk
+  // divides evenly).
+  if (prefill_chunk_tokens == 0 || prefill_chunk_tokens % 128 != 0) {
+    set_error("ignis_model_load: prefill_chunk_tokens must be a nonzero multiple of 128");
+    return nullptr;
+  }
+  if (max_context_tokens == 0) {
+    set_error("ignis_model_load: max_context_tokens must be positive");
+    return nullptr;
+  }
+  // A chunk wider than the sequence pool's own context bound can never be
+  // prefilled anyway, and the GQA attention workspace query needs
+  // max_visible_keys >= the query width it is sized for.
+  if (prefill_chunk_tokens > max_context_tokens) {
+    set_error("ignis_model_load: prefill_chunk_tokens (" + std::to_string(prefill_chunk_tokens) +
+              ") must not exceed max_context_tokens (" + std::to_string(max_context_tokens) + ")");
+    return nullptr;
+  }
+  // P4-05 (GitHub #123): the format both scratch reservations below are
+  // sized for. Refused here rather than defaulted to BF16 -- an unrecognized
+  // value would otherwise reserve one format's arena and let the layers run
+  // the other's routes out of it.
+  if (kv_format != IGNIS_KV_FORMAT_BF16 && kv_format != IGNIS_KV_FORMAT_HQ_E8_2B) {
+    set_error("ignis_model_load: kv_format " + std::to_string(kv_format) +
+              " is not an ignis_kv_format");
+    return nullptr;
+  }
+  out.cache_dtype = ignis_kv_cache_dtype(kv_format);
+
+  // P5-02 (GitHub #150, ADR 0016): the load options, validated before any
+  // binding -- a NULL pointer is the production default, no speculation.
+  int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
+  uint32_t draft_tokens = 0;
+  uint32_t vision_max_tokens = 0;
+  if (options != nullptr) {
+    if (options->size != sizeof(struct ignis_model_load_options)) {
+      set_error("ignis_model_load: options.size " + std::to_string(options->size) +
+                " is not a recognized ignis_model_load_options size");
+      return nullptr;
+    }
+    speculative_backend = options->speculative_backend;
+    draft_tokens = options->draft_tokens;
+    vision_max_tokens = options->vision_max_tokens;
+  }
+  if (vision_max_tokens > IGNIS_VISION_MAX_TOKENS_LIMIT) {
+    set_error("ignis_model_load: vision_max_tokens " + std::to_string(vision_max_tokens) +
+              " exceeds " + std::to_string(IGNIS_VISION_MAX_TOKENS_LIMIT));
+    return nullptr;
+  }
+  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
+      speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
+      speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
+    set_error("ignis_model_load: speculative_backend " + std::to_string(speculative_backend) +
+              " is not an ignis_speculative_backend");
+    return nullptr;
+  }
+  if (speculative_backend == IGNIS_SPECULATIVE_NONE && draft_tokens != 0) {
+    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
+              " needs a speculative_backend");
+    return nullptr;
+  }
+  // P5-04 (GitHub #153): VERIFY_ONLY takes the same window rule -- the
+  // verify graphs are captured at it, and the round is refused at any other.
+  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
+      (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
+    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
+              " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
+    return nullptr;
+  }
+  // GitHub #195: vision and a speculative backend are two independent load
+  // options. #178's fence stood until the verify round learned the sequence's
+  // `rope_delta` (`IgnisVerifyRound::rope_positions`, staged per round); the
+  // drafter's context append needed nothing, because it consumes the span's
+  // KV positions, which is what the reference's own prefill sink captures on
+  // a multimodal span too.
+  out.speculative_backend = speculative_backend;
+  out.draft_tokens = draft_tokens;
+  out.vision_max_tokens = vision_max_tokens;
+
+  ModelBinder binder(tensors, count);
+  if (!binder.build_index(count)) {
+    return nullptr;
+  }
+
+  const Geometry g = Geometry::from(*topology);
+  auto model = std::make_unique<ignis_model>();
+
+  if (!binder.bind("text/token_embedding", {g.vocab, g.hidden}, model->token_embedding) ||
+      !binder.bind("text/final_norm", {g.hidden}, model->final_norm) ||
+      !binder.bind("text/output_head", {g.vocab, g.hidden}, model->output_head)) {
+    return nullptr;
+  }
+
+  model->layers.resize(topology->num_layers);
+  for (uint32_t i = 0; i < topology->num_layers; ++i) {
+    const std::string prefix = "text/layers/" + std::to_string(i) + "/";
+    const auto kind = static_cast<ignis_layer_kind>(topology->layer_kinds[i]);
+    model->layers[i].kind = kind;
+    const bool ok = (kind == IGNIS_LAYER_GQA)
+                        ? bind_gqa_layer(binder, prefix, g, model->layers[i].gqa)
+                        : bind_gdn_layer(binder, prefix, g, model->layers[i].gdn);
+    if (!ok) {
+      return nullptr;
+    }
+  }
+
+  // Without the option the `dflash2/*` tensors are not asked for, so a caller
+  // that hands them over anyway fails on `require_no_extras` below.
+  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
+    return nullptr;
+  }
+  // GitHub #177: likewise the `vision/*` tensors, only with an envelope.
+  if (vision_max_tokens > 0 && !bind_vision(binder, g, model->vision)) {
+    return nullptr;
+  }
+
+  if (!binder.require_no_extras()) {
+    return nullptr;
+  }
+  return model;
+}
+
+// The drafter round's vendored workspaces (`swa`, `linear_swiglu`), checked
+// against their fixed allowance; see kDflash2RoundWorkspaceBytes.
+void check_dflash2_round_workspace(const ignis_model &model, const Geometry &g,
+                                   uint32_t max_context_tokens, uint32_t draft_tokens) {
+  const auto block = static_cast<std::int32_t>(draft_tokens + 1);
+  const std::size_t workspace_bytes =
+      ninfer::ops::swa_workspace_capacity_bytes({0, max_context_tokens}, 1, block,
+                                                IGNIS_DECODE_MAX_BATCH) +
+      ninfer::ops::linear_swiglu_workspace_capacity_bytes(
+          model.dflash2.layers[0].mlp_gate_up.qtype, static_cast<std::int32_t>(2 * g.ffn_intermediate),
+          static_cast<std::int32_t>(g.hidden), ninfer::ops::LinearPolicy::A16Only, 1, 16);
+  if (workspace_bytes > kDflash2RoundWorkspaceBytes) {
+    throw std::runtime_error("the drafter's vendored workspaces need " +
+                             std::to_string(workspace_bytes) + " bytes, past the " +
+                             std::to_string(kDflash2RoundWorkspaceBytes) + "-byte allowance");
+  }
+}
+
+// The arenas and buffers a load reserves beside the weights, sized from a
+// bound model (GitHub #210): the one computation both `ignis_model_load`,
+// which allocates from it, and `ignis_model_plan_reservations`, which only
+// reports it, run. Throws on a sizing failure.
+struct LoadSizes {
+  std::size_t prefill_scratch = 0;
+  std::size_t vision_workspace = 0;
+  std::size_t media_embedding = 0;
+  std::size_t sampling_workspace = 0;
+  std::size_t decode_graph_scratch = 0;
+  std::size_t verify_round = 0;
+  std::size_t drafter_features = 0;
+  std::size_t drafter_scratch = 0;
+
+  ignis_model_reservations reservations() const {
+    const std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
+    const bool vision = media_embedding > 0;
+    ignis_model_reservations out{};
+    out.prefill_scratch_bytes = prefill_scratch;
+    out.vision_workspace_bytes = vision_workspace;
+    out.media_embedding_bytes = media_embedding;
+    // sampling_single_{configs, positions, out}, sampling_decode_{configs,
+    // positions, out, logits} and the workspace, as the load allocates them.
+    out.sampling_bytes = sizeof(ninfer::ops::SamplingConfig) + 2 * sizeof(int32_t) +
+                         sizeof(ninfer::ops::SamplingConfig) * lanes + 2 * sizeof(int32_t) * lanes +
+                         sampling_logits + sampling_workspace;
+    // decode_graph_{scratch, token_ids, slots}, and decode_rope_positions
+    // with vision.
+    out.decode_graph_bytes =
+        decode_graph_scratch + (vision ? 3 : 2) * sizeof(int32_t) * lanes;
+    out.verify_round_bytes = verify_round;
+    out.drafter_round_bytes =
+        drafter_scratch == 0 ? 0 : drafter_features + sizeof(std::int32_t) * lanes + drafter_scratch;
+    return out;
+  }
+
+  std::size_t sampling_logits = 0;
+};
+
+LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topology,
+                          uint32_t prefill_chunk_tokens, uint32_t max_context_tokens,
+                          const LoadOptions &options) {
+  const Geometry g = Geometry::from(topology);
+  LoadSizes sizes;
+
+  // P2-01 (GitHub #83): the scratch, sized for a `prefill_chunk_tokens`-wide
+  // chunk (see compute_program_scratch_bytes above).
+  sizes.prefill_scratch = compute_program_scratch_bytes(
+      model, topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
+      options.cache_dtype, /*batch=*/1);
+  if (options.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+    sizes.prefill_scratch +=
+        dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
+  }
+
+  // GitHub #177: the encoder workspace for the envelope's merged tokens
+  // (capped by the context) and one item's output transient.
+  if (options.vision_max_tokens > 0) {
+    const auto tokens =
+        static_cast<std::int32_t>(std::min(options.vision_max_tokens, max_context_tokens));
+    sizes.vision_workspace =
+        ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
+    sizes.media_embedding = vision_output_transient_bytes(g.hidden, tokens);
+  }
+
+  // P3-03 (GitHub #99): device sampling's workspace and its decode logits.
+  const auto vocab = static_cast<std::int32_t>(g.vocab);
+  sizes.sampling_logits =
+      static_cast<std::size_t>(vocab) * IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t);
+  sizes.sampling_workspace = std::max<std::size_t>(
+      ninfer::ops::sampling_workspace_capacity_bytes(vocab, 1, IGNIS_DECODE_MAX_BATCH), kArenaAlign);
+
+  // P3-05 (GitHub #102) / P5-04 (GitHub #153): the round scratch, one column
+  // per lane, or `k+1` with a draft window.
+  const bool windowed = options.draft_tokens > 0;
+  const auto round_columns = static_cast<std::int32_t>(windowed ? options.draft_tokens + 1 : 1);
+  sizes.decode_graph_scratch = compute_program_scratch_bytes(
+      model, topology, /*chunk=*/round_columns, max_context_tokens, options.cache_dtype,
+      /*batch=*/IGNIS_DECODE_MAX_BATCH, /*head_every_column=*/windowed);
+
+  if (windowed) {
+    sizes.verify_round = verify_round_bytes(topology, options.draft_tokens, options.vision_max_tokens > 0);
+  }
+
+  // P5-05 (GitHub #155): the drafter's round buffers.
+  if (options.speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
+    check_dflash2_round_workspace(model, g, max_context_tokens, options.draft_tokens);
+    const auto block = static_cast<std::size_t>(options.draft_tokens + 1);
+    sizes.drafter_features = kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) * block *
+                             IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t);
+    sizes.drafter_scratch =
+        dflash2_round_activation_bytes(topology, static_cast<std::int32_t>(options.draft_tokens)) +
+        kDflash2RoundWorkspaceBytes;
+  }
+  return sizes;
+}
+
+// GitHub #210: what a loaded model holds beside its weights, read off its own
+// buffers -- the other half of `LoadSizes::reservations`, which the caller
+// compares against its plan.
+ignis_model_reservations reserved_of(const ignis_model &model) {
+  const auto bytes = [](const std::unique_ptr<ninfer::DeviceBuffer> &buffer) -> uint64_t {
+    return buffer != nullptr ? buffer->bytes : 0;
+  };
+  const auto capacity = [](const std::unique_ptr<ninfer::DeviceArena> &arena) -> uint64_t {
+    return arena != nullptr ? arena->capacity() : 0;
+  };
+  ignis_model_reservations out{};
+  out.prefill_scratch_bytes = capacity(model.scratch);
+  out.vision_workspace_bytes = capacity(model.vision_workspace);
+  out.media_embedding_bytes = bytes(model.vision_output);
+  out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
+                       bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
+                       bytes(model.sampling_decode_positions) + bytes(model.sampling_decode_out) +
+                       bytes(model.sampling_decode_logits) + capacity(model.sampling_workspace);
+  out.decode_graph_bytes = capacity(model.decode_graph_scratch) + bytes(model.decode_graph_token_ids) +
+                           bytes(model.decode_graph_slots) + bytes(model.decode_rope_positions);
+  if (model.verify != nullptr) {
+    out.drafter_round_bytes = bytes(model.verify->features) + bytes(model.verify->append_counts) +
+                              capacity(model.verify->drafter_scratch);
+    out.verify_round_bytes = model.verify->device_bytes() - out.drafter_round_bytes;
+  }
+  return out;
+}
+
 } // namespace
+
+extern "C" int32_t ignis_model_plan_reservations(const struct ignis_bound_tensor *tensors,
+                                                 uint64_t count,
+                                                 const struct ignis_topology *topology,
+                                                 uint32_t prefill_chunk_tokens,
+                                                 uint32_t max_context_tokens, int32_t kv_format,
+                                                 const struct ignis_model_load_options *options,
+                                                 struct ignis_model_reservations *out) {
+  if (out != nullptr) {
+    *out = ignis_model_reservations{};
+  }
+  if (tensors == nullptr || topology == nullptr || out == nullptr) {
+    set_error("ignis_model_plan_reservations: null argument");
+    return -1;
+  }
+  LoadOptions load{};
+  const auto model = validate_and_bind(tensors, count, topology, prefill_chunk_tokens,
+                                       max_context_tokens, kv_format, options, load);
+  if (model == nullptr) {
+    return -1;
+  }
+  try {
+    *out = plan_load_sizes(*model, *topology, prefill_chunk_tokens, max_context_tokens, load)
+               .reservations();
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_model_plan_reservations: ") + e.what());
+    return -1;
+  }
+  return 0;
+}
 
 extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, uint64_t count,
                                      const struct ignis_topology *topology,
@@ -804,136 +1171,16 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     set_error("ignis_model_load: null argument");
     return -1;
   }
-  if (topology->num_layers > 0 && topology->layer_kinds == nullptr) {
-    set_error("ignis_model_load: topology.layer_kinds is null");
+  LoadOptions load{};
+  auto model = validate_and_bind(tensors, count, topology, prefill_chunk_tokens,
+                                 max_context_tokens, kv_format, options, load);
+  if (model == nullptr) {
     return -1;
   }
-  if (topology->gdn_num_layers == 0) {
-    set_error("ignis_model_load: topology.gdn_num_layers must be positive");
-    return -1;
-  }
-  if (topology->gdn_state_rows % topology->gdn_num_layers != 0) {
-    set_error("ignis_model_load: gdn_state_rows is not a multiple of gdn_num_layers");
-    return -1;
-  }
-  // P2-01 (GitHub #83): the prefill chunk width the caller will hand
-  // ignis_program_prefill, validated against the reference's own alignment
-  // rule (also the alignment the GDN chunked kernels' 64-token chunk
-  // divides evenly).
-  if (prefill_chunk_tokens == 0 || prefill_chunk_tokens % 128 != 0) {
-    set_error("ignis_model_load: prefill_chunk_tokens must be a nonzero multiple of 128");
-    return -1;
-  }
-  if (max_context_tokens == 0) {
-    set_error("ignis_model_load: max_context_tokens must be positive");
-    return -1;
-  }
-  // A chunk wider than the sequence pool's own context bound can never be
-  // prefilled anyway, and the GQA attention workspace query needs
-  // max_visible_keys >= the query width it is sized for.
-  if (prefill_chunk_tokens > max_context_tokens) {
-    set_error("ignis_model_load: prefill_chunk_tokens (" + std::to_string(prefill_chunk_tokens) +
-              ") must not exceed max_context_tokens (" + std::to_string(max_context_tokens) + ")");
-    return -1;
-  }
-  // P4-05 (GitHub #123): the format both scratch reservations below are
-  // sized for. Refused here rather than defaulted to BF16 -- an unrecognized
-  // value would otherwise reserve one format's arena and let the layers run
-  // the other's routes out of it.
-  if (kv_format != IGNIS_KV_FORMAT_BF16 && kv_format != IGNIS_KV_FORMAT_HQ_E8_2B) {
-    set_error("ignis_model_load: kv_format " + std::to_string(kv_format) +
-              " is not an ignis_kv_format");
-    return -1;
-  }
-  const ninfer::DType cache_dtype = ignis_kv_cache_dtype(kv_format);
-
-  // P5-02 (GitHub #150, ADR 0016): the load options, validated before any
-  // binding -- a NULL pointer is the production default, no speculation.
-  int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
-  uint32_t draft_tokens = 0;
-  uint32_t vision_max_tokens = 0;
-  if (options != nullptr) {
-    if (options->size != sizeof(struct ignis_model_load_options)) {
-      set_error("ignis_model_load: options.size " + std::to_string(options->size) +
-                " is not a recognized ignis_model_load_options size");
-      return -1;
-    }
-    speculative_backend = options->speculative_backend;
-    draft_tokens = options->draft_tokens;
-    vision_max_tokens = options->vision_max_tokens;
-  }
-  if (vision_max_tokens > IGNIS_VISION_MAX_TOKENS_LIMIT) {
-    set_error("ignis_model_load: vision_max_tokens " + std::to_string(vision_max_tokens) +
-              " exceeds " + std::to_string(IGNIS_VISION_MAX_TOKENS_LIMIT));
-    return -1;
-  }
-  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
-      speculative_backend != IGNIS_SPECULATIVE_DFLASH2 &&
-      speculative_backend != IGNIS_SPECULATIVE_VERIFY_ONLY) {
-    set_error("ignis_model_load: speculative_backend " + std::to_string(speculative_backend) +
-              " is not an ignis_speculative_backend");
-    return -1;
-  }
-  if (speculative_backend == IGNIS_SPECULATIVE_NONE && draft_tokens != 0) {
-    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
-              " needs a speculative_backend");
-    return -1;
-  }
-  // P5-04 (GitHub #153): VERIFY_ONLY takes the same window rule -- the
-  // verify graphs are captured at it, and the round is refused at any other.
-  if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
-      (draft_tokens < 1 || draft_tokens > IGNIS_DFLASH2_MAX_DRAFT_TOKENS)) {
-    set_error("ignis_model_load: draft_tokens " + std::to_string(draft_tokens) +
-              " must be in 1.." + std::to_string(IGNIS_DFLASH2_MAX_DRAFT_TOKENS));
-    return -1;
-  }
-  // GitHub #195: vision and a speculative backend are two independent load
-  // options. #178's fence stood until the verify round learned the sequence's
-  // `rope_delta` (`IgnisVerifyRound::rope_positions`, staged per round); the
-  // drafter's context append needed nothing, because it consumes the span's
-  // KV positions, which is what the reference's own prefill sink captures on
-  // a multimodal span too.
-
-  ModelBinder binder(tensors, count);
-  if (!binder.build_index(count)) {
-    return -1;
-  }
-
   const Geometry g = Geometry::from(*topology);
-  auto model = std::make_unique<ignis_model>();
-
-  if (!binder.bind("text/token_embedding", {g.vocab, g.hidden}, model->token_embedding) ||
-      !binder.bind("text/final_norm", {g.hidden}, model->final_norm) ||
-      !binder.bind("text/output_head", {g.vocab, g.hidden}, model->output_head)) {
-    return -1;
-  }
-
-  model->layers.resize(topology->num_layers);
-  for (uint32_t i = 0; i < topology->num_layers; ++i) {
-    const std::string prefix = "text/layers/" + std::to_string(i) + "/";
-    const auto kind = static_cast<ignis_layer_kind>(topology->layer_kinds[i]);
-    model->layers[i].kind = kind;
-    const bool ok = (kind == IGNIS_LAYER_GQA)
-                        ? bind_gqa_layer(binder, prefix, g, model->layers[i].gqa)
-                        : bind_gdn_layer(binder, prefix, g, model->layers[i].gdn);
-    if (!ok) {
-      return -1;
-    }
-  }
-
-  // Without the option the `dflash2/*` tensors are not asked for, so a caller
-  // that hands them over anyway fails on `require_no_extras` below.
-  if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2 && !bind_dflash2(binder, g, model->dflash2)) {
-    return -1;
-  }
-  // GitHub #177: likewise the `vision/*` tensors, only with an envelope.
-  if (vision_max_tokens > 0 && !bind_vision(binder, g, model->vision)) {
-    return -1;
-  }
-
-  if (!binder.require_no_extras()) {
-    return -1;
-  }
+  const int32_t speculative_backend = load.speculative_backend;
+  const uint32_t draft_tokens = load.draft_tokens;
+  const uint32_t vision_max_tokens = load.vision_max_tokens;
   model->speculative_backend = speculative_backend;
   model->draft_tokens = draft_tokens;
 
@@ -960,6 +1207,16 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // what `kernel/src/gqa_layer.cu` checks a sequence pool against.
   model->kv_format = kv_format;
 
+  // GitHub #210: every reservation below is sized here, once, by the same
+  // computation `ignis_model_plan_reservations` reports.
+  LoadSizes sizes;
+  try {
+    sizes = plan_load_sizes(*model, *topology, prefill_chunk_tokens, max_context_tokens, load);
+  } catch (const std::exception &e) {
+    set_error(std::string("ignis_model_load: reservation sizing failed: ") + e.what());
+    return -1;
+  }
+
   const cudaError_t stream_err = cudaStreamCreate(&model->stream);
   if (stream_err != cudaSuccess) {
     set_error(std::string("ignis_model_load: cudaStreamCreate failed: ") +
@@ -972,21 +1229,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // above) -- never at the first long prompt. A chunk whose reservation
   // does not fit the device's free memory fails the load right here, with
   // a message naming the shortfall.
-  std::size_t scratch_bytes = 0;
-  try {
-    scratch_bytes = compute_program_scratch_bytes(
-        *model, *topology, static_cast<std::int32_t>(prefill_chunk_tokens), max_context_tokens,
-        cache_dtype, /*batch=*/1);
-    if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
-      scratch_bytes += dflash2_prefill_scratch_bytes(
-          *topology, static_cast<std::int32_t>(prefill_chunk_tokens));
-    }
-  } catch (const std::exception &e) {
-    set_error(std::string("ignis_model_load: prefill scratch sizing failed: ") + e.what());
-    cudaStreamDestroy(model->stream);
-    model->stream = nullptr;
-    return -1;
-  }
+  const std::size_t scratch_bytes = sizes.prefill_scratch;
 
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
@@ -1019,9 +1262,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     model->vision_max_tokens = vision_max_tokens;
     try {
       const auto tokens = static_cast<std::int32_t>(std::min(vision_max_tokens, max_context_tokens));
-      const std::size_t workspace_bytes =
-          ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
-      const std::size_t output_bytes = vision_output_transient_bytes(g.hidden, tokens);
+      const std::size_t workspace_bytes = sizes.vision_workspace;
+      const std::size_t output_bytes = sizes.media_embedding;
       std::size_t vision_free = 0;
       std::size_t vision_total = 0;
       if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess &&
@@ -1046,7 +1288,6 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // model_internal.h's field comments for why these are separate from
   // `scratch` above.
   try {
-    const auto vocab = static_cast<std::int32_t>(g.vocab);
     model->sampling_single_configs =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(ninfer::ops::SamplingConfig));
     model->sampling_single_positions = std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t));
@@ -1063,12 +1304,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     }
     model->sampling_decode_out =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
-    model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(
-        static_cast<std::size_t>(vocab) * IGNIS_DECODE_MAX_BATCH * sizeof(std::uint16_t));
-    const std::size_t workspace_bytes = ninfer::ops::sampling_workspace_capacity_bytes(
-        vocab, 1, IGNIS_DECODE_MAX_BATCH);
-    model->sampling_workspace =
-        std::make_unique<ninfer::DeviceArena>(std::max<std::size_t>(workspace_bytes, kArenaAlign));
+    model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(sizes.sampling_logits);
+    model->sampling_workspace = std::make_unique<ninfer::DeviceArena>(sizes.sampling_workspace);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: sampling buffer allocation failed: ") + e.what());
     cudaStreamDestroy(model->stream);
@@ -1091,14 +1328,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   // column -- which bounds today's one-column round too, so both rounds
   // share it.
   try {
-    const bool windowed = draft_tokens > 0;
-    const auto round_columns = static_cast<std::int32_t>(windowed ? draft_tokens + 1 : 1);
-    const std::size_t decode_graph_scratch_bytes =
-        compute_program_scratch_bytes(*model, *topology, /*chunk=*/round_columns, max_context_tokens,
-                                      cache_dtype, /*batch=*/IGNIS_DECODE_MAX_BATCH,
-                                      /*head_every_column=*/windowed);
-    model->decode_graph_scratch =
-        std::make_unique<ninfer::DeviceArena>(decode_graph_scratch_bytes);
+    model->decode_graph_scratch = std::make_unique<ninfer::DeviceArena>(sizes.decode_graph_scratch);
     model->decode_graph_token_ids =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
     model->decode_graph_slots =
@@ -1124,29 +1354,14 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
 
   // P5-05 (GitHub #155): the drafter's round buffers (model_internal.h), on
-  // a load with the drafter only.
+  // a load with the drafter only. `plan_load_sizes` has already checked the
+  // vendored workspaces against their allowance.
   if (speculative_backend == IGNIS_SPECULATIVE_DFLASH2) {
     try {
-      const auto block = static_cast<std::int32_t>(draft_tokens + 1);
-      const std::size_t workspace_bytes =
-          ninfer::ops::swa_workspace_capacity_bytes({0, max_context_tokens}, 1, block,
-                                                    IGNIS_DECODE_MAX_BATCH) +
-          ninfer::ops::linear_swiglu_workspace_capacity_bytes(
-              model->dflash2.layers[0].mlp_gate_up.qtype, static_cast<std::int32_t>(2 * g.ffn_intermediate),
-              static_cast<std::int32_t>(g.hidden), ninfer::ops::LinearPolicy::A16Only, 1, 16);
-      if (workspace_bytes > kDflash2RoundWorkspaceBytes) {
-        throw std::runtime_error("the drafter's vendored workspaces need " +
-                                 std::to_string(workspace_bytes) + " bytes, past the " +
-                                 std::to_string(kDflash2RoundWorkspaceBytes) + "-byte allowance");
-      }
       const auto lanes = static_cast<std::size_t>(IGNIS_DECODE_MAX_BATCH);
-      model->verify->features = std::make_unique<ninfer::DeviceBuffer>(
-          kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) * block * lanes *
-          sizeof(std::uint16_t));
+      model->verify->features = std::make_unique<ninfer::DeviceBuffer>(sizes.drafter_features);
       model->verify->append_counts = std::make_unique<ninfer::DeviceBuffer>(lanes * sizeof(std::int32_t));
-      model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(
-          dflash2_round_activation_bytes(*topology, static_cast<std::int32_t>(draft_tokens)) +
-          kDflash2RoundWorkspaceBytes);
+      model->verify->drafter_scratch = std::make_unique<ninfer::DeviceArena>(sizes.drafter_scratch);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -1167,6 +1382,7 @@ extern "C" int32_t ignis_model_stats(const struct ignis_model *model,
   out_stats->vram_bytes = model->vram_bytes;
   out_stats->bound_tensor_count = model->bound_tensor_count;
   out_stats->vision_reserved_bytes = model->vision_reserved_bytes();
+  out_stats->reserved = reserved_of(*model);
   return 0;
 }
 

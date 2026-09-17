@@ -145,7 +145,6 @@ fn cuda_scheduler(
                 prefill_chunk = shape.prefill_chunk,
                 max_context = shape.max_context,
                 kv_format = shape.kv_format.as_str(),
-                kv_pool_bytes = shape.kv_pool_bytes,
                 speculation = %shape.speculation.map_or_else(
                     || "off".to_owned(),
                     |s| format!("{} draft_tokens={}", s.backend().as_str(), s.draft_tokens())
@@ -222,6 +221,7 @@ async fn main() {
         max_context,
         kv_format: _,
         kv_pool_bytes: _,
+        vram: _,
         host_pool_bytes: _,
         prompt_reuse: _,
         retained_pool_bytes: _,
