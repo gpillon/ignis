@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { assessHealth, deriveDashboard, type HealthInput, headerPulse } from "./derive.ts";
+import { assessHealth, deriveDashboard, deriveMemory, type HealthInput, headerPulse } from "./derive.ts";
 import type { Point } from "./history.ts";
-import { emptySnapshot, type Snapshot } from "./snapshot.ts";
+import { emptySnapshot, type Memory as MemorySeries, type Snapshot } from "./snapshot.ts";
 
 const at = (ms: number, over: Partial<Snapshot>): Point => ({ at: ms, snap: { ...emptySnapshot(), ...over }, scrapeMs: 1 });
 const h = (le1: number, inf: number) => ({ bounds: [1, 2, Infinity], cumulative: [le1, inf, inf], sum: inf, count: inf });
@@ -53,6 +53,106 @@ describe("deriveDashboard", () => {
 
     const done = [...decoding, at(15_000, { decodedTokens: 600, generatedTokens: 600, completed: 2 })];
     expect(deriveDashboard(done, 60_000)!.tokens.perRequest).toBe(300);
+  });
+});
+
+
+describe("deriveMemory", () => {
+  const memoryAt = (ms: number, over: Partial<MemorySeries>, retained?: Snapshot["retained"]): Point => {
+    const snap = emptySnapshot();
+    return { at: ms, snap: { ...snap, memory: { ...snap.memory, ...over }, retained: retained ?? snap.retained }, scrapeMs: 1 };
+  };
+
+  it("reads each live figure against the constant that bounds it", () => {
+    const points = [
+      memoryAt(0, { kvPoolUsedPages: 100, kvPoolPages: 400, kvRamArena: { capacity: 800, used: 0 }, retainedSlots: { capacity: 10, inUse: 1 } }),
+      memoryAt(60_000, { kvPoolUsedPages: 300, kvPoolPages: 400, kvRamArena: { capacity: 800, used: 200 }, retainedSlots: { capacity: 10, inUse: 7 } }),
+    ];
+    const m = deriveMemory(points, 0);
+    expect(m.pagesInUse).toMatchObject({ used: 300, capacity: 400, share: 0.75 });
+    expect(m.arenaInUse).toMatchObject({ used: 200, capacity: 800, share: 0.25 });
+    expect(m.slotsInUse).toMatchObject({ used: 7, capacity: 10, share: 0.7 });
+    expect(m.pagesInUse.series).toEqual([100, 300]);
+  });
+
+  it("sparks the window the pill asks for, not the whole history", () => {
+    const pages = (ms: number, used: number) => memoryAt(ms, { kvPoolUsedPages: used, kvPoolPages: 400 });
+    const points = [pages(0, 10), pages(30_000, 20), pages(60_000, 30)];
+    expect(deriveMemory(points, 30_000).pagesInUse.series).toEqual([20, 30]);
+    expect(deriveMemory(points, -Infinity).pagesInUse.series).toEqual([10, 20, 30]);
+  });
+
+  it("lays the plan out in plan order and leaves the rest of the budget to the KV pool", () => {
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 0])) as MemorySeries["reserved"];
+    Object.assign(reserved, { weights: 600, workspace: 300, residual: 100 });
+    const m = deriveMemory([memoryAt(0, { reserved, budgetBytes: 2000, kvPoolPages: 8, kvPageBytes: 100 })], 0);
+    expect(m.planned).toBe(true);
+    expect(m.lines.map((l) => l.line).slice(0, 3)).toEqual(["weights", "cuda_context", "workspace"]);
+    expect(m.linesBytes).toBe(1000);
+    expect(m.kvRoomBytes).toBe(1000);
+    expect(m.kvPool).toEqual({ pages: 8, pageBytes: 100, bytes: 800 });
+    expect(m.spareBytes).toBe(200);
+    expect(m.oversubscribed).toBe(false);
+  });
+
+  it("will not add a plan up unless the scrape carries all eleven lines", () => {
+    // A partial sum would understate the plan and overstate the room beside
+    // it; the server writes the eleven together or not at all.
+    const partial = { ...emptySnapshot().memory.reserved, weights: 600, workspace: 300 };
+    const m = deriveMemory([memoryAt(0, { reserved: partial, budgetBytes: 2000 })], 0);
+    expect(m.linesBytes).toBeNull();
+    expect(m.kvRoomBytes).toBeNull();
+    expect(m.planned).toBe(false);
+  });
+
+  it("reports an overrun rather than clamping it away", () => {
+    // --allow-vram-oversubscription: the plan is larger than the budget it
+    // was laid out in, and the panel has to be able to say so.
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
+    const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
+    expect(m.linesBytes).toBe(1100);
+    expect(m.kvRoomBytes).toBe(-200);
+    expect(m.spareBytes).toBe(-300);
+    expect(m.oversubscribed).toBe(true);
+  });
+
+  it("has no plan, and no share to compute, on a load that exported none", () => {
+    const m = deriveMemory([memoryAt(0, {})], 0);
+    expect(m.planned).toBe(false);
+    expect(m.budgetBytes).toBeNull();
+    expect(m.linesBytes).toBeNull();
+    expect(m.kvRoomBytes).toBeNull();
+    expect(m.kvPool.bytes).toBeNull();
+    expect([m.pagesInUse.share, m.arenaInUse.share, m.slotsInUse.share]).toEqual([null, null, null]);
+    expect(m.skips.total).toBeNull();
+    expect(m.retained.spills.kv_ram.checkpoint).toEqual({ total: null, window: null });
+    expect(deriveMemory([], 0).planned).toBe(false);
+  });
+
+  it("gives a capacity of zero no share, so nothing is drawn as full", () => {
+    // `--prompt-reuse off` without --retained-slots hands out no slots (#215).
+    const m = deriveMemory([memoryAt(0, { retainedSlots: { capacity: 0, inUse: 0 } })], 0);
+    expect(m.slotsInUse).toMatchObject({ used: 0, capacity: 0, share: null });
+  });
+
+  it("counts each retained family by tier and kind, and the skips beside the slots", () => {
+    const matrix = (device: [number, number], kvRam: [number, number]) => ({
+      device: { checkpoint: device[0], prefix: device[1] },
+      kv_ram: { checkpoint: kvRam[0], prefix: kvRam[1] },
+    });
+    const empty = emptySnapshot().retained;
+    const before = { ...empty, spills: matrix([0, 0], [2, 1]) };
+    const after = { ...empty, spills: matrix([0, 0], [6, 4]) };
+    const points = [
+      memoryAt(0, { slotSkips: { publish_skipped_no_slot: 1, capture_skipped_no_slot: 0, capture_skipped_no_page: 0 } }, before),
+      memoryAt(60_000, { slotSkips: { publish_skipped_no_slot: 9, capture_skipped_no_slot: 2, capture_skipped_no_page: 1 } }, after),
+    ];
+    const m = deriveMemory(points, 0);
+    expect(m.retained.spills.kv_ram.checkpoint).toEqual({ total: 6, window: 4 });
+    expect(m.retained.spills.kv_ram.prefix).toEqual({ total: 4, window: 3 });
+    expect(m.retained.spills.device.checkpoint).toEqual({ total: 0, window: 0 });
+    expect(m.skips).toMatchObject({ total: 12, window: 11 });
+    expect(m.skips.byReason.publish_skipped_no_slot).toEqual({ total: 9, window: 8 });
   });
 });
 
