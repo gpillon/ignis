@@ -1,8 +1,8 @@
-import { type ClipboardEvent, type KeyboardEvent, useRef } from "react";
+import { type ClipboardEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import type { ContextUsage } from "../metrics/context.ts";
 import { ContextMeter } from "../metrics/ContextMeter.tsx";
 import type { Attachment } from "../tools/local/attachments.ts";
-import { IconClose, IconImage, IconPaperclip } from "../ui/icons.tsx";
+import { IconClose, IconImage, IconPaperclip, IconPlus } from "../ui/icons.tsx";
 import { dataUriBytes, type PromptImage } from "./images.ts";
 
 /**
@@ -96,40 +96,36 @@ export function Composer(props: {
         </div>
       )}
       <div className="cut mx-auto flex w-full max-w-3xl items-end gap-2 bg-surface p-2 shadow-[inset_0_-2px_0_var(--line)] [--cut-size:14px] focus-within:shadow-[inset_0_-2px_0_var(--ember)]">
-        {props.canAttach && (
-          <>
-            <button
-              type="button"
-              aria-label="Attach files"
-              title="Attach text or PDF files for the model to read"
-              className="grid size-10 shrink-0 place-items-center text-ash hover:text-ink"
-              onClick={() => picker.current?.click()}
-            >
-              <IconPaperclip />
-            </button>
-            <input
-              ref={picker}
-              type="file"
-              name="attachments"
-              multiple
-              hidden
-              onChange={(e) => {
-                const files = Array.from(e.target.files ?? []);
-                e.target.value = "";
-                if (files.length > 0) props.onAttach(files);
-              }}
+        <AddMenu>
+          {props.canAttach && (
+            <AddMenuItem
+              icon={<IconPaperclip />}
+              label="File"
+              hint="Text or PDF, for the model to read"
+              onChoose={() => picker.current?.click()}
             />
-          </>
+          )}
+          <AddMenuItem
+            icon={<IconImage />}
+            label="Image"
+            hint="Sent with this prompt; needs a vision load"
+            onChoose={() => imagePicker.current?.click()}
+          />
+        </AddMenu>
+        {props.canAttach && (
+          <input
+            ref={picker}
+            type="file"
+            name="attachments"
+            multiple
+            hidden
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              e.target.value = "";
+              if (files.length > 0) props.onAttach(files);
+            }}
+          />
         )}
-        <button
-          type="button"
-          aria-label="Add images"
-          title="Send images with this prompt (needs a vision model)"
-          className="grid size-10 shrink-0 place-items-center text-ash hover:text-ink"
-          onClick={() => imagePicker.current?.click()}
-        >
-          <IconImage />
-        </button>
         <input
           ref={imagePicker}
           type="file"
@@ -182,5 +178,87 @@ export function Composer(props: {
         <ContextMeter usage={props.usage} />
       </div>
     </div>
+  );
+}
+
+/**
+ * The `+` beside the prompt and what it offers: one button for everything a
+ * prompt can be given, rather than an icon per kind growing along the box.
+ * It opens upwards — the composer sits at the foot of the page — and closes
+ * on a choice, on Escape, or on a click anywhere else.
+ */
+function AddMenu({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={root} className="relative shrink-0">
+      <button
+        type="button"
+        aria-label="Add to this prompt"
+        title="Add a file or an image"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`grid size-10 place-items-center hover:text-ink [&>svg]:size-[18px] ${open ? "text-ink" : "text-ash"}`}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <IconPlus />
+      </button>
+      {open && (
+        // The click that chose an item is what closes the menu, so the choice
+        // is handled on the way out and never lands on a dismissed menu.
+        <div
+          role="menu"
+          className="cut absolute bottom-full left-0 z-20 mb-2 flex w-56 flex-col bg-surface py-1 shadow-[0_8px_24px_rgba(28,32,38,0.28)] [--cut-size:10px]"
+          onClick={() => setOpen(false)}
+        >
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One thing the `+` can add: what it is, and a line on what happens to it. */
+function AddMenuItem({
+  icon,
+  label,
+  hint,
+  onChoose,
+}: {
+  icon: ReactNode;
+  label: string;
+  hint: string;
+  onChoose: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      className="flex w-full items-start gap-2.5 px-3 py-2 text-left text-ash hover:bg-line hover:text-ink"
+      onClick={onChoose}
+    >
+      <span className="mt-0.5 shrink-0">{icon}</span>
+      <span className="min-w-0">
+        <span className="block font-display text-sm font-semibold text-ink">{label}</span>
+        <span className="block text-xs leading-snug">{hint}</span>
+      </span>
+    </button>
   );
 }
