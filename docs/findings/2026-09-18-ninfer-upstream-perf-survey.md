@@ -1,16 +1,19 @@
-# What upstream ninfer's last month of perf work offers ignis: six portable candidates, a fork-rebase bill, and a v3 migration that gates none of it
+# What upstream ninfer's last month of perf work offers ignis: six prefill candidates with low-single-digit ceilings, and one KV-format axis worth more than all of them
 
 - Kind: research
 - Status: current
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
-- Scope: kernel / vendored subtree currency, NVFP4 linear and SwiGLU routes, GDN convolution output, GQA attention routes, artifact container v2/v3, build time
+- Scope: kernel / vendored subtree currency, NVFP4 linear and SwiGLU routes, GDN convolution output, KV formats, artifact container v2/v3, build time
 - Related: [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [Prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md),
   [Prompt-reuse tax on short TTFT](2026-09-18-prompt-reuse-tax-on-short-ttft.md),
   [Vision TTFT live/live](2026-09-16-vision-ttft-live-live.md),
+  [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md),
+  [hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md),
+  [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md),
   [GQA workspace memset](2026-09-18-gqa-workspace-memset.md),
   [hq prompt workspace under-report](2026-09-12-hq-prompt-workspace-under-report.md)
 - Superseded by: none
@@ -102,11 +105,33 @@ return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 ```
 
 ignis's serving chunk is exactly 1024, so **full chunks take the fused route
-and nothing else does**: every prompt shorter than 1024, every chunk tail, and
+and nothing else does**: every prompt shorter than 1024, every chunk tail,
 every extra traversal boundary that prompt reuse creates
-([prompt-reuse TTFT tax](2026-09-18-prompt-reuse-tax-on-short-ttft.md))
-materializes a 34816 x T BF16 tensor in the arena and reads it back, once per
-layer. At T = 768 that is ~53 MB written and ~53 MB read per layer.
+([prompt-reuse TTFT tax](2026-09-18-prompt-reuse-tax-on-short-ttft.md)) — and
+every chunk *wider* than 1024 — materializes a 34816 x T BF16 tensor in the
+arena and reads it back, once per layer, on all 64 layers (both `gqa_layer.cu`
+and `gdn_layer.cu` call `linear_swiglu` with `mlp_gate_up`).
+
+**Bound the prize before spending a ticket on it.** The extra traffic is
+`64 layers x 4 x 34816 x T` bytes: 9.1 GB at T = 1024, 6.8 GB at T = 768. At
+this card's ~1.79 TB/s that is ~5.1 ms and ~3.8 ms, against a measured 99.7 ms
+for a 1024-token chunk
+([prefill chunk wall time](2026-09-11-prefill-chunk-wall-time.md)). So the
+**ceiling is ~5% of prefill**, and only if none of it overlaps.
+
+**And our own chunk-width sweep argues it down further.** In that finding's
+Measurement 1, only width **1024** takes `TmaFusedW4A4`; 256, 512, 2048, 4096
+and 8192 all take `LinearW4A4Post`. The per-token costs are 0.1607, 0.1150,
+**0.0974**, 0.0947, 0.0936, 0.0965 ms — a smooth decline with a plateau and
+**no dip at 1024**. If the fused route were worth anything near its ceiling,
+1024 would sit below the 512 → 2048 trend. It does not. Either the fused route
+is worth little on this card, or the width effect masks it; the sweep cannot
+separate those, and neither can this survey.
+
+The 65% per-token penalty at width 256 is real, but it is not this: 256 and
+2048 are on the *same* route. The prefill-chunk finding already attributed it
+to GEMM fill and launch amortization, which points at candidate 4's
+narrow-width MMA ladder, not at the SwiGLU registration.
 
 `1c8f8acc perf(ops): fuse nvfp4 swiglu through t96` (2026-09-05) raises the
 `FusedW4A4` ceiling from 48 to 96 on the same resolver and belongs with it.
@@ -146,6 +171,16 @@ exactly. And ignis still does the thing this removes, in both paths:
 and [anatomy](2026-09-18-decode-round-anatomy.md) established that
 `cudaGraphLaunch`'s host duration is linear in node count.
 
+**On decode the prize is already bounded, and it is small.** The anatomy
+finding measures every memcpy node in the round at 0.08 ms of 15.81 ms device
+time and 0.32 µs of submission each, and states outright that removing **every**
+memcpy node — "the residual ping-pong copies and the GDN QKV splits both" — is
+worth about **0.5%**. So candidate 2's decode value is ≤0.5%, and its case has
+to be made on prefill, where the copies scale with T: `2 x 10240 x T x 2` bytes
+per GDN layer over 48 layers is 2.0 GB at T = 1024, ~1.1 ms of a 99.7 ms chunk,
+**~1%** — plus whatever the conv kernel itself gains, which upstream measured
+at 1.5x–3.5x on T = 1..72 but did not publish for chunk widths.
+
 All six of the commit's kernel-surface files are vendored by ignis
 (`include/ninfer/ops/causal_conv1d_silu.h`, `src/ops/kernel/causal_conv1d.cuh`,
 `src/ops/launcher/causal_conv1d.{cu,h}`,
@@ -168,6 +203,12 @@ the grid.
 
 `kernel/vendor/src/ops/kernel/rmsnorm.cuh` contains no `prefetch` — ignis does
 not have it. RMSNorm runs twice per layer over 64 layers, in both phases.
+
+**Ceiling on decode:** the anatomy finding puts `rmsnorm_cta_bf16x2_kernel` at
+0.43 ms and `rmsnorm_warp_bf16x2_kernel` at 0.09 ms, so all RMSNorm is 0.52 ms
+of a 15.81 ms round — **3.3%**. The change removes one of the kernel's two
+memory trips, not the kernel, so its decode ceiling is a fraction of that 3.3%.
+Its prefill share is unmeasured.
 
 ### Candidate 4 — the 34816x5120 W4A4 TMA route
 
@@ -260,6 +301,49 @@ its fixed chunk of 6 is why the rule exists there. The upstream rule would only
 change behaviour under a **BF16 KV cache**, where width 7–8 still falls through
 to `Prompt`.
 
+### The axis this survey did not cover: KV formats, where the measured number is
+
+Everything above is kernel tuning, and
+[anatomy](2026-09-18-decode-round-anatomy.md) has already established that
+decode has nowhere to go — `nvfp4_w4a4_mma_kernel` measures 9.37 ms against a
+9.4 ms bandwidth bound, and total idle is 4.8%. So every candidate here is a
+prefill candidate with a low-single-digit ceiling.
+
+The one large number ignis has measured on decode is the **KV format**:
+[hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md) puts hq-e8-2b at
+**+14.5% of ITL p95** on ignis and +14.3% on the reference — the format's cost,
+paid for the 7.11x capacity that
+[hq-e8-2b KV capacity](2026-09-11-hq-e8-2b-kv-capacity.md) measures (9,216
+bytes per sequence-token against BF16's 65,536).
+
+ignis offers exactly two: `KvPlaneDtype` is `Bf16 | U8`
+(`crates/core/src/kv_format.rs:37`). Upstream spent the same month adding
+formats between those two poles, none of which ignis has:
+
+| upstream | what it adds |
+|---|---|
+| `21a0e85f feat(kv-cache): use fp16 V storage and PV compute` | half-precision V plane and PV accumulation |
+| `4ac73c47 feat(kv-cache): add nvfp4 and k8v4 modes` | NVFP4 KV, and an 8-bit-K / 4-bit-V split |
+| `6183c9be feat(attention): add fp8 kv cache support` | FP8 KV plane |
+| `17a7275f feat(attention): add int8 kv hadamard rotation` | a rotation that makes INT8 KV hold its accuracy |
+
+A format that keeps most of hq's capacity while recovering part of that 14.5%
+would be worth more on decode than all six kernel candidates together, whose
+ceilings sum to low single digits of **prefill**. This survey did not assess
+them: they land in `src/ops/softmax_attention/` and the `gqa_attention_*`
+kernel family, ignis's route selection for the cache dtype is its own
+(`kernel/src/gqa_layer.cu`, `kernel/include/ignis_gqa_workspace.h`), and each
+format is a numerics question — a route-agreement campaign like
+[hq attention route agreement](2026-09-12-hq-attention-route-agreement.md) —
+not a transposition.
+
+Two other attention items were checked and set aside: `9f61a0ca`/`47f9d121`
+(2048 sliding-window attention and its tuning) do not apply, because ignis's
+GQA layers run full attention with no window; and `a7818988 perf(ops): qualify
+variable-width causal cache attention` lives entirely in upstream's renamed
+`src/ops/softmax_attention/` tree, so it is a successor to ignis's vendored
+`gqa_attention` family rather than a patch to it.
+
 ### The v3 artifact migration is a separate axis, not a gate on any of this
 
 Upstream migrated to **v3 artifacts** across `168fdd81` (converter),
@@ -341,32 +425,56 @@ the RMSNorm weight prefetch, lacks the W4A4 weight-code L2 promotion and the
 256-token TMA floor — and already has qk_norm_rope, DFlash2, HyperQuant and the
 dtype-dependent small-T chunk.
 
-**Inferred.** Six candidates are worth an experiment, in this order:
+**Inferred.** The six kernel candidates are all **prefill** candidates with
+low-single-digit ceilings, and none of them moves decode: the decode round is
+at its bandwidth bound (backbone 9.37 ms against a 9.4 ms bound, 4.8% total
+idle), so there is nothing there for a kernel change to take. Ranked by what
+each can be worth against what it costs to try:
 
-1. **Fused SwiGLU registered for every multiple of 256** (`00369f63`, with
-   `1c8f8acc` behind it). Largest hypothesised effect and the clearest
-   mechanism: at any width that is not exactly 1024, ignis pays a 34816 x T
-   BF16 write and read-back per layer that the fused route does not. That is
-   the short-prompt and tail-chunk regime, which is where
-   [Vision TTFT live/live](2026-09-16-vision-ttft-live-live.md) records a 1.85x
-   short-prompt text gap against the reference. Same regime is a reason to
-   measure, not evidence of cause — the reference build carries the same
-   resolver.
-2. **GDN conv split output** (`92bb06eb`). Exact geometry match, six vendored
-   files, **zero conflict** with the fork, upstream's own 1.5x–3.5x on
-   T = 1..72, removes a workspace plane, and removes 144 memcpy nodes per
-   decode round on a graph whose launch cost is linear in node count.
-3. **RMSNorm weight prefetch** (`9954867a`). Smallest diff, bitwise identical
-   output by upstream's claim, 128 launches per token. Cheapest to falsify.
-4. **34816x5120 W4A4 TMA: L2 promotion, Stages 2 → 3, floor 1024 → 256**
-   (`abbeea0a`). Three separable changes; test the schedule change first, since
-   the floor only moves widths 256/512/768.
-5. **Build-time TU split** (`ba5cafef`). Orthogonal to all of the above and
-   costs nothing to take.
-6. **Tiled activation-scale plane** (`1d8587bc`). The largest and the only one
-   with a silent-wrong-numbers failure mode, since the layout and the route
-   must agree. Only after 1–4, and only with the route/layout pairing carried
-   over as one object the way upstream did it.
+1. **Build-time TU split** (`ba5cafef`). Zero numerics, zero route change, and
+   it pays back in the dev loop rather than in the product. Take it first
+   precisely because nothing has to be proved about it.
+2. **34816x5120 W4A4 TMA: L2 promotion, Stages 2 -> 3, floor 1024 -> 256**
+   (`abbeea0a`). Three separable changes on the kernel that is 59% of decode
+   device time and the bulk of prefill. Unlike the others its ceiling is not
+   bounded by an existing measurement, because it is not a byte-count
+   argument — it changes how the same bytes are fetched and staged. The
+   narrow-width MMA ladder is also the only candidate aimed at the one large
+   prefill number ignis has: **+65% per token at width 256** against the
+   plateau.
+3. **RMSNorm weight prefetch** (`9954867a`). Ceiling on decode is a fraction of
+   RMSNorm's 3.3% share; prefill share unmeasured. Smallest diff of the six and
+   bitwise identical by upstream's claim, so it is the cheapest to falsify.
+4. **GDN conv split output** (`92bb06eb`). Decode value is capped at 0.5% by the
+   anatomy finding's own accounting of every memcpy node; prefill ~1% of bytes
+   plus an unquantified conv-kernel gain. Its real attraction is hygiene: exact
+   geometry match, six vendored files, zero conflict with the fork, and it
+   deletes a workspace plane.
+5. **Fused SwiGLU registered for every multiple of 256** (`00369f63`, with
+   `1c8f8acc`). Ceiling ~5% of prefill by arithmetic, and **our own chunk-width
+   sweep shows no step at 1024**, the only width that takes the fused route.
+   Demoted from first place on that evidence. Do the 1023/1024/1025 probe below
+   before opening a ticket.
+6. **Tiled activation-scale plane** (`1d8587bc`). The largest diff and the only
+   one with a silent-wrong-numbers failure mode, since the layout and the route
+   must agree. Last, and only with the route/layout pairing carried over as one
+   object the way upstream did it.
+
+**Inferred.** Six is what could be tied to a route ignis launches, not an audit
+of upstream's month. About 20 of the 86 vendored-file-touching commits were
+read and about 10 diffs opened; the rest were classified by message and file
+list or not reached. The `2026-09-06` DFlash2 op batch in particular — roughly
+thirty `perf(ops)` commits qualifying and tuning variable-width draft and
+target kernels — was set aside as DFlash2-shaped without checking which of
+those kernels ignis's own verify round launches.
+
+**Inferred.** The largest measured number on the table is not in this survey.
+Decode is at its bound and hq-e8-2b costs **14.5% of ITL p95** against BF16.
+That is a **format** question, and upstream spent the same month adding four KV
+formats between ignis's two. Ranked against that, the six kernel candidates are
+prefill hygiene. If the goal is a number a user would notice, the KV-format
+axis is where to look first — at the cost of a numerics campaign rather than a
+transposition.
 
 **Inferred.** A pin bump is the wrong instrument here, and v3 is not the reason
 why: 95 fork-only files and 78 two-sided ones mean the fork would have to
@@ -421,7 +529,18 @@ its own schedule — an ADR, not a prerequisite.
   `a00648cb`. If the fork has moved since, the conflict surface is stale.
 - Candidate 1's link to the 1.85x short-prompt gap is a regime coincidence, not
   an attribution: the reference engine in that measurement is built from the
-  same pin and carries the same `tokens == kPrimaryT` resolver.
+  same pin and carries the same `tokens == kPrimaryT` resolver. And the
+  chunk-width sweep it is read against was not designed as a route A/B — width
+  and route move together in it, so "no dip at 1024" bounds the fused route's
+  value without isolating it.
+- The ceilings quoted for candidates 1 and 2 assume the extra traffic is
+  serialized against the useful traffic at the card's peak bandwidth. Prefill
+  at width 1024 is not bandwidth-bound (99.7 ms for a backbone that streams in
+  ~9 ms), so real overlap will make both smaller, not larger.
+- Coverage: about 20 of the 86 vendored-file-touching commits had their message
+  read and about 10 their diff. The `2026-09-06` DFlash2 `perf(ops)` batch was
+  classified by title alone; ignis runs a DFlash2 drafter and a width-8 verify
+  round, so some of it may apply.
 - Candidate 4's floor change reaches only widths 256/512/768; the L2-promotion
   and Stages changes were read in the diff but their effect on this card is
   unknown, and upstream published no number for them.
@@ -444,12 +563,23 @@ its own schedule — an ADR, not a prerequisite.
 
 ## Follow-ups
 
-- One ticket per candidate, each an A/B on an exclusive card with the
+- **Run the 1023 / 1024 / 1025 probe before any SwiGLU ticket.** Three spans of
+  near-identical token work where only the middle one takes `TmaFusedW4A4`;
+  everything else is held constant, so the route flip is the only variable.
+  It needs no code change — `IGNIS_DECOMP_WIDTHS` on the existing
+  `crates/core/tests/chunk_decomposition_gpu.rs` harness — and it settles
+  whether candidate 1 is worth opening at all, which the chunk-width sweep
+  cannot because width and route move together there.
+- One ticket per remaining candidate, each an A/B on an exclusive card with the
   per-layer method from
   [GQA workspace memset](2026-09-18-gqa-workspace-memset.md) — an in-run
-  control beside the changed layer, since a whole-request delta at this size
-  will not resolve. Candidate 2's control is the GQA layers; candidate 1's is a
-  1024-token chunk against a 768-token one.
+  control beside the changed layer, since a whole-request delta at these
+  ceilings will not resolve. Candidate 4's control is the GDN layers (it
+  changes only the NVFP4 linear route); candidate 2's is the GQA layers.
+- **Scope the KV-format axis**, which this survey did not: which of upstream's
+  four new formats fits ignis's 24/4/256 geometry and paged pool, what each
+  costs per sequence-token against hq's 9,216 bytes, and what route-agreement
+  campaign each would need. That is where the measured 14.5% lives.
 - An audit of the remaining vendored route resolvers for widths ignis serves
   but no route registers, which is what candidates 1 and 2 both turned out to
   be.
