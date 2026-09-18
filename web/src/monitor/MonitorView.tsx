@@ -6,6 +6,9 @@ import {
   type Counter,
   type Dashboard,
   deriveDashboard,
+  EVICTION_TIERS,
+  type EvictionTierName,
+  type Evictions,
   type HealthLevel,
   type Latency,
   type Memory,
@@ -259,16 +262,7 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
           />
           <TimeChart label="Prefix tokens reused per second" {...chart} area height={120} format={formatNumber} series={[{ key: "prefix", label: "Reused tok/s", color: "var(--series-3)", values: dash.prefix.perSecSeries }]} />
         </Card>
-        <Card title="KV evictions" subtitle="Requests moved out to the host RAM tier">
-          <Figures
-            items={[
-              [`Last ${win}`, formatCount(dash.evictions.window)],
-              ["Per minute", formatNumber(dash.evictions.perMin)],
-              ["Since start", formatCount(dash.evictions.total)],
-            ]}
-          />
-          <TimeChart label="KV evictions per minute" {...chart} area height={120} format={formatNumber} series={[{ key: "evictions", label: "Evictions/min", color: "var(--series-4)", values: dash.evictions.perMinSeries }]} />
-        </Card>
+        <EvictionsCard evictions={dash.evictions} chart={chart} win={win} />
         <ScraperCard dash={dash} state={state} />
       </div>
 
@@ -468,6 +462,79 @@ function ReasonBars({ byReason }: { byReason: Dashboard["rejected"]["byReason"] 
         );
       })}
     </ul>
+  );
+}
+
+/** What each residency tier is called on screen, and what leaving it costs (GitHub #224). */
+const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string }> = {
+  vram: { name: "VRAM", note: "work survives in host RAM" },
+  ram: { name: "RAM", note: "work is lost, the request re-prefills" },
+  disk: { name: "Disk", note: "not implemented" },
+};
+
+/**
+ * What each tier gave up over the window (GitHub #224). One row per tier, one
+ * column per kind of departure - a live sequence, retained state dropped, and
+ * state demoted a tier down - because those three cost different things and a
+ * single "evictions" figure could not say which one happened.
+ *
+ * The chart carries only the `live` column: it is the one that costs a request
+ * its prefill, and the only one worth watching move.
+ */
+function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart: ChartFrame; win: string }) {
+  const series = [
+    { key: "vram", label: "VRAM/min", color: "var(--series-4)", values: evictions.vram.live?.perMinSeries ?? [] },
+    { key: "ram", label: "RAM/min", color: "var(--series-1)", values: evictions.ram.live?.perMinSeries ?? [] },
+  ];
+  return (
+    <Card title="Evictions" subtitle={`Departures from each tier in the last ${win}`}>
+      <table className="w-full text-xs">
+        <thead className="text-ash">
+          <tr>
+            <th className="pb-1 text-left font-normal">Tier</th>
+            <th className="pb-1 text-right font-normal">Live</th>
+            <th className="pb-1 text-right font-normal" title="Cached state that left the tier - under pressure, or superseded by a newer turn">
+              Retained
+            </th>
+            <th className="pb-1 text-right font-normal">Demoted</th>
+          </tr>
+        </thead>
+        <tbody>
+          {EVICTION_TIERS.map((tier) => {
+            const row = evictions[tier];
+            const label = EVICTION_TIER_LABEL[tier];
+            return (
+              <tr key={tier} className={row.implemented ? undefined : "text-ash/50"}>
+                <th scope="row" className="py-1 text-left font-display text-[13px] font-semibold">
+                  {label.name}
+                  <span className="ml-1.5 font-sans text-[10px] font-normal text-ash">{label.note}</span>
+                </th>
+                <EvictionCell counter={row.live} emphasis={tier === "ram"} />
+                <EvictionCell counter={row.retained} />
+                <EvictionCell counter={row.demoted} />
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <TimeChart label="Live evictions per minute, by tier" {...chart} area height={120} format={formatNumber} series={series} />
+    </Card>
+  );
+}
+
+/**
+ * One tier/column cell: the window's gain, with the lifetime total under it.
+ * An em dash where the tier has no such departure to report at all - never a
+ * zero, which would read as "it did not happen" rather than "it cannot".
+ */
+function EvictionCell({ counter, emphasis }: { counter: Counter | null; emphasis?: boolean }) {
+  if (!counter) return <td className="py-1 text-right text-ash/50">&mdash;</td>;
+  const hot = emphasis && (counter.window ?? 0) > 0;
+  return (
+    <td className="py-1 text-right tabular-nums">
+      <span className={`font-display text-[15px] font-semibold ${hot ? "text-[var(--series-1)]" : ""}`}>{formatCount(counter.window)}</span>
+      <span className="ml-1 text-[10px] text-ash">/ {formatCount(counter.total)}</span>
+    </td>
   );
 }
 

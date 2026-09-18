@@ -1913,6 +1913,13 @@ impl ConcreteScheduler {
                 }
                 Some(KvRamVictim::Live(discarded)) => {
                     self.compute.discard_snapshot(discarded.request);
+                    // GitHub #224: the tier's own eviction, emitted before
+                    // the requeue it causes — the snapshot left KV-RAM
+                    // whether or not the request is still around to be put
+                    // back on the queue.
+                    events.push(SchedEvent::SnapshotDropped {
+                        request: discarded.request,
+                    });
                     if let Some(idx) = self.requests.iter().position(|r| r.id == discarded.request) {
                         self.requeue_request(idx, events);
                     }
@@ -3477,6 +3484,50 @@ mod tests {
             compute.host_arena_used(),
             "the ledger and the arena agree after every step"
         );
+    }
+
+    /// GitHub #224 — every live snapshot the tier gives up raises its own
+    /// `SnapshotDropped`, one per victim. `Requeued` is absent here because
+    /// these blobs have no request behind them in this fixture, which is the
+    /// point: the tier evicted whether or not anyone was left to re-queue,
+    /// so the two facts cannot be the same fact.
+    #[test]
+    fn every_live_snapshot_the_tier_gives_up_raises_its_own_drop() {
+        let (mut sched, _compute) = three_blobs();
+        let mut events = Vec::new();
+
+        assert!(sched.make_host_room_for_bytes(2, &mut events));
+
+        let dropped: Vec<RequestId> = events
+            .iter()
+            .filter_map(|e| match e {
+                SchedEvent::SnapshotDropped { request } => Some(*request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped.len(),
+            2,
+            "the two blobs the tier gave up each raised a drop: {events:?}"
+        );
+        assert_eq!(sched.host.entry_count(), 1, "and only those two left");
+    }
+
+    /// The refusal path gives up *everything* and still says no — and still
+    /// reports every departure, so a tier that emptied itself for nothing is
+    /// visible rather than silent (GitHub #224).
+    #[test]
+    fn a_refused_blob_still_reports_what_the_tier_gave_up_trying() {
+        let (mut sched, _compute) = three_blobs();
+        let mut events = Vec::new();
+
+        assert!(!sched.make_host_room_for_bytes(5, &mut events));
+
+        let drops = events
+            .iter()
+            .filter(|e| matches!(e, SchedEvent::SnapshotDropped { .. }))
+            .count();
+        assert_eq!(drops, 3, "all three blobs left the tier: {events:?}");
     }
 
     #[test]

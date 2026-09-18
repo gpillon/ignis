@@ -29,6 +29,9 @@ ignis_decoded_tokens_total 12400
 # HELP ignis_kv_cache_evictions_total Cumulative host-tier evictions.
 # TYPE ignis_kv_cache_evictions_total counter
 ignis_kv_cache_evictions_total 4
+# HELP ignis_kv_ram_evictions_total Live host-tier snapshots dropped from KV-RAM to make room; the request re-prefills from the start.
+# TYPE ignis_kv_ram_evictions_total counter
+ignis_kv_ram_evictions_total 2
 # HELP ignis_prefix_reused_tokens_total Cumulative tokens skipped through sibling-prefix reuse.
 # TYPE ignis_prefix_reused_tokens_total counter
 ignis_prefix_reused_tokens_total 8192

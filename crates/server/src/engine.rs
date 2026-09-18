@@ -384,6 +384,7 @@ fn event_request(event: &SchedEvent) -> Option<RequestId> {
         | SchedEvent::Evicted { request, .. }
         | SchedEvent::Restored { request, .. }
         | SchedEvent::Requeued { request }
+        | SchedEvent::SnapshotDropped { request }
         | SchedEvent::PrefixReused { request, .. }
         | SchedEvent::StateReused { request, .. }
         | SchedEvent::PrefillChunk { request, .. }
@@ -425,6 +426,7 @@ async fn telemetry_task(
                     ..
                 } => telemetry.on_restored(request, restore_micros),
                 SchedEvent::Requeued { request } => telemetry.on_requeued(request),
+                SchedEvent::SnapshotDropped { request } => telemetry.on_snapshot_dropped(request),
                 SchedEvent::Done {
                     request,
                     tokens,
