@@ -57,9 +57,17 @@ Read against the vendored sources, nothing hq reads is left unwritten:
 
 `kernel/tests/test_hq_route_agreement.cu` now runs every hq shape the engine
 dispatches twice — over a zeroed workspace and over one filled with 0x7F — and
-requires the two outputs to be **bit-identical**. All 17 arms (prefill W=200,
-prefill W=9..16, decode B=1..8 at the decode graph's own wide envelope) report
-`0 of N elements differ`.
+requires the two outputs to be **bit-identical**. All 25 arms report `0 of N
+elements differ`: prefill W=200, prefill W=9..16, decode W=1 B=1..8 at the
+decode graph's own wide envelope, and verify W=8 B=1..8 in the masked form the
+shipped `--spec dflash2` default actually decodes in, each lane declaring its
+own valid prefix.
+
+End to end, four server runs — two per binary — on a 1,837-token prompt at
+`temperature 0`, `max_tokens 256`, produced **byte-identical** completions
+(`sha256 0ed25a9a08b5c2a0…`, reasoning channel included). That is 256 greedy
+tokens through the decode graph and its verify rounds, which the A/B legs
+below never exercised: they ask for one token.
 
 ### The A/B
 
@@ -83,9 +91,13 @@ untouched by the change and act as an in-run control:
 | 4 | −190.9 ms (−2.12%) | −22.2 ms (−0.52%) |
 | 5 | −507.7 ms (−5.65%) | +162.2 ms (+3.83%) — discarded |
 
-Discard rule fixed before reading the GQA column: a pair whose control moved
-more than 1% is a disturbed run. Both discarded pairs have the GQA number
-moving *with* their control, which is what a disturbed run looks like.
+Discard rule: a pair whose control moved more than 1% is a disturbed run. To
+be exact about when that threshold was chosen — pairs 1-3 were run and read
+first, the 1% threshold was written into the aggregation after seeing pair 3's
+−5.58% control, and pairs 4-5 were then run against it. So pair 3 fell to the
+rule retroactively and pair 5 prospectively. Both discarded pairs have the GQA
+number moving *with* their control, which is what a disturbed run looks like,
+and the three surviving pairs agree to within 20 ms of each other.
 
 Over the three usable pairs: **GQA layer device time −190.9 ms median, −2.12%**,
 against 8.6-9.0 s of GQA layer time and ~12.9 s of total layer time. The
@@ -128,8 +140,8 @@ a 2% effect from five pairs, three of which survived the control.
 - The cost scales with the frontier, so it was largest exactly where prefill
   already hurts: at a 70K frontier the zeroing was 288 MB per GQA layer per
   chunk, against 4 MB at the first chunk of a 1K prompt.
-- On the decode round it was zeroing bytes `write_neutral()` zeroes again a
-  moment later — the same region written twice per layer per token.
+- On the decode round it was clearing slots `write_neutral()` neutralizes again
+  a moment later — the same region written twice per layer per round.
 - `ignis_gqa_workspace_needs_zeroing` enumerates the format that *may* skip the
   zeroing rather than the formats that need it, so a KV format added later
   keeps the zeroing until someone reads its kernels.
@@ -139,7 +151,9 @@ a 2% effect from five pairs, three of which survived the control.
 - Measured at one prompt length (70,368 tokens) on one artifact. The *relative*
   saving grows with the frontier and is negligible for short prompts.
 - The decode-side saving (~17 MB × batch per round) was not separately
-  measured; it is below this method's resolution.
+  measured; it is below this method's resolution. The decode path's evidence
+  here is correctness only — 25 green test arms and byte-identical 256-token
+  completions — not a speed number.
 - The BF16 observation covers decode small-T at a 201-key history only. It does
   not establish that the BF16 prompt route's split partials are safe.
 - Nothing here measures the *number* of nodes removed, only the bytes. One

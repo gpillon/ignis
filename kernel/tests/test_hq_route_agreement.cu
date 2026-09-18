@@ -561,6 +561,11 @@ struct Call {
   // activates. Anything checking what happens to the inactive ones has to
   // declare the envelope the same way.
   std::int32_t envelope_keys = 0;
+  // A1's masked form: each lane's valid prefix, or empty for the dense form
+  // every arm above uses. This is the verify round's own topology (P5-04): a
+  // lane's accepted extent is not known to be the full width, so the round
+  // declares each lane's prefix and the op writes exact zero past it.
+  std::vector<std::int32_t> valid;
 };
 
 // What the transient workspace holds when A1 is handed it.
@@ -635,10 +640,21 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
   // The measured call's own inputs.
   const std::size_t out_elements = static_cast<std::size_t>(kHeadDim) * kQHeads * call.width *
                                    call.batch;
+  // A1's position contract. Dense: every column is valid and positions run
+  // sequentially. Masked: the valid prefix is sequential, the invalid tail
+  // repeats the row's final valid position, and an empty row is all zeros
+  // (kernel/vendor/include/ninfer/ops/gqa_attention.h).
   std::vector<std::int32_t> positions(static_cast<std::size_t>(call.width) * call.batch);
   for (std::int32_t b = 0; b < call.batch; ++b) {
+    const std::int32_t valid =
+        call.valid.empty() ? call.width : call.valid[static_cast<std::size_t>(b)];
     for (std::int32_t w = 0; w < call.width; ++w) {
-      positions[static_cast<std::size_t>(b) * call.width + w] = call.first_position + w;
+      const std::size_t index = static_cast<std::size_t>(b) * call.width + w;
+      if (valid == 0) {
+        positions[index] = 0;
+      } else {
+        positions[index] = call.first_position + (w < valid ? w : valid - 1);
+      }
     }
   }
   std::vector<std::int32_t> table_rows(static_cast<std::size_t>(call.batch));
@@ -671,6 +687,16 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
                         {kHeadDim, kKvHeads, call.width, call.batch});
   const ninfer::Tensor pos(pos_device.p, ninfer::DType::I32, {call.width, call.batch, 1, 1});
   const ninfer::Tensor rows(rows_device.p, ninfer::DType::I32, {call.batch, 1, 1, 1});
+  // The dense/masked choice is part of the call topology, never inferred: an
+  // empty tensor is the dense form, a contiguous I32 [B] the masked one.
+  DeviceBytes valid_device(std::max<std::size_t>(call.valid.size(), 1) * sizeof(std::int32_t));
+  if (!call.valid.empty()) {
+    CUDA_FATAL(cudaMemcpy(valid_device.p, call.valid.data(),
+                          call.valid.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+  }
+  const ninfer::Tensor valid_columns =
+      call.valid.empty() ? ninfer::Tensor{}
+                         : ninfer::Tensor(valid_device.p, ninfer::DType::I32, {call.batch, 1, 1, 1});
   const ninfer::Tensor gate(gate_device.p, ninfer::DType::BF16,
                            {kHeadDim, kQHeads, call.width, call.batch});
   ninfer::Tensor out(out_device.p, ninfer::DType::BF16,
@@ -721,7 +747,7 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
       check(probe[0] == 0x7F && probe[1] == 0x7F,
            std::string(label) + ": the hostile fill did not reach the workspace arena");
     }
-    ninfer::ops::gqa_attention(q, k, v, pos, /*valid_columns=*/ninfer::Tensor{}, rows, gate, kScale,
+    ninfer::ops::gqa_attention(q, k, v, pos, valid_columns, rows, gate, kScale,
                                cache, envelope, workspace, out, /*stream=*/nullptr);
     CUDA_FATAL(cudaStreamSynchronize(nullptr));
     CUDA_FATAL(cudaMemcpy(host_out.data(), out_device.p, out_elements * 2, cudaMemcpyDeviceToHost));
@@ -902,6 +928,60 @@ int main() {
         "decode W=1 B=" + std::to_string(batch), graph_zeroed,
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, graph_call, in, (hq_label + " wide hostile").c_str(),
                   WorkspaceFill::Hostile));
+  }
+
+  // ---- verify: the masked small-T form the production default runs ---------
+  //
+  // `--spec dflash2 --draft-tokens 7` is the shipped default, so every decode
+  // round is a width-8 verify round, not the width-1 shape above: batch-wide,
+  // each lane declaring its own valid prefix, with the invalid tail repeating
+  // the row's final valid position (P5-04, GitHub #153). It is one kernel
+  // instantiation with the width-1 route -- the hq launcher instantiates
+  // `gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true,
+  // ..., GqaTcKVHq>` for every width 1..8 -- but the masked arm is a distinct
+  // runtime path through it, and it is the one the engine actually spends its
+  // decode time in. The zeroing this engine no longer does under hq has to be
+  // dead here above all.
+  //
+  // Lane b takes b + 1 valid columns of 8, so the widths sweep 1..8 across the
+  // batch and no two lanes mask alike. The envelope is the decode graph's, as
+  // above, because that is what leaves inactive split slots behind at all.
+  for (std::int32_t batch = 1; batch <= kMaxLanes; ++batch) {
+    constexpr std::int32_t kVerifyWidth = 8;
+    Inputs in;
+    fill_kv(fx, kVerifyWidth * batch, /*first_position=*/kPrefillTokens, in.k, in.v);
+    fill_q(fx, kVerifyWidth, batch, in.q);
+    fill_gate(in.q.size(), in.gate);
+    Call call{kVerifyWidth, batch, /*first_position=*/kPrefillTokens, /*history=*/kPrefillTokens};
+    call.envelope_keys = static_cast<std::int32_t>(kMaxContext);
+    for (std::int32_t b = 0; b < batch; ++b) {
+      call.valid.push_back(std::min(b + 1, kVerifyWidth));
+    }
+
+    const std::string label = "verify W=8 B=" + std::to_string(batch);
+    const std::vector<std::uint16_t> zeroed =
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, (label + " hq").c_str());
+    check_workspace_independent(
+        label, zeroed,
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, (label + " hq hostile").c_str(),
+                  WorkspaceFill::Hostile));
+    // A1 writes exact BF16 zero to an invalid column. Lane 0 declares one
+    // valid column of eight, so its columns 1..7 must be exactly zero and its
+    // column 0 must not be: without this, an arm that silently ran the dense
+    // form would be a second copy of the decode arm above and would pass.
+    const std::size_t column = static_cast<std::size_t>(kHeadDim) * kQHeads;
+    const auto column_is_zero = [&](std::int32_t index) {
+      const auto begin = zeroed.begin() + static_cast<std::ptrdiff_t>(column * index);
+      return std::all_of(begin, begin + static_cast<std::ptrdiff_t>(column),
+                         [](std::uint16_t bits) { return bits == 0; });
+    };
+    check(!column_is_zero(0), label + ": lane 0's one valid column is all zero");
+    for (std::int32_t w = 1; w < kVerifyWidth; ++w) {
+      check(column_is_zero(w),
+           label + ": lane 0 column " + std::to_string(w) +
+               " is past its declared prefix yet is not exact zero, so the call ran dense and this "
+               "arm repeats the decode arm above");
+    }
   }
 
   if (g_failed != 0) {

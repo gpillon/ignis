@@ -123,7 +123,7 @@ inline std::size_t ignis_gqa_attention_workspace_bytes(ninfer::DType cache_dtype
  * What it buys: the scratch planes are `visible_keys * 4096` bytes at this
  * geometry, so zeroing them was the largest single write in a prefill chunk
  * outside attention itself, once per GQA layer -- and on the decode round it
- * zeroed bytes `write_neutral()` zeroes again a moment later.
+ * cleared slots `write_neutral()` neutralizes again a moment later.
  *
  * kernel/tests/test_hq_route_agreement.cu runs every hq shape this engine
  * dispatches twice, over a zeroed and over a hostile workspace, and requires
