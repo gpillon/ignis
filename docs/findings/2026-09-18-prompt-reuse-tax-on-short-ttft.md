@@ -86,15 +86,52 @@ to penalise.
 **Not established.** How much of the 1.85x this accounts for. The reference's
 TTFT was not re-measured here, and no live/live run was made with reuse off.
 
+## The other side of the bet, measured
+
+Reuse anchors on the **system block**: `Request::publish_point`
+(`crates/core/src/request.rs:294-305`) walks the retained-prefix point and the
+publish point in prompt order, and the comment there says why — "the system
+block ends before the last generation opener". A first attempt at an "agentic"
+arm put the shared text inside one big `user` message and collected nothing;
+**that was the test being wrong, not the engine.** Modelled correctly — one
+shared system block, a new user turn each time — it collects, and handsomely:
+
+| shape | TTFT |
+|---|---|
+| cold system, nothing to claim | 288.4 ms |
+| shared system, first turn (pays the premium) | 275.8 ms |
+| **shared system, every later turn** | **124.0 ms** (−57%) |
+| identical prompt repeated | 54.1 ms |
+
+So the bet pays after a single reuse, and for a conversation it is not close.
+
+**But the premium is charged on every request, including the ones that
+collect.** The chunk profiler on that run:
+
+| request | prefill calls | tokens per call | GPU |
+|---|---|---|---|
+| cold system | **5** | 1024, 320, 64, 43, 2 | 231 ms |
+| claiming the prefix | **3** | 64, ~15, 2 | **66 ms for ~81 tokens** |
+
+A claimant skips the 960-token system block — that is the win — and then pays
+three full traversals for an 81-token tail, 66 ms where one traversal is about
+21 ms. At ~19 ms of fixed cost per traversal, **every request carries roughly
+two extra traversals, about 40 ms, whether it reuses or not**: 36% of a
+reusing turn's 124 ms, and the same again on top of a cold one.
+
 ## Implications
 
 - Any TTFT comparison against the reference should state which side of
   `--prompt-reuse` it was measured on, or measure both.
-- Three cheap-looking directions, none of them yet costed: refuse the cut when
-  the remaining prompt is too short for the bet to pay; align the publish point
-  with the chunk boundary so the second cut disappears; or let the leaf
-  snapshot mutable state at an interior offset so one traversal can still
-  publish at a point inside it.
+- **The optimisation is the cut, not the reuse.** Reuse earns its keep; what
+  does not is paying two extra fixed-cost traversals to take the cuts, on
+  every request, including the claimants that are supposed to be the cheap
+  ones. Sized: about 40 ms per request, 36% of a reusing turn.
+- Directions, none yet costed: align the publish point with the chunk boundary
+  so the cut lands where a traversal was ending anyway; let the leaf snapshot
+  mutable state at an interior offset so one traversal can publish at a point
+  inside it; or refuse the cut when what remains is too short to be worth its
+  own traversal.
 - The comment in `concrete.rs` should carry the measured cost of a short chunk
   rather than its token count, so the next reader prices the cut correctly.
 
@@ -107,12 +144,17 @@ TTFT was not re-measured here, and no live/live run was made with reuse off.
   measurement, not measured directly.
 - Whether the tails are the publish point and the opener specifically was read
   from the code, not confirmed by instrumenting which cut produced which span.
-- Nothing here measures what reuse is worth when it *does* hit, so the bet's
-  other side is unpriced.
+- The hit side is measured at one system-block length (~960 tokens) and one
+  tail length (~64), sequentially, on one launch. Concurrency was tried only
+  on the wrongly-shaped arm.
+- Which cut produced which span is still read from the code rather than
+  instrumented; the five-call shape of a cold system request is not fully
+  accounted for by the two cuts this finding names.
 
 ## Follow-ups
 
-- Measure the hit side: what a claimant saves when a checkpoint or prefix is
-  reused, at the same prompt length.
+- Account for all five prefill calls of a cold system request; this finding
+  names two cuts and sees four.
+- Cost the three directions above against the ~40 ms they would recover.
 - Re-measure the reference live/live at 1,024 tokens, on both sides of
   `--prompt-reuse`, before attributing any of the 1.85x.
