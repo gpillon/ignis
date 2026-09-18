@@ -2,7 +2,18 @@ import { describe, expect, it } from "vitest";
 import { AGENT_TOOL, AGENTS_IGNIS_PROMPT } from "./agents/agents.ts";
 import { ASK_USER_IGNIS_PROMPT, ASK_USER_TOOL } from "./ask/ask.ts";
 import { dateTimePrompt } from "./datetime/datetime.ts";
-import { agentExtras, ALL_TOOLS, ignisPrompt, NO_TOOLS, routeCall, setAllTools, toolExtras, toolsInUse, turnDateTime } from "./index.ts";
+import {
+  agentExtras,
+  ALL_TOOLS,
+  DEFAULT_TOOL_ROUNDS,
+  ignisPrompt,
+  NO_TOOLS,
+  routeCall,
+  setAllTools,
+  toolExtras,
+  toolsInUse,
+  turnDateTime,
+} from "./index.ts";
 import type { Attachment } from "./local/attachments.ts";
 import {
   attachmentsPrompt,
@@ -36,6 +47,7 @@ const all = {
   memory: true,
   files: true,
   readFiles: true,
+  maxRounds: DEFAULT_TOOL_ROUNDS,
 };
 const names = (extras: { tools?: { function: { name: string } }[] }) => (extras.tools ?? []).map((t) => t.function.name);
 
@@ -142,6 +154,16 @@ describe("tools", () => {
     expect(setAllTools({ ...some, enabled: false }, true)).toEqual(some);
     expect(setAllTools({ ...NO_TOOLS, enabled: false }, true)).toEqual(all);
     expect(ALL_TOOLS).toEqual(all);
+  });
+
+  it("gives a turn 16 rounds of tool calls, and keeps the rounds the owner typed across the switch for all", () => {
+    expect(DEFAULT_TOOL_ROUNDS).toBe(16);
+    expect(ALL_TOOLS.maxRounds).toBe(16);
+    expect(NO_TOOLS.maxRounds).toBe(16);
+    // Turning every tool on again hands back ALL_TOOLS: the rounds are not a tool, so they come along.
+    const chosen = { ...NO_TOOLS, enabled: false, maxRounds: 40 };
+    expect(setAllTools(chosen, true)).toEqual({ ...all, maxRounds: 40 });
+    expect(setAllTools({ ...all, maxRounds: 40 }, false).maxRounds).toBe(40);
   });
 
   it("routes declared calls to their runner, and any undeclared tool to unknown", () => {

@@ -34,9 +34,6 @@ import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/w
 // The conversation loop: the sessions, the one reply streaming at a time,
 // and the tools a reply calls. Sessions live in memory; a reload starts over.
 
-/** How many replies in a row may call tools before the Playground stops running them. */
-const MAX_TOOL_ROUNDS = 8;
-
 const exchangeOf = (m: Message): Exchange => ({
   role: m.role,
   content: m.content,
@@ -105,6 +102,8 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     const promptContext = { now: session?.startedAt ?? new Date(), attachments };
     const extras = toolExtras(tools, promptContext);
     const agentTools = agentExtras(tools, promptContext);
+    // The rounds the turn was started with: the same budget for this loop and for each agent's own.
+    const maxRounds = Math.max(1, Math.floor(tools.maxRounds));
     const local: Omit<LocalContext, "settings" | "signal"> = {
       jsSafetyCheck: tools.jsSafetyCheck,
       attachments,
@@ -141,15 +140,15 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         const calls = reply.toolCalls ?? [];
         if (calls.length === 0 || reply.error) break;
         // Every call gets a result, even one that never ran: the history must stay well-formed.
-        if (abort.signal.aborted || round >= MAX_TOOL_ROUNDS) {
+        if (abort.signal.aborted || round >= maxRounds) {
           const reason = abort.signal.aborted
             ? "Stopped before the call ran."
-            : `Not run: a turn can call tools at most ${MAX_TOOL_ROUNDS} times in a row.`;
+            : `Not run: a turn can call tools at most ${maxRounds} times in a row.`;
           addToolResults(sessionId, calls.map((c) => ({ callId: c.id, content: reason })));
           break;
         }
         unanswered = calls;
-        conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, local, abort.signal))];
+        conversation = [...conversation, ...(await runToolCalls(sessionId, reply, requestSettings, extras, agentTools, local, maxRounds, abort.signal))];
         unanswered = [];
         if (abort.signal.aborted) break;
       }
@@ -219,6 +218,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     extras: ToolExtras,
     agentTools: ToolExtras,
     local: Omit<LocalContext, "settings" | "signal">,
+    maxRounds: number,
     signal: AbortSignal,
   ) {
     const calls = reply.toolCalls ?? [];
@@ -279,6 +279,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         tools: agentTools,
         tavilyKey: getTavilyKey(),
         local,
+        maxRounds,
         signal,
         onUpdate: (run) => {
           runs = runs.map((r) => (r.callId === run.callId ? run : r));

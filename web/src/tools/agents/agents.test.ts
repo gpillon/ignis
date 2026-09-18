@@ -10,6 +10,7 @@ import {
   type AgentRun,
   agentSummary,
   agentSystemPrompt,
+  MAX_AGENT_TOOL_ROUNDS,
   parseAgentCall,
   runAgents,
   toolResult,
@@ -257,22 +258,33 @@ describe("agents with tools", () => {
     expect(bodies[1].messages.at(-1)?.content).toMatch(/Unknown tool "agent": the tools available are "web_search", "web_fetch"/);
   });
 
-  it("fails an agent that keeps calling tools", async () => {
+  it("fails an agent that keeps calling tools, after the rounds it was given", async () => {
     let calls = 0;
     const stream = async (o: StreamOptions): Promise<StreamResult> => {
       calls++;
       o.onEvent(callEvent("web_search", { query: "again" }));
       return { ok: true, timeline: timeline() };
     };
-    const [run] = await runAgents([task(1)], {
-      settings,
-      tools: webTools,
-      signal: new AbortController().signal,
-      onUpdate: () => {},
-      stream,
-      runWeb: doneWeb,
-    });
-    expect(calls).toBe(9);
-    expect(run).toMatchObject({ status: "failed", error: expect.stringMatching(/at most 8 times/) });
+    const keepCalling = (maxRounds?: number) => {
+      calls = 0;
+      return runAgents([task(1)], {
+        settings,
+        tools: webTools,
+        signal: new AbortController().signal,
+        onUpdate: () => {},
+        ...(maxRounds === undefined ? {} : { maxRounds }),
+        stream,
+        runWeb: doneWeb,
+      });
+    };
+
+    // The session's rounds: the caller's number, the last round being the one that is not run.
+    const [short] = await keepCalling(2);
+    expect(calls).toBe(3);
+    expect(short).toMatchObject({ status: "failed", error: expect.stringMatching(/at most 2 times/) });
+
+    const [byDefault] = await keepCalling();
+    expect(calls).toBe(MAX_AGENT_TOOL_ROUNDS + 1);
+    expect(byDefault).toMatchObject({ status: "failed", error: expect.stringMatching(/at most 16 times/) });
   });
 });

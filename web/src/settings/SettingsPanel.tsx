@@ -129,7 +129,8 @@ function GeneralSettings(props: {
   );
 }
 
-function ToolsSetting({
+/** The Tools tab: the switch for all of them, the rounds they get, and each tool's own row. */
+export function ToolsSetting({
   tools,
   onChange,
   onOpenMemory,
@@ -149,6 +150,7 @@ function ToolsSetting({
       </div>
       {tools.enabled && (
         <div className="flex flex-col gap-4">
+          <ToolRoundsField rounds={tools.maxRounds} onChange={(maxRounds) => onChange({ ...tools, maxRounds })} />
           <ToolRow
             id="agents"
             label="Agents"
@@ -269,6 +271,40 @@ function ToolRow(props: { id: string; label: string; description: string; on: bo
       </div>
       <Switch on={props.on} onChange={props.onChange} labelledBy={`tool-${props.id}-label`} />
     </div>
+  );
+}
+
+/**
+ * The rounds a turn gets: the conversation's own tool loop and each agent's.
+ * It sits under the switch for all tools and goes with them — with every tool
+ * off nothing calls anything, and a budget for those calls says nothing. The
+ * box holds what is typed, half-typed numbers too; only a whole round of one
+ * or more is kept, and leaving the box shows the value that was.
+ */
+function ToolRoundsField({ rounds, onChange }: { rounds: number; onChange: (rounds: number) => void }) {
+  const [draft, setDraft] = useState(String(rounds));
+  const type = (text: string) => {
+    setDraft(text);
+    const value = Math.floor(Number(text));
+    if (text.trim() !== "" && Number.isFinite(value) && value >= 1) onChange(value);
+  };
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className={caption}>Tool rounds</span>
+      <input
+        className={`${field} font-display tabular-nums`}
+        type="number"
+        name="tool-rounds"
+        min={1}
+        step={1}
+        value={draft}
+        onChange={(e) => type(e.target.value)}
+        onBlur={() => setDraft(String(rounds))}
+      />
+      <span className="text-xs leading-snug text-ash">
+        How many replies in a row may call tools, in a turn and inside each agent. Past it the calls come back unrun.
+      </span>
+    </label>
   );
 }
 

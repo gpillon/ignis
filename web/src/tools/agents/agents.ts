@@ -59,8 +59,8 @@ export function agentSystemPrompt(extras: ToolExtras = {}): string {
 /** ignis admits 8 requests in flight; the main reply has finished while its agents run. */
 export const MAX_PARALLEL_AGENTS = 8;
 
-/** How many replies in a row an agent may call tools in before it is failed. */
-export const MAX_AGENT_TOOL_ROUNDS = 8;
+/** How many replies in a row an agent may call tools in before it is failed, when the caller names no budget. */
+export const MAX_AGENT_TOOL_ROUNDS = 16;
 
 export type AgentStatus = "queued" | "running" | "done" | "failed" | "stopped";
 
@@ -171,6 +171,8 @@ export type RunAgentsOptions = {
   /** For the agents' local tools: the safety check, the attachments, the check log. */
   local?: Omit<LocalContext, "settings" | "signal">;
   limit?: number;
+  /** How many replies in a row an agent may call tools in; the session's tool rounds. */
+  maxRounds?: number;
   /** A full engine is retried, not failed: agents wait for a lane. */
   retryDelayMs?: number;
   maxRetries?: number;
@@ -187,6 +189,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
   const now = options.now ?? (() => performance.now());
   const sleep = options.sleep ?? abortableSleep;
   const limit = Math.max(1, options.limit ?? MAX_PARALLEL_AGENTS);
+  const maxRounds = Math.max(1, Math.floor(options.maxRounds ?? MAX_AGENT_TOOL_ROUNDS));
   const maxRetries = options.maxRetries ?? 60;
   const retryDelayMs = options.retryDelayMs ?? 1000;
   const tools = options.tools ?? {};
@@ -297,10 +300,10 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
       set(task.callId, { figures, rounds: [...(get(task.callId).rounds ?? []), figures] });
       if (result.timeline.stopped) return set(task.callId, { status: "stopped" });
       if (calls.length === 0) return set(task.callId, { status: "done" });
-      if (round >= MAX_AGENT_TOOL_ROUNDS) {
+      if (round >= maxRounds) {
         return set(task.callId, {
           status: "failed",
-          error: `An agent can call tools at most ${MAX_AGENT_TOOL_ROUNDS} times in a row; this one kept calling.`,
+          error: `An agent can call tools at most ${maxRounds} times in a row; this one kept calling.`,
         });
       }
       const content = get(task.callId).content;
