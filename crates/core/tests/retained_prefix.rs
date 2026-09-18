@@ -153,7 +153,7 @@ fn retained_state(
 }
 
 /// The retained-state reuses (`source`, skipped tokens) recorded for
-/// `request` - a prompt checkpoint claim, never a prefix one.
+/// `request` — a prompt checkpoint claim, never a prefix one.
 fn state_reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32)> {
     events
         .iter()
