@@ -70,13 +70,27 @@ indexed array is not a register array.
 | per round | **3,145.23 us** | **44.26 us** (30.55 partial + 13.71 merge) |
 | share of decode kernel time | 16.4% | 0.27% |
 
-**71x.** What it buys, measured the same way at one lane over 8 s:
+**71x.** What it buys, measured the same way over 8 s:
 
 | | before | after |
 |---|---|---|
-| graph replay, mean | 19.18 ms | **15.81 ms** (−17.6%) |
-| rounds completed in 8 s | 388 | **471** (+21.4%) |
+| graph replay at one lane, mean | 19.18 ms | **15.81 ms** (−17.6%) |
+| rounds completed at one lane | 388 | **471** (+21.4%) |
+| graph replay at eight lanes, mean | 33.54 ms | **32.18 ms** (−4.1%) |
+| rounds completed at eight lanes | 215 | **222** (+3.3%) |
 | 256 greedy tokens, request wall | 2,051 ms | **1,721 ms** (−16.1%) |
+
+The rounds figure is a throughput figure: the selection is bit-identical, so
+the drafter proposes the same candidates and a round accepts the same tokens
+it did before. Tokens per round is unchanged, and +21.4% rounds is therefore
++21.4% tokens per second at one lane. The 256-token request, which includes
+its prefill, moved −16.1%, which is consistent.
+
+At eight lanes the win is far smaller, and the reason is the same fact that
+made it large at one: the vendored kernel's parallelism is its column count.
+Eight lanes give it 7 x 8 = 56 columns and so 56 warps instead of seven, which
+is most of what it was missing. Per-kernel attribution at that width was not
+taken — the figures above are the round, not the kernel.
 
 ### That it is the same answer
 
@@ -100,8 +114,10 @@ candidates mean identical drafts, identical drafts mean identical accepts.
 
 **Observed.** The drafter's vendored top-k spent 3,145 us of every decode
 round doing 2.0 us of memory traffic on 0.07% of the card. Replacing it with a
-row-split merge is worth **17.6% of a decode round** and **+21% of decode
-throughput**, at a bit-identical answer.
+row-split merge is worth **17.6% of a decode round and +21% of decode
+throughput at one lane**, and **4.1% at eight**, at a bit-identical answer.
+The gap between the two is the vendored kernel's own shape: its parallelism is
+its column count, and eight lanes hand it eight times as many.
 
 **Inference.** The op was not written for this geometry. One warp per column
 is a reasonable shape when columns are many and rows are few; at a 248k
@@ -126,12 +142,12 @@ one worth leaving alone; neither is visible from reading the code.
 
 ## Limits and unknowns
 
-- Measured at one lane. The eight-lane round was not re-profiled after the
-  change; the drafter's top-k scales with `k * batch` columns, so the saving
-  should grow with the batch, but that is an expectation and not a
-  measurement.
-- One capture per configuration, no repeats. The effect is 20x the run-to-run
-  spread seen on this harness, which is why one capture carries it.
+- One capture per configuration, no repeats. At one lane the effect is 20x
+  the run-to-run spread seen on this harness, which is why one capture carries
+  it; at eight lanes 1.36 ms is closer to that spread and deserves repeats
+  before it is quoted on its own.
+- The eight-lane figures are round times. No node-level capture was taken at
+  that width, so how much of the 1.36 ms is the top-k is not established.
 - Ours is still 22x off its own 2.0 us bound. Nobody has looked at why,
   because at 0.27% of the round there is nothing left to win.
 - The replacement specializes k=16 only, and the arms that exercise other k
@@ -139,7 +155,7 @@ one worth leaving alone; neither is visible from reading the code.
 
 ## Follow-ups
 
-- Re-profile at eight lanes to size the saving under the batch the agentic
-  load actually runs.
+- A node-level capture at eight lanes, with repeats, to attribute the 1.36 ms
+  and to see what the vendored kernel actually cost at 56 columns.
 - `nvfp4_w4a4_mma_kernel` at 247 calls and 37.46 us per call is now 58% of
   decode. Whether it is at its bound has not been checked.
