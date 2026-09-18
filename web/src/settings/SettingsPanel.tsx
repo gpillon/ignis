@@ -22,6 +22,8 @@ export function SettingsPanel(props: {
   onToolsChange: (tools: ToolsState) => void;
   markdown: boolean;
   onMarkdownChange: (on: boolean) => void;
+  parallel: boolean;
+  onParallelChange: (on: boolean) => void;
   /** The active session's files, which the ignis prompt lists. */
   attachments: Attachment[];
   onOpenMemory: () => void;
@@ -68,6 +70,8 @@ function GeneralSettings(props: {
   tools: ToolsState;
   markdown: boolean;
   onMarkdownChange: (on: boolean) => void;
+  parallel: boolean;
+  onParallelChange: (on: boolean) => void;
   attachments: Attachment[];
 }) {
   const { settings, set } = props;
@@ -123,6 +127,8 @@ function GeneralSettings(props: {
         ]}
         onChange={(v) => set("laneTag", v)}
       />
+
+      <ParallelSetting on={props.parallel} onChange={props.onParallelChange} />
 
       <MarkdownSetting on={props.markdown} onChange={props.onMarkdownChange} />
     </>
@@ -352,6 +358,24 @@ function TavilyKeyField() {
         </span>
       )}
     </label>
+  );
+}
+
+/** The parallel switch: other sessions may run their own turn while one streams. */
+function ParallelSetting({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-col gap-0.5">
+        <span id="parallel-label" className="font-display text-sm font-semibold text-ink">
+          Parallel sessions
+        </span>
+        <span className="text-xs leading-snug text-ash">
+          Send in one session while another still streams. A session still answers one reply at a time, and the browser
+          carries five streams at once, agents included — the rest wait for a connection.
+        </span>
+      </div>
+      <Switch on={on} onChange={onChange} labelledBy="parallel-label" />
+    </div>
   );
 }
 
