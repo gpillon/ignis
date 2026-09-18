@@ -129,7 +129,8 @@ function GeneralSettings(props: {
   );
 }
 
-function ToolsSetting({
+/** The Tools tab: the switch for all of them, the rounds they get, and each tool's own row. */
+export function ToolsSetting({
   tools,
   onChange,
   onOpenMemory,
@@ -141,7 +142,6 @@ function ToolsSetting({
   return (
     <fieldset className="flex flex-col gap-2">
       <legend className="sr-only">Tools</legend>
-      <ToolRoundsField rounds={tools.maxRounds} onChange={(maxRounds) => onChange({ ...tools, maxRounds })} />
       <div className="mb-2 flex items-center justify-between gap-3">
         <span id="tools-all-label" className={caption}>
           All tools
@@ -150,6 +150,7 @@ function ToolsSetting({
       </div>
       {tools.enabled && (
         <div className="flex flex-col gap-4">
+          <ToolRoundsField rounds={tools.maxRounds} onChange={(maxRounds) => onChange({ ...tools, maxRounds })} />
           <ToolRow
             id="agents"
             label="Agents"
@@ -275,8 +276,10 @@ function ToolRow(props: { id: string; label: string; description: string; on: bo
 
 /**
  * The rounds a turn gets: the conversation's own tool loop and each agent's.
- * The box holds what is typed, half-typed numbers too; only a whole round of
- * one or more is kept, and leaving the box shows the value that was.
+ * It sits under the switch for all tools and goes with them — with every tool
+ * off nothing calls anything, and a budget for those calls says nothing. The
+ * box holds what is typed, half-typed numbers too; only a whole round of one
+ * or more is kept, and leaving the box shows the value that was.
  */
 function ToolRoundsField({ rounds, onChange }: { rounds: number; onChange: (rounds: number) => void }) {
   const [draft, setDraft] = useState(String(rounds));
@@ -286,7 +289,7 @@ function ToolRoundsField({ rounds, onChange }: { rounds: number; onChange: (roun
     if (text.trim() !== "" && Number.isFinite(value) && value >= 1) onChange(value);
   };
   return (
-    <label className="mb-4 flex flex-col gap-1.5">
+    <label className="flex flex-col gap-1.5">
       <span className={caption}>Tool rounds</span>
       <input
         className={`${field} font-display tabular-nums`}
