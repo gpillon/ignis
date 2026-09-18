@@ -7,6 +7,8 @@
 - Scope: kernel / DFlash2 drafter, speculative decode round, vendored op replacement
 - Related: [ADR 0005](../adr/0005-performance-first-principle.md),
   [ADR 0010](../adr/0010-vendored-reference-kernels.md),
+  [ADR 0031](../adr/0031-vendored-kernel-bottleneck-exemption.md) (the policy this
+  exercised; it lands on its own branch),
   [#155](https://github.com/gpillon/ignis/issues/155) (the drafter round),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
   [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md)

@@ -9,7 +9,8 @@
   [ADR 0020](../adr/0020-batch-wide-decode-round.md),
   [ADR 0021](../adr/0021-live-live-launch-pooling.md),
   [hq vs BF16 live/live](2026-09-13-hq-vs-bf16-live-live.md),
-  [GQA workspace memset](2026-09-18-gqa-workspace-memset.md)
+  [GQA workspace memset](2026-09-18-gqa-workspace-memset.md),
+  [Drafter top-k](2026-09-18-dflash2-topk-one-warp-per-column.md)
 - Superseded by: none
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).
