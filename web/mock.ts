@@ -110,10 +110,16 @@ export function mockIgnis(): Plugin {
           const results = messages.filter((m) => m.role === "tool").map((m) => `- ${m.content.slice(0, 80).replace(/\s+/g, " ")}`);
           content = ["The ", "tools ", "reported ", "back:\n\n", results.join("\n")];
         } else if (offersAgents && last.includes("/agents")) {
-          content = ["I'll ", "split ", "this ", "into ", "three ", "parts."];
-          calls = ["scheduler", "kv-cache", "telemetry"].map((name) => ({
+          // "/agents" splits the task three ways; "/agents 6" asks for six, which
+          // is how the browser's connection limit is reproduced without a GPU
+          // (GitHub #220).
+          const asked = Number(/\/agents\s+(\d+)/.exec(last)?.[1]);
+          const names = ["scheduler", "kv-cache", "telemetry", "sampler", "tokenizer", "router", "allocator", "logger"];
+          const wanted = Number.isFinite(asked) ? Math.min(Math.max(asked, 1), names.length) : 3;
+          content = ["I'll ", "split ", "this ", "into ", `${wanted} `, "parts."];
+          calls = names.slice(0, wanted).map((name) => ({
             tool: "agent",
-            args: { name, prompt: `Look at the ${name} part of: ${last.replace("/agents", "").trim()}` },
+            args: { name, prompt: `Look at the ${name} part of: ${last.replace(/\/agents(\s+\d+)?/, "").trim()}` },
           }));
         } else if (offers("run_js") && last.includes("/js")) {
           content = ["Let ", "me ", "compute ", "it."];
