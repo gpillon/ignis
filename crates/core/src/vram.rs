@@ -84,9 +84,13 @@ pub struct VramLines {
 }
 
 impl VramLines {
+    /// How many lines a plan has. The arity of [`VramLines::entries`], named
+    /// so a reader of the plan does not have to write the number out again.
+    pub const LINES: usize = 11;
+
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
-    pub fn entries(&self) -> [(&'static str, u64); 11] {
+    pub fn entries(&self) -> [(&'static str, u64); Self::LINES] {
         [
             ("weights", self.weights),
             ("cuda_context", self.cuda_context),

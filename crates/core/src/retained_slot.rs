@@ -125,6 +125,20 @@ pub enum RetainedSkip {
 }
 
 impl RetainedSkip {
+    /// Every reason, in the order [`RetainedSkip::index`] numbers them — so a
+    /// per-reason table is an array rather than a branch at every site.
+    pub const ALL: [RetainedSkip; 3] =
+        [RetainedSkip::PublishNoSlot, RetainedSkip::CaptureNoSlot, RetainedSkip::CaptureNoPage];
+
+    /// This reason's position in [`RetainedSkip::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            RetainedSkip::PublishNoSlot => 0,
+            RetainedSkip::CaptureNoSlot => 1,
+            RetainedSkip::CaptureNoPage => 2,
+        }
+    }
+
     /// The log's spelling.
     pub fn as_str(self) -> &'static str {
         match self {

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::host::{RetainedBlob, Tier};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
@@ -113,20 +113,38 @@ fn whole_pool(start: u32) -> RequestInput {
     input(tokens(start, 1272), None, 8)
 }
 
-fn retained_state(events: &[SchedEvent]) -> Vec<(RetainedStateOperation, ReuseSource)> {
+fn retained_state(
+    events: &[SchedEvent],
+) -> Vec<(RetainedStateOperation, ReuseSource, RetainedKind)> {
     events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::RetainedState { operation, source } => Some((*operation, *source)),
+            SchedEvent::RetainedState { operation, source, kind } => {
+                Some((*operation, *source, *kind))
+            }
             _ => None,
         })
         .collect()
 }
 
+/// Both kinds together — what the fact said before it named one (GitHub #216).
 fn count(events: &[SchedEvent], operation: RetainedStateOperation, source: ReuseSource) -> usize {
     retained_state(events)
         .into_iter()
-        .filter(|&fact| fact == (operation, source))
+        .filter(|&(o, s, _)| (o, s) == (operation, source))
+        .count()
+}
+
+/// One kind alone.
+fn count_kind(
+    events: &[SchedEvent],
+    operation: RetainedStateOperation,
+    source: ReuseSource,
+    kind: RetainedKind,
+) -> usize {
+    retained_state(events)
+        .into_iter()
+        .filter(|&fact| fact == (operation, source, kind))
         .count()
 }
 
@@ -162,6 +180,75 @@ fn turn_spilled_to_kv_ram(
     turn
 }
 
+// ── What the scheduler reports it is holding (GitHub #216) ───────────────
+
+#[test]
+fn occupancy_reports_both_pools_and_empties_when_nothing_is_retained() {
+    // The plain field reads ADR 0030 routes through the tick. With prompt
+    // reuse off nothing is left behind, so the pool must come back to zero on
+    // the very step that releases the last request — there is no later one:
+    // the server sends no tick while the scheduler is idle.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig { prompt_reuse: false, retained_slots: 0, ..tight(4) },
+        compute.clone(),
+    );
+    let empty = sched.occupancy();
+    assert_eq!(empty.kv_used_pages, 0);
+    assert_eq!(empty.kv_pool_pages, 81, "the pool it is empty of is named too");
+    assert_eq!(empty.kv_ram_used_bytes, 0);
+
+    sched.submit(turn_at(1), RequestClass::Interactive).unwrap();
+    sched.advance();
+    let busy = sched.occupancy();
+    assert!(busy.kv_used_pages > 0, "the request holds pages while it runs");
+    assert_eq!(busy.kv_pool_pages, empty.kv_pool_pages, "capacity is a constant");
+
+    run_to_idle(&mut sched);
+    assert_eq!(sched.occupancy().kv_used_pages, 0, "and gives them all back");
+}
+
+#[test]
+fn occupancy_reports_the_kv_ram_arena_a_spill_filled() {
+    // The arena's used bytes are the host tier's own accounting: live
+    // snapshots and retained blobs together. Nothing else in the process
+    // knows the figure, which is why ADR 0030 takes it off the scheduler
+    // rather than by asking the leaf.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(tight(2), compute.clone());
+    assert_eq!(sched.occupancy().kv_ram_used_bytes, 0, "nothing spilled yet");
+
+    turn_spilled_to_kv_ram(&mut sched, turn_at(1), RequestClass::Agent);
+    assert_eq!(sched.occupancy().kv_ram_used_bytes, 1, "the blob is charged to the arena");
+    assert_eq!(
+        sched.occupancy().kv_ram_used_bytes,
+        sched.host().used_bytes(),
+        "and it is the tier's own figure, not a second count of it"
+    );
+
+    // Lane pressure that makes room by giving the retained blob up: a
+    // retained bet goes before an evicted live sequence
+    // (`a_retained_agent_checkpoint_is_discarded_before_an_evicted_interactive_sequence`).
+    for i in 0..8 {
+        sched
+            .submit(input(tokens(300_000 + i * 10, 4), None, 60), RequestClass::Interactive)
+            .unwrap();
+    }
+    sched.advance();
+    for i in 0..2 {
+        sched
+            .submit(input(tokens(400_000 + i * 10, 4), None, 4), RequestClass::Interactive)
+            .unwrap();
+        sched.advance();
+    }
+    assert_eq!(sched.host().retained_count(), 0, "the pressure took the blob");
+    assert_eq!(
+        sched.occupancy().kv_ram_used_bytes,
+        sched.host().used_bytes(),
+        "and the arena still reports the tier, live snapshots included"
+    );
+}
+
 // ── AC1: an idle conversation pushed off the device resumes from KV-RAM ──
 
 #[test]
@@ -183,6 +270,14 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
         2,
         "the checkpoint, and the block under it (GitHub #190)"
     );
+    // And the two are told apart, not summed (GitHub #216).
+    for kind in RetainedKind::ALL {
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Spill, ReuseSource::KvRam, kind),
+            1,
+            "one spill of each kind, not two of one: {kind:?}"
+        );
+    }
     assert_eq!(compute.spilled_prefixes(), vec![(n, BLOCK)]);
     let spilled = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
     assert_eq!(sched.host().retained(spilled).unwrap().tier, Tier::Probation);
@@ -501,6 +596,20 @@ fn a_first_turn_misses_every_configured_tier_once() {
     let events = run_to_idle(&mut with_kv_ram);
     assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
     assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam), 1);
+    // Every miss is a checkpoint miss (GitHub #216): the checkpoint pool's
+    // lookup is the only one that reports one, and the prefix walk beside it
+    // records none — no prefix miss is invented to make the two symmetric.
+    for source in [ReuseSource::Device, ReuseSource::KvRam] {
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Checkpoint),
+            1
+        );
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix),
+            0,
+            "no prefix miss is synthesised"
+        );
+    }
 
     let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::new()));
     device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();

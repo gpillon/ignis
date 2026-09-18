@@ -172,12 +172,12 @@ The initial stable metric contract is:
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
-| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from |
-| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram` | Retained state a request chose to resume from, by tier: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
-| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries |
-| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
-| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram` | Retained checkpoints and prefixes that left the tier for nowhere |
-| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
+| `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from and the kind it was |
+| `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
+| `ignis_retained_state_misses_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Requests whose first prefill chunk landed with no checkpoint matching in a tier this load carries. **`kind=prefix` is zero by construction** — see the note below the table (#216, #222) |
+| `ignis_retained_state_spills_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes written into the tier (today only `kv_ram`) |
+| `ignis_retained_state_discards_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained checkpoints and prefixes that left the tier for nowhere |
+| `ignis_retained_state_restores_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Prefills that landed on a checkpoint from the tier, and prefixes brought back from it; a hit whose prefill never lands has no restore |
 | `ignis_requests_accepted_total` | counter | none | Accepted submissions |
 | `ignis_requests_completed_total` | counter | none | Completed requests |
 | `ignis_requests_cancelled_total` | counter | none | Accepted requests cancelled before completion |
@@ -186,6 +186,23 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
+
+ADR 0030 §Observability adds the memory gauges to this contract: the plan's
+eleven reserved lines, the budget, the KV pool's pages and page bytes, the
+pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
+capacity and use, and the retained-slot skips. Every one is bytes, pages or
+slots; no percentage is exported.
+
+**The miss family is checkpoint-only, and stays that way until someone decides
+otherwise.** `ignis_retained_state_misses_total` is projected from a fact the
+*checkpoint pool's* lookup raises. The prefix walk beside it — the longest
+device match and the longest spilled match — records no miss at all, so
+`kind="prefix"` is zero on every load, forever. The `kind` split (#216) made
+this visible rather than creating it: the row above has always counted
+checkpoint misses alone, which is why its wording names a checkpoint where its
+five siblings name both. No prefix miss is synthesised to make the families
+look symmetric. Whether the prefix walk should raise one is a change to the
+fact stream, not to this projection, and is GitHub #222.
 
 Histogram buckets are fixed. TTFT uses 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
 10, 30, 60, 120, and 300 seconds. Request duration uses 0.1, 0.25, 0.5, 1,

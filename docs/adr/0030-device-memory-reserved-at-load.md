@@ -10,6 +10,11 @@ slots) and absorbs GitHub #204. Measurement and code analysis:
 classes. It is the future ADR that ADR 0017 required before KV usage and
 capacity could be exported, and it preserves that ADR's zero-work invariant.
 Built by GitHub #216 (the exposition) and #217 (the Playground's Monitor).
+Amended 2026-09-18 (#216, owner decision) where building it settled three
+readings this section had left to the source column — the retained slots'
+capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's
+use covers — and to record that `SchedEvent::StateReused` widens beside
+`SchedEvent::RetainedState`. Each is marked below.
 
 ## Context
 
@@ -132,9 +137,15 @@ again. They add no serving work of any kind.
 | `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |
 | `ignis_kv_ram_arena_bytes` | gauge | `state="capacity"` | `--kv-host-pool-bytes`, pinned whole at start |
-| `ignis_retained_slots` | gauge | `state="capacity"` | `--retained-slots` |
+| `ignis_retained_slots` | gauge | `state="capacity"` | the retained slots the scheduler hands out (#216) |
 
 A load that refuses to start exports nothing: there is no process to scrape.
+
+**The slot capacity is the scheduler's effective count, not the flag** (#216).
+`--prompt-reuse off` without an explicit `--retained-slots` hands out no slots
+at all (#215), so the flag's value would be a capacity nothing can ever fill —
+and `{state="in_use"}` would be measured against a bound that is not its own.
+The gauge exports `ConcreteScheduler::retained_slot_count()`.
 
 ### Projections of facts that already cross
 
@@ -181,6 +192,13 @@ Without this split the surface would be inconsistent with itself, because
 found no slot is a prefix, and a capture that found no slot or no page is a
 checkpoint.
 
+`SchedEvent::StateReused` widens the same way and for the same reason. It is
+the fact `ignis_retained_reused_tokens_total` — one of the six — is projected
+from, so leaving it alone would have meant the consumer supplying the kind
+from what kind of event had arrived. That is exactly the downstream guess this
+section exists to remove, and the emitting site holds a `CheckpointClaim`
+either way.
+
 `ignis_prefix_reused_tokens_total` is untouched and keeps the sibling-prefix
 meaning #190 gave it: a live sibling's claim is not retained state and takes
 no `kind`.
@@ -193,8 +211,20 @@ fields it already maintains for admission:
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `ignis_kv_pool_used_pages` | gauge | none | the main pool's pages reserved by running requests |
-| `ignis_kv_ram_arena_bytes` | gauge | `state="used"` | the host tier's used bytes |
+| `ignis_kv_pool_used_pages` | gauge | none | the main pool's pages in use: running requests, shared prefixes and retained tail pages together (#216) |
+| `ignis_kv_ram_arena_bytes` | gauge | `state="used"` | the host tier's used bytes: live evicted snapshots and retained blobs together (#216) |
+
+**Both count everything the pool and the arena hold, not one kind of claimant**
+(#216). The pool's charge is one counter for the whole load, and the host
+tier's is one budget for the whole tier; a retained checkpoint's tail page is
+as much a KV page as a running request's, and a retained blob is as much of
+the arena as an evicted snapshot. Splitting either would be the per-class
+accounting this ADR declines below, and a second count of the same memory that
+could disagree with the first. What follows from it: `ignis_kv_pool_used_pages`
+falls to zero after the last request only when nothing was retained. With
+reuse on it settles at what the retained images hold, which
+`ignis_retained_slots{state="in_use"}` names — a reading of the release, not a
+stale figure.
 
 Both are plain field reads of state the admission machine keeps anyway. The
 tick is already sent, already unconditional, and its payload is the same

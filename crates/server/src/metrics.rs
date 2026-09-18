@@ -21,8 +21,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use axum::Router;
 use axum::http::header;
 use axum::routing::get;
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
-use ignis_core::SubmitError;
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::{RetainedSkip, SubmitError};
+
+/// What one load reserved, and the shapes the reservations bound (GitHub
+/// #216, ADR 0030 §Observability). Computed once, during the load that
+/// already builds the plan, and never read again — so exporting it adds no
+/// serving work of any kind.
+///
+/// A load that has no plan (the placeholder path, which loads no model) has
+/// no reservations either, and every series below stays at its zero.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadReservations {
+    /// The plan's lines, as the plan itself holds them — so the exposition
+    /// names them with the plan's own spellings rather than a second set
+    /// kept in step by hand.
+    pub lines: ignis_core::VramLines,
+    /// The budget the plan was laid out inside, derived or explicit.
+    pub budget_bytes: u64,
+    /// The KV pool's page count, as the leaf verified it at load.
+    pub kv_pool_pages: u32,
+    /// One KV page's bytes.
+    pub kv_page_bytes: u64,
+    /// `--kv-host-pool-bytes`, pinned whole at start.
+    pub kv_ram_arena_bytes: u64,
+    /// The retained slots this load hands out — the effective count, which
+    /// is 0 with prompt reuse off and no explicit `--retained-slots`.
+    pub retained_slots: u32,
+}
 
 /// The exposition's content type: Prometheus text format 0.0.4.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -136,15 +162,40 @@ pub struct Metrics {
     kv_evictions: AtomicU64,
     prefix_reused_tokens: AtomicU64,
     /// Per [`ReuseSource::index`], for each of the families below (#190).
-    retained_reused_tokens: [AtomicU64; ReuseSource::ALL.len()],
-    retained_state_hits: [AtomicU64; ReuseSource::ALL.len()],
-    retained_state_misses: [AtomicU64; ReuseSource::ALL.len()],
-    retained_state_spills: [AtomicU64; ReuseSource::ALL.len()],
-    retained_state_discards: [AtomicU64; ReuseSource::ALL.len()],
-    retained_state_restores: [AtomicU64; ReuseSource::ALL.len()],
+    retained_reused_tokens: RetainedFamily,
+    retained_state_hits: RetainedFamily,
+    retained_state_misses: RetainedFamily,
+    retained_state_spills: RetainedFamily,
+    retained_state_discards: RetainedFamily,
+    retained_state_restores: RetainedFamily,
+    /// Per [`RetainedSkip::index`] (GitHub #216).
+    retained_slot_skips: [AtomicU64; RetainedSkip::ALL.len()],
+    /// The retained slots held right now, and the count this load hands out.
+    retained_slots_in_use: AtomicU64,
+    retained_slots_capacity: AtomicU64,
+    /// The load's reservations (GitHub #216): the plan's lines in
+    /// `VramLines::entries()` order, then the shapes they bound. Written once
+    /// at load, and zero on a load that built no plan.
+    vram_reserved: [AtomicU64; VRAM_LINE_COUNT],
+    vram_budget_bytes: AtomicU64,
+    kv_pool_pages: AtomicU64,
+    kv_page_bytes: AtomicU64,
+    kv_ram_arena_capacity_bytes: AtomicU64,
+    /// What the scheduler has occupied, republished on every tick.
+    kv_pool_used_pages: AtomicU64,
+    kv_ram_arena_used_bytes: AtomicU64,
     ttft: Histogram,
     duration: Histogram,
 }
+
+/// One retained-state family: a count per residency tier and per kind of
+/// retained state (GitHub #216) — `[tier][kind]`, so a prompt checkpoint and
+/// a shared prefix are never summed into one figure.
+type RetainedFamily = [[AtomicU64; RetainedKind::ALL.len()]; ReuseSource::ALL.len()];
+
+/// How many lines a VRAM plan has, taken from the plan's own shape rather
+/// than written out again here.
+const VRAM_LINE_COUNT: usize = ignis_core::VramLines::LINES;
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -172,6 +223,16 @@ impl Metrics {
             retained_state_spills: Default::default(),
             retained_state_discards: Default::default(),
             retained_state_restores: Default::default(),
+            retained_slot_skips: Default::default(),
+            retained_slots_in_use: AtomicU64::new(0),
+            retained_slots_capacity: AtomicU64::new(0),
+            vram_reserved: Default::default(),
+            vram_budget_bytes: AtomicU64::new(0),
+            kv_pool_pages: AtomicU64::new(0),
+            kv_page_bytes: AtomicU64::new(0),
+            kv_ram_arena_capacity_bytes: AtomicU64::new(0),
+            kv_pool_used_pages: AtomicU64::new(0),
+            kv_ram_arena_used_bytes: AtomicU64::new(0),
             ttft: Histogram::new(&TTFT_BOUNDS_MS),
             duration: Histogram::new(&DURATION_BOUNDS_MS),
         }
@@ -195,14 +256,22 @@ impl Metrics {
     }
 
     /// A request's prefill skipped `tokens` through retained state in
-    /// `source` — a retained prefix, or a prompt checkpoint (GitHub #190).
-    pub(crate) fn record_retained_reused(&self, source: ReuseSource, tokens: u32) {
-        self.retained_reused_tokens[source.index()].fetch_add(u64::from(tokens), Ordering::Relaxed);
+    /// `source` — a retained prefix, or a prompt checkpoint (GitHub #190,
+    /// #216).
+    pub(crate) fn record_retained_reused(&self, source: ReuseSource, kind: RetainedKind, tokens: u32) {
+        self.retained_reused_tokens[source.index()][kind.index()]
+            .fetch_add(u64::from(tokens), Ordering::Relaxed);
     }
 
-    /// One retained-state lifecycle operation in its residency tier (GitHub
-    /// #190). The telemetry consumer is the only writer.
-    pub(crate) fn record_retained_state(&self, operation: RetainedStateOperation, source: ReuseSource) {
+    /// One retained-state lifecycle operation, in its residency tier and on
+    /// the kind of state it moved (GitHub #190, #216). The telemetry consumer
+    /// is the only writer.
+    pub(crate) fn record_retained_state(
+        &self,
+        operation: RetainedStateOperation,
+        source: ReuseSource,
+        kind: RetainedKind,
+    ) {
         let series = match operation {
             RetainedStateOperation::Hit => &self.retained_state_hits,
             RetainedStateOperation::Miss => &self.retained_state_misses,
@@ -210,7 +279,43 @@ impl Metrics {
             RetainedStateOperation::Discard => &self.retained_state_discards,
             RetainedStateOperation::Restore => &self.retained_state_restores,
         };
-        series[source.index()].fetch_add(1, Ordering::Relaxed);
+        series[source.index()][kind.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A publish or a capture found no retained slot, or no tail page
+    /// (GitHub #216): the signal that a load has run out of room to leave
+    /// reuse behind and is running on without it.
+    pub(crate) fn record_retained_slot_skip(&self, skip: RetainedSkip) {
+        self.retained_slot_skips[skip.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The retained slots a prefix or checkpoint image holds right now.
+    pub(crate) fn set_retained_slots_in_use(&self, in_use: u32) {
+        self.retained_slots_in_use.store(u64::from(in_use), Ordering::Relaxed);
+    }
+
+    /// What the scheduler had occupied when the last step ended (GitHub
+    /// #216): the main pool's pages, and the KV-RAM arena's bytes. Both are
+    /// republished on every tick, including the tick of the step that
+    /// released the last request — which is the last tick there is, so a
+    /// projection that skipped it would read a stale figure for as long as
+    /// the load stayed idle.
+    pub(crate) fn set_occupancy(&self, occupancy: ignis_core::Occupancy) {
+        self.kv_pool_used_pages.store(u64::from(occupancy.kv_used_pages), Ordering::Relaxed);
+        self.kv_ram_arena_used_bytes.store(occupancy.kv_ram_used_bytes, Ordering::Relaxed);
+    }
+
+    /// What this load reserved (GitHub #216, ADR 0030): written once, by the
+    /// load that built the plan, before the first request is served.
+    pub(crate) fn set_load_reservations(&self, reserved: LoadReservations) {
+        for (slot, (_, bytes)) in self.vram_reserved.iter().zip(reserved.lines.entries()) {
+            slot.store(bytes, Ordering::Relaxed);
+        }
+        self.vram_budget_bytes.store(reserved.budget_bytes, Ordering::Relaxed);
+        self.kv_pool_pages.store(u64::from(reserved.kv_pool_pages), Ordering::Relaxed);
+        self.kv_page_bytes.store(reserved.kv_page_bytes, Ordering::Relaxed);
+        self.kv_ram_arena_capacity_bytes.store(reserved.kv_ram_arena_bytes, Ordering::Relaxed);
+        self.retained_slots_capacity.store(u64::from(reserved.retained_slots), Ordering::Relaxed);
     }
 
     /// A request's first token came `ms` after its submission.
@@ -314,6 +419,12 @@ impl Metrics {
                 "Retained state chosen to resume from or brought back, by residency tier.",
                 &self.retained_state_hits,
             ),
+            // `kind` is always `checkpoint` here, and that is the honest
+            // shape: the checkpoint pool's lookup is the only one that
+            // reports a miss, so the prefix series sits at zero rather than
+            // carrying one invented to match it. ADR 0017 records this under
+            // its metric table; emitting a prefix miss would be a change to
+            // the fact stream, not to this projection (GitHub #216, #222).
             (
                 "ignis_retained_state_misses_total",
                 "First prefill chunks with no retained checkpoint matching in the tier.",
@@ -336,9 +447,85 @@ impl Metrics {
             ),
         ] {
             declare(&mut out, name, "counter", help);
-            for (source, slot) in ReuseSource::ALL.iter().zip(series) {
-                let _ = writeln!(out, "{name}{{tier=\"{}\"}} {}", source.as_str(), read(slot));
+            for (source, tier) in ReuseSource::ALL.iter().zip(series) {
+                for (kind, slot) in RetainedKind::ALL.iter().zip(tier) {
+                    let _ = writeln!(
+                        out,
+                        "{name}{{tier=\"{}\",kind=\"{}\"}} {}",
+                        source.as_str(),
+                        kind.as_str(),
+                        read(slot)
+                    );
+                }
             }
+        }
+        declare(
+            &mut out,
+            "ignis_retained_slot_skips_total",
+            "counter",
+            "Publishes and captures that found no retained slot or no tail page.",
+        );
+        for (skip, series) in RetainedSkip::ALL.iter().zip(&self.retained_slot_skips) {
+            let _ = writeln!(
+                out,
+                "ignis_retained_slot_skips_total{{reason=\"{}\"}} {}",
+                skip.as_str(),
+                read(series)
+            );
+        }
+        // What the load reserved, and what is occupied of it (GitHub #216,
+        // ADR 0030 §Observability). Bytes, pages and slots — never a
+        // percentage, which would hide which of its two terms moved.
+        declare(
+            &mut out,
+            "ignis_vram_reserved_bytes",
+            "gauge",
+            "Device bytes this load reserved, by the plan line that reserved them.",
+        );
+        let names = ignis_core::VramLines::default().entries();
+        for ((line, _), series) in names.iter().zip(&self.vram_reserved) {
+            let _ = writeln!(out, "ignis_vram_reserved_bytes{{line=\"{line}\"}} {}", read(series));
+        }
+        let plain_gauges = [
+            (
+                "ignis_vram_budget_bytes",
+                "The device budget the plan was laid out inside.",
+                &self.vram_budget_bytes,
+            ),
+            ("ignis_kv_pool_pages", "Pages the KV pool holds.", &self.kv_pool_pages),
+            ("ignis_kv_page_bytes", "One KV page's bytes.", &self.kv_page_bytes),
+            (
+                "ignis_kv_pool_used_pages",
+                "KV pool pages reserved by running requests and retained state.",
+                &self.kv_pool_used_pages,
+            ),
+        ];
+        for (name, help, series) in plain_gauges {
+            declare(&mut out, name, "gauge", help);
+            let _ = writeln!(out, "{name} {}", read(series));
+        }
+        // Two states of one family: what bounds it, and what is in it. The
+        // arena is bytes and says `used`; the slots are counted and say
+        // `in_use` (ADR 0030 §Observability spells each).
+        for (name, help, used_state, capacity, used) in [
+            (
+                "ignis_kv_ram_arena_bytes",
+                "The pinned host KV-RAM arena: what it holds, and what is used of it.",
+                "used",
+                &self.kv_ram_arena_capacity_bytes,
+                &self.kv_ram_arena_used_bytes,
+            ),
+            (
+                "ignis_retained_slots",
+                "Retained slots this load hands out, and how many hold an image.",
+                "in_use",
+                &self.retained_slots_capacity,
+                &self.retained_slots_in_use,
+            ),
+        ] {
+            declare(&mut out, name, "gauge", help);
+            let _ = writeln!(out, "{name}{{state=\"capacity\"}} {}", read(capacity));
+            let _ = writeln!(out, "{name}{{state=\"{used_state}\"}} {}", read(used));
         }
         declare(
             &mut out,
@@ -425,6 +612,14 @@ mod tests {
             ("ignis_retained_state_spills_total", "counter"),
             ("ignis_retained_state_discards_total", "counter"),
             ("ignis_retained_state_restores_total", "counter"),
+            ("ignis_retained_slot_skips_total", "counter"),
+            ("ignis_vram_reserved_bytes", "gauge"),
+            ("ignis_vram_budget_bytes", "gauge"),
+            ("ignis_kv_pool_pages", "gauge"),
+            ("ignis_kv_page_bytes", "gauge"),
+            ("ignis_kv_pool_used_pages", "gauge"),
+            ("ignis_kv_ram_arena_bytes", "gauge"),
+            ("ignis_retained_slots", "gauge"),
             ("ignis_requests_rejected_total", "counter"),
             ("ignis_request_ttft_seconds", "histogram"),
             ("ignis_request_duration_seconds", "histogram"),
@@ -542,13 +737,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_state_operations_are_counted_per_residency_tier() {
+    fn retained_state_operations_are_counted_per_residency_tier_and_kind() {
         let metrics = Metrics::new();
-        metrics.record_retained_state(RetainedStateOperation::Hit, ReuseSource::Device);
-        metrics.record_retained_state(RetainedStateOperation::Miss, ReuseSource::Device);
-        metrics.record_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam);
-        metrics.record_retained_state(RetainedStateOperation::Discard, ReuseSource::KvRam);
-        metrics.record_retained_state(RetainedStateOperation::Restore, ReuseSource::KvRam);
+        let checkpoint = RetainedKind::Checkpoint;
+        metrics.record_retained_state(RetainedStateOperation::Hit, ReuseSource::Device, checkpoint);
+        metrics.record_retained_state(RetainedStateOperation::Miss, ReuseSource::Device, checkpoint);
+        metrics.record_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam, checkpoint);
+        metrics.record_retained_state(RetainedStateOperation::Discard, ReuseSource::KvRam, checkpoint);
+        metrics.record_retained_state(RetainedStateOperation::Restore, ReuseSource::KvRam, checkpoint);
 
         let text = metrics.render();
         for (name, tier) in [
@@ -558,12 +754,166 @@ mod tests {
             ("ignis_retained_state_discards_total", "kv_ram"),
             ("ignis_retained_state_restores_total", "kv_ram"),
         ] {
-            assert_eq!(value(&text, name, &format!("tier=\"{tier}\"")), "1", "{name}");
+            assert_eq!(
+                value(&text, name, &format!("tier=\"{tier}\",kind=\"checkpoint\"")),
+                "1",
+                "{name}"
+            );
+            // The other kind is its own series and did not move with it —
+            // the whole point of the split (GitHub #216).
+            assert_eq!(
+                value(&text, name, &format!("tier=\"{tier}\",kind=\"prefix\"")),
+                "0",
+                "{name}"
+            );
         }
         assert_eq!(
-            value(&text, "ignis_retained_state_hits_total", "tier=\"kv_ram\""),
+            value(&text, "ignis_retained_state_hits_total", "tier=\"kv_ram\",kind=\"checkpoint\""),
             "0"
         );
+    }
+
+    #[test]
+    fn a_prefix_and_a_checkpoint_in_the_same_tier_are_never_summed_into_one_series() {
+        let metrics = Metrics::new();
+        metrics.record_retained_state(
+            RetainedStateOperation::Spill,
+            ReuseSource::KvRam,
+            RetainedKind::Checkpoint,
+        );
+        for _ in 0..3 {
+            metrics.record_retained_state(
+                RetainedStateOperation::Spill,
+                ReuseSource::KvRam,
+                RetainedKind::Prefix,
+            );
+        }
+        metrics.record_retained_reused(ReuseSource::Device, RetainedKind::Prefix, 64);
+        metrics.record_retained_reused(ReuseSource::KvRam, RetainedKind::Checkpoint, 1536);
+
+        let text = metrics.render();
+        let spills = |kind: &str| {
+            value(&text, "ignis_retained_state_spills_total", &format!("tier=\"kv_ram\",kind=\"{kind}\""))
+        };
+        assert_eq!(spills("checkpoint"), "1");
+        assert_eq!(spills("prefix"), "3", "four spills, and the load shed prefixes");
+        assert_eq!(
+            value(&text, "ignis_retained_reused_tokens_total", "tier=\"device\",kind=\"prefix\""),
+            "64"
+        );
+        assert_eq!(
+            value(&text, "ignis_retained_reused_tokens_total", "tier=\"kv_ram\",kind=\"checkpoint\""),
+            "1536"
+        );
+        // Sibling-prefix reuse keeps its own meaning and takes no kind.
+        assert_eq!(value(&text, "ignis_prefix_reused_tokens_total", ""), "0");
+    }
+
+    #[test]
+    fn the_reservations_are_exported_with_the_plan_own_line_spellings() {
+        let metrics = Metrics::new();
+        // A fresh projection reserves nothing and holds nothing.
+        let empty = metrics.render();
+        for (line, _) in ignis_core::VramLines::default().entries() {
+            assert_eq!(value(&empty, "ignis_vram_reserved_bytes", &format!("line=\"{line}\"")), "0");
+        }
+        assert_eq!(value(&empty, "ignis_kv_pool_pages", ""), "0");
+
+        let mut lines = ignis_core::VramLines::default();
+        lines.weights = 21_000_000_000;
+        lines.cuda_context = 600_000_000;
+        lines.retained_slots = 1_000_000_000;
+        metrics.set_load_reservations(LoadReservations {
+            lines,
+            budget_bytes: 30_000_000_000,
+            kv_pool_pages: 5_000,
+            kv_page_bytes: 1_048_576,
+            kv_ram_arena_bytes: 8 << 30,
+            retained_slots: 9,
+        });
+
+        let text = metrics.render();
+        // The eleven lines are the plan's, in the plan's order and spelling.
+        let exported: Vec<String> = samples(&text)
+            .into_iter()
+            .filter(|(name, _, _)| name == "ignis_vram_reserved_bytes")
+            .map(|(_, labels, _)| labels)
+            .collect();
+        let expected: Vec<String> = ignis_core::VramLines::default()
+            .entries()
+            .iter()
+            .map(|(line, _)| format!("line=\"{line}\""))
+            .collect();
+        assert_eq!(exported, expected, "{text}");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"weights\""), "21000000000");
+        assert_eq!(value(&text, "ignis_vram_reserved_bytes", "line=\"retained_slots\""), "1000000000");
+        assert_eq!(value(&text, "ignis_vram_budget_bytes", ""), "30000000000");
+        assert_eq!(value(&text, "ignis_kv_pool_pages", ""), "5000");
+        assert_eq!(value(&text, "ignis_kv_page_bytes", ""), "1048576");
+        assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"capacity\""), "8589934592");
+        assert_eq!(value(&text, "ignis_retained_slots", "state=\"capacity\""), "9");
+        // Nothing is occupied until a step reports occupancy.
+        assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "0");
+        assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"used\""), "0");
+        assert_eq!(value(&text, "ignis_retained_slots", "state=\"in_use\""), "0");
+    }
+
+    #[test]
+    fn occupancy_and_slot_skips_follow_the_facts_and_come_back_to_zero() {
+        let metrics = Metrics::new();
+        metrics.set_occupancy(ignis_core::Occupancy {
+            kv_used_pages: 412,
+            kv_pool_pages: 1_000,
+            kv_ram_used_bytes: 3 << 30,
+        });
+        metrics.set_retained_slots_in_use(4);
+        metrics.record_retained_slot_skip(RetainedSkip::PublishNoSlot);
+        metrics.record_retained_slot_skip(RetainedSkip::CaptureNoPage);
+        metrics.record_retained_slot_skip(RetainedSkip::CaptureNoPage);
+
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "412");
+        assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"used\""), "3221225472");
+        assert_eq!(value(&text, "ignis_retained_slots", "state=\"in_use\""), "4");
+        for (reason, count) in [
+            ("publish_skipped_no_slot", "1"),
+            ("capture_skipped_no_slot", "0"),
+            ("capture_skipped_no_page", "2"),
+        ] {
+            assert_eq!(
+                value(&text, "ignis_retained_slot_skips_total", &format!("reason=\"{reason}\"")),
+                count
+            );
+        }
+
+        // The last step of a load releases everything, and reports it: these
+        // are gauges of the latest reading, not high-water marks.
+        metrics.set_occupancy(ignis_core::Occupancy { kv_pool_pages: 1_000, ..Default::default() });
+        metrics.set_retained_slots_in_use(0);
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "0");
+        assert_eq!(value(&text, "ignis_kv_ram_arena_bytes", "state=\"used\""), "0");
+        assert_eq!(value(&text, "ignis_retained_slots", "state=\"in_use\""), "0");
+        // A counter does not come back: the skips already happened.
+        assert_eq!(
+            value(&text, "ignis_retained_slot_skips_total", "reason=\"capture_skipped_no_page\""),
+            "2"
+        );
+    }
+
+    #[test]
+    fn no_exported_series_is_a_percentage() {
+        // ADR 0030: every memory series is bytes, pages or slots, so a
+        // reader always has both terms and never a ratio that hides which
+        // of them moved.
+        let text = Metrics::new().render();
+        for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
+            let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
+            assert!(
+                !name.contains("_pct") && !name.contains("percent") && !name.contains("_ratio"),
+                "{name} is a percentage"
+            );
+        }
     }
 
     /// ADR 0017's fixed boundaries, in seconds, `+Inf` implied.

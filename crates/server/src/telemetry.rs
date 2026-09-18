@@ -22,16 +22,24 @@
 //! therefore reads the counters from an injectable
 //! [`IntervalStatsProvider`]; the default is an **event-derived** estimator
 //! (it counts `running` / `waiting` / `kv_evictions` from the routed
-//! [`SchedEvent`]s) and reports `prefilling` / `kv_used_pct` as 0 until core
-//! exposes a `Scheduler::stats(&self)` accessor — which is why those two
-//! never reach the interval event. That accessor is the missing seam this
-//! module is built to close.
+//! [`SchedEvent`]s) and reports `prefilling` as 0 until core exposes it —
+//! which is why that one never reaches the interval event.
+//!
+//! `kv_used_pct` is no longer among them (GitHub #216, ADR 0030). The seam
+//! this module was built to close is closed from the other side: rather than
+//! an accessor a consumer on another thread calls into the live scheduler,
+//! the model thread reads its own occupancy after each step and carries it on
+//! the tick it already sends. So the counter is authoritative without anyone
+//! reaching across a thread for it, and `Scheduler::occupancy` is a plain
+//! field read on the side that owns the scheduler.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
-use ignis_core::{FinishReason, LaneId, RequestClass, RequestId, RetainedSkip, SpecCounters};
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
+use ignis_core::{
+    FinishReason, LaneId, Occupancy, RequestClass, RequestId, RetainedSkip, SpecCounters,
+};
 use serde::Serialize;
 
 use crate::api::finish_reason_str;
@@ -88,10 +96,25 @@ pub struct IntervalCounters {
     pub prefilling: u32,
     /// On a decode lane.
     pub running: u32,
-    /// Main-pool KV occupancy, percent — 0 until core exposes it.
+    /// Main-pool KV occupancy, percent of the pool's pages (GitHub #216):
+    /// the scheduler's own reading, carried on the tick. A convenience for
+    /// the one log line — the two terms it divides are exported separately,
+    /// as pages, so no reader has to take a ratio's word for which moved.
     pub kv_used_pct: u32,
     /// Cumulative evictions to the host KV-RAM tier.
     pub kv_evictions: u64,
+}
+
+/// The main pool's occupancy as a whole percent of its pages (GitHub #216).
+///
+/// A pool of no pages is 0% rather than undefined: the mock load has none, and
+/// a division there would be the only way this projection could panic.
+fn kv_used_pct(occupancy: Occupancy) -> u32 {
+    if occupancy.kv_pool_pages == 0 {
+        return 0;
+    }
+    let used = u64::from(occupancy.kv_used_pages) * 100;
+    (used / u64::from(occupancy.kv_pool_pages)).min(100) as u32
 }
 
 /// Supplies the live scheduler counters for the interval line.
@@ -175,10 +198,14 @@ pub struct Telemetry {
     stats: Option<Arc<dyn IntervalStatsProvider>>,
     /// The tick number (per-step counter; the interval event's `tick`).
     tick: u64,
-    /// The `(waiting, running, kv_evictions)` the last interval event
-    /// carried; `None` before the first tick (ADR 0025: unchanged counters
-    /// are not logged again).
-    last_logged: Option<(u32, u32, u64)>,
+    /// The `(waiting, running, kv_used_pct, kv_evictions)` the last interval
+    /// event carried; `None` before the first tick (ADR 0025: unchanged
+    /// counters are not logged again). `kv_used_pct` is in the tuple because
+    /// it is in the line: left out, the line would report a percentage frozen
+    /// at the last time some *other* counter moved (GitHub #216).
+    last_logged: Option<(u32, u32, u32, u64)>,
+    /// What the scheduler held at the last tick (GitHub #216, ADR 0030).
+    occupancy: Occupancy,
     /// Cumulative evictions to the host KV-RAM tier.
     kv_evictions: u64,
     /// In-flight request telemetry (id → state); removed on completion.
@@ -207,6 +234,7 @@ impl Telemetry {
             stats: None,
             tick: 0,
             last_logged: None,
+            occupancy: Occupancy::default(),
             kv_evictions: 0,
             requests: HashMap::new(),
             metrics: None,
@@ -448,7 +476,9 @@ impl Telemetry {
     pub fn on_prefix_reused(&mut self, tokens: u32, retained: bool) {
         if let Some(metrics) = &self.metrics {
             if retained {
-                metrics.record_retained_reused(ReuseSource::Device, tokens);
+                // A `PrefixReused` fact is a prefix by its own name, so the
+                // kind is read off the event and not off the tier (#216).
+                metrics.record_retained_reused(ReuseSource::Device, RetainedKind::Prefix, tokens);
             } else {
                 metrics.record_prefix_reused(tokens);
             }
@@ -467,11 +497,12 @@ impl Telemetry {
         &mut self,
         id: RequestId,
         source: ReuseSource,
+        kind: RetainedKind,
         tokens: u32,
         restore_micros: u64,
     ) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_retained_reused(source, tokens);
+            metrics.record_retained_reused(source, kind, tokens);
         }
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.reuse = Some((source, tokens, restore_micros));
@@ -481,9 +512,14 @@ impl Telemetry {
     /// Something happened to retained state in one tier (GitHub #190). Not
     /// logged: none of it belongs to one request's line, so only the
     /// installed projection observes it.
-    pub fn on_retained_state(&mut self, operation: RetainedStateOperation, source: ReuseSource) {
+    pub fn on_retained_state(
+        &mut self,
+        operation: RetainedStateOperation,
+        source: ReuseSource,
+        kind: RetainedKind,
+    ) {
         if let Some(metrics) = &self.metrics {
-            metrics.record_retained_state(operation, source);
+            metrics.record_retained_state(operation, source, kind);
         }
     }
 
@@ -491,6 +527,9 @@ impl Telemetry {
     /// (GitHub #215): emit the change-driven `ignis.scheduler.retained_slots`
     /// DEBUG event, as the interval event reports its own counters (ADR 0025).
     pub fn on_retained_slots(&mut self, in_use: u32, capacity: u32) {
+        if let Some(metrics) = &self.metrics {
+            metrics.set_retained_slots_in_use(in_use);
+        }
         tracing::debug!(
             name: "ignis.scheduler.retained_slots",
             retained_slots_in_use = in_use,
@@ -504,6 +543,9 @@ impl Telemetry {
     /// `capacity` retained slots were held then. The request itself runs
     /// regardless.
     pub fn on_retained_slot_skipped(&mut self, id: RequestId, skip: RetainedSkip, in_use: u32, capacity: u32) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_retained_slot_skip(skip);
+        }
         let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
         tracing::info!(
             name: "ignis.request.retained_slot_skipped",
@@ -561,9 +603,7 @@ impl Telemetry {
             // not a `SchedEvent`) — 0 until core exposes it.
             prefilling: 0,
             running,
-            // `kv_used_pct` needs the scheduler's KV pool state, which the
-            // `Scheduler` trait does not expose — 0 until core exposes it.
-            kv_used_pct: 0,
+            kv_used_pct: kv_used_pct(self.occupancy),
             kv_evictions: self.kv_evictions,
         }
     }
@@ -575,15 +615,24 @@ impl Telemetry {
     /// only when the authoritative counters differ from the last one logged
     /// (ADR 0025). A decode run holds them constant for thousands of steps;
     /// one event per step would crowd every other DEBUG event out of the
-    /// logging queue's drop-oldest buffer. `prefilling` / `kv_used_pct` are
-    /// placeholder zeros (see the module doc), so they are not attributes.
-    pub fn emit_interval(&mut self) -> IntervalCounters {
+    /// logging queue's drop-oldest buffer. `prefilling` is a placeholder zero
+    /// (see the module doc), so it is not an attribute.
+    ///
+    /// `occupancy` is what the scheduler held when the step that sent this
+    /// tick ended (GitHub #216, ADR 0030). It joins the change detection
+    /// rather than riding a line whose cadence some other counter sets: an
+    /// integer percentage takes at most 101 values, so a pool filling
+    /// steadily logs a line per point and not a line per step.
+    pub fn emit_interval(&mut self, occupancy: Occupancy) -> IntervalCounters {
         self.tick = self.tick.saturating_add(1);
+        self.occupancy = occupancy;
         let counters = self.counters();
         if let Some(metrics) = &self.metrics {
             metrics.set_scheduler_requests(counters.waiting, counters.running);
+            metrics.set_occupancy(occupancy);
         }
-        let logged = (counters.waiting, counters.running, counters.kv_evictions);
+        let logged =
+            (counters.waiting, counters.running, counters.kv_used_pct, counters.kv_evictions);
         if self.last_logged != Some(logged) {
             self.last_logged = Some(logged);
             tracing::debug!(
@@ -591,6 +640,7 @@ impl Telemetry {
                 tick = self.tick,
                 waiting = counters.waiting,
                 running = counters.running,
+                kv_used_pct = counters.kv_used_pct,
                 kv_evictions = counters.kv_evictions,
                 "scheduler counters changed"
             );
@@ -792,13 +842,18 @@ mod tests {
             .collect()
     }
 
+    /// An occupancy of `used` pages out of `pool`, with no KV-RAM in it.
+    fn occupied(used: u32, pool: u32) -> Occupancy {
+        Occupancy { kv_used_pages: used, kv_pool_pages: pool, ..Occupancy::default() }
+    }
+
     #[test]
     fn an_interval_event_carries_the_authoritative_counters_at_debug() {
         let mut telemetry = telemetry();
         let events = capture_events(|| {
             telemetry.note_submit(1, 3, RequestClass::Interactive);
             telemetry.on_admitted(1, 0);
-            telemetry.emit_interval();
+            telemetry.emit_interval(occupied(31, 100));
         });
         let intervals = intervals(&events);
         assert_eq!(intervals.len(), 1, "one tick, one interval event: {events:?}");
@@ -809,9 +864,94 @@ mod tests {
         assert_eq!(attributes["running"], 1, "the admitted request is on a lane");
         assert_eq!(attributes["waiting"], 0, "no queued request");
         assert_eq!(attributes["kv_evictions"], 0);
-        // Placeholder zeros are not facts (ADR 0025, after ADR 0017).
+        // GitHub #216, ADR 0030: the scheduler carries its own occupancy on
+        // the tick, so this one is a fact and is reported. `prefilling` is
+        // still a placeholder zero and is still absent (ADR 0025).
+        assert_eq!(attributes["kv_used_pct"], 31, "{interval}");
         assert!(attributes.get("prefilling").is_none(), "{interval}");
-        assert!(attributes.get("kv_used_pct").is_none(), "{interval}");
+    }
+
+    #[test]
+    fn a_pool_filling_up_moves_the_interval_line_on_its_own() {
+        // Before GitHub #216 the line changed only when `waiting`, `running`
+        // or `kv_evictions` did, so a decode run that filled the pool logged
+        // one line at the start and nothing after. The percentage is in the
+        // change detection, so it is never a figure frozen at the last time
+        // some other counter moved.
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Interactive);
+            telemetry.on_admitted(1, 0);
+            for used in [10u32, 10, 20, 20, 40] {
+                telemetry.emit_interval(occupied(used, 100));
+            }
+        });
+        let pcts: Vec<u64> = intervals(&events)
+            .iter()
+            .map(|e| e["attributes"]["kv_used_pct"].as_u64().unwrap())
+            .collect();
+        assert_eq!(pcts, vec![10, 20, 40], "a line per point, not a line per step");
+    }
+
+    #[test]
+    fn an_empty_pool_reports_no_occupancy_rather_than_dividing_by_it() {
+        // The placeholder load builds no KV pool; a percentage of nothing is
+        // reported as 0 rather than panicking the telemetry consumer.
+        let mut telemetry = telemetry();
+        let counters = telemetry.emit_interval(occupied(0, 0));
+        assert_eq!(counters.kv_used_pct, 0);
+    }
+
+    #[test]
+    fn the_release_the_last_step_reports_reaches_the_projection() {
+        // GitHub #216: no tick is sent while the scheduler is idle, so the
+        // step that releases the last request's pages is the last chance to
+        // report the release. A projection that read a stale figure would
+        // hold it for as long as the load stayed idle.
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.note_submit(1, 3, RequestClass::Interactive);
+        telemetry.on_admitted(1, 0);
+        telemetry.emit_interval(Occupancy {
+            kv_used_pages: 64,
+            kv_pool_pages: 256,
+            kv_ram_used_bytes: 1 << 30,
+        });
+        let busy = metrics.render();
+        assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
+        assert!(busy.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 1073741824\n"), "{busy}");
+
+        telemetry.on_done(1, 3, FinishReason::Stop, None);
+        telemetry.emit_interval(Occupancy {
+            kv_used_pages: 0,
+            kv_pool_pages: 256,
+            kv_ram_used_bytes: 0,
+        });
+        let idle = metrics.render();
+        assert!(idle.contains("\nignis_kv_pool_used_pages 0\n"), "{idle}");
+        assert!(idle.contains("\nignis_kv_ram_arena_bytes{state=\"used\"} 0\n"), "{idle}");
+    }
+
+    #[test]
+    fn the_retained_slot_facts_reach_the_projection_and_not_only_a_debug_line() {
+        // GitHub #216: `on_retained_slots` logged at DEBUG and never touched
+        // the projection, so slot occupancy was invisible to a scrape.
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = telemetry();
+        telemetry.with_metrics(Arc::clone(&metrics));
+        telemetry.on_retained_slots(3, 8);
+        telemetry.on_retained_slot_skipped(7, RetainedSkip::CaptureNoSlot, 8, 8);
+        telemetry.on_retained_slot_skipped(9, RetainedSkip::CaptureNoSlot, 8, 8);
+
+        let text = metrics.render();
+        assert!(text.contains("\nignis_retained_slots{state=\"in_use\"} 3\n"), "{text}");
+        assert!(
+            text.contains("\nignis_retained_slot_skips_total{reason=\"capture_skipped_no_slot\"} 2\n"),
+            "{text}"
+        );
+        // Capacity is the load's own record, not something a skip teaches.
+        assert!(text.contains("\nignis_retained_slots{state=\"capacity\"} 0\n"), "{text}");
     }
 
     #[test]
@@ -823,10 +963,10 @@ mod tests {
             telemetry.on_admitted(1, 0);
             // Three steps of a steady decode: one change, then nothing new.
             for _ in 0..3 {
-                returned.push(telemetry.emit_interval());
+                returned.push(telemetry.emit_interval(Occupancy::default()));
             }
             telemetry.on_done(1, 3, FinishReason::Stop, None);
-            returned.push(telemetry.emit_interval());
+            returned.push(telemetry.emit_interval(Occupancy::default()));
         });
         let intervals = intervals(&events);
         let ticks: Vec<u64> = intervals
@@ -1070,7 +1210,7 @@ mod tests {
             telemetry.note_submit(1, 3, RequestClass::Interactive); // queued (not yet admitted)
             telemetry.note_submit(2, 3, RequestClass::Interactive); // queued
             telemetry.on_admitted(2, 0); // dealt a lane
-            telemetry.emit_interval();
+            telemetry.emit_interval(Occupancy::default());
         });
         let v = intervals(&events).last().copied().expect("an interval event");
         assert_eq!(v["attributes"]["waiting"], 1, "request 1 is still queued");
@@ -1085,7 +1225,7 @@ mod tests {
             telemetry.on_admitted(1, 0);
             telemetry.on_evicted(1, 450);
             telemetry.on_evicted(1, 450);
-            telemetry.emit_interval();
+            telemetry.emit_interval(Occupancy::default());
         });
         let v = intervals(&events).last().copied().expect("an interval event");
         assert_eq!(v["attributes"]["kv_evictions"], 2, "each eviction bumps the counter");
@@ -1301,7 +1441,7 @@ mod tests {
         telemetry.note_submit(1, 3, RequestClass::Interactive);
         telemetry.note_submit(2, 3, RequestClass::Agent);
         telemetry.on_admitted(2, 0);
-        telemetry.emit_interval();
+        telemetry.emit_interval(Occupancy::default());
         has("ignis_requests_accepted_total 2");
         has("ignis_scheduler_requests{state=\"waiting\"} 1");
         has("ignis_scheduler_requests{state=\"running\"} 1");
@@ -1309,7 +1449,7 @@ mod tests {
 
         telemetry.on_token(2);
         telemetry.on_done(2, 5, FinishReason::Stop, None);
-        telemetry.emit_interval();
+        telemetry.emit_interval(Occupancy::default());
         has("ignis_requests_completed_total 1");
         has("ignis_generated_tokens_total 5");
         has("ignis_scheduler_requests{state=\"waiting\"} 1");
@@ -1367,7 +1507,7 @@ mod tests {
         telemetry.on_admitted(1, 1); // emitted before the cancel, routed after
         telemetry.on_cancelled(2);
         telemetry.on_cancelled(2); // a second cancel is a no-op
-        let counters = telemetry.emit_interval();
+        let counters = telemetry.emit_interval(Occupancy::default());
         assert_eq!((counters.waiting, counters.running), (0, 0));
         let text = metrics.render();
         assert!(text.contains("\nignis_scheduler_requests{state=\"running\"} 0\n"), "{text}");
@@ -1464,20 +1604,29 @@ mod tests {
         let mut telemetry = telemetry();
         telemetry.with_metrics(Arc::clone(&metrics));
         telemetry.note_submit(7, 2048, RequestClass::Interactive);
-        telemetry.on_state_reused(7, ReuseSource::KvRam, 1536, 42);
+        telemetry.on_state_reused(7, ReuseSource::KvRam, RetainedKind::Checkpoint, 1536, 42);
         telemetry.on_prefix_reused(64, true);
         telemetry.on_prefix_reused(32, false);
-        telemetry.on_retained_state(RetainedStateOperation::Spill, ReuseSource::KvRam);
+        telemetry.on_retained_state(
+            RetainedStateOperation::Spill,
+            ReuseSource::KvRam,
+            RetainedKind::Prefix,
+        );
 
         let text = metrics.render();
         for line in [
-            "ignis_retained_reused_tokens_total{tier=\"kv_ram\"} 1536",
-            "ignis_retained_reused_tokens_total{tier=\"device\"} 64",
+            // A checkpoint's restore and a retained prefix's claim are both
+            // retained reuse, and the two are told apart (GitHub #216).
+            "ignis_retained_reused_tokens_total{tier=\"kv_ram\",kind=\"checkpoint\"} 1536",
+            "ignis_retained_reused_tokens_total{tier=\"kv_ram\",kind=\"prefix\"} 0",
+            "ignis_retained_reused_tokens_total{tier=\"device\",kind=\"prefix\"} 64",
+            "ignis_retained_reused_tokens_total{tier=\"device\",kind=\"checkpoint\"} 0",
             "ignis_prefix_reused_tokens_total 32",
-            "ignis_retained_state_spills_total{tier=\"kv_ram\"} 1",
+            "ignis_retained_state_spills_total{tier=\"kv_ram\",kind=\"prefix\"} 1",
+            "ignis_retained_state_spills_total{tier=\"kv_ram\",kind=\"checkpoint\"} 0",
             // A restore is the scheduler's fact, not this call's: nothing here
             // may count one a second time.
-            "ignis_retained_state_restores_total{tier=\"kv_ram\"} 0",
+            "ignis_retained_state_restores_total{tier=\"kv_ram\",kind=\"checkpoint\"} 0",
         ] {
             assert!(text.contains(&format!("
 {line}
@@ -1497,7 +1646,7 @@ mod tests {
             kv_evictions: 9,
         })));
         let mut returned = IntervalCounters::default();
-        let events = capture_events(|| returned = telemetry.emit_interval());
+        let events = capture_events(|| returned = telemetry.emit_interval(Occupancy::default()));
         let v = intervals(&events).last().copied().expect("an interval event");
         // The provider's counters win over the (empty) event-derived set.
         assert_eq!(v["attributes"]["waiting"], 3);

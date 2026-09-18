@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use ignis_core::{
-    FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, Scheduler, SubmitError,
-    TokenId,
+    FinishReason, Occupancy, RequestClass, RequestId, RequestInput, SchedEvent, Scheduler,
+    SubmitError, TokenId,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -87,7 +87,11 @@ enum Command {
 enum TelemetryFact {
     Submitted(RequestId, u32, RequestClass, Option<MediaStats>),
     Routed(SchedEvent),
-    Tick,
+    /// One step happened, and this is what the scheduler held when it ended
+    /// (GitHub #216, ADR 0030). The payload is read on the model thread, from
+    /// fields the admission machine already keeps, and is the same whatever
+    /// the async side is doing with it.
+    Tick(Occupancy),
     Cancelled(RequestId),
     SetStats(Arc<dyn IntervalStatsProvider>),
     SetMetrics(Arc<Metrics>),
@@ -290,7 +294,11 @@ fn model_thread_loop(
         if !scheduler.is_idle() {
             let events = scheduler.advance();
             route_events(&events, &mut streams, &facts);
-            let _ = facts.send(TelemetryFact::Tick);
+            // Read after the step, not before: the step that releases the
+            // last request's pages is the last one there is, so a reading
+            // taken before it would leave the release unreported until a
+            // request that may never come (GitHub #216).
+            let _ = facts.send(TelemetryFact::Tick(scheduler.occupancy()));
             continue;
         }
         // Idle: block on the next command instead of busy-spinning. An
@@ -441,9 +449,10 @@ async fn telemetry_task(
                     source,
                     tokens,
                     restore_micros,
-                } => telemetry.on_state_reused(request, source, tokens, restore_micros),
-                SchedEvent::RetainedState { operation, source } => {
-                    telemetry.on_retained_state(operation, source)
+                    kind,
+                } => telemetry.on_state_reused(request, source, kind, tokens, restore_micros),
+                SchedEvent::RetainedState { operation, source, kind } => {
+                    telemetry.on_retained_state(operation, source, kind)
                 }
                 SchedEvent::RetainedSlots { in_use, capacity } => {
                     telemetry.on_retained_slots(in_use, capacity)
@@ -456,8 +465,8 @@ async fn telemetry_task(
                 } => telemetry.on_retained_slot_skipped(request, skip, in_use, capacity),
                 _ => {}
             },
-            TelemetryFact::Tick => {
-                let snapshot = telemetry.emit_interval();
+            TelemetryFact::Tick(occupancy) => {
+                let snapshot = telemetry.emit_interval(occupancy);
                 counters.store(Arc::new(snapshot));
             }
             TelemetryFact::Cancelled(request) => telemetry.on_cancelled(request),
@@ -683,6 +692,9 @@ mod tests {
         fn mode(&self) -> EngineMode {
             EngineMode::Serving
         }
+        fn occupancy(&self) -> ignis_core::Occupancy {
+            ignis_core::Occupancy::default()
+        }
     }
 
     /// A scheduler that emits a single `[PrefixReused, Token, Done]` batch
@@ -748,6 +760,9 @@ mod tests {
         }
         fn mode(&self) -> EngineMode {
             EngineMode::Serving
+        }
+        fn occupancy(&self) -> ignis_core::Occupancy {
+            ignis_core::Occupancy::default()
         }
     }
 
@@ -876,11 +891,84 @@ mod tests {
                 format!("submitted {id} {prompt_tokens} {class:?} {media:?}")
             }
             TelemetryFact::Routed(event) => format!("routed {event:?}"),
-            TelemetryFact::Tick => "tick".to_owned(),
+            // The occupancy rides along, so the flag-off/flag-on comparison
+            // is over the widened fact and not merely over its variant.
+            TelemetryFact::Tick(occupancy) => format!("tick {occupancy:?}"),
             TelemetryFact::Cancelled(_) | TelemetryFact::SetStats(_) | TelemetryFact::SetMetrics(_) => {
                 unreachable!("only the async side sends these")
             }
         }
+    }
+
+    /// GitHub #216: the occupancy on a tick is read *after* the step, so the
+    /// step that releases the last request's pages reports the release. No
+    /// tick is sent while the scheduler is idle, so there is no later step to
+    /// report it on — read before `advance()` instead and the last tick of a
+    /// load would carry the pages it was still holding, for as long as the
+    /// load stayed idle.
+    ///
+    /// Against a real `ConcreteScheduler`, with prompt reuse off so the pool
+    /// genuinely empties: with it on a checkpoint legitimately keeps a tail
+    /// page and zero would be the wrong assertion.
+    #[tokio::test]
+    async fn the_last_tick_of_a_load_carries_the_release_and_not_the_pages_it_freed() {
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                prompt_reuse: false,
+                retained_slots: 0,
+                ..SchedulerConfig::default()
+            },
+            Arc::new(MockCompute::new()),
+        );
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (thread_tx, mut thread_rx) = unbounded_channel();
+        let (consumer_tx, consumer_rx) = unbounded_channel();
+        let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let driver = std::thread::spawn(move || {
+            model_thread_loop(Box::new(scheduler), command_rx, thread_tx)
+        });
+        let consumer = tokio::spawn(telemetry_task(
+            Telemetry::new(Arc::new(crate::telemetry::FixedClock::new(0))),
+            consumer_rx,
+            Arc::clone(&counters),
+        ));
+        let engine = Engine {
+            model_id: "test-model".into(),
+            max_model_len: 8192,
+            commands: command_tx,
+            facts: consumer_tx.clone(),
+            counters,
+        };
+        let recorder = tokio::spawn(async move {
+            let mut ticks = Vec::new();
+            while let Some(fact) = thread_rx.recv().await {
+                if let TelemetryFact::Tick(occupancy) = &fact {
+                    ticks.push(*occupancy);
+                }
+                let _ = consumer_tx.send(fact);
+            }
+            ticks
+        });
+
+        let (_id, mut rx) = engine
+            .submit(input("test-model", vec![1, 2, 3], Some(4)), RequestClass::Interactive)
+            .await
+            .expect("submit");
+        drain_to_done(&mut rx).await;
+        drop(engine);
+        driver.join().expect("the model thread exits cleanly");
+        let ticks = recorder.await.expect("the recorder finishes");
+        consumer.await.expect("the consumer drains");
+
+        let last = *ticks.last().expect("the load ticked");
+        assert!(
+            ticks.iter().any(|t| t.kv_used_pages > 0),
+            "the request held pages while it ran: {ticks:?}"
+        );
+        assert_eq!(last.kv_used_pages, 0, "the last tick reports the release: {ticks:?}");
+        assert_eq!(last.kv_ram_used_bytes, 0, "{ticks:?}");
+        assert!(last.kv_pool_pages > 0, "and still names the pool it is empty of");
     }
 
     /// Runs a fixed workload through a real model thread and telemetry
@@ -987,9 +1075,13 @@ mod tests {
             "ignis_generated_tokens_total 12",
             // GitHub #190: the retained-state facts reach the projection
             // through this consumer too — three first turns, each missing
-            // both tiers the default load carries.
-            "ignis_retained_state_misses_total{tier=\"device\"} 3",
-            "ignis_retained_state_misses_total{tier=\"kv_ram\"} 3",
+            // both tiers the default load carries. GitHub #216: and every
+            // miss the fact stream carries is a checkpoint miss, so the
+            // prefix series sits at zero rather than at an invented figure.
+            "ignis_retained_state_misses_total{tier=\"device\",kind=\"checkpoint\"} 3",
+            "ignis_retained_state_misses_total{tier=\"kv_ram\",kind=\"checkpoint\"} 3",
+            "ignis_retained_state_misses_total{tier=\"device\",kind=\"prefix\"} 0",
+            "ignis_retained_state_misses_total{tier=\"kv_ram\",kind=\"prefix\"} 0",
         ] {
             assert!(exposition.contains(&format!("\n{line}\n")), "no `{line}` in:\n{exposition}");
         }

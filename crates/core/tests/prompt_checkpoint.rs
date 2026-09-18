@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{
     ArtifactHash, BlobIdentity, ConcreteScheduler, IdentityField, KvFormat, MockCompute, Scheduler,
@@ -108,6 +108,7 @@ fn reuses(events: &[SchedEvent], request: RequestId) -> Vec<(ReuseSource, u32, u
                 source,
                 tokens,
                 restore_micros,
+                ..
             } if *r == request => Some((*source, *tokens, *restore_micros)),
             _ => None,
         })
@@ -1167,6 +1168,7 @@ fn a_spilled_checkpoint_returns_its_pages_to_the_pool() {
         SchedEvent::RetainedState {
             operation: RetainedStateOperation::Spill,
             source: ReuseSource::KvRam,
+            kind: RetainedKind::Checkpoint,
         }
     )));
     assert_eq!(

@@ -59,7 +59,7 @@
 
 use std::sync::Arc;
 
-use ignis_core::checkpoint::ReuseSource;
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
@@ -132,6 +132,21 @@ fn prefix_reuses(events: &[SchedEvent], request: RequestId) -> Vec<u32> {
             SchedEvent::PrefixReused {
                 request: r, tokens, ..
             } if *r == request => Some(*tokens),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every retained-state lifecycle fact, as `(operation, tier, kind)`.
+fn retained_state(
+    events: &[SchedEvent],
+) -> Vec<(RetainedStateOperation, ReuseSource, RetainedKind)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SchedEvent::RetainedState { operation, source, kind } => {
+                Some((*operation, *source, *kind))
+            }
             _ => None,
         })
         .collect()
@@ -732,6 +747,65 @@ fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
         "the larger request ran too"
     );
     assert_eq!(sched.prefix_pinned_pages(), 0, "the block went when it had to");
+}
+
+#[test]
+fn a_lifecycle_fact_names_which_kind_of_retained_state_moved() {
+    // GitHub #216: `tier` alone counted a prompt checkpoint and a shared
+    // prefix as one thing. The same pool as
+    // `the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds`,
+    // read through the facts instead of through the pool: the two bets are
+    // given up one after the other, so each step's facts name exactly one
+    // kind, and a fact that guessed the kind from the tier or the operation
+    // could not tell these two steps apart — both are a `Discard` or a
+    // `Spill` in the same two tiers.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = scheduler(
+        compute.clone(),
+        SchedulerConfig {
+            kv_capacity_pages: 6,
+            max_sequence_tokens: 96,
+            ..config()
+        },
+    );
+    sched
+        .submit(input(tokens(1, 40), None, Some(32), 4), RequestClass::Interactive)
+        .unwrap();
+    sched
+        .submit(
+            input([tokens(1, 20), tokens(700, 30)].concat(), Some(20), None, 4),
+            RequestClass::Interactive,
+        )
+        .unwrap();
+    run_to_idle(&mut sched);
+
+    // One discard's worth of pressure: the checkpoint goes, the block stays.
+    sched
+        .submit(input(tokens(2000, 60), None, None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    let moved = retained_state(&events);
+    assert!(
+        moved.iter().any(|&(operation, _, kind)| operation == RetainedStateOperation::Spill
+            && kind == RetainedKind::Checkpoint),
+        "the checkpoint's spill says checkpoint: {moved:?}"
+    );
+    assert!(
+        !moved.iter().any(|&(_, _, kind)| kind == RetainedKind::Prefix),
+        "and nothing happened to a prefix on this step: {moved:?}"
+    );
+
+    // More pressure: now the block goes, and the checkpoint is already gone.
+    sched
+        .submit(input(tokens(3000, 92), None, None, 4), RequestClass::Interactive)
+        .unwrap();
+    let events = run_to_idle(&mut sched);
+    let moved = retained_state(&events);
+    assert!(
+        moved.iter().any(|&(_, _, kind)| kind == RetainedKind::Prefix),
+        "the block's own fact says prefix: {moved:?}"
+    );
+    assert_eq!(sched.prefix_pinned_pages(), 0, "the block went");
 }
 
 #[test]

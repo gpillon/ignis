@@ -212,6 +212,22 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
         started["attributes"]["bind"].as_str().is_some(),
         "the bind address should appear as a typed attribute: {started}"
     );
+    // GitHub #216: the pinned host arena is locked in RAM for the process's
+    // whole life (ADR 0030), and no line anywhere used to say how large it
+    // is. It is a typed number, not a rendered size string.
+    assert!(
+        started["attributes"]["kv_host_pool_bytes"].as_u64().is_some(),
+        "the pinned KV-RAM arena's bytes should appear as a typed attribute: {started}"
+    );
+}
+
+#[test]
+fn the_startup_record_names_the_arena_the_operator_asked_for() {
+    // The flag reaches the record, rather than the record naming a default
+    // whatever was asked for (GitHub #216).
+    let records = run_until(&["--kv-host-pool-bytes", "2G"], &[], &["ignis.process.started"]);
+    let started = find(&records, "ignis.process.started");
+    assert_eq!(started["attributes"]["kv_host_pool_bytes"], 2u64 << 30);
 }
 
 #[test]

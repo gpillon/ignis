@@ -121,7 +121,7 @@ use std::time::{Duration, Instant};
 
 use crate::checkpoint::{
     CheckpointCapture, CheckpointEntry, CheckpointPool, KV_RAM_RESTORE_FLOOR_TOKENS,
-    RetainedStateOperation, ReuseSource, TierList,
+    RetainedKind, RetainedStateOperation, ReuseSource, TierList,
 };
 use crate::admission::{
     ActiveAdmissionSnapshot, AdmissionProtection, AdmissionResources, ProtectionPhase,
@@ -138,8 +138,8 @@ use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
 use crate::request::Request;
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
-    CheckpointClaim, Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, RetainedAt,
-    Scheduler, SharedPrefixClaim,
+    CheckpointClaim, Compute, DecodeJob, DecodeOutcome, Occupancy, PrefillJob, PrefillOutcome,
+    RetainedAt, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
     BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
@@ -834,6 +834,7 @@ impl ConcreteScheduler {
         events.push(SchedEvent::RetainedState {
             operation: RetainedStateOperation::Discard,
             source: entry.tier,
+            kind: RetainedKind::Checkpoint,
         });
         match entry.tier {
             ReuseSource::Device => {
@@ -929,6 +930,7 @@ impl ConcreteScheduler {
     /// A KV-RAM entry already out of the tier's budget: drop what names it,
     /// free its blob, and report the discard.
     fn forget_kv_ram_blob(&mut self, entry: RetainedKvRamEntry, events: &mut Vec<SchedEvent>) {
+        let kind = entry.blob.kind();
         match entry.blob {
             RetainedBlob::Checkpoint(id) => {
                 self.checkpoints.discard(id);
@@ -944,6 +946,7 @@ impl ConcreteScheduler {
         events.push(SchedEvent::RetainedState {
             operation: RetainedStateOperation::Discard,
             source: ReuseSource::KvRam,
+            kind,
         });
     }
 
@@ -971,6 +974,7 @@ impl ConcreteScheduler {
             events.push(SchedEvent::RetainedState {
                 operation: RetainedStateOperation::Discard,
                 source: ReuseSource::Device,
+                kind: RetainedKind::Prefix,
             });
         }
     }
@@ -1006,6 +1010,7 @@ impl ConcreteScheduler {
         events.push(SchedEvent::RetainedState {
             operation: RetainedStateOperation::Spill,
             source: ReuseSource::KvRam,
+            kind: RetainedKind::Prefix,
         });
         true
     }
@@ -1101,6 +1106,7 @@ impl ConcreteScheduler {
             events.push(SchedEvent::RetainedState {
                 operation,
                 source: ReuseSource::KvRam,
+                kind: RetainedKind::Prefix,
             });
         }
         true
@@ -1160,6 +1166,7 @@ impl ConcreteScheduler {
         events.push(SchedEvent::RetainedState {
             operation: RetainedStateOperation::Spill,
             source: ReuseSource::KvRam,
+            kind: RetainedKind::Checkpoint,
         });
         true
     }
@@ -2532,6 +2539,7 @@ impl Scheduler for ConcreteScheduler {
                         events.push(SchedEvent::RetainedState {
                             operation: RetainedStateOperation::Hit,
                             source: m.source,
+                            kind: RetainedKind::Checkpoint,
                         });
                         let r = &mut self.requests[i];
                         r.prefix_entry = on_device.then_some(m.prefix);
@@ -3105,18 +3113,29 @@ impl Scheduler for ConcreteScheduler {
                                 source: claim.source,
                                 tokens: claim.tokens,
                                 restore_micros: outcome.restore_micros,
+                                // The claim on a prefill job is a prompt
+                                // checkpoint's; a shared prefix a request
+                                // stands on is reported as `PrefixReused`.
+                                kind: RetainedKind::Checkpoint,
                             });
                             events.push(SchedEvent::RetainedState {
                                 operation: RetainedStateOperation::Restore,
                                 source: claim.source,
+                                kind: RetainedKind::Checkpoint,
                             });
                             self.release_kv_ram_claim(i, true);
                         }
                         let misses = std::mem::take(&mut self.requests[i].pending_retained_misses);
                         for source in misses.iter() {
+                            // The checkpoint pool's lookup is the only one
+                            // that reports a miss (GitHub #216): the prefix
+                            // walk beside it records none, so every miss is a
+                            // checkpoint miss, and none is invented for the
+                            // prefix side to make the two look symmetric.
                             events.push(SchedEvent::RetainedState {
                                 operation: RetainedStateOperation::Miss,
                                 source,
+                                kind: RetainedKind::Checkpoint,
                             });
                         }
                     }
@@ -3354,6 +3373,18 @@ impl Scheduler for ConcreteScheduler {
             EngineMode::Serving
         } else {
             EngineMode::Idle
+        }
+    }
+
+    /// Three field reads (GitHub #216). `kv_used_pages` is the counter the
+    /// admission machine keeps as it reserves and releases, so the step that
+    /// releases the last request's pages is also the step that reports the
+    /// release — there is no later step to report it on.
+    fn occupancy(&self) -> Occupancy {
+        Occupancy {
+            kv_used_pages: self.kv_used_pages,
+            kv_pool_pages: self.capacity.kv_pages,
+            kv_ram_used_bytes: self.host.used_bytes(),
         }
     }
 }

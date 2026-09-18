@@ -4,7 +4,12 @@
 
 Accepted (2026-09-13, owner decision). Supersedes the interval-counter
 boundary in ADR 0011 (Context, Consequences) and the "Existing JSONL interval
-telemetry remains compatible" consequence in ADR 0017.
+telemetry remains compatible" consequence in ADR 0017. Amended 2026-09-18
+(#216): `kv_used_pct` is no longer a placeholder — ADR 0030 §Observability
+gives the model thread's tick the scheduler's own occupancy — so it is an
+attribute of the interval event and joins the change detection below. The
+"only authoritative values are attributes" rule is unchanged and now omits
+`prefilling` alone.
 
 ## Context
 
@@ -41,8 +46,18 @@ Nothing outside the repo's own tests reads the line: no bench harness, no
   DEBUG event. The step number rides along as `tick`, so the cadence is still
   readable.
 - Only authoritative values are attributes: `tick`, `waiting`, `running`,
-  `kv_evictions`. `prefilling` and `kv_used_pct` are omitted while they are
-  placeholder zeros, by the same rule ADR 0017 applies to metrics.
+  `kv_used_pct` (#216), `kv_evictions`. `prefilling` is omitted while it is a
+  placeholder zero, by the same rule ADR 0017 applies to metrics.
+- The change detection is over every attribute, `kv_used_pct` included. Left
+  out of it, the line would report a percentage frozen at the last time some
+  *other* counter moved — a decode run that fills the pool holds `waiting`
+  and `running` constant throughout. The trade is deliberate: an integer
+  percentage bounds a steady fill to a line per point rather than per step,
+  but a load whose occupancy oscillates across a boundary does log a line per
+  step, which is the crowding this ADR exists to avoid. It is accepted
+  because DEBUG is off by default and because a percentage that does not
+  move is worse than one that moves too often — a gauge nobody can trust is
+  the placeholder this replaced.
 - The separate telemetry sink is removed: `--telemetry`/`-t`,
   `IGNIS_TELEMETRY`, the `ignis.telemetry.sink_selected`/`sink_failed`
   events, and the sink parameter of the engine constructors.

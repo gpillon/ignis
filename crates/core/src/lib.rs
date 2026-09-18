@@ -63,7 +63,8 @@ pub use admission::{
     ProtectionPhase, RetainedLaneCandidate,
 };
 pub use checkpoint::{
-    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool, ReuseSource,
+    CheckpointCounters, CheckpointEntry, CheckpointId, CheckpointMatch, CheckpointPool,
+    RetainedKind, ReuseSource,
 };
 pub use compute::{LayerKind, ModelConfig};
 pub use concrete::{
@@ -86,7 +87,7 @@ pub use retained_slot::{
     NotTaken, RetainedHolder, RetainedSkip, RetainedSlot, RetainedSlotLedger, RetainedSlots,
 };
 pub use scheduler::{
-    Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
+    Compute, DecodeJob, DecodeOutcome, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
 };
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use vision::{
