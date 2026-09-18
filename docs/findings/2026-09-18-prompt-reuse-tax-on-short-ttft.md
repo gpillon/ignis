@@ -178,6 +178,34 @@ themselves twice over, because the prefix grows past the block and only they
 let turn N reuse turn N−1. **Every cut is load-bearing for a real shape**, and
 removing any of them trades one workload against another.
 
+## What the real trace says: 6.8%, not 58%
+
+The two synthetic workloads above have ~81-token tails, where a cut is most of
+the work. A recorded 157-request qwen-code session
+(`.scratch/vram-analysis/trace-merged-system.jsonl`) does not look like that.
+Over its first 60 requests, each prompt's longest shared prefix with an
+earlier one is a **median 78.2%** — reuse has plenty to bite on — but the tail
+left over is a **median 5,205 tokens** (p25 3,571, p75 12,645), and **not one
+of the 59 tails is under a single 1,024-token serving chunk**.
+
+Replayed in order with `max_tokens` forced to 1, so what is timed is the
+prefill (`.scratch/prefill-2026-09-18/replay_prefill.py`):
+
+| | calls | tokens | GPU | share |
+|---|---|---|---|---|
+| full chunks (≥512 tokens) | 490 | 496,176 | 120.6 s | **93.2%** |
+| short calls (<512 tokens) — the cuts | 162 | 12,501 | **8.8 s** | **6.8%** |
+
+**10.9 prefill calls per request: 8.2 full chunks and 2.7 cut tails.** A cut
+tail is a median of 19 tokens and costs a median of 32.8 ms — more than the
+19 ms fitted at 1K context, because a traversal at 95K context carries its
+attention too (p90 112.7 ms).
+
+So the cut tax on the load this engine is built for is **6.8% of prefill**,
+about 146 ms per request. The 58% in the table above is an artifact of tails
+short enough that the fixed cost is everything; real agent turns add thousands
+of tokens, and the fixed cost is amortised over eight full chunks.
+
 ## Implications
 
 - Any TTFT comparison against the reference should state which side of
@@ -188,9 +216,9 @@ removing any of them trades one workload against another.
   *taking* a cut costs a whole extra traversal of the model.
 - That leaves one direction rather than three: let the leaf publish or capture
   at an interior offset **without ending the traversal** — snapshot the mutable
-  state there and keep going. The prize is the two extra traversals, about
-  38 ms per request: 138 → ~58 ms on the stable-system workload (−58%), 206 →
-  ~168 ms on the growing conversation (−18%).
+  state there and keep going. **The prize on the real load is 6.8% of prefill**,
+  ~146 ms a request, which is a poor trade against the leaf work it needs. The
+  58% figure belongs to a synthetic shape, not to this engine's traffic.
 - The `--prompt-reuse off` comparison at the top of this finding therefore
   measures the premium, not an available saving. The saving available without
   giving anything up is the traversal, not the reuse.
