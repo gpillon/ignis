@@ -105,9 +105,11 @@ describe("toolResult and agentSummary", () => {
 });
 
 describe("parallelAgents", () => {
-  const served = (nextHopProtocol: string) =>
+  const served = (nextHopProtocol: string) => {
+    const entry = { name: "/v1/chat/completions", nextHopProtocol, startTime: 1 } as PerformanceResourceTiming;
     vi.spyOn(performance, "getEntriesByType").mockImplementation(((kind: string) =>
-      kind === "resource" ? [{ name: "/v1/chat/completions", nextHopProtocol, startTime: 1 }] : []) as typeof performance.getEntriesByType);
+      kind === "resource" ? [entry] : []) as typeof performance.getEntriesByType);
+  };
 
   afterEach(() => vi.restoreAllMocks());
 
