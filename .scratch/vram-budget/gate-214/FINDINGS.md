@@ -17,9 +17,9 @@ Units: binary MiB/GiB, as Task Manager's per-process WDDM counters report them.
 | 2 | Process shared equal to the KV-RAM arena and not moving | **PASS** — 8266–8268 MiB, spread 2 MiB; arena 8192 + 74 MiB pre-arena baseline |
 | 3 | No dedicated/shared trading at constant commit | **PASS** — 0 samples (baseline: 23) |
 | 4 | `vram_plan` total matches Task Manager's dedicated right after load | **PASS** — 28558 vs 28574 MiB, +16 MiB, tolerance ±32 MiB |
-| 5 | Every request of the raw trace served, zero `leaf_error` storms | **PARTIAL** — 71/157 served, all 2xx (zero 4xx in the run), **0** `leaf_error`; stopped on the owner's call (§Departures) |
+| 5 | Every request of the raw trace served, zero `leaf_error` storms | **PARTIAL, accepted by the owner** — 71/157 served, all 2xx (zero 4xx in the run), **0** `leaf_error`; stopped and then accepted on the owner's call (§Departures) |
 | 6 | Record KV capacity, retained slots in use, publish/capture skips, comparison table | **Done** — §Recorded numbers, and the finding's comparison table |
-| 7 | A failed check files a follow-up with the evidence, no tuning | **Done** — #219 for the 86 unserved trace requests, #218 for the redaction that hid the KV token capacity. Neither was tuned around |
+| 7 | A failed check files a follow-up with the evidence, no tuning | **Done** — #218 for the redaction that hid the KV token capacity (fixed); #219 for the 86 unserved trace requests, which the owner then closed as not planned, accepting the coverage. Neither was tuned around |
 
 ## The run
 
@@ -125,7 +125,9 @@ Stated from this run's own sample noise, as the ticket asks:
    and the verdict had saturated, so the owner chose to stop. What the
    remaining 86 would have added is render coverage, not memory coverage.
    Filed as #219, which is what criterion 7 asks of a check left partial —
-   disclosure here is not a substitute for the ticket.
+   disclosure here is not a substitute for the ticket. **The owner then
+   accepted 71/157 as sufficient and closed #219 as not planned**, so the
+   coverage is a decision on the record rather than an open gap.
 2. **`ARGS="--vision"`** instead of a `VISION=1` Makefile default: that knob is
    commit 726a1b7 on `issue-191`, not on this branch. Same flag either way.
 3. **Explicit `ARTIFACT=`**: the worktree has no `models/` directory.

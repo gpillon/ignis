@@ -132,8 +132,10 @@ workers.
   out of scope in the spec).
 - 71 of the trace's 157 requests were replayed. The window was 10 minutes past
   what the ticket requires and the memory verdict had saturated, so the run was
-  stopped by the owner; the remaining 86 requests would have added render
-  coverage, not memory coverage.
+  stopped by the owner, who then accepted that coverage and closed the
+  follow-up as not planned. The remaining 86 requests would have added render
+  coverage, not memory coverage; what stays unestablished is whether some body
+  among them renders differently for a reason this run could not see.
 - No image request was served. `--vision` is exercised here as a reservation
   that the plan accounts for, not as an encode path; the encode path has its
   own GPU tests.
@@ -157,7 +159,8 @@ workers.
   confirming the derivation used here (that start's plan holds 7,091 pages
   rather than 6,989, from a different amount of free VRAM).
 - https://github.com/gpillon/ignis/issues/219 — the 86 raw-trace requests this
-  run did not reach. Render coverage only; the memory criteria do not depend
-  on them.
+  run did not reach. Render coverage only; the memory criteria do not depend on
+  them. Closed as not planned: the owner accepted 71/157 rather than spend
+  another ~40 minutes of exclusive GPU on it.
 - The run record lists the run's departures and the exact commands:
   [`.scratch/vram-budget/gate-214/FINDINGS.md`](../../.scratch/vram-budget/gate-214/FINDINGS.md).
