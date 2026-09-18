@@ -66,6 +66,7 @@ export type Latency = {
  */
 export type Meter = { used: number | null; capacity: number | null; share: number | null; series: Values };
 
+
 /** One retained-state series: what it stands at, and what it gained over the window. */
 export type RetainedCount = { total: number | null; window: number | null };
 
@@ -258,11 +259,14 @@ export function deriveMemory(points: Point[], since: number): Memory {
     const known = values.filter((v): v is number => v !== null);
     return known.length ? known.reduce((a, b) => a + b, 0) : null;
   };
+  // The series a meter sparks is the window's own, so the window pill governs
+  // these figures as it governs every other chart on the board.
+  const inWindow = points.filter((p) => p.at >= since);
   const meter = (used: number | null, capacity: number | null, pick: CounterPick): Meter => ({
     used,
     capacity,
     share: used !== null && capacity !== null && capacity > 0 ? used / capacity : null,
-    series: points.map((p) => pick(p.snap)),
+    series: inWindow.map((p) => pick(p.snap)),
   });
   const count = (pick: CounterPick): RetainedCount => ({ total: pick(last), window: increaseOver(points, pick, since) });
 

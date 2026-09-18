@@ -75,6 +75,13 @@ describe("deriveMemory", () => {
     expect(m.pagesInUse.series).toEqual([100, 300]);
   });
 
+  it("sparks the window the pill asks for, not the whole history", () => {
+    const pages = (ms: number, used: number) => memoryAt(ms, { kvPoolUsedPages: used, kvPoolPages: 400 });
+    const points = [pages(0, 10), pages(30_000, 20), pages(60_000, 30)];
+    expect(deriveMemory(points, 30_000).pagesInUse.series).toEqual([20, 30]);
+    expect(deriveMemory(points, -Infinity).pagesInUse.series).toEqual([10, 20, 30]);
+  });
+
   it("lays the plan out in plan order and leaves the rest of the budget to the KV pool", () => {
     const reserved = { ...emptySnapshot().memory.reserved, weights: 600, workspace: 300, residual: 100 };
     const m = deriveMemory([memoryAt(0, { reserved, budgetBytes: 2000, kvPoolPages: 8, kvPageBytes: 100 })], 0);

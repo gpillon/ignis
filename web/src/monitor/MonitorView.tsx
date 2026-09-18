@@ -622,6 +622,10 @@ function planSegments(memory: Memory): PlanSegment[] {
   return segments;
 }
 
+/** Whether the plan overran the budget it was laid out in — only `--allow-vram-oversubscription` lets it. */
+const oversubscribed = (memory: Memory) =>
+  memory.budgetBytes !== null && memory.linesBytes !== null && memory.linesBytes + (memory.kvPool.bytes ?? 0) > memory.budgetBytes;
+
 /** What the load reserved: the plan's lines laid out inside the budget they were planned in. */
 function PlanCard({ memory }: { memory: Memory }) {
   const segments = planSegments(memory);
@@ -660,6 +664,7 @@ function PlanCard({ memory }: { memory: Memory }) {
           <p className="text-[11px] text-ash">
             The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}; what the budget left beyond them holds the pool's own
             block tables, which the plan does not export apart.
+            {oversubscribed(memory) && " This load reserved more than its budget (--allow-vram-oversubscription), so the bar is the plan, not the budget."}
           </p>
         </>
       )}
@@ -793,6 +798,10 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
                 <td className="py-1.5 pr-4 font-display font-semibold">{FAMILY_LABEL[family]}</td>
                 {columns.map((c) => {
                   const cell = memory.retained[family][c.tier][c.kind];
+                  // A zero where the meters above would show a dash: `render()`
+                  // writes all twenty-four of these on every scrape, so an
+                  // absent one means a server older than #216, not an idle
+                  // tier — and reading it as zero is the truthful thing.
                   // The prefix walk raises no miss at all, so this series is
                   // zero by construction rather than a prefix that never
                   // missed (ADR 0017's note, GitHub #216/#222).
@@ -818,8 +827,9 @@ function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
         </table>
       </div>
       <p className="text-[11px] text-ash">
-        Tokens reused counts prompt tokens skipped; the five below it count images. A load that never spilled shows KV-RAM at zero, and a load with prompt reuse
-        off shows every column at zero.
+        Tokens reused counts prompt tokens skipped and the two lookup rows count lookups; spills, discards and restores count images. A load that never spilled
+        shows KV-RAM at zero, and a load with prompt reuse off shows every column at zero. A column shows a zero whether the load reported one or reported
+        nothing at all: the server emits all twenty-four series on every scrape, so an absent one means an older server, not an idle tier.
       </p>
     </Card>
   );
