@@ -6,7 +6,8 @@ export function SessionsPanel(props: {
   open: boolean;
   list: SessionList;
   activeId: number;
-  streamingId: number | null;
+  /** The sessions a reply is streaming into; more than one when turns run in parallel. */
+  streaming: ReadonlySet<number>;
   onNew: () => void;
   onSelect: (id: number) => void;
   onRemove: (id: number) => void;
@@ -32,7 +33,7 @@ export function SessionsPanel(props: {
             key={s.id}
             session={s}
             active={s.id === props.activeId}
-            streaming={s.id === props.streamingId}
+            streaming={props.streaming.has(s.id)}
             onSelect={() => props.onSelect(s.id)}
             onRemove={() => props.onRemove(s.id)}
           />

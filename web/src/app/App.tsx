@@ -37,6 +37,8 @@ export function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
+  // Off: the page runs one turn at a time, whichever session it is in.
+  const [parallel, setParallel] = useState(false);
   const [input, setInput] = useState("");
   // The images the next prompt will carry. They belong to the box, not to a
   // session: once sent they live on the user message, and the box is empty again.
@@ -48,7 +50,7 @@ export function App() {
   const [memoryOpen, setMemoryOpen] = useState(false);
   const closeMemory = useCallback(() => setMemoryOpen(false), []);
   const [drawer, setDrawer] = useState<Drawer>(null);
-  const chat = useConversation({ model, settings, tools });
+  const chat = useConversation({ model, settings, tools, parallel });
   const { active } = chat;
   const monitoring = view === "monitor" && monitorVisible;
 
@@ -120,7 +122,7 @@ export function App() {
             open={drawer === "sessions"}
             list={chat.list}
             activeId={active.id}
-            streamingId={chat.streamingId}
+            streaming={chat.streaming}
             onNew={newSession}
             onSelect={selectSession}
             onRemove={chat.deleteSession}
@@ -144,8 +146,8 @@ export function App() {
               value={input}
               onChange={setInput}
               ready={model.state === "ready"}
-              busy={chat.busy}
-              streamingHere={chat.streamingId === active.id}
+              busy={chat.sendBlocked}
+              streamingHere={chat.streamingHere}
               usage={contextUsage(active.log, settings.maxTokens, model.state === "ready" ? model.contextLimit : null)}
               onSend={send}
               onStop={chat.stop}
@@ -169,6 +171,8 @@ export function App() {
             onToolsChange={setTools}
             markdown={markdown}
             onMarkdownChange={setMarkdown}
+            parallel={parallel}
+            onParallelChange={setParallel}
             attachments={active.attachments}
             onOpenMemory={() => setMemoryOpen(true)}
           />

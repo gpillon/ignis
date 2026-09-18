@@ -31,8 +31,23 @@ import { agentExtras, routeCall, toolExtras, type ToolsState, turnDateTime } fro
 import { getTavilyKey } from "../tools/web/tavilyKey.ts";
 import { parseWebCall, runWeb, type WebRun, webToolResult } from "../tools/web/web.ts";
 
-// The conversation loop: the sessions, the one reply streaming at a time,
-// and the tools a reply calls. Sessions live in memory; a reload starts over.
+// The conversation loop: the sessions, the replies streaming into them, and
+// the tools a reply calls. Sessions live in memory; a reload starts over.
+//
+// A session streams one reply at a time — its history is a line, and two
+// replies writing into it would fork it. Whether *other* sessions may stream
+// meanwhile is the caller's choice (`parallel`): off, the page runs one turn
+// and every Send waits for it; on, each session runs its own. Either way the
+// browser's stream budget (GitHub #220) queues what the connection cannot
+// carry, so parallel sessions share the same five streams on localhost.
+
+/**
+ * A turn may start in `sessionId`: nothing streams there, and — unless
+ * sessions run in parallel — nothing streams anywhere else either.
+ */
+export function canStartTurn(streaming: ReadonlySet<number>, sessionId: number, parallel: boolean): boolean {
+  return parallel ? !streaming.has(sessionId) : streaming.size === 0;
+}
 
 const exchangeOf = (m: Message): Exchange => ({
   role: m.role,
@@ -44,16 +59,30 @@ const exchangeOf = (m: Message): Exchange => ({
   dateTime: m.dateTime,
 });
 
-export function useConversation({ model, settings, tools }: { model: ModelState; settings: PlaygroundSettings; tools: ToolsState }) {
+export function useConversation({
+  model,
+  settings,
+  tools,
+  parallel,
+}: {
+  model: ModelState;
+  settings: PlaygroundSettings;
+  tools: ToolsState;
+  /** Sessions other than the one streaming may start their own turn. */
+  parallel: boolean;
+}) {
   // Session and message ids. The counter lives in a ref, not in a module
   // variable: a hot reload keeps component state but re-runs the module, and
   // a restarted count would hand out ids still on screen (duplicate keys).
   const ids = useRef(2);
   const newId = () => ids.current++;
   const [list, setList] = useState<SessionList>(() => ({ sessions: [createSession(1)], activeId: 1 }));
-  // The session a reply is streaming into; one stream at a time.
-  const [streamingId, setStreamingId] = useState<number | null>(null);
-  const controller = useRef<AbortController | null>(null);
+  // The sessions a reply is streaming into, for the render.
+  const [streaming, setStreaming] = useState<ReadonlySet<number>>(() => new Set());
+  // The same, as the turns themselves see it: a ref settles two Sends in one
+  // tick, which the state — one render behind — would let both through.
+  const controllers = useRef(new Map<number, AbortController>());
+  const running = () => new Set(controllers.current.keys());
   const [attachError, setAttachError] = useState<string | null>(null);
   // Questions waiting for the user, by `messageId:callId`: each settles with the answer.
   const waiting = useRef(new Map<string, (answer: string | null) => void>());
@@ -62,9 +91,13 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   const following = useRef(true);
 
   const active = list.sessions.find((s) => s.id === list.activeId) ?? list.sessions[0];
-  const busy = streamingId !== null;
-  /** A new turn can start: nothing streams and the model is known. */
-  const canRun = !busy && model.state === "ready";
+  /** Anything at all is streaming: what the header's pulse and the model dot show. */
+  const busy = streaming.size > 0;
+  const streamingHere = streaming.has(active.id);
+  /** A new turn can start in the session on screen, and the model is known. */
+  const canRun = canStartTurn(streaming, active.id, parallel) && model.state === "ready";
+  /** Send waits: this session streams, or another one does and turns are not parallel. */
+  const sendBlocked = !canStartTurn(streaming, active.id, parallel);
 
   function selectSession(id: number) {
     following.current = true;
@@ -78,6 +111,9 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
   }
 
   function deleteSession(sessionId: number) {
+    // A session that goes takes its turn with it: the loop would otherwise
+    // keep a stream open, writing into messages nobody can read.
+    controllers.current.get(sessionId)?.abort();
     const id = newId();
     setList((l) => removeSession(l, sessionId, id));
   }
@@ -91,7 +127,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
    * ends the whole turn, agents included.
    */
   async function exchange(sessionId: number, history: Message[], prompt: string | null, images: PromptImage[] = []) {
-    if (busy || model.state !== "ready") return;
+    if (!canStartTurn(running(), sessionId, parallel) || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
     // The notes and files the tools write into the prompt are as they were when the turn started. The date and
     // time is the session's, not this turn's: it sits ahead of the whole conversation, so a moment that moved
@@ -111,10 +147,12 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         logRow(sessionId, { laneTag: "agent", reasoningEffort: "none", figures, error, agent: "run_js safety check" }),
     };
     const abort = new AbortController();
-    controller.current = abort;
-    // Sending is a request to see the answer: follow it from the bottom.
-    following.current = true;
-    setStreamingId(sessionId);
+    controllers.current.set(sessionId, abort);
+    // Sending is a request to see the answer: follow it from the bottom. Only
+    // the session on screen, though — a turn running in another one must not
+    // drag the reader down.
+    if (sessionId === list.activeId) following.current = true;
+    setStreaming((s) => new Set(s).add(sessionId));
 
     let conversation = history;
     if (prompt !== null) {
@@ -170,8 +208,12 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         ),
       }));
     } finally {
-      controller.current = null;
-      setStreamingId(null);
+      controllers.current.delete(sessionId);
+      setStreaming((s) => {
+        const rest = new Set(s);
+        rest.delete(sessionId);
+        return rest;
+      });
     }
   }
 
@@ -342,7 +384,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
    */
   function rerun(messageId: number, prompt: string | null) {
     const index = active.messages.findIndex((m) => m.id === messageId);
-    if (index === -1 || busy || model.state !== "ready") return;
+    if (index === -1 || !canStartTurn(running(), active.id, parallel) || model.state !== "ready") return;
     const sessionId = active.id;
     const images = active.messages[index].images ?? [];
     setList((l) => ({ ...l, sessions: truncateFrom(l.sessions, sessionId, messageId) }));
@@ -386,15 +428,20 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     waiting.current.get(`${messageId}:${callId}`)?.(text);
   }
 
+  /** Stops the turn on screen; with nothing streaming here, stops the ones that are. */
   function stop() {
-    controller.current?.abort();
+    const here = controllers.current.get(active.id);
+    if (here) return here.abort();
+    for (const turn of controllers.current.values()) turn.abort();
   }
 
   return {
     list,
     active,
-    streamingId,
+    streaming,
+    streamingHere,
     busy,
+    sendBlocked,
     canRun,
     following,
     selectSession,
