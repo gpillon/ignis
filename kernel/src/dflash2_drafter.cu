@@ -3,6 +3,8 @@
 
 #include "dflash2_drafter.h"
 
+#include "ignis_dflash2_topk.h"
+
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/dflash2_dynamic_conv.h"
 #include "ninfer/ops/dflash2_selector_predecessors.h"
@@ -254,7 +256,16 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, std::uint32
   ninfer::ops::linear(proposal_hidden, model->output_head, logits, stream);
   ninfer::Tensor candidate_ids    = arena.alloc(ninfer::DType::I32, {top_k, draft_columns, 1, 1});
   ninfer::Tensor candidate_values = arena.alloc(ninfer::DType::BF16, {top_k, draft_columns, 1, 1});
-  ninfer::ops::dflash2_topk(logits, top_k, candidate_ids, candidate_values, stream);
+  // Ours rather than the vendored op (kernel/include/ignis_dflash2_topk.h): the
+  // vendored one gives a single warp to a column and spends 3.1 ms of every
+  // decode round selecting 16 rows of 248,046. Same contract and the same
+  // answer bit-for-bit; a shape it does not specialize it forwards.
+  const std::size_t topk_workspace_bytes =
+      ignis_dflash2_topk_workspace_bytes(vocab, draft_columns, top_k);
+  const ninfer::DeviceSpan topk_workspace =
+      arena.alloc_bytes(std::max<std::size_t>(topk_workspace_bytes, 1));
+  ignis_dflash2_topk(logits, top_k, candidate_ids, candidate_values, topk_workspace.data,
+                     topk_workspace.bytes, stream);
   const ninfer::Tensor candidates = candidate_ids.view({top_k, k, batch});
   ninfer::Tensor unary = arena.alloc(ninfer::DType::FP32, {top_k, k, batch, 1});
   ninfer::ops::cast_bf16_to_fp32(candidate_values.view({top_k, k, batch}), unary, stream);

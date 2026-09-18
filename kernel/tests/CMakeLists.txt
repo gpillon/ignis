@@ -407,6 +407,15 @@ add_test(NAME ignis_kernel_model_load_vision_options_test
 # ignis_kernel for the pool ABI, the production view builders and the
 # engine's own attention-workspace sizing, and keeps the no-SKIP_RETURN_CODE
 # rule (ADR 0006).
+# OURS, not vendored: the DFlash2 drafter's top-k (kernel/src/dflash2_topk.h)
+# against the vendored op it replaces. The vendored op specifies an exact
+# deterministic selection, so the bound is bit equality and there is nothing
+# to calibrate. Links ignis_kernel for our implementation and ignis_vendor for
+# the oracle; no SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
+target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
+
 add_executable(ignis_kernel_hq_route_agreement_test test_hq_route_agreement.cu)
 target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")

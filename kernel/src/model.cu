@@ -26,6 +26,8 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 
+#include "ignis_dflash2_topk.h"
+
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/weight.h"
@@ -766,6 +768,15 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   forward += bf16_bytes(hidden * drafts) * 2;                       // packed, proposal_hidden
   forward += bf16_bytes(vocab * drafts);                            // logits
   forward += i32_bytes(top_k * drafts) + bf16_bytes(top_k * drafts); // candidate ids, values
+  // The row-split partials our own top-k merges (kernel/include/ignis_dflash2_topk.h),
+  // asked of the same function the call site bumps with; a shape it forwards
+  // to the vendored op reports zero, and the call site still bumps one byte
+  // because the arena admits no empty allocation.
+  forward += std::max<std::size_t>(
+      ignis_dflash2_topk_workspace_bytes(static_cast<std::int32_t>(vocab),
+                                         static_cast<std::int32_t>(drafts),
+                                         static_cast<std::int32_t>(top_k)),
+      1);                                                             // top-k partials
   forward += fp32_bytes(top_k * drafts) + i32_bytes(top_k * drafts); // unary, predecessors
   forward += bf16_bytes(kDflash2SelectorRank * drafts);             // hidden_proj
   forward += fp32_bytes(kDflash2SelectorRank * drafts);             // hidden_proj_f32
