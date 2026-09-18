@@ -1,6 +1,7 @@
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
+import { currentStreamBudget } from "../../api/slots.ts";
 import { streamChat } from "../../api/stream.ts";
 import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
 import { isLocalTool, type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../local/local.ts";
@@ -58,6 +59,16 @@ export function agentSystemPrompt(extras: ToolExtras = {}): string {
 
 /** ignis admits 8 requests in flight; the main reply has finished while its agents run. */
 export const MAX_PARALLEL_AGENTS = 8;
+
+/**
+ * How many agents may stream at once: the engine's ceiling, or fewer when the
+ * browser cannot hold that many connections open (GitHub #220, see
+ * `api/slots.ts`). Over HTTP/1.1 the remaining agents stay queued for a moment
+ * instead of stalling the whole page, the Monitor included.
+ */
+export function parallelAgents(): number {
+  return Math.min(MAX_PARALLEL_AGENTS, currentStreamBudget());
+}
 
 /** How many replies in a row an agent may call tools in before it is failed. */
 export const MAX_AGENT_TOOL_ROUNDS = 8;
@@ -186,7 +197,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
   const doRunWeb = options.runWeb ?? runWeb;
   const now = options.now ?? (() => performance.now());
   const sleep = options.sleep ?? abortableSleep;
-  const limit = Math.max(1, options.limit ?? MAX_PARALLEL_AGENTS);
+  const limit = Math.max(1, options.limit ?? parallelAgents());
   const maxRetries = options.maxRetries ?? 60;
   const retryDelayMs = options.retryDelayMs ?? 1000;
   const tools = options.tools ?? {};
