@@ -3376,7 +3376,7 @@ impl Scheduler for ConcreteScheduler {
         }
     }
 
-    /// Four field reads (GitHub #216). `kv_used_pages` is the counter the
+    /// Three field reads (GitHub #216). `kv_used_pages` is the counter the
     /// admission machine keeps as it reserves and releases, so the step that
     /// releases the last request's pages is also the step that reports the
     /// release — there is no later step to report it on.
@@ -3385,7 +3385,6 @@ impl Scheduler for ConcreteScheduler {
             kv_used_pages: self.kv_used_pages,
             kv_pool_pages: self.capacity.kv_pages,
             kv_ram_used_bytes: self.host.used_bytes(),
-            kv_ram_capacity_bytes: self.host.capacity_bytes(),
         }
     }
 }

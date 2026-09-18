@@ -900,6 +900,77 @@ mod tests {
         }
     }
 
+    /// GitHub #216: the occupancy on a tick is read *after* the step, so the
+    /// step that releases the last request's pages reports the release. No
+    /// tick is sent while the scheduler is idle, so there is no later step to
+    /// report it on — read before `advance()` instead and the last tick of a
+    /// load would carry the pages it was still holding, for as long as the
+    /// load stayed idle.
+    ///
+    /// Against a real `ConcreteScheduler`, with prompt reuse off so the pool
+    /// genuinely empties: with it on a checkpoint legitimately keeps a tail
+    /// page and zero would be the wrong assertion.
+    #[tokio::test]
+    async fn the_last_tick_of_a_load_carries_the_release_and_not_the_pages_it_freed() {
+        let scheduler = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "test-model".into(),
+                prompt_reuse: false,
+                retained_slots: 0,
+                ..SchedulerConfig::default()
+            },
+            Arc::new(MockCompute::new()),
+        );
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (thread_tx, mut thread_rx) = unbounded_channel();
+        let (consumer_tx, consumer_rx) = unbounded_channel();
+        let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
+        let driver = std::thread::spawn(move || {
+            model_thread_loop(Box::new(scheduler), command_rx, thread_tx)
+        });
+        let consumer = tokio::spawn(telemetry_task(
+            Telemetry::new(Arc::new(crate::telemetry::FixedClock::new(0))),
+            consumer_rx,
+            Arc::clone(&counters),
+        ));
+        let engine = Engine {
+            model_id: "test-model".into(),
+            max_model_len: 8192,
+            commands: command_tx,
+            facts: consumer_tx.clone(),
+            counters,
+        };
+        let recorder = tokio::spawn(async move {
+            let mut ticks = Vec::new();
+            while let Some(fact) = thread_rx.recv().await {
+                if let TelemetryFact::Tick(occupancy) = &fact {
+                    ticks.push(*occupancy);
+                }
+                let _ = consumer_tx.send(fact);
+            }
+            ticks
+        });
+
+        let (_id, mut rx) = engine
+            .submit(input("test-model", vec![1, 2, 3], Some(4)), RequestClass::Interactive)
+            .await
+            .expect("submit");
+        drain_to_done(&mut rx).await;
+        drop(engine);
+        driver.join().expect("the model thread exits cleanly");
+        let ticks = recorder.await.expect("the recorder finishes");
+        consumer.await.expect("the consumer drains");
+
+        let last = *ticks.last().expect("the load ticked");
+        assert!(
+            ticks.iter().any(|t| t.kv_used_pages > 0),
+            "the request held pages while it ran: {ticks:?}"
+        );
+        assert_eq!(last.kv_used_pages, 0, "the last tick reports the release: {ticks:?}");
+        assert_eq!(last.kv_ram_used_bytes, 0, "{ticks:?}");
+        assert!(last.kv_pool_pages > 0, "and still names the pool it is empty of");
+    }
+
     /// Runs a fixed workload through a real model thread and telemetry
     /// consumer, with a recorder spliced into the facts channel between the
     /// two, and returns every fact the model thread sent — plus the

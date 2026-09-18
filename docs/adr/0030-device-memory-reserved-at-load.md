@@ -136,6 +136,28 @@ again. They add no serving work of any kind.
 
 A load that refuses to start exports nothing: there is no process to scrape.
 
+Three of these read differently from the source column, decided while building
+them (#216):
+
+- **`ignis_retained_slots{state="capacity"}` is the scheduler's effective
+  count, not the flag.** `--prompt-reuse off` without an explicit
+  `--retained-slots` hands out no slots at all (#215), so the flag's value
+  would be a capacity nothing can ever fill. The gauge exports
+  `ConcreteScheduler::retained_slot_count()`, which is what
+  `{state="in_use"}` is measured against.
+- **`ignis_kv_pool_used_pages` counts retained state as well as running
+  requests.** The pool's charge is one counter for the whole load, and a
+  retained checkpoint's tail page and a shared prefix's pages are in it. That
+  is the pool's real occupancy, and pulling them out would be the per-class
+  accounting this ADR declines below. So the gauge returns to zero after the
+  last request only when nothing was retained; with reuse on it settles at
+  what the retained images hold, which `ignis_retained_slots{state="in_use"}`
+  names.
+- **`ignis_kv_ram_arena_bytes{state="used"}` is the whole host tier**, live
+  evicted snapshots included, not retained blobs alone. It is the figure
+  admission itself runs against, and splitting it would be a second count of
+  the same arena that could disagree with the first.
+
 ### Projections of facts that already cross
 
 The model thread already emits these, unconditionally, with metrics off. Only
@@ -180,6 +202,13 @@ Without this split the surface would be inconsistent with itself, because
 `ignis_retained_slot_skips_total` already separates the two: a publish that
 found no slot is a prefix, and a capture that found no slot or no page is a
 checkpoint.
+
+`SchedEvent::StateReused` widens the same way and for the same reason. It is
+the fact `ignis_retained_reused_tokens_total` — one of the six — is projected
+from, so leaving it alone would have meant the consumer supplying the kind
+from what kind of event had arrived. That is exactly the downstream guess this
+section exists to remove, and the emitting site holds a `CheckpointClaim`
+either way.
 
 `ignis_prefix_reused_tokens_total` is untouched and keeps the sibling-prefix
 meaning #190 gave it: a live sibling's claim is not retained state and takes

@@ -51,8 +51,13 @@ Nothing outside the repo's own tests reads the line: no bench harness, no
 - The change detection is over every attribute, `kv_used_pct` included. Left
   out of it, the line would report a percentage frozen at the last time some
   *other* counter moved — a decode run that fills the pool holds `waiting`
-  and `running` constant throughout. An integer percentage takes at most 101
-  values, so a pool filling steadily logs a line per point, not per step.
+  and `running` constant throughout. The trade is deliberate: an integer
+  percentage bounds a steady fill to a line per point rather than per step,
+  but a load whose occupancy oscillates across a boundary does log a line per
+  step, which is the crowding this ADR exists to avoid. It is accepted
+  because DEBUG is off by default and because a percentage that does not
+  move is worse than one that moves too often — a gauge nobody can trust is
+  the placeholder this replaced.
 - The separate telemetry sink is removed: `--telemetry`/`-t`,
   `IGNIS_TELEMETRY`, the `ignis.telemetry.sink_selected`/`sink_failed`
   events, and the sink parameter of the engine constructors.

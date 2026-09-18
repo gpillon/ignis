@@ -369,7 +369,7 @@ pub fn cuda_scheduler(
     // own, not the flag's: prompt reuse off hands out none whatever
     // `--retained-slots` said.
     let reserved = crate::metrics::LoadReservations {
-        lines: vram.lines.entries(),
+        lines: vram.lines,
         budget_bytes: vram.budget_bytes,
         kv_pool_pages: capacity_pages,
         kv_page_bytes: stats.kv_page_bytes,

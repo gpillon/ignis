@@ -24,12 +24,6 @@ use axum::routing::get;
 use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::{RetainedSkip, SubmitError};
 
-/// The eleven lines a VRAM plan reserves, in the plan's own order and with
-/// the plan's own spellings (ADR 0030 §Observability). The load hands them
-/// over as `(line, bytes)` pairs, so the names here are the plan's and not a
-/// second spelling of them kept in step by hand.
-pub const VRAM_LINES: usize = 11;
-
 /// What one load reserved, and the shapes the reservations bound (GitHub
 /// #216, ADR 0030 §Observability). Computed once, during the load that
 /// already builds the plan, and never read again — so exporting it adds no
@@ -39,8 +33,10 @@ pub const VRAM_LINES: usize = 11;
 /// no reservations either, and every series below stays at its zero.
 #[derive(Debug, Clone, Copy)]
 pub struct LoadReservations {
-    /// The plan's eleven lines, `(name, bytes)`.
-    pub lines: [(&'static str, u64); VRAM_LINES],
+    /// The plan's lines, as the plan itself holds them — so the exposition
+    /// names them with the plan's own spellings rather than a second set
+    /// kept in step by hand.
+    pub lines: ignis_core::VramLines,
     /// The budget the plan was laid out inside, derived or explicit.
     pub budget_bytes: u64,
     /// The KV pool's page count, as the leaf verified it at load.
@@ -177,10 +173,10 @@ pub struct Metrics {
     /// The retained slots held right now, and the count this load hands out.
     retained_slots_in_use: AtomicU64,
     retained_slots_capacity: AtomicU64,
-    /// The load's reservations (GitHub #216): the plan's eleven lines in
-    /// [`LoadReservations::lines`] order, then the shapes they bound. Written
-    /// once at load, and zero on a load that built no plan.
-    vram_reserved: [AtomicU64; VRAM_LINES],
+    /// The load's reservations (GitHub #216): the plan's lines in
+    /// `VramLines::entries()` order, then the shapes they bound. Written once
+    /// at load, and zero on a load that built no plan.
+    vram_reserved: [AtomicU64; VRAM_LINE_COUNT],
     vram_budget_bytes: AtomicU64,
     kv_pool_pages: AtomicU64,
     kv_page_bytes: AtomicU64,
@@ -196,6 +192,10 @@ pub struct Metrics {
 /// retained state (GitHub #216) — `[tier][kind]`, so a prompt checkpoint and
 /// a shared prefix are never summed into one figure.
 type RetainedFamily = [[AtomicU64; RetainedKind::ALL.len()]; ReuseSource::ALL.len()];
+
+/// How many lines a VRAM plan has, taken from the plan's own shape rather
+/// than written out again here.
+const VRAM_LINE_COUNT: usize = ignis_core::VramLines::LINES;
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -300,15 +300,15 @@ impl Metrics {
     /// released the last request — which is the last tick there is, so a
     /// projection that skipped it would read a stale figure for as long as
     /// the load stayed idle.
-    pub(crate) fn set_occupancy(&self, kv_pool_used_pages: u32, kv_ram_used_bytes: u64) {
-        self.kv_pool_used_pages.store(u64::from(kv_pool_used_pages), Ordering::Relaxed);
-        self.kv_ram_arena_used_bytes.store(kv_ram_used_bytes, Ordering::Relaxed);
+    pub(crate) fn set_occupancy(&self, occupancy: ignis_core::Occupancy) {
+        self.kv_pool_used_pages.store(u64::from(occupancy.kv_used_pages), Ordering::Relaxed);
+        self.kv_ram_arena_used_bytes.store(occupancy.kv_ram_used_bytes, Ordering::Relaxed);
     }
 
     /// What this load reserved (GitHub #216, ADR 0030): written once, by the
     /// load that built the plan, before the first request is served.
-    pub fn set_load_reservations(&self, reserved: LoadReservations) {
-        for (slot, (_, bytes)) in self.vram_reserved.iter().zip(reserved.lines) {
+    pub(crate) fn set_load_reservations(&self, reserved: LoadReservations) {
+        for (slot, (_, bytes)) in self.vram_reserved.iter().zip(reserved.lines.entries()) {
             slot.store(bytes, Ordering::Relaxed);
         }
         self.vram_budget_bytes.store(reserved.budget_bytes, Ordering::Relaxed);
@@ -420,11 +420,11 @@ impl Metrics {
                 &self.retained_state_hits,
             ),
             // `kind` is always `checkpoint` here, and that is the honest
-            // shape (GitHub #216): the checkpoint pool's lookup is the only
-            // one that reports a miss, so the prefix series sits at zero
-            // rather than carrying a miss invented to match it. Emitting one
-            // from the prefix walk would be a change to the fact stream, not
-            // to this projection — GitHub #222.
+            // shape: the checkpoint pool's lookup is the only one that
+            // reports a miss, so the prefix series sits at zero rather than
+            // carrying one invented to match it. ADR 0017 records this under
+            // its metric table; emitting a prefix miss would be a change to
+            // the fact stream, not to this projection (GitHub #216, #222).
             (
                 "ignis_retained_state_misses_total",
                 "First prefill chunks with no retained checkpoint matching in the tier.",
@@ -482,8 +482,8 @@ impl Metrics {
             "gauge",
             "Device bytes this load reserved, by the plan line that reserved them.",
         );
-        let lines = ignis_core::VramLines::default();
-        for ((line, _), series) in lines.entries().iter().zip(&self.vram_reserved) {
+        let names = ignis_core::VramLines::default().entries();
+        for ((line, _), series) in names.iter().zip(&self.vram_reserved) {
             let _ = writeln!(out, "ignis_vram_reserved_bytes{{line=\"{line}\"}} {}", read(series));
         }
         let plain_gauges = [
@@ -507,7 +507,7 @@ impl Metrics {
         // Two states of one family: what bounds it, and what is in it. The
         // arena is bytes and says `used`; the slots are counted and say
         // `in_use` (ADR 0030 §Observability spells each).
-        for (name, help, taken, capacity, used) in [
+        for (name, help, used_state, capacity, used) in [
             (
                 "ignis_kv_ram_arena_bytes",
                 "The pinned host KV-RAM arena: what it holds, and what is used of it.",
@@ -525,7 +525,7 @@ impl Metrics {
         ] {
             declare(&mut out, name, "gauge", help);
             let _ = writeln!(out, "{name}{{state=\"capacity\"}} {}", read(capacity));
-            let _ = writeln!(out, "{name}{{state=\"{taken}\"}} {}", read(used));
+            let _ = writeln!(out, "{name}{{state=\"{used_state}\"}} {}", read(used));
         }
         declare(
             &mut out,
@@ -824,7 +824,7 @@ mod tests {
         lines.cuda_context = 600_000_000;
         lines.retained_slots = 1_000_000_000;
         metrics.set_load_reservations(LoadReservations {
-            lines: lines.entries(),
+            lines,
             budget_bytes: 30_000_000_000,
             kv_pool_pages: 5_000,
             kv_page_bytes: 1_048_576,
@@ -861,7 +861,11 @@ mod tests {
     #[test]
     fn occupancy_and_slot_skips_follow_the_facts_and_come_back_to_zero() {
         let metrics = Metrics::new();
-        metrics.set_occupancy(412, 3 << 30);
+        metrics.set_occupancy(ignis_core::Occupancy {
+            kv_used_pages: 412,
+            kv_pool_pages: 1_000,
+            kv_ram_used_bytes: 3 << 30,
+        });
         metrics.set_retained_slots_in_use(4);
         metrics.record_retained_slot_skip(RetainedSkip::PublishNoSlot);
         metrics.record_retained_slot_skip(RetainedSkip::CaptureNoPage);
@@ -884,7 +888,7 @@ mod tests {
 
         // The last step of a load releases everything, and reports it: these
         // are gauges of the latest reading, not high-water marks.
-        metrics.set_occupancy(0, 0);
+        metrics.set_occupancy(ignis_core::Occupancy { kv_pool_pages: 1_000, ..Default::default() });
         metrics.set_retained_slots_in_use(0);
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_kv_pool_used_pages", ""), "0");

@@ -524,10 +524,10 @@ pub trait Scheduler: Send {
 /// What a scheduler has occupied, at one instant (GitHub #216, ADR 0030).
 ///
 /// `kv_used_pages` and `kv_pool_pages` are the two terms of the same pool, so
-/// a reader has both and never a ratio that hides which of them moved.
-/// `kv_pool_pages` is the capacity the pool was built with at load, which is
-/// the page count the load plan settled on; `kv_used_pages` can reach it but
-/// never passes it.
+/// a reader has both on the same reading and never a ratio that hides which of
+/// them moved. The pool's capacity rides along for exactly that reason;
+/// nothing else constant does, because a constant read on every step is a
+/// constant the load already knew before the first one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Occupancy {
     /// Main-pool KV pages reserved by running requests, shared prefixes and
@@ -538,6 +538,4 @@ pub struct Occupancy {
     /// The host KV-RAM tier's bytes in use: live snapshots and retained
     /// blobs together.
     pub kv_ram_used_bytes: u64,
-    /// The host KV-RAM tier's capacity in bytes (`--kv-host-pool-bytes`).
-    pub kv_ram_capacity_bytes: u64,
 }

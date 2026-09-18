@@ -36,8 +36,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
-use ignis_core::checkpoint::RetainedKind;
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::{
     FinishReason, LaneId, Occupancy, RequestClass, RequestId, RetainedSkip, SpecCounters,
 };
@@ -630,7 +629,7 @@ impl Telemetry {
         let counters = self.counters();
         if let Some(metrics) = &self.metrics {
             metrics.set_scheduler_requests(counters.waiting, counters.running);
-            metrics.set_occupancy(occupancy.kv_used_pages, occupancy.kv_ram_used_bytes);
+            metrics.set_occupancy(occupancy);
         }
         let logged =
             (counters.waiting, counters.running, counters.kv_used_pct, counters.kv_evictions);
@@ -918,7 +917,6 @@ mod tests {
             kv_used_pages: 64,
             kv_pool_pages: 256,
             kv_ram_used_bytes: 1 << 30,
-            kv_ram_capacity_bytes: 8 << 30,
         });
         let busy = metrics.render();
         assert!(busy.contains("\nignis_kv_pool_used_pages 64\n"), "{busy}");
@@ -929,7 +927,6 @@ mod tests {
             kv_used_pages: 0,
             kv_pool_pages: 256,
             kv_ram_used_bytes: 0,
-            kv_ram_capacity_bytes: 8 << 30,
         });
         let idle = metrics.render();
         assert!(idle.contains("\nignis_kv_pool_used_pages 0\n"), "{idle}");

@@ -595,6 +595,15 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_retained_state_spills_total",
         "ignis_retained_state_discards_total",
         "ignis_retained_state_restores_total",
+        // GitHub #216, ADR 0030 §Observability.
+        "ignis_retained_slot_skips_total",
+        "ignis_retained_slots",
+        "ignis_vram_reserved_bytes",
+        "ignis_vram_budget_bytes",
+        "ignis_kv_pool_pages",
+        "ignis_kv_page_bytes",
+        "ignis_kv_pool_used_pages",
+        "ignis_kv_ram_arena_bytes",
         "ignis_requests_rejected_total",
         "ignis_request_ttft_seconds_bucket",
         "ignis_request_ttft_seconds_sum",
@@ -608,6 +617,20 @@ async fn labels_stay_within_the_bounded_sets() {
     .collect();
     assert_eq!(names, expected, "{text}");
 
+    /// The plan's eleven lines, as ADR 0030 §Observability spells them.
+    const VRAM_LINES: &[&str] = &[
+        "weights",
+        "cuda_context",
+        "workspace",
+        "media_embedding",
+        "sampling",
+        "decode_graph",
+        "verify_round",
+        "drafter_round",
+        "lane_state",
+        "retained_slots",
+        "residual",
+    ];
     const TTFT_LE: &[&str] =
         &["0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60", "120", "300", "+Inf"];
     const DURATION_LE: &[&str] =
@@ -619,8 +642,25 @@ async fn labels_stay_within_the_bounded_sets() {
             "ignis_requests_rejected_total" => &[("reason", &["full", "unknown_model", "oversized"])],
             "ignis_request_ttft_seconds_bucket" => &[("le", TTFT_LE)],
             "ignis_request_duration_seconds_bucket" => &[("le", DURATION_LE)],
+            // GitHub #216: what the load reserved, one series per plan line
+            // and never per allocation.
+            "ignis_vram_reserved_bytes" => &[("line", VRAM_LINES)],
+            // Two states of one family, and the two families spell the
+            // second one differently (ADR 0030 §Observability).
+            "ignis_kv_ram_arena_bytes" => &[("state", &["capacity", "used"])],
+            "ignis_retained_slots" => &[("state", &["capacity", "in_use"])],
+            "ignis_retained_slot_skips_total" => &[(
+                "reason",
+                &["publish_skipped_no_slot", "capture_skipped_no_slot", "capture_skipped_no_page"],
+            )],
             // GitHub #190: one series per residency tier, never per entry.
-            name if name.starts_with("ignis_retained_") => &[("tier", &["device", "kv_ram"])],
+            // GitHub #216: and per kind of retained state, still never per
+            // entry — two bounded sets, so four series a family.
+            name if name.starts_with("ignis_retained_state_")
+                || name == "ignis_retained_reused_tokens_total" =>
+            {
+                &[("tier", &["device", "kv_ram"]), ("kind", &["checkpoint", "prefix"])]
+            }
             _ => &[],
         };
         assert_eq!(labels.len(), allowed.len(), "{name} {labels:?}");
