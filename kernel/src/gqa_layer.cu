@@ -178,7 +178,9 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     // The small-T attention route reserves a fixed number of partial split
     // slots, while only the active prefix is written for a short history: a
     // fresh, zeroed workspace per layer invocation keeps stale inactive
-    // partials from being reduced on the next call (P2-02, GitHub #84). At
+    // partials from being reduced on the next call (P2-02, GitHub #84) --
+    // on the formats whose kernels leave those slots untouched, which is the
+    // question `ignis_gqa_workspace_needs_zeroing` answers below. At
     // a chunk-sized width the resolver's B=1 prompt route legally needs none
     // ("a legal B=1 prompt route may return zero for BF16/INT8 caches"),
     // but neither `DeviceArena` constructor admits zero capacity, so at
@@ -198,12 +200,15 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         ignis_gqa_attention_workspace_bytes(batch_cache.dtype, envelope, tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
         model->scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
-    error = cudaMemsetAsync(attention_workspace_storage.data, 0,
-                            attention_workspace_storage.bytes, stream);
-    if (error != cudaSuccess) {
-      set_error(std::string("ignis_gqa_layer_step: cudaMemsetAsync(attention workspace) failed: ") +
-                cudaGetErrorString(error));
-      return -1;
+    if (ignis_gqa_workspace_needs_zeroing(batch_cache.dtype)) {
+      error = cudaMemsetAsync(attention_workspace_storage.data, 0,
+                              attention_workspace_storage.bytes, stream);
+      if (error != cudaSuccess) {
+        set_error(
+            std::string("ignis_gqa_layer_step: cudaMemsetAsync(attention workspace) failed: ") +
+            cudaGetErrorString(error));
+        return -1;
+      }
     }
     ninfer::DeviceArena attention_workspace(attention_workspace_storage);
     ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, tokens, 1});
@@ -423,12 +428,18 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
         kQHeads, batch_cache.dtype, envelope, batch, lane_tokens, lane_tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
         model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
-    cudaError_t error = cudaMemsetAsync(attention_workspace_storage.data, 0,
-                                        attention_workspace_storage.bytes, stream);
-    if (error != cudaSuccess) {
-      set_error(std::string(op) + ": cudaMemsetAsync(attention workspace) failed: " +
-                cudaGetErrorString(error));
-      return -1;
+    // Graph-safe (ADR 0019): the predicate is the pool's KV format, fixed for
+    // the life of the load (ADR 0022), so which nodes this body records does
+    // not depend on anything a replay can change.
+    cudaError_t error = cudaSuccess;
+    if (ignis_gqa_workspace_needs_zeroing(batch_cache.dtype)) {
+      error = cudaMemsetAsync(attention_workspace_storage.data, 0,
+                              attention_workspace_storage.bytes, stream);
+      if (error != cudaSuccess) {
+        set_error(std::string(op) + ": cudaMemsetAsync(attention workspace) failed: " +
+                  cudaGetErrorString(error));
+        return -1;
+      }
     }
     ninfer::DeviceArena attention_workspace(attention_workspace_storage);
     ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, lane_tokens, batch});

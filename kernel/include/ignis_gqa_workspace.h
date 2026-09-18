@@ -83,4 +83,54 @@ inline std::size_t ignis_gqa_attention_workspace_bytes(ninfer::DType cache_dtype
       kIgnisGqaQHeads, cache_dtype, query_envelope, /*batch_size=*/1, width, query_width);
 }
 
+/* Whether A1 must be handed a zero-initialized transient workspace.
+ *
+ * A1 owns its workspace and suballocates from it, but nothing in
+ * `ninfer/ops/gqa_attention.h` promises that every byte is written before it
+ * is read, and one route says out loud that it is not: the BF16 small-T
+ * partial kernel leaves the split slots it does not use untouched and
+ * "relies on the engine's zero-initialized partial workspace instead"
+ * (kernel/vendor/src/ops/kernel/gqa_attention_decode_bf16.cuh, the
+ * `split >= active_split_count` arm). So zeroing is the default, and the
+ * question this answers is the narrow one: which format carries an in-kernel
+ * guarantee strong enough to skip it.
+ *
+ * Deliberately enumerates the format that may skip the zeroing rather than
+ * the formats that need it. A KV format added later then keeps the zeroing
+ * until someone reads its kernels and says otherwise, instead of silently
+ * inheriting an exemption nobody checked it against.
+ *
+ * hq-e8-2b (U8) is that format, on both routes the GQA layer dispatches:
+ *
+ *   - small-T (every decode round, and the verify widths): the same
+ *     `split >= active_split_count` arm calls `write_neutral()` under hq --
+ *     the route's "public partials contract neutralizes inactive splits" --
+ *     so every slot the reducer can read is written by the launch in front
+ *     of it. The reducer's own bound is device-side
+ *     (`gqa_small_t_active_splits` over `last_pos + 1`,
+ *     kernel/vendor/src/ops/kernel/gqa_attention_decode.cuh) and never
+ *     exceeds the launch capacity this caller reserved for.
+ *   - Prompt (every prefill chunk): the workspace is dominated by the
+ *     rotated-frame scratch planes, and
+ *     `gqa_attention_prefill_hq_scratch_kernel` fills `band_rows` of them
+ *     before the FA2 kernel reads that same range
+ *     (kernel/vendor/src/ops/launcher/gqa_attention_prefill_hq_routes.cuh).
+ *     This engine declares `max_visible_keys` equal to the call's own
+ *     visible history, so `band_rows` covers the whole span. The key-split
+ *     partials riding alongside are written by all `bands_split` blocks the
+ *     launch starts, which is the exact count the reduce kernel reads back.
+ *
+ * What it buys: the scratch planes are `visible_keys * 4096` bytes at this
+ * geometry, so zeroing them was the largest single write in a prefill chunk
+ * outside attention itself, once per GQA layer -- and on the decode round it
+ * zeroed bytes `write_neutral()` zeroes again a moment later.
+ *
+ * kernel/tests/test_hq_route_agreement.cu runs every hq shape this engine
+ * dispatches twice, over a zeroed and over a hostile workspace, and requires
+ * the two outputs to be bit-identical: the claim has a test rather than this
+ * comment. */
+inline bool ignis_gqa_workspace_needs_zeroing(ninfer::DType cache_dtype) {
+  return cache_dtype != ninfer::DType::U8;
+}
+
 #endif /* IGNIS_GQA_WORKSPACE_H */

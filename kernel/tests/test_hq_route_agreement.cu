@@ -511,6 +511,37 @@ void check_agreement(const char *arm, const Agreement &a) {
                 "explains");
 }
 
+// The claim `ignis_gqa_workspace_needs_zeroing` (kernel/include/
+// ignis_gqa_workspace.h) makes about hq, checked against the op rather than
+// against a reading of its kernels: A1's output does not depend on what the
+// transient workspace held when the call began, so the GQA layer can hand it
+// the arena's leftovers instead of zeroing `visible_keys * 4096` bytes per
+// layer.
+//
+// Bit-identical, not "close". A route that reads one stale slot reads a
+// different number, and a tolerance here would be exactly where the next such
+// bug would hide.
+void check_workspace_independent(const std::string &arm, const std::vector<std::uint16_t> &zeroed,
+                                 const std::vector<std::uint16_t> &hostile) {
+  const std::string prefix = arm + " (hostile workspace): ";
+  check(zeroed.size() == hostile.size(), prefix + "the two runs wrote different output extents");
+  // An all-zero output would make the comparison below true no matter what
+  // the op did with the workspace.
+  const bool wrote_something =
+      std::any_of(zeroed.begin(), zeroed.end(), [](std::uint16_t bits) { return bits != 0; });
+  check(wrote_something,
+       prefix + "the zeroed run wrote an all-zero output, so this arm compares nothing");
+  std::size_t differing = 0;
+  for (std::size_t i = 0; i < zeroed.size() && i < hostile.size(); ++i) {
+    if (zeroed[i] != hostile[i]) { ++differing; }
+  }
+  std::printf("  %-28s workspace-independent: %zu of %zu elements differ\n", arm.c_str(), differing,
+             zeroed.size());
+  check(differing == 0,
+       prefix + "A1 returned a different answer over a workspace this engine no longer zeroes, so "
+                "some route reads a slot it never wrote and the zeroing is load-bearing after all");
+}
+
 // ---- one A1 call against one format ---------------------------------------
 
 struct Call {
@@ -522,13 +553,46 @@ struct Call {
   // decode arm's history). Zero for the prefill arm, whose own call is the
   // append.
   std::int32_t history = 0;
+  // The envelope's key bound, when it is not this call's own visible history.
+  // Zero means `first_position + width`, which is what the eager prefill path
+  // declares. The decode round declares the pool's whole context instead
+  // (ADR 0019 -- one captured graph has to serve every replay), and that is
+  // the only reason a launch ever reserves more split slots than the round
+  // activates. Anything checking what happens to the inactive ones has to
+  // declare the envelope the same way.
+  std::int32_t envelope_keys = 0;
 };
+
+// What the transient workspace holds when A1 is handed it.
+//
+// `Hostile` is the state the engine's arena really leaves behind once
+// `ignis_gqa_workspace_needs_zeroing` (kernel/include/ignis_gqa_workspace.h)
+// stops zeroing it under hq: whatever the previous layer wrote there. The
+// byte pattern is 0x7F -- a large finite float (~3.4e38) and a large finite
+// BF16 -- rather than 0xFF, because 0xFF is a NaN in both and `fmaxf`
+// *ignores* a NaN operand, so a stale `partial_m` slot reaching the reducer
+// would be quietly discarded and this arm would pass while proving nothing.
+// A huge finite maximum cannot be ignored: reduced, it drives every real
+// split's weight to zero and flushes the output row to exact zero.
+//
+// Measured while this arm was written (2026-09-18): BF16 -- the format whose
+// kernel says it needs the zeroing -- does not react to the fill either, at
+// any decode width, because the reducer's split bound is computed on the
+// device from `last_pos + 1` and never reaches a slot the launch left
+// unwritten. So the fill cannot be validated by finding a route that breaks
+// under it; what it is validated by is the read-back below, which shows the
+// poison reached the arena the op suballocates from. The BF16 zeroing stays
+// regardless: its kernel states the dependency in writing, the format is the
+// BF16 oracle rather than a serving path (ADR 0022), and one measurement at
+// one history is not the ground to overrule a vendored contract on.
+enum class WorkspaceFill { Zero, Hostile };
 
 // Runs `call` against a freshly built pool in `kv_format` and returns the
 // BF16 output rows, host-side. Everything device-side is torn down before
 // returning, so the two arms never hold two pools at once.
 std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const Call &call,
-                                     const Inputs &in, const char *label) {
+                                     const Inputs &in, const char *label,
+                                     WorkspaceFill fill = WorkspaceFill::Zero) {
   const ignis_seq_pool_spec spec = pool_spec(kv_format);
   ignis_seq_pool *pool           = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, (std::string(label) + " pool create").c_str());
@@ -619,7 +683,8 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
   // The envelope the layer would declare: every key this call can see.
   const ninfer::ops::GqaExecutionEnvelope envelope{
       /*min_visible_keys=*/1,
-      /*max_visible_keys=*/static_cast<std::uint32_t>(call.first_position + call.width)};
+      /*max_visible_keys=*/static_cast<std::uint32_t>(
+          call.envelope_keys > 0 ? call.envelope_keys : call.first_position + call.width)};
 
   std::vector<std::uint16_t> host_out(out_elements, 0);
   try {
@@ -636,7 +701,26 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
             : ninfer::ops::gqa_attention_workspace_capacity_bytes(
                   kQHeads, cache.dtype, envelope, call.batch, call.width, call.width);
     ninfer::DeviceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
-    CUDA_FATAL(cudaMemset(workspace.base(), 0, workspace.capacity()));
+    CUDA_FATAL(cudaMemset(workspace.base(), fill == WorkspaceFill::Hostile ? 0x7F : 0,
+                          workspace.capacity()));
+    if (fill == WorkspaceFill::Hostile) {
+      // The control for the whole hostile-workspace idea: prove the poison
+      // reached the bytes the op is about to suballocate from, and that the
+      // arm is not poisoning the 256-byte floor above a route that reserved
+      // nothing. Without this, "0 of N elements differ" would also be what a
+      // fill that landed nowhere looks like.
+      check(workspace_bytes > 0,
+           std::string(label) + ": this route reserved no workspace, so the hostile fill has "
+                                "nothing to poison and the arm proves nothing");
+      std::uint8_t probe[2] = {0, 0};
+      CUDA_FATAL(cudaMemcpy(&probe[0], workspace.base(), 1, cudaMemcpyDeviceToHost));
+      CUDA_FATAL(cudaMemcpy(&probe[1],
+                            static_cast<const std::uint8_t *>(workspace.base()) +
+                                (workspace.capacity() - 1),
+                            1, cudaMemcpyDeviceToHost));
+      check(probe[0] == 0x7F && probe[1] == 0x7F,
+           std::string(label) + ": the hostile fill did not reach the workspace arena");
+    }
     ninfer::ops::gqa_attention(q, k, v, pos, /*valid_columns=*/ninfer::Tensor{}, rows, gate, kScale,
                                cache, envelope, workspace, out, /*stream=*/nullptr);
     CUDA_FATAL(cudaStreamSynchronize(nullptr));
@@ -735,6 +819,10 @@ int main() {
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq");
     check(bf16.size() == hq.size(), "prefill: both routes wrote the same output extent");
     check_agreement("prefill W=200 B=1", compare(bf16, hq));
+    check_workspace_independent(
+        "prefill W=200 B=1", hq,
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq hostile",
+                  WorkspaceFill::Hostile));
   }
 
   // ---- prefill at the narrow Prompt widths ---------------------------------
@@ -765,6 +853,10 @@ int main() {
     const std::vector<std::uint16_t> hq =
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, hq_label.c_str());
     check_agreement(("prefill W=" + std::to_string(width) + " B=1").c_str(), compare(bf16, hq));
+    check_workspace_independent(
+        "prefill W=" + std::to_string(width) + " B=1", hq,
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, (hq_label + " hostile").c_str(),
+                  WorkspaceFill::Hostile));
   }
 
   // ---- decode: the SmallT route at every exact batch width 1..8 ------------
@@ -795,6 +887,21 @@ int main() {
     check(lanes_differ(hq, call.width, batch),
          "decode hq B=" + std::to_string(batch) + ": every lane produced the identical output");
     check_agreement(("decode W=1 B=" + std::to_string(batch)).c_str(), compare(bf16, hq));
+
+    // The same round as the decode graph declares it: the envelope is the
+    // pool's whole context, not this call's 201 visible keys, so the launch
+    // reserves split slots the round never activates -- the slots whose
+    // contents the engine used to zero. Run as its own pair rather than by
+    // widening the arm above, whose bounds are calibrated against the
+    // measurement that produced them.
+    Call graph_call         = call;
+    graph_call.envelope_keys = static_cast<std::int32_t>(kMaxContext);
+    const std::vector<std::uint16_t> graph_zeroed =
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, graph_call, in, (hq_label + " wide").c_str());
+    check_workspace_independent(
+        "decode W=1 B=" + std::to_string(batch), graph_zeroed,
+        run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, graph_call, in, (hq_label + " wide hostile").c_str(),
+                  WorkspaceFill::Hostile));
   }
 
   if (g_failed != 0) {
