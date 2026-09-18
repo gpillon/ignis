@@ -145,19 +145,55 @@ three-call, 66 ms shape above.
 the opener floored to a 64-token page, the other is the opener. The piece
 between them is 0..63 tokens and costs a full traversal.
 
+## Pricing each cut by switching it off
+
+Every cut behind an environment switch (`IGNIS_CUT_OFF`, an experiment kept on
+this branch and marked not for merge), one server launch per configuration.
+Two workloads, because they disagree:
+
+**A stable system block with independent short queries** — parallel subagents
+sharing tools, asking unrelated things:
+
+| cuts off | cold system | **shared system, steady** | prefill calls per reusing request |
+|---|---|---|---|
+| none | 342.2 ms | **138.1 ms** | 3 |
+| `capture` | 240.6 ms | **74.5 ms** (−46%) | 2 |
+| `opener` | 229.8 ms | **57.7 ms** (−58%) | **1** |
+| `opener` + `capture` | 226.2 ms | 57.8 ms | 1 |
+| all three | 218.0 ms | **183.0 ms** — reuse stops working | 1024-token calls |
+
+**A conversation that grows** — each turn carries every previous one, which is
+what the chained opener publish (#187) says it exists for:
+
+| cuts off | first turn | **turns 2+, median** |
+|---|---|---|
+| none | 438.2 ms | **206.0 ms** |
+| `opener` | 246.0 ms | **232.5 ms** — worse |
+| `capture` | 279.9 ms | **245.1 ms** — worse |
+
+The two tables are the whole answer. On the first workload cuts 3 and 4 cost
+58% of every reusing turn and buy nothing, because the shared prefix *is* the
+system block and cut 2 alone carries it. On the second they pay for
+themselves twice over, because the prefix grows past the block and only they
+let turn N reuse turn N−1. **Every cut is load-bearing for a real shape**, and
+removing any of them trades one workload against another.
+
 ## Implications
 
 - Any TTFT comparison against the reference should state which side of
   `--prompt-reuse` it was measured on, or measure both.
-- **The optimisation is the cut, not the reuse.** Reuse earns its keep; what
-  does not is paying two extra fixed-cost traversals to take the cuts, on
-  every request, including the claimants that are supposed to be the cheap
-  ones. Sized: about 40 ms per request, 36% of a reusing turn.
-- Directions, none yet costed: align the publish point with the chunk boundary
-  so the cut lands where a traversal was ending anyway; let the leaf snapshot
-  mutable state at an interior offset so one traversal can publish at a point
-  inside it; or refuse the cut when what remains is too short to be worth its
-  own traversal.
+- **The optimisation is not removing a cut — it is making a cut cheap.** The
+  switch-off table settles that: each cut earns its keep on at least one real
+  workload, so dropping one is a trade, not a win. What is not earned is that
+  *taking* a cut costs a whole extra traversal of the model.
+- That leaves one direction rather than three: let the leaf publish or capture
+  at an interior offset **without ending the traversal** — snapshot the mutable
+  state there and keep going. The prize is the two extra traversals, about
+  38 ms per request: 138 → ~58 ms on the stable-system workload (−58%), 206 →
+  ~168 ms on the growing conversation (−18%).
+- The `--prompt-reuse off` comparison at the top of this finding therefore
+  measures the premium, not an available saving. The saving available without
+  giving anything up is the traversal, not the reuse.
 - The comment in `concrete.rs` should carry the measured cost of a short chunk
   rather than its token count, so the next reader prices the cut correctly.
 
@@ -179,8 +215,11 @@ between them is 0..63 tokens and costs a full traversal.
 
 ## Follow-ups
 
-- Account for all five prefill calls of a cold system request; this finding
-  names two cuts and sees four.
-- Cost the three directions above against the ~40 ms they would recover.
+- Cost the interior-snapshot direction: what the leaf would have to expose for
+  a prefill call to publish or capture mid-traversal, and whether GDN's chunked
+  prefill materializes a usable intermediate state at all.
+- Both workloads here are synthetic and sequential, one launch each. Before
+  building anything, replay a real captured agent trace and see which of the
+  two shapes it actually is — the answer decides how much the 38 ms is worth.
 - Re-measure the reference live/live at 1,024 tokens, on both sides of
   `--prompt-reuse`, before attributing any of the 1.85x.
