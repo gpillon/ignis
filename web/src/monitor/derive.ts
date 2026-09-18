@@ -29,6 +29,13 @@ export const RATE_SPAN_MS = 30_000;
 export const TOKEN_RATE_SPAN_MS = 10_000;
 /** Latency trends are quantiles over this sliding span. */
 export const TREND_SPAN_MS = 60_000;
+/**
+ * The tokens one KV page holds. Fixed in the kernel
+ * (`kernel/vendor/src/core/paged_kv_cache.h`, `kPagedKVPageSize`) and passed
+ * on by the CUDA leaf as `kv_page_tokens: 64`; no scrape carries it, so the
+ * pool's tokens are its pages multiplied here rather than read from a gauge.
+ */
+export const TOKENS_PER_KV_PAGE = 64;
 
 export type Values = (number | null)[];
 
@@ -85,8 +92,8 @@ export type Memory = {
   linesBytes: number | null;
   /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */
   kvRoomBytes: number | null;
-  /** The pool the room bought: its pages, one page, and the two multiplied. */
-  kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null };
+  /** The pool the room bought: its pages, one page, the two multiplied, and the tokens those pages hold. */
+  kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null; tokens: number | null };
   /** The budget beyond the lines and the pool's pages: page-rounding slack, and the pool's own tables. */
   spareBytes: number | null;
   /** Whether the plan overran its budget, which only --allow-vram-oversubscription allows. */
@@ -280,6 +287,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
   const lines = VRAM_LINES.map((line) => ({ line, bytes: mem.reserved[line] }));
   const linesBytes = lines.every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
   const kvPoolBytes = mem.kvPoolPages !== null && mem.kvPageBytes !== null ? mem.kvPoolPages * mem.kvPageBytes : null;
+  const kvPoolTokens = mem.kvPoolPages === null ? null : mem.kvPoolPages * TOKENS_PER_KV_PAGE;
   const byReason = Object.fromEntries(
     SLOT_SKIP_REASONS.map((reason) => [reason, tally((s) => s.memory.slotSkips[reason])]),
   ) as Record<SlotSkipReason, Tally>;
@@ -290,7 +298,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
     lines,
     linesBytes,
     kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? mem.budgetBytes - linesBytes : null,
-    kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes },
+    kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes, tokens: kvPoolTokens },
     spareBytes: mem.budgetBytes === null || linesBytes === null ? null : mem.budgetBytes - linesBytes - (kvPoolBytes ?? 0),
     oversubscribed: mem.budgetBytes !== null && linesBytes !== null && linesBytes + (kvPoolBytes ?? 0) > mem.budgetBytes,
     pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),

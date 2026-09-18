@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assessHealth, deriveDashboard, deriveMemory, type HealthInput, headerPulse } from "./derive.ts";
+import { assessHealth, deriveDashboard, deriveMemory, type HealthInput, headerPulse, TOKENS_PER_KV_PAGE } from "./derive.ts";
 import type { Point } from "./history.ts";
 import { emptySnapshot, type Memory as MemorySeries, type Snapshot } from "./snapshot.ts";
 
@@ -90,7 +90,7 @@ describe("deriveMemory", () => {
     expect(m.lines.map((l) => l.line).slice(0, 3)).toEqual(["weights", "cuda_context", "workspace"]);
     expect(m.linesBytes).toBe(1000);
     expect(m.kvRoomBytes).toBe(1000);
-    expect(m.kvPool).toEqual({ pages: 8, pageBytes: 100, bytes: 800 });
+    expect(m.kvPool).toEqual({ pages: 8, pageBytes: 100, bytes: 800, tokens: 8 * TOKENS_PER_KV_PAGE });
     expect(m.spareBytes).toBe(200);
     expect(m.oversubscribed).toBe(false);
   });
