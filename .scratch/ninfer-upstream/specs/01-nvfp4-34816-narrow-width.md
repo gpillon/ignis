@@ -1,6 +1,6 @@
 # 01 — NVFP4 34816x5120 W4A4 at narrow prefill widths: Stages 3, weight-code L2 promotion, and the 256-token TMA floor
 
-ADRs: 0010 (vendored reference kernels — every change here is a manifest-recorded
+GitHub: #223. ADRs: 0010 (vendored reference kernels — every change here is a manifest-recorded
 patch to `kernel/vendor/`, not a rewrite).
 Evidence: `docs/findings/2026-09-18-ninfer-upstream-perf-survey.md` (what upstream
 changed and why this is the only candidate aimed at a diagnosed problem),
