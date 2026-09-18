@@ -37,8 +37,9 @@ export function UserTurn({ message: m, actions, onResend }: { message: Message; 
     <div className="group/turn flex flex-col items-end gap-1 self-end md:max-w-[85%]">
       {m.images && m.images.length > 0 && (
         <div className="flex flex-wrap justify-end gap-2">
+          {/* A download, not a new tab: Chrome refuses to navigate the top frame to a `data:` URL. */}
           {m.images.map((image, index) => (
-            <a key={`${image.name}:${index}`} href={image.url} target="_blank" rel="noreferrer" title={image.name}>
+            <a key={`${image.name}:${index}`} href={image.url} download={image.name} title={`Save ${image.name}`}>
               <img src={image.url} alt={image.name} className="cut block max-h-56 w-auto max-w-full [--cut-size:10px]" />
             </a>
           ))}
