@@ -30,6 +30,43 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
 
+# --split-compile : run nvcc's device-code optimizer over several threads per
+# translation unit. Nothing in the sources changes; this is the build's own
+# parallelism, below the level ninja can see.
+#
+# It is here because ninja's parallelism runs out before the build does. The
+# vendored `w8_small_t.cu` instantiates 313 `w8_small_t_mma_kernel` variants
+# across seven geometry families and takes ~222 s on its own, while the whole
+# build's compile work is ~2,547 s over 548 targets — 127 s on this 20-core
+# machine. One translation unit is therefore the floor, and for the last
+# ~95 s of every build 19 cores sit idle waiting for it. `-j` cannot help:
+# the work is inside one nvcc invocation.
+#
+# Measured standalone on that file, same flags: 258.9 s -> 143.0 s.
+#
+# Applied to the heavy units only, not globally: the flag is not free. Setting
+# it on every CUDA source raised the build's total compile work from 3,768 s to
+# 4,286 s (+14%) — during the wide phase there are no spare cores for it to
+# use, so the extra threads only add overhead. Confining it to the units that
+# end up in the tail keeps the tail win and leaves the other ~500 alone.
+#
+# The list is the top of `.ninja_log` sorted by duration; re-derive it after a
+# build if the sources move. `=0` means "as many threads as the machine has",
+# which is what the tail wants because nothing else is running by then.
+set(IGNIS_CUDA_SPLIT_COMPILE "0" CACHE STRING
+    "nvcc --split-compile value for the heavy units (empty = off)")
+set(IGNIS_SPLIT_COMPILE_SOURCES
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/nvfp4/nvfp4_small_t.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_i8.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${IGNIS_VENDOR_DIR}/src/ops/launcher/gqa_attention_decode_bf16.cu
+)
+if(NOT IGNIS_CUDA_SPLIT_COMPILE STREQUAL "")
+  set_source_files_properties(${IGNIS_SPLIT_COMPILE_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "--split-compile=${IGNIS_CUDA_SPLIT_COMPILE}")
+endif()
+
 # CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44; also
 # needed by the P1-10/#46 bf16/w8 dispatch below, and by P1-16/#52's
 # paged_kv_cache/linear_attention_state, which pull cudaStream_t in through
