@@ -19,7 +19,7 @@ Units: binary MiB/GiB, as Task Manager's per-process WDDM counters report them.
 | 4 | `vram_plan` total matches Task Manager's dedicated right after load | **PASS** — 28558 vs 28574 MiB, +16 MiB, tolerance ±32 MiB |
 | 5 | Every request of the raw trace served, zero `leaf_error` storms | **PARTIAL** — 71/157 served, all 2xx (zero 4xx in the run), **0** `leaf_error`; stopped on the owner's call (§Departures) |
 | 6 | Record KV capacity, retained slots in use, publish/capture skips, comparison table | **Done** — §Recorded numbers, and the finding's comparison table |
-| 7 | A failed check files a follow-up with the evidence, no tuning | #218 filed for the redaction that hides the KV token capacity |
+| 7 | A failed check files a follow-up with the evidence, no tuning | **Done** — #219 for the 86 unserved trace requests, #218 for the redaction that hid the KV token capacity. Neither was tuned around |
 
 ## The run
 
@@ -57,24 +57,35 @@ to 2506 MiB (desktop only) after `make stop`.
 ## Recorded numbers
 
 - **KV token capacity 447,296** — 6989 pages × 64 (`KV_PAGE_TOKENS`,
-  `crates/core/src/kv_format.rs:30`). Derived, not read: see #218. Pool
-  4,122,411,008 B, `hq-e8-2b`, `max_context_tokens` 262,144.
+  `crates/core/src/kv_format.rs:30`). Derived during the run, because the log
+  redacted it (#218, fixed afterwards on this branch and verified live: a
+  later start logged `token_capacity 453824` = 7091 × 64, and
+  `bytes_per_token 9216`, both in clear — the capacity differs only because
+  that start derived its budget from a different amount of free VRAM).
+  `hq-e8-2b`, `max_context_tokens` 262,144, pool 4,122,279,936 B on the
+  `kv_pool` line — 128 KiB under the plan's `kv_pool_bytes` of 4,122,411,008,
+  which is the plan's line for the pool rather than the pool's own budget.
 - **Retained slots: 8**, one per decode lane (the default), from 505
   `ignis.scheduler.retained_slots` DEBUG events:
 
   | slots in use | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
   |---|---:|---:|---:|---:|---:|---:|---:|---:|
-  | samples | 1 | 11 | 27 | 45 | 65 | 95 | 155 | 126 |
+  | samples | 1 | 11 | 27 | 45 | 65 | 95 | 155 | 106 |
 
 - **Publish/capture skips: 20** — 15 `capture_skipped_no_slot`,
-  5 `publish_skipped_no_slot`, 0 `capture_skipped_no_page`.
+  5 `publish_skipped_no_slot`, 0 `capture_skipped_no_page`. **Every one of
+  them happened at 8 slots of 8**: the pool skips only when it is full, never
+  as a way of avoiding work it had room for.
 - **`/metrics` at 01:28:53**: retained reused tokens 3,688,114 device /
   10,134,354 kv_ram; hits 27/168; misses 261/94; spills 0/225; discards 19/216;
   restores 27/168; `ignis_prefix_reused_tokens_total` 407,040;
   `ignis_kv_cache_evictions_total` 65.
-- **Requests**: 289 admitted, 288 done — 216 parallel turns, 1 canary,
-  **71 raw-trace requests**. Zero `leaf_error` lines (2026-09-17: 345K lines,
-  105 MB of log, in about a minute, on these same bodies).
+- **Requests**: 289 admitted, 288 done. By client: 216 parallel turns and 1
+  canary completed, leaving **71 completed raw-trace requests**; the 289th
+  admission is the 72nd trace request, in flight when the run was stopped,
+  which is also why 70 responses streamed rather than 71. Zero `leaf_error`
+  lines (2026-09-17: 345K lines, 105 MB of log, in about a minute, on these
+  same bodies).
 - **HTTP**: 543 × 200, 20 × 503, **zero 4xx**. The histogram is the evidence
   for criterion 5, not the failure lines: tower-http classifies only 5xx as a
   failure, so a `render_failed` or `invalid_role` 400 would be invisible there.
@@ -94,8 +105,11 @@ to 2506 MiB (desktop only) after `make stop`.
 Stated from this run's own sample noise, as the ticket asks:
 
 - **Commit flat: ±64 MiB** after the first request. Observed spread 36 MiB over
-  289 samples — live bookkeeping plus a sampling margin. The baseline missed
-  this by two orders of magnitude (3233 MiB).
+  289 samples — live bookkeeping plus a sampling margin. The band is set at
+  roughly twice the observed spread, so it is calibrated by this run rather
+  than independently derived; what makes it usable as a verdict is the
+  distance to the failing case, not its precision — the baseline's spread on
+  the same basis is 2547 MiB, two orders of magnitude out.
 - **Shared equals the arena: 8192 + 74 ± 16 MiB.** Observed 8266–8268. The
   74 MiB is what the process already showed at 01:04:28, before the arena was
   pinned.
@@ -110,6 +124,8 @@ Stated from this run's own sample noise, as the ticket asks:
    71/157 the memory window was already 10 minutes past what the ticket asks
    and the verdict had saturated, so the owner chose to stop. What the
    remaining 86 would have added is render coverage, not memory coverage.
+   Filed as #219, which is what criterion 7 asks of a check left partial —
+   disclosure here is not a substitute for the ticket.
 2. **`ARGS="--vision"`** instead of a `VISION=1` Makefile default: that knob is
    commit 726a1b7 on `issue-191`, not on this branch. Same flag either way.
 3. **Explicit `ARTIFACT=`**: the worktree has no `models/` directory.

@@ -5,7 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: serving / device memory reservation, KV-RAM pinned arena, retained slots, WDDM paging
-- Related: https://github.com/gpillon/ignis/issues/214, https://github.com/gpillon/ignis/issues/207, [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), [ADR 0029](../adr/0029-cross-request-state-reuse.md), [spec](../../.scratch/vram-budget/specs/01-vram-budget.md), [run record](../../.scratch/vram-budget/gate-214/FINDINGS.md), https://github.com/gpillon/ignis/issues/218
+- Related: https://github.com/gpillon/ignis/issues/214, https://github.com/gpillon/ignis/issues/207, [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), [ADR 0029](../adr/0029-cross-request-state-reuse.md), [spec](../../.scratch/vram-budget/specs/01-vram-budget.md), [run record](../../.scratch/vram-budget/gate-214/FINDINGS.md), https://github.com/gpillon/ignis/issues/218, https://github.com/gpillon/ignis/issues/219
 - Superseded by: none
 
 ## Question
@@ -50,12 +50,18 @@ Against the 2026-09-17 baseline, same script and same criteria
 | Quantity | 2026-09-17 | 2026-09-18 |
 |---|---:|---:|
 | window under load | 14.1 min | 24.5 min |
+| requests served | 55 | 287 |
+| first request's cost (commit) | +686 MiB | **+2 MiB** |
+| commit spread *after* the first request | 2547 MiB | **36 MiB** |
+| dedicated spread *after* the first request | 1969 MiB | **34 MiB** |
 | commit, load → end | +2734 MiB | **+6 MiB** |
-| commit spread | 3233 MiB | **36 MiB** |
-| dedicated spread | 2655 MiB | **34 MiB** |
 | process shared | 74 → 976 MiB, climbing | **8266 → 8268 MiB** |
 | dedicated/shared trading at constant commit | 23 samples | **0** |
-| first request's cost | +670 MiB | **+2 MiB** |
+
+Both spreads are measured on the same basis — every sample after the first
+request — so the one-off cost of that request is excluded from both rather
+than inflating the baseline's. The first request's +686 MiB is the csv's
+figure; `REPORT.md` states it as +670 from a slightly different sample pair.
 
 `ignis.runtime.vram_plan` (mode `derived`) totals 29,945,673,472 B = 28,558 MiB:
 weights 17,724, kv_pool 3,931, workspace 2,117, lane_state 1,822,
@@ -75,9 +81,9 @@ workers.
   spread 36 MiB over 289 samples. The tolerance stated for this run is ±64 MiB,
   taken from the sample noise itself; the baseline missed it by two orders of
   magnitude.
-- Process shared memory equals the KV-RAM arena and does not move: 8266–8268
-  MiB, which is the 8,192 MiB pinned arena plus the 74 MiB the process already
-  showed before the arena was pinned.
+- The process's "Shared GPU memory" equals the KV-RAM arena and does not move:
+  8266–8268 MiB, which is the 8,192 MiB pinned arena plus the 74 MiB the
+  process already showed before the arena was pinned.
 - There is no sample where commit stays constant while dedicated and shared
   trade places — the signature of WDDM paging that the 2026-09-17 run showed 23
   times.
@@ -87,7 +93,8 @@ workers.
   262,144 `max_context`. Retained slots are 8, one per decode lane; they
   saturate and stay saturated, and 20 retained operations were skipped for want
   of a slot (15 capture, 5 publish) rather than served with a fresh
-  `cudaMalloc`.
+  `cudaMalloc`. Every skip happened with all 8 slots held, so the pool skips
+  only when it is full.
 - Reuse keeps working while slots are saturated: 3,688,114 tokens reused from
   device-resident state and 10,134,354 from KV-RAM, 195 hits, 225 spills, 0
   device spills.
@@ -95,7 +102,7 @@ workers.
 **Inferred.**
 
 - The first-request delta is the sharpest single indicator of the change in
-  kind: 670 MiB on 2026-09-17 (lazy CUDA init, first prefix image, first
+  kind: 686 MiB on 2026-09-17 (lazy CUDA init, first prefix image, first
   checkpoint) against 2 MiB now. Nothing of consequence is allocated on the
   request path any more; what is left is live bookkeeping.
 - Saturated slots plus continuing reuse is the designed trade working as
@@ -134,13 +141,23 @@ workers.
   explicit-budget or allow-oversubscription modes do under the same load.
 - The 20 × 503 came from the measurement over-driving itself, so this run does
   not establish where the admission ceiling actually sits.
-- The KV token capacity was derived (`page_count` × `KV_PAGE_TOKENS`), not read
-  from the log — see the follow-up.
+- The KV token capacity quoted here was derived (`page_count` ×
+  `KV_PAGE_TOKENS`) rather than read, because the log redacted it during the
+  run. A later start, after the fix, logs it directly and agrees with the
+  derivation — but that is a different plan on a different amount of free
+  VRAM, not this run's number re-read.
 
 ## Follow-ups
 
-- https://github.com/gpillon/ignis/issues/218 — `ignis.runtime.kv_pool` logs
+- https://github.com/gpillon/ignis/issues/218 — `ignis.runtime.kv_pool` logged
   `token_capacity` and `bytes_per_token` as `[REDACTED]`, because
-  `is_sensitive_key` treats the singular word `token` as a credential.
+  `is_sensitive_key` treated the word `token` as a credential wherever it
+  appeared. Fixed on this branch after the run and verified on a later start,
+  which logged `token_capacity 453824` and `bytes_per_token 9216` in clear —
+  confirming the derivation used here (that start's plan holds 7,091 pages
+  rather than 6,989, from a different amount of free VRAM).
+- https://github.com/gpillon/ignis/issues/219 — the 86 raw-trace requests this
+  run did not reach. Render coverage only; the memory criteria do not depend
+  on them.
 - The run record lists the run's departures and the exact commands:
   [`.scratch/vram-budget/gate-214/FINDINGS.md`](../../.scratch/vram-budget/gate-214/FINDINGS.md).

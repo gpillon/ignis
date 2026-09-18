@@ -49,35 +49,26 @@ pub const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `token`/`bearer_token` (a credential) just because one contains the
 /// other's letters.
 const SENSITIVE_KEY_WORDS: &[&str] =
-    &["password", "secret", "authorization", "bearer", "cookie", "credential"];
+    &["password", "secret", "token", "authorization", "bearer", "cookie", "credential"];
 
-/// Keys that are a credential when they stand alone, whatever this engine
-/// also uses the word for. `token` is the unit this whole service is built
-/// on — `token_capacity`, `bytes_per_token`, `token_id` — so flagging it as a
-/// whole word wherever it appears redacted the engine's own arithmetic
-/// (GitHub #218, found by the #214 gate: `ignis.runtime.kv_pool` logged its
-/// capacity as `[REDACTED]`). A field named exactly `token` is still a
-/// credential, and a qualified one is caught by
-/// [`SENSITIVE_KEY_WORD_PAIRS`].
-const SENSITIVE_KEY_EXACT: &[&str] = &["token"];
+/// Words that, beside `token`, make a key a *measurement* of this engine's
+/// unit of work rather than a credential (GitHub #218). `token` stays in
+/// [`SENSITIVE_KEY_WORDS`] and this exempts the counting uses, rather than the
+/// reverse, because the two sides are not symmetric: the names a credential
+/// can be given are open-ended (`api_token`, `github_token`, `csrf_token`, a
+/// bare `headers.token`) and must keep failing closed, while the ways this
+/// codebase counts tokens are a handful that live in this repository.
+///
+/// Found by the #214 gate: `ignis.runtime.kv_pool` reported `token_capacity`
+/// and `bytes_per_token` as `[REDACTED]`, so the capacity had to be derived
+/// from the page count instead of read.
+const TOKEN_MEASUREMENT_WORDS: &[&str] = &["capacity", "count", "per", "id", "ids"];
 
 /// Adjacent-word pairs (after splitting on `_`/`-`/`.`, joined without the
 /// separator) that mark a key as sensitive even though neither word alone
 /// is in [`SENSITIVE_KEY_WORDS`] — `api_key`/`private_key` are credentials;
-/// `key` alone is too common a word (e.g. a cache or map key) to blanket-flag,
-/// and `token` is the same case (see [`SENSITIVE_KEY_EXACT`]). A credential's
-/// qualifier comes before the word it qualifies, so `access_token` is a pair
-/// while `token_capacity` is not — except `token_secret`, which `secret`
-/// already catches as a whole word.
-const SENSITIVE_KEY_WORD_PAIRS: &[&str] = &[
-    "apikey",
-    "privatekey",
-    "accesstoken",
-    "refreshtoken",
-    "authtoken",
-    "idtoken",
-    "sessiontoken",
-];
+/// `key` alone is too common a word (e.g. a cache or map key) to blanket-flag.
+const SENSITIVE_KEY_WORD_PAIRS: &[&str] = &["apikey", "privatekey"];
 
 /// The text a redacted attribute value is replaced with.
 const REDACTED: &str = "[REDACTED]";
@@ -85,16 +76,27 @@ const REDACTED: &str = "[REDACTED]";
 fn is_sensitive_key(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    if words.iter().any(|word| SENSITIVE_KEY_WORDS.contains(word)) {
-        return true;
-    }
-    if words.len() == 1 && SENSITIVE_KEY_EXACT.contains(&words[0]) {
+    let sensitive_word = words.iter().enumerate().any(|(i, word)| {
+        SENSITIVE_KEY_WORDS.contains(word) && !(*word == "token" && measures_tokens(&words, i))
+    });
+    if sensitive_word {
         return true;
     }
     words.windows(2).any(|pair| {
         let joined = format!("{}{}", pair[0], pair[1]);
         SENSITIVE_KEY_WORD_PAIRS.contains(&joined.as_str())
     })
+}
+
+/// Whether the `token` at `index` is being counted rather than carried: it
+/// sits next to one of [`TOKEN_MEASUREMENT_WORDS`], on either side
+/// (`token_capacity`, `bytes_per_token`). A `token` with no such neighbour —
+/// standing alone, or qualified by anything this file does not recognize —
+/// is treated as a credential.
+fn measures_tokens(words: &[&str], index: usize) -> bool {
+    let before = index.checked_sub(1).and_then(|i| words.get(i));
+    let after = words.get(index + 1);
+    [before, after].into_iter().flatten().any(|word| TOKEN_MEASUREMENT_WORDS.contains(word))
 }
 
 /// `tracing`'s default name for an unnamed event is `"event <file>:<line>"`.
@@ -397,19 +399,19 @@ mod tests {
         }
     }
 
-    /// A credential named `token` stays redacted whatever it is qualified
-    /// with, while the engine's own unit of work — which is also called a
-    /// token — keeps its value (GitHub #218). The two the #214 gate needed,
-    /// `token_capacity` and `bytes_per_token` (`ignis.runtime.kv_pool`), came
-    /// out as `[REDACTED]` because `token` was flagged as a whole word
-    /// wherever it appeared.
+    /// A `token` that is being *counted* keeps its value; a `token` that is
+    /// carried stays redacted however it is qualified (GitHub #218). The two
+    /// the #214 gate needed, `token_capacity` and `bytes_per_token` on
+    /// `ignis.runtime.kv_pool`, came out as `[REDACTED]`.
     #[test]
-    fn a_token_count_is_logged_and_a_token_credential_is_not() {
-        for key in ["token", "Token", "access_token", "refresh_token", "auth-token", "id.token", "bearer_token", "session_token", "token_secret"] {
-            assert!(is_sensitive_key(key), "{key} is a credential and should be redacted");
+    fn a_counted_token_is_logged_and_a_carried_one_is_not() {
+        for key in ["token_capacity", "bytes_per_token", "token_count", "eos_token_id", "token_ids"] {
+            assert!(!is_sensitive_key(key), "{key} counts tokens and should be logged");
         }
-        for key in ["token_capacity", "bytes_per_token", "tokens", "prompt_tokens", "max_context_tokens", "draft_tokens", "committed_tokens", "token_id"] {
-            assert!(!is_sensitive_key(key), "{key} is a token count or id, not a credential");
+        // The names a credential can be given are open-ended, so anything this
+        // file does not recognize has to keep failing closed.
+        for key in ["token", "Token", "headers.token", "x-token", "access_token", "refresh_token", "auth-token", "api_token", "github_token", "csrf_token", "oauth_token", "jwt_token", "token_value", "token_hash"] {
+            assert!(is_sensitive_key(key), "{key} is a credential and should be redacted");
         }
     }
 
