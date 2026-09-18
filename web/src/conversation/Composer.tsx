@@ -1,4 +1,5 @@
 import { type ClipboardEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ContextUsage } from "../metrics/context.ts";
 import { ContextMeter } from "../metrics/ContextMeter.tsx";
 import type { Attachment } from "../tools/local/attachments.ts";
@@ -189,48 +190,74 @@ export function Composer(props: {
  */
 function AddMenu({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
-  const root = useRef<HTMLDivElement>(null);
+  const [at, setAt] = useState({ left: 0, bottom: 0 });
+  const button = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+
+  /**
+   * The menu goes in a portal and is placed by hand. It cannot live beside
+   * the button: the prompt box is a `.cut`, and a clip-path cuts its
+   * descendants too, so a menu standing above the box is clipped away
+   * entirely — it opens and nothing is on screen.
+   */
+  function place() {
+    const box = button.current?.getBoundingClientRect();
+    if (box) setAt({ left: box.left, bottom: window.innerHeight - box.top + 8 });
+  }
 
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (!root.current?.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      // The menu is not inside the button's subtree any more, so it has to be asked as well:
+      // closing on its own mousedown would take the item away before its click could land.
+      if (!button.current?.contains(target) && !menu.current?.contains(target)) setOpen(false);
     };
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", place);
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", place);
     };
   }, [open]);
 
   return (
-    <div ref={root} className="relative shrink-0">
+    <div className="shrink-0">
       <button
+        ref={button}
         type="button"
         aria-label="Add to this prompt"
         title="Add a file or an image"
         aria-haspopup="menu"
         aria-expanded={open}
         className={`grid size-10 place-items-center hover:text-ink [&>svg]:size-[18px] ${open ? "text-ink" : "text-ash"}`}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          place();
+          setOpen((o) => !o);
+        }}
       >
         <IconPlus />
       </button>
-      {open && (
-        // The click that chose an item is what closes the menu, so the choice
-        // is handled on the way out and never lands on a dismissed menu.
-        <div
-          role="menu"
-          className="cut absolute bottom-full left-0 z-20 mb-2 flex w-56 flex-col bg-surface py-1 shadow-[0_8px_24px_rgba(28,32,38,0.28)] [--cut-size:10px]"
-          onClick={() => setOpen(false)}
-        >
-          {children}
-        </div>
-      )}
+      {open &&
+        createPortal(
+          // The click that chose an item is what closes the menu, so the choice
+          // is handled on the way out and never lands on a dismissed menu.
+          <div
+            ref={menu}
+            role="menu"
+            style={{ left: at.left, bottom: at.bottom }}
+            className="cut fixed z-40 flex w-56 flex-col bg-surface py-1 shadow-[0_8px_24px_rgba(28,32,38,0.28)] [--cut-size:10px]"
+            onClick={() => setOpen(false)}
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
