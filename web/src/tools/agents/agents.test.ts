@@ -1,18 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { Timeline } from "../../metrics/figures.ts";
 import type { ChatRequest, Settings, ToolExtras } from "../../api/request.ts";
-import { HTTP1_STREAM_BUDGET } from "../../api/connections.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import { runWeb, WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL, type WebRun } from "../web/web.ts";
 import {
   AGENT_SYSTEM_PROMPT,
   AGENT_TOOLS_SYSTEM_PROMPT,
-  MAX_PARALLEL_AGENTS,
   agentRequest,
   type AgentRun,
   agentSummary,
   agentSystemPrompt,
-  parallelAgents,
   parseAgentCall,
   runAgents,
   toolResult,
@@ -102,16 +99,6 @@ describe("toolResult and agentSummary", () => {
   it("summarises the runs", () => {
     expect(agentSummary([run("done"), run("running"), run("done")])).toBe("3 agents: 1 running, 2 done");
     expect(agentSummary([run("queued")])).toBe("1 agent: 1 queued");
-  });
-});
-
-describe("parallelAgents", () => {
-  it("stays under the browser's connection limit over HTTP/1.1", () => {
-    expect(parallelAgents(HTTP1_STREAM_BUDGET)).toBe(HTTP1_STREAM_BUDGET);
-  });
-
-  it("uses every lane the engine admits when the connection multiplexes", () => {
-    expect(parallelAgents(Number.POSITIVE_INFINITY)).toBe(MAX_PARALLEL_AGENTS);
   });
 });
 

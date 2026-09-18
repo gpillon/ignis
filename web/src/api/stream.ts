@@ -1,7 +1,8 @@
 import { authHeaders, keyRequired } from "./auth.ts";
-import { CHAT_PATH, withStreamPermit } from "./connections.ts";
+import { withStreamPermit } from "./connections.ts";
 import { apiErrorMessage } from "./errors.ts";
 import type { Timeline } from "../metrics/figures.ts";
+import { CHAT_PATH } from "./request.ts";
 import { type ChunkEvent, createSseParser, parseChunk } from "./sse.ts";
 
 // One streaming chat request, end to end (GitHub #164): send, read the SSE
@@ -19,12 +20,14 @@ export type StreamOptions = {
   signal?: AbortSignal;
   fetch?: typeof fetch;
   now?: () => number;
+  /** Called when the request goes out, which is later than the call when the page had no connection to spare. */
+  onStart?: () => void;
 };
 
 export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; message: string; timeline: Timeline };
 
 export async function streamChat(options: StreamOptions): Promise<StreamResult> {
-  return withStreamPermit(() => sendChat(options));
+  return withStreamPermit(() => sendChat(options), { signal: options.signal, onGranted: options.onStart });
 }
 
 async function sendChat(options: StreamOptions): Promise<StreamResult> {

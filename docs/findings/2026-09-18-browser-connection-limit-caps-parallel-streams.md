@@ -18,11 +18,11 @@ parallel, and only recovers much later. Is the server failing to answer
 
 Repro: Playground on the Vite dev server (`:5173`, proxying to
 `ignis-server --ui --metrics` on `:8000`), the `agent` tool on, prompt "use 6
-agents to write ~2000 tokens in parallel". Raw material: `.scratch/220/`.
+agents to write ~2000 tokens in parallel". Raw material: [`.scratch/220/`](../../.scratch/220/).
 
 A curl poller hit the endpoints once a second from outside the browser while
 the six agents decoded (`ignis.request.admitted` for request_id 1..6 at
-00:32:49.6–00:32:50.5 UTC in `server-during-repro.log`):
+00:32:49.6–00:32:50.5 UTC in [`server-during-repro.log`](../../.scratch/220/server-during-repro.log)):
 
 | clock | `/metrics` (:9464) | `/ui/metrics` (:8000) | `/v1/models` (:8000) |
 |---|---|---|---|
@@ -36,7 +36,7 @@ Chrome's word for "queued, waiting for a connection".
 
 `netstat` counted the page's sockets next to each poll. Loopback shows both
 ends of a connection, so the count halves; the second repro ran from 02:36:03
-(`poll-3-endpoints-and-sockets.csv`, every sample, unedited):
+([`poll-3-endpoints-and-sockets.csv`](../../.scratch/220/poll-3-endpoints-and-sockets.csv), every sample, unedited):
 
 | clock | established to `:5173` | connections |
 |---|---|---|
@@ -105,3 +105,5 @@ healthy while the page is not, the queue is in the browser.
 - The fix on `issue-220` was verified by unit tests, not yet in a browser: the
   live check (five streaming, one queued, the Monitor still ticking) is open.
 - https://github.com/gpillon/ignis/issues/220
+- https://github.com/gpillon/ignis/issues/221 — how to reach eight streams on
+  plain localhost, where the browser allows six and TLS is not wanted.

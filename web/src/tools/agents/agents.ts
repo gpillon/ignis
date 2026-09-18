@@ -1,7 +1,6 @@
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
-import { currentStreamBudget } from "../../api/connections.ts";
 import { streamChat } from "../../api/stream.ts";
 import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
 import { isLocalTool, type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../local/local.ts";
@@ -59,17 +58,6 @@ export function agentSystemPrompt(extras: ToolExtras = {}): string {
 
 /** ignis admits 8 requests in flight; the main reply has finished while its agents run. */
 export const MAX_PARALLEL_AGENTS = 8;
-
-/**
- * How many agents may start at once: the engine's ceiling, or fewer when the
- * browser cannot hold that many connections open (GitHub #220). Streams wait
- * for a connection anyway (`api/connections.ts`); starting only as many agents
- * as can stream keeps the strip honest, showing the rest as queued rather than
- * as running agents producing nothing.
- */
-export function parallelAgents(budget = currentStreamBudget()): number {
-  return Math.min(MAX_PARALLEL_AGENTS, budget);
-}
 
 /** How many replies in a row an agent may call tools in before it is failed. */
 export const MAX_AGENT_TOOL_ROUNDS = 8;
@@ -198,7 +186,7 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
   const doRunWeb = options.runWeb ?? runWeb;
   const now = options.now ?? (() => performance.now());
   const sleep = options.sleep ?? abortableSleep;
-  const limit = Math.max(1, options.limit ?? parallelAgents());
+  const limit = Math.max(1, options.limit ?? MAX_PARALLEL_AGENTS);
   const maxRetries = options.maxRetries ?? 60;
   const retryDelayMs = options.retryDelayMs ?? 1000;
   const tools = options.tools ?? {};
@@ -222,7 +210,6 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         set(task.callId, { status: "stopped" });
         return null;
       }
-      set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) });
       const calls: ToolCall[] = [];
       // A later request's reasoning is set apart from the earlier ones'.
       let separator = before ? "\n\n" : "";
@@ -230,6 +217,9 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         body: agentRequest(options.settings, turns, tools),
         signal,
         now,
+        // An agent whose stream is waiting for a connection (GitHub #220) is
+        // still queued: it turns running when its request actually goes out.
+        onStart: () => set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) }),
         onEvent: (event) => {
           const run = get(task.callId);
           if (event.kind === "reasoning") {

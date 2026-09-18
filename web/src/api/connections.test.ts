@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { currentStreamBudget, HTTP1_STREAM_BUDGET, observedProtocol, streamBudget, streamsInFlight, withStreamPermit } from "./connections.ts";
+import { createStreamPermits, currentStreamBudget, HTTP1_STREAM_BUDGET, observedProtocol, streamBudget } from "./connections.ts";
 
 describe("streamBudget", () => {
   it("leaves one connection free for the rest of the page over HTTP/1.1", () => {
@@ -107,43 +107,45 @@ describe("currentStreamBudget", () => {
   });
 });
 
-describe("withStreamPermit", () => {
-  const held = () => {
-    let release = () => {};
-    const done = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    return { done, release };
-  };
+const held = () => {
+  let release = () => {};
+  const done = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { done, release };
+};
 
+describe("createStreamPermits", () => {
   it("runs no more streams at once than the budget allows", async () => {
+    const { withPermit, inFlight } = createStreamPermits();
     const streams = Array.from({ length: 4 }, held);
     let peak = 0;
     const runs = streams.map((stream) =>
-      withStreamPermit(async () => {
-        peak = Math.max(peak, streamsInFlight().running);
+      withPermit(async () => {
+        peak = Math.max(peak, inFlight().running);
         await stream.done;
         return "done";
-      }, 2),
+      }, { budget: 2 }),
     );
     await Promise.resolve();
-    expect(streamsInFlight()).toEqual({ running: 2, queued: 2 });
+    expect(inFlight()).toEqual({ running: 2, queued: 2 });
     for (const stream of streams) stream.release();
     expect(await Promise.all(runs)).toEqual(["done", "done", "done", "done"]);
     expect(peak).toBe(2);
-    expect(streamsInFlight()).toEqual({ running: 0, queued: 0 });
+    expect(inFlight()).toEqual({ running: 0, queued: 0 });
   });
 
   it("hands the connection to the next in line, so a queued stream starts at once", async () => {
+    const { withPermit } = createStreamPermits();
     const first = held();
     const started: string[] = [];
-    const running = withStreamPermit(async () => {
+    const running = withPermit(async () => {
       started.push("first");
       await first.done;
-    }, 1);
-    const queued = withStreamPermit(async () => {
+    }, { budget: 1 });
+    const queued = withPermit(async () => {
       started.push("second");
-    }, 1);
+    }, { budget: 1 });
     await Promise.resolve();
     expect(started).toEqual(["first"]);
     first.release();
@@ -152,11 +154,49 @@ describe("withStreamPermit", () => {
   });
 
   it("frees the connection when a stream throws", async () => {
+    const { withPermit, inFlight } = createStreamPermits();
     await expect(
-      withStreamPermit(() => {
+      withPermit(() => {
         throw new Error("the engine dropped it");
-      }, 1),
+      }, { budget: 1 }),
     ).rejects.toThrow("the engine dropped it");
-    expect(streamsInFlight()).toEqual({ running: 0, queued: 0 });
+    expect(inFlight()).toEqual({ running: 0, queued: 0 });
+  });
+
+  it("says when a stream may go, so a queued one is not shown as running", async () => {
+    const { withPermit } = createStreamPermits();
+    const first = held();
+    const granted: string[] = [];
+    const running = withPermit(() => first.done, { budget: 1, onGranted: () => granted.push("first") });
+    const queued = withPermit(async () => {}, { budget: 1, onGranted: () => granted.push("second") });
+    await Promise.resolve();
+    expect(granted).toEqual(["first"]);
+    first.release();
+    await Promise.all([running, queued]);
+    expect(granted).toEqual(["first", "second"]);
+  });
+
+  it("stops waiting when the caller gives up, and leaves the budget alone", async () => {
+    const { withPermit, inFlight } = createStreamPermits();
+    const first = held();
+    const stop = new AbortController();
+    const running = withPermit(() => first.done, { budget: 1 });
+    let ran = false;
+    const queued = withPermit(
+      async () => {
+        ran = true;
+      },
+      { budget: 1, signal: stop.signal },
+    );
+    await Promise.resolve();
+    expect(inFlight()).toEqual({ running: 1, queued: 1 });
+    stop.abort();
+    await queued;
+    // It runs at once with its request already aborted, so it opens no connection.
+    expect(ran).toBe(true);
+    expect(inFlight()).toEqual({ running: 1, queued: 0 });
+    first.release();
+    await running;
+    expect(inFlight()).toEqual({ running: 0, queued: 0 });
   });
 });

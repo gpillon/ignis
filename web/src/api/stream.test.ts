@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { getAuth, saveKey } from "./auth.ts";
 import type { ChunkEvent } from "./sse.ts";
+import { HTTP1_STREAM_BUDGET } from "./connections.ts";
 import { streamChat } from "./stream.ts";
 
 describe("streamChat and the API key", () => {
@@ -141,5 +142,51 @@ describe("streamChat", () => {
     expect(result.timeline.stopped).toBe(true);
     expect(result.timeline.firstTokenAt).toBeDefined();
     expect(result.timeline.usage).toBeUndefined();
+  });
+});
+
+describe("streamChat and the page's connections", () => {
+  it("waits for a connection before it starts the clock, so the queue is not read as latency", async () => {
+    // One more stream than the page can hold (GitHub #220).
+    const wanted = HTTP1_STREAM_BUDGET + 1;
+    const release: (() => void)[] = [];
+    let clock = 0;
+    const holding = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          release.push(() => {
+            controller.enqueue(new TextEncoder().encode(sse({ content: "hi" }, "stop")));
+            controller.close();
+          });
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const started: number[] = [];
+    const runs = Array.from({ length: wanted }, (_, i) =>
+      streamChat({
+        body: {},
+        fetch: holding,
+        now: () => ++clock,
+        onStart: () => started.push(i),
+        onEvent: () => {},
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(Array.from({ length: HTTP1_STREAM_BUDGET }, (_, i) => i));
+
+    const first = release.shift();
+    first?.();
+    await runs[0];
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(started).toEqual(Array.from({ length: wanted }, (_, i) => i));
+
+    for (const end of release) end();
+    const results = await Promise.all(runs);
+    const timelines = results.map((result) => result.timeline);
+    // The queued stream's clock starts after the one it waited for had stopped.
+    expect(timelines[wanted - 1].sentAt).toBeGreaterThan(timelines[0].endedAt!);
+    expect(results.every((result) => result.ok)).toBe(true);
   });
 });

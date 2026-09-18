@@ -1,3 +1,5 @@
+import { CHAT_PATH } from "./request.ts";
+
 // How many requests this browser may keep streaming at once (GitHub #220).
 // Over HTTP/1.1 a browser opens at most six connections per origin, and a
 // stream holds one for as long as it runs: six agents took all six, and every
@@ -13,9 +15,6 @@
 // them: agents, an agent's own tool round and the JavaScript safety check all
 // open one, and a reservation each of them counts separately is no
 // reservation at all.
-
-/** The path every streaming request goes to; `observedProtocol` reads those requests back. */
-export const CHAT_PATH = "/v1/chat/completions";
 
 /** Connections a browser opens per origin over HTTP/1.1. */
 export const BROWSER_CONNECTIONS_PER_ORIGIN = 6;
@@ -70,8 +69,9 @@ function sameOrigin(name: string, origin: string): boolean {
  * The budget for this page, measured now. It is read per call, not once: the
  * first answer comes from the page's own connection and later ones from the
  * chat requests, which a proxy in front could serve differently. The browser
- * keeps a bounded timeline, so once the older entries are dropped this falls
- * back to the page's own connection — the capped answer, never the lifted one.
+ * keeps a bounded timeline, so once the older chat requests are dropped from
+ * it this answers from the page's own connection again — the same origin, so
+ * the same answer unless the server was replaced under the open page.
  */
 export function currentStreamBudget(): number {
   const origin = globalThis.location?.origin;
@@ -81,28 +81,71 @@ export function currentStreamBudget(): number {
   return streamBudget(observedProtocol(streams, origin) ?? page[0]?.nextHopProtocol);
 }
 
-let streaming = 0;
-const waiting: (() => void)[] = [];
+export type PermitOptions = {
+  /** How many streams may run at once; read once, when the call arrives. */
+  budget?: number;
+  /** Stops waiting for a connection when the caller gives up. */
+  signal?: AbortSignal;
+  /** Called when the stream may go, which is at once unless it had to queue. */
+  onGranted?: () => void;
+};
+
+export type StreamPermits = {
+  withPermit: <T>(stream: () => Promise<T>, options?: PermitOptions) => Promise<T>;
+  inFlight: () => { running: number; queued: number };
+};
 
 /**
- * Runs `stream` once the page can afford another one, and hands the
- * connection straight to whoever is next in line when it ends. `budget` is
- * read when the call arrives, so a page that turns out to be multiplexed
- * stops queueing from the next call on.
+ * A budget and the streams holding it. The page shares the one below; a test
+ * makes its own so it starts from nothing.
+ *
+ * A stream that has to wait is handed the connection of whoever finishes
+ * first, rather than re-entering the check, so a queued stream starts the
+ * moment one ends. A caller that gives up while queued leaves the queue and
+ * runs anyway: its request is already aborted, so it opens no connection.
  */
-export async function withStreamPermit<T>(stream: () => Promise<T>, budget = currentStreamBudget()): Promise<T> {
-  if (streaming >= budget) await new Promise<void>((resolve) => waiting.push(resolve));
-  else streaming++;
-  try {
-    return await stream();
-  } finally {
-    const next = waiting.shift();
-    if (next) next();
-    else streaming--;
-  }
+export function createStreamPermits(): StreamPermits {
+  let running = 0;
+  const waiting: (() => void)[] = [];
+
+  const leave = (grant: () => void) => {
+    const at = waiting.indexOf(grant);
+    if (at !== -1) waiting.splice(at, 1);
+  };
+
+  return {
+    inFlight: () => ({ running, queued: waiting.length }),
+    async withPermit<T>(stream: () => Promise<T>, options: PermitOptions = {}): Promise<T> {
+      const budget = options.budget ?? currentStreamBudget();
+      let holds = true;
+      if (running >= budget) {
+        holds = await new Promise<boolean>((resolve) => {
+          const grant = () => resolve(true);
+          waiting.push(grant);
+          options.signal?.addEventListener("abort", () => {
+            leave(grant);
+            resolve(false);
+          }, { once: true });
+        });
+      } else running++;
+      options.onGranted?.();
+      try {
+        return await stream();
+      } finally {
+        if (holds) {
+          const next = waiting.shift();
+          if (next) next();
+          else running--;
+        }
+      }
+    },
+  };
 }
 
-/** How many streams are running or queued, for tests. */
-export function streamsInFlight(): { running: number; queued: number } {
-  return { running: streaming, queued: waiting.length };
-}
+const permits = createStreamPermits();
+
+/** Runs `stream` on the page's own budget. */
+export const withStreamPermit = permits.withPermit;
+
+/** How many streams the page is running or queueing. */
+export const streamsInFlight = permits.inFlight;
