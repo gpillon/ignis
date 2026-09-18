@@ -141,6 +141,7 @@ function ToolsSetting({
   return (
     <fieldset className="flex flex-col gap-2">
       <legend className="sr-only">Tools</legend>
+      <ToolRoundsField rounds={tools.maxRounds} onChange={(maxRounds) => onChange({ ...tools, maxRounds })} />
       <div className="mb-2 flex items-center justify-between gap-3">
         <span id="tools-all-label" className={caption}>
           All tools
@@ -269,6 +270,38 @@ function ToolRow(props: { id: string; label: string; description: string; on: bo
       </div>
       <Switch on={props.on} onChange={props.onChange} labelledBy={`tool-${props.id}-label`} />
     </div>
+  );
+}
+
+/**
+ * The rounds a turn gets: the conversation's own tool loop and each agent's.
+ * The box holds what is typed, half-typed numbers too; only a whole round of
+ * one or more is kept, and leaving the box shows the value that was.
+ */
+function ToolRoundsField({ rounds, onChange }: { rounds: number; onChange: (rounds: number) => void }) {
+  const [draft, setDraft] = useState(String(rounds));
+  const type = (text: string) => {
+    setDraft(text);
+    const value = Math.floor(Number(text));
+    if (text.trim() !== "" && Number.isFinite(value) && value >= 1) onChange(value);
+  };
+  return (
+    <label className="mb-4 flex flex-col gap-1.5">
+      <span className={caption}>Tool rounds</span>
+      <input
+        className={`${field} font-display tabular-nums`}
+        type="number"
+        name="tool-rounds"
+        min={1}
+        step={1}
+        value={draft}
+        onChange={(e) => type(e.target.value)}
+        onBlur={() => setDraft(String(rounds))}
+      />
+      <span className="text-xs leading-snug text-ash">
+        How many replies in a row may call tools, in a turn and inside each agent. Past it the calls come back unrun.
+      </span>
+    </label>
   );
 }
 

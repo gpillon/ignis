@@ -48,7 +48,16 @@ export type ToolsState = {
   memory: boolean;
   files: boolean;
   readFiles: boolean;
+  /**
+   * An option of every tool, not a tool: how many replies in a row may call
+   * tools before the calls stop being run — the conversation's own loop, and
+   * each agent's.
+   */
+  maxRounds: number;
 };
+
+/** The rounds a turn gets when nothing else is chosen. */
+export const DEFAULT_TOOL_ROUNDS = 16;
 
 export const NO_TOOLS: ToolsState = {
   enabled: true,
@@ -63,6 +72,7 @@ export const NO_TOOLS: ToolsState = {
   memory: false,
   files: false,
   readFiles: false,
+  maxRounds: DEFAULT_TOOL_ROUNDS,
 };
 
 /** Every tool on, the safety check too: the Playground's default. */
@@ -79,6 +89,7 @@ export const ALL_TOOLS: ToolsState = {
   memory: true,
   files: true,
   readFiles: true,
+  maxRounds: DEFAULT_TOOL_ROUNDS,
 };
 
 const CHOICES = ["agents", "web", "askUser", "dateTime", "runJs", "plan", "memory", "files", "readFiles"] as const;
@@ -168,10 +179,11 @@ export function agentExtras(tools: ToolsState, context: PromptContext = {}): Too
 
 /**
  * The switch for all tools. Off keeps each tool's choice for when it comes
- * back on; on with no tool chosen turns every tool on.
+ * back on; on with no tool chosen turns every tool on. The rounds are a
+ * setting of the section, not of a tool: they survive either way.
  */
 export function setAllTools(tools: ToolsState, enabled: boolean): ToolsState {
-  if (enabled && CHOICES.every((choice) => !tools[choice])) return ALL_TOOLS;
+  if (enabled && CHOICES.every((choice) => !tools[choice])) return { ...ALL_TOOLS, maxRounds: tools.maxRounds };
   return { ...tools, enabled };
 }
 
