@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAgo, formatBound, formatCount, formatNumber, formatOffset, formatSeconds, formatShare, niceScale } from "./format.ts";
+import { formatAgo, formatBound, formatBytes, formatCount, formatNumber, formatOffset, formatSeconds, formatShare, niceScale } from "./format.ts";
 
 describe("monitor formatting", () => {
   it("compacts counts", () => {
@@ -8,6 +8,18 @@ describe("monitor formatting", () => {
     expect(formatCount(12_345)).toBe("12.3K");
     expect(formatCount(150_000)).toBe("150K");
     expect(formatCount(4_200_000)).toBe("4.2M");
+  });
+
+  it("writes memory in binary units, to the precision the size deserves", () => {
+    expect(formatBytes(null)).toBe("—");
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(900)).toBe("900 B");
+    expect(formatBytes(1536)).toBe("1.5 KiB");
+    expect(formatBytes(402_653_184)).toBe("384 MiB");
+    expect(formatBytes(17_179_869_184)).toBe("16 GiB");
+    // ADR 0030's own measurement, so the figure it quotes is the figure shown.
+    expect(formatBytes(29.69 * 1024 ** 3)).toBe("29.69 GiB");
+    expect(formatBytes(123.4 * 1024 ** 3)).toBe("123 GiB");
   });
 
   it("gives measured figures the decimals their size deserves", () => {
