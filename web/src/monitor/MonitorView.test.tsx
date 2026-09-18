@@ -41,7 +41,7 @@ describe("MonitorView", () => {
     // GitHub #224: three tier rows, with disk present and visibly inert
     // rather than absent or showing a zero.
     for (const tier of ["VRAM", "RAM", "Disk"]) expect(html).toContain(tier);
-    expect(html).toContain("non implementato");
+    expect(html).toContain("not implemented");
     expect(html).toContain("Live");
   });
 

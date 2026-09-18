@@ -469,7 +469,7 @@ function ReasonBars({ byReason }: { byReason: Dashboard["rejected"]["byReason"] 
 const EVICTION_TIER_LABEL: Record<EvictionTierName, { name: string; note: string }> = {
   vram: { name: "VRAM", note: "work survives in host RAM" },
   ram: { name: "RAM", note: "work is lost, the request re-prefills" },
-  disk: { name: "Disk", note: "non implementato" },
+  disk: { name: "Disk", note: "not implemented" },
 };
 
 /**
@@ -487,13 +487,15 @@ function EvictionsCard({ evictions, chart, win }: { evictions: Evictions; chart:
     { key: "ram", label: "RAM/min", color: "var(--series-1)", values: evictions.ram.live?.perMinSeries ?? [] },
   ];
   return (
-    <Card title="Evictions" subtitle={`What each tier gave up in the last ${win}`}>
+    <Card title="Evictions" subtitle={`Departures from each tier in the last ${win}`}>
       <table className="w-full text-xs">
         <thead className="text-ash">
           <tr>
             <th className="pb-1 text-left font-normal">Tier</th>
             <th className="pb-1 text-right font-normal">Live</th>
-            <th className="pb-1 text-right font-normal">Retained</th>
+            <th className="pb-1 text-right font-normal" title="Cached state that left the tier - under pressure, or superseded by a newer turn">
+              Retained
+            </th>
             <th className="pb-1 text-right font-normal">Demoted</th>
           </tr>
         </thead>

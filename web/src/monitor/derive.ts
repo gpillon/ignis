@@ -154,7 +154,10 @@ export type EvictionTierName = (typeof EVICTION_TIERS)[number];
  *   VRAM its work is snapshotted and survives; out of RAM it is destroyed and
  *   the request re-prefills from zero. This is the column that costs.
  * - `retained` — cached state (a prompt checkpoint or a shared prefix) left
- *   the tier for nowhere. A future request pays a miss; nothing in flight does.
+ *   the tier for nowhere. A future request pays a miss; nothing in flight
+ *   does. This column mixes pressure with ordinary turnover: a conversation's
+ *   superseded checkpoints are discarded on the next capture (GitHub #187),
+ *   which is housekeeping, not memory pressure. Watch `live` for pressure.
  * - `demoted` — state that moved down a tier and survived. Not a loss, but it
  *   is how the tier below fills up.
  *

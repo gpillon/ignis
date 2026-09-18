@@ -573,19 +573,26 @@ impl Telemetry {
     /// the misattribution this ticket's request log exists to prevent.
     /// A **live** snapshot was dropped out of the KV-RAM tier to make room
     /// (GitHub #224): the tier's own eviction, projected into
-    /// `ignis_kv_ram_evictions_total`. Not logged — the `requeued` line that
-    /// follows it is the request log's record of the same moment — so only
-    /// the installed projection observes it.
+    /// `ignis_kv_ram_evictions_total` and emitted as the `dropped` line.
+    ///
+    /// The line exists for the same reason `evicted` and `restored` do
+    /// (GitHub #125): the tier's cost has to be attributable from the request
+    /// log alone. `Requeued` carries no line of its own, so without this one a
+    /// dropped request shows up as an `evicted` followed by a second
+    /// `admitted` with nothing in between saying why it started over.
     ///
     /// Deliberately *not* driven off [`Telemetry::on_requeued`]: a requeue
     /// also follows a failed restore, where KV-RAM evicted nothing.
+    ///
     /// The scheduler's interval line (ADR 0025) is deliberately left alone:
     /// it carries `kv_evictions` and gains no second field here, so this
-    /// ticket changes the Prometheus contract only.
-    pub fn on_snapshot_dropped(&mut self, _id: RequestId) {
+    /// ticket changes the Prometheus contract and the request log, not the
+    /// interval contract.
+    pub fn on_snapshot_dropped(&mut self, id: RequestId) {
         if let Some(metrics) = &self.metrics {
             metrics.record_kv_ram_eviction();
         }
+        self.emit_dropped(id);
     }
 
     pub fn on_requeued(&mut self, id: RequestId) {
@@ -736,6 +743,19 @@ impl Telemetry {
             request_id = id,
             snapshot_micros,
             "evicted to the host KV-RAM tier"
+        );
+    }
+
+    /// The `dropped` line (GitHub #224): the host tier gave this request's
+    /// snapshot up to make room for another, so every prefilled token is
+    /// gone and the request starts over. The costly counterpart to
+    /// [`Telemetry::emit_evicted`], whose snapshot survives.
+    fn emit_dropped(&self, id: RequestId) {
+        let _span = tracing::info_span!("ignis.telemetry.emit", request_id = id).entered();
+        tracing::info!(
+            name: "ignis.request.dropped",
+            request_id = id,
+            "snapshot dropped from the host KV-RAM tier: re-prefills from the start"
         );
     }
 
@@ -1618,11 +1638,35 @@ mod tests {
 
         let text = metrics.render();
         for line in ["ignis_kv_cache_evictions_total 1", "ignis_kv_ram_evictions_total 1"] {
-            assert!(text.contains(&format!("
-{line}
-")), "no `{line}` in:
-{text}");
+            assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
         }
+    }
+
+    /// GitHub #224 — and the drop is in the request log too, for the reason
+    /// `evicted` and `restored` are (#125): `Requeued` carries no line, so
+    /// without `dropped` the log would show an eviction and then a second
+    /// admission with nothing saying the work in between was thrown away.
+    #[test]
+    fn a_dropped_snapshot_is_a_line_in_the_request_log() {
+        let mut telemetry = telemetry();
+        let events = capture_events(|| {
+            telemetry.note_submit(1, 3, RequestClass::Agent);
+            telemetry.on_admitted(1, 0);
+            telemetry.on_evicted(1, 45_000);
+            telemetry.on_snapshot_dropped(1);
+            telemetry.on_requeued(1);
+        });
+        let dropped = events
+            .iter()
+            .find(|e| e["event_name"] == "ignis.request.dropped")
+            .expect("a `dropped` line");
+        assert_eq!(dropped["attributes"]["request_id"], 1);
+        // The requeue that follows still writes no line of its own, which is
+        // exactly why this one has to exist.
+        assert!(
+            !events.iter().any(|e| e["event_name"] == "ignis.request.requeued"),
+            "a requeue has no line of its own: {events:?}"
+        );
     }
 
     /// A cancelled request never completed: its late `Done` is not a
