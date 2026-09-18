@@ -71,6 +71,12 @@ ALLOW_VRAM_OVERSUBSCRIPTION ?=
 # retained prompt checkpoints and shared prefixes, reserved at load. Empty =
 # the server's default, one per decode lane.
 RETAINED_SLOTS ?=
+# Vision (--vision, GitHub #179): a load that takes image parts. Without it
+# every `image_url` part is refused with `vision_disabled`, whatever the
+# artifact holds. VISION_MAX_TOKENS caps one request's vision tokens
+# (--vision-max-tokens); empty = the server's own envelope.
+VISION ?=
+VISION_MAX_TOKENS ?=
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G
