@@ -2,7 +2,18 @@ import { type ReactNode, useMemo, useState } from "react";
 import { forgetKey } from "../api/auth.ts";
 import { IconChevron, IconHealth, IconPause, IconPlay } from "../ui/icons.tsx";
 import { Distribution, Legend, type Series, Sparkline, TimeChart } from "./charts.tsx";
-import { type Counter, type Dashboard, deriveDashboard, type HealthLevel, type Latency, type Memory, type Meter, RATE_SPAN_MS, TREND_SPAN_MS } from "./derive.ts";
+import {
+  type Counter,
+  type Dashboard,
+  deriveDashboard,
+  type HealthLevel,
+  type Latency,
+  type Memory,
+  type Meter,
+  RATE_SPAN_MS,
+  TOKENS_PER_KV_PAGE,
+  TREND_SPAN_MS,
+} from "./derive.ts";
 import { formatAgo, formatBound, formatBytes, formatCount, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
 import { bucketCounts } from "./quantile.ts";
 import type { MonitorState } from "./scrape.ts";
@@ -648,7 +659,11 @@ function PlanCard({ memory }: { memory: Memory }) {
             <span className="font-display text-[34px] leading-none font-semibold">{formatBytes(memory.linesBytes)}</span>
             <span className="text-xs text-ash">
               reserved of a {formatBytes(budget)} budget ·{" "}
-              {memory.oversubscribed ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it` : `${formatBytes(memory.kvRoomBytes)} left for the KV pool`}
+              {memory.oversubscribed
+                ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it`
+                : `${formatBytes(memory.kvRoomBytes)} left for the KV pool${
+                    memory.kvPool.tokens === null ? "" : ` (${formatCount(memory.kvPool.tokens)} tokens)`
+                  }`}
             </span>
           </div>
           <div className="flex h-3 gap-px bg-line/40" aria-hidden>
@@ -669,9 +684,10 @@ function PlanCard({ memory }: { memory: Memory }) {
             ))}
           </ul>
           <p className="text-[11px] text-ash">
-            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}. What the budget left beyond those pages is the
-            rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather than
-            split into a figure nothing measured.
+            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}, {TOKENS_PER_KV_PAGE} tokens to a page: the tokens
+            beside the room above are those pages multiplied, the whole pool rather than what is free at this moment. What the budget left beyond those pages
+            is the rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather
+            than split into a figure nothing measured.
             {memory.oversubscribed && " This load reserved more than its budget (--allow-vram-oversubscription), so the bar is the plan, not the budget."}
           </p>
         </>

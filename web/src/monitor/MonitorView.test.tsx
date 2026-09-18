@@ -51,6 +51,8 @@ describe("MonitorView", () => {
     expect(html).toContain("2 GiB");
     expect(html).toContain("8 GiB");
     expect(html).toContain("29 GiB budget");
+    // 4,032 pages of 64 tokens: the room's tokens, beside the bytes.
+    expect(html).toContain("258K tokens");
     expect(html).toContain("Weights");
     expect(html).toContain("KV pool");
     // The prefix miss series is zero by construction, and says so.
