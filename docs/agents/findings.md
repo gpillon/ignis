@@ -85,6 +85,13 @@ does not establish. `Follow-ups` may link future work, while GitHub remains the
 source of truth for its status. Keep raw logs and voluminous output in
 `.scratch/` and reference them when useful.
 
+A profiler capture is not raw material you can commit. An Nsight Systems
+`.nsys-rep` (and its `.sqlite`) records the profiled process's **environment**,
+so it carries every API key that was set when the run started — GitHub's push
+protection caught exactly that here. Commit the command that produced the
+capture and the report derived from it, and leave the capture on disk;
+`.gitignore` refuses the file types that are known to carry one.
+
 Set `Last verified` to the most recent date on which the evidence and conclusion
 were checked. Use repository-relative links for `Related` and `Superseded by`
 when the target is in the repository, and full links for GitHub issues or

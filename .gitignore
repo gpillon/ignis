@@ -41,3 +41,11 @@ models/
 # "*-trace.jsonl" pattern missed "...-real-client.jsonl" once — broadened
 # on purpose, never narrow this back).
 bench/traces/*.jsonl
+
+# profiler captures (GitHub #220's push was blocked by one): an Nsight Systems
+# capture records the profiled process's environment, so it carries whatever
+# API keys were set when the run started. The command and the derived report
+# are the committable evidence; the capture itself stays on disk.
+*.nsys-rep
+*.nsys-rep.sqlite
+*.qdrep
