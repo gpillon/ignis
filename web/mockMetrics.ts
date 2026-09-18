@@ -157,13 +157,13 @@ export function createMetricsSim(start = Date.now()) {
     // Room runs short: the oldest images are spilled to KV-RAM, or dropped.
     while (slots.inUse >= RETAINED_SLOTS && Math.random() < 0.4) {
       const kind = Math.random() < 0.6 ? "checkpoint" : "prefix";
+      // An image either moves down a tier or is given up; it is never both.
       if (slots.spilled * RETAINED_BLOB_BYTES + RETAINED_BLOB_BYTES <= KV_RAM_ARENA_BYTES) {
         bump("spills", "kv_ram", kind);
         slots.spilled++;
       } else {
-        bump("discards", "kv_ram", kind);
+        bump("discards", "device", kind);
       }
-      bump("discards", "device", kind);
       slots.inUse--;
     }
   }

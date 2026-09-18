@@ -722,7 +722,7 @@ function MeterRow({
           ? `${formatShare(meter.used, meter.capacity)} in use`
           : meter.capacity === 0
             ? "this load has none of it to give"
-            : "this scrape carries no bound to read it against"}
+            : `this scrape carries no ${meter.capacity === null ? "bound to read it against" : "figure to read against the bound"}`}
         {aside && ` · ${aside}`}
       </p>
       {children}
