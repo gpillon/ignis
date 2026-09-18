@@ -1,12 +1,18 @@
 import { authHeaders, keyRequired } from "./auth.ts";
+import { withStreamPermit } from "./connections.ts";
 import { apiErrorMessage } from "./errors.ts";
 import type { Timeline } from "../metrics/figures.ts";
+import { CHAT_PATH } from "./request.ts";
 import { type ChunkEvent, createSseParser, parseChunk } from "./sse.ts";
 
 // One streaming chat request, end to end (GitHub #164): send, read the SSE
 // body as it arrives, hand each event to the caller, and keep the timeline
 // the figures are computed from. `fetch` and the clock are injectable so
 // this is testable without a server.
+//
+// Every stream waits for a connection the page can spare (GitHub #220, see
+// `connections.ts`); the wait is before `sentAt`, so a queued stream does not
+// report the queue as its own latency.
 
 export type StreamOptions = {
   body: unknown;
@@ -14,17 +20,23 @@ export type StreamOptions = {
   signal?: AbortSignal;
   fetch?: typeof fetch;
   now?: () => number;
+  /** Called when the request goes out, which is later than the call when the page had no connection to spare. */
+  onStart?: () => void;
 };
 
 export type StreamResult = { ok: true; timeline: Timeline } | { ok: false; message: string; timeline: Timeline };
 
 export async function streamChat(options: StreamOptions): Promise<StreamResult> {
+  return withStreamPermit(() => sendChat(options), { signal: options.signal, onGranted: options.onStart });
+}
+
+async function sendChat(options: StreamOptions): Promise<StreamResult> {
   const now = options.now ?? (() => performance.now());
   const doFetch = options.fetch ?? fetch;
   const timeline: Timeline = { sentAt: now(), stopped: false };
 
   try {
-    const response = await doFetch("/v1/chat/completions", {
+    const response = await doFetch(CHAT_PATH, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify(options.body),

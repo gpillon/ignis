@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addExchange,
   addLogRow,
@@ -24,6 +24,12 @@ const message = (id: number, role: Message["role"], content: string): Message =>
   reasoning: "",
   streaming: role === "assistant",
 });
+
+// `createSession` stamps `startedAt` from the clock, so two sessions built a
+// millisecond apart are not equal. Freezing the clock lets a test compare a
+// session it built against one the code under test built.
+beforeEach(() => vi.useFakeTimers({ now: new Date("2026-09-18T00:00:00Z") }));
+afterEach(() => vi.useRealTimers());
 
 const withMessages = (id: number): SessionList["sessions"][number] => ({
   ...createSession(id),

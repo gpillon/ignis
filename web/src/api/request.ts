@@ -6,6 +6,9 @@
 
 import type { ToolCall } from "./sse.ts";
 
+/** Where every chat request goes; the connection budget reads these back off the timeline. */
+export const CHAT_PATH = "/v1/chat/completions";
+
 export type LaneTag = "interactive" | "agent";
 
 /**

@@ -210,7 +210,6 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         set(task.callId, { status: "stopped" });
         return null;
       }
-      set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) });
       const calls: ToolCall[] = [];
       // A later request's reasoning is set apart from the earlier ones'.
       let separator = before ? "\n\n" : "";
@@ -218,6 +217,9 @@ export async function runAgents(tasks: AgentTask[], options: RunAgentsOptions): 
         body: agentRequest(options.settings, turns, tools),
         signal,
         now,
+        // An agent whose stream is waiting for a connection (GitHub #220) is
+        // still queued: it turns running when its request actually goes out.
+        onStart: () => set(task.callId, { status: "running", reasoning: before, content: "", ...(round === 0 ? { startedAt: now() } : {}) }),
         onEvent: (event) => {
           const run = get(task.callId);
           if (event.kind === "reasoning") {
