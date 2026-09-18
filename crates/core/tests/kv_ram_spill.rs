@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
+use ignis_core::checkpoint::{RetainedKind, RetainedStateOperation, ReuseSource};
 use ignis_core::host::{RetainedBlob, Tier};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, SchedEvent};
 use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
@@ -113,20 +113,38 @@ fn whole_pool(start: u32) -> RequestInput {
     input(tokens(start, 1272), None, 8)
 }
 
-fn retained_state(events: &[SchedEvent]) -> Vec<(RetainedStateOperation, ReuseSource)> {
+fn retained_state(
+    events: &[SchedEvent],
+) -> Vec<(RetainedStateOperation, ReuseSource, RetainedKind)> {
     events
         .iter()
         .filter_map(|e| match e {
-            SchedEvent::RetainedState { operation, source } => Some((*operation, *source)),
+            SchedEvent::RetainedState { operation, source, kind } => {
+                Some((*operation, *source, *kind))
+            }
             _ => None,
         })
         .collect()
 }
 
+/// Both kinds together — what the fact said before it named one (GitHub #216).
 fn count(events: &[SchedEvent], operation: RetainedStateOperation, source: ReuseSource) -> usize {
     retained_state(events)
         .into_iter()
-        .filter(|&fact| fact == (operation, source))
+        .filter(|&(o, s, _)| (o, s) == (operation, source))
+        .count()
+}
+
+/// One kind alone.
+fn count_kind(
+    events: &[SchedEvent],
+    operation: RetainedStateOperation,
+    source: ReuseSource,
+    kind: RetainedKind,
+) -> usize {
+    retained_state(events)
+        .into_iter()
+        .filter(|&fact| fact == (operation, source, kind))
         .count()
 }
 
@@ -183,6 +201,14 @@ fn an_idle_conversation_pushed_off_the_device_resumes_from_kv_ram_and_keeps_goin
         2,
         "the checkpoint, and the block under it (GitHub #190)"
     );
+    // And the two are told apart, not summed (GitHub #216).
+    for kind in RetainedKind::ALL {
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Spill, ReuseSource::KvRam, kind),
+            1,
+            "one spill of each kind, not two of one: {kind:?}"
+        );
+    }
     assert_eq!(compute.spilled_prefixes(), vec![(n, BLOCK)]);
     let spilled = RetainedBlob::Checkpoint(sched.checkpoint_pool().entries()[0].id);
     assert_eq!(sched.host().retained(spilled).unwrap().tier, Tier::Probation);
@@ -501,6 +527,20 @@ fn a_first_turn_misses_every_configured_tier_once() {
     let events = run_to_idle(&mut with_kv_ram);
     assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::Device), 1);
     assert_eq!(count(&events, RetainedStateOperation::Miss, ReuseSource::KvRam), 1);
+    // Every miss is a checkpoint miss (GitHub #216): the checkpoint pool's
+    // lookup is the only one that reports one, and the prefix walk beside it
+    // records none — no prefix miss is invented to make the two symmetric.
+    for source in [ReuseSource::Device, ReuseSource::KvRam] {
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Checkpoint),
+            1
+        );
+        assert_eq!(
+            count_kind(&events, RetainedStateOperation::Miss, source, RetainedKind::Prefix),
+            0,
+            "no prefix miss is synthesised"
+        );
+    }
 
     let mut device_only = ConcreteScheduler::with_config(tight(0), Arc::new(MockCompute::new()));
     device_only.submit(turn_at(1), RequestClass::Interactive).unwrap();

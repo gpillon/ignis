@@ -478,15 +478,24 @@ pub enum SchedEvent {
         /// What the restore itself cost — the device-to-device clone of the
         /// checkpoint into this request's slot, measured by the backend.
         restore_micros: u64,
+        /// Which kind of retained state the prefill resumed from (GitHub
+        /// #216), named by the site that holds the claim rather than left to
+        /// be guessed from the tier it came out of.
+        kind: crate::checkpoint::RetainedKind,
     },
     /// Something happened to retained state in one residency tier (GitHub
     /// #190) — a hit, a miss, a spill, a discard or a restore, as
     /// [`crate::checkpoint::RetainedStateOperation`] defines each. It names
     /// no request: a spill or a discard happens to state no live request
-    /// owns, usually while making room for some other request.
+    /// owns, usually while making room for some other request. `kind` names
+    /// which of the two kinds of retained state moved (GitHub #216) — a
+    /// prompt checkpoint or a shared prefix — so the two are not read back as
+    /// one thing. Every site that reports one holds the blob or entry the
+    /// kind comes from, so it is never inferred from `source` or `operation`.
     RetainedState {
         operation: crate::checkpoint::RetainedStateOperation,
         source: crate::checkpoint::ReuseSource,
+        kind: crate::checkpoint::RetainedKind,
     },
     /// A publish or a capture `request` would have left was not taken (GitHub
     /// #215, ADR 0030): no retained slot was free and no retained state could

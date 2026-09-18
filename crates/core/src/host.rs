@@ -79,6 +79,18 @@ pub enum RetainedBlob {
     /// KV-RAM ledger.
     Prefix(crate::prefix::SpilledPrefixId),
 }
+
+impl RetainedBlob {
+    /// Which kind of retained state this blob is (GitHub #216) — the fact a
+    /// lifecycle report names, read off the blob the reporting site already
+    /// holds rather than guessed from the tier or the operation.
+    pub fn kind(self) -> crate::checkpoint::RetainedKind {
+        match self {
+            RetainedBlob::Checkpoint(_) => crate::checkpoint::RetainedKind::Checkpoint,
+            RetainedBlob::Prefix(_) => crate::checkpoint::RetainedKind::Prefix,
+        }
+    }
+}
 use crate::types::{LaneId, RequestClass, RequestId};
 
 /// How long a retained Interactive entry in KV-RAM keeps its class's priority

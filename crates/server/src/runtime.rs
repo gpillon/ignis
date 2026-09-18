@@ -244,7 +244,7 @@ pub fn cuda_scheduler(
     model_id: String,
     eos: TokenId,
     shape: EngineShape,
-) -> Result<ConcreteScheduler, String> {
+) -> Result<(ConcreteScheduler, crate::metrics::LoadReservations), String> {
     use ignis_artifact::{CudaDevice, Reader, bind_model_scope_27b_with, materialize};
     use ignis_runtime::{CudaLeaf, KV_PAGE_TOKENS};
 
@@ -357,11 +357,26 @@ pub fn cuda_scheduler(
         );
     }
 
-    Ok(scheduler(
+    let sched = scheduler(
         scheduler_config_for_shape(model_id, shape, KV_PAGE_TOKENS, capacity_pages),
         model,
         eos,
-    ))
+    );
+    // GitHub #216 (ADR 0030 §Observability): the plan was a value this
+    // function built, read once and dropped. What it reserved outlives it
+    // now, so an operator can read it off `/metrics` instead of off the one
+    // log line the load wrote. The retained slot count is the scheduler's
+    // own, not the flag's: prompt reuse off hands out none whatever
+    // `--retained-slots` said.
+    let reserved = crate::metrics::LoadReservations {
+        lines: vram.lines.entries(),
+        budget_bytes: vram.budget_bytes,
+        kv_pool_pages: capacity_pages,
+        kv_page_bytes: stats.kv_page_bytes,
+        kv_ram_arena_bytes: shape.host_pool_bytes,
+        retained_slots: sched.retained_slot_count(),
+    };
+    Ok((sched, reserved))
 }
 
 #[cfg(test)]

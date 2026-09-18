@@ -81,6 +81,9 @@ impl Scheduler for Recording {
     fn mode(&self) -> ignis_core::EngineMode {
         self.inner.mode()
     }
+    fn occupancy(&self) -> ignis_core::Occupancy {
+        self.inner.occupancy()
+    }
 }
 
 struct Harness {

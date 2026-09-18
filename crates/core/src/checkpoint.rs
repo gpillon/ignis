@@ -124,6 +124,46 @@ impl ReuseSource {
     }
 }
 
+/// Which of the two kinds of retained state an operation moved (GitHub #216).
+///
+/// A **prompt checkpoint** is one conversation's opener, kept so the next turn
+/// resumes instead of re-prefilling. A **prefix** is a head several requests
+/// share. They are retained for different reasons, given up in a different
+/// order, and cost differently to bring back, so a lifecycle fact that did not
+/// say which it moved could not be read back apart. Every site that reports
+/// one already holds a [`RetainedBlob`](crate::host::RetainedBlob) or the
+/// entry it came from, so the kind is named at the source and never inferred
+/// downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedKind {
+    /// A prompt checkpoint: one conversation's opener.
+    Checkpoint,
+    /// A shared prefix: a head several requests stand on.
+    Prefix,
+}
+
+impl RetainedKind {
+    /// Both kinds, in the order [`RetainedKind::index`] numbers them — so a
+    /// per-kind table is an array rather than a branch at every site.
+    pub const ALL: [RetainedKind; 2] = [RetainedKind::Checkpoint, RetainedKind::Prefix];
+
+    /// The wire spelling (`checkpoint` / `prefix`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetainedKind::Checkpoint => "checkpoint",
+            RetainedKind::Prefix => "prefix",
+        }
+    }
+
+    /// This kind's position in [`RetainedKind::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            RetainedKind::Checkpoint => 0,
+            RetainedKind::Prefix => 1,
+        }
+    }
+}
+
 /// A set of [`ReuseSource`]s: which tiers a lookup found nothing in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TierSet(u8);

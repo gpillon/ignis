@@ -124,7 +124,7 @@ fn cuda_scheduler(
     frontend: &ignis_artifact::FrontendSet,
     shape: ignis_server::runtime::EngineShape,
     logging_handle: &ignis_logging::LoggingHandle,
-) -> Box<dyn Scheduler> {
+) -> (Box<dyn Scheduler>, ignis_server::metrics::LoadReservations) {
     let eos = match frontend.eos_token_id() {
         Some(eos) => eos,
         None => {
@@ -137,7 +137,7 @@ fn cuda_scheduler(
         }
     };
     match ignis_server::runtime::cuda_scheduler(artifact_path, model.into(), eos, shape) {
-        Ok(scheduler) => {
+        Ok((scheduler, reserved)) => {
             tracing::info!(
                 name: "ignis.model.loaded",
                 artifact = %artifact_path.display(),
@@ -155,7 +155,7 @@ fn cuda_scheduler(
                 ),
                 "model loaded on the GPU"
             );
-            Box::new(scheduler)
+            (Box::new(scheduler), reserved)
         }
         Err(err) => {
             tracing::error!(
@@ -222,7 +222,7 @@ async fn main() {
         kv_format: _,
         kv_pool_bytes: _,
         vram: _,
-        host_pool_bytes: _,
+        host_pool_bytes,
         prompt_reuse: _,
         retained_slots: _,
         retained_interactive_ttl_secs: _,
@@ -255,6 +255,12 @@ async fn main() {
         },
     };
 
+    // GitHub #216 (ADR 0030 §Observability): what the load's VRAM plan
+    // reserved, kept past the load so `/metrics` can name it. `None` on the
+    // placeholder path, which loads no model and plans no device memory.
+    // `mut` only under `cuda`: the placeholder path never assigns it.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut load_reservations: Option<ignis_server::metrics::LoadReservations> = None;
     let server = if let Some(artifact_path) = &artifact {
         // The loader path (server-03, GitHub #21): the `.ninfer` container
         // named by `--artifact`/`IGNIS_ARTIFACT` is loaded through the
@@ -296,7 +302,15 @@ async fn main() {
         };
 
         #[cfg(feature = "cuda")]
-        let scheduler = cuda_scheduler(artifact_path, &model, &frontend, engine_shape, &logging_handle);
+        let scheduler = {
+            let (scheduler, reserved) =
+                cuda_scheduler(artifact_path, &model, &frontend, engine_shape, &logging_handle);
+            // GitHub #216: what the plan reserved leaves the load here, so
+            // the exposition can name it. The placeholder path below builds
+            // no plan and leaves this `None`.
+            load_reservations = Some(reserved);
+            scheduler
+        };
         #[cfg(not(feature = "cuda"))]
         let scheduler = {
             tracing::warn!(
@@ -382,6 +396,10 @@ async fn main() {
     // Prometheus metrics (GitHub #89, ADR 0017): without `--metrics`, neither
     // the projection nor any route to it exists.
     let server = if metrics.is_some() { server.with_metrics() } else { server };
+    let server = match load_reservations {
+        Some(reserved) => server.with_load_reservations(reserved),
+        None => server,
+    };
     let auth = api_key.is_some();
     let server = match api_key {
         Some(key) => server.with_api_key(key),
@@ -458,6 +476,9 @@ async fn main() {
         bind = %bind,
         api_key_required = auth,
         metrics = metrics.as_deref().unwrap_or("off"),
+        // GitHub #216: the pinned host arena is locked in RAM from start
+        // (ADR 0030), and until now no line anywhere said how large it is.
+        kv_host_pool_bytes = host_pool_bytes,
         exposed = exposure.as_ref().map_or("no", |_| "yes"),
         "OpenAI API at /v1"
     );

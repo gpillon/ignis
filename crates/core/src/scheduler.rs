@@ -510,4 +510,34 @@ pub trait Scheduler: Send {
 
     /// The operating mode (reported by telemetry interval lines).
     fn mode(&self) -> crate::types::EngineMode;
+
+    /// What this scheduler has occupied right now (GitHub #216, ADR 0030).
+    ///
+    /// Plain reads of fields the admission machine already maintains for its
+    /// own decisions — no allocation, no clock, no call into the leaf. The
+    /// server reads it once per step, on the thread that owns the scheduler,
+    /// and carries the answer along the fact channel it already sends after
+    /// every step, so nothing downstream ever reaches across a thread for it.
+    fn occupancy(&self) -> Occupancy;
+}
+
+/// What a scheduler has occupied, at one instant (GitHub #216, ADR 0030).
+///
+/// `kv_used_pages` and `kv_pool_pages` are the two terms of the same pool, so
+/// a reader has both and never a ratio that hides which of them moved.
+/// `kv_pool_pages` is the capacity the pool was built with at load, which is
+/// the page count the load plan settled on; `kv_used_pages` can reach it but
+/// never passes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Occupancy {
+    /// Main-pool KV pages reserved by running requests, shared prefixes and
+    /// retained tail pages.
+    pub kv_used_pages: u32,
+    /// The main pool's page capacity — constant for the process's life.
+    pub kv_pool_pages: u32,
+    /// The host KV-RAM tier's bytes in use: live snapshots and retained
+    /// blobs together.
+    pub kv_ram_used_bytes: u64,
+    /// The host KV-RAM tier's capacity in bytes (`--kv-host-pool-bytes`).
+    pub kv_ram_capacity_bytes: u64,
 }
