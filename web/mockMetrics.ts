@@ -104,7 +104,7 @@ export function createMetricsSim(start = Date.now()) {
   let nextBurst = start + 15_000;
   const waiting: Request[] = [];
   let running: Request[] = [];
-  const count = { accepted: 0, completed: 0, cancelled: 0, tokens: 0, decoded: 0, evictions: 0, prefix: 0 };
+  const count = { accepted: 0, completed: 0, cancelled: 0, tokens: 0, decoded: 0, evictions: 0, ramDrops: 0, prefix: 0 };
   const rejected = { full: 0, unknown_model: 0, oversized: 0 };
   const ttft = new Histogram(TTFT_BOUNDS_MS);
   const duration = new Histogram(DURATION_BOUNDS_MS);
@@ -225,7 +225,12 @@ export function createMetricsSim(start = Date.now()) {
       return true;
     });
 
-    if (running.length === LANES && waiting.length > 2 && Math.random() < 0.004) count.evictions++;
+    if (running.length === LANES && waiting.length > 2 && Math.random() < 0.004) {
+      count.evictions++;
+      // The tier only drops a live snapshot once it is itself full, so a drop
+      // trails an eviction rather than happening beside it (GitHub #224).
+      if (Math.random() < 0.15) count.ramDrops++;
+    }
   }
 
   return {
@@ -249,6 +254,11 @@ export function createMetricsSim(start = Date.now()) {
         ["ignis_generated_tokens_total", "Generated tokens on completed requests.", count.tokens],
         ["ignis_decoded_tokens_total", "Tokens generated so far, counted as each one is emitted.", count.decoded],
         ["ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", count.evictions],
+        [
+          "ignis_kv_ram_evictions_total",
+          "Live host-tier snapshots dropped from KV-RAM to make room; the request re-prefills from the start.",
+          count.ramDrops,
+        ],
         ["ignis_prefix_reused_tokens_total", "Cumulative tokens skipped through sibling-prefix reuse.", count.prefix],
       ];
       for (const [name, help, value] of counters) {

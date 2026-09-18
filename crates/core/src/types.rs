@@ -440,6 +440,17 @@ pub enum SchedEvent {
     /// snapshot was discarded (the tier was full), so it goes back to
     /// `Admitted` and re-prefills from the start.
     Requeued { request: RequestId },
+    /// A **live** snapshot was dropped out of the KV-RAM tier to make room
+    /// for another one (GitHub #224): the tier's own eviction, the mirror of
+    /// [`SchedEvent::Evicted`]'s departure from the device. The owning
+    /// request loses every prefilled token and re-prefills from the start.
+    ///
+    /// A [`SchedEvent::Requeued`] always accompanies this one, but requeue
+    /// is *not* the same fact: it also fires when a restore fails, which
+    /// costs the same re-prefill without KV-RAM having evicted anything. The
+    /// tier's eviction counter is projected from this event and never from
+    /// `Requeued`, so the two causes stay apart.
+    SnapshotDropped { request: RequestId },
     /// A request's prefill reused a cached prefix (core-07): the `tokens`
     /// leading prompt tokens were skipped — the shared KV prefix is already
     /// warm, so no redundant prefill. Telemetry accumulates these into the

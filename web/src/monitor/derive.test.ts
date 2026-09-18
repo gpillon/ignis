@@ -40,6 +40,50 @@ describe("deriveDashboard", () => {
     expect(headerPulse([])).toEqual({ running: null, waiting: null, tokensPerSec: null, live: false });
   });
 
+  // GitHub #224: an eviction is a departure from a tier, and each departure
+  // lands in the column that says what it cost. The device's spill shows up on
+  // the VRAM row as a demotion even though the series is labelled `kv_ram` --
+  // arriving there is the same act as leaving the device.
+  it("splits evictions by the tier that gave the state up", () => {
+    const retainedWith = (over: { discardsDevice?: number; discardsKvRam?: number; spillsKvRam?: number }) => {
+      const r = emptySnapshot().retained;
+      r.discards.device.checkpoint = over.discardsDevice ?? 0;
+      r.discards.kv_ram.prefix = over.discardsKvRam ?? 0;
+      r.spills.kv_ram.checkpoint = over.spillsKvRam ?? 0;
+      return r;
+    };
+    const points = [
+      at(0, { kvEvictions: 10, kvRamEvictions: 1, retained: retainedWith({}) }),
+      at(60_000, {
+        kvEvictions: 14,
+        kvRamEvictions: 3,
+        retained: retainedWith({ discardsDevice: 5, discardsKvRam: 2, spillsKvRam: 7 }),
+      }),
+    ];
+    const ev = deriveDashboard(points, 60_000)!.evictions;
+
+    expect(ev.vram).toMatchObject({ implemented: true });
+    expect(ev.vram.live).toMatchObject({ total: 14, window: 4 });
+    expect(ev.vram.retained).toMatchObject({ total: 5, window: 5 });
+    expect(ev.vram.demoted).toMatchObject({ total: 7, window: 7 });
+
+    expect(ev.ram.live).toMatchObject({ total: 3, window: 2 });
+    expect(ev.ram.retained).toMatchObject({ total: 2, window: 2 });
+    expect(ev.ram.demoted).toBeNull();
+
+    // No disk tier exists, so every column is absent rather than zero.
+    expect(ev.disk).toEqual({ tier: "disk", implemented: false, live: null, retained: null, demoted: null });
+  });
+
+  // A server too old to export the new series leaves the RAM row blank rather
+  // than reading as a tier that dropped nothing.
+  it("reports no RAM live figure when the server does not export one", () => {
+    const points = [at(0, { kvEvictions: 0 }), at(60_000, { kvEvictions: 2 })];
+    const ev = deriveDashboard(points, 60_000)!.evictions;
+    expect(ev.ram.live).toMatchObject({ total: null, window: null });
+    expect(ev.vram.live).toMatchObject({ total: 2 });
+  });
+
   it("takes throughput from decoded tokens while a long request runs, and per request from completed ones", () => {
     // A request decoding for 10 s: decoded tokens climb, nothing has completed yet.
     const decoding = [
@@ -166,6 +210,7 @@ describe("assessHealth", () => {
     cancelled: 0,
     rejected: { full: 0, unknown_model: 0, oversized: 0 },
     evictions: 0,
+    ramDrops: 0,
     ttftP95: null,
   };
 
@@ -181,6 +226,18 @@ describe("assessHealth", () => {
     expect(assessHealth({ ...quiet, running: 6, waiting: 2 })).toMatchObject({ level: "busy", summary: "2 waiting, 6 running" });
     expect(assessHealth({ ...quiet, running: 6, evictions: 1 }).level).toBe("busy");
     expect(assessHealth({ ...quiet, running: 1, ttftP95: 7.5 }).notes).toContain("p95 time to first token 7.50 s");
+  });
+
+  // GitHub #224: a VRAM eviction keeps the request's work in host RAM; a RAM
+  // drop destroys it. The one that loses work must not read as the milder of
+  // the two.
+  it("ranks a snapshot dropped from RAM above an eviction to RAM", () => {
+    const evicted = assessHealth({ ...quiet, running: 6, evictions: 3 });
+    const dropped = assessHealth({ ...quiet, running: 6, ramDrops: 3 });
+    expect(evicted.level).toBe("busy");
+    expect(dropped.level).toBe("saturated");
+    expect(dropped.summary).toBe("3 snapshots dropped from host RAM in the last 5 min");
+    expect(dropped.notes).toContain("3 snapshots dropped from host RAM: re-prefilled from the start");
   });
 
   it("is saturated when requests are turned away as full, and says why in notes", () => {

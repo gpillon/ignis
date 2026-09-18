@@ -171,6 +171,7 @@ The initial stable metric contract is:
 | `ignis_build_info` | gauge | `version` | Constant build identity with value 1 |
 | `ignis_scheduler_requests` | gauge | `state=waiting\|running` | Current requests by observable scheduler state |
 | `ignis_kv_cache_evictions_total` | counter | none | Cumulative host-tier evictions |
+| `ignis_kv_ram_evictions_total` | counter | none | Live host-tier snapshots dropped **out of** KV-RAM to make room; the owning request re-prefills from the start (#224) |
 | `ignis_prefix_reused_tokens_total` | counter | none | Cumulative tokens skipped through sibling-prefix reuse — a live sibling's prefix only; a retained prefix's claim is counted below (#190) |
 | `ignis_retained_reused_tokens_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Cumulative tokens skipped through retained state: a retained prefix (always `device`) or a prompt checkpoint, by the tier it came from and the kind it was |
 | `ignis_retained_state_hits_total` | counter | `tier=device\|kv_ram`, `kind=checkpoint\|prefix` | Retained state a request chose to resume from: a prompt checkpoint (not yet restored), or a retained prefix brought back from KV-RAM |
@@ -192,6 +193,32 @@ eleven reserved lines, the budget, the KV pool's pages and page bytes, the
 pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
+
+**Eviction is a departure from a tier, and there are five of them (#224).**
+The contract names each one separately rather than summing them, because they
+cost different things:
+
+| Departure | Series |
+|---|---|
+| A live sequence leaves the device for KV-RAM | `ignis_kv_cache_evictions_total` |
+| Retained state leaves the device for nowhere | `ignis_retained_state_discards_total{tier="device"}` |
+| Retained state is demoted device → KV-RAM | `ignis_retained_state_spills_total{tier="kv_ram"}` |
+| Retained state leaves KV-RAM for nowhere | `ignis_retained_state_discards_total{tier="kv_ram"}` |
+| A **live snapshot** is dropped out of KV-RAM | `ignis_kv_ram_evictions_total` |
+
+The last is the most expensive event in the system — the request loses every
+prefilled token — and until #224 it was counted nowhere. It is projected from
+`SchedEvent::SnapshotDropped` and never from the `SchedEvent::Requeued` beside
+it, because requeue also follows a *failed restore*, where KV-RAM evicted
+nothing. `ignis_kv_cache_evictions_total` keeps its unlabelled identity: no
+`tier` label was retro-fitted onto a stable row.
+
+**A disk tier is reserved, not exported.** `ignis_*` carries no
+`tier="disk"` label value and `ReuseSource` has no `Disk` variant. Widening
+five per-tier families and the request log's tier spelling for a tier that
+does not exist would put a permanently-zero label on the contract. The name
+`tier="disk"` is reserved here for whoever builds one; the Monitor shows a
+disk row as explicitly not implemented, fed by no metric.
 
 **The miss family is checkpoint-only, and stays that way until someone decides
 otherwise.** `ignis_retained_state_misses_total` is projected from a fact the

@@ -105,9 +105,9 @@ describe("readSnapshot", () => {
   it("counts the retained counters towards a restart, and the memory gauges not", () => {
     const empty = emptySnapshot();
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
-    // 7 plain counters, 3 reject reasons, 24 retained series, 3 skips, 2 histogram counts.
-    expect(counterValues(empty)).toHaveLength(39);
-    expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(39);
+    // 8 plain counters, 3 reject reasons, 24 retained series, 3 skips, 2 histogram counts.
+    expect(counterValues(empty)).toHaveLength(40);
+    expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     expect(counterValues(moved)).toContain(41_200);
     expect(counterValues(moved)).toContain(12);
     expect(counterValues(moved)).not.toContain(31_138_512_896);

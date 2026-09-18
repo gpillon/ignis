@@ -29,7 +29,7 @@ describe("MonitorView", () => {
       "In use now",
       "Retained state",
       "Prefix reuse",
-      "KV evictions",
+      "Evictions",
       "Scraper",
     ]) {
       expect(html).toContain(`aria-label="${region}"`);
@@ -38,6 +38,10 @@ describe("MonitorView", () => {
     expect(html).toContain("3 requests turned away: engine full");
     expect(html).toContain("ignis 0.1.0");
     expect(html).toContain("All series");
+    // GitHub #224: three tier rows, with disk present and visibly inert
+    // rather than absent or showing a zero.
+    for (const tier of ["VRAM", "RAM", "Disk"]) expect(html).toContain(tier);
+    expect(html).toContain("non implementato");
     expect(html).toContain("Live");
   });
 

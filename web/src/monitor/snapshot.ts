@@ -88,6 +88,8 @@ export type Snapshot = {
   /** Tokens as each is decoded (GitHub #165): moves while requests run. Null from a server without it. */
   decodedTokens: number | null;
   kvEvictions: number | null;
+  /** Live snapshots dropped **out of** KV-RAM (GitHub #224). Null from a server without it. */
+  kvRamEvictions: number | null;
   prefixReusedTokens: number | null;
   /** The six retained-state families, each split by tier and kind (GitHub #190, #216). */
   retained: Record<RetainedFamily, RetainedMatrix>;
@@ -104,6 +106,7 @@ const COUNTERS = {
   generatedTokens: "ignis_generated_tokens_total",
   decodedTokens: "ignis_decoded_tokens_total",
   kvEvictions: "ignis_kv_cache_evictions_total",
+  kvRamEvictions: "ignis_kv_ram_evictions_total",
   prefixReusedTokens: "ignis_prefix_reused_tokens_total",
 } as const;
 
@@ -145,6 +148,7 @@ export function emptySnapshot(): Snapshot {
     generatedTokens: null,
     decodedTokens: null,
     kvEvictions: null,
+    kvRamEvictions: null,
     prefixReusedTokens: null,
     retained: Object.fromEntries(RETAINED_FAMILY_KEYS.map((key) => [key, emptyMatrix()])) as Snapshot["retained"],
     memory: {

@@ -160,6 +160,7 @@ pub struct Metrics {
     generated_tokens: AtomicU64,
     decoded_tokens: AtomicU64,
     kv_evictions: AtomicU64,
+    kv_ram_evictions: AtomicU64,
     prefix_reused_tokens: AtomicU64,
     /// Per [`ReuseSource::index`], for each of the families below (#190).
     retained_reused_tokens: RetainedFamily,
@@ -216,6 +217,7 @@ impl Metrics {
             generated_tokens: AtomicU64::new(0),
             decoded_tokens: AtomicU64::new(0),
             kv_evictions: AtomicU64::new(0),
+            kv_ram_evictions: AtomicU64::new(0),
             prefix_reused_tokens: AtomicU64::new(0),
             retained_reused_tokens: Default::default(),
             retained_state_hits: Default::default(),
@@ -248,6 +250,13 @@ impl Metrics {
     /// A request was evicted to the host KV-RAM tier.
     pub(crate) fn record_eviction(&self) {
         self.kv_evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A live snapshot was dropped out of the KV-RAM tier to make room for
+    /// another (GitHub #224) — the tier's own eviction, the mirror of
+    /// [`Metrics::record_eviction`]'s departure from the device.
+    pub(crate) fn record_kv_ram_eviction(&self) {
+        self.kv_ram_evictions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A request's prefill skipped `tokens` through a sibling's prefix.
@@ -394,6 +403,16 @@ impl Metrics {
                 &self.decoded_tokens,
             ),
             ("ignis_kv_cache_evictions_total", "Cumulative host-tier evictions.", &self.kv_evictions),
+            // The other end of the same tier (#224): what KV-RAM itself
+            // gave up. A live snapshot dropped here is the costliest
+            // departure in the system — the request re-prefills from zero —
+            // so it is its own series and never folded into the row above,
+            // which counts arrivals at the tier.
+            (
+                "ignis_kv_ram_evictions_total",
+                "Live host-tier snapshots dropped from KV-RAM to make room; the request re-prefills from the start.",
+                &self.kv_ram_evictions,
+            ),
             // Sibling-prefix reuse only, as ADR 0017's table row says. A
             // retained prefix is claimed through the same path (#188), and
             // `SchedEvent::PrefixReused::retained` is what keeps its tokens
@@ -605,6 +624,7 @@ mod tests {
             ("ignis_generated_tokens_total", "counter"),
             ("ignis_decoded_tokens_total", "counter"),
             ("ignis_kv_cache_evictions_total", "counter"),
+            ("ignis_kv_ram_evictions_total", "counter"),
             ("ignis_prefix_reused_tokens_total", "counter"),
             ("ignis_retained_reused_tokens_total", "counter"),
             ("ignis_retained_state_hits_total", "counter"),
@@ -663,6 +683,7 @@ mod tests {
             "ignis_generated_tokens_total",
             "ignis_decoded_tokens_total",
             "ignis_kv_cache_evictions_total",
+            "ignis_kv_ram_evictions_total",
             "ignis_prefix_reused_tokens_total",
         ] {
             assert_eq!(value(&text, name, ""), "0", "{name}");
@@ -722,6 +743,7 @@ mod tests {
         let metrics = Metrics::new();
         metrics.record_eviction();
         metrics.record_eviction();
+        metrics.record_kv_ram_eviction();
         metrics.record_prefix_reused(32);
         metrics.record_prefix_reused(64);
         metrics.record_rejected(Rejection::Full);
@@ -730,6 +752,9 @@ mod tests {
 
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_kv_cache_evictions_total", ""), "2");
+        // The two tiers' evictions never bleed into each other: two
+        // snapshots arrived at KV-RAM, one live snapshot left it (#224).
+        assert_eq!(value(&text, "ignis_kv_ram_evictions_total", ""), "1");
         assert_eq!(value(&text, "ignis_prefix_reused_tokens_total", ""), "96");
         assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"full\""), "1");
         assert_eq!(value(&text, "ignis_requests_rejected_total", "reason=\"unknown_model\""), "0");

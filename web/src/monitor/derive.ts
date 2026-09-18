@@ -133,13 +133,44 @@ export type Dashboard = {
   cancelled: Counter;
   rejected: Counter & { byReason: Record<RejectReason, Tally> };
   prefix: Counter & { perSec: number | null; perSecSeries: Values };
-  evictions: Counter;
+  evictions: Evictions;
   ttft: Latency;
   duration: Latency;
   scrapeMsSeries: Values;
   memory: Memory;
   health: Health;
 };
+
+/** The residency tiers the eviction panel reports, fastest first (GitHub #224). */
+export const EVICTION_TIERS = ["vram", "ram", "disk"] as const;
+export type EvictionTierName = (typeof EVICTION_TIERS)[number];
+
+/**
+ * What one tier gave up (GitHub #224). An eviction is a *departure from a
+ * tier*, and the three columns cost different things, so they are never
+ * summed into one number:
+ *
+ * - `live` — a running or half-prefilled request lost residency here. Out of
+ *   VRAM its work is snapshotted and survives; out of RAM it is destroyed and
+ *   the request re-prefills from zero. This is the column that costs.
+ * - `retained` — cached state (a prompt checkpoint or a shared prefix) left
+ *   the tier for nowhere. A future request pays a miss; nothing in flight does.
+ * - `demoted` — state that moved down a tier and survived. Not a loss, but it
+ *   is how the tier below fills up.
+ *
+ * A column is `null` when the tier has no such departure to report — and every
+ * column is `null` on a tier that does not exist (`implemented: false`).
+ */
+export type TierEvictions = {
+  tier: EvictionTierName;
+  /** False when no metric feeds this row because the tier is not built yet. */
+  implemented: boolean;
+  live: Counter | null;
+  retained: Counter | null;
+  demoted: Counter | null;
+};
+
+export type Evictions = Record<EvictionTierName, TierEvictions>;
 
 /** What is known of a set of series, added up; null when none of them is. */
 function sumKnown(values: (number | null)[]): number | null {
@@ -148,6 +179,11 @@ function sumKnown(values: (number | null)[]): number | null {
 }
 
 const totalRejected: CounterPick = (s) => sumKnown(REJECT_REASONS.map((r) => s.rejected[r]));
+
+/** One retained-state family's figure for a tier, over both kinds (GitHub #224). */
+function retainedAt(s: Snapshot, family: RetainedFamily, tier: RetainedTier): number | null {
+  return sumKnown(RETAINED_KINDS.map((kind) => s.retained[family][tier][kind]));
+}
 
 export function deriveDashboard(points: Point[], windowMs: number): Dashboard | null {
   const lastPoint = points.at(-1);
@@ -240,7 +276,32 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     cancelled: counter((s) => s.cancelled),
     rejected: { ...counter(totalRejected), byReason },
     prefix: { ...counter((s) => s.prefixReusedTokens), perSec: prefixRate.at(-1) ?? null, perSecSeries: prefixRate },
-    evictions: counter((s) => s.kvEvictions),
+    evictions: {
+      // Out of VRAM: a live sequence snapshotted to RAM, retained state
+      // dropped outright, and retained state spilled down to RAM — a spill is
+      // recorded *into* `kv_ram`, and arriving there is the same act as
+      // leaving the device.
+      vram: {
+        tier: "vram",
+        implemented: true,
+        live: counter((s) => s.kvEvictions),
+        retained: counter((s) => retainedAt(s, "discards", "device")),
+        demoted: counter((s) => retainedAt(s, "spills", "kv_ram")),
+      },
+      // Out of RAM: a live snapshot dropped to make room (the request loses
+      // every prefilled token), and retained blobs forgotten. Nothing is
+      // demoted below RAM, because there is no tier below it yet.
+      ram: {
+        tier: "ram",
+        implemented: true,
+        live: counter((s) => s.kvRamEvictions),
+        retained: counter((s) => retainedAt(s, "discards", "kv_ram")),
+        demoted: null,
+      },
+      // Reserved, never fed (ADR 0017): no disk tier exists, and the panel
+      // says so rather than showing a zero that could be mistaken for one.
+      disk: { tier: "disk", implemented: false, live: null, retained: null, demoted: null },
+    },
     ttft: latency((s) => s.ttft),
     duration: latency((s) => s.duration),
     scrapeMsSeries: points.map((p) => p.scrapeMs),
@@ -255,7 +316,8 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     completed: dash.completed.window,
     cancelled: dash.cancelled.window,
     rejected: { full: byReason.full.window, unknown_model: byReason.unknown_model.window, oversized: byReason.oversized.window },
-    evictions: dash.evictions.window,
+    evictions: dash.evictions.vram.live?.window ?? null,
+    ramDrops: dash.evictions.ram.live?.window ?? null,
     ttftP95: dash.ttft.p95,
   });
   return dash;
@@ -331,7 +393,10 @@ export type HealthInput = {
   completed: number | null;
   cancelled: number | null;
   rejected: Record<RejectReason, number | null>;
+  /** Live sequences evicted out of VRAM in the window: their work survives in RAM. */
   evictions: number | null;
+  /** Live snapshots dropped out of RAM in the window: their work is gone (GitHub #224). */
+  ramDrops: number | null;
   ttftP95: number | null;
 };
 
@@ -354,10 +419,22 @@ export function assessHealth(h: HealthInput): Health {
   if (n(h.rejected.unknown_model)) notes.push(`${plural(n(h.rejected.unknown_model), "request")} for an unknown model`);
   if (n(h.waiting)) notes.push(`${formatCount(n(h.waiting))} waiting for a lane`);
   if (n(h.evictions)) notes.push(`${plural(n(h.evictions), "KV eviction")} to host RAM`);
+  // A RAM drop outranks a VRAM eviction: the evicted request keeps its work in
+  // host RAM, the dropped one re-prefills from zero (GitHub #224).
+  if (n(h.ramDrops)) notes.push(`${plural(n(h.ramDrops), "snapshot")} dropped from host RAM: re-prefilled from the start`);
   if (n(h.cancelled) >= 2 && n(h.cancelled) / finished >= 0.2) notes.push(`${formatShare(n(h.cancelled), finished)} of finished requests cancelled`);
   if (slow) notes.push(`p95 time to first token ${formatSeconds(h.ttftP95)}`);
 
   if (full) return { level: "saturated", summary: `${plural(full, "request")} turned away in the last ${win}`, notes };
+  // A dropped snapshot is lost work, so it saturates where an eviction only
+  // makes the server busy (GitHub #224).
+  if (n(h.ramDrops)) {
+    return {
+      level: "saturated",
+      summary: `${plural(n(h.ramDrops), "snapshot")} dropped from host RAM in the last ${win}`,
+      notes,
+    };
+  }
   if (n(h.waiting) || n(h.evictions) || slow) {
     const summary = n(h.waiting)
       ? `${formatCount(n(h.waiting))} waiting, ${formatCount(n(h.running))} running`

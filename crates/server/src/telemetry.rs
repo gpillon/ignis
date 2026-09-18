@@ -571,6 +571,23 @@ impl Telemetry {
     /// with it — otherwise the eventual `admitted` line would sum chunks
     /// and tokens across two unrelated prefill attempts, which is exactly
     /// the misattribution this ticket's request log exists to prevent.
+    /// A **live** snapshot was dropped out of the KV-RAM tier to make room
+    /// (GitHub #224): the tier's own eviction, projected into
+    /// `ignis_kv_ram_evictions_total`. Not logged — the `requeued` line that
+    /// follows it is the request log's record of the same moment — so only
+    /// the installed projection observes it.
+    ///
+    /// Deliberately *not* driven off [`Telemetry::on_requeued`]: a requeue
+    /// also follows a failed restore, where KV-RAM evicted nothing.
+    /// The scheduler's interval line (ADR 0025) is deliberately left alone:
+    /// it carries `kv_evictions` and gains no second field here, so this
+    /// ticket changes the Prometheus contract only.
+    pub fn on_snapshot_dropped(&mut self, _id: RequestId) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_kv_ram_eviction();
+        }
+    }
+
     pub fn on_requeued(&mut self, id: RequestId) {
         if let Some(rt) = self.requests.get_mut(&id) {
             rt.prefill_chunks = 0;
@@ -1579,6 +1596,32 @@ mod tests {
             "ignis_request_duration_seconds_count 1",
         ] {
             assert!(text.contains(&format!("\n{line}\n")), "no `{line}` in:\n{text}");
+        }
+    }
+
+    /// GitHub #224 — the two ends of the KV-RAM tier are separate series,
+    /// and a requeue on its own is not one of them. A failed restore raises
+    /// `Requeued` with no `SnapshotDropped` beside it: the request pays the
+    /// same re-prefill, but KV-RAM evicted nothing, so the tier's eviction
+    /// counter must not move.
+    #[test]
+    fn a_requeue_without_a_drop_is_not_a_kv_ram_eviction() {
+        let metrics = Arc::new(Metrics::new());
+        let mut telemetry = Telemetry::new(Arc::new(FixedClock::new(0)));
+        telemetry.with_metrics(Arc::clone(&metrics));
+
+        // Arrival at the tier, then a departure from it.
+        telemetry.on_evicted(1, 450);
+        telemetry.on_snapshot_dropped(1);
+        // A restore that failed: requeue only.
+        telemetry.on_requeued(2);
+
+        let text = metrics.render();
+        for line in ["ignis_kv_cache_evictions_total 1", "ignis_kv_ram_evictions_total 1"] {
+            assert!(text.contains(&format!("
+{line}
+")), "no `{line}` in:
+{text}");
         }
     }
 
