@@ -36,19 +36,25 @@ export function streamBudget(protocol: string | undefined): number {
 
 /**
  * The protocol `origin` is being served over, read from `entries`: the newest
- * chat request, or how the page itself arrived. Only that origin counts, since
- * the limit is per origin and a cross-origin resource (a web tool's search,
- * a font) says nothing about the connection the streams share. `undefined`
- * when the timeline says nothing — a browser reports "" for a resource it may
- * not disclose.
+ * chat request to that origin, since the streams are what the budget is
+ * about. Only that origin counts — a cross-origin resource (a web tool's
+ * search, a font) says nothing about the connection the streams share, and an
+ * h2 one used to lift the cap on a page served over HTTP/1.1. `undefined`
+ * when no chat request has been made yet, or when the browser reports "" for
+ * a resource it may not disclose; the caller then falls back to how the page
+ * itself arrived.
+ *
+ * The name is matched before the origin is parsed: a page that has been open
+ * for a while carries hundreds of entries, and parsing every one of them to
+ * answer this costs more than the answer is worth.
  */
 export function observedProtocol(entries: readonly PerformanceResourceTiming[], origin: string): string | undefined {
-  const ours = entries.filter((entry) => entry.nextHopProtocol !== "" && sameOrigin(entry.name, origin));
-  const chats = ours.filter((entry) => entry.name.includes(CHAT_PATH));
-  const newest = (chats.length > 0 ? chats : ours).reduce<PerformanceResourceTiming | undefined>(
-    (best, entry) => (best === undefined || entry.startTime >= best.startTime ? entry : best),
-    undefined,
-  );
+  let newest: PerformanceResourceTiming | undefined;
+  for (const entry of entries) {
+    if (entry.nextHopProtocol === "" || !entry.name.includes(CHAT_PATH)) continue;
+    if (newest !== undefined && entry.startTime < newest.startTime) continue;
+    if (sameOrigin(entry.name, origin)) newest = entry;
+  }
   return newest?.nextHopProtocol;
 }
 
@@ -70,11 +76,9 @@ function sameOrigin(name: string, origin: string): boolean {
 export function currentStreamBudget(): number {
   const origin = globalThis.location?.origin;
   if (origin === undefined) return HTTP1_STREAM_BUDGET;
-  const entries = [
-    ...(performance.getEntriesByType("navigation") as PerformanceResourceTiming[]),
-    ...(performance.getEntriesByType("resource") as PerformanceResourceTiming[]),
-  ];
-  return streamBudget(observedProtocol(entries, origin));
+  const streams = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+  const page = performance.getEntriesByType("navigation") as PerformanceResourceTiming[];
+  return streamBudget(observedProtocol(streams, origin) ?? page[0]?.nextHopProtocol);
 }
 
 let streaming = 0;

@@ -28,7 +28,7 @@ describe("observedProtocol", () => {
 
   it("reads the protocol the streams themselves were served over", () => {
     const entries = [
-      entry("http://localhost:5173/ui/", "http/1.1", 0),
+      entry("http://localhost:5173/ui/", "h3", 0),
       entry("http://localhost:5173/v1/chat/completions", "h2", 10),
     ];
     expect(observedProtocol(entries, ORIGIN)).toBe("h2");
@@ -42,8 +42,8 @@ describe("observedProtocol", () => {
     expect(observedProtocol(entries, ORIGIN)).toBe("http/1.1");
   });
 
-  it("falls back to how the page itself was served when no request has been made", () => {
-    expect(observedProtocol([entry("http://localhost:5173/ui/", "http/1.1", 0)], ORIGIN)).toBe("http/1.1");
+  it("reads nothing before the first chat request, leaving the page's own connection to answer", () => {
+    expect(observedProtocol([entry("http://localhost:5173/ui/", "http/1.1", 0)], ORIGIN)).toBeUndefined();
   });
 
   it("reads nothing from an empty timeline", () => {
@@ -56,8 +56,11 @@ describe("observedProtocol", () => {
   });
 
   it("ignores another origin's connection, which says nothing about ours", () => {
-    // A web tool's search is served over h2 while the page itself is not.
-    const entries = [entry("http://localhost:5173/ui/", "http/1.1", 0), entry("https://api.tavily.com/search", "h2", 9)];
+    // Another ignis, proxied over h2, answering the same path.
+    const entries = [
+      entry("http://localhost:5173/v1/chat/completions", "http/1.1", 3),
+      entry("https://ignis.example/v1/chat/completions", "h2", 9),
+    ];
     expect(observedProtocol(entries, ORIGIN)).toBe("http/1.1");
     expect(observedProtocol([entry("https://api.tavily.com/search", "h2", 9)], ORIGIN)).toBeUndefined();
   });
@@ -93,6 +96,14 @@ describe("currentStreamBudget", () => {
 
   it("caps where there is no page to read, as under a test runner", () => {
     expect(currentStreamBudget()).toBe(HTTP1_STREAM_BUDGET);
+  });
+
+  it("falls back to how the page itself arrived until a chat request has been served", () => {
+    vi.stubGlobal("location", { origin: ORIGIN });
+    const page = { name: `${ORIGIN}/ui/`, nextHopProtocol: "h2", startTime: 0 } as PerformanceResourceTiming;
+    vi.spyOn(performance, "getEntriesByType").mockImplementation(((kind: string) =>
+      kind === "navigation" ? [page] : []) as typeof performance.getEntriesByType);
+    expect(currentStreamBudget()).toBe(Number.POSITIVE_INFINITY);
   });
 });
 
