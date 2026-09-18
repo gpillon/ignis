@@ -93,6 +93,8 @@ healthy while the page is not, the queue is in the browser.
   Six per origin is the documented HTTP/1.1 behaviour of every major browser,
   but only Chrome was measured, and only the dev server: the embedded build,
   served by `ignis-server --ui` on one origin, was not.
+- The live check was the owner's own run of the repro, read from the page, not
+  a second round of socket counts.
 - The socket counts are the process-wide count for that port, not attributed
   per connection. Which agent owned which socket was not established, and the
   Vite HMR WebSocket was open throughout — the counts suggest Chrome keeps it
@@ -102,8 +104,8 @@ healthy while the page is not, the queue is in the browser.
 
 ## Follow-ups
 
-- The fix on `issue-220` was verified by unit tests, not yet in a browser: the
-  live check (five streaming, one queued, the Monitor still ticking) is open.
-- https://github.com/gpillon/ignis/issues/220
+- https://github.com/gpillon/ignis/issues/220 — closed: the owner ran the
+  six-agent repro in the browser on 2026-09-18 and confirmed the page keeps
+  answering.
 - https://github.com/gpillon/ignis/issues/221 — how to reach eight streams on
   plain localhost, where the browser allows six and TLS is not wanted.
