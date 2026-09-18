@@ -148,10 +148,11 @@ export function useConversation({
     };
     const abort = new AbortController();
     controllers.current.set(sessionId, abort);
-    // Sending is a request to see the answer: follow it from the bottom. Only
-    // the session on screen, though — a turn running in another one must not
-    // drag the reader down.
-    if (sessionId === list.activeId) following.current = true;
+    // Sending is a request to see the answer: follow it from the bottom. A turn
+    // always starts in the session on screen; one left streaming in a session
+    // the reader walked away from moves nothing, since the transcript scrolls
+    // on the session it shows.
+    following.current = true;
     setStreaming((s) => new Set(s).add(sessionId));
 
     let conversation = history;
@@ -428,11 +429,9 @@ export function useConversation({
     waiting.current.get(`${messageId}:${callId}`)?.(text);
   }
 
-  /** Stops the turn on screen; with nothing streaming here, stops the ones that are. */
+  /** Stops the turn of the session on screen, which is the one Stop is shown for. */
   function stop() {
-    const here = controllers.current.get(active.id);
-    if (here) return here.abort();
-    for (const turn of controllers.current.values()) turn.abort();
+    controllers.current.get(active.id)?.abort();
   }
 
   return {
