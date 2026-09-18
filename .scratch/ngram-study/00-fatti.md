@@ -110,15 +110,30 @@ Sono tutti lavori di **training**, non di serving.
 ### Il modello che ignis serve non ha la tabella
 
 Ignis serve `qwen3_8_27b_nvfp4full-v2.ninfer` = **Qwen3.8-27B** NVFP4 + graft
-DFlash2. La model card di Flash-Next riporta "—" alla riga n-gram per il 27B:
-**Qwen3.8-27B non ha modulo n-gram**. Non è una questione di supporto engine:
+DFlash2. Il manifest `…nvfp4full.ninfer.conversion.json` fissa la base a
+`Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+
+Verificato sulla config primaria di quel modello
+(`huggingface.co/Qwen/Qwen3.8-27B/raw/main/config.json`): **nessun campo
+`ngram`, `n_gram`, `heads_per_ngram`, `ngram_vocab_size_base`**. La config
+riporta `hidden_size 5120`, `num_hidden_layers 64`, `vocab_size 248320`,
+`intermediate_size 17408` — gli stessi valori già cablati in
+`crates/core/src/speculation.rs`, quindi è il modello giusto.
+
+**Qwen3.8-27B non ha modulo n-gram.** Non è una questione di supporto engine:
 i pesi non esistono.
 
 ### ninfer non ha codice n-gram
 
-`grep -ril "ngram|n_gram|engram"` su tutto `F:/ai/q38/ninfer` (`*.cpp *.cu *.h
-*.hpp *.cuh *.py`): **zero occorrenze**. Ignis non ha un riferimento live/live
-da cui misurare, contrariamente a ogni lavoro precedente del repo.
+Zero occorrenze su tutto `F:/ai/q38/ninfer` (`*.cpp *.cu *.h *.hpp *.cuh
+*.py`) per `ngram|n_gram|engram`, e zero anche per
+`flash_next|flashnext|flash-next|per_layer_embed|PLE` su `src/` e `include/` —
+la seconda passata serve perché SGLang chiama il modulo "PLE", quindi una
+ricerca per solo "ngram" avrebbe potuto mancare un'implementazione battezzata
+col nome del modello.
+
+Ignis non ha un riferimento live/live da cui misurare, contrariamente a ogni
+lavoro precedente del repo.
 
 ### L'hardware
 

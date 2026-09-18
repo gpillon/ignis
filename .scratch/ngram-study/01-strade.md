@@ -62,11 +62,14 @@ ipotesi.
    campionato vive in VRAM; l'host non lo conosce fino al sync. L'hash
    (multiplicative-XOR su 2 e 3 token) va calcolato in un kernel, non
    sull'host. Così non aggiunge sync e resta catturabile.
-2. **La memoria pinned di ignis non è leggibile da un kernel.** L'unico
-   `cudaHostAlloc` del leaf è in `kernel/vendor/src/core/arena.cu:279` e usa
-   `cudaHostAllocDefault`: page-locked per DMA veloce, **non mappata** nello
-   spazio di indirizzi del device. Un gather UVA richiede
-   `cudaHostAllocMapped`. Serve una seconda arena, non una patch alla vendored
+2. **La memoria pinned di ignis non è dichiarata accessibile da un kernel.**
+   L'unico `cudaHostAlloc` del leaf è in `kernel/vendor/src/core/arena.cu:279`
+   e usa `cudaHostAllocDefault`: page-locked per DMA veloce. È
+   `cudaHostAllocMapped` il flag che *garantisce* per contratto la mappatura
+   nello spazio di indirizzi del device; UVA dà l'uguaglianza dei puntatori,
+   non la mappatura. Se serva davvero il flag su questo driver è da
+   confermare — è il **passo 0 del benchmark**. In ogni caso la conclusione di
+   design non cambia: una seconda arena mappata, senza toccare la vendored
    (nessun conflitto con ADR 0010).
 3. **Il costo in nodi di graph è trascurabile.** fork + kernel hash + kernel
    gather + join ≈ 4 nodi su 1.166, a 0,36-0,73 µs/nodo ≈ 2-3 µs di
@@ -97,22 +100,30 @@ discussione no.
 Standalone, sul modello di `graphlaunch_bench.cu` già usato per l'anatomia del
 round. Nessun modello caricato, nessun peso, nessuna dipendenza da A o B.
 
-**Setup**
-- arena host `cudaHostAllocMapped` di dimensione variabile (8 / 16 / 24 GiB),
-  riempita di righe sintetiche;
-- 16 row id casuali per token, già in VRAM (niente sync);
-- kernel di gather UVA che scrive 16 × 160 valori in un buffer device.
+**Passo 0** — verificare se un kernel legge un'arena `cudaHostAllocDefault` su
+questo driver, o se serve `cudaHostAllocMapped`. Decide la forma dell'arena
+prima di misurare qualsiasi latenza.
 
-**Misure**
-- latenza del kernel isolato, al variare della dimensione della tabella
-  (isola l'effetto TLB/pagine su una working set che non entra in nessuna
-  cache);
-- quanto ne resta scoperto sotto un carico fittizio di ~0,5 ms su un altro
-  stream, dentro e fuori un graph catturato;
-- al variare della larghezza del batch (1 lane vs N lane: gli accessi random
-  si ammortizzano o si sommano?);
-- al variare del formato riga (BF16 / FP8 / NVFP4): qui si vede se la
-  quantizzazione della tabella compra latenza oltre che spazio.
+**Setup**
+- arena host mappata di dimensione variabile (8 / 16 / 24 GiB), riempita di
+  righe sintetiche;
+- 16 row id casuali per token, già in VRAM (niente sync);
+- kernel di gather UVA che scrive le 16 righe in un buffer device.
+
+**Misure**, al variare di quattro parametri
+- **dimensione della tabella** (8 / 16 / 24 GiB): isola l'effetto TLB/pagine
+  su un working set che non entra in nessuna cache;
+- **larghezza della riga**: 160 è la scelta di Flash-Next, ma un retrofit sul
+  27B (hidden 5120) sceglierebbe la propria — a 1280 per tabella, come Engram,
+  la gather per token è 40 KB invece di 5 KB. Va spazzata, non assunta;
+- **larghezza del batch** (1 lane vs N lane): gli accessi random si
+  ammortizzano o si sommano?
+- **formato riga** (BF16 / FP8 / NVFP4): si vede se quantizzare la tabella
+  compra latenza oltre che spazio.
+
+Per ciascuna combinazione: latenza del kernel isolato, e quanto ne resta
+scoperto sotto un carico fittizio di ~0,5 ms su un altro stream, dentro e
+fuori un graph catturato.
 
 **Esito, in un verso o nell'altro, è un finding**
 - si nasconde → il −0,07 % di SGLang è plausibile anche qui, e A/B diventano
