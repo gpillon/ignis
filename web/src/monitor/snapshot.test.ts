@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseExposition } from "./exposition.ts";
 import { IGNIS_EXPOSITION } from "./fixture.ts";
-import { readSnapshot } from "./snapshot.ts";
+import { emptySnapshot, readSnapshot, counterValues, RETAINED_FAMILY_KEYS } from "./snapshot.ts";
 
 describe("readSnapshot", () => {
   it("reads every ADR 0017 contract series", () => {
@@ -37,6 +37,69 @@ describe("readSnapshot", () => {
     expect(s.decodedTokens).toBeNull();
     expect(s.rejected).toEqual({ full: null, unknown_model: null, oversized: null });
     expect(s.ttft).toBeNull();
+  });
+
+  it("reads what the load reserved and what is occupied of it", () => {
+    const { memory } = readSnapshot(parseExposition(IGNIS_EXPOSITION));
+    expect(memory.reserved.weights).toBe(17_179_869_184);
+    expect(memory.reserved.media_embedding).toBe(402_653_184);
+    expect(memory.reserved.residual).toBe(268_435_456);
+    expect(memory.budgetBytes).toBe(31_138_512_896);
+    expect(memory.kvPoolPages).toBe(4032);
+    expect(memory.kvPageBytes).toBe(1_835_008);
+    expect(memory.kvPoolUsedPages).toBe(1536);
+    expect(memory.kvRamArena).toEqual({ capacity: 8_589_934_592, used: 2_147_483_648 });
+    expect(memory.retainedSlots).toEqual({ capacity: 10, inUse: 7 });
+    expect(memory.slotSkips).toEqual({ publish_skipped_no_slot: 12, capture_skipped_no_slot: 5, capture_skipped_no_page: 1 });
+  });
+
+  it("reads all six retained-state families by tier and by kind", () => {
+    const { retained } = readSnapshot(parseExposition(IGNIS_EXPOSITION));
+    expect(RETAINED_FAMILY_KEYS).toEqual(["reusedTokens", "hits", "misses", "spills", "discards", "restores"]);
+    expect(retained.reusedTokens.device).toEqual({ checkpoint: 41_200, prefix: 9800 });
+    expect(retained.hits.kv_ram).toEqual({ checkpoint: 3, prefix: 0 });
+    expect(retained.spills.kv_ram).toEqual({ checkpoint: 6, prefix: 2 });
+    expect(retained.discards.device).toEqual({ checkpoint: 4, prefix: 9 });
+    expect(retained.restores.kv_ram).toEqual({ checkpoint: 3, prefix: 1 });
+    // Checkpoint-only by construction: the prefix walk raises no miss (#222).
+    expect(retained.misses.device).toEqual({ checkpoint: 11, prefix: 0 });
+  });
+
+  it("leaves a memory series a load does not have null, and reads a zero as a zero", () => {
+    // A load without vision, without a drafter and with prompt reuse off: the
+    // lines it did not reserve are exported as zeros, and a load that never
+    // spilled has no kv_ram series at all.
+    const text = [
+      'ignis_vram_reserved_bytes{line="weights"} 17179869184',
+      'ignis_vram_reserved_bytes{line="media_embedding"} 0',
+      'ignis_vram_reserved_bytes{line="drafter_round"} 0',
+      'ignis_retained_slots{state="capacity"} 0',
+      'ignis_retained_state_spills_total{tier="device",kind="checkpoint"} 0',
+    ].join("\n");
+    const s = readSnapshot(parseExposition(`${text}\n`));
+    expect(s.memory.reserved.weights).toBe(17_179_869_184);
+    expect(s.memory.reserved.media_embedding).toBe(0);
+    expect(s.memory.reserved.drafter_round).toBe(0);
+    expect(s.memory.reserved.workspace).toBeNull();
+    expect(s.memory.budgetBytes).toBeNull();
+    expect(s.memory.kvPoolUsedPages).toBeNull();
+    expect(s.memory.kvRamArena).toEqual({ capacity: null, used: null });
+    expect(s.memory.retainedSlots).toEqual({ capacity: 0, inUse: null });
+    expect(s.memory.slotSkips.publish_skipped_no_slot).toBeNull();
+    expect(s.retained.spills.device.checkpoint).toBe(0);
+    expect(s.retained.spills.kv_ram.checkpoint).toBeNull();
+    expect(s.unknown).toEqual([]);
+  });
+
+  it("counts the retained counters towards a restart, and the memory gauges not", () => {
+    const empty = emptySnapshot();
+    const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
+    // 7 plain counters, 3 reject reasons, 24 retained series, 3 skips, 2 histogram counts.
+    expect(counterValues(empty)).toHaveLength(39);
+    expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(39);
+    expect(counterValues(moved)).toContain(41_200);
+    expect(counterValues(moved)).toContain(12);
+    expect(counterValues(moved)).not.toContain(31_138_512_896);
   });
 
   it("lists series outside the contract instead of dropping them", () => {

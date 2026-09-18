@@ -26,6 +26,25 @@ export function formatNumber(n: number | null): string {
   return formatCount(n);
 }
 
+/**
+ * Memory in the binary units the plan is laid out in: `384 MiB`, `16 GiB`,
+ * `29.69 GiB`. Two decimals below 100 of a unit, because a GiB is coarse
+ * enough that rounding it whole would hide a quarter of a load’s workspace.
+ */
+export function formatBytes(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes)) return DASH;
+  const abs = Math.abs(bytes);
+  const units: [number, string][] = [
+    [1024 ** 3, "GiB"],
+    [1024 ** 2, "MiB"],
+    [1024, "KiB"],
+  ];
+  const [scale, unit] = units.find(([s]) => abs >= s) ?? [1, "B"];
+  const value = bytes / scale;
+  const text = unit === "B" || Math.abs(value) >= 100 ? value.toFixed(0) : value.toFixed(2).replace(/\.?0+$/, "");
+  return `${text} ${unit}`;
+}
+
 /** `850 ms`, `2.40 s`, `12.5 s`, `1m 12s`. */
 export function formatSeconds(s: number | null): string {
   if (s === null || !Number.isFinite(s)) return DASH;

@@ -1,7 +1,23 @@
 import { formatCount, formatSeconds, formatShare, formatWindow } from "./format.ts";
 import { type CounterPick, increaseOver, type Point, rollingRate, windowHistogram } from "./history.ts";
 import { histogramMean, histogramQuantile } from "./quantile.ts";
-import { type Histogram, REJECT_REASONS, type RejectReason, type Snapshot } from "./snapshot.ts";
+import {
+  emptySnapshot,
+  type Histogram,
+  REJECT_REASONS,
+  type RejectReason,
+  RETAINED_FAMILY_KEYS,
+  RETAINED_KINDS,
+  RETAINED_TIERS,
+  type RetainedFamily,
+  type RetainedKind,
+  type RetainedTier,
+  SLOT_SKIP_REASONS,
+  type SlotSkipReason,
+  type Snapshot,
+  VRAM_LINES,
+  type VramLine,
+} from "./snapshot.ts";
 
 // Everything the Monitor shows, derived from the scrape history for one
 // window: counter gains and rates, scheduler load, latency quantiles and
@@ -41,6 +57,38 @@ export type Latency = {
   trendP95: Values;
 };
 
+
+/**
+ * A live figure against the constant that bounds it (ADR 0030
+ * §Observability). The share is computed here, from two terms that are both
+ * on the page, because no percentage is exported: a reader can always see
+ * which of the two moved.
+ */
+export type Meter = { used: number | null; capacity: number | null; share: number | null; series: Values };
+
+/** One retained-state series: what it stands at, and what it gained over the window. */
+export type RetainedCount = { total: number | null; window: number | null };
+
+/** What the load reserved, and what is occupied of it. */
+export type Memory = {
+  /** Whether this load laid a plan out at all — the placeholder load has none. */
+  planned: boolean;
+  budgetBytes: number | null;
+  /** The plan's eleven lines, in plan order. */
+  lines: { line: VramLine; bytes: number | null }[];
+  /** The lines added up, as far as they are known. */
+  linesBytes: number | null;
+  /** The budget less the lines: the room the plan left the KV pool. */
+  kvRoomBytes: number | null;
+  /** The pool the room bought: its pages, one page, and the two multiplied. */
+  kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null };
+  pagesInUse: Meter;
+  arenaInUse: Meter;
+  slotsInUse: Meter;
+  skips: { total: number | null; window: number | null; byReason: Record<SlotSkipReason, RetainedCount> };
+  retained: Record<RetainedFamily, Record<RetainedTier, Record<RetainedKind, RetainedCount>>>;
+};
+
 export type HealthLevel = "idle" | "healthy" | "busy" | "saturated";
 /** The verdict: its level, what it rests on in a phrase, and the facts behind it. */
 export type Health = { level: HealthLevel; summary: string; notes: string[] };
@@ -73,6 +121,7 @@ export type Dashboard = {
   ttft: Latency;
   duration: Latency;
   scrapeMsSeries: Values;
+  memory: Memory;
   health: Health;
 };
 
@@ -176,6 +225,7 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     ttft: latency((s) => s.ttft),
     duration: latency((s) => s.duration),
     scrapeMsSeries: points.map((p) => p.scrapeMs),
+    memory: deriveMemory(points, from),
     health: { level: "idle", summary: "", notes: [] },
   };
   dash.health = assessHealth({
@@ -190,6 +240,66 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
     ttftP95: dash.ttft.p95,
   });
   return dash;
+}
+
+
+/**
+ * The memory panel's figures (GitHub #217, ADR 0030 §Observability): the
+ * plan the load reserved, and what is occupied of each shape it bounds.
+ *
+ * The retained-state counters are read as plain totals and window gains
+ * rather than rates: they move a handful of times a minute at most, and a
+ * per-minute rate over a figure that small says less than the figure.
+ */
+export function deriveMemory(points: Point[], since: number): Memory {
+  const last = points.at(-1)?.snap ?? emptySnapshot();
+  const mem = last.memory;
+  const sum = (values: (number | null)[]) => {
+    const known = values.filter((v): v is number => v !== null);
+    return known.length ? known.reduce((a, b) => a + b, 0) : null;
+  };
+  const meter = (used: number | null, capacity: number | null, pick: CounterPick): Meter => ({
+    used,
+    capacity,
+    share: used !== null && capacity !== null && capacity > 0 ? used / capacity : null,
+    series: points.map((p) => pick(p.snap)),
+  });
+  const count = (pick: CounterPick): RetainedCount => ({ total: pick(last), window: increaseOver(points, pick, since) });
+
+  const lines = VRAM_LINES.map((line) => ({ line, bytes: mem.reserved[line] }));
+  const linesBytes = sum(lines.map((l) => l.bytes));
+  const kvPoolBytes = mem.kvPoolPages !== null && mem.kvPageBytes !== null ? mem.kvPoolPages * mem.kvPageBytes : null;
+  const byReason = Object.fromEntries(
+    SLOT_SKIP_REASONS.map((reason) => [reason, count((s) => s.memory.slotSkips[reason])]),
+  ) as Record<SlotSkipReason, RetainedCount>;
+
+  return {
+    planned: mem.budgetBytes !== null && mem.budgetBytes > 0,
+    budgetBytes: mem.budgetBytes,
+    lines,
+    linesBytes,
+    kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? Math.max(0, mem.budgetBytes - linesBytes) : null,
+    kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes },
+    pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),
+    arenaInUse: meter(mem.kvRamArena.used, mem.kvRamArena.capacity, (s) => s.memory.kvRamArena.used),
+    slotsInUse: meter(mem.retainedSlots.inUse, mem.retainedSlots.capacity, (s) => s.memory.retainedSlots.inUse),
+    skips: {
+      total: sum(SLOT_SKIP_REASONS.map((reason) => byReason[reason].total)),
+      window: sum(SLOT_SKIP_REASONS.map((reason) => byReason[reason].window)),
+      byReason,
+    },
+    retained: Object.fromEntries(
+      RETAINED_FAMILY_KEYS.map((family) => [
+        family,
+        Object.fromEntries(
+          RETAINED_TIERS.map((tier) => [
+            tier,
+            Object.fromEntries(RETAINED_KINDS.map((kind) => [kind, count((s) => s.retained[family][tier][kind])])),
+          ]),
+        ),
+      ]),
+    ) as Memory["retained"],
+  };
 }
 
 export type HealthInput = {

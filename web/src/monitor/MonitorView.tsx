@@ -2,18 +2,33 @@ import { type ReactNode, useMemo, useState } from "react";
 import { forgetKey } from "../api/auth.ts";
 import { IconChevron, IconHealth, IconPause, IconPlay } from "../ui/icons.tsx";
 import { Distribution, Legend, type Series, Sparkline, TimeChart } from "./charts.tsx";
-import { type Counter, type Dashboard, deriveDashboard, type HealthLevel, type Latency, RATE_SPAN_MS, TREND_SPAN_MS } from "./derive.ts";
-import { formatAgo, formatBound, formatCount, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
+import { type Counter, type Dashboard, deriveDashboard, type HealthLevel, type Latency, type Memory, type Meter, RATE_SPAN_MS, TREND_SPAN_MS } from "./derive.ts";
+import { formatAgo, formatBound, formatBytes, formatCount, formatNumber, formatSeconds, formatShare, formatWindow } from "./format.ts";
 import { bucketCounts } from "./quantile.ts";
 import type { MonitorState } from "./scrape.ts";
-import { REJECT_REASONS, type RejectReason } from "./snapshot.ts";
+import {
+  REJECT_REASONS,
+  type RejectReason,
+  RETAINED_FAMILY_KEYS,
+  RETAINED_KINDS,
+  RETAINED_TIERS,
+  type RetainedFamily,
+  type RetainedKind,
+  type RetainedTier,
+  SLOT_SKIP_REASONS,
+  type SlotSkipReason,
+  type VramLine,
+} from "./snapshot.ts";
 import { setMonitorInterval, setMonitorPaused, useNow } from "./useMonitor.ts";
 
-// The Monitor (GitHub #165): a live dashboard over ignis's Prometheus
+// The Monitor (GitHub #165, #217): a live dashboard over ignis's Prometheus
 // exposition, scraped by this browser from /ui/metrics. It leads with a
-// verdict in words, then throughput and load, admission, latency, cache
-// pressure and the scraper itself; every series is also in the table at the
-// foot. Only ADR 0017's contract is drawn — no invented metrics.
+// verdict in words, then throughput and load, admission, latency, the memory
+// this load reserved and what is occupied of it, cache pressure and the
+// scraper itself; every series is also in the table at the foot. Only ADR
+// 0017's contract, as ADR 0030 §Observability widened it, is drawn — no
+// invented metrics, and every ratio is computed here from two series that are
+// both on the page.
 
 const WINDOWS = [
   { ms: 60_000, label: "1m" },
@@ -214,6 +229,13 @@ function Board({ dash, state }: { dash: Dashboard; state: MonitorState }) {
         <LatencyCard title="Time to first token" subtitle="Submission to the first token" latency={dash.ttft} chart={chart} win={win} none="No first tokens" />
         <LatencyCard title="Request duration" subtitle="Submission to completion" latency={dash.duration} chart={chart} win={win} none="No requests completed" />
       </div>
+
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <PlanCard memory={dash.memory} />
+        <OccupancyCard memory={dash.memory} win={win} />
+      </div>
+
+      <RetainedCard memory={dash.memory} win={win} />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card title="Prefix reuse" subtitle="Prompt tokens skipped through a sibling's prefix">
@@ -535,6 +557,271 @@ function Row({ label, value }: { label: string; value: string }) {
       <dt className="text-[11px] text-ash">{label}</dt>
       <dd className="truncate font-display font-semibold">{value}</dd>
     </div>
+  );
+}
+
+/** The plan's lines in words, in the order the load reserves them. */
+const LINE_LABEL: Record<VramLine, string> = {
+  weights: "Weights",
+  cuda_context: "CUDA context",
+  workspace: "Workspace",
+  media_embedding: "Media embedding",
+  sampling: "Sampling",
+  decode_graph: "Decode graph",
+  verify_round: "Verify round",
+  drafter_round: "Drafter round",
+  lane_state: "Lane state",
+  retained_slots: "Retained slots",
+  residual: "Residual",
+};
+
+const FAMILY_LABEL: Record<RetainedFamily, string> = {
+  reusedTokens: "Tokens reused",
+  hits: "Hits",
+  misses: "Misses",
+  spills: "Spills",
+  discards: "Discards",
+  restores: "Restores",
+};
+
+const TIER_LABEL: Record<RetainedTier, string> = { device: "Device", kv_ram: "KV-RAM" };
+const KIND_LABEL: Record<RetainedKind, string> = { checkpoint: "Checkpoint", prefix: "Prefix" };
+
+const SKIP_LABEL: Record<SlotSkipReason, string> = {
+  publish_skipped_no_slot: "A prefix found no slot to publish into",
+  capture_skipped_no_slot: "A checkpoint found no slot to capture into",
+  capture_skipped_no_page: "A checkpoint found no tail page to capture",
+};
+
+/**
+ * A plan line's colour: the four series hues, each cycle mixed a step further
+ * into the ground, so eleven lines stay apart without inventing a palette.
+ */
+const planColor = (i: number) => `color-mix(in oklab, var(--series-${(i % 4) + 1}) ${100 - 20 * Math.floor(i / 4)}%, var(--ground))`;
+
+type PlanSegment = { key: string; label: string; bytes: number; color: string; note?: string };
+
+/** The plan's segments in budget order: the eleven lines, the pool the rest bought, and what neither took. */
+function planSegments(memory: Memory): PlanSegment[] {
+  const segments: PlanSegment[] = memory.lines
+    .filter((l) => (l.bytes ?? 0) > 0)
+    .map((l, i) => ({ key: l.line, label: LINE_LABEL[l.line], bytes: l.bytes as number, color: planColor(i) }));
+  if ((memory.kvPool.bytes ?? 0) > 0) {
+    segments.push({
+      key: "kv_pool",
+      label: "KV pool",
+      bytes: memory.kvPool.bytes as number,
+      color: "var(--ember)",
+      note: `${formatCount(memory.kvPool.pages)} pages of ${formatBytes(memory.kvPool.pageBytes)}`,
+    });
+  }
+  const spare = memory.budgetBytes === null ? null : memory.budgetBytes - segments.reduce((a, s) => a + s.bytes, 0);
+  if (spare !== null && spare > 0) {
+    segments.push({ key: "spare", label: "Left over", bytes: spare, color: "var(--line)", note: "the pool's block tables ride here, unexported" });
+  }
+  return segments;
+}
+
+/** What the load reserved: the plan's lines laid out inside the budget they were planned in. */
+function PlanCard({ memory }: { memory: Memory }) {
+  const segments = planSegments(memory);
+  const budget = memory.budgetBytes;
+  return (
+    <Card title="VRAM plan" subtitle="What this load reserved, laid out inside its budget">
+      {!memory.planned || segments.length === 0 ? (
+        <p className="grid h-[150px] place-items-center px-4 text-center text-xs text-ash">
+          This load reserved nothing on the device — no model is held, so there is no plan to lay out.
+        </p>
+      ) : (
+        <>
+          <div className="flex flex-wrap items-baseline gap-x-3">
+            <span className="font-display text-[34px] leading-none font-semibold">{formatBytes(memory.linesBytes)}</span>
+            <span className="text-xs text-ash">
+              reserved of a {formatBytes(budget)} budget · {formatBytes(memory.kvRoomBytes)} left for the KV pool
+            </span>
+          </div>
+          <div className="flex h-3 gap-px bg-line/40" aria-hidden>
+            {segments.map((s) => (
+              <span key={s.key} className="h-full" style={{ flexGrow: s.bytes, background: s.color }} title={`${s.label} · ${formatBytes(s.bytes)}`} />
+            ))}
+          </div>
+          <ul className="grid grid-cols-1 gap-x-5 gap-y-1 sm:grid-cols-2">
+            {segments.map((s) => (
+              <li key={s.key} className="grid grid-cols-[10px_1fr_auto_44px] items-baseline gap-2 text-xs">
+                <span className="size-2.5 translate-y-px rounded-[2px]" style={{ background: s.color }} aria-hidden />
+                <span className="truncate text-ash" title={s.note}>
+                  {s.label}
+                </span>
+                <span className="font-display font-semibold tabular-nums">{formatBytes(s.bytes)}</span>
+                <span className="text-right tabular-nums text-ash">{formatShare(s.bytes, budget)}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-[11px] text-ash">
+            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}; what the budget left beyond them holds the pool's own
+            block tables, which the plan does not export apart.
+          </p>
+        </>
+      )}
+    </Card>
+  );
+}
+
+/** One live figure drawn against the constant that bounds it — never a bare number, never a bare percentage. */
+function MeterRow({
+  label,
+  meter,
+  format,
+  color,
+  unit,
+  aside,
+  children,
+}: {
+  label: string;
+  meter: Meter;
+  format: (v: number | null) => string;
+  color: string;
+  unit?: string;
+  aside?: string;
+  children?: ReactNode;
+}) {
+  const share = meter.share === null ? null : Math.min(1, Math.max(0, meter.share));
+  return (
+    <div className="flex flex-col gap-1.5">
+      <p className="flex flex-wrap items-baseline gap-x-2">
+        <span className="font-display text-[13px] font-semibold">{label}</span>
+        <span className="ml-auto font-display text-sm tabular-nums">
+          <span className="font-semibold">{format(meter.used)}</span>
+          <span className="text-ash">
+            {" / "}
+            {format(meter.capacity)}
+            {unit ? ` ${unit}` : ""}
+          </span>
+        </span>
+      </p>
+      <span className="block h-2.5 bg-line/70" aria-hidden>
+        {share !== null && <span className="block h-full transition-[width] duration-500 motion-reduce:transition-none" style={{ width: `${100 * share}%`, background: color }} />}
+      </span>
+      <p className="text-[11px] text-ash">
+        {meter.share === null ? "nothing bounds it on this load" : `${formatShare(meter.used, meter.capacity)} in use`}
+        {aside && ` · ${aside}`}
+      </p>
+      {children}
+    </div>
+  );
+}
+
+/** What is occupied right now, each figure against its own bound. */
+function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
+  const pageBytes = memory.kvPool.pageBytes;
+  const bytesOf = (pages: number | null) => (pages === null || pageBytes === null ? null : pages * pageBytes);
+  const skips = memory.skips;
+  return (
+    <Card title="In use now" subtitle="Each live figure against the constant that bounds it">
+      <div className="flex flex-col gap-4">
+        <MeterRow
+          label="KV pool pages"
+          meter={memory.pagesInUse}
+          format={formatCount}
+          unit="pages"
+          color="var(--series-1)"
+          aside={pageBytes === null ? undefined : `${formatBytes(bytesOf(memory.pagesInUse.used))} of ${formatBytes(bytesOf(memory.pagesInUse.capacity))}`}
+        >
+          <Sparkline values={memory.pagesInUse.series} color="var(--series-1)" height={30} />
+        </MeterRow>
+        <MeterRow label="KV-RAM arena" meter={memory.arenaInUse} format={formatBytes} color="var(--series-2)" aside="pinned host memory, whole at start">
+          <Sparkline values={memory.arenaInUse.series} color="var(--series-2)" height={30} />
+        </MeterRow>
+        <MeterRow
+          label="Retained slots"
+          meter={memory.slotsInUse}
+          format={formatCount}
+          unit="slots"
+          color="var(--series-4)"
+          aside={memory.slotsInUse.capacity === 0 ? "this load hands out none" : undefined}
+        >
+          <div className="border-l-2 border-line pl-3">
+            <p className="text-[11px] text-ash">
+              {skips.total ? (
+                <>
+                  <span className="font-display font-semibold text-ink">{formatCount(skips.total)}</span> publishes and captures found no room since start
+                  {skips.window ? `, ${formatCount(skips.window)} in the last ${win}` : ""} — reuse was not left behind.
+                </>
+              ) : (
+                "Every publish and capture found room; no reuse was dropped for want of a slot."
+              )}
+            </p>
+            <ul className="mt-1 flex flex-col gap-0.5">
+              {SLOT_SKIP_REASONS.map((reason) => (
+                <li key={reason} className="grid grid-cols-[1fr_auto] gap-2 text-[11px] text-ash">
+                  <span className="truncate">{SKIP_LABEL[reason]}</span>
+                  <span className="font-display font-semibold tabular-nums text-ink">{formatCount(skips.byReason[reason].total)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </MeterRow>
+      </div>
+    </Card>
+  );
+}
+
+/**
+ * The six retained-state families, each split by the tier it lived in and the
+ * kind of state it was — a checkpoint and a prefix cost differently to bring
+ * back, so they are never summed into one figure here.
+ */
+function RetainedCard({ memory, win }: { memory: Memory; win: string }) {
+  const columns = RETAINED_TIERS.flatMap((tier) => RETAINED_KINDS.map((kind) => ({ tier, kind, key: `${tier}/${kind}` })));
+  return (
+    <Card title="Retained state" subtitle={`What reuse held, moved and gave up · gains over the last ${win}`}>
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-[13px]">
+          <thead>
+            <tr className="border-b border-line text-left text-ash">
+              <th className="py-1.5 pr-4 font-display font-medium">Family</th>
+              {columns.map((c) => (
+                <th key={c.key} className="py-1.5 pr-4 text-right font-display font-medium whitespace-nowrap">
+                  {TIER_LABEL[c.tier]} <span className="text-ink">{KIND_LABEL[c.kind]}</span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {RETAINED_FAMILY_KEYS.map((family) => (
+              <tr key={family} className="border-b border-line/50">
+                <td className="py-1.5 pr-4 font-display font-semibold">{FAMILY_LABEL[family]}</td>
+                {columns.map((c) => {
+                  const cell = memory.retained[family][c.tier][c.kind];
+                  // The prefix walk raises no miss at all, so this series is
+                  // zero by construction rather than a prefix that never
+                  // missed (ADR 0017's note, GitHub #216/#222).
+                  const notMeasured = family === "misses" && c.kind === "prefix";
+                  return (
+                    <td key={c.key} className="py-1.5 pr-4 text-right tabular-nums">
+                      {notMeasured ? (
+                        <span className="text-[11px] text-ash" title="Misses are recorded for the checkpoint lookup only; the prefix walk raises none (#222).">
+                          not measured
+                        </span>
+                      ) : (
+                        <>
+                          <span className="font-display font-semibold">{formatCount(cell.total ?? 0)}</span>
+                          {cell.window ? <span className="ml-1.5 text-[11px] text-ash">+{formatCount(cell.window)}</span> : null}
+                        </>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-[11px] text-ash">
+        Tokens reused counts prompt tokens skipped; the five below it count images. A load that never spilled shows KV-RAM at zero, and a load with prompt reuse
+        off shows every column at zero.
+      </p>
+    </Card>
   );
 }
 
