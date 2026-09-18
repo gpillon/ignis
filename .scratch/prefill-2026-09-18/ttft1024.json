@@ -1,0 +1,91 @@
+{
+  "session": "20260918T100142Z",
+  "label": "ignis",
+  "endpoint": "http://127.0.0.1:8000",
+  "engine": "qwen3.8-27b",
+  "artifact": "./models/qwen3_8_27b_nvfp4full-v2.ninfer",
+  "profile": "unrecorded",
+  "date": "2026-09-18T10:01:58Z",
+  "max_tokens": 1,
+  "cells": [
+    {
+      "prompt_tokens": 1024,
+      "warmup_ttft_ms": 193.8766,
+      "samples": [
+        {
+          "index": 0,
+          "ttft_ms": 186.0737,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 1,
+          "ttft_ms": 181.7348,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 2,
+          "ttft_ms": 178.9614,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 3,
+          "ttft_ms": 217.4315,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 4,
+          "ttft_ms": 214.18390000000002,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 5,
+          "ttft_ms": 207.60219999999998,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 6,
+          "ttft_ms": 203.6107,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 7,
+          "ttft_ms": 205.58870000000002,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 8,
+          "ttft_ms": 205.0872,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 9,
+          "ttft_ms": 206.7792,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 10,
+          "ttft_ms": 202.84,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        },
+        {
+          "index": 11,
+          "ttft_ms": 201.82430000000002,
+          "computed_prefill_tokens": 1024,
+          "void": false
+        }
+      ],
+      "median_ttft_ms": 204.34895
+    }
+  ]
+}
