@@ -12,8 +12,11 @@ still that vendored files are not hand-edited.
 Sources: owner statement 2026-09-18 ("i kernel sono intoccabili ma se troviamo
 delle ottimizzazioni per cui ci rendiamo conto che i kernel vendor sono *il
 rallentamento*, possiamo tranquillamente patcharli oppure reimplementarci quella
-funzionalità e togliere il kernel vendor"); Nsight Systems profile of a decode
-round, 2026-09-18 (owner session, not yet written up under `docs/findings/`);
+funzionalità e togliere il kernel vendor");
+`docs/findings/2026-09-18-dflash2-topk-one-warp-per-column.md` and
+`docs/findings/2026-09-18-decode-round-host-idle.md`, the decode-round profile
+the kernel breakdown below comes from (both landed on branch
+`kernel-gqa-workspace-memset`, not yet merged);
 `.scratch/kernel-opt-2026-09-18/candidates.md`.
 
 ## Context
@@ -48,8 +51,26 @@ a top-k=16 over a `[248046 vocab, 7 column]` BF16 logits matrix — **3.47 MB
 read**, which at this card's bandwidth is about **2.0 µs** of memory traffic.
 The kernel is roughly **1,570× off its own memory bound**. It is not slow
 because top-k is hard; it is slow because one warp per column leaves 168 of the
-170 SMs idle. The launcher is the reference's, unchanged, so the reference pays
-the same 3 ms — which is exactly the kind of ceiling ADR 0005 refuses to accept.
+170 SMs idle, with each lane's `TopkEntry list[64]` in local memory at 20
+registers per thread. The launcher is the reference's, unchanged, so the
+reference pays the same 3 ms — which is exactly the kind of ceiling ADR 0005
+refuses to accept.
+
+The replacement is measured, not projected. A row-split merge of ours
+(`kernel/src/dflash2_topk.cu`, grid 122×7 plus 7×1 at 71 registers, against the
+vendored grid 2×1 at 20) costs **44.26 µs per round against the vendored
+3,145.23 µs — 71×**, and takes the decode round at one lane from **19.18 ms to
+15.81 ms (−17.6%)**: 388 rounds per 8 s become 471, and because the selection is
+bit-identical the acceptance is unchanged, so **+21.4% rounds is +21.4% tokens
+per second**. At *eight* lanes the same change is worth only **33.54 → 32.18 ms
+(−4.1%)** — and the reason is the fact that made it large at one lane: the
+vendored kernel's parallelism *is* its column count, and eight lanes hand it 56
+columns instead of 7. How big a win is available is a property of the geometry
+the engine actually runs, which is one more thing that cannot be read off the
+source. Correctness held at exactly the bound the Decision below sets: 18 shapes
+bit-identical against the vendored op as oracle
+(`kernel/tests/test_dflash2_topk.cu`), and 256 greedy tokens byte-identical end
+to end.
 
 The same profile contains the counter-example, and it is the more important
 half. `w8_small_t_mma_kernel` measures **820 µs against a 747 µs roofline** for
@@ -62,6 +83,12 @@ below is written around a measurement and not around a judgement of kernel
 quality — and why a code-reading pass like
 `.scratch/kernel-opt-2026-09-18/candidates.md` (explicitly "nessuna misura su
 GPU") is how candidates get *chosen for profiling*, never how they get changed.
+The same profile retired one of that pass's hypotheses for free: the 224
+memcpy/memset nodes a decode round enqueues between PDL-chained vendored ops
+were suspected of forfeiting each following kernel's prologue overlap, and
+node-level tracing put the gap after a residual copy at **0.10 µs at p50**,
+indistinguishable from a kernel-to-kernel edge. Reading the code made that
+argument look strong; one capture ended it — the thesis cutting the other way.
 
 The argument for opening the hatch at all comes from ADR 0005. The reference is
 "a reference for inspiration only," not a target and not a ceiling; the
@@ -154,6 +181,10 @@ specific vendored kernel as the bottleneck lifts that default for that kernel.**
 - The review question for a patched or replaced kernel is answerable from the
   repo: *which measurement opened this?* — from the manifest entry's `reason`,
   or from the ticket the replacement landed under.
-- First candidate under this ADR: `dflash2_topk`. That is a ticket with its own
-  profile, its own oracle test against the vendored kernel, and its own gate
-  run — not part of this decision.
+- First op replaced under this ADR: `dflash2_topk` (branch
+  `kernel-gqa-workspace-memset`), with its own profile, its own oracle test and
+  its own findings write-up — the work, not this decision. Note how option (b)
+  actually landed: the vendored file **stays** in the subtree and under the
+  manifest, because it is the oracle the replacement is tested against and still
+  the implementation for every `k` the replacement does not specialize. Leaving
+  the call site is not the same as leaving the manifest.
