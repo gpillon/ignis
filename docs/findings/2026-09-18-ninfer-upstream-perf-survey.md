@@ -1,10 +1,10 @@
-# What upstream ninfer's last month of perf work offers ignis: six portable candidates, one blocker, and a large re-vendor bill
+# What upstream ninfer's last month of perf work offers ignis: six portable candidates, a fork-rebase bill, and a v3 migration that gates none of it
 
 - Kind: research
 - Status: current
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
-- Scope: kernel / vendored subtree currency, NVFP4 linear and SwiGLU routes, GDN convolution output, GQA attention routes, build time
+- Scope: kernel / vendored subtree currency, NVFP4 linear and SwiGLU routes, GDN convolution output, GQA attention routes, artifact container v2/v3, build time
 - Related: [ADR 0010](../adr/0010-vendored-reference-kernels.md),
   [Decode round anatomy](2026-09-18-decode-round-anatomy.md),
   [Decode round host idle](2026-09-18-decode-round-host-idle.md),
@@ -260,14 +260,73 @@ its fixed chunk of 6 is why the rule exists there. The upstream rule would only
 change behaviour under a **BF16 KV cache**, where width 7–8 still falls through
 to `Prompt`.
 
-### The blocker for any wholesale sync
+### The v3 artifact migration is a separate axis, not a gate on any of this
 
 Upstream migrated to **v3 artifacts** across `168fdd81` (converter),
-`4cde7ad0` (C++ weight loading — **101 vendored files**), `04350ba9` (engine),
-and `469f014c` (v2 users are pointed at an offline upgrade tool). ignis serves
-`qwen3_8_27b_nvfp4full-v2.ninfer`. Any pin bump past those commits changes
-`src/core/weight.h`, `src/core/tensor.h` and every `*_plan.cpp`/`*_plan.h` in
-the vendored tree at once, and requires a v3 artifact to load.
+`4cde7ad0` (C++ weight loading), `04350ba9` (engine), and `469f014c` (v2 users
+are pointed at an offline upgrade tool). ignis serves
+`qwen3_8_27b_nvfp4full-v2.ninfer`. The first reading of this survey treated
+that as a blocker on the vendored subtree; measuring it shows it is not.
+
+**The vendored kernel surface is nearly v3-indifferent.** `4cde7ad0` touches
+101 vendored files, but **97 of them change 4 lines or fewer** — +232/-76
+across all 101, against +6,647/-4,158 for the commit as a whole. The `Weight`
+struct did not change: every field (`qdata`, `qhigh`, `scales`, `n`, `k`,
+`group`, `layout`, `scale_dtype`, `scale_ne`, `scale_nb`,
+`weight_scale_divisor`, `input_scale_divisor`, `payload`, `padded_shape`, …)
+moved **byte-identical** from `src/core/tensor.h` to a new `src/core/weight.h`,
+and the vendored files' churn is the include that follows it. The only
+non-trivial vendored diffs are `weight.h` (+45/-18), `tensor.h` (0/-43) and two
+op tests.
+
+v3's actual weight lands in `src/artifact/{reader,schema,materializer,binder}.cpp`,
+`src/targets/*/impl/load/bindings.cpp`, `src/models/qwen3_5/config.cpp` and
+`src/core/weight_view.cpp` — **none of which ignis vendors**, because ignis
+replaces them with its own Rust: `crates/artifact/src/{lib,binder,binding,
+materializer,normalize,inventory}.rs`, which reads the container directly
+(`MAGIC = NINFER\x00\x02`, `crates/artifact/src/lib.rs:146`).
+
+**No candidate in this survey needs v3.** Four of the six (`00369f63`,
+`1c8f8acc`, `92bb06eb`, `9954867a`) predate the v3 commits entirely. Of the two
+that postdate them, `abbeea0a` touches only pure-kernel files that include no
+`core/weight.h`, and `1d8587bc`'s `nvfp4_w4a4_plan.h` picks up that header as a
+one-line include.
+
+**What going v3 would actually cost ignis**, read from the container schema and
+the upgrade tool rather than from the commit titles:
+
+- the magic goes `NINFER\0\2` → `NINFER\0\3`, the prefix grows from
+  `<8sQ` to `<8sQ16s`, and an artifact over `LIMIT = 32_000_000_000` bytes is
+  **split into parts** (`NINPRT\0\3` for every part after the first) — ignis's
+  19.4 GB file stays single-part, but the reader has to admit the form;
+- the directory root goes from `{identity: {model_id, weights_id}, objects}` to
+  `{components: {text|vision|mtp|dflash2: {config, resources, target}}, objects,
+  bindings, …}`: the **model config moves into the container**;
+- an object's `name` becomes `id` with the **string preserved**
+  (`"id": value["name"]` in the tool), so `text/token_embedding` stays
+  `text/token_embedding`;
+- `format` and `layout` strings are remapped to snake_case
+  (`W8G32_F16S` → `q8_g32_fp16`, `row-split-k128-v1` → `row_split_k128_v1`);
+  every format and layout ignis's artifact uses is in the tool's tables;
+- the substantive addition is **`bindings`**: logical parameter names mapped to
+  an object, or to a row range of one (`{"parts": [{"object": id, "range":
+  [begin, end]}]}`). The fused-parent splitting that `crates/artifact`'s binder
+  does in Rust today becomes data the container declares.
+
+**And the official upgrade tool refuses ignis's artifact as it stands.**
+`tools/upgrade_ninfer_v2_to_v3.py` gates on
+`KNOWN_COUNTS[(model_id, weights_id)]`, which has
+`("qwen3.8-27b", "nvfp4"): (1124, 1190)` and no `nvfp4full` key at all; ignis's
+file is `("qwen3.8-27b", "nvfp4full")` with **1,325 objects** (text 908, vision
+333, dflash2 66, mtp 12, frontend 6). The tool's structure anticipates all of
+those components — it builds `vision`, `mtp` and `dflash2` entries and detects
+`dflash2/` objects — so the gap is the identity/count guard plus checking its
+hand-written binding table against this object set. That is fork-side work on
+the `nvfp4full` recipe, not a flag.
+
+**The real obstacle to a wholesale pin bump is unrelated to v3**: 95 vendored
+files exist only on the fork side and 78 more are touched by both sides. That
+is a fork-rebase problem, and it would still be there on a v3 tree.
 
 ## Finding
 
@@ -309,11 +368,22 @@ dtype-dependent small-T chunk.
    must agree. Only after 1–4, and only with the route/layout pairing carried
    over as one object the way upstream did it.
 
-**Inferred.** A pin bump is the wrong instrument here. The v3 migration makes
-it an artifact-format change, not a kernel refresh, and 95 fork-only files mean
-the fork would have to rebase first. Each candidate above is a manifest-recorded
-patch under ADR 0010, or an edit to ignis's own dispatch where the decision has
-already moved out of the vendored tree.
+**Inferred.** A pin bump is the wrong instrument here, and v3 is not the reason
+why: 95 fork-only files and 78 two-sided ones mean the fork would have to
+rebase first, which is true on a v2 tree and a v3 tree alike. Each candidate
+above is a manifest-recorded patch under ADR 0010, or an edit to ignis's own
+dispatch where the decision has already moved out of the vendored tree.
+
+**Inferred.** Going v3 and taking upstream's perf work are **independent
+axes**. v3 buys ignis the ability to consume upstream's new official artifacts
+and model cards, and it moves the fused-parameter splitting out of
+`crates/artifact`'s binder into container data. It buys **nothing** on the six
+candidates, all of which are takeable on v2 today. Its cost is a
+`crates/artifact` reader change (new magic and prefix, multi-part form,
+`components` root carrying the config, `bindings`, snake_case format/layout
+names) plus a fork-side extension of `upgrade_ninfer_v2_to_v3.py` to accept the
+`nvfp4full` identity and its 1,325 objects. That makes it its own decision on
+its own schedule — an ADR, not a prerequisite.
 
 ## Implications
 
@@ -331,8 +401,15 @@ already moved out of the vendored tree.
   checkpoint. That makes upstream's `perf(ops)` stream a standing source of
   candidates for ignis's NVFP4 and GDN routes — and only those; everything
   specific to q4/q5/q8 is noise for as long as ignis serves nvfp4-full.
-- The v2/v3 split is a fork-wide fact, not a kernel detail. It bounds how long
-  the vendored subtree can keep tracking upstream at all.
+- The v2/v3 split runs through the **loader**, not the kernels, and ignis
+  already owns its loader in Rust. That is why the vendored subtree can keep
+  tracking upstream's kernel work while the container stays v2 — and why a v3
+  migration, when it happens, is scoped to `crates/artifact` and the artifact
+  file rather than to `kernel/vendor/`.
+- ignis's artifact is a **fork weights variant** (`nvfp4full`, 1,325 objects)
+  that upstream's tooling does not know. Anything upstream ships that keys off
+  `(model_id, weights_id)` will need a fork-side entry; the upgrade tool is the
+  first instance, and it will not be the last.
 
 ## Limits and unknowns
 
@@ -354,6 +431,16 @@ already moved out of the vendored tree.
   be expected to touch decode at all. Candidates 1, 4 and 6 are prefill-side.
 - `02be37cb` and `e51b585c` were classified from their commit messages and file
   lists, not from reading their diffs against ignis's call sites.
+- The v3 container was read from `docs/maintainer/examples/artifact-v3-text.json`
+  and from `tools/upgrade_ninfer_v2_to_v3.py`, against ignis's real v2 header
+  and `crates/artifact/src/lib.rs`. Nothing was built, converted or loaded, so
+  the reader-side cost is a scoped list of schema differences, not an
+  implementation estimate. The 1,043-line `artifact-container.md` was not read
+  and may carry constraints these two sources do not show.
+- `KNOWN_COUNTS` was read as the tool stands on `origin/master`. Whether the
+  official artifacts it does accept have since grown the vision and dflash2
+  components ignis's file carries was not checked, so "fork-side entry" may
+  understate or overstate what the binding table needs.
 
 ## Follow-ups
 
@@ -367,4 +454,8 @@ already moved out of the vendored tree.
   but no route registers, which is what candidates 1 and 2 both turned out to
   be.
 - A separate decision on the v2→v3 artifact question, which is an ADR, not a
-  finding.
+  finding, and which does not block any of the above. Its two open costs are
+  the `crates/artifact` reader change and a fork-side entry in
+  `upgrade_ninfer_v2_to_v3.py` for `("qwen3.8-27b", "nvfp4full")`; the trigger
+  for taking it is wanting an upstream-published artifact, not wanting upstream
+  kernel work.
