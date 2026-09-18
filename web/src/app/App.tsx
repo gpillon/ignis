@@ -18,11 +18,13 @@ import { AGENT_SYSTEM_PROMPT, type AgentRun } from "../tools/agents/agents.ts";
 import { ALL_TOOLS, type ToolsState } from "../tools/index.ts";
 import { Header, type View } from "./Header.tsx";
 import { KeyPage } from "./KeyPage.tsx";
+import { STORED_FLAGS, useStoredFlag } from "./storedFlag.ts";
 import { useConversation } from "./useConversation.ts";
 
 // The Playground (GitHub #164): a streaming chat against ignis's own
 // /v1/chat/completions, with per-request figures measured in the browser.
-// Sessions, settings and figures live in memory; a reload starts over.
+// Sessions, settings and figures live in memory; a reload starts over, apart
+// from the switches this browser stores (`storedFlag.ts`).
 // This is the page's layout; the conversation loop is useConversation.
 // With metrics on, the header switches to the Monitor (GitHub #165); the
 // chat stays mounted underneath, so a streaming reply carries on.
@@ -37,8 +39,9 @@ export function App() {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
-  // Off: the page runs one turn at a time, whichever session it is in.
-  const [parallel, setParallel] = useState(false);
+  // Off: the page runs one turn at a time, whichever session it is in. Stored,
+  // so turning it on survives a reload rather than looking like it never took.
+  const [parallel, setParallel] = useStoredFlag(STORED_FLAGS.parallel, false);
   const [input, setInput] = useState("");
   // The images the next prompt will carry. They belong to the box, not to a
   // session: once sent they live on the user message, and the box is empty again.
