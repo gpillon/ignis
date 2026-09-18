@@ -1,0 +1,129 @@
+# Le tre strade, e quale è misurabile oggi
+
+- Data: 2026-09-18
+- Dipende da: [`00-fatti.md`](00-fatti.md)
+- Stato: proposta, da decidere con l'owner
+
+## A — Servire Qwen3.8-Flash-Next in ignis
+
+Il modello ha l'n-gram nativo: niente da addestrare, i pesi esistono.
+
+**Bloccata dall'hardware, non dal software.**
+
+| | serve | c'è |
+|---|---|---|
+| pesi backbone 125 B | ~62 GiB a NVFP4 | 32,6 GiB VRAM |
+| tabella n-gram | 95,4 GiB BF16 / ~24 GiB NVFP4 | 63,8 GiB RAM, di cui una fetta già impegnata dal tier KV host |
+
+Anche quantizzando tutto al massimo, i pesi del backbone non entrano in VRAM
+senza expert offload — che consuma la stessa RAM host che serve alla tabella.
+E sarebbe comunque un port di architettura nuova (Gated DeltaNet, Qwen Sparse
+Attention, MoE, MTP) in cui **l'n-gram è il pezzo più piccolo**. Il lavoro
+sarebbe il backbone, non la memoria condizionale.
+
+Non raccomandata su questo box.
+
+## B — Innestare una tabella n-gram su Qwen3.8-27B
+
+Il meccanismo di innesto esiste già: `tools/artifact/graft_dflash2_module.py`
+ha aggiunto 66 oggetti al `.ninfer` v1 lasciando i 1.259 di base
+bit-identici. Un modulo n-gram sarebbe lo stesso gesto.
+
+**Il blocco non è il formato, è che i pesi non esistono.** Vanno addestrati
+(ricetta Engram Adapter, backbone congelato). Il training non è il mestiere di
+ignis, e né compute né volume dati sono dichiarati nell'abstract del paper.
+
+Resta un'opzione reale ma di un altro progetto. Se interessa, il primo passo è
+leggere il PDF completo dell'Engram Adapter per il costo di training, non
+scrivere codice in ignis.
+
+## C — Il substrato di serving
+
+**Questa è la parte che il repo possiede davvero, ed è misurabile oggi senza
+un solo peso addestrato.**
+
+La meccanica è identica in A e in B: dagli ultimi 2-3 token ricavi 16 indirizzi
+deterministici, peschi 16 righe da una tabella in RAM host, le fondi nel
+residual a layer 2. Se quel gesto costa poco su questa macchina, sia A sia B
+diventano discorsi sensati; se costa molto, nessuno dei due lo è.
+
+### La domanda che decide tutto
+
+> La gather si nasconde dentro il decode round di ignis, che è catturato in un
+> CUDA graph da 1.166 nodi con solo 0,80 ms di idle su 15,81 ms?
+
+SGLang misura −0,07 % su H200/Linux e **non discute affatto l'interazione con i
+CUDA graph**. Ignis cattura il round. Il numero di SGLang non trasferisce per
+ipotesi.
+
+### I sette nodi concreti
+
+1. **Gli indirizzi devono nascere sul device.** In decode il token appena
+   campionato vive in VRAM; l'host non lo conosce fino al sync. L'hash
+   (multiplicative-XOR su 2 e 3 token) va calcolato in un kernel, non
+   sull'host. Così non aggiunge sync e resta catturabile.
+2. **La memoria pinned di ignis non è leggibile da un kernel.** L'unico
+   `cudaHostAlloc` del leaf è in `kernel/vendor/src/core/arena.cu:279` e usa
+   `cudaHostAllocDefault`: page-locked per DMA veloce, **non mappata** nello
+   spazio di indirizzi del device. Un gather UVA richiede
+   `cudaHostAllocMapped`. Serve una seconda arena, non una patch alla vendored
+   (nessun conflitto con ADR 0010).
+3. **Il costo in nodi di graph è trascurabile.** fork + kernel hash + kernel
+   gather + join ≈ 4 nodi su 1.166, a 0,36-0,73 µs/nodo ≈ 2-3 µs di
+   submission.
+4. **La finestra di overlap è ampia.** 15,81 ms su ~64 layer ≈ 0,25 ms per
+   layer; fino all'iniezione a layer 2 ci sono ~0,5 ms. Va nascosta la latenza
+   di 16 letture random su PCIe, non una banda.
+5. **Lo stato per sequenza è minuscolo**: i due token id precedenti. Va nel
+   seq pool per slot, esattamente dove sta già la finestra del drafter
+   (precedente: GitHub #152).
+6. **Convivenza con DFlash2.** SGLang tiene il lookup attivo in prefill,
+   decode e verifica del target, e lo toglie solo nel draft. Tradotto per
+   ignis: il verify round fa la gather per M+1 posizioni per slot (indirizzi
+   derivati dai draft, quindi anch'essi device-resident), il drafter no.
+7. **Il budget RAM è condiviso** con il tier KV host, che ADR 0030 riserva al
+   load. Una tabella e una KV-RAM arena competono per gli stessi 63,8 GiB.
+
+### Il rischio specifico di questa macchina
+
+Windows/WDDM. Il repo ha già visto WDDM paginare sotto pressione (lavoro
+#207/ADR 0030). Lo zero-copy da kernel verso host memory mappata è la
+primitiva più esposta a quel comportamento, e su Windows non ha lo stesso
+profilo che su Linux. È precisamente ciò che una misura risolve e una
+discussione no.
+
+## Proposta: il microbenchmark, prima di qualsiasi design
+
+Standalone, sul modello di `graphlaunch_bench.cu` già usato per l'anatomia del
+round. Nessun modello caricato, nessun peso, nessuna dipendenza da A o B.
+
+**Setup**
+- arena host `cudaHostAllocMapped` di dimensione variabile (8 / 16 / 24 GiB),
+  riempita di righe sintetiche;
+- 16 row id casuali per token, già in VRAM (niente sync);
+- kernel di gather UVA che scrive 16 × 160 valori in un buffer device.
+
+**Misure**
+- latenza del kernel isolato, al variare della dimensione della tabella
+  (isola l'effetto TLB/pagine su una working set che non entra in nessuna
+  cache);
+- quanto ne resta scoperto sotto un carico fittizio di ~0,5 ms su un altro
+  stream, dentro e fuori un graph catturato;
+- al variare della larghezza del batch (1 lane vs N lane: gli accessi random
+  si ammortizzano o si sommano?);
+- al variare del formato riga (BF16 / FP8 / NVFP4): qui si vede se la
+  quantizzazione della tabella compra latenza oltre che spazio.
+
+**Esito, in un verso o nell'altro, è un finding**
+- si nasconde → il −0,07 % di SGLang è plausibile anche qui, e A/B diventano
+  valutabili nel merito;
+- non si nasconde → si sa il perché e quanto, e si è risparmiato un port.
+
+Costo stimato: una sessione. Richiede la card in esclusiva (ADR 0006), quindi
+`make gpu-status` prima.
+
+## Raccomandazione
+
+**C prima**, poi si decide. È l'unico dei tre che produce un numero invece di
+una discussione, non richiede pesi che non esistono, e il suo risultato è la
+premessa di entrambi gli altri.
