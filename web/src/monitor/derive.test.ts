@@ -83,13 +83,37 @@ describe("deriveMemory", () => {
   });
 
   it("lays the plan out in plan order and leaves the rest of the budget to the KV pool", () => {
-    const reserved = { ...emptySnapshot().memory.reserved, weights: 600, workspace: 300, residual: 100 };
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 0])) as MemorySeries["reserved"];
+    Object.assign(reserved, { weights: 600, workspace: 300, residual: 100 });
     const m = deriveMemory([memoryAt(0, { reserved, budgetBytes: 2000, kvPoolPages: 8, kvPageBytes: 100 })], 0);
     expect(m.planned).toBe(true);
     expect(m.lines.map((l) => l.line).slice(0, 3)).toEqual(["weights", "cuda_context", "workspace"]);
     expect(m.linesBytes).toBe(1000);
     expect(m.kvRoomBytes).toBe(1000);
     expect(m.kvPool).toEqual({ pages: 8, pageBytes: 100, bytes: 800 });
+    expect(m.spareBytes).toBe(200);
+    expect(m.oversubscribed).toBe(false);
+  });
+
+  it("will not add a plan up unless the scrape carries all eleven lines", () => {
+    // A partial sum would understate the plan and overstate the room beside
+    // it; the server writes the eleven together or not at all.
+    const partial = { ...emptySnapshot().memory.reserved, weights: 600, workspace: 300 };
+    const m = deriveMemory([memoryAt(0, { reserved: partial, budgetBytes: 2000 })], 0);
+    expect(m.linesBytes).toBeNull();
+    expect(m.kvRoomBytes).toBeNull();
+    expect(m.planned).toBe(false);
+  });
+
+  it("reports an overrun rather than clamping it away", () => {
+    // --allow-vram-oversubscription: the plan is larger than the budget it
+    // was laid out in, and the panel has to be able to say so.
+    const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
+    const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
+    expect(m.linesBytes).toBe(1100);
+    expect(m.kvRoomBytes).toBe(-200);
+    expect(m.spareBytes).toBe(-300);
+    expect(m.oversubscribed).toBe(true);
   });
 
   it("has no plan, and no share to compute, on a load that exported none", () => {

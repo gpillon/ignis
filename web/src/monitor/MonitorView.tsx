@@ -601,7 +601,11 @@ const planColor = (i: number) => `color-mix(in oklab, var(--series-${(i % 4) + 1
 
 type PlanSegment = { key: string; label: string; bytes: number; color: string; note?: string };
 
-/** The plan's segments in budget order: the eleven lines, the pool the rest bought, and what neither took. */
+/**
+ * The plan's segments in budget order: the eleven lines, the pool the rest
+ * bought, and the budget neither took. The bytes come from `deriveMemory`;
+ * what this adds is only how each one is drawn and what it is called.
+ */
 function planSegments(memory: Memory): PlanSegment[] {
   const segments: PlanSegment[] = memory.lines
     .filter((l) => (l.bytes ?? 0) > 0)
@@ -615,16 +619,17 @@ function planSegments(memory: Memory): PlanSegment[] {
       note: `${formatCount(memory.kvPool.pages)} pages of ${formatBytes(memory.kvPool.pageBytes)}`,
     });
   }
-  const spare = memory.budgetBytes === null ? null : memory.budgetBytes - segments.reduce((a, s) => a + s.bytes, 0);
-  if (spare !== null && spare > 0) {
-    segments.push({ key: "spare", label: "Left over", bytes: spare, color: "var(--line)", note: "the pool's block tables ride here, unexported" });
+  if (memory.spareBytes !== null && memory.spareBytes > 0) {
+    segments.push({
+      key: "spare",
+      label: "Unspent budget",
+      bytes: memory.spareBytes,
+      color: "var(--line)",
+      note: "what the pages did not buy, the pool's own tables included",
+    });
   }
   return segments;
 }
-
-/** Whether the plan overran the budget it was laid out in — only `--allow-vram-oversubscription` lets it. */
-const oversubscribed = (memory: Memory) =>
-  memory.budgetBytes !== null && memory.linesBytes !== null && memory.linesBytes + (memory.kvPool.bytes ?? 0) > memory.budgetBytes;
 
 /** What the load reserved: the plan's lines laid out inside the budget they were planned in. */
 function PlanCard({ memory }: { memory: Memory }) {
@@ -634,14 +639,16 @@ function PlanCard({ memory }: { memory: Memory }) {
     <Card title="VRAM plan" subtitle="What this load reserved, laid out inside its budget">
       {!memory.planned || segments.length === 0 ? (
         <p className="grid h-[150px] place-items-center px-4 text-center text-xs text-ash">
-          This load reserved nothing on the device — no model is held, so there is no plan to lay out.
+          This scrape carries no plan: either the load holds no model and reserved nothing, or the server predates the memory series. The panel cannot tell the
+          two apart, so it says neither.
         </p>
       ) : (
         <>
           <div className="flex flex-wrap items-baseline gap-x-3">
             <span className="font-display text-[34px] leading-none font-semibold">{formatBytes(memory.linesBytes)}</span>
             <span className="text-xs text-ash">
-              reserved of a {formatBytes(budget)} budget · {formatBytes(memory.kvRoomBytes)} left for the KV pool
+              reserved of a {formatBytes(budget)} budget ·{" "}
+              {memory.oversubscribed ? `${formatBytes(Math.abs(memory.spareBytes ?? 0))} over it` : `${formatBytes(memory.kvRoomBytes)} left for the KV pool`}
             </span>
           </div>
           <div className="flex h-3 gap-px bg-line/40" aria-hidden>
@@ -662,9 +669,10 @@ function PlanCard({ memory }: { memory: Memory }) {
             ))}
           </ul>
           <p className="text-[11px] text-ash">
-            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}; what the budget left beyond them holds the pool's own
-            block tables, which the plan does not export apart.
-            {oversubscribed(memory) && " This load reserved more than its budget (--allow-vram-oversubscription), so the bar is the plan, not the budget."}
+            The pool is {formatCount(memory.kvPool.pages)} pages of {formatBytes(memory.kvPool.pageBytes)}. What the budget left beyond those pages is the
+            rounding a whole page forces, plus the pool's own block tables — neither is exported apart, so it is shown as one unspent remainder rather than
+            split into a figure nothing measured.
+            {memory.oversubscribed && " This load reserved more than its budget (--allow-vram-oversubscription), so the bar is the plan, not the budget."}
           </p>
         </>
       )}
@@ -708,7 +716,13 @@ function MeterRow({
         {share !== null && <span className="block h-full transition-[width] duration-500 motion-reduce:transition-none" style={{ width: `${100 * share}%`, background: color }} />}
       </span>
       <p className="text-[11px] text-ash">
-        {meter.share === null ? "nothing bounds it on this load" : `${formatShare(meter.used, meter.capacity)} in use`}
+        {/* A bound of zero is a load that hands none out; a bound of none is a
+            scrape that does not carry one. The two read differently. */}
+        {meter.share !== null
+          ? `${formatShare(meter.used, meter.capacity)} in use`
+          : meter.capacity === 0
+            ? "this load has none of it to give"
+            : "this scrape carries no bound to read it against"}
         {aside && ` · ${aside}`}
       </p>
       {children}
@@ -745,9 +759,12 @@ function OccupancyCard({ memory, win }: { memory: Memory; win: string }) {
           color="var(--series-4)"
           aside={memory.slotsInUse.capacity === 0 ? "this load hands out none" : undefined}
         >
+          <Sparkline values={memory.slotsInUse.series} color="var(--series-4)" height={30} />
           <div className="border-l-2 border-line pl-3">
             <p className="text-[11px] text-ash">
-              {skips.total ? (
+              {skips.total === null ? (
+                "This scrape carries no skip counter, so whether reuse was dropped for want of a slot is not known."
+              ) : skips.total > 0 ? (
                 <>
                   <span className="font-display font-semibold text-ink">{formatCount(skips.total)}</span> publishes and captures found no room since start
                   {skips.window ? `, ${formatCount(skips.window)} in the last ${win}` : ""} — reuse was not left behind.

@@ -67,10 +67,26 @@ describe("MonitorView", () => {
     const now = Date.now();
     const state = applyScrape(initialMonitor(), { kind: "ok", text: bare }, now, 2);
     const html = renderToStaticMarkup(<MonitorView state={state} />);
-    expect(html).toContain("This load reserved nothing on the device");
-    expect(html).toContain("nothing bounds it on this load");
+    // What a scrape does not carry is said of the scrape, never of the load.
+    expect(html).toContain("This scrape carries no plan");
+    expect(html).toContain("this scrape carries no bound to read it against");
+    expect(html).toContain("This scrape carries no skip counter");
+    expect(html).not.toContain("Every publish and capture found room");
     expect(html).toContain('aria-label="Retained state"');
     expect(html).toContain('aria-label="Server health"');
+  });
+
+  it("tells a bound of zero apart from a bound the scrape does not carry", () => {
+    // --prompt-reuse off hands out no slots (#215): the bound is exported, and
+    // it is zero. That is a load with none to give, not a missing figure.
+    const noSlots = IGNIS_EXPOSITION.replace('ignis_retained_slots{state="capacity"} 10', 'ignis_retained_slots{state="capacity"} 0').replace(
+      'ignis_retained_slots{state="in_use"} 7',
+      'ignis_retained_slots{state="in_use"} 0',
+    );
+    const html = renderToStaticMarkup(<MonitorView state={applyScrape(initialMonitor(), { kind: "ok", text: noSlots }, Date.now(), 2)} />);
+    expect(html).toContain("this load has none of it to give");
+    expect(html).toContain("this load hands out none");
+    expect(html).not.toContain("this scrape carries no bound to read it against");
   });
 
   it("says when the key is wanted instead of drawing charts", () => {

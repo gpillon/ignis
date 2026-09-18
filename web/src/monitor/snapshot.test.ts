@@ -53,16 +53,19 @@ describe("readSnapshot", () => {
     expect(memory.slotSkips).toEqual({ publish_skipped_no_slot: 12, capture_skipped_no_slot: 5, capture_skipped_no_page: 1 });
   });
 
-  it("reads all six retained-state families by tier and by kind", () => {
+  it("reads all six retained-state families in both tiers and both kinds", () => {
     const { retained } = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     expect(RETAINED_FAMILY_KEYS).toEqual(["reusedTokens", "hits", "misses", "spills", "discards", "restores"]);
-    expect(retained.reusedTokens.device).toEqual({ checkpoint: 41_200, prefix: 9800 });
-    expect(retained.hits.kv_ram).toEqual({ checkpoint: 3, prefix: 0 });
-    expect(retained.spills.kv_ram).toEqual({ checkpoint: 6, prefix: 2 });
-    expect(retained.discards.device).toEqual({ checkpoint: 4, prefix: 9 });
-    expect(retained.restores.kv_ram).toEqual({ checkpoint: 3, prefix: 1 });
-    // Checkpoint-only by construction: the prefix walk raises no miss (#222).
-    expect(retained.misses.device).toEqual({ checkpoint: 11, prefix: 0 });
+    // All twenty-four series the server writes, read against the fixture's own figures.
+    expect(retained).toEqual({
+      reusedTokens: { device: { checkpoint: 41_200, prefix: 9800 }, kv_ram: { checkpoint: 6400, prefix: 0 } },
+      hits: { device: { checkpoint: 18, prefix: 7 }, kv_ram: { checkpoint: 3, prefix: 0 } },
+      // Checkpoint-only by construction: the prefix walk raises no miss (#222).
+      misses: { device: { checkpoint: 11, prefix: 0 }, kv_ram: { checkpoint: 5, prefix: 0 } },
+      spills: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 6, prefix: 2 } },
+      discards: { device: { checkpoint: 4, prefix: 9 }, kv_ram: { checkpoint: 1, prefix: 0 } },
+      restores: { device: { checkpoint: 0, prefix: 0 }, kv_ram: { checkpoint: 3, prefix: 1 } },
+    });
   });
 
   it("leaves a memory series a load does not have null, and reads a zero as a zero", () => {
@@ -75,6 +78,9 @@ describe("readSnapshot", () => {
       'ignis_vram_reserved_bytes{line="drafter_round"} 0',
       'ignis_retained_slots{state="capacity"} 0',
       'ignis_retained_state_spills_total{tier="device",kind="checkpoint"} 0',
+      'ignis_retained_state_hits_total{tier="device",kind="prefix"} 0',
+      'ignis_retained_reused_tokens_total{tier="device",kind="checkpoint"} 0',
+      'ignis_retained_slot_skips_total{reason="capture_skipped_no_page"} 0',
     ].join("\n");
     const s = readSnapshot(parseExposition(`${text}\n`));
     expect(s.memory.reserved.weights).toBe(17_179_869_184);
@@ -86,8 +92,13 @@ describe("readSnapshot", () => {
     expect(s.memory.kvRamArena).toEqual({ capacity: null, used: null });
     expect(s.memory.retainedSlots).toEqual({ capacity: 0, inUse: null });
     expect(s.memory.slotSkips.publish_skipped_no_slot).toBeNull();
+    expect(s.memory.slotSkips.capture_skipped_no_page).toBe(0);
     expect(s.retained.spills.device.checkpoint).toBe(0);
     expect(s.retained.spills.kv_ram.checkpoint).toBeNull();
+    expect(s.retained.hits.device.prefix).toBe(0);
+    expect(s.retained.hits.device.checkpoint).toBeNull();
+    expect(s.retained.reusedTokens.device.checkpoint).toBe(0);
+    expect(s.retained.misses.kv_ram.prefix).toBeNull();
     expect(s.unknown).toEqual([]);
   });
 

@@ -67,8 +67,8 @@ export type Latency = {
 export type Meter = { used: number | null; capacity: number | null; share: number | null; series: Values };
 
 
-/** One retained-state series: what it stands at, and what it gained over the window. */
-export type RetainedCount = { total: number | null; window: number | null };
+/** A counter read twice over: where it stands, and what it gained over the window. */
+export type Tally = { total: number | null; window: number | null };
 
 /** What the load reserved, and what is occupied of it. */
 export type Memory = {
@@ -77,17 +77,25 @@ export type Memory = {
   budgetBytes: number | null;
   /** The plan's eleven lines, in plan order. */
   lines: { line: VramLine; bytes: number | null }[];
-  /** The lines added up, as far as they are known. */
+  /**
+   * The eleven lines added up, or null when the scrape does not carry all
+   * eleven. A partial sum would understate the plan and overstate the room
+   * left beside it, and the server writes the eleven together or not at all.
+   */
   linesBytes: number | null;
-  /** The budget less the lines: the room the plan left the KV pool. */
+  /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */
   kvRoomBytes: number | null;
   /** The pool the room bought: its pages, one page, and the two multiplied. */
   kvPool: { pages: number | null; pageBytes: number | null; bytes: number | null };
+  /** The budget beyond the lines and the pool's pages: page-rounding slack, and the pool's own tables. */
+  spareBytes: number | null;
+  /** Whether the plan overran its budget, which only --allow-vram-oversubscription allows. */
+  oversubscribed: boolean;
   pagesInUse: Meter;
   arenaInUse: Meter;
   slotsInUse: Meter;
-  skips: { total: number | null; window: number | null; byReason: Record<SlotSkipReason, RetainedCount> };
-  retained: Record<RetainedFamily, Record<RetainedTier, Record<RetainedKind, RetainedCount>>>;
+  skips: Tally & { byReason: Record<SlotSkipReason, Tally> };
+  retained: Record<RetainedFamily, Record<RetainedTier, Record<RetainedKind, Tally>>>;
 };
 
 export type HealthLevel = "idle" | "healthy" | "busy" | "saturated";
@@ -116,7 +124,7 @@ export type Dashboard = {
   accepted: Counter;
   completed: Counter;
   cancelled: Counter;
-  rejected: Counter & { byReason: Record<RejectReason, { total: number | null; window: number | null }> };
+  rejected: Counter & { byReason: Record<RejectReason, Tally> };
   prefix: Counter & { perSec: number | null; perSecSeries: Values };
   evictions: Counter;
   ttft: Latency;
@@ -126,10 +134,13 @@ export type Dashboard = {
   health: Health;
 };
 
-const totalRejected: CounterPick = (s) => {
-  const known = REJECT_REASONS.map((r) => s.rejected[r]).filter((v): v is number => v !== null);
+/** What is known of a set of series, added up; null when none of them is. */
+function sumKnown(values: (number | null)[]): number | null {
+  const known = values.filter((v): v is number => v !== null);
   return known.length ? known.reduce((a, b) => a + b, 0) : null;
-};
+}
+
+const totalRejected: CounterPick = (s) => sumKnown(REJECT_REASONS.map((r) => s.rejected[r]));
 
 export function deriveDashboard(points: Point[], windowMs: number): Dashboard | null {
   const lastPoint = points.at(-1);
@@ -255,10 +266,6 @@ export function deriveDashboard(points: Point[], windowMs: number): Dashboard | 
 export function deriveMemory(points: Point[], since: number): Memory {
   const last = points.at(-1)?.snap ?? emptySnapshot();
   const mem = last.memory;
-  const sum = (values: (number | null)[]) => {
-    const known = values.filter((v): v is number => v !== null);
-    return known.length ? known.reduce((a, b) => a + b, 0) : null;
-  };
   // The series a meter sparks is the window's own, so the window pill governs
   // these figures as it governs every other chart on the board.
   const inWindow = points.filter((p) => p.at >= since);
@@ -268,28 +275,30 @@ export function deriveMemory(points: Point[], since: number): Memory {
     share: used !== null && capacity !== null && capacity > 0 ? used / capacity : null,
     series: inWindow.map((p) => pick(p.snap)),
   });
-  const count = (pick: CounterPick): RetainedCount => ({ total: pick(last), window: increaseOver(points, pick, since) });
+  const tally = (pick: CounterPick): Tally => ({ total: pick(last), window: increaseOver(points, pick, since) });
 
   const lines = VRAM_LINES.map((line) => ({ line, bytes: mem.reserved[line] }));
-  const linesBytes = sum(lines.map((l) => l.bytes));
+  const linesBytes = lines.every((l) => l.bytes !== null) ? sumKnown(lines.map((l) => l.bytes)) : null;
   const kvPoolBytes = mem.kvPoolPages !== null && mem.kvPageBytes !== null ? mem.kvPoolPages * mem.kvPageBytes : null;
   const byReason = Object.fromEntries(
-    SLOT_SKIP_REASONS.map((reason) => [reason, count((s) => s.memory.slotSkips[reason])]),
-  ) as Record<SlotSkipReason, RetainedCount>;
+    SLOT_SKIP_REASONS.map((reason) => [reason, tally((s) => s.memory.slotSkips[reason])]),
+  ) as Record<SlotSkipReason, Tally>;
 
   return {
-    planned: mem.budgetBytes !== null && mem.budgetBytes > 0,
+    planned: mem.budgetBytes !== null && mem.budgetBytes > 0 && linesBytes !== null,
     budgetBytes: mem.budgetBytes,
     lines,
     linesBytes,
-    kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? Math.max(0, mem.budgetBytes - linesBytes) : null,
+    kvRoomBytes: mem.budgetBytes !== null && linesBytes !== null ? mem.budgetBytes - linesBytes : null,
     kvPool: { pages: mem.kvPoolPages, pageBytes: mem.kvPageBytes, bytes: kvPoolBytes },
+    spareBytes: mem.budgetBytes === null || linesBytes === null ? null : mem.budgetBytes - linesBytes - (kvPoolBytes ?? 0),
+    oversubscribed: mem.budgetBytes !== null && linesBytes !== null && linesBytes + (kvPoolBytes ?? 0) > mem.budgetBytes,
     pagesInUse: meter(mem.kvPoolUsedPages, mem.kvPoolPages, (s) => s.memory.kvPoolUsedPages),
     arenaInUse: meter(mem.kvRamArena.used, mem.kvRamArena.capacity, (s) => s.memory.kvRamArena.used),
     slotsInUse: meter(mem.retainedSlots.inUse, mem.retainedSlots.capacity, (s) => s.memory.retainedSlots.inUse),
     skips: {
-      total: sum(SLOT_SKIP_REASONS.map((reason) => byReason[reason].total)),
-      window: sum(SLOT_SKIP_REASONS.map((reason) => byReason[reason].window)),
+      total: sumKnown(SLOT_SKIP_REASONS.map((reason) => byReason[reason].total)),
+      window: sumKnown(SLOT_SKIP_REASONS.map((reason) => byReason[reason].window)),
       byReason,
     },
     retained: Object.fromEntries(
@@ -298,7 +307,7 @@ export function deriveMemory(points: Point[], since: number): Memory {
         Object.fromEntries(
           RETAINED_TIERS.map((tier) => [
             tier,
-            Object.fromEntries(RETAINED_KINDS.map((kind) => [kind, count((s) => s.retained[family][tier][kind])])),
+            Object.fromEntries(RETAINED_KINDS.map((kind) => [kind, tally((s) => s.retained[family][tier][kind])])),
           ]),
         ),
       ]),
