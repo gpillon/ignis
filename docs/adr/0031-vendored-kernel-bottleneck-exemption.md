@@ -47,8 +47,9 @@ doing work, on a card with 170 SMs. One warp owns one column. The work itself is
 a top-k=16 over a `[248046 vocab, 7 column]` BF16 logits matrix — **3.47 MB
 read**, which at this card's bandwidth is about **2.0 µs** of memory traffic.
 The kernel is roughly **1,570× off its own memory bound**. It is not slow
-because top-k is hard; it is slow because the reference launches it at a
-geometry where its own drafter never sees it.
+because top-k is hard; it is slow because one warp per column leaves 168 of the
+170 SMs idle. The launcher is the reference's, unchanged, so the reference pays
+the same 3 ms — which is exactly the kind of ceiling ADR 0005 refuses to accept.
 
 The same profile contains the counter-example, and it is the more important
 half. `w8_small_t_mma_kernel` measures **820 µs against a 747 µs roofline** for
@@ -121,9 +122,13 @@ specific vendored kernel as the bottleneck lifts that default for that kernel.**
   passing any tolerance-based check. Where the op is not exact — accumulation
   order in a GEMM — the oracle is the reference's own op test with its fp64
   references and tolerances, which 0010 already requires to stay green.
-- **Every patch and every replacement is re-gated by the performance gate**
-  (ADR 0005 / 0007). A change made for speed that does not show the speed in a
-  live/live measurement is reverted, not kept because the code reads better.
+- **Every patch and every replacement has to show its win, per op:** the profile
+  that opened the exemption is re-taken on the exclusive card and must show the
+  time actually moved, alongside the oracle test above. A change made for speed
+  that does not show the speed is reverted, not kept because the code reads
+  better. The 99% live/live performance gate (ADR 0005 / 0007) is unchanged and
+  stays where the standing convention puts it — once at phase end, over the
+  phase's changes together — it is not re-run per kernel.
 - **The correctness floor is not traded.** ADR 0005's floor comes first: no
   kernel change is accepted on a speed number alone if the engine's output stops
   being sane.

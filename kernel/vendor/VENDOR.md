@@ -7,6 +7,10 @@ must be diffable, so "we ported the reference's kernel" means *this exact file
 is the reference's file*, and a script proves it.
 
 - Policy: `docs/adr/0010-vendored-reference-kernels.md`
+- The one exemption: `docs/adr/0031-vendored-kernel-bottleneck-exemption.md` —
+  a kernel *measured* as the bottleneck may carry a recorded patch, or be
+  replaced by our own implementation in `kernel/src/` and leave the subtree.
+  Read it before editing anything here; nothing below changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
   vendored alongside the code)
 - Spec: `.scratch/runtime/specs/01-device-resident-forward.md` (GitHub #36)
