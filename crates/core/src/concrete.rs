@@ -261,24 +261,6 @@ fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
 /// (GitHub #178: one media item per chunk).
-
-/// EXPERIMENT (prefill-profile branch, not for merge): which prefill cuts the
-/// run is pricing by leaving them out. `IGNIS_CUT_OFF=block,opener,capture`.
-fn cuts_off(name: &str) -> bool {
-    use std::sync::OnceLock;
-    static OFF: OnceLock<Vec<String>> = OnceLock::new();
-    OFF.get_or_init(|| {
-        std::env::var("IGNIS_CUT_OFF")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-    .iter()
-    .any(|s| s == name)
-}
-
 fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     let start = r.prefill_progress;
     let take = (r.input.tokens.len() as u32 - start).min(serving_chunk);
@@ -2678,19 +2660,7 @@ impl Scheduler for ConcreteScheduler {
             };
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
-                // EXPERIMENT (prefill-profile branch, not for merge): price each
-                // cut by switching it off. IGNIS_CUT_OFF is a comma list of
-                // `block`, `opener`, `capture`.
-                let at = if cuts_off("block") && cuts_off("opener") {
-                    0
-                } else if cuts_off("opener") {
-                    self.requests[i].retained_prefix_point(self.config.kv_page_tokens)
-                } else if cuts_off("block") {
-                    let r = &self.requests[i];
-                    if r.publish_tokens > r.prefill_progress { r.publish_tokens } else { 0 }
-                } else {
-                    self.requests[i].publish_point(self.config.kv_page_tokens)
-                };
+                let at = self.requests[i].publish_point(self.config.kv_page_tokens);
                 let taken = at > 0 && {
                     let mut earlier = batch[..n]
                         .iter()
@@ -2722,9 +2692,6 @@ impl Scheduler for ConcreteScheduler {
                     // `--prompt-reuse off` captures nothing, whatever slots the
                     // load gives live siblings (GitHub #215).
                     if !self.config.prompt_reuse {
-                        return 0;
-                    }
-                    if cuts_off("capture") {
                         return 0;
                     }
                     let r = &self.requests[i];
