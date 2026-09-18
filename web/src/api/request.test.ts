@@ -21,6 +21,14 @@ describe("conversationTurns", () => {
     ]);
   });
 
+  it("carries a prompt's images back with it, so a later request repeats the same bytes", () => {
+    const images = [{ name: "a.jpg", url: "data:image/jpeg;base64,AA", width: 8, height: 6 }];
+    expect(conversationTurns([{ ...user("look"), images }, reply("a cat")])).toEqual([
+      { role: "user", content: "look", images },
+      { role: "assistant", content: "a cat" },
+    ]);
+  });
+
   it("keeps a reply that only called tools, and the tool results after it", () => {
     const call = { id: "call_0", name: "agent", arguments: "{}" };
     expect(
@@ -155,6 +163,36 @@ describe("buildChatRequest", () => {
     const before = buildChatRequest(settings, turns.slice(0, 2)).messages;
     const after = buildChatRequest(settings, turns).messages;
     expect(after.slice(0, before.length)).toEqual(before);
+  });
+
+  it("sends a turn without images as a plain string, so it tokenizes as it always did", () => {
+    const body = buildChatRequest(settings, [{ role: "user", content: "hi" }]);
+    expect(body.messages.at(-1)).toEqual({ role: "user", content: "hi" });
+  });
+
+  it("sends a turn's images as content parts, the images ahead of the text", () => {
+    const image = (url: string) => ({ name: "a.jpg", url, width: 4, height: 4 });
+    const body = buildChatRequest(settings, [
+      { role: "user", content: "what is this?", images: [image("data:image/jpeg;base64,AA"), image("data:image/jpeg;base64,BB")] },
+    ]);
+    expect(body.messages.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,AA" } },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,BB" } },
+        { type: "text", text: "what is this?" },
+      ],
+    });
+  });
+
+  it("sends an image with no words of its own as the image part alone", () => {
+    const body = buildChatRequest(settings, [
+      { role: "user", content: "", images: [{ name: "a.jpg", url: "data:image/jpeg;base64,AA", width: 4, height: 4 }] },
+    ]);
+    expect(body.messages.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,AA" } }],
+    });
   });
 
   it("leaves max_tokens out when unset, so the engine's own cap applies", () => {

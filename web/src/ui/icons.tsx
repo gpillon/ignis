@@ -43,6 +43,16 @@ export function IconPaperclip() {
   );
 }
 
+export function IconImage() {
+  return (
+    <svg {...icon} width={18} height={18}>
+      <rect x="2" y="3" width="14" height="11" rx="1.5" />
+      <circle cx="6.2" cy="6.8" r="1.2" />
+      <path d="M2.6 12.2l3.6-3.4 2.6 2.4 2.4-2.2 4 3.6" />
+    </svg>
+  );
+}
+
 export function IconClose() {
   return (
     <svg {...icon} width={14} height={14}>

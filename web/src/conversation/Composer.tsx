@@ -1,10 +1,16 @@
-import { type KeyboardEvent, useRef } from "react";
+import { type ClipboardEvent, type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ContextUsage } from "../metrics/context.ts";
 import { ContextMeter } from "../metrics/ContextMeter.tsx";
 import type { Attachment } from "../tools/local/attachments.ts";
-import { IconClose, IconPaperclip } from "../ui/icons.tsx";
+import { IconClose, IconImage, IconPaperclip, IconPlus } from "../ui/icons.tsx";
+import { dataUriBytes, type PromptImage } from "./images.ts";
 
-/** The prompt box under the conversation: Send, or Stop while this session streams, the session's attached files, and the context bar. */
+/**
+ * The prompt box under the conversation: Send, or Stop while this session
+ * streams, the session's attached files, the images this prompt will carry,
+ * and the context bar.
+ */
 export function Composer(props: {
   value: string;
   onChange: (value: string) => void;
@@ -23,15 +29,31 @@ export function Composer(props: {
   attachError: string | null;
   onAttach: (files: File[]) => void;
   onDetach: (name: string) => void;
+  /** The images this prompt will be sent with, in the order they go on the wire. */
+  images: PromptImage[];
+  imageError: string | null;
+  onAddImages: (files: File[]) => void;
+  onRemoveImage: (index: number) => void;
 }) {
   const { busy, streamingHere } = props;
   const picker = useRef<HTMLInputElement>(null);
+  const imagePicker = useRef<HTMLInputElement>(null);
+  /** An empty prompt still goes out when it carries an image: the picture is the question. */
+  const hasPrompt = props.value.trim() !== "" || props.images.length > 0;
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       props.onSend();
     }
+  }
+
+  /** A pasted screenshot becomes an image of the prompt; pasted text is left to the textarea. */
+  function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    props.onAddImages(files);
   }
 
   return (
@@ -53,32 +75,71 @@ export function Composer(props: {
           {props.attachError && <span className="text-xs leading-snug text-fault">{props.attachError}</span>}
         </div>
       )}
+      {(props.images.length > 0 || props.imageError) && (
+        <div className="mx-auto mb-2 flex w-full max-w-3xl flex-wrap items-end gap-2">
+          {props.images.map((image, index) => (
+            <span key={`${image.name}:${index}`} className="cut relative block bg-surface p-1 [--cut-size:8px]">
+              <img src={image.url} alt={image.name} className="block h-20 w-auto max-w-40 object-cover" />
+              <span className="mt-1 block max-w-40 truncate text-center font-display text-[11px] tabular-nums text-ash">
+                {image.width}×{image.height}, {Math.round(dataUriBytes(image.url) / 1024).toLocaleString()} KB
+              </span>
+              <button
+                type="button"
+                aria-label={`Remove ${image.name}`}
+                onClick={() => props.onRemoveImage(index)}
+                className="cut absolute top-1 right-1 grid size-6 place-items-center bg-surface text-ash [--cut-size:4px] hover:text-fault"
+              >
+                <IconClose />
+              </button>
+            </span>
+          ))}
+          {props.imageError && <span className="pb-2 text-xs leading-snug text-fault">{props.imageError}</span>}
+        </div>
+      )}
       <div className="cut mx-auto flex w-full max-w-3xl items-end gap-2 bg-surface p-2 shadow-[inset_0_-2px_0_var(--line)] [--cut-size:14px] focus-within:shadow-[inset_0_-2px_0_var(--ember)]">
-        {props.canAttach && (
-          <>
-            <button
-              type="button"
-              aria-label="Attach files"
-              title="Attach text or PDF files for the model to read"
-              className="grid size-10 shrink-0 place-items-center text-ash hover:text-ink"
-              onClick={() => picker.current?.click()}
-            >
-              <IconPaperclip />
-            </button>
-            <input
-              ref={picker}
-              type="file"
-              name="attachments"
-              multiple
-              hidden
-              onChange={(e) => {
-                const files = Array.from(e.target.files ?? []);
-                e.target.value = "";
-                if (files.length > 0) props.onAttach(files);
-              }}
+        <AddMenu>
+          {props.canAttach && (
+            <AddMenuItem
+              icon={<IconPaperclip />}
+              label="File"
+              hint="Text or PDF, for the model to read"
+              onChoose={() => picker.current?.click()}
             />
-          </>
+          )}
+          <AddMenuItem
+            icon={<IconImage />}
+            label="Image"
+            hint="Sent with this prompt; needs a vision load"
+            onChoose={() => imagePicker.current?.click()}
+          />
+        </AddMenu>
+        {props.canAttach && (
+          <input
+            ref={picker}
+            type="file"
+            name="attachments"
+            multiple
+            hidden
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              e.target.value = "";
+              if (files.length > 0) props.onAttach(files);
+            }}
+          />
         )}
+        <input
+          ref={imagePicker}
+          type="file"
+          name="images"
+          accept="image/*"
+          multiple
+          hidden
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = "";
+            if (files.length > 0) props.onAddImages(files);
+          }}
+        />
         <textarea
           className="max-h-60 min-h-10 flex-1 resize-none bg-transparent px-2 py-2 text-[15px] leading-normal text-ink [field-sizing:content] placeholder:text-ash focus:outline-none"
           rows={1}
@@ -88,6 +149,7 @@ export function Composer(props: {
           placeholder={props.ready ? "Ask anything" : "Waiting for the model…"}
           onChange={(e) => props.onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
         />
         {streamingHere ? (
           <button
@@ -101,7 +163,7 @@ export function Composer(props: {
           <button
             type="button"
             className="cut bg-[#ff5a1f] px-5 py-2.5 font-display text-sm font-semibold text-[#1c2026] hover:bg-[#ff7a45] disabled:cursor-default disabled:bg-line disabled:text-ash"
-            disabled={busy || !props.value.trim() || !props.ready}
+            disabled={busy || !hasPrompt || !props.ready}
             onClick={props.onSend}
           >
             Send
@@ -117,5 +179,113 @@ export function Composer(props: {
         <ContextMeter usage={props.usage} />
       </div>
     </div>
+  );
+}
+
+/**
+ * The `+` beside the prompt and what it offers: one button for everything a
+ * prompt can be given, rather than an icon per kind growing along the box.
+ * It opens upwards — the composer sits at the foot of the page — and closes
+ * on a choice, on Escape, or on a click anywhere else.
+ */
+function AddMenu({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const [at, setAt] = useState({ left: 0, bottom: 0 });
+  const button = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+
+  /**
+   * The menu goes in a portal and is placed by hand. It cannot live beside
+   * the button: the prompt box is a `.cut`, and a clip-path cuts its
+   * descendants too, so a menu standing above the box is clipped away
+   * entirely — it opens and nothing is on screen.
+   */
+  function place() {
+    const box = button.current?.getBoundingClientRect();
+    if (box) setAt({ left: box.left, bottom: window.innerHeight - box.top + 8 });
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      // The menu is not inside the button's subtree any more, so it has to be asked as well:
+      // closing on its own mousedown would take the item away before its click could land.
+      if (!button.current?.contains(target) && !menu.current?.contains(target)) setOpen(false);
+    };
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", place);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", place);
+    };
+  }, [open]);
+
+  return (
+    <div className="shrink-0">
+      <button
+        ref={button}
+        type="button"
+        aria-label="Add to this prompt"
+        title="Add a file or an image"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`grid size-10 place-items-center hover:text-ink [&>svg]:size-[18px] ${open ? "text-ink" : "text-ash"}`}
+        onClick={() => {
+          place();
+          setOpen((o) => !o);
+        }}
+      >
+        <IconPlus />
+      </button>
+      {open &&
+        createPortal(
+          // The click that chose an item is what closes the menu, so the choice
+          // is handled on the way out and never lands on a dismissed menu.
+          <div
+            ref={menu}
+            role="menu"
+            style={{ left: at.left, bottom: at.bottom }}
+            className="cut fixed z-40 flex w-56 flex-col bg-surface py-1 shadow-[0_8px_24px_rgba(28,32,38,0.28)] [--cut-size:10px]"
+            onClick={() => setOpen(false)}
+          >
+            {children}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
+/** One thing the `+` can add: what it is, and a line on what happens to it. */
+function AddMenuItem({
+  icon,
+  label,
+  hint,
+  onChoose,
+}: {
+  icon: ReactNode;
+  label: string;
+  hint: string;
+  onChoose: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      className="flex w-full items-start gap-2.5 px-3 py-2 text-left text-ash hover:bg-line hover:text-ink"
+      onClick={onChoose}
+    >
+      <span className="mt-0.5 shrink-0">{icon}</span>
+      <span className="min-w-0">
+        <span className="block font-display text-sm font-semibold text-ink">{label}</span>
+        <span className="block text-xs leading-snug">{hint}</span>
+      </span>
+    </button>
   );
 }

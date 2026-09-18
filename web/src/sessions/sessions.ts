@@ -4,6 +4,7 @@ import type { ToolCall } from "../api/sse.ts";
 import type { AgentRun } from "../tools/agents/agents.ts";
 import type { Question } from "../tools/ask/ask.ts";
 import type { UnknownCall } from "../tools/errors.ts";
+import type { PromptImage } from "../conversation/images.ts";
 import type { Attachment } from "../tools/local/attachments.ts";
 import type { LocalRun } from "../tools/local/local.ts";
 import type { WebRun } from "../tools/web/web.ts";
@@ -17,6 +18,13 @@ export type Message = {
   /** `tool` messages carry a call's result back to the model; the transcript shows them through the call. */
   role: "user" | "assistant" | "tool";
   content: string;
+  /**
+   * Images sent with this prompt (GitHub #174). They live on the message and
+   * not on the session: a fork, a resend and a regenerate all repeat the
+   * turn as it went out, and the engine only has a media prefix to reuse
+   * while the bytes stay the same.
+   */
+  images?: PromptImage[];
   reasoning: string;
   streaming: boolean;
   figures?: Figures;
@@ -99,6 +107,12 @@ export function titleFrom(prompt: string): string {
   return line.length > TITLE_LENGTH ? `${line.slice(0, TITLE_LENGTH - 1).trimEnd()}…` : line;
 }
 
+/** A session's title from its first prompt, falling back to the image's name when the prompt is only an image. */
+function titleOf(first: Message): string {
+  const title = titleFrom(first.content);
+  return title === UNTITLED && first.images?.length ? titleFrom(first.images[0].name) : title;
+}
+
 /**
  * A session to write in. An active session with no messages yet is reused,
  * so repeated clicks do not pile up empty sessions; otherwise `newId` opens
@@ -127,7 +141,7 @@ export function removeSession(list: SessionList, id: number, newId: number): Ses
 export function addExchange(sessions: Session[], sessionId: number, user: Message, reply: Message): Session[] {
   return sessions.map((s) =>
     s.id === sessionId
-      ? { ...s, title: s.messages.length === 0 ? titleFrom(user.content) : s.title, messages: [...s.messages, user, reply] }
+      ? { ...s, title: s.messages.length === 0 ? titleOf(user) : s.title, messages: [...s.messages, user, reply] }
       : s,
   );
 }
@@ -148,7 +162,7 @@ export function addMessages(sessions: Session[], sessionId: number, added: Messa
   return sessions.map((s) => {
     if (s.id !== sessionId) return s;
     const first = s.messages.length === 0 ? added.find((m) => m.role === "user") : undefined;
-    return { ...s, title: first ? titleFrom(first.content) : s.title, messages: [...s.messages, ...added] };
+    return { ...s, title: first ? titleOf(first) : s.title, messages: [...s.messages, ...added] };
   });
 }
 

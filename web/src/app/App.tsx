@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { forgetKey, useAuth } from "../api/auth.ts";
 import { useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
+import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
 import { contextUsage } from "../metrics/context.ts";
 import { Readout } from "../metrics/Readout.tsx";
@@ -37,6 +38,10 @@ export function App() {
   const [tools, setTools] = useState<ToolsState>(ALL_TOOLS);
   const [markdown, setMarkdown] = useState(true);
   const [input, setInput] = useState("");
+  // The images the next prompt will carry. They belong to the box, not to a
+  // session: once sent they live on the user message, and the box is empty again.
+  const [images, setImages] = useState<PromptImage[]>([]);
+  const [imageError, setImageError] = useState<string | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [reader, setReader] = useState<OpenAgent | null>(null);
   const closeReader = useCallback(() => setReader(null), []);
@@ -76,9 +81,20 @@ export function App() {
 
   function send() {
     const text = input.trim();
-    if (!text || !chat.canRun) return;
+    if ((!text && images.length === 0) || !chat.canRun) return;
     setInput("");
-    chat.send(text);
+    setImages([]);
+    setImageError(null);
+    chat.send(text, images);
+  }
+
+  /** Picked or pasted files as prompt images; the ones that cannot be read are named instead. */
+  async function addImages(files: File[]) {
+    const results = await Promise.all(files.map(imageFromFile));
+    const errors = results.flatMap((r) => (r.ok ? [] : [r.error]));
+    setImageError(errors.length > 0 ? errors.join(" ") : null);
+    const added = results.flatMap((r) => (r.ok ? [r.image] : []));
+    if (added.length > 0) setImages((current) => [...current, ...added]);
   }
 
   const set = <K extends keyof PlaygroundSettings>(key: K, value: PlaygroundSettings[K]) =>
@@ -138,6 +154,10 @@ export function App() {
               attachError={chat.attachError}
               onAttach={(files) => void chat.attach(files)}
               onDetach={chat.detach}
+              images={images}
+              imageError={imageError}
+              onAddImages={(files) => void addImages(files)}
+              onRemoveImage={(index) => setImages((current) => current.filter((_, i) => i !== index))}
             />
           </main>
 

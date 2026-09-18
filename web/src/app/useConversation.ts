@@ -3,6 +3,7 @@ import type { ModelState } from "../api/model.ts";
 import { buildChatRequest, conversationTurns, type Exchange, type Settings, type ToolExtras } from "../api/request.ts";
 import type { ToolCall } from "../api/sse.ts";
 import { streamChat } from "../api/stream.ts";
+import type { PromptImage } from "../conversation/images.ts";
 import { computeFigures } from "../metrics/figures.ts";
 import {
   addAttachments,
@@ -39,6 +40,7 @@ const MAX_TOOL_ROUNDS = 8;
 const exchangeOf = (m: Message): Exchange => ({
   role: m.role,
   content: m.content,
+  images: m.images,
   failed: m.error !== undefined,
   toolCalls: m.toolCalls,
   toolCallId: m.toolCallId,
@@ -85,12 +87,13 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
 
   /**
    * One turn, streamed into `sessionId` after `history`: to `prompt` sent as
-   * a new user message (send, resend), or to the history as it stands when
-   * `prompt` is null (regenerate). A reply that calls agents starts them,
-   * hands their answers back and streams the next reply, until one answers
-   * without calling a tool. Stop ends the whole turn, agents included.
+   * a new user message (send, resend), with `images` on it when it carries
+   * any, or to the history as it stands when `prompt` is null (regenerate).
+   * A reply that calls agents starts them, hands their answers back and
+   * streams the next reply, until one answers without calling a tool. Stop
+   * ends the whole turn, agents included.
    */
-  async function exchange(sessionId: number, history: Message[], prompt: string | null) {
+  async function exchange(sessionId: number, history: Message[], prompt: string | null, images: PromptImage[] = []) {
     if (busy || model.state !== "ready") return;
     const requestSettings: Settings = { ...settings, model: model.id };
     // The notes and files the tools write into the prompt are as they were when the turn started. The date and
@@ -123,6 +126,7 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
         content: prompt,
         reasoning: "",
         streaming: false,
+        ...(images.length > 0 ? { images } : {}),
         ...(stamp ? { dateTime: stamp } : {}),
       };
       setList((l) => ({ ...l, sessions: addMessages(l.sessions, sessionId, [user]) }));
@@ -324,19 +328,24 @@ export function useConversation({ model, settings, tools }: { model: ModelState;
     setList((l) => ({ ...l, sessions: addLogRow(l.sessions, sessionId, { at: new Date().toLocaleTimeString(), ...row }) }));
   }
 
-  /** Sends `prompt` in the active session, when a turn can start. */
-  function send(prompt: string) {
+  /** Sends `prompt`, and the images picked with it, in the active session when a turn can start. */
+  function send(prompt: string, images: PromptImage[] = []) {
     if (!canRun) return;
-    void exchange(active.id, active.messages, prompt);
+    void exchange(active.id, active.messages, prompt, images);
   }
 
-  /** Drops `messageId` and what follows, then streams again: an edited prompt, or a fresh reply. */
+  /**
+   * Drops `messageId` and what follows, then streams again: an edited
+   * prompt, or a fresh reply. An edited prompt keeps the images the original
+   * was sent with — editing the words is not a reason to take the picture away.
+   */
   function rerun(messageId: number, prompt: string | null) {
     const index = active.messages.findIndex((m) => m.id === messageId);
     if (index === -1 || busy || model.state !== "ready") return;
     const sessionId = active.id;
+    const images = active.messages[index].images ?? [];
     setList((l) => ({ ...l, sessions: truncateFrom(l.sessions, sessionId, messageId) }));
-    void exchange(sessionId, active.messages.slice(0, index), prompt);
+    void exchange(sessionId, active.messages.slice(0, index), prompt, prompt === null ? [] : images);
   }
 
   function saveEdit(messageId: number, text: string) {
