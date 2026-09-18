@@ -1,7 +1,7 @@
 import { computeFigures, type Figures } from "../../metrics/figures.ts";
 import { buildChatRequest, type ChatRequest, type Settings, type ToolDefinition, type ToolExtras, type Turn } from "../../api/request.ts";
 import type { ToolCall } from "../../api/sse.ts";
-import { currentStreamBudget } from "../../api/slots.ts";
+import { currentStreamBudget } from "../../api/connections.ts";
 import { streamChat } from "../../api/stream.ts";
 import { type UnknownCall, unknownCall, unknownToolError } from "../errors.ts";
 import { isLocalTool, type LocalContext, type LocalRun, localToolResult, runLocalCalls, startedRun } from "../local/local.ts";
@@ -61,13 +61,14 @@ export function agentSystemPrompt(extras: ToolExtras = {}): string {
 export const MAX_PARALLEL_AGENTS = 8;
 
 /**
- * How many agents may stream at once: the engine's ceiling, or fewer when the
- * browser cannot hold that many connections open (GitHub #220, see
- * `api/slots.ts`). Over HTTP/1.1 the remaining agents stay queued for a moment
- * instead of stalling the whole page, the Monitor included.
+ * How many agents may start at once: the engine's ceiling, or fewer when the
+ * browser cannot hold that many connections open (GitHub #220). Streams wait
+ * for a connection anyway (`api/connections.ts`); starting only as many agents
+ * as can stream keeps the strip honest, showing the rest as queued rather than
+ * as running agents producing nothing.
  */
-export function parallelAgents(): number {
-  return Math.min(MAX_PARALLEL_AGENTS, currentStreamBudget());
+export function parallelAgents(budget = currentStreamBudget()): number {
+  return Math.min(MAX_PARALLEL_AGENTS, budget);
 }
 
 /** How many replies in a row an agent may call tools in before it is failed. */

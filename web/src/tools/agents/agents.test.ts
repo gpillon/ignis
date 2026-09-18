@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { Timeline } from "../../metrics/figures.ts";
 import type { ChatRequest, Settings, ToolExtras } from "../../api/request.ts";
+import { HTTP1_STREAM_BUDGET } from "../../api/connections.ts";
 import type { StreamOptions, StreamResult } from "../../api/stream.ts";
 import { runWeb, WEB_FETCH_TOOL, WEB_IGNIS_PROMPT, WEB_SEARCH_TOOL, type WebRun } from "../web/web.ts";
 import {
@@ -105,22 +106,12 @@ describe("toolResult and agentSummary", () => {
 });
 
 describe("parallelAgents", () => {
-  const served = (nextHopProtocol: string) => {
-    const entry = { name: "/v1/chat/completions", nextHopProtocol, startTime: 1 } as PerformanceResourceTiming;
-    vi.spyOn(performance, "getEntriesByType").mockImplementation(((kind: string) =>
-      kind === "resource" ? [entry] : []) as typeof performance.getEntriesByType);
-  };
-
-  afterEach(() => vi.restoreAllMocks());
-
   it("stays under the browser's connection limit over HTTP/1.1", () => {
-    served("http/1.1");
-    expect(parallelAgents()).toBe(5);
+    expect(parallelAgents(HTTP1_STREAM_BUDGET)).toBe(HTTP1_STREAM_BUDGET);
   });
 
   it("uses every lane the engine admits when the connection multiplexes", () => {
-    served("h2");
-    expect(parallelAgents()).toBe(MAX_PARALLEL_AGENTS);
+    expect(parallelAgents(Number.POSITIVE_INFINITY)).toBe(MAX_PARALLEL_AGENTS);
   });
 });
 

@@ -34,43 +34,74 @@ the Vite proxy passed them through in about two. Meanwhile the owner saw a long
 **Stalled** bar on the browser's own `/ui/metrics` request in DevTools —
 Chrome's word for "queued, waiting for a connection".
 
-`netstat`, sampled next to each poll, counted the page's sockets (both ends of
-each loopback connection, so halve them):
+`netstat` counted the page's sockets next to each poll. Loopback shows both
+ends of a connection, so the count halves; the second repro ran from 02:36:03
+(`poll-3-endpoints-and-sockets.csv`, every sample, unedited):
 
-| clock | established to `:5173` | connections | agents still streaming |
-|---|---|---|---|
-| 02:36:09 | 12 | 6 | 6 |
-| 02:36:17 | 8 | 4 | 4 |
-| 02:36:39 | 4 | 2 | 2 |
+| clock | established to `:5173` | connections |
+|---|---|---|
+| 02:36:03 … 02:36:12 | 12 | 6 |
+| 02:36:13 … 02:36:16 | 10 | 5 |
+| 02:36:17 … 02:36:37 | 8 | 4 |
+| 02:36:38 | 6 | 3 |
+| 02:36:39 | 4 | 2 |
+| 02:36:41 … 02:36:55 | 6 | 3 |
 
 Six streams, six connections: exactly the six a browser opens per origin over
-HTTP/1.1. The scrape had no socket left and waited for an agent to finish.
+HTTP/1.1. The scrape had no socket left and waited for an agent to finish. The
+bounce back to three at 02:36:41 is the page reconnecting after the agents
+ended, not an agent restarting.
 
-## Conclusion
+## Finding
 
-Over HTTP/1.1 the Playground's parallelism is bounded by the browser, not by
-the engine. A stream holds one of the six connections per origin for its whole
-life, so:
+Observed: while six agents stream, the page holds six connections to its
+origin, the server answers every request in about a millisecond, and the
+browser reports the page's own scrape as Stalled.
 
-- with six agents the page has none left, and **every** same-origin request
-  waits — the Monitor scrape first, but equally a new chat or an uncached
-  asset;
-- `MAX_PARALLEL_AGENTS = 8` is unreachable from a browser on HTTP/1.1: agents
-  seven and eight cannot start until earlier ones end, so two of the engine's
-  eight lanes stay unusable however many agents the model asks for.
+Inferred, from the three together: over HTTP/1.1 the Playground's parallelism
+is bounded by the browser, not by the engine. A stream holds one of the six
+connections per origin for its whole life, so with six agents the page has none
+left and **every** same-origin request waits — the Monitor scrape first, but
+equally a new chat or an uncached asset. `MAX_PARALLEL_AGENTS = 8` is
+unreachable from a browser on HTTP/1.1: agents seven and eight cannot start
+until earlier ones end, so two of the engine's eight lanes stay unusable
+however many agents the model asks for.
 
 The limit is per origin and specific to HTTP/1.1. A multiplexed connection
 (h2, h3) carries all the streams at once, which is what a TLS reverse proxy or
 `--expose` provides; plain localhost does not, and serving it over TLS is not
-wanted. So the browser's protocol, readable from
-`PerformanceResourceTiming.nextHopProtocol`, is what decides how many streams
-the page may start — capped at five when it cannot be confirmed to multiplex,
-uncapped on h2 and h3 (`web/src/api/slots.ts`).
+wanted.
 
-## Reusing this
+## Implications
+
+The budget belongs around every stream, not around one caller: agents, an
+agent's own tool round and the JavaScript safety check all open one, and a
+reservation each counts separately reserves nothing. `web/src/api/connections.ts`
+holds it, reading the protocol from `PerformanceResourceTiming.nextHopProtocol`
+for the page's own origin — five streams when it cannot be confirmed to
+multiplex, unbounded on h2 and h3.
 
 Any future Playground feature that holds a connection open — a second live
 panel, a server-sent log tail, per-agent progress channels — spends from the
 same six. Measure before assuming the server is slow: poll the endpoint with
 curl from outside the browser and count sockets with `netstat`. If both are
 healthy while the page is not, the queue is in the browser.
+
+## Limits and unknowns
+
+- One browser (Chrome on Windows 11), one session, through the Vite dev proxy.
+  Six per origin is the documented HTTP/1.1 behaviour of every major browser,
+  but only Chrome was measured, and only the dev server: the embedded build,
+  served by `ignis-server --ui` on one origin, was not.
+- The socket counts are the process-wide count for that port, not attributed
+  per connection. Which agent owned which socket was not established, and the
+  Vite HMR WebSocket was open throughout — the counts suggest Chrome keeps it
+  out of the HTTP pool, but the evidence does not establish that.
+- Whether an h2 page really lifts the limit was not observed; it follows from
+  the protocol, not from a measurement taken here.
+
+## Follow-ups
+
+- The fix on `issue-220` was verified by unit tests, not yet in a browser: the
+  live check (five streaming, one queued, the Monitor still ticking) is open.
+- https://github.com/gpillon/ignis/issues/220
