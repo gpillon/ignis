@@ -119,6 +119,32 @@ three full traversals for an 81-token tail, 66 ms where one traversal is about
 two extra traversals, about 40 ms, whether it reuses or not**: 36% of a
 reusing turn's 124 ms, and the same again on top of a cold one.
 
+## All four cuts, named
+
+`take` in the prefill-job builder is `chunk_take` narrowed by `publish_point`
+and then by `checkpoint_point`, and `publish_point` returns **a different
+boundary on successive advances** — it walks `[retained_prefix_point,
+publish_tokens]` in prompt order and yields the first one past what the
+request already shares. So two functions produce three points, and with the
+chunk width that is four cuts and five pieces. Production `kv_page_tokens` is
+64 (`crates/runtime/src/cuda_leaf.rs:530`), which is why the boundaries below
+land on multiples of 64:
+
+| cut | at | why | piece measured |
+|---|---|---|---|
+| 1 | `serving_chunk_tokens` = 1,024 | ADR 0018, so a long prefill costs the decode lanes one chunk of latency | 1024 |
+| 2 | `retained_prefix_point` — the system block end, floored to a page | #126/#188: publish the block a burst of siblings shares | 320 |
+| 3 | `publish_tokens` — the opener floored to a page | #187: chain a second prefix over the block, so a conversation past its first page can still take a checkpoint | 64 |
+| 4 | `checkpoint_point` — the generation opener itself | #186: the prompt checkpoint's state is the state *there* | 43 |
+| — | the rest of the prompt | | 2 |
+
+A claimant already shares cut 2, and still pays cuts 3 and 4 — which is the
+three-call, 66 ms shape above.
+
+**Cuts 3 and 4 are always less than one page apart**, by construction: one is
+the opener floored to a 64-token page, the other is the opener. The piece
+between them is 0..63 tokens and costs a full traversal.
+
 ## Implications
 
 - Any TTFT comparison against the reference should state which side of
