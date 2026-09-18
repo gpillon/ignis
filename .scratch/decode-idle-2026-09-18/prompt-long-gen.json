@@ -1,0 +1,1 @@
+{"model": "qwen3.8-27b", "messages": [{"role": "user", "content": "Write a detailed technical essay about the design of GPU inference engines: memory hierarchy, KV caching, batching, speculative decoding, and scheduling. Be exhaustive and keep going with concrete detail."}], "max_tokens": 3000, "temperature": 0.0, "stream": false}

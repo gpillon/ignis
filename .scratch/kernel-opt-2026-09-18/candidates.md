@@ -75,8 +75,12 @@ plausibilmente l'edge PDL successivo a dipendenza piena di stream.
 Collegamento alla misura nota: `docs/findings/2026-09-13-hq-vs-bf16-decode-cost.md`
 riporta ignis al 25-27% di utilizzo memoria contro 37-44% di ninfer.
 
-Verifica proposta (carta esclusiva, `make gpu-status` prima): una traccia nsys di
-un singolo decode round a B=1 e B=8, contando i tipi di nodo e i gap fra kernel.
+**ESEGUITA 2026-09-18 e SMENTITA.** Traccia nsys a B=1 e B=8: il gap dopo la
+copia del residual e 0.10 us a p50 e 0.13 us a p99, come un edge
+kernel->kernel. I nodi memcpy/memset costano solo la propria esecuzione. B e C
+non sono lavoro di prestazioni: valgono ~0.16% del decode. Il tempo se ne va
+altrove -- ~1 ms per round di stalli host, fisso col batch. Vedi
+docs/findings/2026-09-18-decode-round-host-idle.md.
 
 ## Follow-up separato (decisione di design, non ticket)
 
