@@ -19,6 +19,9 @@ When output names a domain concept, use the term as defined here.
 - **Vendored op** — an operator copied *verbatim* from the reference and
   tracked by a manifest (pinned commit, content hashes, recorded patches).
   Anything hand-written is not one, and carries no port claim (ADR 0010).
+  A vendored op that a measurement identifies as the bottleneck may carry a
+  recorded patch, or be replaced by our own implementation — which is then not
+  a vendored op and makes no port claim (ADR 0031).
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
 - **Lane tag** — the request's own statement of its class, carried as an ignis
   extension field on the request and echoed in the request log. Two classes,

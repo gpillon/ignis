@@ -6,6 +6,11 @@ Accepted (2026-09-05, project review). **Clarifies ADR 0005** — it makes
 "port the proven CUDA for now, re-implement later" operational, and defines
 what a port claim means.
 
+**Clarified by ADR 0031** (2026-09-18): the escape hatch in the last Decision
+bullet below is exercisable now, per op, when a measurement identifies a
+vendored kernel as the bottleneck — by a recorded patch or by our own
+implementation replacing the call. The provenance rules below are unchanged.
+
 Sources: `.scratch/REVIEW-2026-09-05.md` §3.2, §4.2, §5.4; spec
 `.scratch/runtime/specs/01-device-resident-forward.md` (GitHub #36).
 
