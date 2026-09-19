@@ -91,9 +91,8 @@ impl std::fmt::Display for RopeScalingError {
 impl std::error::Error for RopeScalingError {}
 
 /// Two scalings are the same when their four scalars are bit-identical.
-/// Written out rather than derived because `f32` is not [`Eq`] — and this
-/// type travels inside the engine shape, which is compared whole when a
-/// reload decides whether anything actually changed.
+/// Written out rather than derived because `f32` is not [`Eq`], and
+/// `EngineShape` — which carries this — derives it.
 impl PartialEq for RopeScaling {
     fn eq(&self, other: &Self) -> bool {
         self.bits() == other.bits()
@@ -133,9 +132,10 @@ impl RopeScaling {
         }
         let scaling = Self { factor, temperature, beta_fast, beta_slow };
         if !scaling.is_yarn() {
-            // The ramp is unread without a factor; a caller that left it at
-            // whatever is not refused for it.
-            return Ok(Self { factor, ..Self::NONE });
+            // No scaling, however it was spelled: a factor of 1 and a factor
+            // of 0 build the same linear table, and the ramp is unread, so a
+            // caller that left it at whatever is not refused for it either.
+            return Ok(Self::NONE);
         }
         if !temperature.is_finite() || temperature <= 0.0 {
             return Err(RopeScalingError::Temperature(temperature));
@@ -274,6 +274,7 @@ mod tests {
         // legacy FP32 angle route.
         let one = RopeScaling::parse("yarn:1").unwrap();
         assert!(!one.is_yarn());
+        assert_eq!(one, RopeScaling::NONE);
         assert_eq!(one.to_string(), "none");
     }
 
