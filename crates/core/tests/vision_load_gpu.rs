@@ -22,6 +22,7 @@ use ignis_artifact::{bind_model_scope_27b_with, materialize, text_scope_27b, Cud
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::RopeScaling;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::program_stats;
 use ignis_core::{KvFormat, Vision, VISION_OBJECTS};
@@ -88,6 +89,7 @@ fn a_vision_load_binds_the_tower_and_reserves_its_workspace_and_a_plain_load_rep
             KvFormat::Bf16,
             None,
             vision,
+            RopeScaling::NONE,
         )
         .unwrap_or_else(|e| panic!("ignis_model_load ({vision:?}): {e}"));
         let pool = SeqPool::create(

@@ -46,7 +46,7 @@ use ignis_core::model_load::load_qwen38_27b_with_options;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
 use ignis_core::vision::{vision_item_control, Multimodal};
-use ignis_core::{KvFormat, Vision};
+use ignis_core::{KvFormat, RopeScaling, Vision};
 
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt};
 
@@ -116,6 +116,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
         KvFormat::Bf16,
         None,
         Some(Vision::default()),
+        RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision: {e}"));
     let pool = new_pool();

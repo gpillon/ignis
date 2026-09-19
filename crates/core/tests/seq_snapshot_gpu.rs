@@ -46,6 +46,7 @@ use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::gqa_layer::run_gqa_layer;
 use ignis_core::model_load::{Model, load_qwen38_27b_with_options};
+use ignis_core::RopeScaling;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
 use ignis_core::step::{
     MultimodalPrefill, SamplingParams, decode_program_batch, prefill_program,
@@ -153,6 +154,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         ignis_core::KvFormat::Bf16,
         None,
         Some(Vision::default()),
+        RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("load model: {e}"));
     // Two slots and room for two full-context sequences plus a short one:

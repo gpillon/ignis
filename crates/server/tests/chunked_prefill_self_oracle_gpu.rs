@@ -23,6 +23,7 @@ use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_options, Model};
+use ignis_core::RopeScaling;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step::{prefill_program_with_route, PrefillRoute};
 
@@ -166,6 +167,7 @@ fn self_oracle(vision: Option<Vision>) {
         ignis_core::KvFormat::Bf16,
         None,
         vision,
+        RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load (vision {vision:?}): {e}"));
 

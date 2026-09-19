@@ -68,7 +68,7 @@ use ignis_core::step::{
     VerifyLane,
 };
 use ignis_core::vision::{vision_item_control, Multimodal};
-use ignis_core::{KvFormat, Speculation, SpeculativeBackend, Vision};
+use ignis_core::{KvFormat, RopeScaling, Speculation, SpeculativeBackend, Vision};
 
 use support::vision_canary::{argmax_lowest_id, load_canaries, prefill_prompt, Canary};
 
@@ -345,6 +345,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         KvFormat::Bf16,
         Some(speculation),
         Some(Vision::default()),
+        RopeScaling::NONE,
     )
     .unwrap_or_else(|e| panic!("ignis_model_load with vision and dflash2: {e}"));
     let stats = model.stats();
