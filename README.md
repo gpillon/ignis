@@ -267,7 +267,9 @@ smoke test of the image on its own — no GPU, no model.
 
 `Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
 Its `artifacts` stage is what CI exports the Linux tarball from, so the release
-binaries and the image binaries are the same build.
+binaries and the image binaries are the same build. Why it is shaped this way —
+one build for both, two workflows that fail independently, a tag only cut on a
+green dry run: ADR 0032.
 
 Both are compiled for **SM120a** only. The Linux tarball needs the CUDA 13
 runtime on the host; the Windows zip carries `cudart64_*.dll`.
