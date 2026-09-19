@@ -52,7 +52,8 @@ def rare_keys(keys, tokenizer):
 
 
 def eval_corpus(root, files, model, tok, keys, key_rows, vectors, layer,
-                alphas, thresholds, max_tokens, chunk, label, log=print):
+                alphas, thresholds, max_tokens, chunk, label, log=print,
+                center=None):
     """Run every (alpha, threshold) over `files`, against the alpha=0 baseline."""
     texts = {}
     for path in files:
@@ -65,7 +66,8 @@ def eval_corpus(root, files, model, tok, keys, key_rows, vectors, layer,
     for path in files:
         t0 = time.time()
         r = run_file(model, tok, texts[path], keys, key_rows, vectors, layer,
-                     alpha=0.0, max_tokens=max_tokens, chunk=chunk)
+                     alpha=0.0, max_tokens=max_tokens, chunk=chunk,
+                     center=center)
         base[path] = r
         ids, offsets, pos, rows, _names = build_matches(
             tok, texts[path], keys, key_rows, max_tokens=max_tokens)
@@ -75,7 +77,8 @@ def eval_corpus(root, files, model, tok, keys, key_rows, vectors, layer,
                 model, layer,
                 torch.tensor(pos, dtype=torch.long, device=device),
                 vectors.index_select(0, torch.tensor(rows)).to(device),
-                torch.tensor([ids], dtype=torch.long, device=device))
+                torch.tensor([ids], dtype=torch.long, device=device),
+                center=center)
             cos_all.extend(c.tolist())
         log("  [%s] baseline %-52s %5d tok %4d matches %.1fs"
             % (label, path[-52:], r["tokens"], len(r["positions"]),
@@ -97,7 +100,7 @@ def eval_corpus(root, files, model, tok, keys, key_rows, vectors, layer,
                 r = run_file(model, tok, texts[path], keys, key_rows, vectors,
                              layer, alpha=alpha, cos_threshold=tau[tname],
                              max_tokens=max_tokens, chunk=chunk,
-                             force_hook=(alpha == 0.0))
+                             force_hook=(alpha == 0.0), center=center)
                 if alpha == 0.0:
                     identical = identical and bool(
                         torch.equal(r["nll"], b["nll"]))
@@ -151,6 +154,14 @@ def main():
     ap.add_argument("--ood-root", default=None,
                     help="a second corpus, from another project (Fase 4)")
     ap.add_argument("--ood-files", type=int, default=20)
+    ap.add_argument("--center", action="store_true",
+                    help="subtract the index mean from every row before "
+                         "normalising: alpha then scales the symbol-specific "
+                         "component instead of the layer's shared direction")
+    ap.add_argument("--shuffle-values", action="store_true",
+                    help="permute the key->row mapping: the negative control "
+                         "that separates 'the matched row carries information' "
+                         "from 'any vector of that norm does this'")
     args = ap.parse_args()
 
     set_deterministic(0)
@@ -158,6 +169,16 @@ def main():
     keys = man["keys"]
     key_rows = {k: i for i, k in enumerate(keys)}
     model, tok = load_model(args.model, device_map=args.device, quant=args.quant)
+
+    if args.shuffle_values:
+        # Same keys, same match positions, same number of injections, same
+        # vector norms — only the pairing is wrong.  If the delta is the same
+        # as with the correct pairing, the key match carries no information
+        # and what is being measured is the perturbation, not the retrieval.
+        import random as _random
+        rows = list(key_rows.values())
+        _random.Random(1234).shuffle(rows)
+        key_rows = dict(zip(key_rows.keys(), rows))
 
     if args.rare_only:
         keep = rare_keys(keys, tok)
@@ -170,12 +191,17 @@ def main():
     report = {"index": args.index, "layer": man["layer"],
               "pooling": man["pooling"], "model": args.model,
               "quant": args.quant, "rare_only": args.rare_only,
+              "shuffle_values": args.shuffle_values,
               "keys_in_use": len(keys), "alphas": alphas}
+
+    center = vectors.float().mean(dim=0) if args.center else None
+    report["center"] = bool(args.center)
 
     t0 = time.time()
     in_dom, tau, cos = eval_corpus(
         args.root, man["held_out_files"], model, tok, keys, key_rows, vectors,
-        man["layer"], alphas, None, args.max_tokens, args.chunk, "in-domain")
+        man["layer"], alphas, None, args.max_tokens, args.chunk, "in-domain",
+        center=center)
     report["in_domain"] = in_dom
     report["thresholds"] = tau
     report["cosine_percentiles"] = {
@@ -188,10 +214,16 @@ def main():
         cap = int(args.max_tokens * 3.487 * 0.85)
         ood_files = [p for p in ood_files
                      if os.path.getsize(os.path.join(args.ood_root, p)) <= cap]
-        ood_files = ood_files[:args.ood_files]
+        # Evenly spaced through the sorted list rather than the first N: taking
+        # the head would sample one directory (`apps/`, `bench/`) and measure
+        # that subsystem's vocabulary overlap instead of the project's.
+        if len(ood_files) > args.ood_files:
+            step = len(ood_files) / args.ood_files
+            ood_files = [ood_files[int(i * step)] for i in range(args.ood_files)]
         ood, _, _ = eval_corpus(
             args.ood_root, ood_files, model, tok, keys, key_rows, vectors,
-            man["layer"], alphas, None, args.max_tokens, args.chunk, "ood")
+            man["layer"], alphas, None, args.max_tokens, args.chunk, "ood",
+            center=center)
         report["ood"] = ood
         report["ood_files"] = ood_files
         report["ood_root"] = args.ood_root

@@ -202,9 +202,108 @@ non come speranza.
 
 ---
 
-## 4. Fasi 1-4 — indice, iniezione, sweep, fuori dominio
+## 4. Fase 1 — l'indice
 
-_In esecuzione._
+Una sola passata sul corpus produce tutte e sei le varianti (L, P): il forward
+è la parte cara e non dipende da quale tap si legge, quindi costruirle
+separatamente rifarebbe gli stessi 659 forward sei volte. Il set di chiavi è
+condiviso per costruzione, ed è anche ciò che rende confrontabili gli assi
+dello sweep.
+
+| | |
+|---|---|
+| righe (chiavi distinte indicizzate) | **3.345** |
+| nomi scartati perché ambigui (definiti in 2+ posti) | 1.149 |
+| nomi scartati (file oltre il budget di token) | 2.945 |
+| file held-out | 20 |
+| tempo di costruzione, 6 varianti | 11,8 min |
+| dimensione per variante | 19,7 MB (3.345 × 5120 × fp16) |
+
+I file held-out non sono campionati ma **scelti**: quelli che usano più simboli
+definiti altrove, che è il caso d'uso sotto esame. In testa:
+`crates/server/tests/vision_mixed_load_gpu.rs` (217 simboli esterni),
+`crates/server/tests/vision_dflash2_gpu.rs` (213),
+`kernel/include/ignis_seq_internal.h` (213), `crates/server/src/main.rs` (206).
+
+### Il budget di token è un muro, non una preferenza
+
+| max_tokens | file coperti | forward | picco VRAM |
+|---|---|---|---|
+| 4096 | 581/801 | **4,11 s** | 20,58 GiB |
+| 8192 | 706/801 | **78,85 s** | 32,00 GiB |
+
+A 8192 il picco tocca esattamente la capacità della card e WDDM pagina: **19×
+più lento**. L'indice è costruito a 8192 (il tap non calcola `lm_head` e sta
+sotto), ma **lo sweep gira a 4096**, quindi i file held-out più lunghi vengono
+troncati. La troncatura è identica fra baseline e iniezione, quindi il ΔNLL
+resta valido; si perde copertura, non correttezza.
+
+---
+
+## 5. Fasi 2-3 — lo sweep, e un errore nella forma dell'iniezione
+
+**Il controllo α = 0 passa**: con l'hook forzato a girare, l'iniezione a
+ampiezza zero riproduce il baseline **bit per bit** su tutte le varianti. Il
+path di iniezione non sporca niente.
+
+Lo sweep nella forma del §7 — `residual += α·‖h_t‖·v/‖v‖` con `v` la riga
+grezza dell'indice — dà, sulla metrica primaria (ΔNLL sulla finestra di 8
+token dopo il match, % contro baseline, tasso di match 3,76 %):
+
+| variante | α=0,1 | α=0,3 | α=1 | α=1, τ mediana | α=1, τ alta |
+|---|---|---|---|---|---|
+| L19/last | +0,022 | +0,045 | +0,668 | +0,228 | +0,089 |
+| L19/mean | +0,048 | +0,124 | +0,624 | +0,232 | +0,003 |
+| L47/last | **−0,053** | +0,069 | +4,940 | +1,950 | +0,291 |
+| L47/mean | −0,018 | +0,110 | +2,670 | +0,631 | +0,006 |
+
+Danno quasi ovunque, monotono in α. Ma la forma è sbagliata, e il §2 di questo
+documento dice perché.
+
+### Quello che si stava davvero iniettando
+
+Misurato sulle 3.345 righe dell'indice:
+
+| variante | coseno grezzo medio | ‖μ‖ / ‖v‖ medio | ‖v−μ‖ / ‖v‖ medio | coseno centrato |
+|---|---|---|---|---|
+| L2/last | 0,9865 | 0,9935 | **0,123** | +0,031 |
+| L19/last | 0,9080 | 0,9530 | **0,308** | +0,002 |
+| L19/mean | 0,9748 | 0,9872 | **0,155** | +0,003 |
+| L47/last | 0,6242 | 0,7889 | **0,609** | +0,001 |
+
+μ = media delle righe dell'indice.
+
+Normalizzare la riga **grezza** significa che a L19/last il 95 % di ciò che si
+somma è la direzione condivisa del layer — quella delle attivazioni massive
+già presente in `h_t` — e solo il 31 % è la parte che distingue un simbolo
+dall'altro. A L2 la parte distintiva è il 12 %. **α non stava scalando il
+simbolo: stava amplificando ciò che il residual aveva già.** Il danno monotono
+in α, identico fra `last` e `mean`, e i coseni tutti stretti fra 0,77 e 0,89,
+sono tutti coerenti con questo e con nient'altro.
+
+Che le righe centrate abbiano coseno medio ≈ 0 dice che l'informazione
+specifica del simbolo c'è ed è quasi ortogonale fra simboli. Era nascosta sotto
+la direzione comune.
+
+**Departure dichiarata rispetto al §7**: l'iniezione diventa
+
+```
+residual += α · ‖h_t‖ · (v − μ) / ‖v − μ‖
+```
+
+e il coseno del gate si calcola anch'esso su vettori centrati. Non è un cambio
+di idea: è il §7 applicato dopo aver scoperto, in Fase 0a, che il coseno
+grezzo in un residual stream non misura somiglianza. La formula del §7 è stata
+scritta prima di quella scoperta.
+
+Il controllo negativo che decide tutto è **la stessa iniezione con
+l'accoppiamento chiave→riga permutato**: stesse chiavi, stesse posizioni,
+stesse norme, solo la riga sbagliata. Nella forma grezza avrebbe riprodotto
+quasi esattamente il danno della forma corretta — e si sarebbe letto come "la
+chiave non porta informazione" quando invece confermava l'artefatto. Va
+eseguito solo sulla forma centrata.
+
+_Run centrate in esecuzione._
 
 ---
 

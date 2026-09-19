@@ -101,7 +101,8 @@ def token_nll(model, input_ids, chunk=512):
 
 @torch.no_grad()
 def run_file(model, tokenizer, text, keys, key_rows, vectors, layer, alpha,
-             cos_threshold=None, max_tokens=None, chunk=512, force_hook=False):
+             cos_threshold=None, max_tokens=None, chunk=512, force_hook=False,
+             center=None):
     """One file, one (alpha, threshold): returns per-token NLL and the match set.
 
     `force_hook` runs the injection path even at alpha = 0.  That is the only
@@ -122,7 +123,7 @@ def run_file(model, tokenizer, text, keys, key_rows, vectors, layer, alpha,
         vec = torch.zeros(0, vectors.shape[1], device=device)
 
     with Injector(model, layer, pos, vec, alpha, cos_threshold,
-                  force=force_hook) as inj:
+                  force=force_hook, center=center) as inj:
         nll = token_nll(model, input_ids, chunk=chunk)
         injected = inj.injected if alpha != 0.0 else 0
         cosines = inj.cosines
