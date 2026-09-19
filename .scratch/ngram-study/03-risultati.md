@@ -357,26 +357,38 @@ L47 il controllo non discrimina.
 Questo è il risultato più informativo dell'esperimento, e va letto con
 precisione:
 
-> **Iniettare la riga del simbolo giusto costa 4-8× meno che iniettarne una a
-> caso della stessa norma, nella stessa posizione.** La corrispondenza esatta
-> chiave→valore *non* è priva di informazione: il vettore corretto è
-> compatibile col contesto locale in un modo in cui uno qualunque non è.
+> **Iniettare la riga del simbolo giusto costa meno che iniettarne una a caso
+> della stessa norma, nella stessa posizione**: stima puntuale 1,3-8,4× più
+> bassa, **stesso segno in tutte e sei le celle** di L19. Gli intervalli però
+> si sovrappongono: è una direzione coerente, non una separazione. Distinguerle
+> richiederebbe un bootstrap appaiato sui ΔNLL per file, che questo run non ha
+> salvato.
 
 E va letto insieme al fatto che il costo corretto resta **positivo**. Cioè:
 l'informazione c'è, l'iniezione additiva non la trasforma in una predizione
 migliore. Nel migliore dei casi è innocua.
 
-Coerente con la Fase 0b: 4-8× si vede a L19, lo stesso layer dove il recall@1
-era 0,413; a L47, dove il recall era la metà, il controllo non separa.
+Coerente con la Fase 0b: la direzione è netta a L19, lo stesso layer dove il
+recall@1 era 0,413; a L47, dove il recall era la metà, il segno stesso cambia
+da cella a cella.
 
 ---
 
 ## 7. Fase 4 — fuori dominio, e il filtro delle chiavi rare
 
-Corpus OOD: **ninfer** (`F:/ai/q38/ninfer`), 818 file C++/CUDA propri —
-un altro progetto, stesso dominio, massima sovrapposizione di vocabolario,
-che è il caso che il §7 dice costare davvero. 20 file campionati a passo
-costante sull'elenco ordinato.
+Due corpora, e **quello pulito non è quello che il piano chiedeva**.
+
+`kernel/vendor/` è una copia vendorizzata dei sorgenti kernel di ninfer, e fa
+parte del corpus di ignis per scelta. Quindi **1.184 delle 3.345 righe
+dell'indice (35,4 %) sono definite lì**, e 11 dei 20 file ninfer campionati
+hanno un omonimo sotto `kernel/vendor/`: `src/core/dtype.h`,
+`src/ops/linear/bf16/bf16_gemv.cu`, `include/ninfer/ops/prepare_masked_block.h`
+e altri otto. **ninfer non è fuori dominio: è un corpus parzialmente
+sovrapposto.**
+
+Il campione che per costruzione non condivide niente è l'altro: gli header
+ffmpeg/curl vendorizzati sotto l'albero di build di ninfer. C di terze parti,
+zero provenienza comune.
 
 _(Il primo campione conteneva 16 file su 20 di header ffmpeg/curl vendorizzati
 sotto l'albero di build di ninfer: C di terze parti, non codice di ninfer.
@@ -386,28 +398,34 @@ ignis resta a 801 file, quindi indice e risultati precedenti restano validi.)_
 
 ### Il tasso di match, che è il numero che rende interpretabili gli altri
 
-| condizione | chiavi | match in dominio | match fuori dominio |
+| corpus | chiavi | match in dominio | match fuori |
 |---|---|---|---|
-| tutte le chiavi | 3.345 | 3,76 % | **3,89 %** |
-| solo chiavi rare | 2.850 | 0,28 % | 0,86 % |
+| **C di terze parti** (ffmpeg, curl) | 3.345 | 3,76 % | **2,80 %** |
+| C di terze parti | 2.850 rare | 0,28 % | 0,17 % |
+| sorgenti ninfer (parz. sovrapposti) | 3.345 | 3,76 % | 3,89 % |
+| sorgenti ninfer (parz. sovrapposti) | 2.850 rare | 0,28 % | 0,86 % |
 
-**Fuori dominio il meccanismo spara più spesso che in dominio.** Con tutte le
-chiavi, 3,89 % contro 3,76 %: i nomi dei simboli di ignis compaiono nel codice
-di ninfer più frequentemente che nei file held-out di ignis stesso. Il
-meccanismo, così com'è, **non è selettivo in alcun senso utile**.
+**Il numero che regge è 2,80 %**: su codice che non condivide una riga con
+questo repository, il meccanismo spara al **74 % della frequenza che ha in
+casa**. Non è selettivo in alcun senso utile. (Il 3,89 % su ninfer è più alto
+del dato in dominio, ma è gonfiato dalla sovrapposizione di `kernel/vendor/` e
+non va citato come misura fuori dominio.)
 
 Il filtro "chiavi rare" del §7 (≥ 2 token BPE **e** contenuta in nessun altro
-nome) toglie il **15 %** delle chiavi (3.345 → 2.850) e il **93 % dei match**
+nome) toglie il **15 % delle chiavi dell'indice** (3.345 → 2.850; sui 7.598
+nomi distinti del corpus ne passano 6.033, ma l'indice contiene solo quelli
+non ambigui e dentro il budget di token) e il **93 % dei match**
 (3,76 % → 0,28 %). Quasi tutto il matching lo fanno poche centinaia di nomi
-corti e comuni. Migliora il rapporto OOD/in-dominio? No: peggiora, da 1,03 a
-3,07. Riduce l'esposizione in assoluto, non la selettività relativa.
+corti e comuni. Riduce l'esposizione in assoluto, non la selettività relativa:
+sul C di terze parti il rapporto fuori/in-dominio passa da 0,74 a 0,61.
 
 ### ΔNLL fuori dominio
 
-A L19/last centrato, con tutte le chiavi, sul codice di ninfer: −0,116 %
+A L19/last centrato, con tutte le chiavi, sui sorgenti ninfer: −0,116 %
 [−0,353, +0,140] sulla finestra di 8 a α=0,1, −0,274 % [−0,680, +0,184] a
-α=0,3; sull'intero file −0,100 % e −0,126 %. **Non sale.** Il criterio di
-danno del §7 (OOD ≤ +0,5 %) è rispettato con margine.
+α=0,3; sull'intero file −0,100 % e −0,126 %. Sul C di terze parti (L47), tutti
+i valori sono compatibili con zero. **Non sale.** Il criterio di danno del §7
+(OOD ≤ +0,5 %) è rispettato con margine.
 
 Ma va letto col tasso di match accanto, come il §7 impone: non sale *perché*
 iniettare il simbolo giusto in codice simile non fa male, non perché il
@@ -432,7 +450,8 @@ diventa **negativa e significativa**:
 | α=0,1 τ mediana | −0,162 % [−0,312, −0,034] | −0,099 % [−0,179, −0,026] |
 | α=0,3 τ alta | −0,151 % [−0,383, −0,004] | −0,057 % [−0,118, −0,007] |
 
-Quattro celle con l'intervallo bootstrap interamente sotto zero. Letto da solo,
+Quattro celle con l'intervallo bootstrap interamente sotto zero (n = 18 file:
+due held-out non contengono nessun match a chiavi rare). Letto da solo,
 questo è il filtro di selettività del §6 che funziona: togli i nomi comuni,
 resta il segnale.
 
@@ -490,10 +509,11 @@ Cosa **è** risultato vero, e vale più del verdetto:
    entrambi i test danno esattamente il caso.
 3. **La chiave è informativa ma non sfruttabile per somma.** 4-8× meno danno
    con la riga giusta, mai un guadagno.
-4. **Il meccanismo non è selettivo.** Fuori dominio spara *più* spesso che in
-   dominio (3,89 % contro 3,76 %). Il filtro delle chiavi rare toglie il 15 %
-   delle chiavi e il 93 % dei match, e peggiora il rapporto OOD/in-dominio da
-   1,03 a 3,07.
+4. **Il meccanismo non è selettivo.** Su codice senza una riga in comune con
+   questo repository spara al 74 % della frequenza che ha in casa (2,80 %
+   contro 3,76 %). Il filtro delle chiavi rare toglie il 15 % delle chiavi
+   dell'indice e il 93 % dei match, portando il rapporto a 0,61: riduce
+   l'esposizione, non la selettività.
 
 ### Cosa direbbe il prossimo passo, se ce ne fosse uno
 

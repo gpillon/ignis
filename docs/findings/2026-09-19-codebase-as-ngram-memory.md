@@ -88,21 +88,50 @@ tokens and contained in no other key) several cells go significantly negative:
 -0.280% [-0.412, -0.152] at α=0.1, -0.358% [-0.702, -0.025] at α=0.3.
 
 Two negative controls decide what those numbers mean. Both permute the
-key→row pairing, keeping the same keys, positions and norms:
+key→row pairing, keeping the same keys, positions and norms. Intervals are
+bootstrap over held-out files (n=20 at the full key set, n=18 at the rare set,
+where two files contain no rare match at all):
 
 | condition | correct row | shuffled row |
 |---|---|---|
-| all keys, L19, α=0.1, τ none | +0.010 | +0.058 |
-| all keys, L19, α=0.1, τ median | +0.007 | +0.062 |
-| all keys, L19, α=0.3, τ none | +0.051 | +0.198 |
-| rare keys, L19, α=0.1, τ none | -0.280 | -0.210 |
-| rare keys, L19, α=0.3, τ none | -0.358 | **-0.502** |
+| all keys, L19, α=0.1, τ none | +0.010 [-0.067, +0.080] | +0.058 [-0.003, +0.113] |
+| all keys, L19, α=0.1, τ median | +0.007 [-0.041, +0.056] | +0.062 [+0.012, +0.114] |
+| all keys, L19, α=0.3, τ none | +0.051 [-0.133, +0.225] | +0.198 [+0.059, +0.330] |
+| rare keys, L19, α=0.1, τ none | -0.280 [-0.412, -0.152] | -0.210 [-0.408, -0.026] |
+| rare keys, L19, α=0.3, τ none | -0.358 [-0.702, -0.025] | **-0.502** [-0.769, -0.227] |
 
-Out of domain (ninfer's own 818 C++/CUDA sources, not its vendored build
-tree): the match rate is **3.89% against 3.76% in domain**. The rare-key filter
-removes 15% of the keys and 93% of the matches (3.76% -> 0.28% in domain,
-2.80% -> 0.17% on third-party C), and moves the out-of-domain/in-domain match
-ratio from 1.03 to 3.07 — the wrong way.
+At the full key set the correct row's point estimate is 1.3-8.4x lower than the
+shuffled one and the sign is the same in all six L19 cells measured, but every
+interval overlaps: suggestive, not separated. Separating them would need a
+paired bootstrap over per-file deltas, which this run did not store. At the
+rare key set the shuffled row does as well or better, and there the overlap
+argues in the conservative direction.
+
+**Out of domain.** Two corpora, and the cleaner one is not the one the plan
+asked for:
+
+| corpus | keys | match rate, in domain | match rate, out |
+|---|---|---|---|
+| third-party C (ffmpeg, curl headers under ninfer's build tree) | 3,345 | 3.76% | **2.80%** |
+| third-party C | 2,850 rare | 0.28% | 0.17% |
+| ninfer's own sources | 3,345 | 3.76% | 3.89% |
+| ninfer's own sources | 2,850 rare | 0.28% | 0.86% |
+
+The ninfer row is **not a clean out-of-domain measurement**: ignis carries a
+vendored copy of ninfer's kernel sources in `kernel/vendor/`, which is part of
+this repository and therefore part of the index — 1,184 of the 3,345 index rows
+(35.4%) are defined there, and 11 of the 20 sampled ninfer files have a
+same-basename counterpart under it. It measures a partially overlapping corpus,
+not a foreign one.
+
+The third-party C sample has zero shared provenance by construction, and it
+still matches at **2.80%, 74% of the in-domain rate**. That is the load-bearing
+non-selectivity number.
+
+The rare-key filter removes 15% of the index keys (3,345 -> 2,850; of the
+corpus's 7,598 distinct names, 6,033 pass the rule, and the index holds only
+the subset that is unambiguous and fits the token budget) and 93% of the
+matches.
 
 ## Finding
 
@@ -113,16 +142,19 @@ Observed:
   200 candidates 41.3% of the time, 83x chance.
 - It is not at layer 2. At L2 and L5 recall@1 is at chance and the gold and
   non-gold cosines agree to three decimals.
-- With the full key set, injecting the *correct* row costs 4-8x less than
-  injecting a random row of the same norm at the same position.
+- With the full key set, injecting the *correct* row costs less than injecting
+  a random row of the same norm at the same position: point estimates 1.3-8.4x
+  lower, the same sign in all six L19 cells, intervals overlapping.
 - With the rare-key set, the apparent gain is reproduced — and at α=0.3
   exceeded — by the shuffled pairing.
-- Out of domain the mechanism fires more often than in domain.
+- On code with no shared provenance, the mechanism still matches at 74% of its
+  in-domain rate.
 
 Inferred:
 
-- The key→value match carries information about **compatibility** (the right
-  vector disturbs less) but not information the model converts into a **better
+- The key→value match probably carries information about **compatibility**
+  (the right vector disturbs less, consistently in direction if not
+  separably) but not information the model converts into a **better
   prediction**. An additive injection does not turn the first into the second.
 - The small rare-key improvement is a generic perturbation effect at a 0.28%
   match rate, not retrieval. Without the shuffled control it would have been
@@ -171,6 +203,14 @@ survives its control.
   nothing about it.
 - The evaluation truncates held-out files at 4096 tokens, a VRAM limit rather
   than a design choice, so the longest files are only partly scored.
+- The "correct disturbs less" comparison is unpaired: the bootstrap resamples
+  files within each arm separately, so the intervals overlap even though the
+  direction is consistent. A paired bootstrap over per-file deltas would settle
+  it and needs a rerun that stores them.
+- ninfer is a *partially overlapping* corpus, not an out-of-domain one, because
+  `kernel/vendor/` is a vendored copy of its kernel sources and is deliberately
+  part of ignis's own corpus. Its numbers are reported as same-domain. The
+  third-party C sample is the clean one.
 - NF4 weights, not the NVFP4 the server runs. The measurement is of hidden-state
   structure, which is unlikely to hinge on that, but it is not the served
   numerics.
