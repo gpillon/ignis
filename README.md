@@ -119,12 +119,18 @@ ignis/
 ## Prerequisites
 
 - **Rust** — the workspace (Cargo).
-- **MSVC C++ build tools** (Visual Studio 2022, C++ workload) — for the kernel leaf.
-- **NVIDIA CUDA Toolkit** (`nvcc`) — target `SM120a`; set `CUDA_PATH` if it is not on
-  the default install path.
+- **A C++ toolchain for the kernel leaf** — MSVC C++ build tools (Visual Studio
+  2022, C++ workload) on Windows; GCC on Linux.
+- **NVIDIA CUDA Toolkit** (`nvcc`) — target `SM120a`; set `CUDA_PATH`
+  (`CUDA_HOME` on Linux) if it is not on the default install path.
 - **CMake + Ninja** — the kernel leaf builds with the Ninja generator.
 - **The `.ninfer` model artifact** — weights + tokenizer + chat-template (the
   frontend object set).
+
+Windows is the development host; Linux builds the same engine
+(`kernel/build.sh`, `mk/os/linux.mk`) and is what the container image below is
+built from. Some `make` targets are still Windows-only there — `mk/os/linux.mk`
+names which, GitHub #167.
 
 ## Build
 
@@ -231,6 +237,36 @@ requires the 5090 to be free and **fails** — never skips — when the GPU is b
 or a kernel errors (ADR 0006; a skip is not green for compute work). The kernel
 leaf additionally has its own CTest executable running each vendored op's
 reference test at real 27B geometry (ADR 0010).
+
+## Releases and the container image
+
+`.github/workflows/release.yml` builds the GPU engine for both hosts on every
+push to `main` or a `ci/**` branch, and publishes nothing. A `v*` tag — which
+must match `workspace.package.version`, or the job refuses it — turns the same
+run into a GitHub Release (a Windows `.zip` and a Linux `.tar.gz`, each with
+its SHA-256) and pushes the `linux/amd64` image to
+`ghcr.io/gpillon/ignis`.
+
+```
+podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e IGNIS_ARTIFACT=/models/qwen3_8_27b_nvfp4full-v2.ninfer \
+  ghcr.io/gpillon/ignis:0.1.0
+```
+
+(`docker`: `--gpus all` in place of `--device`.) Every flag has an `IGNIS_*`
+environment variable (`crates/server/src/config.rs`); anything after the image
+name is passed to the server, and `--ui` — a bare switch with no environment
+variable — is the image's default command. The image carries the CUDA runtime
+but no driver: the host's NVIDIA driver is injected by the container runtime,
+and the model is mounted, never baked in.
+
+`Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
+Its `artifacts` stage is what CI exports the Linux tarball from, so the release
+binaries and the image binaries are the same build.
+
+Both are compiled for **SM120a** only. The Linux tarball needs the CUDA 13
+runtime on the host; the Windows zip carries `cudart64_*.dll`.
 
 ## Models (`./models`)
 
