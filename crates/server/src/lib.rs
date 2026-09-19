@@ -23,6 +23,7 @@ pub mod api;
 pub mod artifact_template;
 pub mod config;
 pub mod decoder;
+pub mod download;
 pub mod engine;
 pub mod expose;
 pub mod instruction;

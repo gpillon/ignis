@@ -27,12 +27,25 @@
 //!   `127.0.0.1:8000`; localhost-only by design — no network exposure, no
 //!   auth, v1).
 //! - `IGNIS_ARTIFACT` / `--artifact`, `-a` — the `.ninfer` container path
-//!   (the real tokenizer and chat template, artifact-02); unset = the
-//!   built-in placeholder template (its rendered `content` is not natural
-//!   text). A configured artifact is loaded through the verified loader
-//!   path (server-03): its sidecar must be present and its checksum report
-//!   clean, or the server refuses to start (no silent fallback to the
-//!   placeholder).
+//!   (the real tokenizer and chat template, artifact-02). A configured
+//!   artifact is loaded through the verified loader path (server-03): it
+//!   must exist, its sidecar must be present and its checksum report clean,
+//!   or the server refuses to start (no silent fallback to the placeholder).
+//!   Unset, the model is looked for under `--model-download-path` and
+//!   fetched when it is not there (below).
+//! - `IGNIS_MODEL_DOWNLOAD` / `--model-download` / `--no-model-download` —
+//!   may a missing model be fetched (ADR 0033, GitHub #234)? On by default,
+//!   and only ever consulted with `--artifact` unset. On a terminal the
+//!   operator is asked first; without one (a container, a daemon) it
+//!   downloads, since there is nobody to answer. A build without
+//!   `--features cuda` never downloads: it could not run the weights.
+//!   Off, or a model the registry does not know, is the built-in
+//!   placeholder template (its rendered `content` is not natural text).
+//! - `IGNIS_MODEL_DOWNLOAD_PATH` / `--model-download-path` — where a fetched
+//!   model lands, and where one fetched earlier is found (default
+//!   `./models`). Flat: the artifact and its sidecar keep the names the
+//!   repo publishes them under, so `hf download … --local-dir models` and
+//!   this produce the same file.
 //! - `IGNIS_ENABLE_THINKING` / `--enable-thinking` — the server-wide default
 //!   for `enable_thinking` (GitHub #68); `true` or `false`, default `true`.
 //!   An unparseable value, or a `false` the loaded template cannot honour,
@@ -81,6 +94,7 @@ use ignis_core::{
 };
 use ignis_server::{
     config::{self, Config, ConfigOutcome},
+    download,
     engine::Engine,
     loader,
     template::SimpleTemplateProvider,
@@ -218,6 +232,8 @@ async fn main() {
         model,
         bind,
         artifact,
+        model_download,
+        model_download_path,
         enable_thinking: default_enable_thinking,
         reasoning_effort: default_reasoning_effort,
         prefill_chunk: _,
@@ -261,6 +277,64 @@ async fn main() {
         },
     };
 
+    // Where the artifact comes from (GitHub #234, ADR 0033): the path the
+    // operator named, one already under `--model-download-path`, one fetched
+    // now, or none at all — which is the placeholder start this server has
+    // always had, with a line saying which of the reasons it was.
+    let source = download::artifact_source(
+        &download::DownloadSettings {
+            artifact: artifact.as_deref(),
+            model: &model,
+            enabled: model_download,
+            dir: &model_download_path,
+            // A binary built without `cuda` could not run the weights it
+            // fetched, so it never fetches them: this is what keeps
+            // `make mock`, `cargo test` and every CPU CI job off the network.
+            supported: cfg!(feature = "cuda"),
+        },
+        |path| path.exists(),
+        download::ask_on_terminal,
+    );
+    let artifact = match source {
+        download::ArtifactSource::Use(path) => Some(path),
+        download::ArtifactSource::Placeholder(reason) => {
+            tracing::warn!(
+                name: "ignis.model.placeholder_template",
+                reason = reason.as_str(),
+                model = %model,
+                download_path = %model_download_path.display(),
+                "no artifact — placeholder template (content is not natural text) and MockCompute"
+            );
+            None
+        }
+        download::ArtifactSource::Download { entry, dir } => {
+            // Said yes, or nobody was there to ask. A transfer that does not
+            // end in a verified artifact refuses the start: coming up on the
+            // mock instead would be exactly the silent degradation the loader
+            // path below refuses for an unclean checksum.
+            let downloader = match download::Downloader::huggingface() {
+                Ok(downloader) => downloader,
+                Err(err) => {
+                    tracing::error!(name: "ignis.model.download_failed", error = %err, "refusing to start");
+                    exit_after_flush(&logging_handle, 1);
+                }
+            };
+            match downloader.fetch(entry, &dir).await {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    tracing::error!(
+                        name: "ignis.model.download_failed",
+                        model = entry.model,
+                        repo = entry.repo,
+                        error = %err,
+                        "refusing to start"
+                    );
+                    exit_after_flush(&logging_handle, 1);
+                }
+            }
+        }
+    };
+
     // GitHub #216 (ADR 0030 §Observability): what the load's VRAM plan
     // reserved, kept past the load so `/metrics` can name it. `None` on the
     // placeholder path, which loads no model and plans no device memory.
@@ -275,6 +349,20 @@ async fn main() {
         // set. A missing sidecar or a report that is not clean is a load
         // failure: serving a broken artifact would silently degrade to the
         // placeholder, so the server refuses to start instead.
+        //
+        // A path that is not there at all gets its own line (GitHub #234):
+        // the sidecar error below would otherwise name a file next to a file
+        // that does not exist, and say nothing about the download that could
+        // have produced it.
+        if !artifact_path.exists() {
+            tracing::error!(
+                name: "ignis.artifact.missing",
+                artifact = %artifact_path.display(),
+                model = %model,
+                "no such file — refusing to start; drop --artifact/IGNIS_ARTIFACT to fetch the model into --model-download-path instead"
+            );
+            exit_after_flush(&logging_handle, 1);
+        }
         let sidecar = match loader::find_sidecar(artifact_path) {
             Ok(path) => path,
             Err(err) => {
@@ -351,10 +439,8 @@ async fn main() {
             }
         }
     } else {
-        tracing::warn!(
-            name: "ignis.model.placeholder_template",
-            "no artifact (set --artifact/IGNIS_ARTIFACT) — placeholder template (content is not natural text) and MockCompute"
-        );
+        // Why there is no artifact was said once, with its reason, where the
+        // decision was made (`ignis.model.placeholder_template` above).
         let engine = Engine::with_clock(mock_scheduler(&model), Arc::new(SystemClock));
         Server::new(engine, Box::new(SimpleTemplateProvider))
     }

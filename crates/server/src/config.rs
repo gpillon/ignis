@@ -33,6 +33,16 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u32 = 30;
 /// ADR 0026). On: a route, and no cost to a server nobody opens in a browser.
 pub const DEFAULT_UI: bool = true;
 
+/// Whether a missing model may be fetched (GitHub #234, ADR 0033). On: a
+/// server that cannot find its weights is useless, and the one machine that
+/// must never spend the bandwidth says so with `--no-model-download`.
+pub const DEFAULT_MODEL_DOWNLOAD: bool = true;
+
+/// Where a fetched model lands (`--model-download-path`): the same `./models`
+/// every other instruction in this repo names, so a `hf download --local-dir
+/// models` done by hand and a download the server did are the same file.
+pub const DEFAULT_MODEL_DOWNLOAD_PATH: &str = "./models";
+
 /// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
 /// ceiling against a fat-fingered value, not a real operating point — a
 /// healthy request legitimately runs for minutes at a large `max_tokens`,
@@ -63,6 +73,18 @@ pub struct Config {
     pub model: String,
     pub bind: String,
     pub artifact: Option<PathBuf>,
+    /// May the server fetch [`Config::model`] when no artifact is on disk
+    /// (`--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`,
+    /// GitHub #234)? On by default. Off never refuses a start: it falls back
+    /// to the placeholder template, exactly as an unfetchable model always
+    /// did. Only consulted when `artifact` is `None` — a named path is the
+    /// operator's word.
+    pub model_download: bool,
+    /// Where a fetched model lands, and where one fetched earlier is looked
+    /// for (`--model-download-path` / `IGNIS_MODEL_DOWNLOAD_PATH`, GitHub
+    /// #234). Flat, one file per model: the artifact and its sidecar keep
+    /// the names the repo publishes them under.
+    pub model_download_path: PathBuf,
     pub enable_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The prefill chunk width, in tokens (a nonzero multiple of
@@ -318,6 +340,8 @@ pub fn resolve(
     let mut media_allow_private_network = false;
     let mut media_cache_mib = None;
     let mut ui = None;
+    let mut model_download = None;
+    let mut model_download_path = None;
     let mut metrics_on = false;
     let mut metrics_bind = None;
     let mut api_key = None;
@@ -362,6 +386,11 @@ pub fn resolve(
             "--media-cache-mib" => media_cache_mib = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = Some(true),
             "--no-ui" => ui = Some(false),
+            "--model-download" => model_download = Some(true),
+            "--no-model-download" => model_download = Some(false),
+            "--model-download-path" => {
+                model_download_path = Some(take_value(args, &mut i, flag)?)
+            }
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
@@ -474,6 +503,14 @@ pub fn resolve(
         model,
         bind,
         artifact,
+        model_download: resolve_model_download(model_download, &env)?,
+        model_download_path: non_empty(
+            model_download_path.or_else(|| env("IGNIS_MODEL_DOWNLOAD_PATH")),
+        )
+        .map_or_else(
+            || PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH),
+            PathBuf::from,
+        ),
         enable_thinking,
         reasoning_effort,
         prefill_chunk,
@@ -517,6 +554,29 @@ fn resolve_ui(
         "0" | "false" | "off" => Ok(false),
         _ => Err(ConfigError(format!(
             "`IGNIS_UI` must be true or false, got `{raw}`"
+        ))),
+    }
+}
+
+/// `--model-download` / `--no-model-download` / `IGNIS_MODEL_DOWNLOAD`
+/// (GitHub #234). On by default: a server whose model is not on disk can
+/// fetch it, and the machine that must not spend 19 GB of bandwidth says so
+/// once. The flags win over the environment, as everywhere else here.
+fn resolve_model_download(
+    flag: Option<bool>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    if let Some(on) = flag {
+        return Ok(on);
+    }
+    let Some(raw) = non_empty(env("IGNIS_MODEL_DOWNLOAD")) else {
+        return Ok(DEFAULT_MODEL_DOWNLOAD);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(ConfigError(format!(
+            "`IGNIS_MODEL_DOWNLOAD` must be true or false, got `{raw}`"
         ))),
     }
 }
@@ -1027,7 +1087,9 @@ fn help_text() -> String {
          OPTIONS:\n\
          \x20   -m, --model <id>              env: IGNIS_MODEL         (default: {DEFAULT_MODEL})\n\
          \x20   -b, --bind <addr>             env: IGNIS_BIND          (default: {DEFAULT_BIND})\n\
-         \x20   -a, --artifact <path>         env: IGNIS_ARTIFACT      (default: unset — placeholder template)\n\
+         \x20   -a, --artifact <path>         env: IGNIS_ARTIFACT      (default: unset — the model is looked for under --model-download-path, and fetched when it is not there)\n\
+         \x20       --model-download / --no-model-download env: IGNIS_MODEL_DOWNLOAD (default: on; fetch a missing model — asked first when stdin is a terminal, downloaded straight away when it is not; off keeps the placeholder template)\n\
+         \x20       --model-download-path <dir> env: IGNIS_MODEL_DOWNLOAD_PATH (default: {DEFAULT_MODEL_DOWNLOAD_PATH}; where a fetched model lands, and where one fetched earlier is found)\n\
          \x20       --enable-thinking <bool>  env: IGNIS_ENABLE_THINKING   (default: true)\n\
          \x20       --reasoning-effort <val>  env: IGNIS_REASONING_EFFORT (default: unset — template default)\n\
          \x20       --prefill-chunk <tokens>  env: IGNIS_PREFILL_CHUNK  (default: {DEFAULT_PREFILL_CHUNK}; nonzero multiple of {PREFILL_CHUNK_ALIGNMENT})\n\
@@ -2117,6 +2179,82 @@ mod tests {
         let env = env_map(&[("IGNIS_UI", "maybe")]);
         let err = resolve(&[], env).expect_err("not a boolean");
         assert!(err.0.contains("IGNIS_UI"), "{}", err.0);
+    }
+
+    // ── fetching a missing model (GitHub #234) ───────────────────────────
+
+    #[test]
+    fn model_downloads_are_on_by_default_and_land_in_models() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert!(config.model_download);
+        assert_eq!(
+            config.model_download_path,
+            PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH)
+        );
+    }
+
+    #[test]
+    fn both_model_download_flags_are_bare_switches() {
+        // The next argument is a flag of its own, not a value.
+        for (flag, want) in [("--model-download", true), ("--no-model-download", false)] {
+            let config =
+                expect_config(resolve(&args(&[flag, "--bind", "b"]), no_env).expect("resolve"));
+            assert_eq!(config.model_download, want, "{flag}");
+            assert_eq!(config.bind, "b", "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_model_download_env_vars_apply_and_the_flags_win_over_them() {
+        let env = env_map(&[
+            ("IGNIS_MODEL_DOWNLOAD", "false"),
+            ("IGNIS_MODEL_DOWNLOAD_PATH", "/srv/models"),
+        ]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert!(!config.model_download);
+        assert_eq!(config.model_download_path, PathBuf::from("/srv/models"));
+
+        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "off")]);
+        assert!(expect_config(resolve(&args(&["--model-download"]), env).expect("resolve")).model_download);
+        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "on")]);
+        assert!(
+            !expect_config(resolve(&args(&["--no-model-download"]), env).expect("resolve"))
+                .model_download
+        );
+        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD_PATH", "/srv/models")]);
+        assert_eq!(
+            expect_config(
+                resolve(&args(&["--model-download-path", "D:/weights"]), env).expect("resolve")
+            )
+            .model_download_path,
+            PathBuf::from("D:/weights")
+        );
+
+        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD", "maybe")]);
+        let err = resolve(&[], env).expect_err("not a boolean");
+        assert!(err.0.contains("IGNIS_MODEL_DOWNLOAD"), "{}", err.0);
+    }
+
+    #[test]
+    fn an_empty_model_download_path_is_the_default_not_the_working_directory() {
+        // An unset-looking env var (`IGNIS_MODEL_DOWNLOAD_PATH=`) must not
+        // turn the destination into `.`, where a 19 GB file would land
+        // wherever the server happened to be started from.
+        let env = env_map(&[("IGNIS_MODEL_DOWNLOAD_PATH", "")]);
+        assert_eq!(
+            expect_config(resolve(&[], env).expect("resolve")).model_download_path,
+            PathBuf::from(DEFAULT_MODEL_DOWNLOAD_PATH)
+        );
+    }
+
+    #[test]
+    fn help_lists_both_model_download_flags() {
+        let ConfigOutcome::Help(text) = resolve(&args(&["--help"]), no_env).expect("resolve")
+        else {
+            panic!("expected Help");
+        };
+        assert!(text.contains("--no-model-download"), "{text}");
+        assert!(text.contains("--model-download-path"), "{text}");
     }
 
     #[test]

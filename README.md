@@ -125,7 +125,8 @@ ignis/
   (`CUDA_HOME` on Linux) if it is not on the default install path.
 - **CMake + Ninja** — the kernel leaf builds with the Ninja generator.
 - **The `.ninfer` model artifact** — weights + tokenizer + chat-template (the
-  frontend object set).
+  frontend object set). Not a manual step any more: a GPU build with no
+  `--artifact` fetches it (ADR 0033) — see "Models" below.
 
 Windows is the development host; Linux builds the same engine
 (`kernel/build.sh`, `mk/os/linux.mk`) and is what the container image below is
@@ -262,9 +263,22 @@ Playground is on because the server's own default is on. The image carries the C
 but no driver: the host's NVIDIA driver is injected by the container runtime,
 and the model is mounted, never baked in.
 
-Without `IGNIS_ARTIFACT` the image starts on the deterministic CPU mock (ADR
-0006), so `podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.0` is a
-smoke test of the image on its own — no GPU, no model.
+Without `IGNIS_ARTIFACT` the image fetches the model into `./models` inside
+the container (ADR 0033 — nothing on stdin to ask, so it downloads). Mount a
+model directory and point the download at it to keep what it fetches:
+
+```
+podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
+  -v /path/to/models:/models \
+  ghcr.io/gpillon/ignis:0.1.0 --model-download-path /models
+```
+
+To smoke-test the image on its own — no GPU, no model, the deterministic CPU
+mock (ADR 0006) — say so:
+
+```
+podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.0 --no-model-download
+```
 
 `Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
 Its `artifacts` stage is what CI exports the Linux tarball from, so the release
@@ -311,6 +325,28 @@ a symlink into the real store):
 set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
 ```
 
+### Getting the model without one (ADR 0033)
+
+A GPU build started **without** `--artifact`/`IGNIS_ARTIFACT` looks for the
+model under `--model-download-path` (default `./models`, the same flat
+file names Hugging Face publishes) and fetches it when it is not there:
+
+```
+ignis-server                      # asks first: the size, the source, the destination
+ignis-server --no-model-download  # never fetches: the placeholder template and the CPU mock
+ignis-server --model-download-path D:\weights
+```
+
+On a terminal you are asked (`[y/N]`, on stderr); without one — a container,
+a daemon, CI — nobody can answer, so it just downloads. What it fetches is
+`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`: the artifact and its
+`.graft.json` sidecar, streamed to a `.part` file, checked against the size
+and SHA-256 pinned in the binary, and renamed into place only then. An
+interrupted download resumes; a tampered one is discarded and refuses the
+start. On this machine nothing is ever fetched — `./models` already holds the
+file under exactly that name. A build without `--features cuda` never
+downloads at all.
+
 The grafted DFlash2 drafter module is what phase 5 (gate G5, GitHub #66,
 spec `.scratch/runtime/specs/05-speculative-decoding.md`) loads for
 speculative decoding. Until that phase lands, ignis binds only the text scope:
@@ -346,8 +382,10 @@ full, always-current table.
 
 | Variable | Flag | Alias | Default | Meaning |
 |---|---|---|---|---|
-| `IGNIS_ARTIFACT` | `--artifact <path>` | `-a` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). **Unset → the built-in placeholder template**, whose rendered content is not natural text. A configured artifact is verified (checksum clean) or the server refuses to start. |
-| `IGNIS_MODEL` | `--model <id>` | `-m` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name). |
+| `IGNIS_ARTIFACT` | `--artifact <path>` | `-a` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). A configured artifact must exist and verify (checksum clean) or the server refuses to start. **Unset → the model is looked for under `--model-download-path`, and fetched when it is not there.** |
+| `IGNIS_MODEL_DOWNLOAD` | `--model-download` / `--no-model-download` | — | **on** | Fetch a missing model (ADR 0033). On a terminal you are asked first; without one (a container, a daemon) it downloads, since nobody can answer. Only consulted with `--artifact` unset, and only in a `--features cuda` build — a CPU-mock binary never downloads weights it could not run. Off → the built-in placeholder template, whose rendered content is not natural text. |
+| `IGNIS_MODEL_DOWNLOAD_PATH` | `--model-download-path <dir>` | — | `./models` | Where a fetched model lands, and where one fetched earlier is found. Flat, under the names the repo publishes: a `hf download … --local-dir models` done by hand and a download the server did are the same file. |
+| `IGNIS_MODEL` | `--model <id>` | `-m` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name) — and the key the download registry is looked up by. |
 | `IGNIS_BIND` | `--bind <addr>` | `-b` | `127.0.0.1:8000` | The bind address (localhost only, no auth). |
 | `IGNIS_ENABLE_THINKING` | `--enable-thinking <true\|false>` | — | `true` | The server-wide default for `enable_thinking`. |
 | `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |

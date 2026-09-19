@@ -143,15 +143,38 @@ fn an_unrecognized_flag_emits_a_config_invalid_event() {
 }
 
 #[test]
-fn a_missing_artifact_sidecar_emits_a_sidecar_missing_event() {
+fn an_artifact_path_that_is_not_there_emits_an_artifact_missing_event() {
+    // GitHub #234: a named path that does not exist gets its own line. The
+    // sidecar error would otherwise name a record next to a file that is not
+    // there, and say nothing about the download that could have produced it.
     let missing = std::env::temp_dir().join("ignis-logging-test-does-not-exist.ninfer");
     let record = run(&["--artifact", missing.to_str().unwrap()]);
-    assert_eq!(record["event_name"], "ignis.artifact.sidecar_missing");
+    assert_eq!(record["event_name"], "ignis.artifact.missing");
     assert_eq!(record["severity_text"], "ERROR");
     assert_eq!(
         record["attributes"]["artifact"], missing.display().to_string(),
         "the artifact path should appear as a typed attribute, not only in body: {record}"
     );
+    assert!(
+        record["body"].as_str().unwrap_or_default().contains("--model-download-path"),
+        "the refusal should say how the model could be fetched instead: {record}"
+    );
+}
+
+#[test]
+fn a_missing_artifact_sidecar_emits_a_sidecar_missing_event() {
+    // A file that is there but carries no provenance record (ADR 0002): the
+    // load is refused before anything is read out of the container.
+    let artifact = std::env::temp_dir().join("ignis-logging-test-no-sidecar.ninfer");
+    std::fs::write(&artifact, b"not a real container").expect("write the stand-in artifact");
+    let record = run(&["--artifact", artifact.to_str().unwrap()]);
+    assert_eq!(record["event_name"], "ignis.artifact.sidecar_missing");
+    assert_eq!(record["severity_text"], "ERROR");
+    assert_eq!(
+        record["attributes"]["artifact"], artifact.display().to_string(),
+        "the artifact path should appear as a typed attribute, not only in body: {record}"
+    );
+    let _ = std::fs::remove_file(&artifact);
 }
 
 #[test]
@@ -201,6 +224,9 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
 
     let placeholder = find(&records, "ignis.model.placeholder_template");
     assert_eq!(placeholder["severity_text"], "WARN");
+    // GitHub #234: which of the reasons it was. This binary is built without
+    // `--features cuda`, so it never fetches weights it could not run.
+    assert_eq!(placeholder["attributes"]["reason"], "not-supported");
 
     let started = find(&records, "ignis.process.started");
     assert_eq!(started["severity_text"], "INFO");
