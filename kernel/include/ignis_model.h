@@ -152,6 +152,22 @@ struct ignis_model_load_options {
    * rotates its columns at `position + rope_delta` the way a decode round
    * already does. */
   uint32_t vision_max_tokens;
+  /* GitHub #227: YaRN RoPE scaling, the text frequency table this load
+   * rotates at. 0 (or 1) is no scaling -- the linear table the engine has
+   * always used, whose `attention_factor` of 1 keeps `ops::rope`'s exact
+   * legacy FP32 angle route -- and a factor in (1, 64] builds the YaRN table
+   * over the checkpoint's 262,144-position trained envelope, which is what
+   * lets a context past that envelope mean anything. The three below are the
+   * ramp's and are read only with a factor: `temperature` scales the q-side
+   * attention factor (`temperature * ln(factor) + 1`), `beta_fast` /
+   * `beta_slow` place the blend band. Zero-filling them with no factor is
+   * accepted; with a factor they must be positive and finite, and
+   * beta_fast > beta_slow. Text only: the DFlash2 drafter keeps its own
+   * unscaled table at window-local positions, and vision its 2-D one. */
+  float rope_scaling_factor;
+  float rope_scaling_temperature;
+  float rope_scaling_beta_fast;
+  float rope_scaling_beta_slow;
 };
 
 /* The widest vision envelope a load accepts, in merged tokens: 4x that many

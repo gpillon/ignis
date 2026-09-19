@@ -9,9 +9,12 @@
 #include "ignis_model.h"
 #include "ignis_step.h"
 
+#include "rope_scaling.h"
+
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h>
 
@@ -255,6 +258,13 @@ struct ignis_model {
   uint64_t hidden = 0;
   uint64_t vocab = 0;
   float rms_norm_eps = 0.0F;
+  // GitHub #227: the text rotary table every GQA layer rotates at, built
+  // once at load from the load's `--rope-scaling` (kernel/src/rope_scaling.h)
+  // -- the linear table without it, the YaRN one with it. Held here rather
+  // than rebuilt per layer call, which is what the GQA layers did before the
+  // table had anything to say.
+  ninfer::ops::RopeFrequencies text_rope =
+      ninfer::ops::rope_linear_frequencies(ignis::kTextRopeTheta, ignis::kTextRotaryDim);
   cudaStream_t stream = nullptr;
   // GitHub #212: with vision, media encode runs out of this arena too,
   // between prefill steps; it is sized for the larger of the two.

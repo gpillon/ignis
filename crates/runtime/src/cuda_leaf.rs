@@ -89,6 +89,13 @@ pub struct CudaLeafConfig {
     /// encoder workspace (inside the prefill scratch, GitHub #212) and output
     /// transient before the pool is built; `None` is today's load.
     pub vision: Option<ignis_core::Vision>,
+    /// The text rotary table this load runs on (`--rope-scaling`, GitHub
+    /// #227): [`ignis_core::RopeScaling::NONE`] is the linear table the
+    /// engine has always used, and a YaRN factor rescales the trained
+    /// 262,144-position envelope so a longer context means something.
+    /// Frozen for the life of the load, like the two above: a sequence's
+    /// cached keys are rotated with it.
+    pub rope_scaling: ignis_core::RopeScaling,
 }
 
 impl Default for CudaLeafConfig {
@@ -118,6 +125,7 @@ impl Default for CudaLeafConfig {
             prefill_chunk_tokens: crate::DEFAULT_PREFILL_CHUNK,
             speculation: None,
             vision: None,
+            rope_scaling: ignis_core::RopeScaling::NONE,
         }
     }
 }
@@ -260,6 +268,7 @@ impl CudaLeafConfig {
             self.kv_format,
             self.speculation,
             self.vision,
+            self.rope_scaling,
         )?;
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
@@ -434,6 +443,7 @@ impl StepLeaf for CudaLeaf {
             self.config.kv_format,
             self.config.speculation,
             self.config.vision,
+            self.config.rope_scaling,
         )
         .map_err(|e| leaf_error("model load", e))?;
         let cfg = ModelConfig::qwen38_27b();
@@ -470,6 +480,10 @@ impl StepLeaf for CudaLeaf {
             // beside the capacity the pool holds after it.
             vision_max_tokens = self.config.vision.map_or(0, |v| v.max_tokens()),
             vision_reserved_bytes = model.stats().vision_reserved_bytes,
+            // GitHub #227: `none`, or the YaRN spec the table was built
+            // from -- the one place a long-context run can be checked
+            // against what the operator meant to ask for.
+            rope_scaling = %self.config.rope_scaling,
             "kv pool"
         );
         // P3-05 (GitHub #102, ADR 0019): capture the decode graphs once,

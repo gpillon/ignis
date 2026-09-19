@@ -229,6 +229,9 @@ async fn main() {
         instruction_policy,
         speculation: _,
         vision,
+        // GitHub #227: read through `EngineShape` above, like the other
+        // load-shape knobs.
+        rope_scaling: _,
         media,
         request_timeout_secs,
         ui,

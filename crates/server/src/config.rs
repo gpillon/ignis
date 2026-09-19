@@ -48,6 +48,8 @@ pub use ignis_core::{KvFormat, VramMode};
 /// desktop and every other process on the card (GitHub #210).
 pub const DEFAULT_VRAM_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 pub use ignis_core::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
+
+pub use ignis_core::{MAX_YARN_FACTOR, RopeScaling};
 pub use ignis_core::{DEFAULT_VISION_MAX_TOKENS, VISION_MAX_TOKENS_LIMIT, Vision};
 
 /// The fully-resolved config `main` needs to start the server — one field
@@ -115,6 +117,11 @@ pub struct Config {
     /// Vision, chosen at load (`--vision`/`--vision-max-tokens`, GitHub #177).
     /// `None` binds and reserves nothing of the vision tower.
     pub vision: Option<Vision>,
+    /// The text rotary table, chosen at load (`--rope-scaling`, GitHub
+    /// #227). [`RopeScaling::NONE`] is the linear table the engine has
+    /// always used; a YaRN factor rescales the checkpoint's trained
+    /// 262,144-position envelope, which is what a context past it needs.
+    pub rope_scaling: RopeScaling,
     /// Media acquisition (`--media-allow-private-network`,
     /// `--media-cache-mib`, GitHub #179). Only nameable with vision on.
     pub media: MediaOptions,
@@ -300,6 +307,7 @@ pub fn resolve(
     let mut draft_tokens = None;
     let mut vision = false;
     let mut vision_max_tokens = None;
+    let mut rope_scaling = None;
     let mut media_allow_private_network = false;
     let mut media_cache_mib = None;
     let mut ui = false;
@@ -340,6 +348,7 @@ pub fn resolve(
             "--request-timeout" => request_timeout = Some(take_value(args, &mut i, flag)?),
             "--spec" => spec = Some(take_value(args, &mut i, flag)?),
             "--draft-tokens" => draft_tokens = Some(take_value(args, &mut i, flag)?),
+            "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
             "--vision" => vision = true,
             "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
             "--media-allow-private-network" => media_allow_private_network = true,
@@ -416,6 +425,7 @@ pub fn resolve(
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
     let vision = resolve_vision(vision, vision_max_tokens, &env)?;
+    let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
     // GitHub #195 lifted #178's refusal of the two together: the drafter
     // follows a multimodal prompt now (its context append takes the span's KV
     // positions, and the verify round rotates at `position + rope_delta`), so
@@ -470,6 +480,7 @@ pub fn resolve(
         instruction_policy,
         speculation,
         vision,
+        rope_scaling,
         media,
         request_timeout_secs,
         ui,
@@ -477,6 +488,23 @@ pub fn resolve(
         api_key,
         expose,
     }))
+}
+
+/// `--rope-scaling` / `IGNIS_ROPE_SCALING` (GitHub #227), in the
+/// reference's own grammar: `none` (the default -- the linear table, the
+/// engine unchanged) or `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]`.
+///
+/// Off by default on purpose: YaRN buys positions past the checkpoint's
+/// trained 262,144 at some cost to everything inside it, so the operator
+/// who needs the long context names it, and nobody else pays for it.
+fn resolve_rope_scaling(
+    flag: Option<String>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<RopeScaling, ConfigError> {
+    let Some(raw) = non_empty(flag.or_else(|| env("IGNIS_ROPE_SCALING"))) else {
+        return Ok(RopeScaling::NONE);
+    };
+    RopeScaling::parse(&raw).map_err(|e| ConfigError(format!("`--rope-scaling`: {e}")))
 }
 
 /// `--vision` / `IGNIS_VISION` and `--vision-max-tokens` /
@@ -987,6 +1015,7 @@ fn help_text() -> String {
          \x20       --request-timeout <secs>  env: IGNIS_REQUEST_TIMEOUT (default: {DEFAULT_REQUEST_TIMEOUT_SECS}; max {MAX_REQUEST_TIMEOUT_SECS})\n\
          \x20       --spec <backend>          env: IGNIS_SPEC           (default: unset — no speculation; dflash2)\n\
          \x20       --draft-tokens <n>        env: IGNIS_DRAFT_TOKENS   (required with --spec; 1..{MAX_DRAFT_TOKENS})\n\
+         \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
          \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
          \x20       --media-allow-private-network env: IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK (default: off; needs --vision; fetch image URLs on private, loopback and link-local addresses)\n\
@@ -1841,6 +1870,41 @@ mod tests {
         let config =
             expect_config(resolve(&args(&["--draft-tokens", "7"]), env).expect("resolve"));
         assert_eq!(config.speculation.map(|s| s.draft_tokens()), Some(7), "flag must win over env");
+    }
+
+    // ── rope scaling as a load option (GitHub #227) ───────────────────────
+
+    #[test]
+    fn rope_scaling_is_off_by_default() {
+        let config = expect_config(resolve(&[], no_env).expect("resolve"));
+        assert_eq!(config.rope_scaling, RopeScaling::NONE);
+        assert!(!config.rope_scaling.is_yarn());
+    }
+
+    #[test]
+    fn the_rope_scaling_flag_and_env_carry_the_reference_grammar() {
+        let a = args(&["--rope-scaling", "yarn:4,t=0.25"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        assert!(config.rope_scaling.is_yarn());
+        assert_eq!(config.rope_scaling.factor(), 4.0);
+        assert_eq!(config.rope_scaling.temperature(), 0.25);
+
+        let env = env_map(&[("IGNIS_ROPE_SCALING", "yarn:2")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.rope_scaling.factor(), 2.0);
+
+        let env = env_map(&[("IGNIS_ROPE_SCALING", "yarn:2")]);
+        let config =
+            expect_config(resolve(&args(&["--rope-scaling", "none"]), env).expect("resolve"));
+        assert_eq!(config.rope_scaling, RopeScaling::NONE, "flag must win over env");
+    }
+
+    #[test]
+    fn a_bad_rope_scaling_is_a_startup_error_naming_the_flag() {
+        let err = resolve(&args(&["--rope-scaling", "yarn:0.5"]), no_env).expect_err("bad factor");
+        assert!(err.0.contains("--rope-scaling"), "{}", err.0);
+        let err = resolve(&args(&["--rope-scaling", "linear"]), no_env).expect_err("bad shape");
+        assert!(err.0.contains("--rope-scaling"), "{}", err.0);
     }
 
     // ── vision as a load option (GitHub #177) ─────────────────────────────

@@ -48,6 +48,7 @@ pub mod model_load;
 pub mod prefix;
 pub mod request;
 pub mod retained_slot;
+pub mod rope_scaling;
 pub mod scheduler;
 #[cfg(feature = "cuda")]
 pub mod seq;
@@ -88,6 +89,10 @@ pub use retained_slot::{
 };
 pub use scheduler::{
     Compute, DecodeJob, DecodeOutcome, Occupancy, PrefillJob, PrefillOutcome, RetainedAt, Scheduler,
+};
+pub use rope_scaling::{
+    DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,
+    MAX_YARN_FACTOR, RopeScaling, RopeScalingError,
 };
 pub use speculation::{MAX_DRAFT_TOKENS, Speculation, SpeculativeBackend};
 pub use vision::{

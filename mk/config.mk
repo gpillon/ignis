@@ -77,6 +77,12 @@ RETAINED_SLOTS ?=
 # (--vision-max-tokens); empty = the server's own envelope.
 VISION ?=
 VISION_MAX_TOKENS ?=
+# RoPE scaling (--rope-scaling, GitHub #227): the text rotary table. Empty
+# (or `none`) is the linear table the checkpoint was trained with, correct
+# through 262,144 positions; `yarn:F` rescales that envelope by F, which is
+# what a MAX_CONTEXT past it needs to mean anything. The full spelling is
+# `yarn:F[,t=<c>][,bf=<n>][,bs=<n>]`.
+ROPE_SCALING ?=
 # The KV-RAM host tier's budget (--kv-host-pool-bytes, P4-07, GitHub #125):
 # 0 disables the host tier entirely (no evict-to-RAM overflow path).
 KV_HOST_POOL_BYTES ?= 8G

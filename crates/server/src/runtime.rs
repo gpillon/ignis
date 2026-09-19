@@ -57,6 +57,10 @@ pub struct EngineShape {
     /// Vision (`--vision`/`--vision-max-tokens`, GitHub #177): `None` binds
     /// and reserves nothing of the vision tower.
     pub vision: Option<ignis_core::Vision>,
+    /// The text rotary table (`--rope-scaling`, GitHub #227):
+    /// [`ignis_core::RopeScaling::NONE`] is the linear one, a YaRN factor
+    /// rescales the checkpoint's trained position envelope.
+    pub rope_scaling: ignis_core::RopeScaling,
 }
 
 impl Default for EngineShape {
@@ -78,6 +82,7 @@ impl Default for EngineShape {
             retained_interactive_ttl: ignis_core::host::DEFAULT_RETAINED_INTERACTIVE_TTL,
             speculation: None,
             vision: None,
+            rope_scaling: ignis_core::RopeScaling::NONE,
         }
     }
 }
@@ -98,6 +103,7 @@ impl From<&crate::config::Config> for EngineShape {
             )),
             speculation: config.speculation,
             vision: config.vision,
+            rope_scaling: config.rope_scaling,
         }
     }
 }
@@ -221,6 +227,7 @@ fn leaf_config_for_shape(shape: EngineShape, kv_pool_bytes: u64) -> ignis_runtim
         prefill_chunk_tokens: shape.prefill_chunk,
         speculation: shape.speculation,
         vision: shape.vision,
+        rope_scaling: shape.rope_scaling,
         retained_slots: shape.retained_slots,
         ..ignis_runtime::CudaLeafConfig::default()
     }
@@ -525,6 +532,7 @@ mod tests {
             retained_interactive_ttl: std::time::Duration::from_secs(60),
             speculation: None,
             vision: None,
+            rope_scaling: ignis_core::RopeScaling::NONE,
         };
 
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768);

@@ -50,6 +50,17 @@ When output names a domain concept, use the term as defined here.
   other systems fail the allocation. ignis refuses it unless the operator
   explicitly accepts it for an explicit budget.
   _Avoid_: shared memory, spill (a spill is KV-RAM's).
+- **Trained position envelope** — the 262,144 rotary positions the checkpoint
+  was trained over. Not a limit the engine enforces: a sequence past it is
+  served (the attention envelope reaches 1,048,576 keys under hq-e8-2b), it is
+  simply rotated at angles the model never saw.
+- **RoPE scaling** — the text rotary frequency table a load runs on, chosen at
+  load and frozen for its life. Either *none* — the linear table, correct
+  through the **trained position envelope** — or **YaRN** at a factor, which
+  rescales that envelope: the high-frequency pairs keep extrapolating, the low
+  ones interpolate at `1/factor`, a ramp blends the band between, and a q-side
+  attention factor rides along. Text only: the DFlash2 drafter keeps its own
+  unscaled table at window-local positions, and vision its 2-D one.
 - **Hot reload** — in-place model reload without restarting the server; the model
   lifecycle is decoupled from the server lifecycle.
 - **Performance-first** — the organizing principle: correctness (a self-check

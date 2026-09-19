@@ -385,6 +385,18 @@ target_link_libraries(ignis_kernel_model_load_speculative_options_test
 add_test(NAME ignis_kernel_model_load_speculative_options_test
          COMMAND ignis_kernel_model_load_speculative_options_test)
 
+# GitHub #227: OURS -- the text RoPE frequency table and its load option.
+# Host-only twice over: the YaRN builder is pure math over the checkpoint's
+# rope constants, and the load arms all fail at (or ahead of) binding, so
+# this test needs no GPU at all, like the page-budget test above. It reaches
+# into `kernel/src` for `rope_scaling.h`, which is a leaf-internal header,
+# not part of the public include directory.
+add_executable(ignis_kernel_rope_scaling_test test_rope_scaling.cpp)
+target_include_directories(ignis_kernel_rope_scaling_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_rope_scaling_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_rope_scaling_test COMMAND ignis_kernel_rope_scaling_test)
+
 # GitHub #177: OURS -- `ignis_model_load`'s vision envelope. The envelope is
 # range-checked before binding, and with it each of the 333 `vision/*` tensors
 # is required, named when missing or mis-shaped, and an extra without it.

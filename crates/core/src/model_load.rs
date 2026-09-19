@@ -28,6 +28,7 @@ use ignis_artifact::{
 
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
+use crate::rope_scaling::RopeScaling;
 use crate::speculation::{SpeculativeBackend, Speculation};
 use crate::vision::Vision;
 
@@ -84,14 +85,22 @@ pub(crate) mod ffi {
     }
 
     /// 1:1 with `struct ignis_model_load_options` (ADR 0016: `size` first).
+    /// `PartialEq` without `Eq`: the four rope scalars below are floats.
     #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct IgnisModelLoadOptions {
         pub size: u32,
         pub speculative_backend: i32,
         pub draft_tokens: u32,
         /// GitHub #177: the vision envelope, 0 = no vision.
         pub vision_max_tokens: u32,
+        /// GitHub #227: the text rotary table. A factor of 0 or 1 is no
+        /// scaling (the linear table); the three below are the YaRN ramp's
+        /// and are read only with a factor.
+        pub rope_scaling_factor: f32,
+        pub rope_scaling_temperature: f32,
+        pub rope_scaling_beta_fast: f32,
+        pub rope_scaling_beta_slow: f32,
     }
 
     /// 1:1 with `struct ignis_model_reservations` (GitHub #210): every
@@ -291,13 +300,23 @@ pub fn model_scope(speculation: Option<Speculation>, vision: Option<Vision>) -> 
 fn load_options(
     speculation: Option<Speculation>,
     vision: Option<Vision>,
+    rope_scaling: RopeScaling,
 ) -> Option<ffi::IgnisModelLoadOptions> {
-    (speculation.is_some() || vision.is_some()).then(|| ffi::IgnisModelLoadOptions {
-        size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
-        // IGNIS_SPECULATIVE_NONE
-        speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
-        draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
-        vision_max_tokens: vision.map_or(0, |v| v.max_tokens()),
+    (speculation.is_some() || vision.is_some() || rope_scaling.is_yarn()).then(|| {
+        ffi::IgnisModelLoadOptions {
+            size: std::mem::size_of::<ffi::IgnisModelLoadOptions>() as u32,
+            // IGNIS_SPECULATIVE_NONE
+            speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
+            draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
+            vision_max_tokens: vision.map_or(0, |v| v.max_tokens()),
+            // GitHub #227: `none` crosses as a zero factor, which is the
+            // leaf's linear branch -- the same table a NULL options pointer
+            // gets, so a load that scales nothing is untouched by this.
+            rope_scaling_factor: rope_scaling.factor(),
+            rope_scaling_temperature: rope_scaling.temperature(),
+            rope_scaling_beta_fast: rope_scaling.beta_fast(),
+            rope_scaling_beta_slow: rope_scaling.beta_slow(),
+        }
     })
 }
 
@@ -585,6 +604,7 @@ pub fn load_qwen38_27b_with_speculation(
         kv_format,
         speculation,
         None,
+        RopeScaling::NONE,
     )
 }
 
@@ -606,6 +626,7 @@ pub fn load_qwen38_27b_with_options(
     kv_format: KvFormat,
     speculation: Option<Speculation>,
     vision: Option<Vision>,
+    rope_scaling: RopeScaling,
 ) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(
@@ -616,7 +637,7 @@ pub fn load_qwen38_27b_with_options(
     )?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
-    let options = load_options(speculation, vision);
+    let options = load_options(speculation, vision, rope_scaling);
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -656,6 +677,7 @@ pub fn plan_qwen38_27b_reservations(
     kv_format: KvFormat,
     speculation: Option<Speculation>,
     vision: Option<Vision>,
+    rope_scaling: RopeScaling,
 ) -> Result<IgnisModelReservations, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(
@@ -666,7 +688,7 @@ pub fn plan_qwen38_27b_reservations(
     )?;
     let mut layer_kinds_buf = Vec::new();
     let topology = qwen38_27b_topology(&mut layer_kinds_buf);
-    let options = load_options(speculation, vision);
+    let options = load_options(speculation, vision, rope_scaling);
 
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
@@ -798,27 +820,54 @@ mod tests {
 
     #[test]
     fn a_load_with_neither_option_crosses_a_null_options_pointer() {
-        assert_eq!(load_options(None, None), None, "today's load, byte for byte");
+        assert_eq!(
+            load_options(None, None, RopeScaling::NONE),
+            None,
+            "today's load, byte for byte"
+        );
+        // GitHub #227: `none` and an explicit factor of 1 are the same
+        // no-op, and neither is worth an options struct.
+        assert_eq!(load_options(None, None, RopeScaling::parse("yarn:1").unwrap()), None);
     }
 
     #[test]
     fn a_vision_only_load_crosses_the_envelope_with_no_speculation() {
-        let options = load_options(None, Some(Vision::new(8192).unwrap())).expect("options");
+        let options =
+            load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE).expect("options");
         assert_eq!(options.size as usize, std::mem::size_of::<ffi::IgnisModelLoadOptions>());
         assert_eq!(options.speculative_backend, 0);
         assert_eq!(options.draft_tokens, 0);
         assert_eq!(options.vision_max_tokens, 8192);
 
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let without_vision = load_options(Some(spec), None).expect("options");
+        let without_vision = load_options(Some(spec), None, RopeScaling::NONE).expect("options");
         assert_eq!(without_vision.vision_max_tokens, 0);
         assert_eq!(without_vision.draft_tokens, 7);
+        // Every load sends the rope scalars; with no scaling they are the
+        // zero factor the leaf reads as "the linear table".
+        assert_eq!(without_vision.rope_scaling_factor, 0.0);
+    }
+
+    #[test]
+    fn a_rope_scaling_only_load_still_crosses_the_options_struct() {
+        // GitHub #227: the options gate used to be "speculation or vision",
+        // and a YaRN-only load would have crossed a NULL pointer -- serving
+        // the linear table while the operator asked for a scaled one.
+        let scaling = RopeScaling::parse("yarn:4,t=0.25,bf=16,bs=2").unwrap();
+        let options = load_options(None, None, scaling).expect("options");
+        assert_eq!(options.speculative_backend, 0);
+        assert_eq!(options.vision_max_tokens, 0);
+        assert_eq!(options.rope_scaling_factor, 4.0);
+        assert_eq!(options.rope_scaling_temperature, 0.25);
+        assert_eq!(options.rope_scaling_beta_fast, 16.0);
+        assert_eq!(options.rope_scaling_beta_slow, 2.0);
     }
 
     #[test]
     fn the_options_mirror_is_the_leaf_structs_size() {
-        // uint32 size, int32 backend, uint32 draft_tokens, uint32 vision_max_tokens.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 16);
+        // uint32 size, int32 backend, uint32 draft_tokens, uint32
+        // vision_max_tokens, and (GitHub #227) four float rope scalars.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 32);
         // uint64 x 3.
         assert_eq!(std::mem::size_of::<IgnisModelStats>(), 24);
     }

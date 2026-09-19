@@ -846,6 +846,9 @@ struct LoadOptions {
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  // GitHub #227: the text rotary table's scaling; the default is no scaling,
+  // the linear table.
+  ignis::RopeScaling rope_scaling{};
 };
 
 // The argument checks and the tensor binding of a load, shared by the load
@@ -906,6 +909,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
       set_error("ignis_model_load: options.size " + std::to_string(options->size) +
@@ -915,6 +919,17 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     speculative_backend = options->speculative_backend;
     draft_tokens = options->draft_tokens;
     vision_max_tokens = options->vision_max_tokens;
+    rope_scaling.factor = options->rope_scaling_factor;
+    rope_scaling.temperature = options->rope_scaling_temperature;
+    rope_scaling.beta_fast = options->rope_scaling_beta_fast;
+    rope_scaling.beta_slow = options->rope_scaling_beta_slow;
+  }
+  // GitHub #227: a scaling that cannot build a table is refused by name --
+  // the alternative is a load that silently rotates at a different one.
+  if (const std::string rejection = ignis::rope_scaling_rejection(rope_scaling);
+      !rejection.empty()) {
+    set_error("ignis_model_load: " + rejection);
+    return nullptr;
   }
   if (vision_max_tokens > IGNIS_VISION_MAX_TOKENS_LIMIT) {
     set_error("ignis_model_load: vision_max_tokens " + std::to_string(vision_max_tokens) +
@@ -950,6 +965,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.speculative_backend = speculative_backend;
   out.draft_tokens = draft_tokens;
   out.vision_max_tokens = vision_max_tokens;
+  out.rope_scaling = rope_scaling;
 
   ModelBinder binder(tensors, count);
   if (!binder.build_index(count)) {
@@ -958,6 +974,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
 
   const Geometry g = Geometry::from(*topology);
   auto model = std::make_unique<ignis_model>();
+  // GitHub #227: the table the text layers will rotate at, resolved once
+  // here -- the linear one without scaling, the YaRN one with it.
+  model->text_rope = ignis::text_rope_frequencies(rope_scaling);
 
   if (!binder.bind("text/token_embedding", {g.vocab, g.hidden}, model->token_embedding) ||
       !binder.bind("text/final_norm", {g.hidden}, model->final_norm) ||
