@@ -303,7 +303,71 @@ quasi esattamente il danno della forma corretta — e si sarebbe letto come "la
 chiave non porta informazione" quando invece confermava l'artefatto. Va
 eseguito solo sulla forma centrata.
 
-_Run centrate in esecuzione._
+### Lo sweep nella forma centrata
+
+α ∈ {0, 0,03, 0,1, 0,3, 1,0}, τ ∈ {nessuna, mediana, alta}, tasso di match
+3,76 %. Metrica primaria, finestra 8 token, con intervallo bootstrap sui 20
+file held-out.
+
+**L19/last centrato** — coseni ora distribuiti (p5 −0,020 · p50 0,232 ·
+p95 0,395) invece che schiacciati fra 0,77 e 0,89:
+
+| α | τ nessuna | τ mediana | τ alta |
+|---|---|---|---|
+| 0 | +0,000 [0, 0] | — | — |
+| 0,03 | +0,001 [−0,045, +0,046] | **−0,012** [−0,048, +0,024] | +0,021 [−0,005, +0,046] |
+| 0,1 | +0,010 [−0,067, +0,080] | +0,007 [−0,041, +0,056] | +0,027 [+0,006, +0,050] |
+| 0,3 | +0,051 [−0,133, +0,225] | +0,037 [−0,065, +0,144] | +0,038 [−0,003, +0,082] |
+| 1,0 | +1,760 [+1,199, +2,337] | +0,913 [+0,509, +1,348] | +0,102 [+0,003, +0,202] |
+
+**L47/last centrato** — coseni p5 −0,075 · p50 0,109 · p95 0,229:
+
+| α | τ nessuna | τ mediana | τ alta |
+|---|---|---|---|
+| 0,03 | +0,001 [−0,030, +0,030] | +0,003 [−0,033, +0,036] | +0,013 [−0,012, +0,039] |
+| 0,1 | **−0,004** [−0,053, +0,042] | +0,018 [−0,026, +0,064] | +0,004 [−0,016, +0,024] |
+| 0,3 | +0,141 [+0,024, +0,255] | +0,156 [+0,048, +0,274] | +0,008 [−0,035, +0,049] |
+| 1,0 | +3,334 [+2,705, +4,091] | +1,663 [+1,305, +2,049] | +0,290 [+0,092, +0,546] |
+
+Il migliore di tutto lo sweep è **−0,012 %**, con l'intervallo che contiene
+zero. Nessuna combinazione si avvicina alla soglia di −0,5 % del §7.
+
+---
+
+## 6. Il controllo permutato — la chiave *porta* informazione
+
+Stesse chiavi, stesse posizioni, stesse norme, solo l'accoppiamento
+chiave→riga permutato. Metrica primaria, finestra 8:
+
+**L19/last centrato**
+
+| configurazione | riga corretta | riga sbagliata | rapporto |
+|---|---|---|---|
+| α=0,1 τ nessuna | +0,010 [−0,067, +0,080] | +0,058 [−0,003, +0,113] | **6,0×** |
+| α=0,1 τ mediana | +0,007 [−0,041, +0,056] | +0,062 [+0,012, +0,114] | **8,4×** |
+| α=0,3 τ nessuna | +0,051 [−0,133, +0,225] | +0,198 [+0,059, +0,330] | **3,9×** |
+| α=0,3 τ mediana | +0,037 [−0,065, +0,144] | +0,179 [+0,045, +0,313] | **4,8×** |
+| α=0,1 τ alta | +0,027 [+0,006, +0,050] | +0,040 [−0,001, +0,080] | 1,4× |
+| α=0,3 τ alta | +0,038 [−0,003, +0,082] | +0,049 [−0,019, +0,110] | 1,3× |
+
+**L47/last centrato**: il segno è nella stessa direzione a τ nessuna e alta
+(2,0× e 5,4×) ma si inverte a τ mediana; gli intervalli si sovrappongono. A
+L47 il controllo non discrimina.
+
+Questo è il risultato più informativo dell'esperimento, e va letto con
+precisione:
+
+> **Iniettare la riga del simbolo giusto costa 4-8× meno che iniettarne una a
+> caso della stessa norma, nella stessa posizione.** La corrispondenza esatta
+> chiave→valore *non* è priva di informazione: il vettore corretto è
+> compatibile col contesto locale in un modo in cui uno qualunque non è.
+
+E va letto insieme al fatto che il costo corretto resta **positivo**. Cioè:
+l'informazione c'è, l'iniezione additiva non la trasforma in una predizione
+migliore. Nel migliore dei casi è innocua.
+
+Coerente con la Fase 0b: 4-8× si vede a L19, lo stesso layer dove il recall@1
+era 0,413; a L47, dove il recall era la metà, il controllo non separa.
 
 ---
 

@@ -21,8 +21,15 @@ import re
 from lexmask import EXT_LANG, RUST, C, TS, mask_source
 
 CORPUS_EXTS = tuple(EXT_LANG)
+# `vendor` is deliberately NOT here: ignis's own corpus includes
+# `kernel/vendor/`, which is code this repo carries and edits.  What is
+# excluded is build output and package-manager checkouts — for the
+# out-of-domain corpus these hold third-party sources (ffmpeg, curl) that
+# would replace "another project's code" with "any C at all".
 EXCLUDED_DIRS = {"target", "node_modules", ".git", "build", "dist", ".scratch",
-                 "__pycache__", ".venv", "venv"}
+                 "__pycache__", ".venv", "venv",
+                 "build-ninja", "vcpkg_installed", "_deps", "cmake-build-debug",
+                 "cmake-build-release"}
 
 
 class Symbol:

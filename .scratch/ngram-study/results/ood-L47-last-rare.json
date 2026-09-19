@@ -1,0 +1,448 @@
+{
+  "alphas": [
+    0.0,
+    0.1,
+    0.3
+  ],
+  "center": true,
+  "cosine_percentiles": {
+    "25": -0.006300194188952446,
+    "5": -0.050701189786195755,
+    "50": 0.03838023915886879,
+    "75": 0.12923982739448547,
+    "95": 0.26812946796417236
+  },
+  "in_domain": {
+    "alpha=0.1/tau=high": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.02951928806435993,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.037764141549696435,
+          "lo": -0.024670277839999758,
+          "mean": 0.004666165275102302,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.0699362833167904,
+          "lo": -0.03276116846951857,
+          "mean": 0.010631903326036767,
+          "n_files": 18
+        }
+      },
+      "tau": 0.2033511847257614,
+      "tau_name": "high",
+      "whole_file": {
+        "hi": 0.006582319780683051,
+        "lo": -0.0030819279499497633,
+        "mean": 0.002035588762633609,
+        "n_files": 20
+      }
+    },
+    "alpha=0.1/tau=median": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.1405231439302816,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": -0.003569006901532905,
+          "lo": -0.15089854598261876,
+          "mean": -0.06810081322508757,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.010002546307689823,
+          "lo": -0.2710102299654329,
+          "mean": -0.11614071178874043,
+          "n_files": 18
+        }
+      },
+      "tau": 0.03926559537649155,
+      "tau_name": "median",
+      "whole_file": {
+        "hi": 0.006763764490555603,
+        "lo": -0.009920379264593557,
+        "mean": -0.001441624467341775,
+        "n_files": 20
+      }
+    },
+    "alpha=0.1/tau=none": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.2829277710978587,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.045314602364884334,
+          "lo": -0.11824292800586204,
+          "mean": -0.03128485676568631,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.11508306783759174,
+          "lo": -0.1840434955308377,
+          "mean": -0.029645982097120424,
+          "n_files": 18
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.007807854468875587,
+        "lo": -0.005107360554384682,
+        "mean": 0.0013087174629001267,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=high": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.02951928806435993,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.03828366588658123,
+          "lo": -0.06429882179615756,
+          "mean": -0.012008465784958388,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.14241288654701967,
+          "lo": -0.030829264383994318,
+          "mean": 0.04849319477455311,
+          "n_files": 18
+        }
+      },
+      "tau": 0.2033511847257614,
+      "tau_name": "high",
+      "whole_file": {
+        "hi": 0.0069848154839903835,
+        "lo": -0.006906147812804615,
+        "mean": -0.0004575093734636611,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=median": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.1405231439302816,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.030480499364696836,
+          "lo": -0.24255401579590805,
+          "mean": -0.09417424930858333,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.18513031229491747,
+          "lo": -0.5475505320851822,
+          "mean": -0.16781995817879505,
+          "n_files": 18
+        }
+      },
+      "tau": 0.03926559537649155,
+      "tau_name": "median",
+      "whole_file": {
+        "hi": 0.012518092981816609,
+        "lo": -0.014529774180717114,
+        "mean": -0.0007508923477598226,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=none": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.2829277710978587,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.13993653573934586,
+          "lo": -0.2815397411845745,
+          "mean": -0.06791467525286435,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.22871781289655585,
+          "lo": -0.6881491517025083,
+          "mean": -0.2047663434006924,
+          "n_files": 18
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.0128217169245359,
+        "lo": -0.021980027780730507,
+        "mean": -0.004138568445131258,
+        "n_files": 20
+      }
+    },
+    "alpha=0/tau=none": {
+      "alpha": 0.0,
+      "alpha0_reproduces_baseline": true,
+      "injected_rate_pct": 0.0,
+      "match_rate_pct": 0.2829277710978587,
+      "primary": {
+        "32": {
+          "hi": 0.0,
+          "lo": 0.0,
+          "mean": 0.0,
+          "n_files": 18
+        },
+        "8": {
+          "hi": 0.0,
+          "lo": 0.0,
+          "mean": 0.0,
+          "n_files": 18
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "mean": 0.0,
+        "n_files": 20
+      }
+    }
+  },
+  "index": "../results/index-L47-last",
+  "keys_in_use": 2850,
+  "layer": 47,
+  "model": "F:/ai/models/Qwen3.8-27B-nf4",
+  "ood": {
+    "alpha=0.1/tau=high": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.0138217000691085,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.05550748960211815,
+          "lo": 0.0,
+          "mean": 0.018502496534039382,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.0,
+          "lo": -0.3298385133672283,
+          "mean": -0.10994617112240944,
+          "n_files": 4
+        }
+      },
+      "tau": 0.2954138517379761,
+      "tau_name": "high",
+      "whole_file": {
+        "hi": 0.0,
+        "lo": -0.0029640284148202993,
+        "mean": -0.0009880094716067664,
+        "n_files": 20
+      }
+    },
+    "alpha=0.1/tau=median": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.07905058676921538,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.46012191546511694,
+          "lo": 0.01844550437210379,
+          "mean": 0.21968235634148692,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.2751446525203285,
+          "lo": -0.6623244899323336,
+          "mean": -0.10708705901348851,
+          "n_files": 4
+        }
+      },
+      "tau": -0.011361809447407722,
+      "tau_name": "median",
+      "whole_file": {
+        "hi": 0.006730788763474755,
+        "lo": -0.006047158412001587,
+        "mean": 0.0006856071836806088,
+        "n_files": 20
+      }
+    },
+    "alpha=0.1/tau=none": {
+      "alpha": 0.1,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.16856465326537906,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.4748293050632494,
+          "lo": 0.03416964975785193,
+          "mean": 0.23438974593961942,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.2751446525203285,
+          "lo": -0.6966346780089865,
+          "mean": -0.14139724709014137,
+          "n_files": 4
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.021020123257990877,
+        "lo": -0.005092132583121281,
+        "mean": 0.00605168192378332,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=high": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.0138217000691085,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.0,
+          "lo": -0.04686831942496282,
+          "mean": -0.015622773141654273,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.0,
+          "lo": -1.4866337064971944,
+          "mean": -0.4955445688323981,
+          "n_files": 4
+        }
+      },
+      "tau": 0.2954138517379761,
+      "tau_name": "high",
+      "whole_file": {
+        "hi": 0.007914126289372025,
+        "lo": 0.0,
+        "mean": 0.0026380420964573414,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=median": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.07905058676921538,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.5274388698906836,
+          "lo": 0.04425907180435354,
+          "mean": 0.3398931578137531,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.9411430262197582,
+          "lo": -0.8901523601341483,
+          "mean": -0.07538994158269842,
+          "n_files": 4
+        }
+      },
+      "tau": -0.011361809447407722,
+      "tau_name": "median",
+      "whole_file": {
+        "hi": 0.016366471903830178,
+        "lo": -0.013385734118909831,
+        "mean": 0.0010942069569637738,
+        "n_files": 20
+      }
+    },
+    "alpha=0.3/tau=none": {
+      "alpha": 0.3,
+      "alpha0_reproduces_baseline": null,
+      "injected_rate_pct": 0.16856465326537906,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.5274388698906836,
+          "lo": 0.06285738695193197,
+          "mean": 0.34609259619627925,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.9411430262197582,
+          "lo": -0.8901523601341483,
+          "mean": -0.08050930136886757,
+          "n_files": 4
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.016366471903830178,
+        "lo": -0.00932513693644095,
+        "mean": 0.002731140085921174,
+        "n_files": 20
+      }
+    },
+    "alpha=0/tau=none": {
+      "alpha": 0.0,
+      "alpha0_reproduces_baseline": true,
+      "injected_rate_pct": 0.0,
+      "match_rate_pct": 0.16856465326537906,
+      "primary": {
+        "32": {
+          "hi": 0.0,
+          "lo": 0.0,
+          "mean": 0.0,
+          "n_files": 4
+        },
+        "8": {
+          "hi": 0.0,
+          "lo": 0.0,
+          "mean": 0.0,
+          "n_files": 4
+        }
+      },
+      "tau": null,
+      "tau_name": "none",
+      "whole_file": {
+        "hi": 0.0,
+        "lo": 0.0,
+        "mean": 0.0,
+        "n_files": 20
+      }
+    }
+  },
+  "ood_files": [
+    "apps/cli/options.cpp",
+    "build-ninja/vcpkg_installed/vcpkg/blds/curl/src/url-8_21_0-3ffa9f46b7.clean/lib/select.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavcodec/aacps.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavcodec/evc_parse.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavcodec/mjpeg.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavcodec/tpeldsp.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavfilter/perlin.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libavutil/aes_ctr.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg-bin2c/src/n8.1.1-c1a357cadb.clean/libswscale/loongarch/swscale_loongarch.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavcodec/cbs_vp8.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavcodec/jpeglsdec.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavcodec/qsv.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavdevice/alsa.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavformat/lrc.h",
+    "build-ninja/vcpkg_installed/vcpkg/blds/ffmpeg/src/n8.1.2-114db953a4.clean/libavutil/ppc/intreadwrite.h",
+    "build-ninja/vcpkg_installed/vcpkg/pkgs/ffmpeg_x64-windows/include/libavfilter/buffersink.h",
+    "build-ninja/vcpkg_installed/x64-windows/include/libavutil/film_grain_params.h",
+    "src/ops/attn_input_proj/w8/w8_attn_input_plan.cpp",
+    "src/ops/linear/linear.cpp",
+    "src/product/prompt_input/prompt_input.cpp"
+  ],
+  "ood_root": "F:/ai/q38/ninfer",
+  "pooling": "last",
+  "quant": "none",
+  "rare_only": true,
+  "shuffle_values": false,
+  "thresholds": {
+    "high": 0.2033511847257614,
+    "median": 0.03926559537649155,
+    "none": null
+  },
+  "wall_seconds": 797.9
+}
