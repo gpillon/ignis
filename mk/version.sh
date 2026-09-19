@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# The release version, for the Makefile (the Linux VERSION_TOOL hook,
-# mk/os/linux.mk). The counterpart of mk/windows/version.ps1 -- same three
-# actions, same files, same output.
+# The release version, for the Makefile (the VERSION_TOOL hook of every
+# mk/os/<os>.mk -- this one script serves both hosts).
+#
+# Not under mk/linux/ and with no mk/windows/ twin, unlike the GPU and server
+# hooks beside it: those wrap things that genuinely differ per OS (nvidia-smi
+# through a 64-bit shell, process groups, pid files). This is text editing
+# over four files, the same four on either host, and mk/os/windows.mk already
+# refuses to run at all without a POSIX sh -- which on Windows means Git for
+# Windows, which ships this bash. There WAS a PowerShell twin. It drifted
+# from this file inside a single session (it kept accepting a version grammar
+# this one had already dropped), which is the whole argument against it.
 #
 #   show           print the version each file declares
 #   check          exit 1 when they disagree: the comparison
@@ -34,7 +42,7 @@
 
 set -uo pipefail
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo" || exit 1
 
 die() { echo "error: $*" >&2; exit 1; }

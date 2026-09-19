@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# The behavioural test of the version tool (`make version-selftest`), for
-# both implementations: mk/linux/version.sh always, mk/windows/version.ps1
-# whenever a powershell is on PATH. docs/agents/testing.md's rule -- every
-# code change ships with a test -- and the two are checked against each other
-# rather than separately, because the thing most likely to go wrong with two
-# implementations of one tool is that they stop agreeing.
+# The behavioural test of mk/version.sh (`make version-selftest`), which is
+# docs/agents/testing.md's rule applied to a script: every code change ships
+# with a test. It found four real bugs in the tool the first time it ran --
+# build metadata silently splitting the four files, a repair being refused, a
+# clean-tree guard blocking the second bump of a session, and a success
+# message printed over files that had not taken the version.
 #
 # It drives the real repo files and puts them back with git afterwards, so it
 # refuses to start unless those four files are clean. It is NOT part of
-# `make ci`: a check that writes to tracked files has no business running
-# inside one.
+# `make ci`: a check that writes to tracked files has no business inside one.
+#
+# Every assertion reads the four files directly rather than believing what
+# the tool printed -- the point is to catch a tool that lies about its own
+# writes, which is exactly what the first version did.
 
 set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo" || exit 1
 
+tool="bash mk/version.sh"
 failed=0
 note() { printf '  %s\n' "$*"; }
 fail() { printf '  FAIL: %s\n' "$*" >&2; failed=$((failed + 1)); }
@@ -32,25 +36,7 @@ if [ -n "$dirty" ]; then
     exit 1
 fi
 
-# The implementations under test. Each is a command prefix taking the tool's
-# own arguments; `run <impl> <args...>` is how the cases below call them.
-implementations=("bash mk/linux/version.sh")
-if command -v powershell >/dev/null 2>&1; then
-    implementations+=("powershell -NoProfile -ExecutionPolicy Bypass -File mk/windows/version.ps1")
-elif command -v pwsh >/dev/null 2>&1; then
-    implementations+=("pwsh -NoProfile -File mk/windows/version.ps1")
-else
-    note "no powershell on PATH: the Windows implementation is not exercised here"
-fi
-
-run() {
-    local impl="$1"; shift
-    # shellcheck disable=SC2086 -- the prefix is ours, and word-split on purpose
-    $impl "$@" 2>&1
-}
-
-# What the four files declare, as one line, read independently of the tool so
-# a tool that lies about its own writes is caught.
+# What the four files declare, as one line, read independently of the tool.
 declared() {
     local cargo lock web weblock
     cargo="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
@@ -83,57 +69,52 @@ expect_refused() {
     fail "$label: not refused (output: $output)"
 }
 
-for impl in "${implementations[@]}"; do
-    echo "== ${impl##* } =="
-    restore
+# An explicit version reaches all four files.
+$tool set 9.9.9 >/dev/null 2>&1
+expect_all 9.9.9 "set 9.9.9"
 
-    # An explicit version reaches all four files.
-    run "$impl" set 9.9.9 >/dev/null
-    expect_all 9.9.9 "set 9.9.9"
+# The three parts, each from the version before it.
+$tool bump patch >/dev/null 2>&1
+expect_all 9.9.10 "bump patch"
+$tool bump minor >/dev/null 2>&1
+expect_all 9.10.0 "bump minor"
+$tool bump major >/dev/null 2>&1
+expect_all 10.0.0 "bump major"
 
-    # The three parts, each from the version before it.
-    run "$impl" bump patch >/dev/null
-    expect_all 9.9.10 "bump patch"
-    run "$impl" bump minor >/dev/null
-    expect_all 9.10.0 "bump minor"
-    run "$impl" bump major >/dev/null
-    expect_all 10.0.0 "bump major"
+# A prerelease is a version like any other, and patching one releases it
+# rather than stepping past it (`npm version patch`'s rule).
+$tool set 10.1.0-rc.1 >/dev/null 2>&1
+expect_all 10.1.0-rc.1 "set 10.1.0-rc.1"
+$tool bump patch >/dev/null 2>&1
+expect_all 10.1.0 "bump patch from a prerelease"
 
-    # A prerelease is a version like any other, and patching one releases it
-    # rather than stepping past it (`npm version patch`'s rule).
-    run "$impl" set 10.1.0-rc.1 >/dev/null
-    expect_all 10.1.0-rc.1 "set 10.1.0-rc.1"
-    run "$impl" bump patch >/dev/null
-    expect_all 10.1.0 "bump patch from a prerelease"
+# check agrees with the files while they agree with each other.
+if $tool check 2>&1 | grep -q "ok: every file declares 10.1.0"; then
+    note "ok: check passes on an agreeing tree"
+else
+    fail "check did not pass on an agreeing tree"
+fi
 
-    # check agrees with the files while they agree with each other.
-    if run "$impl" check | grep -q "ok: every file declares 10.1.0"; then
-        note "ok: check passes on an agreeing tree"
-    else
-        fail "check did not pass on an agreeing tree"
-    fi
+# Setting what every file already declares is the one refusal that is about
+# state rather than syntax.
+expect_refused "$($tool set 10.1.0 2>&1)" "setting the version already declared" "already declares"
 
-    # Setting what every file already declares is the one refusal that is
-    # about state rather than syntax.
-    expect_refused "$(run "$impl" set 10.1.0)" "setting the version already declared" "already declares"
+# Syntax. `+build` is refused on purpose: npm drops build metadata, so it
+# could never reach the web files (see mk/version.sh's header).
+expect_refused "$($tool set 1.2 2>&1)" "a two-part version" "not a version"
+expect_refused "$($tool set 1.2.3+cuda13 2>&1)" "build metadata" "not a version"
+expect_refused "$($tool set '' 2>&1)" "an empty version"
+expect_refused "$($tool bump quarterly 2>&1)" "an unknown part"
 
-    # Syntax. `+build` is refused on purpose: npm drops build metadata, so it
-    # could never reach the web files (see either script's header).
-    expect_refused "$(run "$impl" set 1.2)" "a two-part version" "not a version"
-    expect_refused "$(run "$impl" set 1.2.3+cuda13)" "build metadata" "not a version"
-    expect_refused "$(run "$impl" set '')" "an empty version"
-    expect_refused "$(run "$impl" bump quarterly)" "an unknown part"
+# A half-bumped tree is the state this tool exists to repair, so setting the
+# version it half-carries must work rather than be refused.
+restore
+$tool set 9.9.9 >/dev/null 2>&1
+git checkout -- web/package.json web/package-lock.json
+$tool set 9.9.9 >/dev/null 2>&1
+expect_all 9.9.9 "repairing a tree where only the web files drifted"
 
-    # A half-bumped tree is the state this tool exists to repair, so setting
-    # the version it half-carries must work rather than be refused.
-    restore
-    run "$impl" set 9.9.9 >/dev/null
-    git checkout -- web/package.json web/package-lock.json
-    run "$impl" set 9.9.9 >/dev/null
-    expect_all 9.9.9 "repairing a tree where only the web files drifted"
-
-    restore
-done
+restore
 
 if [ "$failed" -ne 0 ]; then
     echo "version selftest: $failed check(s) failed" >&2

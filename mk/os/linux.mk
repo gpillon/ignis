@@ -39,10 +39,9 @@ SERVER_STATUS = $(call todo,background status)
 # sh: start the server and vite in one process group, `trap 'kill 0' INT TERM EXIT`.
 DEV_UI = $(call todo,run-ui / dev-ui)
 
-# Pure text editing over four files, so this one is not a todo: the Linux
-# script is the whole implementation, and mk/windows/version.ps1 is its
-# counterpart rather than the other way round.
-VERSION_TOOL = bash mk/linux/version.sh
+# Not a todo, and not OS-specific either: mk/version.sh is text editing over
+# four files and serves both hosts, so mk/os/windows.mk names the same one.
+VERSION_TOOL = bash mk/version.sh
 
 OS_REQUIRED_TOOLS :=
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
