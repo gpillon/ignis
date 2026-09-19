@@ -88,6 +88,28 @@ token and decode back to themselves, in this tokenizer:
 | `0`–`255` | **10 / 256** |
 | Pooled, distinct | **1,255** (0 id collisions) |
 
+### How wide can the option set get
+
+`crates/server/tests/classify_option_ceiling_gpu.rs`, under the GPU profile.
+A 256-entry support-routing taxonomy (`area - action`), 16 tickets whose
+destination is unambiguous, scored at six widths. The answer alphabet is
+filtered against the loaded tokenizer — 114 of the 676 uppercase bigrams are
+two tokens, so `BQ` and `CJ` are skipped rather than mislabelling two options
+onto one logit.
+
+| Options | Prompt tokens | mass p50 | mass min | in-slot |
+|---:|---:|---:|---:|---:|
+| 8 | 171 | 0.9978 | 0.9971 | 100% |
+| 32 | 449 | 0.9994 | 0.9987 | 100% |
+| 64 | 823 | 0.9988 | 0.9938 | 100% |
+| 128 | 1,571 | 0.9960 | 0.9588 | 100% |
+| 192 | 2,319 | 0.9962 | 0.9855 | 100% |
+| 256 | 3,067 | 0.9967 | 0.9875 | 100% |
+
+There is no mechanical ceiling below 256: the mass does not decay with width,
+and the unrestricted winner is a declared answer token at every width. What
+grows is the prompt.
+
 ### The same readout over an image
 
 `crates/server/tests/classify_vision_readout_gpu.rs`, under the GPU profile:
@@ -192,12 +214,14 @@ pixels.
   figures are properties of the model's distribution and are more robust to it.
 - 118/118 above the 0.9 threshold is 118 samples, not a guarantee. The
   threshold needs re-measuring on any workload before it is trusted to abstain.
-- Two and three options only, on both fixtures. The slot count above is a
-  property of the *tokenizer*; whether the model still puts its mass on the
-  declared slots when there are 60 or 255 of them — and when the labels are
-  `AA` and `JK` rather than the `A`/`B`/`C` of every multiple-choice question
-  it was trained on — is the measurement that sets the real ceiling, and it
-  has not been made.
+- The width sweep is 16 tickets on a taxonomy written for the purpose, whose
+  right answers are close to literal. Its **mass** figures are robust — mass
+  is a property of the distribution and does not care whether a task is easy —
+  but its accuracy column (100% at 8 options settling to 62% from 128 on) is a
+  sanity check on a fixture of ours, never a quality claim.
+- The widths were swept on text prompts. Whether 256 options hold their mass
+  when the evidence is an image, where the answer tokens sit thousands of
+  positions after it, is unmeasured.
 - The vision rows are four, with a hand-written option set. They are a
   mechanism check. The text path's boundary verification has no counterpart
   there either: `prepare_prompt` returns scattered token ids rather than a
