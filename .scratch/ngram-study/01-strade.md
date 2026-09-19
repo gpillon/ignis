@@ -2,7 +2,23 @@
 
 - Data: 2026-09-18
 - Dipende da: [`00-fatti.md`](00-fatti.md)
-- Stato: proposta, da decidere con l'owner
+- Stato: **superato il 2026-09-19 per la parte operativa** — vedi
+  [`03-risultati.md`](03-risultati.md) e
+  [il finding](../../docs/findings/2026-09-19-codebase-as-ngram-memory.md)
+
+> **Il microbenchmark proposto qui sotto non va eseguito, e il percorso veloce
+> non va costruito.** La sua premessa era che il segnale ci fosse: l'esito
+> misurato è *nessun segnale*. Non è stato confutato — è rimasto senza scopo.
+>
+> Portata precisa della chiusura: cade la **strada C** nella forma testata,
+> cioè un retrofit **additivo e non addestrato** — l'unica che l'hardware di
+> questa macchina consentiva. La **strada A** (servire Flash-Next) resta
+> bloccata dall'hardware, come qui descritto. La **strada B** (adapter
+> addestrato) resta aperta, e ora ha il suo primo dato: l'informazione è
+> recuperabile, a L19 su 64, con recall@1 0,413 contro 0,005 del caso.
+>
+> Resta valida senza riserve l'analisi dei vincoli (§ hardware, § ninfer, §
+> config), che è il motivo per cui questo documento non viene riscritto.
 
 ## A — Servire Qwen3.8-Flash-Next in ignis
 

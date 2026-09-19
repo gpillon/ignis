@@ -124,9 +124,23 @@ this repository and therefore part of the index — 1,184 of the 3,345 index row
 same-basename counterpart under it. It measures a partially overlapping corpus,
 not a foreign one.
 
-The third-party C sample has zero shared provenance by construction, and it
-still matches at **2.80%, 74% of the in-domain rate**. That is the load-bearing
-non-selectivity number.
+The third-party sample is the cleaner one, but "third-party" overstates it:
+of its 20 files, 16 are vendored foreign code (ffmpeg, curl under
+`build-ninja/vcpkg_installed/`) and 4 are ninfer's own sources
+(`apps/cli/options.cpp`, `src/ops/linear/linear.cpp`,
+`src/ops/attn_input_proj/w8/w8_attn_input_plan.cpp`,
+`src/product/prompt_input/prompt_input.cpp`), which carry the same shared
+provenance the row above describes. It still matches at **2.80%, 74% of the
+in-domain rate**, and that is the load-bearing non-selectivity number — with
+the contamination pulling it *up*, so a purely foreign corpus would land at or
+below 74%, never above. The correction runs in the conservative direction.
+
+Note also that the match rate is a property of the key and the corpus, not of
+the layer: the in-domain rate is 3.76% at both L19 and L47. The two rows
+therefore compare two *corpora*, not two layers. What is missing is a clean
+foreign corpus measured with the L19 index; the 3.89% row is the contaminated
+one, and it says that on code sharing provenance the mechanism fires slightly
+*more* than at home.
 
 The rare-key filter removes 15% of the index keys (3,345 -> 2,850; of the
 corpus's 7,598 distinct names, 6,033 pass the rule, and the index holds only
@@ -210,7 +224,9 @@ survives its control.
 - ninfer is a *partially overlapping* corpus, not an out-of-domain one, because
   `kernel/vendor/` is a vendored copy of its kernel sources and is deliberately
   part of ignis's own corpus. Its numbers are reported as same-domain. The
-  third-party C sample is the clean one.
+  third-party C sample is the cleaner one, and 16 of its 20 files are foreign;
+  the other 4 are ninfer's own, so even it is not a purely foreign corpus. No
+  clean foreign corpus was measured against the L19 index.
 - NF4 weights, not the NVFP4 the server runs. The measurement is of hidden-state
   structure, which is unlikely to hinge on that, but it is not the served
   numerics.
