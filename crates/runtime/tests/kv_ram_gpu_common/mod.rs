@@ -468,7 +468,11 @@ pub fn a_burst_block_brought_back_from_kv_ram_serves_exactly(loaded: &Loaded) {
         events.iter().any(|e| {
             matches!(
                 e,
-                SchedEvent::RetainedState { operation: o, source: ReuseSource::KvRam } if *o == operation
+                // GitHub #216 gave the fact a `kind`; what this asserts is
+                // the operation and the tier it happened on, as it always
+                // did -- either kind spilling and coming back is the claim.
+                SchedEvent::RetainedState { operation: o, source: ReuseSource::KvRam, kind: _ }
+                    if *o == operation
             )
         })
     };

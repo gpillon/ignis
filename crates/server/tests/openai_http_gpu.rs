@@ -87,8 +87,11 @@ fn harness_with(shape: EngineShape) -> Option<Harness> {
         .eos_token_id()
         .unwrap_or_else(|| panic!("qwen3.8-27b generation config must carry eos_token_id"));
 
+    // GitHub #210: the builder hands back the VRAM plan's reservations
+    // beside the scheduler, for `/metrics` to name. This test serves
+    // requests and reads none of them.
     let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
-        Ok(scheduler) => scheduler,
+        Ok((scheduler, _reservations)) => scheduler,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
                 return None;

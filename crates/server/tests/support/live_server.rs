@@ -80,8 +80,11 @@ impl LiveServer {
         let instrument_frontend =
             FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
 
+        // GitHub #210: the builder hands back the VRAM plan's reservations
+        // beside the scheduler, for `/metrics` to name. A live-server test
+        // serves requests and reads none of them.
         let scheduler = match cuda_scheduler(path, model.into(), eos, shape) {
-            Ok(scheduler) => scheduler,
+            Ok((scheduler, _reservations)) => scheduler,
             Err(e) => {
                 if gpu_profile::skip_or_fail(&format!("cuda_scheduler: {e}")) {
                     return None;
