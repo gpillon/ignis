@@ -94,13 +94,31 @@ struct Readout {
     argmax_in_slots: bool,
     full_vocab_argmax: u32,
     prompt_tokens: usize,
+    /// The declared options' own ids, in slot order -- what an answer is
+    /// keyed by, rather than the letter that carried it.
+    option_ids: Vec<String>,
     /// Wall time for this row's prefill alone, in microseconds -- the whole
     /// GPU cost of one decision, since no token is ever decoded.
     prefill_micros: u128,
 }
 
-/// `.scratch/jev-classify/` at the worktree root -- raw experiment output,
-/// never committed (`docs/agents/`: findings are promoted separately).
+/// SemIf's authored decision fixture, committed beside this test.
+///
+/// Committed rather than fetched because this is a GPU-profile test: under
+/// `IGNIS_GPU_PROFILE=1` a missing fixture is a hard failure, so the
+/// serialized sweep must not depend on a file somebody downloaded by hand.
+/// See `fixtures/semif/NOTICE.md` for its provenance and licence.
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("semif")
+        .join("authored144.jsonl")
+}
+
+/// `.scratch/jev-classify/` at the worktree root -- raw per-row output, never
+/// committed (`docs/agents/findings.md`: raw material stays in `.scratch/`,
+/// the durable synthesis is promoted to `docs/findings/`).
 fn scratch_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -240,9 +258,9 @@ fn median(values: &mut Vec<f64>) -> f64 {
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn typed_option_logits_are_readable_from_one_prefill() {
-    let fixture_path = scratch_dir().join("authored144.jsonl");
-    let Ok(fixture_text) = std::fs::read_to_string(&fixture_path) else {
-        if gpu_profile::skip_or_fail(&format!("the fixture is absent: {}", fixture_path.display())) {
+    let fixture = fixture_path();
+    let Ok(fixture_text) = std::fs::read_to_string(&fixture) else {
+        if gpu_profile::skip_or_fail(&format!("the fixture is absent: {}", fixture.display())) {
             return;
         }
         unreachable!("skip_or_fail panics under the profile");
@@ -393,6 +411,7 @@ fn typed_option_logits_are_readable_from_one_prefill() {
             argmax_in_slots: slots.contains(&full_vocab_argmax),
             full_vocab_argmax,
             prompt_tokens: prompt_ids.len(),
+            option_ids: row.options.iter().map(|o| o.id.clone()).collect(),
             prefill_micros,
         });
     }
@@ -405,6 +424,7 @@ fn typed_option_logits_are_readable_from_one_prefill() {
         let record = json!({
             "id": readout.id,
             "family": readout.family,
+            "option_ids": readout.option_ids,
             "label": readout.label,
             "predicted": readout.predicted,
             "correct": readout.predicted == readout.label,

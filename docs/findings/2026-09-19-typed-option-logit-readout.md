@@ -36,8 +36,10 @@ a plausible-looking argmax. The question is where the mass actually sits.
 Fixture: SemIf's `benchmarks/data/authored144.jsonl` — 144 authored decisions
 across three families (`candidate_selection`, `evidence_interpretation`,
 `rule_application`), each with a `state`, a `question`, 2–3 options, and a
-`label` naming the authored answer. Raw rows in
-`.scratch/jev-classify/readout.jsonl`; the fixture itself is not committed.
+`label` naming the authored answer. Committed verbatim at
+`crates/server/tests/fixtures/semif/` (MIT; see its `NOTICE.md`), because a
+missing fixture is a hard failure under the GPU profile. Raw per-row output in
+`.scratch/jev-classify/readout.jsonl`.
 
 The prompt is SemIf's `direct_messages` reproduced exactly: its `DIRECT_SYSTEM`
 instruction verbatim, plus one user message carrying
@@ -112,10 +114,17 @@ decision is one prefill of ~132 tokens.
 - **The gather belongs inside `RuntimeCompute::prefill_step`.** A full-vocab
   buffer is 151,936 × f32 ≈ 607 KB per decision; only the slot logits, the
   full-vocab logsumexp and the full-vocab argmax need to cross the seam.
-- **Evidence-first is load-bearing.** Jev's shape is one `state` and many
-  questions. With the evidence at the head of the payload, that is one shared
-  token prefix and N short suffixes — exactly the reuse ignis already has
-  (#191/#193), and the reason SemIf's own shared mode is 8.6x its fresh one.
+- **Evidence-first costs nothing and keeps reuse possible.** Jev's shape is one
+  `state` and many questions; with the evidence at the head of the payload that
+  is one shared token prefix and N short suffixes. It does **not** follow that
+  prefix reuse pays here. A traversal on ignis is ~19 ms fixed
+  (`2026-09-18-prompt-reuse-tax-on-short-ttft.md`), and splitting a 132-token
+  prompt into prefix plus suffix is two traversals where one cost 36.5 ms —
+  reuse only earns its keep once the `state` itself is hundreds of tokens. The
+  likely win on short decisions is the **batched prefill** the scheduler
+  already does: prompts this short do not fill the GEMM
+  (`2026-09-11-prefill-chunk-wall-time.md`). SemIf's own 8.6x from shared state
+  was measured on a different engine and does not transfer.
 - **28 decisions/s is the floor**, measured serially with no reuse and no
   batching, both of which the engine already does.
 
@@ -137,6 +146,12 @@ decision is one prefill of ~132 tokens.
   already resident, not a served request: no HTTP, no scheduler, no admission.
 - BF16 logits promoted to f32. SemIf saw 5–6 of 777 argmaxes move between
   execution paths at BF16; near-ties here will behave the same way.
+- Measured with `KvFormat::Bf16`. The served default is **hq-e8-2b**
+  (`make config`), whose near-ties can land differently (GitHub #160). The
+  mass and in-slot figures are far from any margin that format could move,
+  but the nine errors — whose top probability sits at a median 0.634 — are
+  exactly the rows where it might. Re-measure under hq before the calibration
+  threshold is trusted.
 
 ## Follow-ups
 
