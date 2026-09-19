@@ -382,9 +382,12 @@ When output names a domain concept, use the term as defined here.
 - **Per-lane sampling** — sampling parameters and RNG state carried per
   sequence, not per decode round: lanes in one round hold different
   temperatures, seeds and penalty histories. Sampling happens device-side in
-  the leaf, which returns token ids and never ships logits to the host. What
-  a request generates therefore depends on its own seed alone, never on which
-  lanes happened to share its round.
+  the leaf, which returns token ids: the **decode** path never ships logits to
+  the host. What a request generates therefore depends on its own seed alone,
+  never on which lanes happened to share its round. A **readout** is the one
+  path that does receive logits, and it draws no sample — it has no seed, no
+  RNG and no penalty history to disturb, so the independence above is a
+  property of decode that the readout cannot violate.
 - **N-lane concurrency** — 8 resident decode lanes (N=8), with overflow to the
   host KV-RAM tier; sized for a ~10-subagent concurrent coding workload. Real
   at long context only under hq-e8-2b: eight lanes at a 40,960-token context
@@ -489,6 +492,38 @@ When output names a domain concept, use the term as defined here.
   text claimant may stand on a multimodal publisher's head. A claimant learns
   its own delta only from a prefill span, which is why a multimodal claim
   always leaves at least one prompt token to prefill (ADR 0029).
+
+## Decisions
+
+- **Decision** — one question put to the model about supplied evidence, whose
+  answer is a distribution over a declared set of options rather than
+  generated text. It is the unit a decision request is made of: one evidence,
+  many decisions.
+- **Readout** — reading the logits of named tokens at one position instead of
+  sampling a token there. The **decode** path samples and never ships logits
+  to the host (**per-lane sampling**); a readout is the opposite of that in
+  both halves — it receives logits and draws no sample. A readout costs one
+  prefill and generates nothing.
+- **Answer token** — the single token that stands for one option of a
+  **decision**, and whose logit the **readout** reads. Nothing to do with a
+  decode **lane**, a **GDN slot** or a **retained slot**, which are all
+  per-sequence device resources; an answer token is a vocabulary entry.
+- **Answer alphabet** — the ordered pool answer tokens are drawn from: single
+  characters first (`A`-`Z`, `a`-`z`, `0`-`9`), then uppercase bigrams. It is
+  **computed from the loaded tokenizer, never compiled in**: a label is
+  admitted only if it encodes to exactly one token that decodes back to
+  itself, which rejects 114 of the 676 uppercase bigrams in the 27B's
+  tokenizer. A label that is two tokens would have its first token's logit
+  read, and that token belongs to another label.
+- **Constrained decode** — a decode whose sampling is restricted, per lane, to
+  a declared set of tokens. What a **readout** is to one position, this is to
+  a run of them: the answer's shape is the caller's, so nothing has to parse
+  what comes back. It is the only decision primitive that generates tokens.
+- **Answer mass** — how much of the whole next-token distribution the answer
+  tokens hold, `exp(logsumexp(answer logits) - logsumexp(all logits))`. It is
+  what says whether a restricted softmax is reading the model or renormalizing
+  noise: a **decision** whose answer mass is near zero has an argmax that
+  means nothing.
 
 ## Observability
 
