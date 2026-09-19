@@ -89,6 +89,10 @@ jobs:
 
       - name: Build and push
         uses: docker/build-push-action@v6
+        env:
+          # No build-record artifact: nothing reads it here, and an unfiltered
+          # download-artifact in the release job chokes on it.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           file: ./Containerfile

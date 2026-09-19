@@ -101,6 +101,10 @@ jobs:
 
       - name: Build the Linux binaries
         uses: docker/build-push-action@v6
+        env:
+          # No build-record artifact: nothing reads it here, and an unfiltered
+          # download-artifact in the release job chokes on it.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           file: ./Containerfile
@@ -175,8 +179,7 @@ jobs:
 
       # Only the components this build touches. The full toolkit took 7.9
       # minutes of a 26-minute job, almost all of it downloading libraries
-      # (cuBLAS, cuFFT, Nsight) nothing here links. The names are the ones
-      # CUDA's own version.json reports, minus its `cuda_` prefix:
+      # (cuBLAS, cuFFT, Nsight) nothing here links. It is now 0.7:
       #
       #   nvcc       the compiler driver
       #   crt        bin/crt, its link stubs
@@ -189,6 +192,8 @@ jobs:
       #              include/cccl, which is where sampling_device.cuh's
       #              <cub/block/block_merge_sort.cuh> resolves
       #   nvml_dev   nvml.lib, for ignis_device_nvml_mem_info (GitHub #210)
+      #   nvtx       nvtx3/nvToolsExt.h, which the vendored core/nvtx.h
+      #              includes
       #   the rest   the small tools nvcc and CMake's compiler probe shell
       #              out to; together a few MB against cuBLAS's several
       #              hundred
@@ -204,11 +209,17 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "nvml_dev", "nvfatbin", "nvjitlink", "cuobjdump", "nvdisasm", "cuxxfilt", "nvprune"]'
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "nvml_dev", "nvtx", "nvfatbin", "nvjitlink", "cuobjdump", "nvdisasm", "cuxxfilt", "nvprune"]'
 
-      # What the kernel leaf and the Rust link actually open. A missing one
-      # here would otherwise surface as a confusing nvcc or link error ten
-      # minutes later, or -- worse -- as a zip with no cudart in it.
+      # What the kernel leaf and the Rust link actually open. Not a sample:
+      # every toolkit header the tree includes, which is the whole set
+      #
+      #   grep -rhoE '#include <[A-Za-z0-9_/]+\.(h|cuh)>' kernel/ | sort -u
+      #
+      # finds that resolves inside CUDA, plus the tools and import libs. A
+      # component left out would otherwise surface as a confusing nvcc error
+      # ten minutes into the build -- which is how `nvtx` was found -- or,
+      # worse, as a zip with no cudart in it.
       - name: Check the toolkit has what the build needs
         shell: bash
         env:
@@ -218,6 +229,11 @@ jobs:
           cuda="$(cygpath -u "$CUDA_PATH")"
           missing=0
           for f in bin/nvcc.exe bin/crt/link.stub nvvm/bin/cicc.exe \
+                   include/cuda.h include/cuda_runtime.h include/cuda_runtime_api.h \
+                   include/cuda_bf16.h include/cuda_fp16.h include/cuda_fp4.h \
+                   include/cuda_fp8.h include/cuda_pipeline.h \
+                   include/cooperative_groups.h include/math_constants.h \
+                   include/nvml.h include/nvtx3/nvToolsExt.h \
                    include/cccl/cub/block/block_merge_sort.cuh \
                    lib/x64/cudart.lib lib/x64/cuda.lib lib/x64/nvml.lib; do
             if [ -e "$cuda/$f" ]; then echo "  ok      $f"; else echo "  MISSING $f"; missing=1; fi
@@ -312,10 +328,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      # By name, not "everything this run produced": docker/build-push-action
+      # uploads a build record of its own (`<owner>~<repo>~XXXXXX.dockerbuild`),
+      # an unfiltered download tries to fetch that too, and when it cannot the
+      # whole step fails after five retries -- with both real archives already
+      # on disk. That is what withheld the v0.1.0 release while the image was
+      # already published. DOCKER_BUILD_RECORD_UPLOAD on the build steps stops
+      # it being created; this pattern means it would not matter if it were.
       - uses: actions/download-artifact@v4
         with:
+          pattern: "*-x86_64"
           merge-multiple: true
           path: dist
+
+      - name: What will be released
+        run: ls -l dist
 
       - name: Release
         uses: softprops/action-gh-release@v2
