@@ -271,6 +271,21 @@ binaries and the image binaries are the same build. Why it is shaped this way â€
 one build for both, two workflows that fail independently, a tag only cut on a
 green dry run: ADR 0032.
 
+Cutting one starts with the version, which four files must agree on â€” the two
+the workflow compares (`Cargo.toml`, `web/package.json`, because the Playground
+ships inside the binary) and the two lockfiles that would otherwise be rewritten
+by the next build:
+
+```
+make version                     # what each of the four declares
+make version-bump T=patch        # or minor, major
+make version-bump V=1.2.3-rc.1   # or an exact version: x.y.z, -prerelease and +build optional
+make version-check               # what the workflow checks, before you tag
+```
+
+It edits and stops there: the commit and the tag are printed, not run, because
+pushing a `v*` tag publishes a release.
+
 Both are compiled for **SM120a** only. The Linux tarball needs the CUDA 13
 runtime on the host; the Windows zip carries `cudart64_*.dll`.
 

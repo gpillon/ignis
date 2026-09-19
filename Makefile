@@ -430,7 +430,28 @@ clippy: ## cargo clippy, every target of every crate
 test-all: test typecheck-web test-web ## Everything CPU-side: cargo test + web typecheck + vitest
 
 .PHONY: ci
-ci: check test-all ## What a CI job would run (no GPU)
+ci: version-check check test-all ## What a CI job would run (no GPU)
+
+# ---------------------------------------------------------------------------
+##@ Release
+# ---------------------------------------------------------------------------
+
+# `make version-bump` takes exactly one of T= and V=. Recursive on purpose:
+# $(error) fires when the recipe expands this, so naming neither is an error
+# of the bump target alone, not of parsing the Makefile.
+VERSION_BUMP_ARGS = $(strip   $(if $(and $(strip $(T)),$(strip $(V))),$(error name T= or V=, not both),   $(if $(strip $(V)),set $(strip $(V)),   $(if $(strip $(T)),bump $(strip $(T)),   $(error usage: make version-bump T=patch|minor|major -- or -- make version-bump V=x.y.z)))))
+
+.PHONY: version
+version: ## Print the version every release file declares
+	@$(VERSION_TOOL) show
+
+.PHONY: version-check
+version-check: ## Refuse what the release workflow refuses -- run it before you tag
+	@$(VERSION_TOOL) check
+
+.PHONY: version-bump
+version-bump: ## Bump the release version (T=patch|minor|major, or V=x.y.z[-rc.1][+build])
+	@$(VERSION_TOOL) $(VERSION_BUMP_ARGS)
 
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)
