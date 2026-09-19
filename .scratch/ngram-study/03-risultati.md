@@ -477,8 +477,9 @@ altrettanto bene. Senza questo controllo si sarebbe riportato un guadagno di
 −0,28 % che non esiste.
 
 Da notare che **questo non contraddice il §6**: a chiavi piene (3,76 % di
-match) la riga corretta danneggia 4-8× meno di una a caso, e quella differenza
-è reale. Le due cose insieme dicono una cosa sola e precisa:
+match) la riga corretta danneggia meno di una a caso in tutte e sei le celle,
+anche se gli intervalli si sovrappongono. Le due cose insieme dicono una cosa
+sola e precisa:
 
 > La corrispondenza chiave→valore porta informazione su **compatibilità** — il
 > vettore giusto disturba meno — ma non porta informazione che il modello
@@ -507,8 +508,10 @@ Cosa **è** risultato vero, e vale più del verdetto:
    punto d'uso e definizione è 0,413 contro 0,005 del caso, **83× il caso**.
 2. **È in un punto preciso.** L19 su 64, non il layer 2 di Flash-Next, dove
    entrambi i test danno esattamente il caso.
-3. **La chiave è informativa ma non sfruttabile per somma.** 4-8× meno danno
-   con la riga giusta, mai un guadagno.
+3. **La chiave è probabilmente informativa, ma non sfruttabile per somma.**
+   Meno danno con la riga giusta — stima puntuale 1,3-8,4× più bassa, stesso
+   segno in tutte e sei le celle di L19, intervalli sovrapposti — e mai un
+   guadagno.
 4. **Il meccanismo non è selettivo.** Su codice senza una riga in comune con
    questo repository spara al 74 % della frequenza che ha in casa (2,80 %
    contro 3,76 %). Il filtro delle chiavi rare toglie il 15 % delle chiavi
