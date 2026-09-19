@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # LICENSE is the verbatim Apache text; the root NOTICE carries the copyright
 # and points at kernel/NOTICE for the vendored subtree's own terms (ADR 0010).
