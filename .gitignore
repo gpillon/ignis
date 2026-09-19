@@ -49,3 +49,12 @@ bench/traces/*.jsonl
 *.nsys-rep
 *.nsys-rep.sqlite
 *.qdrep
+
+# n-gram study (.scratch/ngram-study): the index blobs and any model weights
+# are large and reproducible from the scripts + manifest, so only the manifest,
+# the metrics and the scripts are committed.
+.scratch/ngram-study/results/*.bin
+.scratch/ngram-study/results/*.npy
+.scratch/ngram-study/results/*.safetensors
+.scratch/ngram-study/scripts/__pycache__/
+.scratch/ngram-study/scripts/.pytest_cache/
