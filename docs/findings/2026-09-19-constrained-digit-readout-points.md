@@ -74,10 +74,13 @@ twice as a bare array and once fenced in markdown.
 
 ## Finding
 
-**The model answers on a 0–999 normalized scale**, not in absolute pixels. The
-free probe's boxes are all within 0–999 on a 4096-pixel image, and rescaling
-the constrained reading by `value / 999 × 4096` lands within 84 px of the
-target every time.
+**The model's native scale is 0–999 normalized**, not absolute pixels. The
+free probe establishes this on its own: its system message was
+`"You are a helpful assistant."` with **no scale declared anywhere**, and on a
+4096-pixel image it answered `[634, 789, 901, 864]`, `[244,230,380,261]` and
+`[853, 150, 931, 173]` — every coordinate inside 0–999, every one landing on
+the right button once rescaled. Rescaling the constrained reading the same way
+(`value / 999 × 4096`) lands within 84 px of the target every time.
 
 **The constraint reads the model rather than overruling it.** Two independent
 signs. First, the constrained reading reproduces the centre of the box the
@@ -109,7 +112,10 @@ caller can read it directly.
   same primitive, not new machinery.
 - **The cost is one prefill plus K steps.** The prefill is the whole expense
   here (~1.85 s for 16K image tokens); six constrained steps after it are
-  ordinary decode rounds.
+  ordinary decode rounds. That 16K is the *default* vision budget refusing to
+  downscale a 4096² image — a pointing endpoint on real screenshots will want
+  a lower `--vision-max-tokens` and a cheaper prefill, and the accuracy at
+  that budget is unmeasured. It is a trade-off to be chosen, not a detail.
 - **Nothing has to parse.** The free probe came back three different ways —
   bare array twice, markdown-fenced JSON once — and a shipped endpoint would
   have to handle all of them plus the ones it has not seen. A constrained
@@ -129,12 +135,16 @@ caller can read it directly.
   Delete button" or "the checkbox next to Sync" is untested.
 - Greedy only. No sampling, no temperature.
 - The digits are picked by restricted argmax, so the reading is the model's
-  most likely **digit string**, not its most likely **number**: a distribution
-  straddling 499/500 resolves digit by digit and can land somewhere neither
-  branch would have. Unmeasured how often that matters.
-- 0–999 was declared in the prompt as well as being the model's native scale,
-  so this does not separate "it answers in 0–999" from "it obeys the declared
-  scale". A run declaring a different range would.
+  most likely **digit string**, not its most likely **number**. This is not a
+  theoretical corner: a target at the exact centre of an axis puts the first
+  digit on a coin flip between 4 and 5, and the two digits that follow align
+  to whichever won — landing somewhere neither 499 nor 500 would have. The
+  first digit's probability is what exposes it, which is an argument for
+  returning the per-digit trace and not only the number.
+- The constrained prompt declared 0–999, which happens to be the model's
+  native scale, so this run says nothing about whether it would **obey** a
+  different declared range. That decides whether the endpoint can offer an
+  arbitrary range or only rescale from the native one.
 - BF16 KV; the served default is hq-e8-2b.
 - The `<|box_start|>` path was never exercised — the model chose JSON on its
   own. Whether the special-token route is more accurate is untested.
