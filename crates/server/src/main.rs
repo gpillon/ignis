@@ -53,13 +53,16 @@
 //! - `IGNIS_REQUEST_TIMEOUT` / `--request-timeout` — how long a
 //!   non-streaming completion waits before the handler gives up with a
 //!   `504` (default 30 seconds, max 3600 — GitHub #95).
-//! - `--ui` (flag only, no env var) — serve the Playground at `/ui/`
-//!   (GitHub #163, ADR 0026); off by default.
+//! - `--ui` / `--no-ui` / `IGNIS_UI` — serve the Playground at `/ui/`
+//!   (GitHub #163, ADR 0026); **on** by default. A binary built without
+//!   `web/dist` serves the page that says how to build it, so the default
+//!   costs a route and nothing else.
 //! - `--metrics` / `--metrics-bind <addr>` (flags only, no env var) — serve
 //!   Prometheus metrics at `GET /metrics` on their own listener (default
-//!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics` with
-//!   `--ui`, under the API key when one is set (GitHub #89, ADR 0017). Off by
-//!   default, and off means neither the routes nor the projection exist.
+//!   `127.0.0.1:9464`, no API key, never exposed), and at `/ui/metrics`
+//!   unless `--no-ui`, under the API key when one is set (GitHub #89, ADR
+//!   0017). Off by default, and off means neither the routes nor the
+//!   projection exist.
 //! - `IGNIS_API_KEY` / `--api-key` — when set, every `/v1` request must
 //!   send `Authorization: Bearer <key>` or gets a `401`; unset (default)
 //!   leaves the API open. `auto` generates a key at start and prints it to

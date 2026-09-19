@@ -105,7 +105,7 @@ ignis/
 │   ├── logging/     # structured logging (tracing layers, hotpath lint, trace context)
 │   ├── bench/       # trace-replay harness + gate/canary runner
 │   └── vendor/      # ADR 0010 vendoring tool (manifest, hashes, patch records)
-├── web/             # the Playground: React + Vite page served at /ui/ with --ui (ADR 0026)
+├── web/             # the Playground: React + Vite page served at /ui/ (ADR 0026)
 ├── kernel/          # C++/CUDA leaf: program + vendored ops (CMake + nvcc) + build.ps1
 ├── bench/traces/    # recorded load traces (JSONL; only the *.meta.json ship)
 ├── scripts/         # gpu-preflight / gpu-profile / vendor-ninfer (PowerShell)
@@ -211,19 +211,20 @@ triple, `target/x86_64-pc-windows-msvc/debug/ignis-server`.
 
 ### 3. Playground (optional)
 
-The Playground (`web/`, React + Vite, ADR 0026) is embedded into `ignis-server`
-only if `web/dist` exists when cargo builds it — cargo never runs npm. Build
-the frontend first (needs Node.js), then the server, then run with `--ui`:
+The Playground (`web/`, React + Vite, ADR 0026) is served at `/ui/` unless
+`--no-ui` (or `IGNIS_UI=false`) says otherwise, but it is embedded into
+`ignis-server` only if `web/dist` exists when cargo builds it — cargo never
+runs npm. Build the frontend first (needs Node.js), then the server:
 
 ```
 npm --prefix web ci
 npm --prefix web run build
 cargo build --release -p ignis-server
-target\x86_64-pc-windows-msvc\release\ignis-server.exe --ui    # http://127.0.0.1:8000/ui/
+target\x86_64-pc-windows-msvc\release\ignis-server.exe    # http://127.0.0.1:8000/ui/
 ```
 
-A server built without `web/dist` still accepts `--ui` and serves a page with
-these instructions. For frontend work, `npm --prefix web run dev` proxies `/v1`
+A server built without `web/dist` still serves `/ui/`, as a page with these
+instructions. For frontend work, `npm --prefix web run dev` proxies `/v1`
 and `/ui/metrics` to a running ignis (`IGNIS_URL`, default
 `http://127.0.0.1:8000`); `npm --prefix web run dev:mock` serves a fake engine
 instead, so no GPU is needed.
@@ -256,8 +257,8 @@ podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
 
 (`docker`: `--gpus all` in place of `--device`.) Every flag has an `IGNIS_*`
 environment variable (`crates/server/src/config.rs`); anything after the image
-name is passed to the server, and `--ui` — a bare switch with no environment
-variable — is the image's default command. The image carries the CUDA runtime
+name is passed to the server. The image sets no default command: the
+Playground is on because the server's own default is on. The image carries the CUDA runtime
 but no driver: the host's NVIDIA driver is injected by the container runtime,
 and the model is mounted, never baked in.
 
@@ -359,8 +360,8 @@ full, always-current table.
 | `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | `--allow-vram-oversubscription` | — | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. |
 | `IGNIS_RETAINED_SLOTS` | `--retained-slots <n>` | — | one per decode lane (`N_DECODE_LANES`); `0` with `--prompt-reuse off` (a count given then shares heads between live siblings only) | Retained slots reserved at load (ADR 0030): where every retained prompt checkpoint and shared prefix keeps its state image. When none is free, retained state gives one up — checkpoints before retained prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. Replaces the removed `--retained-pool-bytes`. |
 | `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
-| — | `--ui` | — | off | Serve the Playground at `/ui/` (flag only, no env var — ADR 0026). |
-| — | `--metrics` | — | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` with `--ui` (flag only, no env var — ADR 0017). |
+| `IGNIS_UI` | `--ui` / `--no-ui` | — | **on** | Serve the Playground at `/ui/` (ADR 0026). A binary built without `web/dist` serves the page that says how to build it. |
+| — | `--metrics` | — | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--no-ui` (flag only, no env var — ADR 0017). |
 | — | `--metrics-bind <addr>` | — | `127.0.0.1:9464` | The metrics listener's address; needs `--metrics`. No API key, never exposed. |
 | — | `--help` | `-h` | — | Print the flag table and exit. |
 | — | `--version` | `-V` | — | Print the crate version and exit. |

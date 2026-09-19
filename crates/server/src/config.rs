@@ -29,6 +29,10 @@ pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 /// existed.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u32 = 30;
 
+/// Whether the Playground is served without anyone saying so (GitHub #163,
+/// ADR 0026). On: a route, and no cost to a server nobody opens in a browser.
+pub const DEFAULT_UI: bool = true;
+
 /// The upper bound `--request-timeout`/`IGNIS_REQUEST_TIMEOUT` accepts: a
 /// ceiling against a fat-fingered value, not a real operating point — a
 /// healthy request legitimately runs for minutes at a large `max_tokens`,
@@ -128,8 +132,11 @@ pub struct Config {
     /// How long a non-streaming request waits for its completion before the
     /// handler gives up with a `504` (GitHub #95). In `[1, MAX_REQUEST_TIMEOUT_SECS]`.
     pub request_timeout_secs: u32,
-    /// Serve the Playground under `/ui/` (`--ui`, GitHub #163, ADR 0026).
-    /// Flag-only: no env var, no alias.
+    /// Serve the Playground under `/ui/` (GitHub #163, ADR 0026). On unless
+    /// `--no-ui` / `IGNIS_UI=false` turns it off: a binary that embedded the
+    /// build serves it, and one that did not serves the page saying how to
+    /// build it, so the default costs a route and nothing else. `--ui` is
+    /// still accepted, and now says out loud what is already true.
     pub ui: bool,
     /// The metrics listener's address when `--metrics` is on (GitHub #89,
     /// ADR 0017): `--metrics-bind`, else [`DEFAULT_METRICS_BIND`]. `None` =
@@ -310,7 +317,7 @@ pub fn resolve(
     let mut rope_scaling = None;
     let mut media_allow_private_network = false;
     let mut media_cache_mib = None;
-    let mut ui = false;
+    let mut ui = None;
     let mut metrics_on = false;
     let mut metrics_bind = None;
     let mut api_key = None;
@@ -353,7 +360,8 @@ pub fn resolve(
             "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
             "--media-allow-private-network" => media_allow_private_network = true,
             "--media-cache-mib" => media_cache_mib = Some(take_value(args, &mut i, flag)?),
-            "--ui" => ui = true,
+            "--ui" => ui = Some(true),
+            "--no-ui" => ui = Some(false),
             "--metrics" => metrics_on = true,
             "--metrics-bind" => metrics_bind = Some(take_value(args, &mut i, flag)?),
             "--api-key" => api_key = Some(take_value(args, &mut i, flag)?),
@@ -483,11 +491,34 @@ pub fn resolve(
         rope_scaling,
         media,
         request_timeout_secs,
-        ui,
+        ui: resolve_ui(ui, &env)?,
         metrics,
         api_key,
         expose,
     }))
+}
+
+/// `--ui` / `--no-ui` / `IGNIS_UI` (GitHub #163, ADR 0026). On by default:
+/// the Playground is what the server is for on a desktop, and a binary built
+/// without `web/dist` serves the page that says how to build it rather than
+/// failing. The flags win over the environment, as everywhere else here.
+fn resolve_ui(
+    flag: Option<bool>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<bool, ConfigError> {
+    if let Some(on) = flag {
+        return Ok(on);
+    }
+    let Some(raw) = non_empty(env("IGNIS_UI")) else {
+        return Ok(DEFAULT_UI);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(ConfigError(format!(
+            "`IGNIS_UI` must be true or false, got `{raw}`"
+        ))),
+    }
 }
 
 /// `--rope-scaling` / `IGNIS_ROPE_SCALING` (GitHub #227), in the
@@ -1020,8 +1051,8 @@ fn help_text() -> String {
          \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
          \x20       --media-allow-private-network env: IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK (default: off; needs --vision; fetch image URLs on private, loopback and link-local addresses)\n\
          \x20       --media-cache-mib <n>     env: IGNIS_MEDIA_CACHE_MIB (default: {DEFAULT_MEDIA_CACHE_MIB} with --vision; prepared images kept for reuse, 0 disables, max {MEDIA_CACHE_MIB_LIMIT})\n\
-         \x20       --ui                      serve the Playground at /ui/ (default: off; flag only)\n\
-         \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics with --ui (default: off; flag only)\n\
+         \x20       --ui / --no-ui            env: IGNIS_UI             (default: on; serve the Playground at /ui/)\n\
+         \x20       --metrics                 serve Prometheus metrics on their own listener, and at /ui/metrics unless --no-ui (default: off; flag only)\n\
          \x20       --metrics-bind <addr>     the metrics listener (default: {DEFAULT_METRICS_BIND}; flag only; needs --metrics; no API key, never exposed)\n\
          \x20       --api-key <key>           env: IGNIS_API_KEY        (default: unset — /v1 needs no key; set = Authorization: Bearer <key>; auto = generate one and print it)\n\
          \x20       --expose <mode>           env: IGNIS_EXPOSE         (default: unset — reachable at --bind only; cloudflare-quick = public https://*.trycloudflare.com URL, printed at start; always requires an API key, auto when none is set)\n\
@@ -2057,20 +2088,35 @@ mod tests {
     // ── the Playground (GitHub #163, ADR 0026) ───────────────────────────
 
     #[test]
-    fn the_playground_is_off_by_default_and_on_with_ui() {
-        assert!(!expect_config(resolve(&[], no_env).expect("resolve")).ui);
+    fn the_playground_is_on_by_default_and_off_with_no_ui() {
+        assert!(expect_config(resolve(&[], no_env).expect("resolve")).ui);
         assert!(expect_config(resolve(&args(&["--ui"]), no_env).expect("resolve")).ui);
+        assert!(!expect_config(resolve(&args(&["--no-ui"]), no_env).expect("resolve")).ui);
     }
 
     #[test]
-    fn ui_takes_no_value_and_has_no_env_var() {
-        // A bare switch: the next argument is parsed as a flag of its own.
-        let config = expect_config(resolve(&args(&["--ui", "--bind", "b"]), no_env).expect("resolve"));
-        assert!(config.ui);
-        assert_eq!(config.bind, "b");
+    fn both_ui_flags_are_bare_switches() {
+        // The next argument is parsed as a flag of its own, not as a value.
+        for (flag, want) in [("--ui", true), ("--no-ui", false)] {
+            let config =
+                expect_config(resolve(&args(&[flag, "--bind", "b"]), no_env).expect("resolve"));
+            assert_eq!(config.ui, want, "{flag}");
+            assert_eq!(config.bind, "b", "{flag}");
+        }
+    }
 
-        let env = env_map(&[("IGNIS_UI", "true")]);
+    #[test]
+    fn the_ui_env_var_applies_and_the_flags_win_over_it() {
+        let env = env_map(&[("IGNIS_UI", "false")]);
         assert!(!expect_config(resolve(&[], env).expect("resolve")).ui);
+        let env = env_map(&[("IGNIS_UI", "off")]);
+        assert!(expect_config(resolve(&args(&["--ui"]), env).expect("resolve")).ui);
+        let env = env_map(&[("IGNIS_UI", "true")]);
+        assert!(!expect_config(resolve(&args(&["--no-ui"]), env).expect("resolve")).ui);
+
+        let env = env_map(&[("IGNIS_UI", "maybe")]);
+        let err = resolve(&[], env).expect_err("not a boolean");
+        assert!(err.0.contains("IGNIS_UI"), "{}", err.0);
     }
 
     #[test]

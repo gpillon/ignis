@@ -9,6 +9,8 @@ CUDA ?= 1
 PROFILE ?= release
 
 # 1 = build web/dist before the server (so it is embedded) and pass --ui.
+# Anything else passes --no-ui, because the server serves the Playground
+# unless told not to -- make says which it means rather than relying on that.
 UI ?= 1
 
 # 1 = pass --metrics (ADR 0017): Prometheus text at GET /metrics on its own

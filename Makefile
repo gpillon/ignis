@@ -99,7 +99,7 @@ GPU_ENGINE_FLAGS = $(if $(ARTIFACT),--artifact $(ARTIFACT)) \
 SERVER_FLAGS = --bind $(BIND) \
   $(if $(filter 1,$(CUDA)),$(GPU_ENGINE_FLAGS)) \
   $(if $(MODEL),--model $(MODEL)) \
-  $(if $(filter 1,$(UI)),--ui) \
+  $(if $(filter 1,$(UI)),--ui,--no-ui) \
   $(if $(filter 1,$(METRICS)),--metrics $(if $(METRICS_BIND),--metrics-bind $(METRICS_BIND))) \
   $(if $(API_KEY),--api-key $(API_KEY)) \
   $(if $(EXPOSE),--expose $(EXPOSE)) \

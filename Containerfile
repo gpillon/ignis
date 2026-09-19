@@ -99,8 +99,8 @@ COPY kernel/NOTICE /usr/share/doc/ignis/NOTICE-kernel
 # The server's own default is 127.0.0.1, which nothing outside the container
 # can reach. Everything else stays at the server's default and is set through
 # the IGNIS_* environment (crates/server/src/config.rs) or flags after the
-# image name; `--ui` is a bare switch with no environment variable, which is
-# why it is the CMD.
+# image name -- the Playground included, which is served unless IGNIS_UI=false
+# or `--no-ui` says otherwise.
 ENV IGNIS_BIND=0.0.0.0:8000
 
 # IGNIS_ARTIFACT is deliberately NOT defaulted. A .ninfer container is tens of
@@ -118,7 +118,10 @@ USER ignis
 WORKDIR /home/ignis
 
 ENTRYPOINT ["/usr/local/bin/ignis-server"]
-CMD ["--ui"]
+# No CMD: the server's own defaults are the image's, the Playground among
+# them. A CMD here would also be replaced wholesale by the first argument
+# anyone passes after the image name, which is how `--ui` used to disappear
+# the moment someone added a flag.
 
 LABEL org.opencontainers.image.title="ignis" \
       org.opencontainers.image.description="ignis: OpenAI-compatible inference server for Qwen3.8-27B NVFP4 on Blackwell (SM120a), with the Playground UI" \

@@ -99,12 +99,13 @@ pub fn router(state: Arc<Server>) -> Router {
     } else {
         TEXT_REQUEST_BODY_LIMIT
     }));
-    // The Playground (GitHub #163): present only when `--ui` gave it assets.
+    // The Playground (GitHub #163): present unless `--no-ui` withheld the
+    // assets -- served by default since ADR 0026's 2026-09-19 amendment.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
     // The Playground's copy of the Prometheus exposition (GitHub #89, ADR
-    // 0017): only with both `--ui` and `--metrics`, and behind the same key
+    // 0017): only with the Playground and `--metrics`, and behind the same key
     // as `/v1` when one is set — an exposed server (ADR 0028) must not
     // publish its load to anyone. Prometheus itself scrapes the metrics
     // listener (`Server::metrics_app`); this listener has no `/metrics`.
