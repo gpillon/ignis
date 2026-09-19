@@ -297,6 +297,20 @@ impl DecodeOutcome {
 /// path is the same one every other failed spill takes.
 pub const NO_HOST_ROOM: i32 = -6;
 
+/// The [`ComputeError::Kernel`] code a backend reports when a job asked for
+/// a [`PrefillJob::readout`] on a chunk that carries no tokens (GitHub
+/// #237): no forward pass runs, so there are no logits at that position to
+/// read.
+///
+/// Numbered far outside the leaf ABI's own codes (`-1..-6`) because nothing
+/// in the leaf produces it: it is the adapter refusing an incoherent job,
+/// the way it refuses a claim on a prefix it holds no handle for. The
+/// scheduler does not branch on it — the job is deterministic, so the
+/// `MAX_PREFILL_ATTEMPTS` retries fail identically and the request ends with
+/// [`FinishReason::Error`], which is the right end for a request that can
+/// never be served. GitHub #238 owes the trim that keeps it from arising.
+pub const READOUT_WITHOUT_TOKENS: i32 = -1001;
+
 /// The compute seam the scheduler drives for actual token generation.
 ///
 /// This is the *only* GPU-coupled step in the engine. The scheduler's logic —

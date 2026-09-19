@@ -180,8 +180,13 @@ pixels.
   kind that terminates at `prefill_complete` without ever taking a decode
   lane, and the endpoint.
 - **The gather belongs inside `RuntimeCompute::prefill_step`.** A full-vocab
-  buffer is 151,936 × f32 ≈ 607 KB per decision; only the slot logits, the
+  buffer is 248,320 × f32 ≈ 970 KB per decision; only the slot logits, the
   full-vocab logsumexp and the full-vocab argmax need to cross the seam.
+  (Editorial correction, 2026-09-20, GitHub #237: this line first read
+  151,936 × f32 ≈ 607 KB. That is Qwen2/Qwen3's vocabulary, not this
+  artifact's — its `<|image_pad|>` alone sits at id 248,056, and
+  `ModelConfig::qwen38_27b().vocab` is 248,320. Nothing else here depends on
+  the figure.)
 - **Evidence-first costs nothing and keeps reuse possible.** Jev's shape is one
   `state` and many questions; with the evidence at the head of the payload that
   is one shared token prefix and N short suffixes. It does **not** follow that

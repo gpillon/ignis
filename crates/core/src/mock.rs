@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
-use crate::decision::{Readout, log_sum_exp};
+use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -589,20 +589,13 @@ impl MockCompute {
             })
             .collect();
         let answer_lse = log_sum_exp(&logits);
-        let winner = logits
-            .iter()
-            .enumerate()
-            .fold(None::<(usize, f32)>, |best, (index, &value)| match best {
-                Some((_, high)) if !(value > high) => best,
-                _ => Some((index, value)),
-            });
         Readout {
             full_log_sum_exp: if answer_lse.is_finite() {
                 answer_lse + Self::OUTSIDE_THE_ANSWERS
             } else {
                 0.0
             },
-            full_argmax: winner.map_or(0, |(index, _)| answers[index]),
+            full_argmax: argmax(&logits).map_or(0, |slot| answers[slot]),
             logits,
         }
     }

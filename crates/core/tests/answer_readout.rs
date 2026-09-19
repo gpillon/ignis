@@ -63,8 +63,13 @@ fn a_requested_readout_comes_back_through_the_compute_seam() {
         "the mock's answer tokens hold some of its distribution"
     );
     assert!(
-        readout.winner().is_some(),
-        "a non-empty readout names a winning slot"
+        mass < 1.0,
+        "and never all of it: a mock whose mass were exactly 1 would let a caller          that forgot to check the mass pass on CPU and fail on the card, got {mass}"
+    );
+    let winner = readout.winner().expect("a non-empty readout names a winning slot");
+    assert_eq!(
+        readout.full_argmax, answers[winner],
+        "the mock's unrestricted argmax is a declared answer, as the served          model's is on every row the finding scored"
     );
 }
 

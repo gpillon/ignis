@@ -27,9 +27,8 @@ use crate::types::TokenId;
 /// it did *not* name.
 ///
 /// The full-vocabulary buffer the kernel writes is one f32 per column —
-/// 248,320 of them on the 27B, so nearly a megabyte per decision rather
-/// than ADR 0034's 607 KB, which counted a vocabulary this model does not
-/// have — and it never crosses the seam. The gather happens on the adapter's side of it
+/// 248,320 of them on the 27B, nearly a megabyte per decision — and it never
+/// crosses the seam. The gather happens on the adapter's side of it
 /// ([`Readout::gather`]), which is why this type holds the answers alone.
 ///
 /// `full_log_sum_exp` and `full_argmax` are what the answers are judged
@@ -57,7 +56,9 @@ impl Readout {
     /// returns. An id past the end of the vocabulary reads
     /// `f32::NEG_INFINITY` rather than panicking or aliasing another
     /// column — a readout runs on the prefill path, where a panic would
-    /// take the round down with it.
+    /// take the round down with it. An empty `logits` (a leaf claiming a
+    /// zero-wide head, which no real one does) reports token 0 and an
+    /// infinite log-sum-exp, so the answer mass is 0: nothing was read.
     pub fn gather(logits: &[f32], answers: &[TokenId]) -> Self {
         let gathered: Vec<f32> = answers
             .iter()
@@ -109,13 +110,6 @@ impl Readout {
     pub fn winner(&self) -> Option<usize> {
         argmax(&self.logits)
     }
-
-    /// Whether the model's own unrestricted winner is one of `answers` —
-    /// the question that says whether the restriction agreed with the model
-    /// or overruled it.
-    pub fn argmax_is_an_answer(&self, answers: &[TokenId]) -> bool {
-        answers.contains(&self.full_argmax)
-    }
 }
 
 /// `logsumexp` in f64 over f32 logits, max-subtracted so a vocabulary-wide
@@ -137,7 +131,7 @@ pub fn log_sum_exp(values: &[f32]) -> f64 {
 
 /// The index of the largest value, or `None` when there is none. Ties go to
 /// the first, matching the kernel's own argmax.
-fn argmax(values: &[f32]) -> Option<usize> {
+pub(crate) fn argmax(values: &[f32]) -> Option<usize> {
     values
         .iter()
         .enumerate()

@@ -1828,7 +1828,13 @@ fn a_readout_job_with_nothing_to_prefill_fails_loudly() {
     let error = compute
         .prefill_step(&[readout_job(1, Vec::new(), &[2, 5])])
         .expect_err("an empty readout chunk is refused");
-    assert!(matches!(error, ComputeError::Kernel(_)), "{error}");
+    assert!(
+        matches!(
+            error,
+            ComputeError::Kernel(code) if code == ignis_core::scheduler::READOUT_WITHOUT_TOKENS
+        ),
+        "the refusal names itself rather than passing for a kernel fault: {error}"
+    );
     assert_eq!(
         compute.live_sequences(),
         0,

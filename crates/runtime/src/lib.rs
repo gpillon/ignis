@@ -257,6 +257,11 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// Required rather than defaulted for the same reason — every leaf
     /// knows this, and a default would be a wrong answer waiting to be
     /// believed.
+    ///
+    /// `model` is taken for symmetry with [`StepLeaf::stats`], not because
+    /// today's leaf reads it: ignis is specialized for one topology
+    /// (`CONTEXT.md`), so `CudaLeaf` answers from its `ModelConfig` and
+    /// ignores the handle.
     fn vocab(&self, model: &Self::Model) -> u32;
     /// Allocate one sequence with its full context reservation.
     fn allocate_sequence(
@@ -925,7 +930,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     start_position = job.start_position,
                     "a readout job whose chunk carries no tokens runs no forward pass"
                 );
-                unwind!(RuntimeError::Leaf(-1).into());
+                unwind!(RuntimeError::Leaf(ignis_core::scheduler::READOUT_WITHOUT_TOKENS).into());
             }
             if let Some(publish) = job.publish_prefix {
                 to_publish.push((job.request, publish));

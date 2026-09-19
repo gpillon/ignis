@@ -14,8 +14,10 @@ stands on.
   carries the readout back: the answer logits, the full-vocabulary log-sum-exp
   (for **answer mass**), and the unrestricted argmax.
 - The gather happens **inside** `RuntimeCompute::prefill_step`. The
-  full-vocabulary buffer is 151,936 x f32 = 607 KB per decision and must never
-  cross the seam.
+  full-vocabulary buffer is 248,320 x f32 = 970 KB per decision and must never
+  cross the seam. (Corrected 2026-09-20 while implementing: this said 151,936
+  x f32 = 607 KB, which is Qwen2/Qwen3's vocabulary, not this artifact's.
+  ADR 0034 still carries the old figure and is the owner's to amend.)
 - `PrefillOutcome` is `Copy` today. Breaking that touches its callers.
 - The **answer alphabet** is computed from the loaded tokenizer at load:
   `A`-`Z`, `a`-`z`, `0`-`9`, then uppercase bigrams, admitting a label only if
