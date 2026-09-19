@@ -13,6 +13,7 @@
 #   SERVER_STATUS          report the background server process
 #   DEV_UI                 server + Vite as one foreground session; Ctrl+C
 #                          (or the session dying) stops both
+#   VERSION_TOOL           show / check / set / bump the release version
 #   OS_REQUIRED_TOOLS      tools `make doctor` requires
 #   OS_OPTIONAL_TOOLS      tools `make doctor` only reports
 #   OS_TOOL_HINT           where those tools come from
@@ -52,6 +53,8 @@ SERVER_START = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action start
 SERVER_STOP = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action stop
 SERVER_STATUS = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action status
 DEV_UI = $(SERVER_CTL_ENV) $(PS) -File mk/windows/devui.ps1
+
+VERSION_TOOL = $(PS) -File mk/windows/version.ps1
 
 OS_REQUIRED_TOOLS := powershell
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
