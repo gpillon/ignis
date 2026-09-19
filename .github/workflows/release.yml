@@ -210,10 +210,19 @@ jobs:
           cp LICENSE NOTICE README.md "$name"/
           cp kernel/NOTICE "$name"/NOTICE-kernel
           # cudart is the one CUDA library the binaries load that does not
-          # ship with the driver; NVIDIA lists it as redistributable. The
-          # action hands CUDA_PATH out in Windows spelling, which a glob in
-          # git bash does not expand.
-          cp "$(cygpath -u "$CUDA_PATH")"/bin/cudart64_*.dll "$name"/
+          # ship with the driver; NVIDIA lists it as redistributable. CUDA 13
+          # keeps it under bin/x64, 12 kept it directly under bin, and
+          # CUDA_PATH arrives in Windows spelling, which git bash will not
+          # glob. A missing DLL is a zip that does not run, so say so here
+          # rather than ship one.
+          cuda="$(cygpath -u "$CUDA_PATH")"
+          dll=$(ls "$cuda"/bin/x64/cudart64_*.dll "$cuda"/bin/cudart64_*.dll 2>/dev/null | head -1)
+          if [ -z "$dll" ]; then
+            echo "::error::no cudart64_*.dll under $cuda/bin or $cuda/bin/x64"
+            ls -R "$cuda"/bin | head -40
+            exit 1
+          fi
+          cp "$dll" "$name"/
           7z a -tzip "$name.zip" "$name" >/dev/null
           sha256sum "$name.zip" | tee "$name.zip.sha256"
           ls -l "$name"

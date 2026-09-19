@@ -102,8 +102,13 @@ COPY kernel/NOTICE /usr/share/doc/ignis/NOTICE-kernel
 # image name; `--ui` is a bare switch with no environment variable, which is
 # why it is the CMD.
 ENV IGNIS_BIND=0.0.0.0:8000
-# The model is mounted, never baked in: a .ninfer container is tens of GB.
-ENV IGNIS_ARTIFACT=/models/model.ninfer
+
+# IGNIS_ARTIFACT is deliberately NOT defaulted. A .ninfer container is tens of
+# GB, so it is mounted rather than baked in -- and a default pointing at a path
+# that is usually absent would turn "no model given" into a load failure.
+# Left unset, the image starts on the deterministic CPU mock (ADR 0006), which
+# is what makes `docker run <image>` a useful smoke test on its own; set it to
+# the mounted artifact to serve the real model on the GPU.
 
 # The OpenAI-compatible API + the Playground, and the Prometheus listener
 # (ADR 0017) for a server started with --metrics --metrics-bind 0.0.0.0:9464.

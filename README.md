@@ -261,6 +261,10 @@ variable — is the image's default command. The image carries the CUDA runtime
 but no driver: the host's NVIDIA driver is injected by the container runtime,
 and the model is mounted, never baked in.
 
+Without `IGNIS_ARTIFACT` the image starts on the deterministic CPU mock (ADR
+0006), so `podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.0` is a
+smoke test of the image on its own — no GPU, no model.
+
 `Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
 Its `artifacts` stage is what CI exports the Linux tarball from, so the release
 binaries and the image binaries are the same build.
