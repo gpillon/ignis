@@ -302,6 +302,20 @@ make version-check               # the workflow's comparison + the lockfiles, be
 It edits and stops there: the commit and the tag are printed, not run, because
 pushing a `v*` tag publishes a release.
 
+What the release changed is drafted from the range, not written from memory:
+
+```
+make changelog                   # since the last v* tag, to HEAD
+make changelog FROM=v0.1.1 TO=v0.1.2
+```
+
+It reads the issues the range's commits name, the ADRs added or amended in it,
+and the commits that name no issue at all, and prints Markdown for the body of
+the version-bump commit and of the GitHub release. GitHub's own
+`generate_release_notes` cannot do this — it lists merged PRs, and this repo
+merges locally. It is a draft: the headings are sorted by what the range can
+prove, not by what matters most, so read the follow-ups too.
+
 Both are compiled for **SM120a** only. The Linux tarball needs the CUDA 13
 runtime on the host; the Windows zip carries `cudart64_*.dll`.
 

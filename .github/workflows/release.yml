@@ -348,6 +348,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          # This only ever adds the compare link: it lists merged PRs and this
+          # repo merges locally. What a release changed is written by hand
+          # into the body below, from the draft `make changelog` prints (it is
+          # the last thing `make version-bump` tells you to run).
           generate_release_notes: true
           body: |
             ## ignis v${{ needs.version.outputs.version }}

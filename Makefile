@@ -454,11 +454,27 @@ version-check: ## The release workflow's version comparison, plus the two lockfi
 version-bump: ## Bump the release version (T=patch|minor|major, or V=x.y.z[-rc.1])
 	@$(VERSION_TOOL) $(VERSION_BUMP_ARGS)
 
+# FROM defaults to the last v* tag and TO to HEAD, so a bare `make changelog`
+# drafts the release being prepared. TO without FROM would land in $1 and
+# silently draft the wrong range, so it is refused rather than guessed.
+CHANGELOG_ARGS = $(strip   $(if $(and $(strip $(TO)),$(if $(strip $(FROM)),,x)),     $(error TO= needs FROM= -- usage: make changelog [FROM=v0.1.1 [TO=v0.1.2]]))   $(strip $(FROM)) $(strip $(TO)))
+
+.PHONY: changelog
+changelog: ## Draft the release notes since the last tag (FROM=/TO= for another range)
+	@$(CHANGELOG_TOOL) $(CHANGELOG_ARGS)
+
 # Not part of `make ci`: it drives the real files and puts them back with
 # git, and a check that writes to tracked files has no business inside one.
 .PHONY: version-selftest
 version-selftest: ## Test the version tool itself -- both implementations, compared
 	@bash mk/version-selftest.sh
+
+# This one builds its own repository under a temp directory and stubs gh, so
+# unlike version-selftest it writes nothing and reaches nothing -- it could
+# join `make ci` the day CI runs the Makefile's own tests.
+.PHONY: changelog-selftest
+changelog-selftest: ## Test the changelog draft -- a throwaway repo, a stubbed gh
+	@bash mk/changelog-selftest.sh
 
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)

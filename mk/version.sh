@@ -187,6 +187,7 @@ write_version() {
     show
     echo
     echo "next:"
+    echo "  make changelog                                             # the draft the commit body and the release notes are written from"
     echo "  git commit -m 'ignis $new' -- Cargo.toml Cargo.lock web/package.json web/package-lock.json && git push origin main"
     echo "  git tag -a v$new -m 'ignis $new' && git push origin v$new   # builds and publishes the release"
 }

@@ -15,6 +15,8 @@
 #                          (or the session dying) stops both
 #   VERSION_TOOL           show / check / set / bump the release version
 #                          (mk/version.sh on both hosts -- see below)
+#   CHANGELOG_TOOL         draft the release notes for a commit range
+#                          (mk/changelog.sh on both hosts -- see below)
 #   OS_REQUIRED_TOOLS      tools `make doctor` requires
 #   OS_OPTIONAL_TOOLS      tools `make doctor` only reports
 #   OS_TOOL_HINT           where those tools come from
@@ -55,10 +57,11 @@ SERVER_STOP = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action stop
 SERVER_STATUS = $(SERVER_CTL_ENV) $(PS) -File mk/windows/server.ps1 -Action status
 DEV_UI = $(SERVER_CTL_ENV) $(PS) -File mk/windows/devui.ps1
 
-# The one hook here that is not PowerShell: mk/version.sh is text editing
-# over four files, and the sh this file already requires (the $(error) above)
-# is Git for Windows', which ships bash.
+# The two hooks here that are not PowerShell: mk/version.sh is text editing
+# over four files and mk/changelog.sh is git and gh, and the sh this file
+# already requires (the $(error) above) is Git for Windows', which ships bash.
 VERSION_TOOL = bash mk/version.sh
+CHANGELOG_TOOL = bash mk/changelog.sh
 
 OS_REQUIRED_TOOLS := powershell
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi

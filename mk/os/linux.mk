@@ -41,7 +41,9 @@ DEV_UI = $(call todo,run-ui / dev-ui)
 
 # Not a todo, and not OS-specific either: mk/version.sh is text editing over
 # four files and serves both hosts, so mk/os/windows.mk names the same one.
+# mk/changelog.sh is git and gh, which are the same on either host.
 VERSION_TOOL = bash mk/version.sh
+CHANGELOG_TOOL = bash mk/changelog.sh
 
 OS_REQUIRED_TOOLS :=
 OS_OPTIONAL_TOOLS := cmake ninja nvidia-smi
