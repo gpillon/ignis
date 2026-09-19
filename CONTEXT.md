@@ -25,8 +25,18 @@ When output names a domain concept, use the term as defined here.
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
 - **Lane tag** — the request's own statement of its class, carried as an ignis
   extension field on the request and echoed in the request log. Two classes,
-  `Interactive` and `Agent`; absent or unrecognized means `Interactive`. It is
-  what makes a per-class gate cell and the **eviction priority** mean anything.
+  `Interactive` and `Agent`; absent or unrecognized means `Interactive`, except
+  on a **decision** request, where it means `Agent`. It is what makes a
+  per-class gate cell and the **eviction priority** mean anything.
+
+  The exception is not a preference about importance. A decision holds no
+  residency for an eviction to take — it prefills, reads and ends — so
+  `Interactive` would buy it a protection it cannot use and spend one a
+  conversation would. And a decision never takes a decode lane, only the
+  single global **prefill lane**, so a fan-out of twenty questions is twenty
+  prefills queued on it; under `Interactive` they would cut ahead of every
+  waiting conversation. A caller whose single decision really is interactive
+  says so with the tag.
 - **Prefill lane** — the single global prefill slot: exactly one request at a
   time holds device-resident **prefill progress** and consumes chunks, and
   every other prefill queues behind it. It is a slot, not a promise about
