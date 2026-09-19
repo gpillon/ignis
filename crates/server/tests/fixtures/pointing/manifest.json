@@ -1,0 +1,68 @@
+{
+  "side": 4096,
+  "scenes": [
+    {
+      "id": "large",
+      "image": "large.png",
+      "width": 4096,
+      "height": 4096,
+      "blue_box": [
+        2600,
+        3200,
+        3700,
+        3480
+      ],
+      "blue_centre": [
+        3150,
+        3340
+      ],
+      "blue_size": [
+        1100,
+        280
+      ],
+      "blue_fraction_of_side": 0.2686
+    },
+    {
+      "id": "medium",
+      "image": "medium.png",
+      "width": 4096,
+      "height": 4096,
+      "blue_box": [
+        1000,
+        900,
+        1560,
+        1050
+      ],
+      "blue_centre": [
+        1280,
+        975
+      ],
+      "blue_size": [
+        560,
+        150
+      ],
+      "blue_fraction_of_side": 0.1367
+    },
+    {
+      "id": "small",
+      "image": "small.png",
+      "width": 4096,
+      "height": 4096,
+      "blue_box": [
+        3500,
+        600,
+        3820,
+        690
+      ],
+      "blue_centre": [
+        3660,
+        645
+      ],
+      "blue_size": [
+        320,
+        90
+      ],
+      "blue_fraction_of_side": 0.0781
+    }
+  ]
+}
