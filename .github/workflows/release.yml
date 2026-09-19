@@ -101,6 +101,9 @@ jobs:
           target: artifacts
           platforms: linux/amd64
           outputs: type=local,dest=./out/linux
+          # A SLSA attestation belongs on an image, not loose in a tarball:
+          # left on, buildx drops a provenance.json next to the binaries.
+          provenance: false
           # An explicit scope, shared with image.yml: the default is per
           # workflow, which would compile the same kernel twice per push.
           cache-from: type=gha,scope=linux-cuda
@@ -215,13 +218,23 @@ jobs:
           # CUDA_PATH arrives in Windows spelling, which git bash will not
           # glob. A missing DLL is a zip that does not run, so say so here
           # rather than ship one.
+          #
+          # A bash glob, not `ls`: an unmatched glob makes ls exit 2, and
+          # under `set -e` that kills the step before the check below can
+          # report anything -- which is exactly how this failed once, with no
+          # output at all. An unmatched glob simply stays literal here, and
+          # `-f` rejects it.
           cuda="$(cygpath -u "$CUDA_PATH")"
-          dll=$(ls "$cuda"/bin/x64/cudart64_*.dll "$cuda"/bin/cudart64_*.dll 2>/dev/null | head -1)
+          dll=""
+          for candidate in "$cuda"/bin/x64/cudart64_*.dll "$cuda"/bin/cudart64_*.dll; do
+            if [ -f "$candidate" ]; then dll="$candidate"; break; fi
+          done
           if [ -z "$dll" ]; then
             echo "::error::no cudart64_*.dll under $cuda/bin or $cuda/bin/x64"
-            ls -R "$cuda"/bin | head -40
+            find "$cuda" -name 'cudart64*' -o -name '*.dll' | head -40
             exit 1
           fi
+          echo "cudart: $dll"
           cp "$dll" "$name"/
           7z a -tzip "$name.zip" "$name" >/dev/null
           sha256sum "$name.zip" | tee "$name.zip.sha256"
