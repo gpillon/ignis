@@ -5,7 +5,7 @@
 - Observed: 2026-09-19
 - Last verified: 2026-09-19
 - Scope: serving / classification readout, prefill logits, `Compute` seam
-- Related: `crates/server/tests/classify_readout_gpu.rs`, GitHub #72 (`out_logits`), #191/#193 (prompt reuse), SemIf (github.com/TheoLeeCJ/SemIf), TypeSafe Jev `POST /v1/systemone`
+- Related: `crates/server/tests/classify_readout_gpu.rs`, `classify_vision_readout_gpu.rs`, `slot_alphabet.rs`, GitHub #72 (`out_logits`), #178 (multimodal prefill), #191/#193 (prompt reuse), #235 (shared-suffix study), SemIf (github.com/TheoLeeCJ/SemIf), TypeSafe Jev `POST /v1/systemone`
 - Superseded by: none
 
 ## Question
@@ -73,6 +73,37 @@ Calibration, reading the restricted softmax's top probability as a confidence:
 Median top probability: 0.991 on correct rows, 0.634 on the nine wrong ones.
 No wrong row has low `allowed_mass` (lowest is 0.9598).
 
+### How many answer slots exist
+
+`crates/server/tests/slot_alphabet.rs`, CPU-only. Labels that are exactly one
+token and decode back to themselves, in this tokenizer:
+
+| Alphabet | Clean single tokens |
+|---|---|
+| `A`–`Z` | 26 / 26 |
+| `a`–`z` | 26 / 26 |
+| `0`–`9` | 10 / 10 |
+| `AA`–`ZZ` | 562 / 676 |
+| `aa`–`zz` | 631 / 676 |
+| `0`–`255` | **10 / 256** |
+| Pooled, distinct | **1,255** (0 id collisions) |
+
+### The same readout over an image
+
+`crates/server/tests/classify_vision_readout_gpu.rs`, under the GPU profile:
+the four vision canary images as evidence, the criterion and options as text,
+three close distractors each (`42`/`47`/`74`, `Two`/`Three`/`Four`, a
+near-miss of the same error string).
+
+| Canary | Tokens (image columns) | Correct | `allowed_mass` | Prefill |
+|---|---|---|---|---|
+| number | 286 (196) | yes | 1.0000 | 76.9 ms |
+| colour | 152 (64) | yes | 0.9992 | 39.8 ms |
+| circles | 183 (96) | yes | 0.9998 | 39.2 ms |
+| text | 200 (100) | yes | 0.9997 | 38.4 ms |
+
+4/4 correct, `argmax_in_slots` 4/4, top probability ≥ 0.999 on every row.
+
 SemIf's own reference points, for orientation only — a different model (4B),
 a different runtime (HF transformers), a different card (3090): balanced
 accuracy 0.813 on this fixture, 2.33 decisions/s fresh and 20.03 with prefix
@@ -103,6 +134,21 @@ endpoint as a `confidence` field, as Jev's own `choice` and `score` answers do.
 At 36.5 ms and zero decoded tokens per decision, the entire GPU cost of a
 decision is one prefill of ~132 tokens.
 
+**The label alphabet is not the ceiling.** 1,255 distinct single-token labels
+exist here, five times Jev's 255-option limit, so an extended alphabet
+(`A`–`Z`, `a`–`z`, `0`–`9`, then bigrams) removes the 16-option cap outright
+and TypeSafe's documented two-stage pattern is not needed for the mechanism.
+The one alphabet that does **not** work is the obvious one: numbering options
+`1`..`255` would read the logit of `"1"` for options 1, 10 and 100 alike,
+because only `0`–`9` are single tokens.
+
+**The readout holds over an image.** `prefill_program_multimodal` takes the
+same `out_logits` buffer, and on the four vision canaries the declared options
+hold ≥ 0.999 of the distribution with the unrestricted winner in slot every
+time. Four rows cannot support an accuracy claim and none is made; what they
+establish is that the mechanism does not care whether the evidence is text or
+pixels.
+
 ## Implications
 
 - **Nothing below the kernel leaf needs to change.** `cuda_leaf.rs`'s
@@ -127,6 +173,16 @@ decision is one prefill of ~132 tokens.
   was measured on a different engine and does not transfer.
 - **28 decisions/s is the floor**, measured serially with no reuse and no
   batching, both of which the engine already does.
+- **An image-evidenced decision is the one thing Jev cannot do.** Its `state`
+  is `string | object | array`. If ignis's takes content parts, the endpoint
+  is a superset rather than a clone — at the cost of the media encode (the
+  image columns dominate: 196 columns cost 76.9 ms against 64 columns'
+  39.8 ms).
+- **N questions over one state fan out as N internal requests** (option A):
+  nothing new in the scheduler, and the existing batched prefill groups them
+  because they arrive together. The single-request, N-suffix alternative is
+  GitHub #235, and the measurement that decides it is how well A already
+  groups.
 
 ## Limits and unknowns
 
@@ -136,9 +192,18 @@ decision is one prefill of ~132 tokens.
   figures are properties of the model's distribution and are more robust to it.
 - 118/118 above the 0.9 threshold is 118 samples, not a guarantee. The
   threshold needs re-measuring on any workload before it is trusted to abstain.
-- Two and three options only. Jev allows up to 255, which no single-token
-  uppercase-letter alphabet reaches (16 here, ~62 across `A-Za-z0-9`). Whether
-  the mass stays on-slot with 16 or 60 declared letters is unmeasured.
+- Two and three options only, on both fixtures. The slot count above is a
+  property of the *tokenizer*; whether the model still puts its mass on the
+  declared slots when there are 60 or 255 of them — and when the labels are
+  `AA` and `JK` rather than the `A`/`B`/`C` of every multiple-choice question
+  it was trained on — is the measurement that sets the real ceiling, and it
+  has not been made.
+- The vision rows are four, with a hand-written option set. They are a
+  mechanism check. The text path's boundary verification has no counterpart
+  there either: `prepare_prompt` returns scattered token ids rather than a
+  string to append a letter to, so slot cleanliness is checked but the answer
+  boundary is assumed from the shared `<|im_start|>assistant
+` tail.
 - The prompt is SemIf's, tuned on a 4B. `serde_json`'s compact separators
   differ from Python's `json.dumps` defaults (`,`/`:` against `, `/`: `), so
   the token sequence is not byte-identical to theirs.
