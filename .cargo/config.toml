@@ -1,6 +1,13 @@
-# ignis is a Windows MSVC project: the kernel leaf is an MSVC/COFF static
+# On Windows ignis is an MSVC project: the kernel leaf is an MSVC/COFF static
 # library (nvcc + cl) linked into the Rust binaries, so builds must use the
 # MSVC target (x86_64-w64-mingw32-gcc cannot consume the MSVC CRT import
 # libs). Project-local: does not change the machine-wide rustup default.
+#
+# Cargo has no host condition for `build.target`, so this pin is in force on
+# Linux too (GitHub #167). Everything that builds there passes its own target
+# and so overrides it: the Makefile through CARGO_TARGET, the Containerfile
+# and the CI workflow through an explicit --target. A bare `cargo` command on
+# Linux needs `CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu` in the
+# environment, otherwise it asks for a Windows target that is not installed.
 [build]
 target = "x86_64-pc-windows-msvc"

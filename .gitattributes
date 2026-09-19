@@ -7,3 +7,8 @@ kernel/vendor/** -text
 # The Makefile and its includes run under a POSIX sh on every OS: keep them LF.
 Makefile text eol=lf
 *.mk text eol=lf
+
+# Shell scripts are executed by bash on Linux (kernel/build.sh, mk/linux/*.sh,
+# the Containerfile's build stage). A CRLF checkout on a Windows worktree that
+# is then copied into a container dies with a CR in every command name.
+*.sh text eol=lf

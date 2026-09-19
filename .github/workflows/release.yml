@@ -1,0 +1,273 @@
+# Build ignis for Windows and Linux (x86_64, CUDA/SM120a) and, on a v* tag,
+# publish the binaries as a GitHub Release and the linux/amd64 image to GHCR.
+#
+# A push to main or to a ci/** branch runs the same two builds without
+# publishing anything: that is the dry run for a release, so a tag is only
+# ever cut on a pipeline already known to be green.
+#
+# Both halves build the real GPU engine (`--features cuda`). No runner has an
+# NVIDIA GPU, so nothing here is *run* -- the kernel leaf is compiled for
+# SM120a and linked against the toolkit's driver stubs (crates/artifact/
+# build.rs). Tests stay on the machine with the 5090 (docs/agents/testing.md).
+
+name: release
+
+on:
+  push:
+    branches: [main, "ci/**"]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CUDA_VERSION: "13.1.1"
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # The version the artifacts are named after. On a tag it must be the version
+  # the workspace already declares -- a tag that disagrees with Cargo.toml is
+  # a release whose `--version` output lies, so it fails here instead.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          web_version=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' web/package.json | head -1)
+          echo "Cargo.toml       $cargo_version"
+          echo "web/package.json $web_version"
+          if [ "$cargo_version" != "$web_version" ]; then
+            echo "::error::workspace version ($cargo_version) and web/package.json ($web_version) disagree"
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error::tag v$tag_version does not match workspace.package.version $cargo_version"
+              exit 1
+            fi
+            echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${cargo_version}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Linux: one build, inside the Containerfile. Its `artifacts` stage holds
+  # exactly the binaries the runtime image runs, so the tarball and the image
+  # can never drift apart, and the CUDA toolkit is installed once (in the
+  # base image) rather than once per job.
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The nvidia/cuda devel image plus a full cargo target directory does
+      # not fit next to the runner's preinstalled SDKs.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: needs.version.outputs.is_release == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # The release payload, exported straight out of the build.
+      - name: Build the Linux binaries
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          target: artifacts
+          platforms: linux/amd64
+          outputs: type=local,dest=./out/linux
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 4 cores, 16 GB: nvcc on the W4A4/TMA units needs more than 2 GB
+          # each, so the width is capped below the core count.
+          build-args: |
+            KERNEL_BUILD_JOBS=3
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          target: runtime
+          platforms: linux/amd64
+          push: ${{ needs.version.outputs.is_release == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # No cache-to here: this shares its whole `build` stage with the step
+          # above, which already exported it, and the builder is still warm.
+          cache-from: type=gha
+          build-args: |
+            KERNEL_BUILD_JOBS=3
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ignis-v${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu"
+          mv out/linux "$name"
+          chmod +x "$name"/ignis-server "$name"/ignis-bench "$name"/ignis-artifact-inspect
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" | tee "$name.tar.gz.sha256"
+          ls -l "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ignis-v*-x86_64-unknown-linux-gnu.tar.gz*
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the Playground
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda-${{ env.CUDA_VERSION }}
+
+      # The full network install rather than a sub-package list: CUDA 13
+      # renamed several components, and a wrong name fails the job an hour
+      # into it. Narrowing this is an optimisation for once the pipeline is
+      # known good.
+      - name: Install the CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+
+      # kernel/build.ps1 is cmake + ninja + nvcc and takes the better part of
+      # an hour on a 4-core runner. It rebuilds only what changed, so the
+      # build directory is cached on the kernel sources themselves.
+      - name: Cache the kernel leaf build
+        uses: actions/cache@v4
+        with:
+          path: kernel/build
+          key: kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('kernel/CMakeLists.txt', 'kernel/build.ps1', 'kernel/src/**', 'kernel/include/**', 'kernel/tests/**', 'kernel/vendor/src/**', 'kernel/vendor/include/**') }}
+          restore-keys: |
+            kernel-${{ runner.os }}-cuda${{ env.CUDA_VERSION }}-
+
+      - name: Build
+        shell: pwsh
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc `
+            --workspace --features ignis-server/cuda
+
+      - name: Package
+        shell: bash
+        env:
+          CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
+        run: |
+          set -euo pipefail
+          name="ignis-v${{ needs.version.outputs.version }}-x86_64-pc-windows-msvc"
+          mkdir "$name"
+          cp target/x86_64-pc-windows-msvc/release/ignis-server.exe "$name"/
+          cp target/x86_64-pc-windows-msvc/release/ignis-bench.exe "$name"/
+          cp target/x86_64-pc-windows-msvc/release/ignis-artifact-inspect.exe "$name"/
+          cp README.md "$name"/
+          cp kernel/NOTICE "$name"/NOTICE
+          # cudart is the one CUDA library the binaries load that does not
+          # ship with the driver; NVIDIA lists it as redistributable.
+          cp "$CUDA_PATH"/bin/cudart64_*.dll "$name"/
+          7z a -tzip "$name.zip" "$name" >/dev/null
+          sha256sum "$name.zip" | tee "$name.zip.sha256"
+          ls -l "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ignis-v*-x86_64-pc-windows-msvc.zip*
+          if-no-files-found: error
+
+  release:
+    needs: [version, linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## ignis v${{ needs.version.outputs.version }}
+
+            ### Container image (linux/amd64)
+
+            ```
+            podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
+              -v /path/to/models:/models:ro \
+              -e IGNIS_ARTIFACT=/models/<name>.ninfer \
+              ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+            ```
+
+            (`docker`: `--gpus all` in place of `--device`.) The image carries
+            the CUDA runtime but no driver — the host's NVIDIA driver is
+            injected by the container runtime.
+
+            ### Binaries
+
+            The kernel is compiled for **SM120a** (RTX 5090 / Blackwell
+            consumer) only, and the engine needs a `.ninfer` artifact, which
+            is not part of this release. The Linux tarball needs the CUDA 13
+            runtime on the host; the Windows zip carries `cudart64_*.dll`.
+            Both need an NVIDIA driver new enough for CUDA 13.

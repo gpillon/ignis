@@ -1,0 +1,38 @@
+# What never enters the image build context (Containerfile). The repo root
+# holds multi-hundred-MB server logs and a Windows `target/`, so this file is
+# the difference between a two-second context upload and a ten-minute one.
+
+# Build outputs. kernel/build/ especially: it carries a CMakeCache.txt written
+# by the MSVC generator, and cmake refuses to reconfigure someone else's cache
+# in the container ("CMakeCache.txt directory is different").
+target/
+kernel/build*/
+web/node_modules/
+web/dist/
+web/.vitest/
+node_modules/
+
+# Logs (ignis-server.log alone is ~270 MB) and profiler captures, which embed
+# the profiled process's environment.
+*.log
+*.log.err
+_bench_logs/
+*.nsys-rep
+*.nsys-rep.sqlite
+*.qdrep
+
+# The artifact store is a symlink to a path outside the repo; it resolves to
+# nothing in the build context, and the model is mounted at runtime anyway.
+models
+
+# Scratch, local state and recorded traces.
+.scratch/
+.git/
+.github/
+.qwen/
+.claude/
+.codex/
+local.mk
+bench/traces/*.jsonl
+__pycache__/
+*.pyc

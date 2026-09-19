@@ -2,10 +2,15 @@
 # built on a vendored subtree of the reference's core and ops (ADR 0010).
 # See kernel/NOTICE and kernel/vendor/VENDOR.md for provenance.
 #
-# Configure/build: kernel/build.ps1 (plain PowerShell, imports the MSVC env
-# itself — same pattern as ninfer's configure-ninja.ps1/build-ninja.ps1).
-# Run the leaf's own tests: kernel/build.ps1 -Test (or ctest from the build
-# directory).
+# Configure/build: kernel/build.ps1 on Windows (plain PowerShell, imports the
+# MSVC env itself — same pattern as ninfer's configure-ninja.ps1/
+# build-ninja.ps1), kernel/build.sh on Linux (the same cmake + Ninja + nvcc
+# configure, no env to import). Run the leaf's own tests: kernel/build.ps1
+# -Test / kernel/build.sh --test (or ctest from the build directory).
+#
+# Both hosts produce the same two static archives into kernel/build/, under
+# the platform's own naming (ignis_kernel.lib / libignis_kernel.a), which
+# crates/artifact/build.rs links into the Rust binaries.
 
 cmake_minimum_required(VERSION 3.28)
 project(ignis-kernel LANGUAGES CXX CUDA)
@@ -26,9 +31,19 @@ endif()
 # __security_check_cookie, __GSHandlerCheck) that MSVC emits by default. /GS is
 # irrelevant for compute kernels (no stack-buffer semantics), so disable it —
 # for the C++ translation units of the vendored core as well as for CUDA. The
-# final Rust link provides the MSVC CRT (build.rs).
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
+# final Rust link provides the MSVC CRT (build.rs). MSVC-only: /GS has no
+# GCC/Clang spelling, and those hosts emit no such symbols to begin with.
+if(MSVC)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -GS-")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GS-")
+endif()
+
+# rustc links ELF binaries as PIE, and the ELF linker refuses a non-PIC object
+# in one ("relocation R_X86_64_32S against `.rodata' can not be used when
+# making a PIE object"). So the archives must be position-independent on
+# Linux. Inert on MSVC — COFF has no PIC/non-PIC distinction, and CMake
+# ignores the property there.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # CUDA::cudart (P1-07, GitHub #43; also needed by P1-08, GitHub #44; also
 # needed by the P1-10/#46 bf16/w8 dispatch below, and by P1-16/#52's
@@ -248,10 +263,10 @@ add_library(ignis_vendor STATIC
   ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
   ${IGNIS_VENDOR_DIR}/src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu
 )
-set_target_properties(ignis_vendor PROPERTIES
-  PREFIX ""
-  OUTPUT_NAME "ignis_vendor"
-)
+# No PREFIX override: the platform default is what crates/artifact/build.rs
+# expects on each host — "" on MSVC (ignis_vendor.lib), "lib" on Linux, where
+# `-lignis_*` only finds libignis_vendor.a.
+set_target_properties(ignis_vendor PROPERTIES OUTPUT_NAME "ignis_vendor")
 target_include_directories(ignis_vendor PUBLIC
   ${IGNIS_VENDOR_DIR}/src
   ${IGNIS_VENDOR_DIR}/include
@@ -281,10 +296,10 @@ file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu
 )
 add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS})
-set_target_properties(ignis_kernel PROPERTIES
-  PREFIX ""
-  OUTPUT_NAME "ignis_kernel"
-)
+# No PREFIX override: the platform default is what crates/artifact/build.rs
+# expects on each host — "" on MSVC (ignis_kernel.lib), "lib" on Linux, where
+# `-lignis_*` only finds libignis_kernel.a.
+set_target_properties(ignis_kernel PROPERTIES OUTPUT_NAME "ignis_kernel")
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
 # GitHub #210: device memory as NVML reports it, read before a context exists
