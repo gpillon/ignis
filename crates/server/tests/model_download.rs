@@ -66,6 +66,11 @@ struct Served {
     truncate_after: AtomicUsize,
     /// Ignore `Range` and always answer `200` with the whole body.
     ignore_range: AtomicUsize,
+    /// Answer every ranged request `416`, as a source whose file is shorter
+    /// than the range asked for does.
+    range_not_satisfiable: AtomicUsize,
+    /// Serve this many extra bytes past the body (0 = none).
+    extra_bytes: AtomicUsize,
 }
 
 /// `GET /{owner}/{name}/resolve/main/{file}` — the route Hugging Face serves
@@ -90,7 +95,14 @@ async fn resolve(
         .map(|s| s.to_owned());
     state.ranges.lock().expect("ranges").push(range.clone());
 
-    let body = artifact_bytes();
+    if range.is_some() && state.range_not_satisfiable.load(Ordering::SeqCst) == 1 {
+        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    }
+    let mut body = artifact_bytes();
+    body.extend(std::iter::repeat_n(
+        0xABu8,
+        state.extra_bytes.load(Ordering::SeqCst),
+    ));
     let ignore_range = state.ignore_range.load(Ordering::SeqCst) == 1;
     let start = match (&range, ignore_range) {
         (Some(raw), false) => raw
@@ -297,6 +309,66 @@ async fn a_server_that_ignores_the_range_restarts_the_transfer_cleanly() {
     state.ignore_range.store(1, Ordering::SeqCst);
     let path = downloader.fetch(&entry, &dir).await.expect("restarted fetch");
 
+    assert_eq!(std::fs::read(&path).expect("artifact"), body);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_source_longer_than_the_pin_is_discarded_mid_transfer() {
+    // A body that is still arriving past the published size is a different
+    // file, whatever its first bytes were: stop at the chunk that crosses the
+    // line rather than write the rest, and leave nothing to resume.
+    let (addr, state) = repo_server().await;
+    let body = artifact_bytes();
+    let digest: &'static str = Box::leak(sha256_hex(&body).into_boxed_str());
+    let entry = entry(body.len() as u64, digest);
+    let dir = temp_dir("toolong");
+    state.extra_bytes.store(8192, Ordering::SeqCst);
+
+    let downloader = Downloader::with_base(format!("http://{addr}")).expect("downloader");
+    let err = downloader
+        .fetch(&entry, &dir)
+        .await
+        .expect_err("a longer source must refuse the transfer");
+
+    assert!(err.to_string().contains("longer"), "{err}");
+    assert!(!dir.join(ARTIFACT).exists());
+    assert!(
+        !dir.join(format!("{ARTIFACT}.part")).exists(),
+        "nothing is left for the next start to resume"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_partial_the_source_cannot_satisfy_is_discarded_instead_of_retried_forever() {
+    // The source's file ends before the `.part` does (it was republished
+    // shorter): the ranged request comes back `416`. Keeping the partial file
+    // would send the same unsatisfiable range on every start from now on.
+    let (addr, state) = repo_server().await;
+    let body = artifact_bytes();
+    let digest: &'static str = Box::leak(sha256_hex(&body).into_boxed_str());
+    let entry = entry(body.len() as u64, digest);
+    let dir = temp_dir("unsatisfiable");
+    let downloader = Downloader::with_base(format!("http://{addr}")).expect("downloader");
+
+    state.truncate_after.store(4096, Ordering::SeqCst);
+    downloader.fetch(&entry, &dir).await.expect_err("cut short");
+    state.truncate_after.store(0, Ordering::SeqCst);
+    state.range_not_satisfiable.store(1, Ordering::SeqCst);
+    let err = downloader
+        .fetch(&entry, &dir)
+        .await
+        .expect_err("416 must refuse the transfer");
+    assert!(err.to_string().contains("4096"), "{err}");
+    assert!(
+        !dir.join(format!("{ARTIFACT}.part")).exists(),
+        "the unresumable part file is discarded"
+    );
+
+    // And the start after that one fetches the artifact whole.
+    state.range_not_satisfiable.store(0, Ordering::SeqCst);
+    let path = downloader.fetch(&entry, &dir).await.expect("clean fetch");
     assert_eq!(std::fs::read(&path).expect("artifact"), body);
     let _ = std::fs::remove_dir_all(&dir);
 }

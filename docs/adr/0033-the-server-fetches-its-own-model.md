@@ -44,9 +44,12 @@ binary (`crates/server/src/download.rs`).
   published `.sha256` sits in the same trust domain as the artifact it
   describes, so it can attest nothing about it. The transfer streams to
   `<name>.part`, hashes as it writes, and renames only once the length and
-  digest match. A digest mismatch deletes the part file; a short body keeps
-  it, because that is a dropped connection and the next start resumes it with
-  `Range`.
+  digest match. What becomes of the part file says which failure it was: a
+  body that stopped early keeps it, because that is a dropped connection and
+  the next start resumes it with `Range`; a body that hashes wrong, one that
+  runs past the pinned length, and a partial the source answers `416` to are
+  all deleted — they are not this artifact, and keeping them would make every
+  later start resume bytes that can never verify.
 - **The sidecar first.** The provenance record (ADR 0002) is one small
   request and the loader refuses a load without it, so it is fetched before
   the body: a repo that cannot serve it fails in a second instead of an hour.
@@ -63,17 +66,20 @@ binary (`crates/server/src/download.rs`).
   gets `-v …:/models --model-download-path /models`.
 - Adding a model is a registry row — id, repo, two file names, size, digest —
   and nothing else.
-- The pinned digest means a republished artifact under the same file name
-  fails verification here. That is the intended direction of the failure: a
-  new image is a new registry row and a new binary, not a silent swap.
+- The pins mean a republished artifact under the same file name fails here —
+  by length if it grew or shrank, by digest if it did neither. That is the
+  intended direction of the failure: a new image is a new registry row and a
+  new binary, not a silent swap.
 
 ## Considered Options
 
 - **A `models.json` next to the binary** — rejected: a file an attacker can
   edit is not a trust anchor, and a registry that ships with the engine
   cannot drift from the loader that consumes it.
-- **Trusting the repo's `.sha256`** — rejected, same trust domain (see
-  `docs/findings/`'s fail-closed rule).
+- **Trusting the repo's `.sha256`** — rejected: a digest served by the same
+  repo, over the same connection, as the artifact it describes attests only
+  that the transfer was not corrupted — which the length check already tells
+  us — and nothing about what was published.
 - **Downloading on a non-cuda build too** — rejected: 19.4 GB of weights for
   a backend that will never bind them.
 - **Asking even without a TTY** (a timeout, defaulting to no) — rejected: a

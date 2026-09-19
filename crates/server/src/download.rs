@@ -193,9 +193,16 @@ pub fn artifact_source(
 /// the transfer against a local server instead of the internet.
 pub const HUGGINGFACE: &str = "https://huggingface.co";
 
-/// How long the connection alone may take. The transfer itself is deliberately
-/// **not** capped: 19.4 GB over a slow line is a long download, not a hung one.
+/// How long the connection alone may take. The transfer as a whole is
+/// deliberately **not** capped: 19.4 GB over a slow line is a long download,
+/// not a hung one.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the transfer may go without a single byte arriving. A slow line
+/// keeps its bytes coming and is never cut; a peer that has stopped talking
+/// altogether must not hold the start open forever, since nothing downstream
+/// of it has a deadline of its own.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read in this much of the `.part` at a time when a resumed transfer replays
 /// it through the hasher.
@@ -243,6 +250,7 @@ impl Downloader {
     pub fn with_base(base: impl Into<String>) -> Result<Self, DownloadError> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .user_agent(concat!("ignis/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| DownloadError::new(format!("HTTP client: {err}")))?;
@@ -317,11 +325,15 @@ impl Downloader {
     async fn fetch_artifact(&self, entry: &ModelEntry, path: &Path) -> Result<(), DownloadError> {
         let part = part_path(path);
         let url = self.url(entry.repo, entry.artifact_file);
-        // What an earlier attempt left. More bytes than the pin names is not
-        // a resume point but a different file, so it starts over.
+        // What an earlier attempt left. As many bytes as the pin names (or
+        // more) is not a resume point but a different file — the digest check
+        // never passed on it, so it is discarded rather than continued.
         let mut have = match tokio::fs::metadata(&part).await {
             Ok(meta) if meta.len() < entry.bytes => meta.len(),
-            Ok(_) => 0,
+            Ok(_) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                0
+            }
             Err(_) => 0,
         };
         let mut hasher = Sha256::new();
@@ -338,6 +350,16 @@ impl Downloader {
             .await
             .map_err(|err| DownloadError::new(format!("GET {url}: {err}")))?;
         let status = response.status();
+        // The source has no bytes past where the partial file ends: it is not
+        // the file this `.part` was the start of. Keeping it would send the
+        // same unsatisfiable range on every start from now on, so it goes.
+        if have > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(DownloadError::new(format!(
+                "{}: the source has no bytes past {have}, where the partial download ends — it was discarded, start again to fetch the artifact whole",
+                entry.artifact_file
+            )));
+        }
         if !status.is_success() {
             return Err(DownloadError::new(format!(
                 "GET {url}: {} {}",
@@ -385,6 +407,17 @@ impl Downloader {
                 .map_err(|err| DownloadError::new(format!("write {}: {err}", part.display())))?;
             hasher.update(&chunk);
             written += chunk.len() as u64;
+            // A body longer than the pin is a different file, whatever its
+            // first bytes were. Stopping here costs one chunk instead of the
+            // rest of the transfer, and the part file goes with it.
+            if written > entry.bytes {
+                drop(file);
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(DownloadError::new(format!(
+                    "{}: the source is longer than the published {} bytes — it is not this artifact, and the download was discarded",
+                    entry.artifact_file, entry.bytes
+                )));
+            }
             let done = written as f64 / entry.bytes.max(1) as f64;
             if done >= next_log {
                 next_log = done + PROGRESS_STEP;
@@ -502,14 +535,32 @@ async fn open_part(part: &Path, have: u64) -> Result<tokio::fs::File, DownloadEr
 /// carries the plain lines `mk/windows/common.ps1` parses (the generated API
 /// key, the public URL).
 pub fn ask_on_terminal(entry: &ModelEntry, path: &Path) -> Option<bool> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() {
         return None;
     }
-    let mut stderr = std::io::stderr();
+    Some(ask(
+        entry,
+        path,
+        &mut std::io::stderr(),
+        &mut std::io::stdin().lock(),
+    ))
+}
+
+/// The question itself, over any pair of streams — the seam the tests drive.
+///
+/// Everything that is not a plain yes is a no, EOF and a stdin that cannot be
+/// read included: past this point the terminal is known to be there, so the
+/// only safe reading of "no answer" is the one that spends nothing.
+pub fn ask(
+    entry: &ModelEntry,
+    path: &Path,
+    out: &mut impl std::io::Write,
+    input: &mut impl std::io::BufRead,
+) -> bool {
     let _ = writeln!(
-        stderr,
+        out,
         "\nignis-server: no model at {}\n  {} is published at https://huggingface.co/{} ({:.1} GiB)\n  it will be saved as {}\n  (--no-model-download never asks; --model-download-path puts it elsewhere)",
         path.display(),
         entry.model,
@@ -517,19 +568,20 @@ pub fn ask_on_terminal(entry: &ModelEntry, path: &Path) -> Option<bool> {
         entry.gib(),
         path.display(),
     );
-    let _ = write!(stderr, "Download it now? [y/N] ");
-    let _ = stderr.flush();
+    let _ = write!(out, "Download it now? [y/N] ");
+    let _ = out.flush();
 
     let mut answer = String::new();
-    // EOF (a closed stdin) reads as no: the operator never said yes.
-    if std::io::stdin().lock().read_line(&mut answer).ok()? == 0 {
-        let _ = writeln!(stderr);
-        return Some(false);
+    match input.read_line(&mut answer) {
+        Ok(0) | Err(_) => {
+            let _ = writeln!(out);
+            false
+        }
+        Ok(_) => matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ),
     }
-    Some(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 #[cfg(test)]
@@ -684,6 +736,78 @@ mod tests {
                 dir
             }
         );
+    }
+
+    /// A stdin that fails instead of answering (a pipe that broke, a byte
+    /// sequence `read_line` cannot decode).
+    struct FailingInput;
+
+    impl std::io::Read for FailingInput {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stdin is gone"))
+        }
+    }
+
+    impl std::io::BufRead for FailingInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("stdin is gone"))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn the_question_names_the_size_the_source_and_the_destination() {
+        // AC6: what the operator is about to spend, where it comes from and
+        // where it lands — all three in the question, on the stream the
+        // caller gives it (stderr in `ask_on_terminal`, never stdout, which
+        // carries the lines `mk/windows/common.ps1` parses).
+        let entry = &REGISTRY[0];
+        let path = PathBuf::from(DIR).join(entry.artifact_file);
+        let mut out = Vec::new();
+        let answered = ask(entry, &path, &mut out, &mut &b"y\n"[..]);
+        let asked = String::from_utf8(out).expect("utf-8");
+        assert!(answered);
+        assert!(asked.contains(entry.model), "{asked}");
+        assert!(asked.contains(entry.repo), "{asked}");
+        assert!(asked.contains("18.1 GiB"), "{asked}");
+        assert!(asked.contains(&path.display().to_string()), "{asked}");
+        assert!(asked.contains("[y/N]"), "{asked}");
+    }
+
+    #[test]
+    fn only_a_plain_yes_spends_the_bandwidth() {
+        // AC6: EOF reads as no, and so does everything that is not a yes —
+        // 19.4 GB is not something to spend on a stray Enter.
+        let entry = &REGISTRY[0];
+        let path = PathBuf::from(DIR).join(entry.artifact_file);
+        for (answer, want) in [
+            ("y\n", true),
+            ("Y\n", true),
+            ("yes\n", true),
+            ("  yes  \n", true),
+            ("n\n", false),
+            ("\n", false),
+            ("later\n", false),
+            ("", false), // EOF: stdin closed without an answer
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(
+                ask(entry, &path, &mut out, &mut answer.as_bytes()),
+                want,
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stdin_that_cannot_be_read_is_a_no() {
+        // The terminal was there (`ask_on_terminal` checked), so a read that
+        // fails is not "nobody to ask" — it is an operator who never said
+        // yes, and the fail-closed answer is the one that downloads nothing.
+        let entry = &REGISTRY[0];
+        let path = PathBuf::from(DIR).join(entry.artifact_file);
+        let mut out = Vec::new();
+        assert!(!ask(entry, &path, &mut out, &mut FailingInput));
     }
 
     #[test]

@@ -72,8 +72,13 @@ build:
    flags.
 3. **AC3 — the artifact is verified before it is used.** The download
    streams to `<file>.part`, hashes as it writes, and renames to the final
-   name only when the digest and the byte count match the pinned values. A
-   mismatch deletes the `.part`, leaves no final file, and refuses the start.
+   name only when the digest and the byte count match the pinned values.
+   Nothing unverified is ever left under the artifact's real name. What
+   becomes of the `.part` depends on what went wrong: a body that stopped
+   early is a dropped connection, so it is kept for AC4 to resume; a body
+   that arrived whole and hashes to something else — or one longer than the
+   pin, or a partial the source can no longer satisfy — is not this artifact
+   at all, so it is deleted rather than resumed forever.
 4. **AC4 — an interrupted download resumes.** A second run sends
    `Range: bytes=<part len>-`, continues the digest over the bytes already
    on disk, and ends with the same verified file.

@@ -263,9 +263,10 @@ Playground is on because the server's own default is on. The image carries the C
 but no driver: the host's NVIDIA driver is injected by the container runtime,
 and the model is mounted, never baked in.
 
-Without `IGNIS_ARTIFACT` the image fetches the model into `./models` inside
-the container (ADR 0033 — nothing on stdin to ask, so it downloads). Mount a
-model directory and point the download at it to keep what it fetches:
+Without `IGNIS_ARTIFACT` the image fetches the model into its own working
+directory (`/home/ignis/models`, ADR 0033 — nothing on stdin to ask, so it
+downloads), and loses it with the container. Mount a model directory and
+point the download at it to keep what it fetches:
 
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \

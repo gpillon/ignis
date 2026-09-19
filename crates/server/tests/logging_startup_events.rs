@@ -37,11 +37,26 @@ fn run(args: &[&str]) -> serde_json::Value {
     run_with_envs(args, &[])
 }
 
+/// What every launch in this file carries (GitHub #234): a model is never
+/// fetched here, and never looked for in the repo's own `./models`. Without
+/// it, the same launches built with `--features cuda` would download 19.4 GB
+/// — or find the real artifact next to the test and load it on the GPU.
+fn no_download() -> [String; 3] {
+    let empty = std::env::temp_dir().join("ignis-logging-test-no-models");
+    let _ = std::fs::create_dir_all(&empty);
+    [
+        "--no-model-download".to_owned(),
+        "--model-download-path".to_owned(),
+        empty.display().to_string(),
+    ]
+}
+
 fn run_with_envs(args: &[&str], envs: &[(&str, &str)]) -> serde_json::Value {
     let exe = env!("CARGO_BIN_EXE_ignis-server");
     let mut command = Command::new(exe);
     command
         .args(args)
+        .args(no_download())
         .env("IGNIS_LOG_FORMAT", "json")
         .env("IGNIS_LOG_LEVEL", "info");
     for (key, value) in envs {
@@ -82,6 +97,7 @@ fn run_until(args: &[&str], envs: &[(&str, &str)], until: &[&str]) -> Vec<serde_
     command
         .args(args)
         .args(["--bind", "127.0.0.1:0"])
+        .args(no_download())
         .env("IGNIS_LOG_FORMAT", "json")
         .env("IGNIS_LOG_LEVEL", "info")
         .stdout(Stdio::piped());
@@ -224,9 +240,15 @@ fn no_artifact_emits_placeholder_template_then_process_started() {
 
     let placeholder = find(&records, "ignis.model.placeholder_template");
     assert_eq!(placeholder["severity_text"], "WARN");
-    // GitHub #234: which of the reasons it was. This binary is built without
-    // `--features cuda`, so it never fetches weights it could not run.
-    assert_eq!(placeholder["attributes"]["reason"], "not-supported");
+    // GitHub #234: which of the reasons it was. Without `--features cuda`
+    // this binary never fetches weights it could not run; with it, the
+    // harness's own `--no-model-download` is the reason. Either way the
+    // record says which, and neither downloads anything.
+    let reason = placeholder["attributes"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        matches!(reason, "not-supported" | "downloads-disabled"),
+        "unexpected placeholder reason {reason:?}: {placeholder}"
+    );
 
     let started = find(&records, "ignis.process.started");
     assert_eq!(started["severity_text"], "INFO");
