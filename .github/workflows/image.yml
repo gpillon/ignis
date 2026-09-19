@@ -54,12 +54,18 @@ jobs:
 
       # The nvidia/cuda devel image is ~10 GB unpacked, and the kernel leaf's
       # build directory and cargo's target directory are several more each.
+      #
+      # Removed in parallel: these are independent trees, and serially they
+      # cost 1.7 minutes of a job that takes 2 minutes when the build cache
+      # is warm.
       - name: Free disk space
         run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
-                      /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
-                      /opt/hostedtoolcache/CodeQL
+          for d in /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
+                   /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+                   /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$d" &
+          done
+          wait
           df -h /
 
       - uses: docker/setup-buildx-action@v3
