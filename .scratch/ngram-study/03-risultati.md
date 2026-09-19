@@ -3,7 +3,7 @@
 - Data: 2026-09-19
 - Branch: `ngram-study`
 - Esegue: [`02-storage.md`](02-storage.md) §7, sul veicolo del §8
-- Stato: **in corso** — veicolo e Fase 0 chiusi, Fasi 1-4 in esecuzione
+- Stato: **completo** — Fasi 0-4 eseguite, esito nel §9
 
 Tutti i numeri qui sono misurati su questa macchina. Gli script stanno in
 `scripts/`, gli output grezzi in `results/`, l'identità esatta di modello e
@@ -368,6 +368,145 @@ migliore. Nel migliore dei casi è innocua.
 
 Coerente con la Fase 0b: 4-8× si vede a L19, lo stesso layer dove il recall@1
 era 0,413; a L47, dove il recall era la metà, il controllo non separa.
+
+---
+
+## 7. Fase 4 — fuori dominio, e il filtro delle chiavi rare
+
+Corpus OOD: **ninfer** (`F:/ai/q38/ninfer`), 818 file C++/CUDA propri —
+un altro progetto, stesso dominio, massima sovrapposizione di vocabolario,
+che è il caso che il §7 dice costare davvero. 20 file campionati a passo
+costante sull'elenco ordinato.
+
+_(Il primo campione conteneva 16 file su 20 di header ffmpeg/curl vendorizzati
+sotto l'albero di build di ninfer: C di terze parti, non codice di ninfer.
+`build-ninja`, `vcpkg_installed` e `_deps` sono ora esclusi dall'enumerazione.
+`vendor` **no**: `kernel/vendor/` fa parte del corpus di ignis. Il corpus di
+ignis resta a 801 file, quindi indice e risultati precedenti restano validi.)_
+
+### Il tasso di match, che è il numero che rende interpretabili gli altri
+
+| condizione | chiavi | match in dominio | match fuori dominio |
+|---|---|---|---|
+| tutte le chiavi | 3.345 | 3,76 % | **3,89 %** |
+| solo chiavi rare | 2.850 | 0,28 % | 0,86 % |
+
+**Fuori dominio il meccanismo spara più spesso che in dominio.** Con tutte le
+chiavi, 3,89 % contro 3,76 %: i nomi dei simboli di ignis compaiono nel codice
+di ninfer più frequentemente che nei file held-out di ignis stesso. Il
+meccanismo, così com'è, **non è selettivo in alcun senso utile**.
+
+Il filtro "chiavi rare" del §7 (≥ 2 token BPE **e** contenuta in nessun altro
+nome) toglie il **15 %** delle chiavi (3.345 → 2.850) e il **93 % dei match**
+(3,76 % → 0,28 %). Quasi tutto il matching lo fanno poche centinaia di nomi
+corti e comuni. Migliora il rapporto OOD/in-dominio? No: peggiora, da 1,03 a
+3,07. Riduce l'esposizione in assoluto, non la selettività relativa.
+
+### ΔNLL fuori dominio
+
+A L19/last centrato, con tutte le chiavi, sul codice di ninfer: −0,116 %
+[−0,353, +0,140] sulla finestra di 8 a α=0,1, −0,274 % [−0,680, +0,184] a
+α=0,3; sull'intero file −0,100 % e −0,126 %. **Non sale.** Il criterio di
+danno del §7 (OOD ≤ +0,5 %) è rispettato con margine.
+
+Ma va letto col tasso di match accanto, come il §7 impone: non sale *perché*
+iniettare il simbolo giusto in codice simile non fa male, non perché il
+meccanismo si astenga. Si astiene lo 0 % delle volte.
+
+Con le sole chiavi rare i numeri OOD sono tutti compatibili con zero e con
+intervalli larghi quanto il loro stesso valore (+0,294 % [−0,444, +1,197]) —
+a un tasso di match dello 0,86 % non dicono niente, esattamente il falso via
+libera che il §7 descrive.
+
+---
+
+## 8. Il guadagno che non c'era
+
+Con le sole chiavi rare, in dominio, L19/last centrato, la metrica primaria
+diventa **negativa e significativa**:
+
+| configurazione | ΔNLL finestra 8 | ΔNLL finestra 32 |
+|---|---|---|
+| α=0,1 τ nessuna | **−0,280 % [−0,412, −0,152]** | −0,142 % [−0,243, −0,050] |
+| α=0,3 τ nessuna | **−0,358 % [−0,702, −0,025]** | −0,172 % [−0,318, −0,028] |
+| α=0,1 τ mediana | −0,162 % [−0,312, −0,034] | −0,099 % [−0,179, −0,026] |
+| α=0,3 τ alta | −0,151 % [−0,383, −0,004] | −0,057 % [−0,118, −0,007] |
+
+Quattro celle con l'intervallo bootstrap interamente sotto zero. Letto da solo,
+questo è il filtro di selettività del §6 che funziona: togli i nomi comuni,
+resta il segnale.
+
+**Non è così.** Lo stesso esperimento con l'accoppiamento chiave→riga
+permutato:
+
+| configurazione | riga corretta | riga sbagliata |
+|---|---|---|
+| α=0,03 τ nessuna | +0,021 [−0,105, +0,149] | **−0,123** [−0,236, −0,009] |
+| α=0,1 τ nessuna | −0,280 [−0,412, −0,152] | −0,210 [−0,408, −0,026] |
+| α=0,3 τ nessuna | −0,358 [−0,702, −0,025] | **−0,502** [−0,769, −0,227] |
+| α=0,1 τ mediana | −0,162 [−0,312, −0,034] | −0,063 [−0,197, +0,082] |
+| α=0,3 τ mediana | −0,066 [−0,259, +0,141] | −0,207 [−0,449, +0,065] |
+
+**Iniettare il vettore di un simbolo a caso fa uguale o meglio.** A α=0,3 il
+permutato è più basso del corretto. Gli intervalli si sovrappongono ovunque e
+il segno del confronto cambia da cella a cella.
+
+Quindi il miglioramento a chiavi rare **non è recupero**: è l'effetto di una
+perturbazione qualunque, di ampiezza modesta, applicata allo 0,28 % dei token.
+Un vettore casuale della norma giusta nella posizione giusta lo produce
+altrettanto bene. Senza questo controllo si sarebbe riportato un guadagno di
+−0,28 % che non esiste.
+
+Da notare che **questo non contraddice il §6**: a chiavi piene (3,76 % di
+match) la riga corretta danneggia 4-8× meno di una a caso, e quella differenza
+è reale. Le due cose insieme dicono una cosa sola e precisa:
+
+> La corrispondenza chiave→valore porta informazione su **compatibilità** — il
+> vettore giusto disturba meno — ma non porta informazione che il modello
+> converta in una **predizione migliore**. L'iniezione additiva non trasforma
+> la prima nella seconda.
+
+---
+
+## 9. Verdetto, secondo i criteri dichiarati prima di misurare
+
+| esito | condizione (§7) | risultato |
+|---|---|---|
+| successo | ΔNLL in-dominio ≤ −2 % **e** OOD ≤ +0,5 % | **no** — il migliore è −0,358 %, e non sopravvive al controllo permutato |
+| gate necessario | esiste α con guadagno in-dominio, ma OOD > +2 % | **no** — nessun guadagno reale, e l'OOD non sale |
+| **nessun segnale** | nessun α/L/P dà ΔNLL in-dominio < −0,5 % | **sì** |
+
+**Esito: nessun segnale.** L'ipotesi del §3 — che lo stato nascosto dell'ultimo
+token del corpo di una funzione sia un riassunto *utilizzabile* di quel corpo —
+è falsa nella forma in cui il §7 la mette alla prova, su 6 varianti (L, P), 5
+ampiezze, 3 soglie, 20 file held-out e due corpora fuori dominio.
+
+Cosa **è** risultato vero, e vale più del verdetto:
+
+1. **Il riassunto esiste.** Fase 0a: gli hidden di fine-definizione non sono
+   collassati (rango efficace 60-85 su 199). Fase 0b: a L19 il recall@1 fra
+   punto d'uso e definizione è 0,413 contro 0,005 del caso, **83× il caso**.
+2. **È in un punto preciso.** L19 su 64, non il layer 2 di Flash-Next, dove
+   entrambi i test danno esattamente il caso.
+3. **La chiave è informativa ma non sfruttabile per somma.** 4-8× meno danno
+   con la riga giusta, mai un guadagno.
+4. **Il meccanismo non è selettivo.** Fuori dominio spara *più* spesso che in
+   dominio (3,89 % contro 3,76 %). Il filtro delle chiavi rare toglie il 15 %
+   delle chiavi e il 93 % dei match, e peggiora il rapporto OOD/in-dominio da
+   1,03 a 3,07.
+
+### Cosa direbbe il prossimo passo, se ce ne fosse uno
+
+Il §6 diceva che "la parte non gratis è precisamente quella che impedisce al
+modello di peggiorare". La misura lo conferma e lo rende più stretto: **non
+basta impedire di peggiorare, serve una trasformazione appresa che converta un
+vettore compatibile in una predizione**. Cioè esattamente il gate addestrato
+dell'Engram Adapter, non una soglia sul coseno. Questo esperimento ha
+quantificato quanto lavoro deve fare quel gate: tutto.
+
+Il percorso veloce di [`01-strade.md`](01-strade.md) — arena mappata, gather
+UVA, indirizzi device-resident, cattura nel graph — **non va costruito.** La
+sua premessa era che il segnale ci fosse.
 
 ---
 
