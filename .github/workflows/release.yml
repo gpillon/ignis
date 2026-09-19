@@ -178,25 +178,33 @@ jobs:
       # (cuBLAS, cuFFT, Nsight) nothing here links. The names are the ones
       # CUDA's own version.json reports, minus its `cuda_` prefix:
       #
-      #   nvcc      the compiler, and with it nvvm/cicc on Windows
-      #   crt       bin/crt, nvcc's link stubs
-      #   cudart    the runtime: headers, cudart.lib, cuda.lib, and the
-      #             cudart64_*.dll the release zip carries
-      #   cccl      CUB/Thrust/libcu++ -- sampling_device.cuh includes
-      #             <cub/block/block_merge_sort.cuh>, which CUDA 13 keeps
-      #             under include/cccl
-      #   nvml_dev  nvml.lib, for ignis_device_nvml_mem_info (GitHub #210)
+      #   nvcc       the compiler driver
+      #   crt        bin/crt, its link stubs
+      #   nvvm       cicc, the device compiler nvcc drives -- a component of
+      #              its own on Windows, not part of nvcc
+      #   cudart     the runtime: headers, cudart.lib, cuda.lib, and the
+      #              cudart64_*.dll the release zip carries
+      #   thrust     CUB/Thrust/libcu++. Still spelled `thrust` in the
+      #              installer even though CUDA 13 lays it down under
+      #              include/cccl, which is where sampling_device.cuh's
+      #              <cub/block/block_merge_sort.cuh> resolves
+      #   nvml_dev   nvml.lib, for ignis_device_nvml_mem_info (GitHub #210)
+      #   the rest   the small tools nvcc and CMake's compiler probe shell
+      #              out to; together a few MB against cuBLAS's several
+      #              hundred
       #
-      # An unrecognized name is skipped by the installer rather than
-      # refused, so the step after this one checks the files instead of
-      # trusting the list.
+      # The names are NVIDIA's own (the Windows installation guide's
+      # component table), because the installer REFUSES an unrecognized one
+      # -- `cccl_13.1` took the whole job down with exit 3772776473 in five
+      # seconds. It refusing is the good case; the step after this one
+      # covers the other one, a name that is valid but was left out.
       - name: Install the CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: network
-          sub-packages: '["nvcc", "crt", "cudart", "cccl", "nvml_dev"]'
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "thrust", "nvml_dev", "nvfatbin", "nvjitlink", "cuobjdump", "nvdisasm", "cuxxfilt", "nvprune"]'
 
       # What the kernel leaf and the Rust link actually open. A missing one
       # here would otherwise surface as a confusing nvcc or link error ten
