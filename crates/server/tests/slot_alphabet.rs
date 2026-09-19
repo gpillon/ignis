@@ -54,6 +54,33 @@ fn clean_slots<'a>(
     (slots, collisions)
 }
 
+/// Does this model carry the grounding vocabulary Qwen-VL uses for pointing
+/// at a region of an image? If the special tokens are there, the model was
+/// trained to emit boxes and points, and coordinates should be asked for in
+/// its own format rather than through an invented grid.
+#[test]
+fn report_the_grounding_vocabulary() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() {
+        eprintln!("skip: {ARTIFACT} does not exist");
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
+    let set = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let tokenizer = set.tokenizer();
+    for marker in [
+        "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
+        "<|object_ref_start|>", "<|object_ref_end|>", "<|point_start|>", "<|point_end|>",
+        "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
+    ] {
+        match tokenizer.encode(marker) {
+            Ok(ids) if ids.len() == 1 => eprintln!("ignis grounding: {marker} = single token {}", ids[0]),
+            Ok(ids) => eprintln!("ignis grounding: {marker} = {} tokens (not a special token)", ids.len()),
+            Err(e) => eprintln!("ignis grounding: {marker} = encode failed: {e}"),
+        }
+    }
+}
+
 #[test]
 fn count_the_single_token_answer_slots() {
     let path = Path::new(ARTIFACT);
