@@ -2,11 +2,17 @@
 # holds multi-hundred-MB server logs and a Windows `target/`, so this file is
 # the difference between a two-second context upload and a ten-minute one.
 
-# Build outputs. kernel/build/ especially: it carries a CMakeCache.txt written
+# Build outputs. kernel/build especially: it carries a CMakeCache.txt written
 # by the MSVC generator, and cmake refuses to reconfigure someone else's cache
 # in the container ("CMakeCache.txt directory is different").
+#
+# Spelled out rather than `kernel/build*/`: an ignore pattern's trailing slash
+# is dropped before matching, so that glob also swallows kernel/build.sh --
+# the script the Linux build.rs runs -- and the failure is a `bash: No such
+# file or directory` an hour into the image build.
 target/
-kernel/build*/
+kernel/build
+kernel/build-*
 web/node_modules/
 web/dist/
 web/.vitest/
