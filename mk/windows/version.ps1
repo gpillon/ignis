@@ -3,10 +3,13 @@
 # actions, same files, same output.
 #
 #   show           print the version each file declares
-#   check          exit 1 when they disagree (what .github/workflows/release.yml
-#                  checks before it builds anything, runnable before you tag)
+#   check          exit 1 when they disagree: the comparison
+#                  .github/workflows/release.yml makes before it builds
+#                  anything (Cargo.toml against web/package.json), runnable
+#                  before you tag -- plus the two lockfiles, which the
+#                  workflow does not look at and the next build would rewrite
 #   set <version>  write an explicit version, `x.y.z` with an optional
-#                  `-prerelease` and `+build`
+#                  `-prerelease`
 #   bump <part>    patch, minor or major, from what the workspace declares
 #
 # The version lives in four files and every one of them must agree: the
@@ -44,14 +47,26 @@ $ErrorActionPreference = 'Stop'
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $Repo
 
-# `x.y.z`, optionally `-prerelease` and `+build` (semver 2.0.0's grammar,
-# minus the leading-zero rule -- `01.0.0` is nobody's typo worth a rejection
-# message).
-$VersionPattern = '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+# `x.y.z`, optionally `-prerelease`. Semver's `+build` is deliberately not
+# accepted: `npm version` drops build metadata, so it would land in the two
+# Rust files and not in the two web ones -- and the release workflow compares
+# those two by string, so such a version could never tag at all.
+$VersionPattern = '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 function Die([string]$Message) {
-    Write-Host "error: $Message" -ForegroundColor Red
+    [Console]::Error.WriteLine("error: $Message")
     exit 1
+}
+
+# Put back what a failed step already wrote, and say so either way: a rollback
+# that quietly failed would leave a half-bumped tree behind a message claiming
+# it did not.
+function Restore-Files([string[]]$Paths) {
+    if (Invoke-Tool 'git' (@('checkout', '--') + $Paths)) {
+        [Console]::Error.WriteLine("restored: $($Paths -join ' ')")
+    } else {
+        [Console]::Error.WriteLine("warning: could not restore $($Paths -join ' ') -- check them by hand")
+    }
 }
 
 # Run a native tool quietly and report success. `Continue` for the duration:
@@ -85,10 +100,14 @@ function Get-CargoVersion {
     if ($m.Success) { return $m.Groups[1].Value } else { return '' }
 }
 
-# The lockfile's entry for one workspace member -- the line after its name.
+# What the lockfile says the workspace members are at: every `ignis-*`
+# entry's version, deduplicated. One value when they agree -- which is what
+# `check` wants to compare -- and a `/`-joined list when they do not, so a
+# single stale member is visible rather than hidden behind the first one.
 function Get-CargoLockVersion {
-    $m = [regex]::Match((Read-File 'Cargo.lock'), '(?m)^name = "ignis-server"\r?\nversion = "(.*)"')
-    if ($m.Success) { return $m.Groups[1].Value } else { return '' }
+    $found = [regex]::Matches((Read-File 'Cargo.lock'), '(?m)^name = "ignis-[a-z-]*"\r?\nversion = "(.*)"') |
+        ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+    return ($found -join '/')
 }
 
 function Get-JsonVersion([string]$Path) {
@@ -127,18 +146,30 @@ function Test-Versions {
     Write-Host "ok: every file declares $cargo"
 }
 
-# Refuse to edit a file that already carries changes: a bump is a mechanical
-# rewrite, and mixing it into unrelated work is how a release commit ends up
-# carrying something nobody reviewed.
-function Assert-Clean {
+# Say so when those files already carry changes, and carry on. It was a
+# refusal at first, and that was wrong twice over: a second bump in the same
+# session is ordinary, and repairing a tree a half-done bump left is the case
+# this tool exists for. What the refusal was really guarding -- a release
+# commit sweeping up unrelated work -- is handled where it belongs, by the
+# `git commit` line printed below naming its four files.
+function Warn-IfDirty {
     $dirty = & git status --porcelain -- Cargo.toml Cargo.lock web/package.json web/package-lock.json 2>$null
-    if ($dirty) { Die ("the version files already have uncommitted changes:`n" + ($dirty -join "`n")) }
+    if ($dirty) {
+        [Console]::Error.WriteLine("note: the version files already carry changes:`n" + ($dirty -join "`n"))
+    }
 }
 
 function Set-Version([string]$New) {
     $old = Get-CargoVersion
     if (-not $old) { Die 'no version in Cargo.toml [workspace.package]' }
-    if ($New -eq $old) { Die "the workspace already declares $New" }
+    # Refuse only when every file already says it. Setting the version a
+    # disagreeing tree half-carries is the repair this exists for -- that is
+    # the state a half-done bump leaves, and what the failed v0.1.1 tag was.
+    if ($New -eq $old -and $New -eq (Get-CargoLockVersion) -and
+        $New -eq (Get-JsonVersion 'web/package.json') -and
+        $New -eq (Get-JsonVersion 'web/package-lock.json')) {
+        Die "every file already declares $New"
+    }
 
     # Only inside [workspace.package]: `version = "1"` appears under a dozen
     # dependencies in the same file.
@@ -154,22 +185,32 @@ function Set-Version([string]$New) {
     # failure even when the exe returned 0 (cargo prints "Locking N packages"
     # there).
     if (-not (Invoke-Tool 'cargo' @('update', '--workspace', '--offline'))) {
-        & git checkout -- Cargo.toml
-        Die "cargo could not refresh Cargo.lock (Cargo.toml left at $old)"
+        Restore-Files @('Cargo.toml')
+        Die 'cargo could not refresh Cargo.lock'
     }
 
     # npm owns both web files: package.json and the two places the lockfile
     # repeats the version. --no-git-tag-version keeps it out of git entirely.
     if (-not (Invoke-Tool 'npm' @('version', $New, '--no-git-tag-version', '--allow-same-version') 'web')) {
-        & git checkout -- Cargo.toml Cargo.lock
-        Die 'npm could not set the Playground version (nothing changed)'
+        Restore-Files @('Cargo.toml', 'Cargo.lock')
+        Die 'npm could not set the Playground version'
     }
 
-    Write-Host "$old -> $New"
+    # Never report a bump the release workflow would refuse: the two tools
+    # above each normalize what they are given (npm drops build metadata,
+    # for one), so what they wrote is checked rather than assumed.
+    $written = @((Get-CargoVersion), (Get-CargoLockVersion),
+                 (Get-JsonVersion 'web/package.json'), (Get-JsonVersion 'web/package-lock.json'))
+    if ($written | Where-Object { $_ -ne $New }) {
+        Show-Versions
+        Die "the files did not all take $New -- fix them before tagging"
+    }
+
+    if ($old -eq $New) { Write-Host "repaired $New" } else { Write-Host "$old -> $New" }
     Show-Versions
     Write-Host ''
     Write-Host 'next:'
-    Write-Host "  git commit -am 'ignis $New' && git push origin main"
+    Write-Host "  git commit -m 'ignis $New' -- Cargo.toml Cargo.lock web/package.json web/package-lock.json && git push origin main"
     Write-Host "  git tag -a v$New -m 'ignis $New' && git push origin v$New   # builds and publishes the release"
 }
 
@@ -199,14 +240,14 @@ switch ($Action) {
     'set' {
         if (-not $Value) { Die 'set needs a version' }
         if ($Value -notmatch $VersionPattern) {
-            Die "'$Value' is not a version: expected x.y.z, optionally -prerelease and +build (e.g. 1.2.3, 1.2.3-rc.1, 1.2.3+cuda13)"
+            Die "'$Value' is not a version: expected x.y.z, optionally -prerelease (e.g. 1.2.3, 1.2.3-rc.1). Semver +build metadata is not accepted -- npm drops it, and the release workflow compares Cargo.toml against web/package.json by string"
         }
-        Assert-Clean
+        Warn-IfDirty
         Set-Version $Value
     }
     'bump' {
         if (-not $Value) { Die 'bump needs patch, minor or major' }
-        Assert-Clean
+        Warn-IfDirty
         Step-Version $Value
     }
 }

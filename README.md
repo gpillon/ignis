@@ -273,14 +273,14 @@ green dry run: ADR 0032.
 
 Cutting one starts with the version, which four files must agree on — the two
 the workflow compares (`Cargo.toml`, `web/package.json`, because the Playground
-ships inside the binary) and the two lockfiles that would otherwise be rewritten
-by the next build:
+ships inside the binary) and the two lockfiles it does not look at, which the
+next build would rewrite:
 
 ```
 make version                     # what each of the four declares
 make version-bump T=patch        # or minor, major
-make version-bump V=1.2.3-rc.1   # or an exact version: x.y.z, -prerelease and +build optional
-make version-check               # what the workflow checks, before you tag
+make version-bump V=1.2.3-rc.1   # or an exact version: x.y.z, -prerelease optional
+make version-check               # the workflow's comparison + the lockfiles, before you tag
 ```
 
 It edits and stops there: the commit and the tag are printed, not run, because

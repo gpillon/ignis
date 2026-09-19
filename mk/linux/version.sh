@@ -4,10 +4,13 @@
 # actions, same files, same output.
 #
 #   show           print the version each file declares
-#   check          exit 1 when they disagree (what .github/workflows/release.yml
-#                  checks before it builds anything, runnable before you tag)
+#   check          exit 1 when they disagree: the comparison
+#                  .github/workflows/release.yml makes before it builds
+#                  anything (Cargo.toml against web/package.json), runnable
+#                  before you tag -- plus the two lockfiles, which the
+#                  workflow does not look at and the next build would rewrite
 #   set <version>  write an explicit version, `x.y.z` with an optional
-#                  `-prerelease` and `+build`
+#                  `-prerelease`
 #   bump <part>    patch, minor or major, from what the workspace declares
 #
 # The version lives in four files and every one of them must agree: the
@@ -36,10 +39,22 @@ cd "$repo" || exit 1
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# `x.y.z`, optionally `-prerelease` and `+build` (semver 2.0.0's grammar,
-# minus the leading-zero rule -- `01.0.0` is nobody's typo worth a rejection
-# message).
-version_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+# Put back what a failed step already wrote, and say so either way: a rollback
+# that quietly failed would leave a half-bumped tree behind a message claiming
+# it did not.
+restore() {
+    if git checkout -- "$@" 2>/dev/null; then
+        echo "restored: $*" >&2
+    else
+        echo "warning: could not restore $* -- check them by hand" >&2
+    fi
+}
+
+# `x.y.z`, optionally `-prerelease`. Semver's `+build` is deliberately not
+# accepted: `npm version` drops build metadata, so it would land in the two
+# Rust files and not in the two web ones -- and the release workflow compares
+# those two by string, so such a version could never tag at all.
+version_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 cargo_version() {
     sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
@@ -54,9 +69,13 @@ web_lock_version() {
     sed -n 's/^  "version": "\(.*\)",$/\1/p' web/package-lock.json | head -1
 }
 
-# The lockfile's entry for one workspace member -- the line after its name.
+# What the lockfile says the workspace members are at: every `ignis-*`
+# entry's version, deduplicated. One value when they agree -- which is what
+# `check` wants to compare -- and a `/`-joined list when they do not, so a
+# single stale member is visible rather than hidden behind the first one.
 cargo_lock_version() {
-    awk '/^name = "ignis-server"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' Cargo.lock
+    awk '/^name = "ignis-[a-z-]*"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print }' Cargo.lock |
+        sort -u | paste -sd/ -
 }
 
 show() {
@@ -90,50 +109,77 @@ check() {
     echo "ok: every file declares $cargo"
 }
 
-# Refuse to edit a file that already carries changes: a bump is a mechanical
-# rewrite, and mixing it into unrelated work is how a release commit ends up
-# carrying something nobody reviewed.
-require_clean() {
+# Say so when those files already carry changes, and carry on. It was a
+# refusal at first, and that was wrong twice over: a second bump in the same
+# session is ordinary, and repairing a tree a half-done bump left is the case
+# this tool exists for. What the refusal was really guarding -- a release
+# commit sweeping up unrelated work -- is handled where it belongs, by the
+# `git commit` line printed below naming its four files.
+warn_if_dirty() {
     local dirty
     dirty="$(git status --porcelain -- Cargo.toml Cargo.lock web/package.json web/package-lock.json 2>/dev/null)"
-    [ -z "$dirty" ] || die "the version files already have uncommitted changes:
-$dirty"
+    [ -z "$dirty" ] || echo "note: the version files already carry changes:
+$dirty" >&2
 }
 
 write_version() {
     local new="$1" old
     old="$(cargo_version)"
     [ -n "$old" ] || die "no version in Cargo.toml [workspace.package]"
-    [ "$new" != "$old" ] || die "the workspace already declares $new"
+    # Refuse only when every file already says it. Setting the version a
+    # disagreeing tree half-carries is the repair this exists for -- that is
+    # the state a half-done bump leaves, and what the failed v0.1.1 tag was.
+    if [ "$new" = "$old" ] && [ "$new" = "$(cargo_lock_version)" ] &&
+        [ "$new" = "$(web_version)" ] && [ "$new" = "$(web_lock_version)" ]; then
+        die "every file already declares $new"
+    fi
 
     # Only inside [workspace.package]: `version = "1"` appears under a dozen
     # dependencies in the same file.
-    awk -v new="$new" '
+    if ! awk -v new="$new" '
         /^\[workspace\.package\]$/ { in_section = 1; print; next }
         /^\[/ { in_section = 0 }
         in_section && /^version *= *"/ { print "version = \"" new "\""; next }
         { print }
-    ' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+    ' Cargo.toml > Cargo.toml.tmp; then
+        rm -f Cargo.toml.tmp
+        die "could not rewrite Cargo.toml (nothing changed)"
+    fi
+    mv Cargo.toml.tmp Cargo.toml || die "could not replace Cargo.toml"
 
     # Cargo owns its lockfile: --offline touches nothing but the workspace
     # members' own entries, and never reaches the network.
     if ! cargo update --workspace --offline >/dev/null 2>&1; then
-        git checkout -- Cargo.toml 2>/dev/null
-        die "cargo could not refresh Cargo.lock (Cargo.toml left at $old)"
+        restore Cargo.toml
+        die "cargo could not refresh Cargo.lock"
     fi
 
     # npm owns both web files: package.json and the two places the lockfile
     # repeats the version. --no-git-tag-version keeps it out of git entirely.
     if ! (cd web && npm version "$new" --no-git-tag-version --allow-same-version >/dev/null 2>&1); then
-        git checkout -- Cargo.toml Cargo.lock 2>/dev/null
-        die "npm could not set the Playground version (nothing changed)"
+        restore Cargo.toml Cargo.lock
+        die "npm could not set the Playground version"
     fi
 
-    echo "$old -> $new"
+    # Never report a bump the release workflow would refuse: the two tools
+    # above each normalize what they are given (npm drops build metadata,
+    # for one), so what they wrote is checked rather than assumed.
+    for file_version in "$(cargo_version)" "$(cargo_lock_version)" "$(web_version)" "$(web_lock_version)"; do
+        if [ "$file_version" != "$new" ]; then
+            show
+            die "the files did not all take $new -- fix them before tagging"
+        fi
+    done
+
+    if [ "$old" = "$new" ]; then
+        echo "repaired $new"
+    else
+        echo "$old -> $new"
+    fi
     show
     echo
     echo "next:"
-    echo "  git commit -am 'ignis $new' && git push origin main"
+    echo "  git commit -m 'ignis $new' -- Cargo.toml Cargo.lock web/package.json web/package-lock.json && git push origin main"
     echo "  git tag -a v$new -m 'ignis $new' && git push origin v$new   # builds and publishes the release"
 }
 
@@ -164,13 +210,13 @@ case "$action" in
     set)
         [ $# -ge 2 ] || die "set needs a version"
         [[ "$2" =~ $version_re ]] ||
-            die "'$2' is not a version: expected x.y.z, optionally -prerelease and +build (e.g. 1.2.3, 1.2.3-rc.1, 1.2.3+cuda13)"
-        require_clean
+            die "'$2' is not a version: expected x.y.z, optionally -prerelease (e.g. 1.2.3, 1.2.3-rc.1). Semver +build metadata is not accepted -- npm drops it, and the release workflow compares Cargo.toml against web/package.json by string"
+        warn_if_dirty
         write_version "$2"
         ;;
     bump)
         [ $# -ge 2 ] || die "bump needs patch, minor or major"
-        require_clean
+        warn_if_dirty
         bump "$2"
         ;;
     *) die "unknown action '$action' (expected show, check, set or bump)" ;;

@@ -439,19 +439,26 @@ ci: version-check check test-all ## What a CI job would run (no GPU)
 # `make version-bump` takes exactly one of T= and V=. Recursive on purpose:
 # $(error) fires when the recipe expands this, so naming neither is an error
 # of the bump target alone, not of parsing the Makefile.
-VERSION_BUMP_ARGS = $(strip   $(if $(and $(strip $(T)),$(strip $(V))),$(error name T= or V=, not both),   $(if $(strip $(V)),set $(strip $(V)),   $(if $(strip $(T)),bump $(strip $(T)),   $(error usage: make version-bump T=patch|minor|major -- or -- make version-bump V=x.y.z)))))
+VERSION_BUMP_USAGE := usage: make version-bump T=patch|minor|major -- or -- make version-bump V=x.y.z
+VERSION_BUMP_ARGS = $(strip   $(if $(and $(strip $(T)),$(strip $(V))),     $(error name T= or V=, not both),     $(if $(strip $(V)),       set $(strip $(V)),       $(if $(strip $(T)),         bump $(strip $(T)),         $(error $(VERSION_BUMP_USAGE))))))
 
 .PHONY: version
 version: ## Print the version every release file declares
 	@$(VERSION_TOOL) show
 
 .PHONY: version-check
-version-check: ## Refuse what the release workflow refuses -- run it before you tag
+version-check: ## The release workflow's version comparison, plus the two lockfiles
 	@$(VERSION_TOOL) check
 
 .PHONY: version-bump
-version-bump: ## Bump the release version (T=patch|minor|major, or V=x.y.z[-rc.1][+build])
+version-bump: ## Bump the release version (T=patch|minor|major, or V=x.y.z[-rc.1])
 	@$(VERSION_TOOL) $(VERSION_BUMP_ARGS)
+
+# Not part of `make ci`: it drives the real files and puts them back with
+# git, and a check that writes to tracked files has no business inside one.
+.PHONY: version-selftest
+version-selftest: ## Test the version tool itself -- both implementations, compared
+	@bash mk/version-selftest.sh
 
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)

@@ -93,9 +93,8 @@ fn harness(vision: Option<Vision>) -> Option<Harness> {
         vision,
         ..EngineShape::default()
     };
-    // GitHub #210: the builder hands back the VRAM plan's reservations
-    // beside the scheduler, for `/metrics` to name. This test serves
-    // requests and reads none of them.
+    // GitHub #210: the reservations beside the scheduler are for `/metrics`,
+    // which this test does not read.
     let scheduler = match cuda_scheduler(path, MODEL.into(), eos, shape) {
         Ok((scheduler, _reservations)) => scheduler,
         Err(e) => {
