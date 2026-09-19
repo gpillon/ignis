@@ -262,8 +262,17 @@ async fn post_large(app: &axum::Router, text_bytes: usize) -> u16 {
 }
 
 #[tokio::test]
-async fn a_vision_load_accepts_a_request_body_past_the_default_limit() {
-    // 4 MiB: an inline data URI of a ~3 MiB screenshot.
-    assert_eq!(post_large(&harness(None, 0, None).app, 4 << 20).await, 413, "a text-only load keeps axum's default");
+async fn a_vision_load_accepts_a_request_body_past_the_text_limit() {
+    // 4 MiB: an inline data URI of a ~3 MiB screenshot, or a prompt around
+    // the engine's own context ceiling. Both loads take it now (GitHub
+    // #230) -- axum's 2 MiB default sat under one max-context prompt.
+    assert_ne!(post_large(&harness(None, 0, None).app, 4 << 20).await, 413, "4 MiB of prompt is not oversized");
     assert_ne!(post_large(&vision().app, 4 << 20).await, 413, "a vision load takes large inline media");
+    // Each load still has a cap, and the text one is the lower of the two.
+    assert!(ignis_server::api::TEXT_REQUEST_BODY_LIMIT < ignis_server::api::MEDIA_REQUEST_BODY_LIMIT);
+    assert_eq!(
+        post_large(&harness(None, 0, None).app, ignis_server::api::TEXT_REQUEST_BODY_LIMIT + (1 << 16)).await,
+        413,
+        "a text-only load refuses a body past its own limit"
+    );
 }

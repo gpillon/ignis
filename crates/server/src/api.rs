@@ -51,8 +51,21 @@ use crate::thinking::{
 use crate::toolcall::{ToolCall as ScannedToolCall, ToolCallScanner, ToolEvent};
 
 /// The request body limit of a `--vision` load, in bytes (the reference's
-/// `--max-request-mib` default).
+/// `--max-request-mib` default). It is this size because it is the media
+/// budget's own: inline base64 is 4/3 of its decoded size, so the 256 MiB
+/// `max_encoded_media_bytes` a request may spend needs 341 MiB of body to
+/// arrive in. Anything lower would refuse, by byte count, media the budget
+/// says is admissible -- and only for the inline path, since media fetched
+/// by URL never crosses the body at all.
 pub const MEDIA_REQUEST_BODY_LIMIT: usize = 384 << 20;
+
+/// The request body limit of a text-only load, in bytes (GitHub #230). The
+/// largest prompt the engine can accept at all is its attention envelope,
+/// 1,048,576 tokens under hq-e8-2b, which is 3-4 MB of text; this is about
+/// four times that, so an oversized prompt is refused by `--max-context`
+/// with a 400 that names the context, never by a byte count that does not.
+/// axum's own 2 MiB default sat *under* one max-context prompt.
+pub const TEXT_REQUEST_BODY_LIMIT: usize = 16 << 20;
 
 /// Build the OpenAI router for `server` (the axum state it serves behind).
 ///
@@ -75,14 +88,17 @@ pub fn router(state: Arc<Server>) -> Router {
         // Only the `/v1` routes above: the Playground's static pages stay
         // reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
-    // A `--vision` load takes images inline as base64 data URIs (GitHub
-    // #179), far past axum's 2 MiB default body limit: the reference's
-    // 384 MiB request cap, enforced before JSON parsing, admits a full
-    // 256 MiB media budget once base64-encoded. A text-only load keeps the
-    // default it has always served with.
-    if state.media.is_some() {
-        router = router.layer(axum::extract::DefaultBodyLimit::max(MEDIA_REQUEST_BODY_LIMIT));
-    }
+    // The body cap, enforced before JSON parsing: wider with `--vision`,
+    // which takes images inline as base64 data URIs (GitHub #179), than for
+    // a text-only load, which only ever carries a prompt (GitHub #230).
+    // Both are past what their own load can use, so the refusal an operator
+    // meets is the one that names the real limit -- the context, or the
+    // media budget -- rather than a byte count.
+    router = router.layer(axum::extract::DefaultBodyLimit::max(if state.media.is_some() {
+        MEDIA_REQUEST_BODY_LIMIT
+    } else {
+        TEXT_REQUEST_BODY_LIMIT
+    }));
     // The Playground (GitHub #163): present only when `--ui` gave it assets.
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
