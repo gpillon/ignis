@@ -1,0 +1,12 @@
+diff --git a/reference/tools/test_kv/test_hq_codec.cu b/vendor/tools/test_kv/test_hq_codec.cu
+index 7e96c7e..7f018c9 100644
+--- a/reference/tools/test_kv/test_hq_codec.cu
++++ b/vendor/tools/test_kv/test_hq_codec.cu
+@@ -16,6 +16,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <random>
+ #include <vector>
+ 

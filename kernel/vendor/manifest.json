@@ -1660,7 +1660,12 @@
     },
     {
       "path": "tools/test_kv/test_hq_codec.cu",
-      "sha256": "64f97e43ecad71a848a660236d4d6cee3e52f3117d86ebcbc08382ccb6189835"
+      "sha256": "64f97e43ecad71a848a660236d4d6cee3e52f3117d86ebcbc08382ccb6189835",
+      "patch": {
+        "diff": "patches/tools/test_kv/test_hq_codec.cu.diff",
+        "sha256": "63f09a9f78ae3d1225497e2c5978f763b07adc56856da7fbfcf179717d5a87c9",
+        "reason": "std::memcpy needs <cstring>: MSVC's headers pull it in transitively, libstdc++ does not, so the Linux build of ignis_hq_codec_test fails without it (GitHub #225)."
+      }
     }
   ]
 }

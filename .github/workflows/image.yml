@@ -1,0 +1,107 @@
+# The linux/amd64 container image, built on every push and published to GHCR
+# on a v* tag.
+#
+# Its own workflow on purpose (GitHub #225): the image and the release
+# binaries fail independently, so a registry outage never withholds a release
+# and a broken Windows build never withholds the image. release.yml builds the
+# Linux binaries out of this same Containerfile's `artifacts` stage, and both
+# workflows read and write one shared buildx cache scope, so the kernel is
+# compiled once per push rather than once per workflow.
+#
+# No runner has an NVIDIA GPU: the image is built, never run. The kernel leaf
+# is compiled for SM120a and linked against the toolkit's driver stubs.
+
+name: image
+
+on:
+  push:
+    branches: [main, "ci/**"]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A tag's run is never cancelled: it is the one that publishes.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same guard release.yml applies: an image tagged 0.1.0 whose
+      # `--version` says something else is worse than no image.
+      - name: Check the tag against the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          echo "tag v$tag_version, Cargo.toml $cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag v$tag_version does not match workspace.package.version $cargo_version"
+            exit 1
+          fi
+
+      # The nvidia/cuda devel image is ~10 GB unpacked, and the kernel leaf's
+      # build directory and cargo's target directory are several more each.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
+                      /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          target: runtime
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # An explicit scope, shared with release.yml's linux job: the default
+          # is per workflow, which would compile the same kernel twice.
+          cache-from: type=gha,scope=linux-cuda
+          cache-to: type=gha,mode=max,scope=linux-cuda
+          build-args: |
+            KERNEL_BUILD_JOBS=3
+
+      - name: Published
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

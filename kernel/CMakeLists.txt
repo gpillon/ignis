@@ -302,6 +302,18 @@ add_library(ignis_kernel STATIC ${IGNIS_KERNEL_SRCS})
 set_target_properties(ignis_kernel PROPERTIES OUTPUT_NAME "ignis_kernel")
 target_include_directories(ignis_kernel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ignis_kernel PUBLIC ignis_vendor)
+# ...and back: the dependency between the two archives is genuinely mutual.
+# The vendored plans call `ninfer::ops::linear` (nvfp4_linear_swiglu_plan.cpp,
+# attn_input_proj, linear_add), and the qtype dispatcher behind that name is
+# ours, not vendored -- kernel/src/linear.cu, in ignis_kernel.
+#
+# The MSVC linker resolves that on its own (it re-scans the archives it was
+# given), so the cycle stayed invisible until the first Linux build: ld walks
+# its inputs once, left to right, and a symbol first needed by an archive to
+# the RIGHT of the one defining it is simply undefined. Declaring the cycle is
+# how CMake is told to repeat both archives on the link line; it also fixes
+# the test executables that name only ignis_vendor.
+target_link_libraries(ignis_vendor PUBLIC ignis_kernel)
 # GitHub #210: device memory as NVML reports it, read before a context exists
 # (ignis_device_nvml_mem_info). nvml.dll ships with the driver.
 target_link_libraries(ignis_kernel PUBLIC CUDA::nvml)

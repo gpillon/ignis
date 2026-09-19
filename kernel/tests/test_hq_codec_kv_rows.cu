@@ -39,6 +39,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

@@ -132,6 +132,16 @@ fn main() {
     for name in libraries {
         println!("cargo:rustc-link-lib=static={name}");
     }
+    // The two archives depend on each other (kernel/CMakeLists.txt says why),
+    // and on ELF that is an ordering problem: ld walks its inputs once, so a
+    // symbol `ignis_vendor` needs from `ignis_kernel` is undefined because
+    // `ignis_kernel` was already behind it on the line. Naming the first one
+    // again is the ordinary fix, and the second copy contributes nothing when
+    // the first already resolved everything. The MSVC linker re-scans on its
+    // own and needs no such help.
+    if !windows {
+        println!("cargo:rustc-link-lib=static={}", libraries[0]);
+    }
 
     if windows {
         // CUDA runtime (dynamic): the static library imports cudart symbols;
