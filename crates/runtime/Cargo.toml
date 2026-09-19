@@ -3,6 +3,7 @@ name = "ignis-runtime"
 description = "ignis: safe step-ABI runtime and scheduler compute adapter"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ignis-core = { path = "../core" }

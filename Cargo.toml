@@ -8,6 +8,9 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# LICENSE is the verbatim Apache text; the root NOTICE carries the copyright
+# and points at kernel/NOTICE for the vendored subtree's own terms (ADR 0010).
+license = "Apache-2.0"
 
 # GitHub #135. The GPU profile's f64 layer oracles are CPU-bound on scalar
 # `f64` with per-element NVFP4 / W8 dequantization, and at the default

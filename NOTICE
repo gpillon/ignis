@@ -1,0 +1,11 @@
+ignis
+Copyright 2026 the ignis authors
+
+This product includes software developed by the ignis authors, licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+The C++/CUDA kernel leaf is built on a vendored subtree of the reference
+stack's core and ops (ADR 0010). kernel/NOTICE and kernel/vendor/VENDOR.md
+record that subtree's provenance and its upstream terms; kernel/vendor/
+manifest.json pins the reference commit and the content hash of every
+vendored file.

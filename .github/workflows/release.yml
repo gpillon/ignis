@@ -179,6 +179,17 @@ jobs:
         with:
           key: cuda-${{ env.CUDA_VERSION }}
 
+      # kernel/build.ps1 needs ninja on PATH (its only fallback is a path on
+      # the development machine). The runner image ships it, but an hour-long
+      # job should not depend on that staying true.
+      - name: Ensure ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          ninja --version
+
       # The full network install rather than a sub-package list: CUDA 13
       # renamed several components, and a wrong name fails the job an hour
       # into it. Narrowing this is an optimisation for once the pipeline is
@@ -220,8 +231,10 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/ignis-server.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-bench.exe "$name"/
           cp target/x86_64-pc-windows-msvc/release/ignis-artifact-inspect.exe "$name"/
-          cp README.md "$name"/
-          cp kernel/NOTICE "$name"/NOTICE
+          # Apache-2.0 asks that a redistribution carry LICENSE and NOTICE;
+          # kernel/NOTICE is the vendored ops' own provenance (ADR 0010).
+          cp LICENSE NOTICE README.md "$name"/
+          cp kernel/NOTICE "$name"/NOTICE-kernel
           # cudart is the one CUDA library the binaries load that does not
           # ship with the driver; NVIDIA lists it as redistributable. The
           # action hands CUDA_PATH out in Windows spelling, which a glob in

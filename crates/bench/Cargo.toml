@@ -3,6 +3,7 @@ name = "ignis-bench"
 description = "ignis: trace-replay benchmark harness + canary suite runner"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true }

@@ -130,7 +130,7 @@ ignis/
 Windows is the development host; Linux builds the same engine
 (`kernel/build.sh`, `mk/os/linux.mk`) and is what the container image below is
 built from. Some `make` targets are still Windows-only there — `mk/os/linux.mk`
-names which, GitHub #167.
+names which, GitHub #226.
 
 ## Build
 
@@ -466,3 +466,13 @@ With thanks to the NInfer project and its contributors:
 - **dylan (dylanbrodiefafard)** — RAM KV cache concept, LRU lane eviction,
   decode CPU-spin fix.
 - **Neroued** — original NInfer engine.
+
+## License
+
+Apache License 2.0 — `LICENSE`, with the copyright in `NOTICE`.
+
+The vendored reference ops under `kernel/vendor/` keep their upstream terms
+(also Apache-2.0); `kernel/NOTICE` and `kernel/vendor/VENDOR.md` record that
+subtree's provenance, and `kernel/vendor/manifest.json` pins the reference
+commit and every vendored file's content hash (ADR 0010). Release archives and
+the container image carry `LICENSE`, `NOTICE` and `NOTICE-kernel`.

@@ -71,10 +71,11 @@ FROM scratch AS artifacts
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-server /
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-bench /
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect /
-# kernel/NOTICE is the provenance of the vendored reference ops (ADR 0010):
-# it travels with every binary that carries them.
-COPY README.md /
-COPY kernel/NOTICE /NOTICE
+# Apache-2.0 asks that a redistribution carry LICENSE and NOTICE; kernel/NOTICE
+# is the provenance of the vendored reference ops (ADR 0010), and travels with
+# every binary that carries them.
+COPY LICENSE NOTICE README.md /
+COPY kernel/NOTICE /NOTICE-kernel
 
 # --- the runtime image ------------------------------------------------------
 FROM docker.io/nvidia/cuda:13.1.1-base-ubuntu24.04 AS runtime
@@ -89,6 +90,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-server /usr/local/bin/
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-bench /usr/local/bin/
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/ignis-artifact-inspect /usr/local/bin/
+
+# Apache-2.0 travels with the binaries (LICENSE and the root NOTICE), and so
+# does the vendored subtree's own provenance.
+COPY LICENSE NOTICE /usr/share/doc/ignis/
+COPY kernel/NOTICE /usr/share/doc/ignis/NOTICE-kernel
 
 # The server's own default is 127.0.0.1, which nothing outside the container
 # can reach. Everything else stays at the server's default and is set through
@@ -109,9 +115,7 @@ WORKDIR /home/ignis
 ENTRYPOINT ["/usr/local/bin/ignis-server"]
 CMD ["--ui"]
 
-# No org.opencontainers.image.licenses: the repository declares no license of
-# its own yet. kernel/NOTICE records the vendored ops' provenance and terms,
-# and ships inside the image at /NOTICE.
 LABEL org.opencontainers.image.title="ignis" \
       org.opencontainers.image.description="ignis: OpenAI-compatible inference server for Qwen3.8-27B NVFP4 on Blackwell (SM120a), with the Playground UI" \
-      org.opencontainers.image.source="https://github.com/gpillon/ignis"
+      org.opencontainers.image.source="https://github.com/gpillon/ignis" \
+      org.opencontainers.image.licenses="Apache-2.0"

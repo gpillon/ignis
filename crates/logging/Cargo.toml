@@ -3,6 +3,7 @@ name = "ignis-logging"
 description = "ignis: canonical structured-logging event model (tracing-backed, GitHub #78)"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 tracing = { workspace = true }
