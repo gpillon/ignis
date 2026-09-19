@@ -73,6 +73,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             checkpoint: None,
             capture_checkpoint: None,
             multimodal: None,
+            readout: None,
             request,
             tokens: prompt,
             context_tokens: 256,

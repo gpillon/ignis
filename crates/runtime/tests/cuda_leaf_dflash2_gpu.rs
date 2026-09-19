@@ -93,6 +93,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             checkpoint: None,
             capture_checkpoint: None,
             multimodal: None,
+            readout: None,
             request,
             tokens: prompt,
             context_tokens: MAX_CONTEXT,

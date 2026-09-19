@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
+use crate::decision::{Readout, log_sum_exp};
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -358,6 +359,15 @@ impl Compute for MockCompute {
                 // declines the bet testable too.
                 checkpoint_captured: job.capture_checkpoint.is_some()
                     && !g.capture_refusals.remove(&job.request),
+                // GitHub #237 / ADR 0034: the `Compute` seam now carries a
+                // second kind of answer, and every CPU-only implementation
+                // of it has to produce one or the scheduler's tests stop
+                // covering the path (ADR 0006). A job that asked for no
+                // readout gets none, exactly as a real backend reports.
+                readout: job
+                    .readout
+                    .as_deref()
+                    .map(|answers| Self::readout(self.seed, job.request, answers)),
             })
             .collect())
     }
@@ -550,6 +560,50 @@ impl MockCompute {
     fn free_blob(&self, blob: MockBlob) {
         if let Some(arena) = self.inner.lock().unwrap().arena.as_mut() {
             arena.free(blob);
+        }
+    }
+
+    /// How much of the mock's modelled distribution sits *outside* the
+    /// answer tokens, in nats. Small and nonzero on purpose: a readout
+    /// whose answer mass were exactly 1 would let a caller that forgot to
+    /// check the mass pass every CPU test and fail on the card, and the
+    /// real measurement is a median 99.8% held by the declared options
+    /// (`docs/findings/2026-09-19-typed-option-logit-readout.md`).
+    const OUTSIDE_THE_ANSWERS: f64 = 0.002;
+
+    /// The deterministic readout (GitHub #237): a pure function of (mock
+    /// seed, request id, answer token id, slot), shaped like a real one
+    /// rather than uniform — separated logits with one clear winner, an
+    /// answer mass just under 1, and an unrestricted argmax that *is* a
+    /// declared answer, which is what the served model does on every row
+    /// the finding scored.
+    fn readout(seed: u64, request: RequestId, answers: &[TokenId]) -> Readout {
+        let logits: Vec<f32> = answers
+            .iter()
+            .enumerate()
+            .map(|(slot, &id)| {
+                let mixed = Self::mix(seed, request, u64::from(id), slot as u32);
+                // -4 ..= +4 in thousandths: wide enough to separate slots,
+                // fine enough that two of one batch practically never tie.
+                (f64::from(mixed % 8_000) / 1000.0 - 4.0) as f32
+            })
+            .collect();
+        let answer_lse = log_sum_exp(&logits);
+        let winner = logits
+            .iter()
+            .enumerate()
+            .fold(None::<(usize, f32)>, |best, (index, &value)| match best {
+                Some((_, high)) if !(value > high) => best,
+                _ => Some((index, value)),
+            });
+        Readout {
+            full_log_sum_exp: if answer_lse.is_finite() {
+                answer_lse + Self::OUTSIDE_THE_ANSWERS
+            } else {
+                0.0
+            },
+            full_argmax: winner.map_or(0, |(index, _)| answers[index]),
+            logits,
         }
     }
 

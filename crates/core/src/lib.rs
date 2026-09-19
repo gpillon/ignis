@@ -32,6 +32,7 @@ pub mod admission;
 pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
+pub mod decision;
 pub mod gdn;
 #[cfg(feature = "cuda")]
 pub mod gdn_layer;
@@ -68,6 +69,7 @@ pub use checkpoint::{
     RetainedKind, ReuseSource,
 };
 pub use compute::{LayerKind, ModelConfig};
+pub use decision::{AnswerAlphabet, AnswerToken, LabelTokenizer, Readout};
 pub use concrete::{
     Clock, ConcreteScheduler, DEFAULT_SERVING_CHUNK_TOKENS, MAX_PREFILL_ATTEMPTS, SchedulerConfig,
     resolve_serving_chunk_tokens,

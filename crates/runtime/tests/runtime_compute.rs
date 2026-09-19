@@ -13,6 +13,10 @@ use ignis_runtime::{
     DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats, StepLeaf,
 };
 
+/// The stub's output-head width (GitHub #237). Small enough to write out in
+/// a test, wide enough that an answer token past it is a distinct case.
+const STUB_VOCAB: u32 = 16;
+
 #[derive(Default)]
 struct Calls {
     models_released: u32,
@@ -21,6 +25,10 @@ struct Calls {
     sequences_released: u32,
     prefill_positions: Vec<u32>,
     prefill_params: Vec<DecodeParams>,
+    /// GitHub #237: whether each prefill call was handed a logits buffer,
+    /// and how long it was — a job that asked for no readout must not cost
+    /// one, which is a claim about the *call*, not about the outcome.
+    prefill_logit_buffers: Vec<Option<usize>>,
     decode_batch_sizes: Vec<usize>,
     decode_params: Vec<Vec<DecodeParams>>,
     /// P5-06 (GitHub #154): each decode round's per-lane budget and stop ids.
@@ -193,6 +201,7 @@ impl StepLeaf for StubLeaf {
         start_position: u32,
         params: DecodeParams,
         span: MultimodalSpan<'_, Self::Media>,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32> {
         self.calls.lock().unwrap().multimodal_spans.push(SpanCall {
             start: start_position,
@@ -202,7 +211,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, params)
+        self.prefill(model, sequence, tokens, start_position, params, out_logits)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -352,6 +361,10 @@ impl StepLeaf for StubLeaf {
         Ok(())
     }
 
+    fn vocab(&self, _model: &Self::Model) -> u32 {
+        STUB_VOCAB
+    }
+
     fn prefill(
         &self,
         _model: &Self::Model,
@@ -359,13 +372,25 @@ impl StepLeaf for StubLeaf {
         _tokens: &[u32],
         start_position: u32,
         params: DecodeParams,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32> {
         let call = {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
             calls.prefill_params.push(params);
+            calls
+                .prefill_logit_buffers
+                .push(out_logits.as_ref().map(|buffer| buffer.len()));
             calls.prefill_positions.len()
         };
+        if let Some(buffer) = out_logits {
+            // A ramp, so a gather that read the wrong column or the wrong
+            // position would produce a wrong number rather than a
+            // plausible one: column `i` is worth `i / 2`.
+            for (column, logit) in buffer.iter_mut().enumerate() {
+                *logit = column as f32 / 2.0;
+            }
+        }
         self.prefill_error
             .or_else(|| {
                 self.prefill_error_on_call
@@ -475,6 +500,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 checkpoint: None,
                 capture_checkpoint: None,
                 multimodal: None,
+                readout: None,
                 request: 1,
                 tokens: vec![4, 5],
                 context_tokens: 9,
@@ -487,6 +513,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 checkpoint: None,
                 capture_checkpoint: None,
                 multimodal: None,
+                readout: None,
                 request: 2,
                 tokens: vec![4, 5],
                 context_tokens: 9,
@@ -543,6 +570,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         checkpoint: None,
         capture_checkpoint: None,
         multimodal: None,
+        readout: None,
         request,
         tokens: vec![4, 5],
         context_tokens: 9,
@@ -1142,6 +1170,7 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             checkpoint: None,
             capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 0 }),
             multimodal: None,
+            readout: None,
         }])
         .unwrap();
 
@@ -1175,6 +1204,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             checkpoint: None,
             capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 2 }),
             multimodal: None,
+            readout: None,
         }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
@@ -1197,6 +1227,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 }),
                 capture_checkpoint: None,
                 multimodal: None,
+                readout: None,
             }])
             .unwrap();
     }
@@ -1445,6 +1476,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         checkpoint: None,
         capture_checkpoint: None,
         multimodal: Some(prompt.clone()),
+        readout: None,
     }
 }
 
@@ -1606,6 +1638,7 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         checkpoint: None,
         capture_checkpoint: None,
         multimodal: None,
+        readout: None,
     };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
@@ -1645,6 +1678,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             checkpoint: None,
             capture_checkpoint: None,
             multimodal: None,
+            readout: None,
         }])
         .unwrap();
     compute.release(1);
@@ -1681,10 +1715,147 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             checkpoint: None,
             capture_checkpoint: None,
             multimodal: None,
+            readout: None,
         }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");
 
     compute.discard_spilled_prefix(1, 4);
     assert_eq!(compute.spilled_prefixes(), 0);
+}
+
+// ── the readout seam (GitHub #237, ADR 0034) ─────────────────────────────
+
+/// A prefill job that reads `answers` out at its last position.
+fn readout_job(request: u64, tokens: Vec<u32>, answers: &[u32]) -> PrefillJob {
+    PrefillJob {
+        readout: Some(std::sync::Arc::from(answers.to_vec())),
+        tokens,
+        ..prefill(request, None)
+    }
+}
+
+#[test]
+fn a_readout_job_is_gathered_on_the_leafs_side_of_the_seam() {
+    let leaf = Arc::new(StubLeaf::with_tokens([7]));
+    let model = Arc::new(Model::load(leaf.clone()).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+
+    let outcomes = compute
+        .prefill_step(&[readout_job(1, vec![4, 5], &[2, 5])])
+        .expect("a readout prefill succeeds");
+
+    assert_eq!(
+        leaf.calls.lock().unwrap().prefill_logit_buffers,
+        vec![Some(STUB_VOCAB as usize)],
+        "the leaf is handed a buffer exactly as wide as its output head"
+    );
+    let readout = outcomes[0].readout.as_ref().expect("the readout comes back");
+    assert_eq!(
+        readout.logits,
+        vec![1.0, 2.5],
+        "the named columns of the stub's ramp, in the order asked for"
+    );
+    assert_eq!(
+        readout.full_argmax,
+        STUB_VOCAB - 1,
+        "the unrestricted winner is the ramp's top column, which no answer named"
+    );
+    let mass = readout.answer_mass();
+    assert!(
+        (0.0..=1.0).contains(&mass),
+        "answer mass is a probability, got {mass}"
+    );
+    assert!(
+        mass < 0.1,
+        "the ramp keeps most of its mass outside the two answers, got {mass}"
+    );
+    assert_eq!(readout.winner(), Some(1), "column 5 outranks column 2");
+}
+
+#[test]
+fn a_job_that_asks_for_no_readout_is_handed_no_buffer() {
+    let leaf = Arc::new(StubLeaf::with_tokens([7]));
+    let model = Arc::new(Model::load(leaf.clone()).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+
+    let outcomes = compute.prefill_step(&[prefill(1, None)]).expect("prefill");
+
+    assert_eq!(
+        leaf.calls.lock().unwrap().prefill_logit_buffers,
+        vec![None],
+        "no readout was asked for, so the 248,320-wide buffer is never allocated"
+    );
+    assert!(outcomes[0].readout.is_none(), "and none comes back");
+}
+
+#[test]
+fn one_readout_job_in_a_batch_does_not_give_the_others_one() {
+    let leaf = Arc::new(StubLeaf::with_tokens([7]));
+    let model = Arc::new(Model::load(leaf.clone()).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+
+    let outcomes = compute
+        .prefill_step(&[
+            prefill(1, None),
+            readout_job(2, vec![4, 5], &[3]),
+            prefill(3, None),
+        ])
+        .expect("a mixed batch succeeds");
+
+    assert_eq!(
+        leaf.calls.lock().unwrap().prefill_logit_buffers,
+        vec![None, Some(STUB_VOCAB as usize), None],
+        "a decision batched beside ordinary prefills costs only itself"
+    );
+    assert!(outcomes[0].readout.is_none());
+    assert_eq!(
+        outcomes[1].readout.as_ref().expect("the decision's readout").logits,
+        vec![1.5]
+    );
+    assert!(outcomes[2].readout.is_none());
+}
+
+#[test]
+fn a_readout_job_with_nothing_to_prefill_fails_loudly() {
+    // A chunk with no tokens runs no forward pass, so there are no logits
+    // at this position to read. Returning `None` here would hand the caller
+    // a decision with no answer and no error; the batch fails instead.
+    let leaf = Arc::new(StubLeaf::with_tokens([7]));
+    let model = Arc::new(Model::load(leaf.clone()).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+
+    let error = compute
+        .prefill_step(&[readout_job(1, Vec::new(), &[2, 5])])
+        .expect_err("an empty readout chunk is refused");
+    assert!(matches!(error, ComputeError::Kernel(_)), "{error}");
+    assert_eq!(
+        compute.live_sequences(),
+        0,
+        "the failed batch leaves nothing behind for the retry to prefill twice"
+    );
+    assert!(
+        leaf.calls.lock().unwrap().prefill_logit_buffers.is_empty(),
+        "the leaf was never called at all"
+    );
+}
+
+#[test]
+fn an_answer_token_past_the_output_head_does_not_take_the_prefill_down() {
+    let leaf = Arc::new(StubLeaf::with_tokens([7]));
+    let model = Arc::new(Model::load(leaf.clone()).expect("stub model loads"));
+    let compute = RuntimeCompute::new(model, 99);
+
+    let outcomes = compute
+        .prefill_step(&[readout_job(1, vec![4, 5], &[4, STUB_VOCAB + 100])])
+        .expect("the prefill itself is unaffected");
+
+    let readout = outcomes[0].readout.as_ref().expect("a readout");
+    assert_eq!(readout.logits[0], 2.0);
+    assert!(
+        readout.logits[1].is_infinite() && readout.logits[1] < 0.0,
+        "a column the head does not have loses every comparison: {:?}",
+        readout.logits
+    );
+    assert_eq!(readout.winner(), Some(0));
 }

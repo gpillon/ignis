@@ -548,6 +548,7 @@ pub fn a_turn_from_a_retained_slot_generates_what_a_split_cold_prefill_generates
         checkpoint: None,
         capture_checkpoint: None,
         multimodal: None,
+        readout: None,
     };
 
     // Turn N: publish the block and the chained link, capture at the opener,

@@ -11,6 +11,7 @@
 //!   scheduler (admission, lanes, batched prefill, eviction) CPU-testable
 //!   without a GPU (ADR 0006).
 
+use crate::decision::Readout;
 use crate::types::{
     ComputeError, DecodeParams, FinishReason, LaneId, RequestClass, RequestId, RequestInput,
     SchedEvent, SpecCounters, SubmitError, TokenId,
@@ -131,6 +132,22 @@ pub struct PrefillJob {
     /// holds at most one media item's placeholders
     /// ([`crate::vision::Multimodal::cap_chunk`]).
     pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
+    /// The **answer tokens** this job reads out (GitHub #237, ADR 0034):
+    /// the vocabulary entries naming the options of a decision, whose
+    /// logits at this chunk's last position are the answer. `None` on every
+    /// job that is not a decision's last chunk — which is every job the
+    /// engine has today — and a job that asks for no readout pays for none:
+    /// the backend allocates no logits buffer and gathers nothing.
+    ///
+    /// Set only on the chunk that ends at the prompt's **last position**,
+    /// because that is the position whose next-token distribution holds the
+    /// decision. The chunk must also carry at least one token: a chunk with
+    /// nothing to prefill runs no forward pass, so there would be no logits
+    /// to read (GitHub #238 trims a reuse claim for exactly this reason).
+    ///
+    /// The order is the answer's order — [`PrefillOutcome::readout`]'s
+    /// `logits[i]` is the logit of `readout[i]`.
+    pub readout: Option<std::sync::Arc<[TokenId]>>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -167,7 +184,7 @@ pub struct DecodeJob {
 /// failure, once from the retry. What a request's total answers is "how
 /// much encode work did this request cause", not "what did this image cost
 /// to encode".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrefillOutcome {
     /// Wall time this chunk spent encoding a media item, in microseconds.
     pub encode_micros: u64,
@@ -187,6 +204,17 @@ pub struct PrefillOutcome {
     /// only on `true`, and gives the slot back on `false`, so its ledger and
     /// the device never disagree about what exists.
     pub checkpoint_captured: bool,
+    /// The **readout** this job asked for (GitHub #237, ADR 0034), if it
+    /// asked for one: the logits of its [`PrefillJob::readout`] answer
+    /// tokens at the chunk's last position, the full-vocabulary log-sum-exp
+    /// behind them, and the unrestricted argmax.
+    ///
+    /// This is the only thing a decision ever produces — no token is
+    /// sampled for it and none is emitted. What does *not* cross this seam
+    /// is the buffer it was read from: one f32 per vocabulary column, near
+    /// a megabyte per decision, gathered on the backend's side and dropped
+    /// there.
+    pub readout: Option<Readout>,
 }
 
 impl PrefillOutcome {

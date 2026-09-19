@@ -396,6 +396,7 @@ impl StepLeaf for CudaLeaf {
         start_position: u32,
         params: DecodeParams,
         span: MultimodalSpan<'_, Self::Media>,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         step::prefill_program_multimodal(
@@ -414,7 +415,7 @@ impl StepLeaf for CudaLeaf {
                     scatter_indices: media.scatter_indices,
                 }),
             },
-            None,
+            out_logits,
         )
         .map_err(|e| leaf_error("prefill", e))
     }
@@ -722,6 +723,7 @@ impl StepLeaf for CudaLeaf {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         step::prefill_program_sampled(
@@ -731,9 +733,18 @@ impl StepLeaf for CudaLeaf {
             &token_ids,
             u64::from(start_position),
             sampling_params(params),
-            None,
+            out_logits,
         )
         .map_err(|e| leaf_error("prefill", e))
+    }
+
+    /// The output head's width — 248,320 columns, which is what the kernel
+    /// writes into a readout buffer (GitHub #237). ignis is specialized for
+    /// this one topology (`CONTEXT.md`), so the number comes from the same
+    /// `ModelConfig` the load itself is built from rather than being asked
+    /// of the leaf.
+    fn vocab(&self, _model: &Self::Model) -> u32 {
+        ModelConfig::qwen38_27b().vocab as u32
     }
 
     fn decode(

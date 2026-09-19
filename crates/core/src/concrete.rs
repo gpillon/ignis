@@ -2896,6 +2896,10 @@ impl Scheduler for ConcreteScheduler {
                     // request that takes a checkpoint".
                     capture_checkpoint,
                     multimodal: r.input.multimodal.clone(),
+                    // GitHub #237 built the seam; the request kind that
+                    // asks for a readout is GitHub #238's. Nothing the
+                    // scheduler serves today is a decision.
+                    readout: None,
                 }
             })
             .collect();
@@ -2907,7 +2911,7 @@ impl Scheduler for ConcreteScheduler {
                     // by the zip below rather than caught.
                     debug_assert_eq!(outcomes.len(), jobs.len(), "one prefill outcome per job");
                     for ((&i, job), outcome) in batch.iter().zip(&jobs).zip(
-                        outcomes.iter().copied().chain(std::iter::repeat(PrefillOutcome::default())),
+                        outcomes.iter().cloned().chain(std::iter::repeat(PrefillOutcome::default())),
                     ) {
                         // GitHub #81 / ADR 0012: the prefill span — one per
                         // request per `prefill_step` call (the chunked-

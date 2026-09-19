@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use ignis_core::vision::{MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestId, RetainedAt, SpecCounters, TokenId,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RequestId, RetainedAt, SpecCounters,
+    TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -245,6 +246,18 @@ pub trait StepLeaf: Send + Sync + 'static {
     fn release_model(&self, model: Self::Model);
     /// Read the leaf's current geometry and step counters.
     fn stats(&self, model: &Self::Model) -> Result<RuntimeStats, i32>;
+    /// Columns the loaded model's output head writes — the length a
+    /// [`StepLeaf::prefill`] logits buffer must have (GitHub #237).
+    ///
+    /// The leaf's own number, and it is **not** the 151,936 ADR 0034
+    /// quotes: that is Qwen2/Qwen3's vocabulary, and this artifact's runs to
+    /// 248,320 (its `<|image_pad|>` alone sits at id 248,056). So a readout
+    /// buffer is nearer 970 KB than the ADR's 607, and one sized from the
+    /// wrong number would be a short write into the caller's memory.
+    /// Required rather than defaulted for the same reason — every leaf
+    /// knows this, and a default would be a wrong answer waiting to be
+    /// believed.
+    fn vocab(&self, model: &Self::Model) -> u32;
     /// Allocate one sequence with its full context reservation.
     fn allocate_sequence(
         &self,
@@ -359,6 +372,12 @@ pub trait StepLeaf: Send + Sync + 'static {
         BlobIdentity::UNSET
     }
     /// Warm one sequence with a prefill span.
+    ///
+    /// `out_logits`, when `Some`, is filled with the span's **last**
+    /// position's full logits — the readout path (GitHub #237, ADR 0034).
+    /// It must be [`StepLeaf::vocab`] entries long. No token is sampled for
+    /// it and the sequence is left exactly as a `None` call would leave it:
+    /// a readout observes the prefill, it does not change it.
     fn prefill(
         &self,
         model: &Self::Model,
@@ -366,6 +385,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32>;
     /// Encode one media item's patch rows into a device-resident embedding
     /// (the media encode step, GitHub #178). A leaf without vision refuses.
@@ -377,6 +397,11 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// [`StepLeaf::prefill`] over a span of a multimodal prompt: rotated at
     /// the span's three-axis positions, its placeholder columns taking the
     /// embedding's columns. A leaf without vision refuses.
+    ///
+    /// `out_logits` is [`StepLeaf::prefill`]'s, and is here for the same
+    /// reason the text path has it: the evidence a decision is put to may
+    /// be an image, and a readout wired only to the text path would return
+    /// nothing at all for one rather than failing (GitHub #237).
     fn prefill_multimodal(
         &self,
         _model: &Self::Model,
@@ -385,6 +410,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _start_position: u32,
         _params: DecodeParams,
         _span: MultimodalSpan<'_, Self::Media>,
+        _out_logits: Option<&mut [f32]>,
     ) -> Result<(), i32> {
         Err(-1)
     }
@@ -591,6 +617,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         media: &mut HashMap<RequestId, LiveMedia<L::Media>>,
         job: &PrefillJob,
         multimodal: &Multimodal,
+        out_logits: Option<&mut [f32]>,
     ) -> Result<u64, i32> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
@@ -632,6 +659,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 rope_delta: multimodal.rope_delta,
                 media: span_media,
             },
+            out_logits,
         )?;
         if chunk.is_some_and(|chunk| chunk.completes_item)
             && let Some(done) = media.remove(&job.request)
@@ -843,6 +871,16 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // progress section carries the pending token the capturing
             // sequence had at its opener.
             if !job.tokens.is_empty() {
+                // GitHub #237: the full-vocabulary buffer, allocated only
+                // for a job that asked to read one out — every other job
+                // pays nothing, not an allocation and not a gather. It is
+                // one f32 per output-head column (248,320 of them on the
+                // 27B) and it dies at the end of this iteration: what
+                // crosses the `Compute` seam is the gather below.
+                let mut logits = job
+                    .readout
+                    .as_ref()
+                    .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -853,16 +891,41 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.params,
+                            logits.as_deref_mut(),
                         )
                         .map(|()| 0),
-                    Some(multimodal) => {
-                        self.prefill_multimodal_job(&mut sequence.handle, &mut media, job, multimodal)
-                    }
+                    Some(multimodal) => self.prefill_multimodal_job(
+                        &mut sequence.handle,
+                        &mut media,
+                        job,
+                        multimodal,
+                        logits.as_deref_mut(),
+                    ),
                 };
                 match warmed {
                     Ok(encode_micros) => outcomes[index].encode_micros = encode_micros,
                     Err(code) => unwind!(RuntimeError::Leaf(code).into()),
                 }
+                if let (Some(answers), Some(logits)) = (&job.readout, &logits) {
+                    outcomes[index].readout = Some(Readout::gather(logits, answers));
+                }
+            } else if job.readout.is_some() {
+                // A chunk with nothing to prefill runs no forward pass, so
+                // there are no logits at this position to read — an exact
+                // repeat of a decision, whose reuse claim covered its whole
+                // prompt, is the way to get here (GitHub #238 trims such a
+                // claim by one token for exactly this reason). Failing
+                // loudly rather than returning `None`: a readout that
+                // silently did not happen is a decision answered by
+                // whatever the caller does with an absent answer.
+                // hotpath-lint-allow: failure-only path (the batch returns `Err` on the next line), reviewed exception (GitHub #237).
+                tracing::error!(
+                    name: "ignis.runtime.readout_without_tokens",
+                    request_id = job.request,
+                    start_position = job.start_position,
+                    "a readout job whose chunk carries no tokens runs no forward pass"
+                );
+                unwind!(RuntimeError::Leaf(-1).into());
             }
             if let Some(publish) = job.publish_prefix {
                 to_publish.push((job.request, publish));

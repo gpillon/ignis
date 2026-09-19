@@ -737,6 +737,9 @@ mod tests {
             Ok(())
         }
         fn release_prefix(&self, _model: &Self::Model, _prefix: Self::Prefix) {}
+        fn vocab(&self, _model: &Self::Model) -> u32 {
+            8
+        }
         fn prefill(
             &self,
             _model: &Self::Model,
@@ -744,6 +747,7 @@ mod tests {
             _tokens: &[TokenId],
             _start_position: u32,
             _params: DecodeParams,
+            _out_logits: Option<&mut [f32]>,
         ) -> Result<(), i32> {
             Ok(())
         }
