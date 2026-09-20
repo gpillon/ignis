@@ -133,6 +133,201 @@ impl<T> Ordered<T> {
     }
 }
 
+/// A whole JSON value that keeps the order its object keys were written in.
+///
+/// [`Ordered`] does this for a map whose values all share one type, which is
+/// what `criteria` is. A `state` is any JSON at all, and `instructions` may be
+/// an object too, so those need the same promise over the whole shape — the
+/// same reason, one level up.
+///
+/// **Without it a JSON evidence reaches the model alphabetised.**
+/// `serde_json::Map` is a `BTreeMap` in this build, so `{"order":…,"note":…}`
+/// serializes as `{"note":…,"order":…}`, and the record the caller wrote is
+/// not the record the model reads. Measured on the loaded model: one order
+/// record answered `gift` 0.32 as an object and 0.82 as the identical text,
+/// and the object answered *bit-identically* to the same object with its keys
+/// already sorted — which is what named the cause.
+///
+/// `serde_json::Number` is kept rather than an `f64`, so `149.0` is still
+/// `149.0` in the prompt. The caller's own spelling of a number is part of the
+/// bytes the model reads, and normalizing it moved an answer too.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderedValue {
+    Null,
+    Bool(bool),
+    Number(serde_json::Number),
+    String(String),
+    Array(Vec<OrderedValue>),
+    /// Entries in the order they were written. Duplicates are kept, for the
+    /// reason [`Ordered`] keeps them: which copy wins is a parser's choice.
+    Object(Vec<(String, OrderedValue)>),
+}
+
+impl OrderedValue {
+    /// A `serde_json::Value` as one of these — for a value this server built
+    /// itself, where there is no caller's order to lose.
+    pub fn from_json(value: &JsonValue) -> Self {
+        match value {
+            JsonValue::Null => Self::Null,
+            JsonValue::Bool(flag) => Self::Bool(*flag),
+            JsonValue::Number(number) => Self::Number(number.clone()),
+            JsonValue::String(text) => Self::String(text.clone()),
+            JsonValue::Array(items) => Self::Array(items.iter().map(Self::from_json).collect()),
+            JsonValue::Object(fields) => {
+                Self::Object(fields.iter().map(|(key, value)| (key.clone(), Self::from_json(value))).collect())
+            }
+        }
+    }
+
+    /// The same value as `serde_json`'s, for a path that does not care about
+    /// order — reading content parts, whose shape is fixed and named.
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            Self::Null => JsonValue::Null,
+            Self::Bool(flag) => JsonValue::Bool(*flag),
+            Self::Number(number) => JsonValue::Number(number.clone()),
+            Self::String(text) => JsonValue::String(text.clone()),
+            Self::Array(items) => JsonValue::Array(items.iter().map(Self::to_json).collect()),
+            Self::Object(entries) => {
+                JsonValue::Object(entries.iter().map(|(key, value)| (key.clone(), value.to_json())).collect())
+            }
+        }
+    }
+
+    /// Write this value as JSON, every object's entries in their own order.
+    ///
+    /// Hand-written for the reason [`payload_text`] is hand-written:
+    /// `serde_json` would sort exactly what this exists to keep. Strings and
+    /// keys still go through `serde_json` for their escaping, which is the one
+    /// part of this nobody should write a second time.
+    pub fn write(&self, out: &mut String) {
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+            Self::Number(number) => out.push_str(&number.to_string()),
+            Self::String(text) => out.push_str(&quoted(text)),
+            Self::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    item.write(out);
+                }
+                out.push(']');
+            }
+            Self::Object(entries) => {
+                out.push('{');
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&quoted(key));
+                    out.push(':');
+                    value.write(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// This value as JSON text, every object's entries in their own order.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+
+    /// The text this value carries, if it is a string.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// A JSON string literal, escaped the way `serde_json` escapes one.
+fn quoted(text: &str) -> String {
+    serde_json::to_string(text).expect("a string always serializes")
+}
+
+impl fmt::Display for OrderedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_text())
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AnyValue;
+
+        impl<'de> Visitor<'de> for AnyValue {
+            type Value = OrderedValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::Null)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::Null)
+            }
+
+            fn visit_some<D: Deserializer<'de>>(self, inner: D) -> Result<OrderedValue, D::Error> {
+                OrderedValue::deserialize(inner)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::Number(value.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::Number(value.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<OrderedValue, E> {
+                // A non-finite float is not JSON, and `null` is what
+                // `serde_json` itself writes in place of one.
+                Ok(serde_json::Number::from_f64(value).map_or(OrderedValue::Null, OrderedValue::Number))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<OrderedValue, E> {
+                Ok(OrderedValue::String(value))
+            }
+
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(self, mut access: S) -> Result<OrderedValue, S::Error> {
+                let mut items = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some(item) = access.next_element()? {
+                    items.push(item);
+                }
+                Ok(OrderedValue::Array(items))
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<OrderedValue, M::Error> {
+                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some(entry) = access.next_entry::<String, OrderedValue>()? {
+                    entries.push(entry);
+                }
+                Ok(OrderedValue::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(AnyValue)
+    }
+}
+
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Ordered<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct InOrder<T>(std::marker::PhantomData<T>);
@@ -168,7 +363,10 @@ pub struct DecideRequest {
     /// OpenAI content parts, so the evidence may be an image. The content
     /// parts are ours; Jev's `state` is `string | object | array`, which
     /// makes this a superset rather than a clone.
-    pub state: JsonValue,
+    ///
+    /// [`OrderedValue`] and not `JsonValue`, because an object's key order is
+    /// part of what the model reads and `serde_json::Map` would sort it away.
+    pub state: OrderedValue,
     /// The model to route to; the loaded model when absent or blank.
     #[serde(default)]
     pub model: Option<String>,
@@ -205,9 +403,10 @@ pub struct Question {
     #[serde(rename = "type")]
     pub kind: QuestionKind,
     /// What the model should decide. A string, object or array — anything
-    /// but a string is serialized into the prompt as JSON.
+    /// but a string is serialized into the prompt as JSON, in the order it
+    /// was written ([`OrderedValue`]).
     #[serde(alias = "question")]
-    pub instructions: JsonValue,
+    pub instructions: OrderedValue,
     /// The type's own options: absent for a bare `noul`, a map for a
     /// `choice`, an ordered array for a `score`.
     #[serde(default, alias = "options")]
@@ -435,7 +634,7 @@ pub struct PreparedQuestion {
     pub id: String,
     pub kind: QuestionKind,
     /// The instructions, as the prompt will carry them.
-    pub instructions: JsonValue,
+    pub instructions: OrderedValue,
     /// The options in declared order: what the caller called each one, and
     /// the description the prompt gives it.
     pub options: Vec<PreparedOption>,
@@ -608,12 +807,12 @@ fn prepare_program(
 /// Whether `instructions` says nothing at all — an empty string, an empty
 /// object or array, or `null`. A question with no instructions has no
 /// criterion to apply, and the model would answer the options alone.
-fn instructions_are_empty(instructions: &JsonValue) -> bool {
+fn instructions_are_empty(instructions: &OrderedValue) -> bool {
     match instructions {
-        JsonValue::Null => true,
-        JsonValue::String(text) => text.trim().is_empty(),
-        JsonValue::Array(items) => items.is_empty(),
-        JsonValue::Object(fields) => fields.is_empty(),
+        OrderedValue::Null => true,
+        OrderedValue::String(text) => text.trim().is_empty(),
+        OrderedValue::Array(items) => items.is_empty(),
+        OrderedValue::Object(entries) => entries.is_empty(),
         _ => false,
     }
 }
@@ -803,17 +1002,28 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
     let ask = match question.kind.is_constrained() {
         true => payload_text(&[("instruction", &question.instructions)]),
         false => {
-            let options: Vec<JsonValue> = question
+            // `description` before `letter`, which is **not** the order this
+            // reads in. It is the order `json!` used to emit, because
+            // `serde_json::Map` sorted these two keys — and every number this
+            // endpoint rests on was measured against those bytes
+            // (`classify_option_ceiling_gpu.rs` and
+            // `classify_readout_gpu.rs` still build their options that way).
+            // Writing them in the order a reader would choose would be a
+            // prompt nobody has measured, so the accident is kept and named.
+            let options: Vec<OrderedValue> = question
                 .options
                 .iter()
                 .zip(&question.answers)
                 .map(|(option, answer)| {
-                    json!({ "letter": answer.label, "description": option.description })
+                    OrderedValue::Object(vec![
+                        ("description".to_owned(), OrderedValue::String(option.description.clone())),
+                        ("letter".to_owned(), OrderedValue::String(answer.label.clone())),
+                    ])
                 })
                 .collect();
             payload_text(&[
                 ("criterion", &question.instructions),
-                ("options", &JsonValue::Array(options)),
+                ("options", &OrderedValue::Array(options)),
             ])
         }
     };
@@ -869,7 +1079,7 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
 /// property anyone should have to re-derive: the next field added here
 /// would silently reorder a prompt that has been measured. The order in
 /// the call site is the order the model sees.
-fn payload_text(fields: &[(&str, &JsonValue)]) -> String {
+fn payload_text(fields: &[(&str, &OrderedValue)]) -> String {
     let mut out = String::from("{");
     for (index, (name, value)) in fields.iter().enumerate() {
         if index > 0 {
@@ -878,9 +1088,7 @@ fn payload_text(fields: &[(&str, &JsonValue)]) -> String {
         out.push('"');
         out.push_str(name);
         out.push_str("\":");
-        out.push_str(
-            &serde_json::to_string(value).expect("a `JsonValue` always serializes"),
-        );
+        value.write(&mut out);
     }
     out.push('}');
     out
@@ -890,8 +1098,8 @@ fn payload_text(fields: &[(&str, &JsonValue)]) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Evidence {
     /// A string, object or array — Jev's own `state`, carried into the
-    /// prompt's JSON payload.
-    Json(JsonValue),
+    /// prompt's JSON payload in the order it was written.
+    Json(OrderedValue),
     /// OpenAI content parts, so the evidence may be an image. Ours, not
     /// Jev's.
     Parts(Vec<ContentPart>),
@@ -905,18 +1113,23 @@ impl Evidence {
     /// when **every** element is an object carrying a `type` string, which
     /// is what a content part always has and what evidence like
     /// `[{"id": 1, "title": "…"}]` does not. Anything else is evidence.
-    pub fn read(state: &JsonValue) -> Self {
-        let JsonValue::Array(items) = state else {
+    pub fn read(state: &OrderedValue) -> Self {
+        let OrderedValue::Array(items) = state else {
             return Self::Json(state.clone());
         };
         let parts_shaped = !items.is_empty()
-            && items
-                .iter()
-                .all(|item| item.get("type").and_then(JsonValue::as_str).is_some());
+            && items.iter().all(|item| match item {
+                OrderedValue::Object(entries) => entries
+                    .iter()
+                    .any(|(key, value)| key == "type" && value.as_str().is_some()),
+                _ => false,
+            });
         if !parts_shaped {
             return Self::Json(state.clone());
         }
-        match serde_json::from_value::<Vec<ContentPart>>(state.clone()) {
+        // Content parts are a named shape with no order to keep, so they read
+        // through `serde_json` like every other typed body on this server.
+        match serde_json::from_value::<Vec<ContentPart>>(state.to_json()) {
             Ok(parts) => Self::Parts(parts),
             Err(_) => Self::Json(state.clone()),
         }
