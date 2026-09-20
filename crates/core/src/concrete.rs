@@ -3272,6 +3272,14 @@ impl Scheduler for ConcreteScheduler {
         // `Running`, never holds a decode lane, emits no token, and carries
         // its readout out on the finish event.
         //
+        // The placement is load-bearing for ADR 0004, not only for tidiness.
+        // A decision's `remaining_work` is 0 — it has no tokens to generate
+        // — so it would satisfy `run_admission`'s temporal-backfill test
+        // (`remaining_work <= frontier && <= temporal_credit`) trivially and
+        // spend no credit doing it, taking a protected lane away from the
+        // conversation the protection was opened for. Emptying it from the
+        // candidate set here is what makes that unreachable.
+        //
         // `FinishReason::Stop` because the decision is *answered* — nothing
         // was cut short. Its `tokens` is 0, honestly: it generated nothing.
         let decided: Vec<usize> = self
