@@ -6,7 +6,7 @@
 - Last verified: 2026-09-20
 - Scope: serving / decisions, the `/v1/decide` prompt, shared-prefix reuse
 - Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, GitHub #239, #240
-- Superseded by: none
+- Superseded by: none (followed by `2026-09-20-the-evidence-belongs-in-the-system-block.md`, which takes the re-measurement this one leaves open and shows the byte order was not what the reuse turned on)
 
 ## Question
 
@@ -106,9 +106,15 @@ Three things are deliberately *not* fixed:
   rewriting them would silently restate history. A re-run of
   `classify_readout_gpu.rs` against the evidence-first payload is the
   measurement that would close the gap between the shipped prompt and the
-  published accuracy, and it is not done here.
+  published accuracy, and it is not done here. *(Taken on 2026-09-20 by
+  GitHub #240: that sweep now runs **both** layouts over the same rows on one
+  load, the sorted one kept verbatim as the record —
+  `2026-09-20-the-evidence-belongs-in-the-system-block.md`.)*
 - **No re-measurement has been taken**, so the accuracy numbers still
-  describe the old prompt.
+  describe the old prompt. *(Since taken, and the shipped prompt is not the
+  evidence-first payload this document proposed either: #240 moved the
+  evidence into the system block, where the reuse actually lives. Balanced
+  accuracy 0.934 -> 0.963.)*
 - **The claim still stands in the readout finding's own Implications**, with
   a pointer to this document beside it rather than a rewrite. Erasing it
   would erase that the claim was made and believed, which is the part worth

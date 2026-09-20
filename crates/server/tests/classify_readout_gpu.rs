@@ -44,7 +44,9 @@ use ignis_core::step::prefill_program;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 
+use ignis_core::decision::AnswerAlphabet;
 use ignis_server::artifact_template::ArtifactTemplateProvider;
+use ignis_server::decide::{DecideRequest, Evidence, messages_for, prepare};
 use ignis_server::template::{ChatMessage, TemplateProvider};
 use ignis_server::thinking::ThinkingOptions;
 
@@ -155,6 +157,43 @@ fn decision_messages(row: &Row) -> Vec<ChatMessage> {
         ChatMessage::text("system", DIRECT_SYSTEM),
         ChatMessage::text("user", payload.to_string()),
     ]
+}
+
+/// The same row as the body a Jev client would POST to `/v1/decide`.
+///
+/// Written out rather than built with `json!`, which sorts object keys in
+/// this build and would throw away the declared option order — the exact
+/// trap `docs/findings/2026-09-20-evidence-first-needs-explicit-key-order.md`
+/// records.
+fn decide_body(row: &Row) -> String {
+    let string = |value: &str| serde_json::to_string(value).expect("a string serializes");
+    let criteria = row
+        .options
+        .iter()
+        .map(|option| format!("{}:{}", string(&option.id), string(&option.description)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"state":{},"questions":{{"q":{{"type":"choice","instructions":{},"criteria":{{{criteria}}}}}}}}}"#,
+        serde_json::to_string(&row.state).expect("the state serializes"),
+        string(&row.question),
+    )
+}
+
+/// The prompt `/v1/decide` actually sends for this row — the endpoint's own
+/// `prepare` and `messages_for`, not a copy of them (GitHub #240).
+///
+/// The difference from [`decision_messages`] is where the evidence sits: in
+/// the system block, where a sibling question's retained prefix can reach
+/// it, rather than at the head of the user payload where nothing can. That
+/// is a different prompt, and this sweep is what says whether it is a worse
+/// one.
+fn shipped_messages(row: &Row, alphabet: &AnswerAlphabet) -> Result<Vec<ChatMessage>, String> {
+    let request: DecideRequest =
+        serde_json::from_str(&decide_body(row)).map_err(|e| format!("body: {e}"))?;
+    let prepared =
+        prepare(&request.questions, alphabet).map_err(|refusal| format!("prepare: {}", refusal.message))?;
+    Ok(messages_for(&Evidence::read(&request.state), &prepared[0]))
 }
 
 /// The answer slots for `count` options: each letter's token id, verified the
@@ -332,6 +371,25 @@ fn typed_option_logits_are_readable_from_one_prefill() {
 
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = vec![0f32; vocab];
+
+    // Two layouts over the same rows, on the same load (GitHub #240).
+    //
+    // `measured` is the prompt every number in
+    // `docs/findings/2026-09-20-...` was measured on — SemIf's, with the
+    // evidence in the user payload. `shipped` is what `/v1/decide` sends
+    // now, with the evidence in the system block so a fan-out's followers
+    // can claim it. Moving text between turns is a different prompt, and a
+    // reuse argument is no reason to accept a worse answer: this is the
+    // comparison that says it is not one.
+    let alphabet = AnswerAlphabet::from_tokenizer(tokenizer_set.tokenizer());
+    type Layout = fn(&Row, &AnswerAlphabet) -> Result<Vec<ChatMessage>, String>;
+    let layouts: [(&str, Layout); 2] = [
+        ("measured", |row, _| Ok(decision_messages(row))),
+        ("shipped", shipped_messages),
+    ];
+    let mut by_layout: Vec<(&str, Vec<Readout>)> = Vec::new();
+
+    for (layout, messages_of) in layouts {
     let mut readouts: Vec<Readout> = Vec::new();
     let mut excluded: Vec<(String, String)> = Vec::new();
 
@@ -344,7 +402,13 @@ fn typed_option_logits_are_readable_from_one_prefill() {
             excluded.push((row.id.clone(), format!("label {} is out of range", row.label)));
             continue;
         }
-        let messages = decision_messages(row);
+        let messages = match messages_of(row, &alphabet) {
+            Ok(messages) => messages,
+            Err(reason) => {
+                excluded.push((row.id.clone(), reason));
+                continue;
+            }
+        };
         let prompt_text = match provider.render_text(&messages, &thinking, &[]) {
             Ok(text) => text,
             Err(rejection) => {
@@ -439,7 +503,7 @@ fn typed_option_logits_are_readable_from_one_prefill() {
         lines.push_str(&record.to_string());
         lines.push('\n');
     }
-    let out = scratch.join("readout.jsonl");
+    let out = scratch.join(format!("readout-{layout}.jsonl"));
     std::fs::write(&out, lines).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
 
     assert!(
@@ -454,17 +518,17 @@ fn typed_option_logits_are_readable_from_one_prefill() {
     let min_mass = masses.iter().copied().fold(f64::INFINITY, f64::min);
     let median_mass = median(&mut masses);
 
-    eprintln!("ignis classify: rows={} scored={scored} excluded={}", rows.len(), excluded.len());
+    eprintln!("ignis classify {layout}: rows={} scored={scored} excluded={}", rows.len(), excluded.len());
     for (id, reason) in &excluded {
-        eprintln!("ignis classify: excluded {id}: {reason}");
+        eprintln!("ignis classify {layout}: excluded {id}: {reason}");
     }
     eprintln!(
-        "ignis classify: accuracy={:.3} balanced_accuracy={:.3} (SemIf reference on a 4B: 0.813)",
+        "ignis classify {layout}: accuracy={:.3} balanced_accuracy={:.3} (SemIf reference on a 4B: 0.813)",
         hits as f64 / scored as f64,
         balanced_accuracy(&readouts)
     );
     eprintln!(
-        "ignis classify: argmax_in_slots={in_slots}/{scored} ({:.1}%) allowed_mass median={median_mass:.4} min={min_mass:.4}",
+        "ignis classify {layout}: argmax_in_slots={in_slots}/{scored} ({:.1}%) allowed_mass median={median_mass:.4} min={min_mass:.4}",
         100.0 * in_slots as f64 / scored as f64
     );
     let mut latencies: Vec<f64> = readouts.iter().map(|r| r.prefill_micros as f64 / 1000.0).collect();
@@ -472,11 +536,11 @@ fn typed_option_logits_are_readable_from_one_prefill() {
     let median_ms = median(&mut latencies);
     let mut prompt_lengths: Vec<f64> = readouts.iter().map(|r| r.prompt_tokens as f64).collect();
     eprintln!(
-        "ignis classify: prefill median={median_ms:.1} ms  total={total_ms:.0} ms over {scored} decisions ({:.1} decisions/s, serial, no prefix reuse)",
+        "ignis classify {layout}: prefill median={median_ms:.1} ms  total={total_ms:.0} ms over {scored} decisions ({:.1} decisions/s, serial, no prefix reuse)",
         1000.0 * scored as f64 / total_ms
     );
     eprintln!(
-        "ignis classify: prompt tokens median={:.0} max={:.0}",
+        "ignis classify {layout}: prompt tokens median={:.0} max={:.0}",
         median(&mut prompt_lengths),
         prompt_lengths.iter().copied().fold(0.0, f64::max)
     );
@@ -490,7 +554,7 @@ fn typed_option_logits_are_readable_from_one_prefill() {
     }
     for (family, (hit, total)) in &families {
         eprintln!(
-            "ignis classify: family {family}: {hit}/{total} ({:.3})",
+            "ignis classify {layout}: family {family}: {hit}/{total} ({:.3})",
             *hit as f64 / *total as f64
         );
     }
@@ -510,7 +574,61 @@ fn typed_option_logits_are_readable_from_one_prefill() {
         })
         .collect();
     if !strays.is_empty() {
-        eprintln!("ignis classify: off-slot winners: {}", strays.join(" "));
+        eprintln!("ignis classify {layout}: off-slot winners: {}", strays.join(" "));
     }
-    eprintln!("ignis classify: rows written to {}", out.display());
+    eprintln!("ignis classify {layout}: rows written to {}", out.display());
+    by_layout.push((layout, readouts));
+    }
+
+    // ── the comparison the layout change rests on ────────────────────────
+    let summary = |readouts: &[Readout]| {
+        let scored = readouts.len() as f64;
+        let mut masses: Vec<f64> = readouts.iter().map(|r| r.allowed_mass).collect();
+        (
+            readouts.iter().filter(|r| r.predicted == r.label).count() as f64 / scored,
+            balanced_accuracy(readouts),
+            readouts.iter().filter(|r| r.argmax_in_slots).count() as f64 / scored,
+            median(&mut masses),
+        )
+    };
+    let (measured, shipped) = (&by_layout[0].1, &by_layout[1].1);
+    assert_eq!(
+        measured.len(),
+        shipped.len(),
+        "the two layouts must score the same rows to be comparable"
+    );
+    let (m_acc, m_bal, m_slots, m_mass) = summary(measured);
+    let (s_acc, s_bal, s_slots, s_mass) = summary(shipped);
+    let agreed = measured
+        .iter()
+        .zip(shipped)
+        .filter(|(a, b)| a.id == b.id && a.predicted == b.predicted)
+        .count();
+    eprintln!(
+        "ignis classify A/B: accuracy {m_acc:.3} -> {s_acc:.3}  balanced {m_bal:.3} -> {s_bal:.3}  \
+         argmax_in_slots {:.1}% -> {:.1}%  mass median {m_mass:.4} -> {s_mass:.4}  \
+         same answer on {agreed}/{} rows",
+        100.0 * m_slots,
+        100.0 * s_slots,
+        measured.len()
+    );
+
+    // Guards, not targets. One sweep of 144 authored rows cannot resolve a
+    // point of accuracy, and none is claimed — what it can resolve is a
+    // layout that broke the readout, which is the only thing that would
+    // make the reuse a bad trade.
+    assert!(
+        s_mass > 0.9,
+        "the declared options still hold the distribution: median mass {s_mass:.4}"
+    );
+    assert!(
+        s_slots > m_slots - 0.05,
+        "the model still answers with a declared letter as often: {:.1}% -> {:.1}%",
+        100.0 * m_slots,
+        100.0 * s_slots
+    );
+    assert!(
+        s_bal > m_bal - 0.05,
+        "and is no less right: balanced accuracy {m_bal:.3} -> {s_bal:.3}"
+    );
 }
