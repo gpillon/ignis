@@ -872,7 +872,9 @@ impl ignis_core::Compute for HoldFollower {
         &self,
         jobs: &[ignis_core::PrefillJob],
     ) -> Result<Vec<ignis_core::PrefillOutcome>, ignis_core::ComputeError> {
-        let follower = jobs.iter().any(|job| job.request > 1);
+        // Request ids start at 0, so the sequenced first question is 0 and
+        // every follower is 1 or above.
+        let follower = jobs.iter().any(|job| job.request >= 1);
         if follower && !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let _ = self.entered.send(());
             let _ = self.go.lock().unwrap().recv();
@@ -914,7 +916,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
         held: std::sync::atomic::AtomicBool::new(false),
         released: released_tx,
     });
-    let app = server_over(compute.clone() as Arc<dyn ignis_core::Compute>).app();
+    let (app, _, cancelled) = recording_over(compute.clone() as Arc<dyn ignis_core::Compute>);
 
     let request = Request::builder()
         .method("POST")
@@ -939,9 +941,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
 
     let releases = tokio::task::spawn_blocking(move || {
         let mut seen = std::collections::BTreeSet::new();
-        while let Ok(request) =
-            released_rx.recv_timeout(std::time::Duration::from_secs(10))
-        {
+        while let Ok(request) = released_rx.recv_timeout(std::time::Duration::from_secs(3)) {
             seen.insert(request);
         }
         seen
@@ -949,11 +949,6 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     .await
     .expect("the collector ran");
 
-    assert!(
-        releases.len() > 1,
-        "the sequenced first question and at least one follower were \
-         released: {releases:?}"
-    );
     let prefilled: std::collections::BTreeSet<u64> = compute
         .inner
         .prefill_calls()
@@ -962,9 +957,29 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
         .map(|job| job.request)
         .collect();
     assert!(
+        prefilled.len() > 1,
+        "a follower was in the engine when the client went away: {prefilled:?}"
+    );
+    assert!(
         prefilled.is_subset(&releases),
-        "every request the engine started is released, none left running: \
-         started {prefilled:?}, released {releases:?}"
+        "every request the engine started released its resources, none left \
+         running: started {prefilled:?}, released {releases:?}"
+    );
+
+    // The assertion with teeth. Everything above is also true of a fan-out
+    // that simply *finished* — a decision terminates in the tick its prefill
+    // does, so the followers held here were a few microseconds from
+    // answering nobody, and a `CancelOnDrop` deleted from `ask` leaves every
+    // line above green (verified by mutation). What only a cancelled
+    // request has is a cancel issued for it.
+    let cancelled: std::collections::BTreeSet<u64> =
+        cancelled.lock().unwrap().iter().copied().collect();
+    let followers: std::collections::BTreeSet<u64> =
+        prefilled.iter().copied().filter(|&id| id >= 1).collect();
+    assert!(
+        followers.is_subset(&cancelled),
+        "the handler's future dropping cancels every internal request still \
+         alive: followers {followers:?}, cancelled {cancelled:?}"
     );
 }
 
@@ -976,6 +991,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
 struct RecordingScheduler {
     inner: ConcreteScheduler,
     submitted: Arc<std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>>,
+    cancelled: Arc<std::sync::Mutex<Vec<ignis_core::RequestId>>>,
 }
 
 impl ignis_core::Scheduler for RecordingScheduler {
@@ -989,6 +1005,12 @@ impl ignis_core::Scheduler for RecordingScheduler {
     }
 
     fn cancel(&mut self, request: ignis_core::RequestId) -> bool {
+        // Recorded before delegating, and the return value is not the
+        // property under test: the engine calls this for a request that has
+        // already finished too, and `cancel` answers `false`. What a
+        // disconnected client owes its siblings is that the cancel was
+        // *issued*.
+        self.cancelled.lock().unwrap().push(request);
         self.inner.cancel(request)
     }
 
@@ -1017,14 +1039,26 @@ impl ignis_core::Scheduler for RecordingScheduler {
     }
 }
 
-fn recording() -> (axum::Router, Arc<std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>>) {
-    let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+type Submitted = Arc<
+    std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>,
+>;
+type Cancelled = Arc<std::sync::Mutex<Vec<ignis_core::RequestId>>>;
+
+fn recording() -> (axum::Router, Submitted) {
+    let (app, submitted, _) = recording_over(Arc::new(MockCompute::new()));
+    (app, submitted)
+}
+
+fn recording_over(compute: Arc<dyn ignis_core::Compute>) -> (axum::Router, Submitted, Cancelled) {
+    let submitted: Submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cancelled: Cancelled = Arc::new(std::sync::Mutex::new(Vec::new()));
     let scheduler = RecordingScheduler {
-        inner: scheduler_over(Arc::new(MockCompute::new())),
+        inner: scheduler_over(compute),
         submitted: submitted.clone(),
+        cancelled: cancelled.clone(),
     };
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate));
-    (server.app(), submitted)
+    (server.app(), submitted, cancelled)
 }
 
 #[tokio::test]
