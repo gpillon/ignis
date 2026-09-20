@@ -425,6 +425,23 @@ pub trait TemplateProvider: Send + Sync {
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection>;
 
+    /// The **answer alphabet** this provider's tokenizer can name (GitHub
+    /// #237, #239): the labels `/v1/decide` gives a decision's options.
+    ///
+    /// It belongs here because it is a property of the loaded tokenizer and
+    /// nothing else — a label is admitted only if it encodes to exactly one
+    /// token that decodes back to itself — and this seam is the only place
+    /// that holds one. Computed once, at the `Server` that owns the
+    /// provider, never per request: it is 624 encode round-trips on the
+    /// 27B's tokenizer.
+    ///
+    /// The default is empty, which is the honest answer for a provider with
+    /// no real tokenizer: `/v1/decide` then refuses every request rather
+    /// than labelling options with something it cannot read back.
+    fn answer_alphabet(&self) -> ignis_core::decision::AnswerAlphabet {
+        ignis_core::decision::AnswerAlphabet::default()
+    }
+
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
     fn render_tokens(&self, tokens: &[TokenId]) -> String;

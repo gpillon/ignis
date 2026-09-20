@@ -511,6 +511,32 @@ pub async fn collect_tokens(
     }
 }
 
+/// Drive a submitted **decision** to its answer (GitHub #239): wait for its
+/// [`SchedEvent::Done`] and hand back the readout it finished with.
+///
+/// The mirror of [`collect_tokens`], and deliberately not a special case of
+/// it: a decision emits no token, so there is nothing to collect but the
+/// readout. A `Done` that carries none is a request the engine could not
+/// answer — [`FinishReason::Error`] from the scheduler's own guard — and is
+/// reported as not completed rather than as an empty answer.
+pub async fn collect_readout(
+    rx: &mut EventStream,
+    timeout: Duration,
+) -> Result<ignis_core::decision::Readout, CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SchedEvent::Done { readout, .. })) => {
+                return readout.ok_or(CollectError::NotCompleted);
+            }
+            // Every other event for this request — its admission, its
+            // prefill chunks, a restore — says nothing about the answer.
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
+        }
+    }
+}
+
 /// The request's stream ended without a completion.
 #[derive(Debug)]
 pub enum CollectError {
