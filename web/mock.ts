@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Plugin } from "vite";
+import { mockDecide } from "./mockDecide.ts";
 import { createMetricsSim } from "./mockMetrics.ts";
 
 // A fake ignis for `npm run dev:mock`: enough of /v1/models, streaming
@@ -20,6 +21,10 @@ import { createMetricsSim } from "./mockMetrics.ts";
 // search and one page read; an agent-lane request with the web tools whose
 // task contains "/web" searches once before its report ("/agents /web …").
 // The calls themselves run in the browser against the real services.
+//
+// Decide: /v1/decide answers every primitive from a hash of the question
+// (mockDecide.ts); "/error" in a question's instructions fails that question
+// alone, "/full" in the evidence refuses the whole request.
 //
 // Ask: with `ask_user` declared, a prompt containing "/ask" asks which team.
 // Local: "/js", "/plan", "/file" and "/html" call run_js, update_plan and create_file.
@@ -185,6 +190,23 @@ export function mockIgnis(): Plugin {
           res.write(pieces[i++]);
         }, pace);
         req.on("close", () => clearInterval(timer));
+      });
+
+      server.middlewares.use("/v1/decide", async (req, res) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end();
+          return;
+        }
+        let raw = "";
+        req.on("data", (part) => (raw += part));
+        await new Promise((resolve) => req.on("end", resolve));
+        const { status, body } = mockDecide(raw);
+        res.statusCode = status;
+        res.setHeader("Content-Type", "application/json");
+        // One prefill, and the answers land together: the wait is the prefill,
+        // not a stream.
+        setTimeout(() => res.end(JSON.stringify(body)), 260);
       });
 
       // A live simulation (mockMetrics.ts), so the Monitor has traffic to draw.

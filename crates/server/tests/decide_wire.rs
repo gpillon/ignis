@@ -12,7 +12,7 @@ use ignis_core::types::TokenId;
 use serde_json::{Value as JsonValue, json};
 
 use ignis_server::decide::{
-    Answer, DecideRequest, Evidence, MAX_OPTIONS, Ordered, PreparedQuestion, Question,
+    Answer, DecideRequest, Evidence, MAX_OPTIONS, Ordered, OrderedValue, PreparedQuestion, Question,
     QuestionKind, Refusal, answer_for, expected_level, messages_for, prepare, score_confidence,
 };
 
@@ -341,7 +341,7 @@ fn our_own_names_for_jevs_fields_are_read_as_aliases() {
         }
     }));
     assert_eq!(questions[0].kind, QuestionKind::Noul);
-    assert_eq!(questions[0].instructions, json!("Urgent?"));
+    assert_eq!(questions[0].instructions, OrderedValue::String("Urgent?".to_owned()));
     assert_eq!(questions[0].options[0].description, "yes");
 }
 
@@ -354,7 +354,7 @@ fn the_same_options_in_two_orders_are_two_different_prompts() {
             r#"{{"state":"s","questions":{{"department":{{"type":"choice","instructions":"Which team?","criteria":{criteria}}}}}}}"#
         );
         let questions = prepared(&body);
-        let messages = messages_for(&Evidence::Json(json!("evidence")), &questions[0]);
+        let messages = messages_for(&Evidence::Json(OrderedValue::from_json(&json!("evidence"))), &questions[0]);
         messages[1].content.text()
     };
     let forward = of(r#"{"billing":"Payments","technical":"Bugs"}"#);
@@ -387,6 +387,88 @@ fn the_answer_tokens_follow_the_declared_order() {
     // And the winning label maps back to the option that carried it.
     let answer = answer_for(question, &readout_of(&[0.1, 0.9]));
     assert!(matches!(&answer, Answer::Choice { choice, .. } if choice == "aardvark"));
+}
+
+// ── an evidence's own order is an input too ─────────────────────────────
+
+/// The system block one question is asked under, for a `state` written exactly
+/// as the caller wrote it.
+fn system_block_for(state: &str) -> String {
+    let body = format!(
+        r#"{{"state":{state},"questions":{{"q":{{"type":"noul","instructions":"Is it?"}}}}}}"#
+    );
+    let request: DecideRequest = serde_json::from_str(&body).expect("a valid request");
+    let questions = prepare(&request.questions, &alphabet(), &encoder).expect("a valid decision");
+    messages_for(&Evidence::read(&request.state), &questions[0])[0].content.text()
+}
+
+#[test]
+fn a_json_evidence_reaches_the_model_in_the_order_it_was_written() {
+    // The same argument option order gets, one level up. `serde_json::Map` is
+    // a `BTreeMap` in this build, so without `OrderedValue` this record would
+    // arrive alphabetised — and it is not a presentation detail: on the loaded
+    // model the authored order and the sorted order answered 0.82 and 0.32 to
+    // the same question.
+    let authored = system_block_for(r#"{"order":"A-4471","note":"it is a gift","amount":12}"#);
+    assert!(
+        authored.find(r#""order""#).unwrap() < authored.find(r#""note""#).unwrap(),
+        "the caller wrote `order` first: {authored}"
+    );
+    assert!(
+        authored.find(r#""note""#).unwrap() < authored.find(r#""amount""#).unwrap(),
+        "and `note` before `amount`: {authored}"
+    );
+
+    // Written the other way round it is a different prompt, which is the whole
+    // claim: a sorted-away order would make these two identical.
+    let reversed = system_block_for(r#"{"amount":12,"note":"it is a gift","order":"A-4471"}"#);
+    assert_ne!(authored, reversed);
+}
+
+#[test]
+fn a_nested_object_keeps_its_order_too() {
+    let block = system_block_for(r#"{"shipping":{"method":"standard","country":"IT"}}"#);
+    assert!(
+        block.find(r#""method""#).unwrap() < block.find(r#""country""#).unwrap(),
+        "the order holds all the way down: {block}"
+    );
+}
+
+#[test]
+fn a_number_keeps_the_spelling_the_caller_gave_it() {
+    // `149.0` and `149` are different bytes in the prompt, and the model reads
+    // bytes. Parsing through an `f64` would have made them the same.
+    assert!(system_block_for(r#"{"price":149.0}"#).contains("149.0"));
+    assert!(!system_block_for(r#"{"price":149}"#).contains("149.0"));
+}
+
+#[test]
+fn an_object_instruction_keeps_its_order() {
+    let body = r#"{"state":"s","questions":{"q":{"type":"noul","instructions":{"ask":"is it?","about":"the order"}}}}"#;
+    let request: DecideRequest = serde_json::from_str(body).expect("a valid request");
+    let questions = prepare(&request.questions, &alphabet(), &encoder).expect("a valid decision");
+    let user = messages_for(&Evidence::read(&request.state), &questions[0])[1].content.text();
+    assert!(
+        user.find(r#""ask""#).unwrap() < user.find(r#""about""#).unwrap(),
+        "`instructions` is a `state` in miniature: {user}"
+    );
+}
+
+#[test]
+fn the_options_keep_the_two_keys_in_the_order_they_were_measured_with() {
+    // `description` before `letter`. Not the order anyone would choose, but
+    // the order `serde_json` used to emit, and the order every number this
+    // endpoint rests on was measured against.
+    let questions = prepared(
+        r#"{"state":"s","questions":{"q":{"type":"choice","instructions":"Which?","criteria":{"billing":"Payments"}}}}"#,
+    );
+    let user = messages_for(&Evidence::Json(OrderedValue::from_json(&json!("s"))), &questions[0])[1]
+        .content
+        .text();
+    assert!(
+        user.contains(r#"{"description":"Payments","letter":"A"}"#),
+        "the measured option shape is kept: {user}"
+    );
 }
 
 // ── the ceiling (acceptance 6) ───────────────────────────────────────────
@@ -537,7 +619,7 @@ fn a_state_that_is_content_parts_is_read_as_content_parts() {
         { "type": "image_url", "image_url": { "url": "https://example.test/a.png" } },
         { "type": "text", "text": "the receipt above" }
     ]);
-    let evidence = Evidence::read(&state);
+    let evidence = Evidence::read(&OrderedValue::from_json(&state));
     let Evidence::Parts(parts) = &evidence else {
         panic!("expected content parts, got {evidence:?}");
     };
@@ -558,7 +640,7 @@ fn a_json_array_of_records_is_evidence_not_content_parts() {
         json!({ "ticket": 12 }),
         json!("a plain string"),
     ] {
-        let evidence = Evidence::read(&state);
+        let evidence = Evidence::read(&OrderedValue::from_json(&state));
         assert!(
             matches!(evidence, Evidence::Json(_)),
             "{state} should be evidence, got {evidence:?}"
@@ -577,7 +659,7 @@ fn image_evidence_leads_the_prompt_and_drops_the_evidence_field() {
         "questions": { "q": { "type": "choice", "instructions": "Which number?", "criteria": { "42": null, "47": null } } }
     }));
     let state = json!([{ "type": "image_url", "image_url": { "url": "https://example.test/a.png" } }]);
-    let messages = messages_for(&Evidence::read(&state), &questions[0]);
+    let messages = messages_for(&Evidence::read(&OrderedValue::from_json(&state)), &questions[0]);
 
     assert_eq!(messages[0].content.text(), ignis_server::decide::DIRECT_SYSTEM);
     let ignis_server::template::MessageContent::Parts(parts) = &messages[1].content else {
@@ -604,7 +686,7 @@ fn text_evidence_rides_in_the_system_block() {
     // system block and nowhere else (`decide::messages_for` says why).
     let questions = prepared(JEV_CHOICE);
     let messages = messages_for(
-        &Evidence::read(&json!("Help! My payouts have been failing for 3 days.")),
+        &Evidence::read(&OrderedValue::from_json(&json!("Help! My payouts have been failing for 3 days."))),
         &questions[0],
     );
     assert_eq!(messages.len(), 2);
@@ -643,7 +725,7 @@ fn two_questions_over_one_state_have_the_same_system_block() {
       }
     }"#;
     let questions = prepared(body);
-    let evidence = Evidence::read(&json!("Help! My payouts have been failing for 3 days."));
+    let evidence = Evidence::read(&OrderedValue::from_json(&json!("Help! My payouts have been failing for 3 days.")));
     let first = messages_for(&evidence, &questions[0]);
     let second = messages_for(&evidence, &questions[1]);
 
@@ -676,7 +758,7 @@ fn an_image_state_stays_in_the_user_turn() {
         "questions": { "q": { "type": "choice", "instructions": "Which number?", "criteria": { "42": null, "47": null } } }
     }));
     let state = json!([{ "type": "image_url", "image_url": { "url": "https://example.test/a.png" } }]);
-    let messages = messages_for(&Evidence::read(&state), &questions[0]);
+    let messages = messages_for(&Evidence::read(&OrderedValue::from_json(&state)), &questions[0]);
 
     assert_eq!(
         messages[0].content.text(),
@@ -710,7 +792,7 @@ fn a_structured_instruction_reaches_the_prompt_whole() {
             }
         }
     }));
-    let text = messages_for(&Evidence::Json(json!("s")), &questions[0]).remove(1).content.text();
+    let text = messages_for(&Evidence::Json(OrderedValue::from_json(&json!("s"))), &questions[0]).remove(1).content.text();
     let payload: JsonValue = serde_json::from_str(&text).expect("JSON");
     assert_eq!(payload["criterion"]["ask"], "Is it urgent?");
 }
@@ -779,7 +861,7 @@ fn a_field_the_primitive_cannot_honour_is_refused_not_ignored() {
 #[test]
 fn a_constrained_questions_prompt_declares_its_shape_and_asks_the_instruction_alone() {
     let prepared = prepare_one_wire(&program_body("point", "")).expect("a point");
-    let messages = messages_for(&Evidence::Json(json!("s")), &prepared[0]);
+    let messages = messages_for(&Evidence::Json(OrderedValue::from_json(&json!("s"))), &prepared[0]);
     let system = messages[0].content.text();
     assert!(
         system.starts_with(&ignis_server::numbers::point_system(3)),

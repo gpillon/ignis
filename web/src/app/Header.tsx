@@ -6,9 +6,9 @@ import { MonitorPulse } from "../monitor/MonitorPulse.tsx";
 import { useMemoryNotes } from "../tools/local/memory.ts";
 import { IconSessions, IconSliders } from "../ui/icons.tsx";
 
-export type View = "chat" | "monitor";
+export type View = "chat" | "decide" | "monitor";
 
-/** The kiln bar: brand, the Playground/Monitor switch, model status, and the drawer buttons below `lg`. */
+/** The kiln bar: brand, the view switch, model status, and the drawer buttons below `lg`. */
 export function Header({
   model,
   busy,
@@ -17,6 +17,7 @@ export function Header({
   onOpenMemory,
   view = "chat",
   onView,
+  monitorAvailable = false,
 }: {
   model: ModelState;
   busy: boolean;
@@ -25,15 +26,20 @@ export function Header({
   onForgetKey?: () => void;
   onOpenMemory: () => void;
   view?: View;
-  /** Present when ignis serves metrics: switches between the chat and the Monitor. */
+  /** Switches views. The Decide tab needs no metrics, so this is always present in the app. */
   onView?: (view: View) => void;
+  /** ignis serves metrics, so the Monitor is one of the views on offer. */
+  monitorAvailable?: boolean;
 }) {
   const chat = view === "chat";
+  // The chat and the bench both have two side columns that are drawers below
+  // `lg`; the Monitor has none.
+  const sided = view !== "monitor";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
       <div className="flex items-center gap-3 px-4 py-3 sm:gap-4 md:px-6">
-        {chat && (
-          <HeaderButton label="Sessions" onClick={() => onOpen("sessions")}>
+        {sided && (
+          <HeaderButton label={chat ? "Sessions" : "Decisions"} onClick={() => onOpen("sessions")}>
             <IconSessions />
           </HeaderButton>
         )}
@@ -41,12 +47,12 @@ export function Header({
         <img src={wordmark} alt="ignis" className="h-[18px] w-auto" />
         <span className="hidden h-6 w-px bg-kiln-line sm:block" aria-hidden />
         {onView ? (
-          <ViewSwitch view={view} onView={onView} />
+          <ViewSwitch view={view} onView={onView} monitorAvailable={monitorAvailable} />
         ) : (
           <span className="hidden font-display text-[15px] font-medium tracking-wide text-[#b9bec4] sm:block">Playground</span>
         )}
         <ModelStatus model={model} busy={busy} />
-        {onView && chat && <MonitorPulse onOpen={() => onView("monitor")} />}
+        {onView && monitorAvailable && chat && <MonitorPulse onOpen={() => onView("monitor")} />}
         <MemoryButton onOpen={onOpenMemory} />
         {onForgetKey && (
           <button
@@ -58,8 +64,8 @@ export function Header({
             Lock
           </button>
         )}
-        {chat && (
-          <HeaderButton label="Settings" onClick={() => onOpen("settings")}>
+        {sided && (
+          <HeaderButton label={chat ? "Settings" : "Questions"} onClick={() => onOpen("settings")}>
             <IconSliders />
           </HeaderButton>
         )}
@@ -69,10 +75,13 @@ export function Header({
   );
 }
 
-function ViewSwitch({ view, onView }: { view: View; onView: (view: View) => void }) {
+function ViewSwitch({ view, onView, monitorAvailable }: { view: View; onView: (view: View) => void; monitorAvailable: boolean }) {
+  // The Monitor is only on offer when ignis serves metrics; the Decide tab
+  // talks to /v1/decide and is there either way.
   const views: [View, string][] = [
     ["chat", "Playground"],
-    ["monitor", "Monitor"],
+    ["decide", "Decide"],
+    ...(monitorAvailable ? ([["monitor", "Monitor"]] as [View, string][]) : []),
   ];
   return (
     <nav aria-label="View" className="flex items-center gap-1 self-stretch">

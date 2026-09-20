@@ -61,6 +61,24 @@ export function IconClose() {
   );
 }
 
+/** Delete, said the way every other interface says it. */
+export function IconTrash() {
+  return (
+    <svg {...icon} width={15} height={15}>
+      <path d="M3 5h10M6.5 5V3.5h3V5M4.5 5l.6 8.5h5.8L11.5 5M6.8 7.5v4M9.2 7.5v4" />
+    </svg>
+  );
+}
+
+/** Open the picture at its own size. */
+export function IconExpand() {
+  return (
+    <svg {...icon} width={14} height={14}>
+      <path d="M6 2.5H2.5V6M10 13.5h3.5V10" />
+    </svg>
+  );
+}
+
 export function IconChevron({ className }: { className?: string }) {
   return (
     <svg {...icon} className={className}>

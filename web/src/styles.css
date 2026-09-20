@@ -507,3 +507,35 @@
     animation: none;
   }
 }
+
+/* The Decide tab (GitHub #247). Two reveals, and the difference between them
+   is the information: a readout's bars all grow at once, because a readout
+   generates nothing and every answer came out of one prefill; a constrained
+   decode's digits land left to right, one forced token each. */
+@layer components {
+  .bar-grow {
+    transition: width 260ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .digit-land {
+    animation: digit-land 180ms ease-out both;
+  }
+  @keyframes digit-land {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+  }
+  /* The bar's own end, chamfered like the wordmark rather than rounded. */
+  .bar-end {
+    clip-path: polygon(0 0, calc(100% - 3px) 0, 100% 3px, 100% 100%, 0 100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar-grow {
+    transition: none;
+  }
+  .digit-land {
+    animation: none;
+  }
+}

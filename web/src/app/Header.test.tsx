@@ -3,26 +3,42 @@ import { describe, expect, it } from "vitest";
 import { PulseChip } from "../monitor/MonitorPulse.tsx";
 import { Header } from "./Header.tsx";
 
-// The header's Playground/Monitor switch and the engine pulse (GitHub #165).
+// The header's view switch (GitHub #165, #247) and the engine pulse.
 
 const base = { model: { state: "loading" } as const, busy: false, onOpen: () => {}, onOpenMemory: () => {} };
 
 describe("Header", () => {
-  it("shows the plain Playground label without metrics", () => {
+  it("shows the plain Playground label with no switch at all", () => {
     const html = renderToStaticMarkup(<Header {...base} />);
     expect(html).toContain("Playground");
     expect(html).not.toContain('aria-label="View"');
   });
 
-  it("switches views when metrics answer, marking the current one and hiding the chat drawers in the Monitor", () => {
-    const chat = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} />);
+  it("offers Decide without metrics and adds the Monitor only when they answer", () => {
+    const plain = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} />);
+    expect(plain).toContain(">Decide<");
+    expect(plain).not.toContain(">Monitor<");
+    // The pulse chip reads the metrics too, so it waits for them as well.
+    expect(plain).not.toContain('aria-label="Monitor"');
+
+    const withMetrics = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} monitorAvailable />);
+    expect(withMetrics).toContain(">Monitor<");
+  });
+
+  it("marks the current view and hides the chat drawers outside the chat", () => {
+    const chat = renderToStaticMarkup(<Header {...base} view="chat" onView={() => {}} monitorAvailable />);
     expect(chat).toMatch(/aria-current="page"[^>]*>Playground</);
     expect(chat).toContain('aria-label="Sessions"');
 
-    const monitor = renderToStaticMarkup(<Header {...base} view="monitor" onView={() => {}} />);
+    const monitor = renderToStaticMarkup(<Header {...base} view="monitor" onView={() => {}} monitorAvailable />);
     expect(monitor).toMatch(/aria-current="page"[^>]*>Monitor</);
     expect(monitor).not.toContain('aria-label="Sessions"');
     expect(monitor).not.toContain('aria-label="Settings"');
+
+    const decide = renderToStaticMarkup(<Header {...base} view="decide" onView={() => {}} monitorAvailable />);
+    expect(decide).toMatch(/aria-current="page"[^>]*>Decide</);
+    expect(decide).not.toContain('aria-label="Sessions"');
+    expect(decide).not.toContain('aria-label="Settings"');
   });
 });
 

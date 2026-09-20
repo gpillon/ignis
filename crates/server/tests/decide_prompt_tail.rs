@@ -39,7 +39,7 @@ use std::path::Path;
 use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::decision::AnswerAlphabet;
 use ignis_server::artifact_template::ArtifactTemplateProvider;
-use ignis_server::decide::{Evidence, messages_for, prepare};
+use ignis_server::decide::{Evidence, OrderedValue, messages_for, prepare};
 use serde_json::json;
 use ignis_server::template::TemplateProvider;
 use ignis_server::thinking::ThinkingOptions;
@@ -197,7 +197,7 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
         "The customer writes at length about a payout failure that has now lasted three days, with invoice numbers, timestamps and an increasingly short temper. "
             .repeat(12)
     ));
-    let messages = messages_for(&Evidence::read(&long), &prepared[0]);
+    let messages = messages_for(&Evidence::read(&OrderedValue::from_json(&long)), &prepared[0]);
     let rendered = provider
         .apply_chat_template(&messages, &thinking, &[])
         .unwrap_or_else(|e| panic!("template: {}", e.message));

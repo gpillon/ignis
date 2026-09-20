@@ -18,9 +18,22 @@ describe("App", () => {
     expect(html).toContain("Warming up");
   });
 
-  it("offers no Monitor until /ui/metrics has answered", () => {
+  it("keeps the Decide tab mounted behind the chat, so a typed request survives a look elsewhere", () => {
     const html = renderToStaticMarkup(<App />);
-    expect(html).not.toContain('aria-label="View"');
+    expect(html).toContain("Nothing is generated");
+    // Its three columns, each with its own scroll.
+    expect(html).toContain('aria-label="Decisions"');
+    expect(html).toContain('aria-label="Answers"');
+    expect(html).toContain('aria-label="Questions"');
+  });
+
+  it("offers the Decide tab from the start and the Monitor only once /ui/metrics has answered", () => {
+    const html = renderToStaticMarkup(<App />);
+    // The Decide tab talks to /v1/decide, so it never waits on the metrics
+    // listener; the Monitor is the one view that does.
+    expect(html).toContain('aria-label="View"');
+    expect(html).toContain(">Decide<");
+    expect(html).not.toContain(">Monitor<");
     expect(html).not.toContain('aria-label="Monitor"');
   });
 
