@@ -45,6 +45,31 @@ req 0  media.encode_seconds 3.62486  media.cache_hits 0  vision_tokens 16384
 req 2  media.encode_seconds 0.0      media.cache_hits 1
 ```
 
+### The eviction path, on the card
+
+The pool being *full* is the one branch the fan-out rows never reach, and it
+is the branch a real-time caller with several distinct frames lives on. Driven
+directly, with `--vision-max-tokens 16384` so the floor makes the pool exactly
+one 4096×4096 item (160 MiB, 128 pages of 128 columns):
+
+| call | wall | `media.encode_seconds` |
+|---|---|---|
+| the 4K screenshot | 6.21 s | 3.6303 — pool now full, 128/128 pages |
+| a different, small image (the canary's `number.png`) | 0.14 s | — succeeded |
+| the 4K screenshot again | 6.16 s | **3.7471 — re-encoded** |
+
+The middle call could only succeed by the leaf answering
+`IGNIS_MEDIA_ENCODE_POOL_FULL`, the runtime releasing the unheld 4K entry and
+asking again; the third call re-encoding is what proves the 4K was the entry
+released. Against the same 4K asked twice with room to spare, which costs
+2.37 s and no encode, the difference is the whole of the eviction.
+
+One detail worth naming: the re-encoding request still reports
+`media.cache_hits 1`. That is the *server's* `MediaCache` — the prepared
+patches, on the CPU side — which still had them. The two caches sit at
+different tiers and this is exactly the split the slice's spec describes: the
+patches were kept, the embedding was not.
+
 The VRAM plan at the default pool, from `ignis.runtime.vram_plan`:
 
 ```
@@ -80,10 +105,11 @@ verified live at 320.0 MiB, matching the pre-existing recorded figure.
 
 ## Caveats and limits
 
-- **Single run per cell.** The baseline was measured the same way, and the
-  effect (2.1x) is far outside the ~9% spread visible between the two
-  4-question cold rows (13.27 s and 13.24 s). A tighter figure would need
-  repeats.
+- **Single run per cell.** The baseline was measured the same way. The two
+  cold 4-question rows that were taken (13.27 s and 13.24 s) agree to 0.2%,
+  and the three cold 1-question rows to 1% (6.27 / 6.26 / 6.21 s), so the
+  2.1x is far outside anything the spread could explain — but that is two and
+  three samples, not a distribution.
 - **It does not make a new frame cheaper.** An unseen picture still costs
   ~3.6 s of tower whatever the pool holds. Nothing encodes ahead of a request
   either — that is GitHub #246, and it is what "N frames ready at time N"
@@ -94,7 +120,8 @@ verified live at 320.0 MiB, matching the pre-existing recorded figure.
   The claim the table makes (one encode for the whole fan-out) is unaffected —
   one encode is all the log contains — but the per-question observability is
   thinner than it looks.
-- **Measured on one image size.** A 4096×4096 screenshot is the pool's
-  expensive case (16,384 columns, 160 MiB, 128 pages). The paging exists for
-  the opposite end (a 320×240 thumbnail is 80 columns and one page), and that
-  end is not measured here.
+- **Two image sizes, not a sweep.** The fan-out rows are all the 4096×4096
+  screenshot, the pool's expensive case (16,384 columns, 160 MiB, 128 pages);
+  the eviction rows add the canary's small image at the other end. Nothing
+  here measures how many mixed-size items a pool actually holds before it
+  starts evicting, which is the number a real-time caller would want.
