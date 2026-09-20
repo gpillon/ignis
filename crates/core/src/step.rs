@@ -47,7 +47,24 @@ mod ffi {
         pub stop_id_count: u32,
         /// P5-04: caller-owned, valid for the call.
         pub stop_ids: *const i32,
+        /// P6-06 (GitHub #242, ADR 0034): entries in `permitted_ids`; 0 with
+        /// a null pointer is an unconstrained draw, bit for bit what this
+        /// ABI did before the field existed.
+        pub permitted_count: u32,
+        /// P6-06: caller-owned, valid for the call. At most
+        /// `IGNIS_MAX_PERMITTED_TOKENS` ids; the leaf drives every other
+        /// column of this lane's logits out of reach before it samples, so
+        /// the constraint composes with temperature, top-k and the seed
+        /// instead of replacing them.
+        pub permitted_ids: *const i32,
     }
+
+    /// `IGNIS_MAX_PERMITTED_TOKENS` (GitHub #242): the most ids one lane's
+    /// permitted set may carry. Ten digits and a few forced literals is what
+    /// a constrained decode needs, and the cap is what lets the set live in
+    /// a fixed per-lane staging row; a larger set is refused, never
+    /// truncated.
+    pub const MAX_PERMITTED_TOKENS: usize = 32;
 
     /// 1:1 with `struct ignis_decode_options` (ADR 0016; P5-04, GitHub
     /// #153). `size` must be `sizeof(struct ignis_decode_options)`; a null
@@ -62,6 +79,13 @@ mod ffi {
         pub out_committed_counts: *mut i32,
         /// P5-05 (GitHub #155): each lane's extent this round, or null.
         pub out_extents: *mut u32,
+        /// P6-06 (GitHub #242): each lane's committed token's probability
+        /// within its own permitted set, or 0 for a lane that declared
+        /// none. Null asks for nothing. One float per lane rather than a
+        /// logits row — the per-digit confidence a number's uncertainty is
+        /// summed from has to come from somewhere, and this is the cheapest
+        /// thing that is not the host reading logits (ADR 0034).
+        pub out_permitted_probs: *mut f32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -223,6 +247,10 @@ const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams {
     remaining_tokens: 0,
     stop_id_count: 0,
     stop_ids: std::ptr::null(),
+    // GitHub #242: an unconstrained draw, which is what every caller of
+    // this constant wants — the constraint is a decode-round parameter.
+    permitted_count: 0,
+    permitted_ids: std::ptr::null(),
 };
 
 /// A sequence's real sampling parameters for one program-layer call (P3-03,
@@ -270,6 +298,11 @@ impl SamplingParams {
             remaining_tokens: 0,
             stop_id_count: 0,
             stop_ids: std::ptr::null(),
+            // GitHub #242: the permitted set rides the decode job, not the
+            // sampling parameters a request carries — `step::decode_*`
+            // fills it per round.
+            permitted_count: 0,
+            permitted_ids: std::ptr::null(),
         }
     }
 }
@@ -840,6 +873,9 @@ pub fn decode_program_verify_runs(
         draft_counts: if proposes { draft_counts.as_ptr() } else { std::ptr::null() },
         out_committed_counts: committed.as_mut_ptr(),
         out_extents: extents.as_mut_ptr(),
+        // GitHub #242: a verify round refuses a permitted set outright, so
+        // there is no probability for it to report.
+        out_permitted_probs: std::ptr::null_mut(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(

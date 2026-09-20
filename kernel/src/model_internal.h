@@ -309,6 +309,15 @@ struct ignis_model {
   // sampling is one `ninfer::ops::sample` call over every lane, not one call
   // per lane.
   std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_logits;
+  // P6-06 (GitHub #242): the round's per-lane permitted token sets, staged
+  // like the configs above and at stable addresses for the same reason.
+  // `permitted` is I32 [IGNIS_DECODE_MAX_BATCH][IGNIS_MAX_PERMITTED_TOKENS],
+  // `permitted_counts` is I32 [lanes] (0 = that lane is unconstrained), and
+  // `permitted_probs` is the F32 [lanes] the post-sample kernel writes the
+  // committed token's restricted probability into.
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted_counts;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted_probs;
   std::unique_ptr<ninfer::DeviceArena> sampling_workspace;
 
   // P3-05 (GitHub #102, ADR 0019): the decode CUDA graphs' own resources,

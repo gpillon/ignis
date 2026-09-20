@@ -1060,8 +1060,12 @@ struct LoadSizes {
     out.media_embedding_bytes = media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
+    // GitHub #242 adds the permitted-set staging to the same line: ids
+    // [lanes][cap], counts [lanes] and the committed probabilities [lanes].
     out.sampling_bytes = sizeof(ninfer::ops::SamplingConfig) + 2 * sizeof(int32_t) +
                          sizeof(ninfer::ops::SamplingConfig) * lanes + 2 * sizeof(int32_t) * lanes +
+                         sizeof(int32_t) * lanes * IGNIS_MAX_PERMITTED_TOKENS +
+                         sizeof(int32_t) * lanes + sizeof(float) * lanes +
                          sampling_logits + sampling_workspace;
     // decode_graph_{scratch, token_ids, slots}, and decode_rope_positions
     // with vision.
@@ -1148,7 +1152,11 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
                        bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
                        bytes(model.sampling_decode_positions) + bytes(model.sampling_decode_out) +
-                       bytes(model.sampling_decode_logits) + capacity(model.sampling_workspace);
+                       bytes(model.sampling_decode_logits) +
+                       bytes(model.sampling_decode_permitted) +
+                       bytes(model.sampling_decode_permitted_counts) +
+                       bytes(model.sampling_decode_permitted_probs) +
+                       capacity(model.sampling_workspace);
   out.decode_graph_bytes = capacity(model.decode_graph_scratch) + bytes(model.decode_graph_token_ids) +
                            bytes(model.decode_graph_slots) + bytes(model.decode_rope_positions);
   if (model.verify != nullptr) {
@@ -1345,6 +1353,16 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     model->sampling_decode_out =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(sizes.sampling_logits);
+    // GitHub #242: three small per-lane rows, allocated whether or not any
+    // request ever constrains a draw -- 4 KB against a plan in gigabytes,
+    // and an allocation that depends on traffic is one the VRAM plan cannot
+    // state at load (ADR 0030).
+    model->sampling_decode_permitted = std::make_unique<ninfer::DeviceBuffer>(
+        sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH * IGNIS_MAX_PERMITTED_TOKENS);
+    model->sampling_decode_permitted_counts =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->sampling_decode_permitted_probs =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(float) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_workspace = std::make_unique<ninfer::DeviceArena>(sizes.sampling_workspace);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: sampling buffer allocation failed: ") + e.what());
