@@ -2957,6 +2957,7 @@ impl Scheduler for ConcreteScheduler {
                         .decision
                         .clone()
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
+                        permitted: None,
                 }
             })
             .collect();
@@ -3370,6 +3371,7 @@ impl Scheduler for ConcreteScheduler {
                     lane: self.requests[i].lane.expect("running requests hold a lane"),
                     params: self.requests[i].input.params,
                     remaining_tokens: self.requests[i].remaining_work.min(u32::MAX as u64) as u32,
+                    permitted: None,
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -3395,6 +3397,7 @@ impl Scheduler for ConcreteScheduler {
                         .entered();
                         let DecodeOutcome {
                             tokens,
+                            probabilities,
                             finish,
                             spec,
                         } = res;

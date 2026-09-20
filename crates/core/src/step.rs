@@ -784,7 +784,14 @@ pub fn decode_program_batch_sampled(
 /// would commit one free token in the middle of its own forced text.
 ///
 /// The successor itself is not returned here — it is the sequence's pending
-/// token, which the next round emits.
+/// token, which the next round emits. What comes back is its **probability
+/// within the permitted set**, which the round that emits it has no way to
+/// recompute: by then the sequence has moved on.
+///
+/// `out_logits` is [`prefill_program_sampled`]'s, unchanged in meaning. A
+/// call may ask for both — the readout observes the prefill and the
+/// constraint decides its draw — although nothing in the engine does: a
+/// decision reads a position and a program generates from one.
 pub fn prefill_program_permitted(
     model: &Model,
     pool: &SeqPool,
@@ -793,6 +800,7 @@ pub fn prefill_program_permitted(
     start_position: u64,
     sampling: SamplingParams,
     permitted: &[i32],
+    out_logits: Option<&mut [f32]>,
 ) -> Result<f32, String> {
     if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
         return Err(format!(
@@ -804,6 +812,10 @@ pub fn prefill_program_permitted(
     let mut probability = 0f32;
     let mut options = PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault);
     options.out_permitted_prob = &mut probability;
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
     let params = ffi::IgnisSamplingParams {
         permitted_count: permitted.len() as u32,
         permitted_ids: match permitted.is_empty() {
@@ -822,7 +834,7 @@ pub fn prefill_program_permitted(
             start_position,
             &params,
             &options,
-            std::ptr::null_mut(),
+            logits_ptr,
         )
     };
     if rc != 0 {
@@ -1176,6 +1188,12 @@ pub struct SpanMediaColumns<'a> {
 /// #178): the chunked route, rotated at the span's three-axis positions, with
 /// the media columns scattered over its placeholder rows. The sequence keeps
 /// the span's rope delta for every later decode round.
+///
+/// `permitted` is [`prefill_program_permitted`]'s, and is here because the
+/// evidence a **program** is put to is normally an image: spec 06's `point`
+/// is a screenshot and a question, and a constrained run wired only to the
+/// text path could not answer one. Empty for an ordinary prefill, and the
+/// returned probability is then 0.
 pub fn prefill_program_multimodal(
     model: &Model,
     pool: &SeqPool,
@@ -1183,9 +1201,17 @@ pub fn prefill_program_multimodal(
     token_ids: &[i32],
     start_position: u64,
     sampling: SamplingParams,
+    permitted: &[i32],
     span: MultimodalPrefill<'_>,
     out_logits: Option<&mut [f32]>,
-) -> Result<(), String> {
+) -> Result<f32, String> {
+    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+        return Err(format!(
+            "prefill_program_multimodal: {} ids, past the leaf's {} (a set is refused, never truncated)",
+            permitted.len(),
+            ffi::MAX_PERMITTED_TOKENS
+        ));
+    }
     if span.positions.len() != 3 * token_ids.len() {
         return Err(format!(
             "prefill_program_multimodal: {} positions for {} tokens",
@@ -1202,6 +1228,7 @@ pub fn prefill_program_multimodal(
         ),
         None => (std::ptr::null(), std::ptr::null(), 0, 0),
     };
+    let mut probability = 0f32;
     let options = ffi::IgnisPrefillOptions {
         mrope_positions: span.positions.as_ptr(),
         rope_delta: span.rope_delta,
@@ -1209,13 +1236,21 @@ pub fn prefill_program_multimodal(
         media,
         media_scatter_indices: scatter,
         media_first_column: first_column,
+        out_permitted_prob: &mut probability,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
-    let params = sampling.to_ffi();
+    let params = ffi::IgnisSamplingParams {
+        permitted_count: permitted.len() as u32,
+        permitted_ids: match permitted.is_empty() {
+            true => std::ptr::null(),
+            false => permitted.as_ptr(),
+        },
+        ..sampling.to_ffi()
+    };
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -1232,7 +1267,7 @@ pub fn prefill_program_multimodal(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(())
+    Ok(probability)
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.

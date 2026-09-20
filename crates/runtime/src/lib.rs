@@ -165,15 +165,38 @@ pub struct DecodeLane<'a> {
     /// The committed run is cut at the first of these, inclusive: the
     /// model's EOS, or none for a lane that decodes past it.
     pub stop_ids: &'a [TokenId],
+    /// The ids this lane's **draw** is restricted to (GitHub #242), or
+    /// empty for an ordinary round.
+    ///
+    /// It constrains the token the lane draws *this* round, which the leaf
+    /// returns on the *next* one
+    /// ([`ignis_core::scheduler::DecodeJob::permitted`]). A constrained lane
+    /// commits exactly one token: the drafts a verify round would accept are
+    /// proposed by a second model that knows nothing of a set, so a round
+    /// with any constrained lane in it is run as a plain round.
+    pub permitted: &'a [TokenId],
 }
 
 /// One lane's committed run from a decode round (P5-06, GitHub #154).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent since GitHub #242: `drawn_probability` is an
+/// `f32`, and a run is compared for equality in tests and nowhere else.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaneRun {
     /// The committed tokens, in order.
     pub tokens: Vec<TokenId>,
     /// The round's speculative counters, when it was a verify round.
     pub spec: Option<SpecCounters>,
+    /// The probability of the token this round **drew** within its
+    /// [`DecodeLane::permitted`] set (GitHub #242), or `None` for an
+    /// unconstrained lane.
+    ///
+    /// It belongs to the token the *next* round returns, not to anything in
+    /// `tokens`. The leaf reports it here because by the time that token is
+    /// emitted the sequence has moved past the position it was drawn at, and
+    /// there is nothing left to recompute it from;
+    /// [`RuntimeCompute`] is what holds it for the one round in between.
+    pub drawn_probability: Option<f32>,
 }
 
 impl LaneRun {
@@ -182,6 +205,16 @@ impl LaneRun {
         Self {
             tokens: vec![token],
             spec: None,
+            drawn_probability: None,
+        }
+    }
+
+    /// One committed token, and the probability of the one this round drew
+    /// for the next (GitHub #242).
+    pub fn drawn(token: TokenId, probability: Option<f32>) -> Self {
+        Self {
+            drawn_probability: probability,
+            ..Self::token(token)
         }
     }
 }
@@ -383,6 +416,11 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// It must be [`StepLeaf::vocab`] entries long. No token is sampled for
     /// it and the sequence is left exactly as a `None` call would leave it:
     /// a readout observes the prefill, it does not change it.
+    ///
+    /// `permitted`, when non-empty, restricts the draw this span makes
+    /// (GitHub #242) — the successor the first decode round returns — and
+    /// the call reports its probability within that set. Empty is an
+    /// ordinary prefill and reports 0.
     fn prefill(
         &self,
         model: &Self::Model,
@@ -390,8 +428,9 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
+        permitted: &[TokenId],
         out_logits: Option<&mut [f32]>,
-    ) -> Result<(), i32>;
+    ) -> Result<f32, i32>;
     /// Encode one media item's patch rows into a device-resident embedding
     /// (the media encode step, GitHub #178). A leaf without vision refuses.
     fn encode_media(&self, _model: &Self::Model, _item: &MediaItem) -> Result<Self::Media, i32> {
@@ -414,9 +453,10 @@ pub trait StepLeaf: Send + Sync + 'static {
         _tokens: &[TokenId],
         _start_position: u32,
         _params: DecodeParams,
+        _permitted: &[TokenId],
         _span: MultimodalSpan<'_, Self::Media>,
         _out_logits: Option<&mut [f32]>,
-    ) -> Result<(), i32> {
+    ) -> Result<f32, i32> {
         Err(-1)
     }
     /// Decode one round over a batch of warmed sequences, `lanes` parallel
@@ -570,6 +610,19 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// #178): at most one per request, held from its item's first covered
     /// chunk until its last placeholder is prefilled.
     media: Mutex<HashMap<RequestId, LiveMedia<L::Media>>>,
+    /// The probability of the token a **program** request has drawn and not
+    /// yet emitted (GitHub #242), per request.
+    ///
+    /// This is the one-round lag, held on this side of the `Compute` seam
+    /// because this is the only side that can hold it. The leaf draws a
+    /// token at the end of one call and returns it at the start of the
+    /// next, and its probability within the permitted set is computed from
+    /// at most 32 logits that exist only at the moment of the draw. By the
+    /// round that emits the token those logits are gone, so the number is
+    /// carried across here — one `f32` per program in flight — rather than
+    /// recomputed or reported a round early
+    /// ([`ignis_core::scheduler::DecodeJob::permitted`]).
+    drawn: Mutex<HashMap<RequestId, f32>>,
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
@@ -586,6 +639,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             retained: Mutex::new(HashMap::new()),
             spilled_prefixes: Mutex::new(HashMap::new()),
             media: Mutex::new(HashMap::new()),
+            drawn: Mutex::new(HashMap::new()),
         }
     }
 
@@ -623,7 +677,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         job: &PrefillJob,
         multimodal: &Multimodal,
         out_logits: Option<&mut [f32]>,
-    ) -> Result<u64, i32> {
+    ) -> Result<(u64, f32), i32> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
         let mut encode_micros = 0;
@@ -653,12 +707,14 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             first_column: chunk.first_column,
             scatter_indices: &chunk.scatter_indices,
         });
-        self.model.leaf.prefill_multimodal(
+        let permitted = job.permitted.clone().unwrap_or_else(|| Vec::new().into());
+        let probability = self.model.leaf.prefill_multimodal(
             self.model.handle(),
             sequence,
             &job.tokens,
             start,
             job.params,
+            &permitted,
             MultimodalSpan {
                 positions: &positions,
                 rope_delta: multimodal.rope_delta,
@@ -671,7 +727,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         {
             self.release_media_handle(done.handle);
         }
-        Ok(encode_micros)
+        Ok((encode_micros, probability))
     }
 
     /// Number of live leaf sequences (the CPU-stub observation point).
@@ -886,6 +942,9 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .readout
                     .as_ref()
                     .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
+                // GitHub #242: the set this chunk's own draw is restricted
+                // to, empty on every chunk that is not a program's last.
+                let permitted = job.permitted.clone().unwrap_or_else(|| Vec::new().into());
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -896,9 +955,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.params,
+                            &permitted,
                             logits.as_deref_mut(),
                         )
-                        .map(|()| 0),
+                        .map(|probability| (0, probability)),
                     Some(multimodal) => self.prefill_multimodal_job(
                         &mut sequence.handle,
                         &mut media,
@@ -908,7 +968,15 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     ),
                 };
                 match warmed {
-                    Ok(encode_micros) => outcomes[index].encode_micros = encode_micros,
+                    Ok((encode_micros, probability)) => {
+                        outcomes[index].encode_micros = encode_micros;
+                        // The first token of a program's run was just drawn
+                        // here; the first decode round returns it, and this
+                        // is the only place its probability exists.
+                        if job.permitted.is_some() {
+                            self.drawn.lock().unwrap().insert(job.request, probability);
+                        }
+                    }
                     Err(code) => unwind!(RuntimeError::Leaf(code).into()),
                 }
                 if let (Some(answers), Some(logits)) = (&job.readout, &logits) {
@@ -1126,12 +1194,19 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // and at the EOS, so the sequence never commits past the text its
         // request emits.
         let eos = [self.eos];
+        // GitHub #242: cloned out of `batch` before the lanes borrow it,
+        // because the handles below take it mutably. Cloning an `Arc` per
+        // lane, not a set.
+        let permitted: Vec<ignis_core::program::PermittedSet> = batch
+            .iter()
+            .map(|(job, _)| job.permitted.clone().unwrap_or_else(|| Vec::new().into()))
+            .collect();
         let decoded = {
             let lanes: Vec<DecodeLane<'_>> = batch
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| active[*index])
-                .map(|(_, (job, sequence))| DecodeLane {
+                .map(|(index, (job, sequence))| DecodeLane {
                     params: job.params,
                     remaining_tokens: job
                         .params
@@ -1141,6 +1216,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         })
                         .max(1),
                     stop_ids: if job.params.ignore_eos { &[] } else { &eos },
+                    permitted: &permitted[index],
                 })
                 .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
@@ -1187,7 +1263,28 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 released.push(sequence);
                 continue;
             }
-            let LaneRun { mut tokens, spec } = decoded.next().expect("decoded result length was checked");
+            let LaneRun {
+                mut tokens,
+                spec,
+                drawn_probability,
+            } = decoded.next().expect("decoded result length was checked");
+            // GitHub #242 — the one-round lag, closed here. The round
+            // returns the token drawn *last* time, so its probability is the
+            // one held from then; what this round drew is held for the next.
+            // A lane that drew unconstrained leaves nothing behind, so the
+            // entry disappears on the round after a program's last set and
+            // never outlives the request.
+            let probabilities = match self.drawn.lock().unwrap().remove(&job.request) {
+                Some(probability) => vec![probability],
+                None => Vec::new(),
+            };
+            if let Some(probability) = drawn_probability {
+                self.drawn.lock().unwrap().insert(job.request, probability);
+            }
+            debug_assert!(
+                probabilities.is_empty() || tokens.len() == 1,
+                "a constrained lane commits exactly one token, so there is one                  probability for it"
+            );
             let eos_at = (!job.params.ignore_eos)
                 .then(|| tokens.iter().position(|&token| token == self.eos))
                 .flatten();
@@ -1204,7 +1301,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     DecodeOutcome::run(tokens)
                 }
             };
-            outcomes[index] = Some(DecodeOutcome { spec, ..outcome });
+            outcomes[index] = Some(DecodeOutcome {
+                spec,
+                probabilities,
+                ..outcome
+            });
         }
         drop(sequences);
         for sequence in released {
@@ -1220,6 +1321,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // GitHub #178: a request completed or cancelled mid-item releases
         // the item's embedding with its sequence.
         self.release_media_of(request);
+        // GitHub #242: and a program cancelled mid-run leaves a draw nobody
+        // will ever emit. One `f32`, but the id is never reused, so an entry
+        // left here would be leaked for the life of the process.
+        self.drawn.lock().unwrap().remove(&request);
         let sequence = self.sequences.lock().unwrap().remove(&request);
         if let Some(sequence) = sequence {
             self.release_sequence(sequence.handle);

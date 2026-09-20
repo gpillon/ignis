@@ -76,6 +76,19 @@ struct Inner {
     /// backend whose blobs are ordinary allocations — today's default, and
     /// what every scenario that is not about placement wants.
     arena: Option<MockHostArena>,
+    /// The draw a **program** request has made and not yet emitted (GitHub
+    /// #242), per request: the token the *next* decode round returns.
+    ///
+    /// This is the leaf's one-round lag, modelled on purpose. A mock that
+    /// emitted the set it was handed in the same call would let a scheduler
+    /// that constrained only its rounds pass every CPU test and read one
+    /// free token in the middle of its forced text on the card — which is
+    /// exactly the bug `permitted_decode_gpu.rs` caught, and exactly the
+    /// bug a mock exists to catch first (ADR 0006).
+    pending: HashMap<RequestId, crate::program::Draw>,
+    /// Constrained steps served so far, per request: what varies the mock's
+    /// pick from one step to the next.
+    drawn: HashMap<RequestId, u32>,
 }
 
 /// Which blob a span of [`MockHostArena`] holds: the three kinds the host
@@ -342,6 +355,14 @@ impl Compute for MockCompute {
             g.limits.insert(job.request, job.params.max_tokens);
             g.seeds.insert(job.request, job.params.seed);
         }
+        for job in jobs {
+            // GitHub #242: a prefill *draws*, and a program's first token is
+            // the one it draws. Held until a decode round asks for it.
+            if let Some(permitted) = &job.permitted {
+                let draw = Self::draw(self.seed, &mut g, job.request, permitted);
+                g.pending.insert(job.request, draw);
+            }
+        }
         g.prefill_batches.push(jobs.to_vec());
         Ok(jobs
             .iter()
@@ -449,6 +470,21 @@ impl Compute for MockCompute {
         Ok(jobs
             .iter()
             .map(|job| {
+                // GitHub #242 — a program lane, which is a different round
+                // entirely: exactly one token, the one drawn a round ago,
+                // and no speculation, no EOS and no token cap (the schedule
+                // is the budget, and the scheduler owns it).
+                if let Some(emitted) = g.pending.remove(&job.request) {
+                    if let Some(permitted) = &job.permitted {
+                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
+                        g.pending.insert(job.request, next);
+                    }
+                    *g.generated.entry(job.request).or_insert(0) += 1;
+                    return DecodeOutcome::constrained_run(
+                        vec![emitted.token],
+                        vec![emitted.probability],
+                    );
+                }
                 let round = {
                     let rounds = g.rounds.entry(job.request).or_insert(0);
                     *rounds += 1;
@@ -493,6 +529,7 @@ impl Compute for MockCompute {
                 DecodeOutcome {
                     tokens: run,
                     finish,
+                    probabilities: Vec::new(),
                     spec: (!g.run_lengths.is_empty())
                         .then(|| SpecCounters::round(length - 1, committed - 1)),
                 }
@@ -598,6 +635,40 @@ impl MockCompute {
             full_argmax: argmax(&logits).map_or(0, |slot| answers[slot]),
             logits,
         }
+    }
+
+    /// The mock's **constrained** draw (GitHub #242): a member of
+    /// `permitted`, picked deterministically, with a probability inside it.
+    ///
+    /// The probability is never 0 and never 1 for a set of more than one
+    /// token, for the reason [`MockCompute::OUTSIDE_THE_ANSWERS`] exists: a
+    /// mock that reported a perfect draw would let a caller that never looks
+    /// at the trace report zero uncertainty and pass, then meet a units
+    /// digit at 0.149 on the card
+    /// (`docs/findings/2026-09-19-constrained-digit-readout-points.md`). A
+    /// set of **one** does report exactly 1, which is not a courtesy but the
+    /// arithmetic: a softmax over one logit is 1, and a forced literal
+    /// therefore adds nothing to an answer's uncertainty.
+    fn draw(
+        seed: u64,
+        state: &mut Inner,
+        request: RequestId,
+        permitted: &[TokenId],
+    ) -> crate::program::Draw {
+        let step = {
+            let drawn = state.drawn.entry(request).or_insert(0);
+            *drawn += 1;
+            *drawn - 1
+        };
+        let request_seed = state.seeds.get(&request).copied().unwrap_or(0);
+        let mixed = Self::mix(seed, request, request_seed, step);
+        let token = permitted[mixed as usize % permitted.len()];
+        let probability = match permitted.len() {
+            1 => 1.0,
+            // 0.50 ..= 0.999, well clear of both ends.
+            _ => 0.5 + (mixed % 500) as f32 / 1000.0,
+        };
+        crate::program::Draw { token, probability }
     }
 
     /// The deterministic token mix: a pure function of (mock seed, request

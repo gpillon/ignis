@@ -16,6 +16,10 @@ use ignis_runtime::{
 /// The stub's output-head width (GitHub #237). Small enough to write out in
 /// a test, wide enough that an answer token past it is a distinct case.
 const STUB_VOCAB: u32 = 16;
+/// What the stub reports for a constrained draw (GitHub #242): a real
+/// number, neither absent nor certain, so a caller that never reads the
+/// trace cannot pass by reporting zero uncertainty.
+const STUB_PERMITTED_PROBABILITY: f32 = 0.75;
 
 #[derive(Default)]
 struct Calls {
@@ -25,6 +29,8 @@ struct Calls {
     sequences_released: u32,
     prefill_positions: Vec<u32>,
     prefill_params: Vec<DecodeParams>,
+    /// The permitted set of each prefill call, in order (GitHub #242).
+    prefill_permitted: Vec<Vec<u32>>,
     /// GitHub #237: whether each prefill call was handed a logits buffer,
     /// and how long it was — a job that asked for no readout must not cost
     /// one, which is a claim about the *call*, not about the outcome.
@@ -33,6 +39,8 @@ struct Calls {
     decode_params: Vec<Vec<DecodeParams>>,
     /// P5-06 (GitHub #154): each decode round's per-lane budget and stop ids.
     decode_lanes: Vec<Vec<(u32, Vec<u32>)>>,
+    /// The permitted set of each round's lanes, in order (GitHub #242).
+    decode_permitted: Vec<Vec<Vec<u32>>>,
     /// P4-10 (GitHub #126): the prefixes published (their token counts) and
     /// the claims served (the context each claimant reserved), so a test can
     /// see that a claimant was allocated *against* a prefix rather than
@@ -200,9 +208,10 @@ impl StepLeaf for StubLeaf {
         tokens: &[u32],
         start_position: u32,
         params: DecodeParams,
+        permitted: &[u32],
         span: MultimodalSpan<'_, Self::Media>,
         out_logits: Option<&mut [f32]>,
-    ) -> Result<(), i32> {
+    ) -> Result<f32, i32> {
         self.calls.lock().unwrap().multimodal_spans.push(SpanCall {
             start: start_position,
             positions: span.positions.to_vec(),
@@ -211,7 +220,7 @@ impl StepLeaf for StubLeaf {
                 .media
                 .map(|media| (*media.embedding, media.first_column, media.scatter_indices.to_vec())),
         });
-        self.prefill(model, sequence, tokens, start_position, params, out_logits)
+        self.prefill(model, sequence, tokens, start_position, params, permitted, out_logits)
     }
 
     fn release_model(&self, _model: Self::Model) {
@@ -372,12 +381,14 @@ impl StepLeaf for StubLeaf {
         _tokens: &[u32],
         start_position: u32,
         params: DecodeParams,
+        permitted: &[u32],
         out_logits: Option<&mut [f32]>,
-    ) -> Result<(), i32> {
+    ) -> Result<f32, i32> {
         let call = {
             let mut calls = self.calls.lock().unwrap();
             calls.prefill_positions.push(start_position);
             calls.prefill_params.push(params);
+            calls.prefill_permitted.push(permitted.to_vec());
             calls
                 .prefill_logit_buffers
                 .push(out_logits.as_ref().map(|buffer| buffer.len()));
@@ -391,13 +402,21 @@ impl StepLeaf for StubLeaf {
                 *logit = column as f32 / 2.0;
             }
         }
-        self.prefill_error
-            .or_else(|| {
-                self.prefill_error_on_call
-                    .filter(|(expected, _)| call == *expected)
-                    .map(|(_, code)| code)
-            })
-            .map_or(Ok(()), Err)
+        if let Some(code) = self.prefill_error.or_else(|| {
+            self.prefill_error_on_call
+                .filter(|(expected, _)| call == *expected)
+                .map(|(_, code)| code)
+        }) {
+            return Err(code);
+        }
+        // GitHub #242: the stub draws under constraint the way the leaf
+        // does — the *first* permitted id, which is enough to tell one
+        // step's set from another's, at a probability that is neither 0 nor
+        // 1 so a caller that ignores the trace cannot pass by accident.
+        Ok(match permitted.is_empty() {
+            true => 0.0,
+            false => STUB_PERMITTED_PROBABILITY,
+        })
     }
 
     fn decode(
@@ -418,14 +437,26 @@ impl StepLeaf for StubLeaf {
                 .map(|lane| (lane.remaining_tokens, lane.stop_ids.to_vec()))
                 .collect(),
         );
+        calls
+            .decode_permitted
+            .push(lanes.iter().map(|lane| lane.permitted.to_vec()).collect());
         drop(calls);
         let mut runs = self.runs.lock().unwrap();
         let mut tokens = self.tokens.lock().unwrap();
         Ok(sequences
             .iter()
-            .map(|_| {
-                runs.pop_front()
-                    .unwrap_or_else(|| LaneRun::token(tokens.pop_front().unwrap_or(7)))
+            .zip(lanes)
+            .map(|(_, lane)| {
+                let run = runs
+                    .pop_front()
+                    .unwrap_or_else(|| LaneRun::token(tokens.pop_front().unwrap_or(7)));
+                // The draw this round made, for the token the *next* round
+                // returns (GitHub #242).
+                LaneRun {
+                    drawn_probability: (!lane.permitted.is_empty())
+                        .then_some(STUB_PERMITTED_PROBABILITY),
+                    ..run
+                }
             })
             .collect())
     }
@@ -508,6 +539,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 params: left,
                 shared_prefix: None,
                 publish_prefix: None,
+                permitted: None,
             },
             PrefillJob {
                 checkpoint: None,
@@ -521,6 +553,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 params: right,
                 shared_prefix: None,
                 publish_prefix: None,
+                permitted: None,
             },
         ])
         .unwrap();
@@ -532,12 +565,14 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 lane: 0,
                 params: left,
                 remaining_tokens: 3,
+                permitted: None,
             },
             DecodeJob {
                 request: 2,
                 lane: 1,
                 params: right,
                 remaining_tokens: 4,
+                permitted: None,
             },
         ])
         .unwrap();
@@ -545,6 +580,81 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(calls.prefill_params, vec![left, right]);
     assert_eq!(calls.decode_params, vec![vec![left, right]]);
+}
+
+/// GitHub #242: the adapter holds the leaf's one-round lag so the scheduler
+/// does not have to.
+///
+/// The leaf draws at the *end* of a call and returns at the *start* of the
+/// next one, and a constrained draw's probability exists only at the moment
+/// of the draw — at most 32 logits, gone by the round that emits the token.
+/// So a round reports the probability held from the round before, and holds
+/// the one it just made. An adapter that reported its own round's draw would
+/// pair every digit with the next digit's confidence, which on a number is
+/// wrong by a factor of ten and looks entirely plausible.
+///
+/// The stub reports a probability for a constrained draw and nothing for a
+/// free one, so what this pins is *which round the number appears on*.
+#[test]
+fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
+    let leaf = Arc::new(StubLeaf::with_tokens([11, 12, 13]));
+    let model = Arc::new(Model::load(leaf.clone()).unwrap());
+    let compute = RuntimeCompute::new(model, 99);
+    let digits: ignis_core::program::PermittedSet = vec![3, 4, 5].into();
+
+    // The prefill draws the run's first token under the first step's set.
+    compute
+        .prefill_step(&[PrefillJob {
+            permitted: Some(digits.clone()),
+            ..prefill(1, Some(8))
+        }])
+        .unwrap();
+    assert_eq!(
+        leaf.calls.lock().unwrap().prefill_permitted,
+        vec![vec![3, 4, 5]],
+        "the set reached the leaf's prefill, which is where a constrained run starts"
+    );
+
+    let round = |permitted: Option<ignis_core::program::PermittedSet>| {
+        compute
+            .decode_step(&[DecodeJob {
+                request: 1,
+                lane: 0,
+                params: DecodeParams::default(),
+                remaining_tokens: 8,
+                permitted,
+            }])
+            .unwrap()
+            .remove(0)
+    };
+
+    // Round one returns the prefill's draw, with the prefill's probability.
+    let first = round(Some(digits.clone()));
+    assert_eq!(first.tokens, vec![11]);
+    assert_eq!(
+        first.probabilities,
+        vec![STUB_PERMITTED_PROBABILITY],
+        "the probability of the token this round EMITS, which the prefill drew"
+    );
+
+    // The last round carries no set: its own draw is discarded, and the
+    // token it returns still carries the probability of the round before.
+    let last = round(None);
+    assert_eq!(last.tokens, vec![12]);
+    assert_eq!(last.probabilities, vec![STUB_PERMITTED_PROBABILITY]);
+
+    // And once the schedule is spent nothing is left holding a number.
+    let after = round(None);
+    assert_eq!(after.tokens, vec![13]);
+    assert!(
+        after.probabilities.is_empty(),
+        "a round after an unconstrained one reports nothing: the entry is          removed when it is used, not left for the next lane to pick up"
+    );
+    assert_eq!(
+        leaf.calls.lock().unwrap().decode_permitted,
+        vec![vec![vec![3, 4, 5]], vec![Vec::<u32>::new()], vec![Vec::<u32>::new()]],
+        "and each round carried its own step's set, not the one before it"
+    );
 }
 
 #[test]
@@ -558,6 +668,7 @@ fn adapter_rejects_decode_batches_larger_than_the_resident_lane_bound() {
             lane: request,
             params: DecodeParams::default(),
             remaining_tokens: 8,
+            permitted: None,
         })
         .collect();
 
@@ -581,6 +692,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         },
         shared_prefix: None,
         publish_prefix: None,
+        permitted: None,
     }
 }
 
@@ -655,7 +767,8 @@ fn adapter_maps_allocation_and_decode_errors_without_losing_live_state() {
             lane: 0,
             params: DecodeParams::default(),
             remaining_tokens: 8,
-        }]),
+            permitted: None,
+}]),
         Err(ComputeError::Kernel(-19))
     );
     assert_eq!(decode_compute.live_sequences(), 1);
@@ -690,7 +803,8 @@ fn adapter_enforces_max_tokens_and_eos() {
             ..DecodeParams::default()
         },
         remaining_tokens: 1,
-    };
+        permitted: None,
+};
     assert_eq!(
         compute.decode_step(&[job.clone()]).unwrap(),
         vec![DecodeOutcome::token(7)]
@@ -713,7 +827,8 @@ fn adapter_enforces_max_tokens_and_eos() {
                 lane: 1,
                 params: DecodeParams::default(),
                 remaining_tokens: 8,
-            }])
+                permitted: None,
+}])
             .unwrap(),
         vec![DecodeOutcome::finished(FinishReason::Stop)]
     );
@@ -734,7 +849,8 @@ fn adapter_can_keep_a_measurement_lane_alive_past_eos() {
             ..DecodeParams::default()
         },
         remaining_tokens: 8,
-    };
+        permitted: None,
+};
 
     assert_eq!(
         compute.decode_step(std::slice::from_ref(&job)).unwrap(),
@@ -761,12 +877,14 @@ fn adapter_decodes_multiple_requests_in_one_ordered_leaf_round() {
                     lane: 0,
                     params: DecodeParams::default(),
                     remaining_tokens: 8,
+                    permitted: None,
                 },
                 DecodeJob {
                     request: 2,
                     lane: 1,
                     params: DecodeParams::default(),
                     remaining_tokens: 8,
+                    permitted: None,
                 },
             ])
             .unwrap(),
@@ -1176,7 +1294,8 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 0 }),
             multimodal: None,
             readout: None,
-        }])
+            permitted: None,
+}])
         .unwrap();
 
     leaf.calls.lock().unwrap().fail_checkpoint_snapshots = true;
@@ -1210,7 +1329,8 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             capture_checkpoint: Some(RetainedAt { tokens: 6, slot: 2 }),
             multimodal: None,
             readout: None,
-        }])
+            permitted: None,
+}])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
     compute.spill_checkpoint(1).unwrap();
@@ -1233,7 +1353,8 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 capture_checkpoint: None,
                 multimodal: None,
                 readout: None,
-            }])
+                permitted: None,
+}])
             .unwrap();
     }
 
@@ -1323,6 +1444,7 @@ fn job(request: u64, params: DecodeParams, remaining_tokens: u32) -> DecodeJob {
         lane: request as usize,
         params,
         remaining_tokens,
+        permitted: None,
     }
 }
 
@@ -1332,7 +1454,8 @@ fn the_leaf_is_handed_each_lanes_budget_and_stop_ids() {
         LaneRun {
             tokens: vec![5, 6, 7],
             spec: None,
-        },
+                    drawn_probability: None,
+},
         LaneRun::token(8),
     ]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
@@ -1373,7 +1496,8 @@ fn a_run_cut_at_eos_emits_the_tokens_before_it_and_finishes_with_stop() {
     let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
         tokens: vec![5, 6, 99],
         spec: None,
-    }]));
+            drawn_probability: None,
+}]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
     compute.prefill_step(&[prefill(1, None)]).unwrap();
@@ -1393,7 +1517,8 @@ fn a_committed_run_counts_toward_max_tokens() {
     let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
         tokens: vec![5, 6, 7],
         spec: None,
-    }]));
+            drawn_probability: None,
+}]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
     let params = DecodeParams {
@@ -1423,7 +1548,8 @@ fn a_verify_rounds_counters_ride_its_outcome() {
     let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
         tokens: vec![5, 6, 7],
         spec: Some(spec),
-    }]));
+            drawn_probability: None,
+}]));
     let model = Arc::new(Model::load(leaf).unwrap());
     let compute = RuntimeCompute::new(model, 99);
     compute.prefill_step(&[prefill(1, None)]).unwrap();
@@ -1441,7 +1567,8 @@ fn an_empty_run_is_refused_without_losing_the_sequence() {
     let leaf = Arc::new(StubLeaf::with_runs([LaneRun {
         tokens: vec![],
         spec: None,
-    }]));
+            drawn_probability: None,
+}]));
     let model = Arc::new(Model::load(leaf).unwrap());
     let compute = RuntimeCompute::new(model, 99);
     compute.prefill_step(&[prefill(1, None)]).unwrap();
@@ -1483,6 +1610,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         capture_checkpoint: None,
         multimodal: Some(prompt.clone()),
         readout: None,
+        permitted: None,
     }
 }
 
@@ -1646,7 +1774,8 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         capture_checkpoint: None,
         multimodal: None,
         readout: None,
-    };
+        permitted: None,
+};
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
     assert_eq!(leaf.calls.lock().unwrap().prefixes_released, 0, "neither head was dropped");
@@ -1686,7 +1815,8 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             capture_checkpoint: None,
             multimodal: None,
             readout: None,
-        }])
+            permitted: None,
+}])
         .unwrap();
     compute.release(1);
 
@@ -1723,7 +1853,8 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             capture_checkpoint: None,
             multimodal: None,
             readout: None,
-        }])
+            permitted: None,
+}])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");
 

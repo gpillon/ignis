@@ -26,6 +26,7 @@ fn job(request: u64, readout: Option<Vec<TokenId>>) -> PrefillJob {
         capture_checkpoint: None,
         multimodal: None,
         readout: readout.map(Arc::from),
+        permitted: None,
     }
 }
 

@@ -747,9 +747,10 @@ mod tests {
             _tokens: &[TokenId],
             _start_position: u32,
             _params: DecodeParams,
+            _permitted: &[TokenId],
             _out_logits: Option<&mut [f32]>,
-        ) -> Result<(), i32> {
-            Ok(())
+        ) -> Result<f32, i32> {
+            Ok(0.0)
         }
         fn decode(
             &self,

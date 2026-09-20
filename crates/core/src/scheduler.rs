@@ -148,6 +148,20 @@ pub struct PrefillJob {
     /// The order is the answer's order — [`PrefillOutcome::readout`]'s
     /// `logits[i]` is the logit of `readout[i]`.
     pub readout: Option<std::sync::Arc<[TokenId]>>,
+    /// The **permitted token set** this chunk's own draw is restricted to
+    /// (GitHub #242, ADR 0034), if this is a **program** request's last
+    /// chunk.
+    ///
+    /// Set for the same reason and on the same chunk as
+    /// [`PrefillJob::readout`], and for one more: a prefill *draws the first
+    /// token of the run that follows it*, which the first decode round then
+    /// returns ([`crate::program`]). A program that constrained only its
+    /// rounds would commit the prompt's own free successor as the first
+    /// token of its forced text.
+    ///
+    /// `None` on every other job, which pays nothing for it: the backend
+    /// masks no logits and the round takes whatever path it takes.
+    pub permitted: Option<crate::program::PermittedSet>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -165,6 +179,22 @@ pub struct DecodeJob {
     /// its lane's extent to so the sequence never commits past the text the
     /// request can emit.
     pub remaining_tokens: u32,
+    /// The **permitted token set for the draw this round makes** (GitHub
+    /// #242) — whose token this lane returns **next** round, not this one.
+    ///
+    /// The lag is the leaf's, and the seam states it rather than hiding it
+    /// ([`crate::program`]): a round returns the token the previous call
+    /// drew. So a K-step program's round `i` carries step `i`'s set and
+    /// returns step `i-1`'s token; its first round carries step 1 and
+    /// returns the token [`PrefillJob::permitted`] drew; and its last round
+    /// carries `None`, drawing a token nobody reads.
+    ///
+    /// [`DecodeOutcome::probabilities`] is paired with the tokens the round
+    /// *emits*, so it is the backend that holds the lag — a `Compute`
+    /// implementation that reported this round's draw probability beside
+    /// the previous round's token would be off by one step, which on a
+    /// number is off by a factor of ten.
+    pub permitted: Option<crate::program::PermittedSet>,
 }
 
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
@@ -236,10 +266,22 @@ impl PrefillOutcome {
 /// after whatever tokens preceded it in the round: a run cut at EOS is the
 /// tokens before the EOS plus [`FinishReason::Stop`]. `tokens` is empty only
 /// on a finished outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent: `probabilities` is `f32`, and a decode
+/// outcome is compared for equality in tests and nowhere else.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodeOutcome {
     /// The committed tokens to emit, in order.
     pub tokens: Vec<TokenId>,
+    /// The probability of each token in `tokens`, within the permitted set
+    /// **that token** was drawn from (GitHub #242): parallel to `tokens`,
+    /// and **empty** for every lane that drew unconstrained — which is every
+    /// lane the engine has apart from a program's.
+    ///
+    /// A backend fills this from the draw one round earlier than the one
+    /// reporting it, because that is the round the token came from
+    /// ([`DecodeJob::permitted`]).
+    pub probabilities: Vec<f32>,
     /// Why the request finished this round, after `tokens`; `None` while it
     /// keeps running.
     pub finish: Option<FinishReason>,
@@ -258,8 +300,23 @@ impl DecodeOutcome {
     pub fn run(tokens: Vec<TokenId>) -> Self {
         Self {
             tokens,
+            probabilities: Vec::new(),
             finish: None,
             spec: None,
+        }
+    }
+
+    /// A run of constrained tokens, each with its own probability within
+    /// the set it was drawn from (GitHub #242).
+    pub fn constrained_run(tokens: Vec<TokenId>, probabilities: Vec<f32>) -> Self {
+        debug_assert_eq!(
+            tokens.len(),
+            probabilities.len(),
+            "a probability belongs to a token, so there is one of each"
+        );
+        Self {
+            probabilities,
+            ..Self::run(tokens)
         }
     }
 
@@ -271,9 +328,8 @@ impl DecodeOutcome {
     /// `tokens`, then the request finished.
     pub fn run_then_finished(tokens: Vec<TokenId>, reason: FinishReason) -> Self {
         Self {
-            tokens,
             finish: Some(reason),
-            spec: None,
+            ..Self::run(tokens)
         }
     }
 
