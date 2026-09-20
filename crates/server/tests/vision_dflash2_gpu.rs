@@ -391,7 +391,7 @@ fn the_drafter_follows_an_image_prompt_and_its_text_stays_the_decode_rounds_text
         );
         let control = vision_item_control(item.grid);
         let embedding = step::encode_media(&model, item.grid, &item.patches, &control)
-            .unwrap_or_else(|e| panic!("{}: encode: {e}", canary.id));
+            .unwrap_or_else(|(_, e)| panic!("{}: encode: {e}", canary.id));
         assert_eq!(embedding.columns() as usize, item.token_span.count);
         let mut logits = vec![0f32; vocab];
 

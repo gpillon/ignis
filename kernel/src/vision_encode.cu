@@ -4,7 +4,7 @@
 // RoPE, segmented attention, projection + bias + residual, LayerNorm, fc1 +
 // bias, GELU-tanh, fc2 + bias + residual), then the merger (LayerNorm, 2x2
 // view, fc1 + bias, GELU-exact, fc2 + bias) -- into the load's
-// `vision_output`. The program layer is ours (ADR 0009); every op is the ADR
+// the model's embedding pool (ADR 0035). The program layer is ours (ADR 0009); every op is the ADR
 // 0010 vendored one, called in the reference's order
 // (`impl/runtime/vision_context_impl.h`, `VisionContext::encode`).
 //
@@ -136,12 +136,13 @@ void copy_host(const void *src, ninfer::Tensor &dst, cudaStream_t stream, const 
   }
 }
 
-// The encoder over one item, enqueued on the model's stream into
-// `model->vision_output`, its intermediates in `backing` as `layout` places
-// them (VisionContext::encode).
+// The encoder over one item, enqueued on the model's stream into the pool
+// pages `pages` names (GitHub #243), its intermediates in `backing` as
+// `layout` places them (VisionContext::encode).
 void encode(ignis_model &model, const ignis_media_encode_input &input,
             const VisionWorkspaceLayout &layout, const ninfer::DeviceSpan &backing,
-            std::int32_t patches, std::int32_t tokens) {
+            std::int32_t patches, std::int32_t tokens,
+            const std::vector<std::int32_t> &pages) {
   const VisionWeights &w = model.vision;
   const cudaStream_t stream = model.stream;
 
@@ -231,9 +232,22 @@ void encode(ignis_model &model, const ignis_media_encode_input &input,
   ninfer::ops::add_bias(bf16_vector(w.merger_fc1_bias, kVisionMergerHidden), hidden, stream);
   ninfer::ops::gelu(hidden, ninfer::ops::GeluMode::Exact, stream);
   const auto out_hidden = static_cast<std::int32_t>(model.hidden);
-  ninfer::Tensor output(model.vision_output->p, ninfer::DType::BF16, {out_hidden, tokens});
-  ninfer::ops::linear(hidden, w.merger_fc2, output, stream);
-  ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, out_hidden), output, stream);
+  // GitHub #243: the merger's second projection writes the item's columns
+  // straight into its pool pages, one call per page. The columns are the
+  // GEMM's N, so a page is a plain column range of the same
+  // `linear` + `add_bias` a single output transient took -- the pages are
+  // never gathered and no kernel here reads a page table. The alternative,
+  // encoding contiguously and copying into pages, would cost a second
+  // envelope-sized reservation to encode into.
+  const VisionEmbeddingPool &pool = model.vision_pool;
+  for (std::size_t p = 0; p < pages.size(); ++p) {
+    const auto first = static_cast<std::int32_t>(p) * pool.page_columns;
+    const std::int32_t take = std::min(pool.page_columns, tokens - first);
+    const ninfer::Tensor hidden_page = hidden.slice(1, first, take);
+    ninfer::Tensor output(pool.page_ptr(pages[p]), ninfer::DType::BF16, {out_hidden, take});
+    ninfer::ops::linear(hidden_page, w.merger_fc2, output, stream);
+    ninfer::ops::add_bias(bf16_vector(w.merger_fc2_bias, out_hidden), output, stream);
+  }
 }
 
 } // namespace
@@ -257,12 +271,8 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
               std::to_string(input->size));
     return -1;
   }
-  if (model->vision_output == nullptr) {
+  if (!model->vision_pool.present()) {
     set_error("ignis_media_encode: the model was loaded without vision");
-    return -1;
-  }
-  if (model->vision_output_live) {
-    set_error("ignis_media_encode: a media embedding is already live; release it first");
     return -1;
   }
   if (input->patches == nullptr || input->position_ids == nullptr || input->cu_seqlens == nullptr ||
@@ -298,22 +308,53 @@ extern "C" int32_t ignis_media_encode(struct ignis_model *model,
                                " workspace bytes, the load reserved " +
                                std::to_string(model->scratch->capacity()));
     }
+    // GitHub #243: the item's pages, claimed before any kernel runs. The
+    // embedding owns them, so it is built first and named as their owner.
+    auto embedding = std::make_unique<ignis_media_embedding>();
+    embedding->model = model;
+    embedding->columns = static_cast<std::int32_t>(tokens);
+    VisionEmbeddingPool &pool = model->vision_pool;
+    const std::int32_t want = pool.pages_for(embedding->columns);
+    embedding->pages = pool.take(want, embedding.get());
+    if (embedding->pages.empty() && want > 0) {
+      // The envelope check above already refused an item the pool could
+      // never hold, so this is only "not right now": the caller releases
+      // something and calls again.
+      set_error("ignis_media_encode: an item of " + std::to_string(tokens) +
+                " merged tokens needs " + std::to_string(want) + " of the pool's " +
+                std::to_string(pool.pages()) + " pages, and only " +
+                std::to_string(pool.free_pages()) + " are free -- release an embedding first");
+      return IGNIS_MEDIA_ENCODE_POOL_FULL;
+    }
+    // Any exit but the successful one gives the pages back. An encoder op
+    // that throws must not leave the pool holding room for an embedding
+    // nobody will ever be handed -- there is no other owner to release it,
+    // since only a returned handle reaches ignis_media_embedding_release.
+    bool handed_over = false;
+    struct PageGuard {
+      VisionEmbeddingPool &pool;
+      const std::vector<std::int32_t> &pages;
+      const bool &handed_over;
+      ~PageGuard() {
+        if (!handed_over) {
+          pool.give(pages);
+        }
+      }
+    } guard{pool, embedding->pages, handed_over};
     // Held until the stream has drained: nothing else may take these bytes
     // while the encoder's kernels still run on them.
     ninfer::DeviceArena::Scope scope = model->scratch->scope();
     const ninfer::DeviceSpan backing =
         model->scratch->alloc_bytes(layout.bytes, kVisionWorkspaceAlignment);
-    encode(*model, *input, layout, backing, patches, static_cast<std::int32_t>(tokens));
+    encode(*model, *input, layout, backing, patches, static_cast<std::int32_t>(tokens),
+           embedding->pages);
     const cudaError_t err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
       set_error(std::string("ignis_media_encode: cudaStreamSynchronize failed: ") +
                 cudaGetErrorString(err));
       return -1;
     }
-    auto embedding = std::make_unique<ignis_media_embedding>();
-    embedding->model = model;
-    embedding->columns = static_cast<std::int32_t>(tokens);
-    model->vision_output_live = true;
+    handed_over = true;
     *out_embedding = embedding.release();
     return 0;
   } catch (const std::exception &e) {
@@ -331,7 +372,7 @@ extern "C" void ignis_media_embedding_release(struct ignis_media_embedding *embe
     return;
   }
   if (embedding->model != nullptr) {
-    embedding->model->vision_output_live = false;
+    embedding->model->vision_pool.give(embedding->pages);
   }
   delete embedding;
 }

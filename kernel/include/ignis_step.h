@@ -206,12 +206,26 @@ struct ignis_prefill_options {
  * column); `cu_seqlens` `[t+1]` segment bounds; `position_table_indices` /
  * `_weights` `[4*P]`, four bilinear corners per patch. `h` and `w` are even.
  *
- * The load's vision reservation holds one embedding at a time: an encode
- * while one is live is refused (release it first), and so is an item wider
- * than the load's envelope. The encoder runs out of the load's scratch
- * arena, which prefill steps share (GitHub #212), so it is never called
- * from inside one. Returns 0 and the handle, or -1 (see
- * ignis_media_last_error) on a load without vision or any invalid input. */
+ * The load's embedding pool (GitHub #243) holds as many embeddings at a time
+ * as their columns fit. An item wider than the load's envelope is refused
+ * with -1; an item that would fit an empty pool but not the free pages left
+ * is refused with IGNIS_MEDIA_ENCODE_POOL_FULL, which says "release
+ * something and call again" rather than "this can never work" -- the caller
+ * owns the eviction policy, this side owns only the pages. The encoder runs
+ * out of the load's scratch arena, which prefill steps share (GitHub #212),
+ * so it is never called from inside one. Returns 0 and the handle, -1 (see
+ * ignis_media_last_error) on a load without vision or any invalid input, or
+ * IGNIS_MEDIA_ENCODE_POOL_FULL. */
+
+/* An embedding's width in merged columns per pool page (GitHub #243). One
+ * page is this many `[hidden]` BF16 columns: 1,280 KiB at 5120 hidden, whose
+ * 10,240-byte column keeps every page 256-aligned. */
+#define IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS 128
+
+/* ignis_media_encode: the item fits the pool but not the pages free right
+ * now. Distinct from -1 because it is the only failure a caller can clear by
+ * releasing another embedding and retrying. */
+#define IGNIS_MEDIA_ENCODE_POOL_FULL (-2)
 struct ignis_media_encode_input {
   uint32_t size; /* sizeof(struct ignis_media_encode_input) */
   uint32_t grid_t;

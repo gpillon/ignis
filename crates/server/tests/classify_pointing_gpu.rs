@@ -293,7 +293,7 @@ fn a_constrained_readout_points_at_the_blue_button() {
         let item = &prompt.media[0];
         let control = vision_item_control(item.grid);
         let embedding = step::encode_media(&model, item.grid, &item.patches, &control)
-            .unwrap_or_else(|e| panic!("{}: encode: {e}", scene.id));
+            .unwrap_or_else(|(_, e)| panic!("{}: encode: {e}", scene.id));
         eprintln!(
             "ignis pointing {}: {}x{} image -> {} prompt tokens ({} image columns); blue box {:?} centre {:?} size {:?}",
             scene.id,

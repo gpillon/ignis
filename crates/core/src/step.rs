@@ -1134,23 +1134,32 @@ fn media_last_error() -> String {
     message.to_string_lossy().into_owned()
 }
 
+pub use crate::vision::MEDIA_ENCODE_POOL_FULL;
+
 /// Run the media encode step (GitHub #178) over one item: its row-major BF16
 /// patch rows on `grid` and the encoder control
 /// ([`crate::vision::vision_item_control`]) computed for that grid.
+///
+/// The error carries the leaf's return code beside its message, because
+/// [`MEDIA_ENCODE_POOL_FULL`] is the one a caller acts on rather than
+/// reports (GitHub #243).
 pub fn encode_media<'m>(
     model: &'m Model,
     grid: Grid,
     patches: &[u16],
     control: &VisionItemControl,
-) -> Result<MediaEmbedding<'m>, String> {
+) -> Result<MediaEmbedding<'m>, (i32, String)> {
     let raw = grid.raw_patches() as usize;
     if patches.len() != raw * ignis_artifact::vision::PATCH_FEATURES {
-        return Err(format!(
-            "encode_media: {} patch values for a {}x{}x{} grid",
-            patches.len(),
-            grid.t,
-            grid.h,
-            grid.w
+        return Err((
+            -1,
+            format!(
+                "encode_media: {} patch values for a {}x{}x{} grid",
+                patches.len(),
+                grid.t,
+                grid.h,
+                grid.w
+            ),
         ));
     }
     if control.patches as usize != raw
@@ -1159,7 +1168,10 @@ pub fn encode_media<'m>(
         || control.position_table_weights.len() != 4 * raw
         || control.cu_seqlens.len() != grid.t as usize + 1
     {
-        return Err("encode_media: the control does not describe the grid".to_string());
+        return Err((
+            -1,
+            "encode_media: the control does not describe the grid".to_string(),
+        ));
     }
     let input = ffi::IgnisMediaEncodeInput {
         size: std::mem::size_of::<ffi::IgnisMediaEncodeInput>() as u32,
@@ -1175,7 +1187,7 @@ pub fn encode_media<'m>(
     let mut handle = std::ptr::null_mut();
     let rc = unsafe { ffi::ignis_media_encode(model.handle(), &input, &mut handle) };
     if rc != 0 {
-        return Err(media_last_error());
+        return Err((rc, media_last_error()));
     }
     Ok(MediaEmbedding {
         handle,

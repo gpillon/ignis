@@ -35,10 +35,36 @@ const HIDDEN: u64 = 5120;
 /// The leaf's vision allocation alignment (`kVisionWorkspaceAlignment`).
 const VISION_ALIGN: u64 = 256;
 
-/// The vision envelope a load reserves for.
+/// The leaf's `IGNIS_MEDIA_ENCODE_POOL_FULL` (GitHub #243): the embedding
+/// pool cannot take another item until one is released.
+///
+/// The one encode refusal a caller acts on rather than reports — every other
+/// is -1 and means the call can never work. It lives here, and not beside
+/// the rest of the step ABI, because the policy that clears it
+/// (`RuntimeCompute`'s cache) is built without the `cuda` feature.
+pub const MEDIA_ENCODE_POOL_FULL: i32 = -2;
+
+/// Merged columns per embedding pool page (`IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS`,
+/// GitHub #243). At [`HIDDEN`] a page is 1,280 KiB.
+pub const EMBEDDING_PAGE_COLUMNS: u64 = 128;
+
+/// One embedding pool page, in bytes.
+pub const EMBEDDING_PAGE_BYTES: u64 = HIDDEN * EMBEDDING_PAGE_COLUMNS * 2;
+
+/// The embedding pool a load that names none asks for (GitHub #243): zero,
+/// which [`Vision::pool_bytes`] raises to its floor — one envelope-wide
+/// item, at *this* load's envelope. Exactly what GitHub #177 always
+/// reserved, so a load that says nothing does not move the VRAM plan, and a
+/// short-context load does not suddenly reserve for a context it cannot
+/// serve.
+pub const DEFAULT_EMBEDDING_POOL_BYTES: u64 = 0;
+
+/// The vision envelope a load reserves for, and the embedding pool it holds
+/// encoded items in (GitHub #243).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vision {
     max_tokens: u32,
+    pool_bytes: u64,
 }
 
 /// A vision envelope outside `1..=VISION_MAX_TOKENS_LIMIT`.
@@ -61,22 +87,59 @@ impl Default for Vision {
     fn default() -> Self {
         Self {
             max_tokens: DEFAULT_VISION_MAX_TOKENS,
+            pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
         }
     }
 }
 
 impl Vision {
-    /// An envelope of `max_tokens` merged vision tokens per request.
+    /// An envelope of `max_tokens` merged vision tokens per request, with the
+    /// default embedding pool.
     pub fn new(max_tokens: u32) -> Result<Self, VisionEnvelopeOutOfRange> {
         if max_tokens == 0 || max_tokens > VISION_MAX_TOKENS_LIMIT {
             return Err(VisionEnvelopeOutOfRange(max_tokens));
         }
-        Ok(Self { max_tokens })
+        Ok(Self {
+            max_tokens,
+            pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
+        })
+    }
+
+    /// The same envelope holding encoded items in a `pool_bytes` pool
+    /// (GitHub #243).
+    ///
+    /// The value is what the operator asked for; the leaf rounds it up to
+    /// whole pages and floors it at the envelope's own output, because an
+    /// item that fits the envelope has to fit the pool once everything else
+    /// is released — a caller told "release something and retry" must be able
+    /// to make progress. [`Self::pool_bytes`] reports the floored, rounded
+    /// number, which is what the VRAM plan carries.
+    pub fn with_pool_bytes(self, pool_bytes: u64) -> Self {
+        Self { pool_bytes, ..self }
     }
 
     /// The configured envelope, in merged vision tokens.
     pub fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    /// The embedding pool the leaf reserves, in bytes: whole pages, never
+    /// below one envelope-wide item (GitHub #243).
+    pub fn pool_bytes(&self, max_context_tokens: u32) -> u64 {
+        let floor = self.output_transient_bytes(max_context_tokens);
+        let want = self.pool_bytes.max(floor);
+        want.div_ceil(EMBEDDING_PAGE_BYTES) * EMBEDDING_PAGE_BYTES
+    }
+
+    /// The pool's pages at `max_context_tokens`.
+    pub fn pool_pages(&self, max_context_tokens: u32) -> u64 {
+        self.pool_bytes(max_context_tokens) / EMBEDDING_PAGE_BYTES
+    }
+
+    /// What the operator asked for, before the floor and the rounding — what
+    /// the load option carries across the ABI.
+    pub fn requested_pool_bytes(&self) -> u64 {
+        self.pool_bytes
     }
 
     /// The envelope the leaf actually reserves for: no request can carry more
@@ -86,7 +149,8 @@ impl Vision {
     }
 
     /// One item's `[5120, V]` BF16 encoder output at the envelope, rounded to
-    /// the leaf's alignment (the output transient half of the reservation).
+    /// the leaf's alignment — the widest single embedding, and so (GitHub
+    /// #243) the floor under [`Self::pool_bytes`].
     pub fn output_transient_bytes(&self, max_context_tokens: u32) -> u64 {
         let bytes = HIDDEN * u64::from(self.envelope_tokens(max_context_tokens)) * 2;
         bytes.div_ceil(VISION_ALIGN) * VISION_ALIGN
@@ -580,5 +644,59 @@ mod tests {
     #[test]
     fn the_vision_object_count_is_the_artifacts() {
         assert_eq!(VISION_OBJECTS, 333);
+    }
+
+    #[test]
+    fn a_page_is_a_whole_number_of_columns_and_of_alignment_units() {
+        // A column is 5120 x 2 = 10,240 bytes = 40 x 256, so every page
+        // boundary is a 256-aligned address whatever the page width is —
+        // which is what lets the encoder write and the prefill read at a
+        // page pointer with the same ops they used on one flat buffer.
+        assert_eq!(EMBEDDING_PAGE_BYTES, 1_310_720);
+        assert_eq!(EMBEDDING_PAGE_BYTES % VISION_ALIGN, 0);
+        assert_eq!(HIDDEN * 2 % VISION_ALIGN, 0);
+    }
+
+    #[test]
+    fn the_default_pool_is_exactly_what_the_output_transient_always_was() {
+        // GitHub #243 must not move the VRAM plan for a load that asks for
+        // nothing: the default pool is one envelope-wide embedding, which is
+        // the reservation GitHub #177 took.
+        let vision = Vision::default();
+        assert_eq!(DEFAULT_EMBEDDING_POOL_BYTES, 0, "zero asks for the floor");
+        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
+        assert_eq!(vision.pool_pages(262_144), 256);
+        // And at a short context the floor moves with the envelope, rather
+        // than reserving 320 MiB for tokens this load can never carry.
+        assert_eq!(vision.pool_bytes(2048), vision.output_transient_bytes(2048));
+        assert_eq!(vision.pool_bytes(2048), 16 * EMBEDDING_PAGE_BYTES);
+    }
+
+    #[test]
+    fn a_pool_is_floored_at_one_envelope_wide_item_and_rounded_to_pages() {
+        // The floor is the termination argument for the caller's eviction
+        // loop: an item that fits the envelope has to fit the pool once
+        // everything else is released, or "release something and retry"
+        // never ends. Asking for less is raised, not refused.
+        let vision = Vision::default().with_pool_bytes(1024);
+        assert_eq!(vision.requested_pool_bytes(), 1024);
+        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
+
+        // Above the floor it is the request, rounded up to whole pages.
+        let big = Vision::default().with_pool_bytes(335_544_320 + 1);
+        assert_eq!(big.pool_bytes(262_144), 335_544_320 + EMBEDDING_PAGE_BYTES);
+        assert_eq!(big.pool_pages(262_144), 257);
+    }
+
+    #[test]
+    fn a_small_context_lowers_the_floor_with_the_envelope() {
+        // The envelope is capped by the context, so a short-context load
+        // floors the pool far lower — and a pool asked for in bytes is then
+        // as many items as fit, not one.
+        let vision = Vision::new(1024).unwrap().with_pool_bytes(0);
+        assert_eq!(vision.pool_bytes(4096), 8 * EMBEDDING_PAGE_BYTES);
+        assert_eq!(vision.output_transient_bytes(4096), 1024 * HIDDEN * 2);
+        assert_eq!(vision.pool_bytes(4096), vision.output_transient_bytes(4096));
     }
 }

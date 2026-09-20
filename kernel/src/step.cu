@@ -753,7 +753,7 @@ bool validate_span_multimodal(const ignis_model *model, int32_t route, const Spa
     return (span.media == nullptr && span.count == 0) ||
            refuse("media columns need the span's multimodal positions");
   }
-  if (model->vision_output == nullptr) {
+  if (!model->vision_pool.present()) {
     return refuse("a multimodal span on a model loaded without vision");
   }
   if (route != IGNIS_PREFILL_ROUTE_CHUNKED) {
@@ -893,13 +893,28 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                     cudaGetErrorString(err));
           return -1;
         }
-        const std::size_t column =
-            multimodal.first_column + static_cast<std::size_t>(first - multimodal.scatter);
-        const ninfer::Tensor columns(static_cast<std::uint8_t *>(model->vision_output->p) +
-                                         column * static_cast<std::size_t>(hidden) *
-                                             sizeof(std::uint16_t),
-                                     ninfer::DType::BF16, {hidden, count, 1, 1});
-        ninfer::ops::scatter(columns, indices, left, model->stream);
+        const auto column =
+            static_cast<std::int32_t>(multimodal.first_column) +
+            static_cast<std::int32_t>(first - multimodal.scatter);
+        // GitHub #243: the chunk's columns are contiguous in the embedding's
+        // column space but sit in its pool pages, so the scatter runs once
+        // per page run. Same `ops::scatter` the single output transient
+        // took, over a narrower column range and the matching slice of the
+        // indices -- no kernel here reads a page table.
+        const VisionEmbeddingPool &pool = model->vision_pool;
+        for (std::int32_t done = 0; done < count;) {
+          const std::int32_t at = column + done;
+          const std::int32_t page = at / pool.page_columns;
+          const std::int32_t within = at % pool.page_columns;
+          const std::int32_t take = std::min(count - done, pool.page_columns - within);
+          const ninfer::Tensor columns(
+              pool.page_ptr(multimodal.media->pages[static_cast<std::size_t>(page)]) +
+                  static_cast<std::size_t>(within) * static_cast<std::size_t>(hidden) *
+                      sizeof(std::uint16_t),
+              ninfer::DType::BF16, {hidden, take, 1, 1});
+          ninfer::ops::scatter(columns, indices.slice(0, done, take), left, model->stream);
+          done += take;
+        }
       }
     }
 
@@ -2088,10 +2103,10 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->verify != nullptr) {
     out_stats->vram_bytes += model->verify->device_bytes();
   }
-  // GitHub #177: the vision output transient (its weights are already in
+  // GitHub #177: the media embedding pool (its weights are already in
   // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212).
-  if (model->vision_output != nullptr) {
-    out_stats->vram_bytes += model->vision_output->bytes;
+  if (model->vision_pool.buffer != nullptr) {
+    out_stats->vram_bytes += model->vision_pool.buffer->bytes;
   }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;
