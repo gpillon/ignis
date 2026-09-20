@@ -432,6 +432,11 @@ impl Metrics {
         // not arrived yet", where the other order reads as "a decision with
         // no mass" — the shape of the failure this whole family exists to
         // show.
+        debug_assert_eq!(
+            answer_mass.is_some(),
+            primitive.has_answer_mass(),
+            "a primitive observes a mass exactly when it has one to observe"
+        );
         if let Some(answer_mass) = answer_mass {
             self.answer_mass.observe(answer_mass);
         }

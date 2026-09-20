@@ -304,6 +304,13 @@ pub fn read(plan: &Plan, drawn: &[Draw]) -> Option<BTreeMap<String, Reading>> {
 /// everyone makes once: the model answers 0-999 on *both* axes, so a
 /// 1600x900 screenshot needs two different divisors, and a caller who used
 /// one has an answer that is right along x and wrong along y.
+///
+/// The top of the range maps to `pixels`, which is one past the last
+/// addressable column — the same arithmetic `classify_pointing_gpu.rs`
+/// measured with, kept so the served reading and the finding's are the same
+/// number. A caller clicking at exactly `x == width` is off the image by
+/// one; nothing in the measured data ever read a top-of-range digit, so this
+/// is a stated edge rather than an observed one.
 pub fn to_pixels(value: u64, sigma: f64, digits: u32, pixels: u32) -> (i64, f64) {
     let per_unit = f64::from(pixels) / scale(digits) as f64;
     ((value as f64 * per_unit).round() as i64, sigma * per_unit)

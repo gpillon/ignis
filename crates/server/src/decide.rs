@@ -1072,6 +1072,10 @@ pub fn program_answer_for(
             digits: reading.digits.clone(),
         };
     }
+    debug_assert!(
+        question.kind.is_spatial(),
+        "every program that is not a number answers on an image"
+    );
     // Spatial: the answer is in pixels of the image the caller submitted,
     // and each axis is scaled by its own side.
     let Some((width, height)) = pixels else {

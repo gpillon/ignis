@@ -810,12 +810,12 @@ async fn a_box_reads_four_axes_from_one_run() {
         let expected = (normalized as f64 / 99.0 * f64::from(side)).round() as i64;
         assert_eq!(answer["pixels"][axis].as_i64().unwrap(), expected, "{axis}");
     }
-    assert_eq!(
-        compute.prefill_calls().iter().flatten().map(|job| job.request).collect::<Vec<_>>()
-            .windows(2).all(|pair| pair[0] == pair[1]),
-        true,
+    let requests: Vec<_> =
+        compute.prefill_calls().iter().flatten().map(|job| job.request).collect();
+    assert!(
+        requests.windows(2).all(|pair| pair[0] == pair[1]),
         "one request, not four: the y digits are read after x has been forced, so \
-         the model knows where it put x"
+         the model knows where it put x - {requests:?}"
     );
 }
 
