@@ -1,553 +1,310 @@
-# ignis
+<p align="center">
+  <img src="web/assets/images/logo-trasparent.png" alt="Ignis" width="140">
+</p>
 
-A high-throughput inference engine for **Qwen 3.8-27B** on a single **NVIDIA
-RTX 5090** (SM120a), serving an **OpenAI-compatible HTTP API** from a Rust core
-backed by a C++/CUDA kernel leaf.
+<h1 align="center">Ignis</h1>
 
-**Status:** early development — **the engine now serves real completions on
-the GPU.** With `IGNIS_ARTIFACT` set and the binary built with `--features
-cuda`, `ignis-server` loads the model onto the device and drives the real
-64-layer program (device-resident, step-level C ABI — ADR 0009, verbatim-
-vendored reference kernels — ADR 0010) for both streaming and non-streaming
-chat completions, stopping on the model's own EOS token or `max_tokens`.
-Without an artifact, or without `--features cuda`, it falls back to the
-deterministic CPU-only mock (`MockCompute`, ADR 0006) for protocol and loop
-work.
+<p align="center">
+  <b>A single-GPU inference engine for Qwen3.8-27B, built for the load an agent makes.</b>
+</p>
 
-**Gate history:** G1 GREEN (2026-09-07, 97.1% teacher-forced canary
-agreement), G2 GREEN (2026-09-09, TTFT ratios 0.878/0.851 on the 8K/32K
-cells), G3 closed 2026-09-10 with one open gap (#110, the ITL p95 cell).
-**Next milestone: the G4 gate run** (master #65, the reference feature
-floor) — hq-e8-2b KV as a load option, snapshot/restore + KV-RAM host tier,
-device prefix reuse, unified eviction, tagged lanes; verdict is the 99%
-performance gate (ADR 0007) on the recorded "1 main + N subagents" load.
-The full phase/gate plan is `.scratch/ROADMAP.md`; the review that reset it
-is `.scratch/REVIEW-2026-09-05.md`.
+<p align="center">
+  OpenAI-compatible HTTP API &nbsp;·&nbsp; Rust core &nbsp;·&nbsp; C++/CUDA kernel leaf &nbsp;·&nbsp; one Blackwell card
+</p>
+
+<p align="center">
+  <img alt="license Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-d94b1f?style=flat-square">
+  <img alt="target SM120a" src="https://img.shields.io/badge/target-SM120a%20%2F%20RTX%205090%20%7C%20RTX%20PRO%206000-d94b1f?style=flat-square">
+  <img alt="model Qwen3.8-27B NVFP4" src="https://img.shields.io/badge/model-Qwen3.8--27B%20NVFP4-d94b1f?style=flat-square">
+  <img alt="API OpenAI-compatible" src="https://img.shields.io/badge/API-OpenAI--compatible-d94b1f?style=flat-square">
+</p>
 
 ---
 
-## What it is
+Ignis is a deliberately specialized engine: **one model family, one class of
+card**. It gives up generality and takes back speed. It loads an NVFP4
+Qwen3.8-27B onto a single Blackwell card — an **RTX 5090** or an **RTX PRO
+6000**, both `SM120a` — serves streaming and non-streaming
+completions over the OpenAI v1 API, and is shaped around the workload a
+developer actually produces — *one main agent plus a handful of subagents
+hitting the same card at once*. Eight resident decode lanes run as one
+batch-wide round; the paged KV cache is budgeted in bytes rather than in
+sequences; conversation state survives the request that built it; images are
+evidence, not an afterthought; and a decision can be answered without
+generating a single token. A Playground, a live Monitor and Prometheus
+metrics ship in the binary.
 
-`ignis` is a deliberately specialized inference engine: one model family, one
-GPU class. It is **not** a recreation of the reference stack (NInfer) — it is a
-new architecture that borrows proven kernel work where it helps.
+Rust owns everything above the *step* — scheduling, admission, KV accounting,
+serving. The forward pass and all GPU compute live in a C++/CUDA static
+library behind a flat, device-resident step-level C ABI. The engine is its own
+dogfood target, and partly there already: it serves some of the coding agents
+that build it, and the rest of that is what the remaining work is for.
 
-- **Performance-first.** Correctness (a self-check of *sane* output) is a
-  non-negotiable floor; above it, performance is the #1 objective. The
-  north-star is *"the best local coding engine"* — maximum throughput **and**
-  agent parallelism that saturates the GPU in prefill *and* decode.
-- **Rust core + C++/CUDA leaf.** Rust owns everything above the *step* —
-  scheduling, KV accounting, serving; the forward pass and all GPU compute live
-  in a static C++/CUDA library behind a flat, device-resident step-level C ABI
-  (ADR 0009).
+**TL;DR** — grab a build from
+[Releases](https://github.com/gpillon/ignis/releases): a Windows `.zip`, a
+Linux `.tar.gz`, or the container image. Point it at a Blackwell card and open
+<http://127.0.0.1:8000/ui/>. The longer path is [Quick start](#quick-start).
 
-The engine is also its own dogfood target: good enough to run a developer's own
-concurrent coding agent (a "1 main agent + N subagents" load).
+## What sets it apart
 
-## Architecture
+Every number below is a measurement on a 5090.
 
-Two layers, plus the artifact that carries the weights and the frontend
-objects. Items marked *(planned)* are the G1–G4 build-out, not shipped code:
+### The decode round
 
-```
-HTTP (OpenAI-compatible: /v1/models, /v1/chat/completions, /v1/responses)
-  │
-Rust core (crates/core)
-  ├── Scheduler: prefill + N=8 decode lanes (host-tier overflow)
-  │              + full admission state machine (protection / backfill class /
-  │              temporal credit / frontier distance)
-  ├── Paged KV page accounting + block tables (device pages reported by the leaf)
-  ├── KV-RAM host tier (probation / protected eviction) + prefix reuse *(in progress: G4)*
-  ├── Artifact loader (.ninfer reader + binder + materializer + device views)
-  ├── Telemetry (JSONL interval lines; request lifecycle as structured logs)
-  └── crates/runtime: safe wrapper over the step ABI *(shipped: G1)*
-        │
-Step-level C ABI (device-resident, opaque handles — ADR 0009)
-  model load · sequence alloc/release/snapshot · prefill(span, pos)
-  · decode round(batch) · sampling params · stats
-        │
-Kernel leaf (kernel/, C++/CUDA static lib — CMake + nvcc, SM120a)
-  ├── program: device arena, streams, the 64-layer op sequence,
-  │            sequence state (KV pages, fp32 GDN slots, conv taps)
-  └── vendored ops (verbatim from the reference, ADR 0010)
-      ├── NVFP4 / BF16 / W8G32 linear (GEMV, small-T; W4A4 + TMA since G2)
-      ├── GQA attention (bf16 + hq-e8-2b paged decode + prefill; i8 unused)
-      ├── GDN family (causal conv1d + SiLU, gating, recurrence, chunked since G2)
-      ├── norms / embedding / sampling
-      └── per-width decode CUDA graphs *(shipped: G3, widths 1..8)*
-```
+- **One batch-wide round for all eight lanes**, replayed from **per-width CUDA
+  graphs** (widths 1..8), not one launch sequence per sequence.
+- The round is **1,166 graph nodes and 15.81 ms of device time that is weight
+  streaming at the card's bandwidth** — the backbone GEMM at 100% of roofline,
+  the output head at 86%. Graph submission costs 2.2% of it, and the whole
+  remaining headroom is the 4.8% the device spends idle.
+- Prefill and decode **interleave at chunk level**, so a long prompt never
+  stalls the lanes already generating.
 
-**The model lifecycle is decoupled from the server lifecycle** (hot-reload-ready
-by construction): the KV pool, CUDA graphs, and scheduler state are regenerable
-per model. The per-sequence context defaults to 40960 tokens (a 32K prompt
-plus an 8K generation, `--max-context`), the model's 262k envelope being the
-ceiling; the paged KV pool is sized in **bytes**: whatever the **VRAM budget**
-leaves once the weights, workspaces, lanes and retained state are laid out
-(ADR 0030), or `--kv-pool-bytes` when named. The budget is the memory free at
-start minus a 1 GiB headroom (`--vram-headroom-bytes`) or an explicit
-`--vram-budget-bytes`, and a plan that cannot hold one full context refuses
-the start. What that budget is worth in tokens is derived from the KV
-format in force (`--kv-format`, hq-e8-2b by default since its attention
-routes landed): 65536 sequence-tokens under BF16, 7.11x that under hq-e8-2b,
-reported at load. BF16 is retained and is the format every correctness
-oracle runs against (ADR 0022). The target max concurrency is N=8 (resident
-lanes with host-tier overflow, sized for a ~10-subagent concurrent workload).
+### Speculative decoding (DFlash2)
 
-## Repo layout
+- The served artifact carries a **grafted DFlash2 drafter**; `--spec dflash2
+  --draft-tokens 7` runs draft-and-verify rounds against it.
+- The drafter's vendored top-k gave one warp to each of seven columns over a
+  248k vocabulary and spent 3,145 µs — 16.4% of decode kernel time — to move
+  2.0 µs of memory. **Our row-split replacement does it in 44 µs at a
+  bit-identical answer: 17.6% of a decode round, +21% decode throughput at one
+  lane**. A vendored kernel *measured* as the bottleneck may be replaced — that
+  is the one exemption to verbatim vendoring.
 
-```
-ignis/
-├── crates/
-│   ├── core/        # scheduler, paged KV accounting, request state machine, host tier
-│   ├── artifact/    # .ninfer reader (reader / binder / materializer)
-│   ├── runtime/     # safe step-ABI wrapper (CudaLeaf, decode graphs)
-│   ├── server/      # HTTP + OpenAI schemas + telemetry
-│   ├── logging/     # structured logging (tracing layers, hotpath lint, trace context)
-│   ├── bench/       # trace-replay harness + gate/canary runner
-│   └── vendor/      # ADR 0010 vendoring tool (manifest, hashes, patch records)
-├── web/             # the Playground: React + Vite page served at /ui/ (ADR 0026)
-├── kernel/          # C++/CUDA leaf: program + vendored ops (CMake + nvcc) + build.ps1
-├── bench/traces/    # recorded load traces (JSONL; only the *.meta.json ship)
-├── scripts/         # gpu-preflight / gpu-profile / vendor-ninfer (PowerShell)
-├── docs/            # adr/, design/, agents/, findings/
-├── CONTEXT.md       # glossary (domain vocabulary only)
-└── AGENTS.md        # agent conventions (issue tracker, testing)
-```
+### KV that costs bytes, not sequences
 
----
+- **hq-e8-2b** is the serving KV format: a sequence-token costs **9,216 bytes
+  against BF16's 65,536 — 7.11x the capacity**, so eight lanes at a 40,960
+  context need ~3.02 GB instead of 20 GiB.
+- BF16 is retained, not deprecated: it is the format every correctness oracle
+  runs against.
+- The GQA workspace zeroing is **dead work under hq** — every byte the next
+  launch reads it writes itself — and removing it is worth 2.12% of GQA layer
+  device time on a 70K prefill.
 
-## Prerequisites
+### State that outlives its request
 
-- **Rust** — the workspace (Cargo).
-- **A C++ toolchain for the kernel leaf** — MSVC C++ build tools (Visual Studio
-  2022, C++ workload) on Windows; GCC on Linux.
-- **NVIDIA CUDA Toolkit** (`nvcc`) — target `SM120a`; set `CUDA_PATH`
-  (`CUDA_HOME` on Linux) if it is not on the default install path.
-- **CMake + Ninja** — the kernel leaf builds with the Ninja generator.
-- **The `.ninfer` model artifact** — weights + tokenizer + chat-template (the
-  frontend object set). Not a manual step any more: a GPU build with no
-  `--artifact` fetches it (ADR 0033) — see "Models" below.
+- **Cross-request reuse**: a prompt checkpoint captured at the generation
+  opener, a retained prefix shared between siblings, and a lazy spill into a
+  pinned **KV-RAM** host tier with unified eviction.
+- A device-to-device prefix clone is **0.25 ms for 148 MiB — 96x cheaper than a
+  PCIe round trip and ~8,000x cheaper than re-prefilling the head**; a
+  full-context snapshot/restore round trip is ~90 ms, about 100x cheaper than
+  the re-prefill it replaces.
 
-Windows is the development host; Linux builds the same engine
-(`kernel/build.sh`, `mk/os/linux.mk`) and is what the container image below is
-built from. Some `make` targets are still Windows-only there — `mk/os/linux.mk`
-names which, GitHub #226.
+### A VRAM plan, decided at load
 
-## Build
+- Every byte the process will hold is **reserved and laid out before the first
+  request**, and the plan is printed: weights, workspaces, lane state, decode
+  and drafter graphs, retained slots, media embeddings, and whatever is left
+  becomes the KV pool. The Monitor shows that plan beside what is in use —
+  [see it](#the-playground).
+- The load that used to grow the process **2,734 MiB in 14 minutes now grows it
+  6 MiB in 24.5**, and the printed plan matches what the OS reports to within
+  16 MiB. No paging, no surprise at minute forty.
 
-The build has two parts: the C++/CUDA kernel leaf, then the Rust workspace that
-links it.
+### Lanes that know who is asking
 
-### With make (the short path)
+- A request states its own **lane tag** — `interactive` or `agent` — through the
+  `class` extension field or an `@<lane>` suffix on the model name. The tag
+  drives protection, backfill priority and eviction order, so a burst of
+  subagents fills the lanes a foreground conversation is not using instead of
+  evicting it.
+- Admission is a full state machine: protection, backfill class, temporal
+  credit, frontier distance.
 
-The `Makefile` wraps the steps below (needs GNU make and a POSIX `sh` — on
-Windows, Git for Windows' `usr\bin` on `PATH`). `make` alone lists every
-target; the everyday ones:
+### Jev-like decisions, answered without generating (`/v1/decide`)
 
-```
-make doctor          # toolchain, rust target, artifact, web deps
-make dev             # build (web + kernel + GPU server), then run it
-make run             # run the last build; fails, naming the changed files, if it is stale
-make mock            # the same on the CPU mock (no GPU, no kernel, no artifact)
-make start / stop    # daemon server (log in .scratch/serve/), waits for /v1/models, survives the terminal
-make dev-ui          # build, then server + Playground hot reload; Ctrl+C stops both
-make metrics         # scrape the metrics listener of a server started with METRICS=1
-make watch CUDA=0    # rebuild + restart on every Rust change (cargo-watch)
-make test            # cargo test, workspace-wide
-make gpu-status      # who holds the 5090
-```
+- A **classification is not a completion**. `POST /v1/decide` prefills the
+  evidence once and reads the answer out of the logits at a single position.
+- Six primitives: **`noul`** (yes/no), **`choice`**, **`score`**, and — one
+  constrained digit per step — **`number`**, **`point`**, **`box`**.
+- On 144 authored decisions the declared options hold a median **99.8%** of the
+  model's distribution, and the readout costs **~36.5 ms and zero decoded
+  tokens** at 0.934 balanced accuracy on the layout first measured; moving the
+  evidence into the system block takes it to **0.963**.
+- `point` reads a click target off a 4096px screenshot to within 84 px worst
+  case, inside the button on every scene tested.
+- The same handler is served as **`/v1/systemone`**, so a Jev client reaches
+  this engine by changing the URL and nothing else.
 
-With `CUDA=1` the server starts in the G5 gate configuration: the full
-262144-token context, hq-e8-2b KV, DFlash2 speculation with 7 draft tokens
-(`MAX_CONTEXT`, `KV_FORMAT`, `SPEC`, `DRAFT_TOKENS`, `PREFILL_CHUNK`,
-`REQUEST_TIMEOUT`; `SPEC=` turns speculation off).
-Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
-`make dev-ui SPEC= MAX_CONTEXT=40960`) or in an untracked `local.mk`
-(`local.mk.example`); `make config` prints what is in force. A CUDA
-`run`/`start` first runs a GPU guard (the preflight plus a check for other
-ignis GPU work), skippable with `GPU_CHECK=0`. Per-OS behavior sits behind
-`mk/os/<os>.mk`: Windows is implemented, Linux is scaffolded (the CPU mock,
-web and test targets work; kernel, GPU and background-server hooks report
-"not implemented").
+### Images as evidence
 
-### 1. Kernel leaf (C++/CUDA)
+- `--vision` loads the tower and reserves its workspace; images arrive inline
+  as data URIs or as URLs the server fetches, prepares and caches.
+- The encoder output is kept past its request, keyed by content digest and
+  grid: **four questions over one 4096x4096 screenshot go from 27.92 s to
+  13.24 s** on one encode instead of four, and 9.49 s when the picture was
+  already seen.
+- The tower's quadratic curve is the checkpoint's own scheme, not a bug: 88.2%
+  of a 16,384-column encode is the attention kernel, holding 164.7 TFLOP/s with
+  0.1% device idle, so 3.67 s is the worst case per image — and the only lever
+  is sending a smaller one.
 
-`kernel/build.ps1` configures and builds the kernel leaf with CMake + Ninja +
-`nvcc`, targeting `SM120a` (`CMAKE_CUDA_ARCHITECTURES=120a`) in a Release
-build, into `kernel/build/` (the `crates/*/build.rs` link that artifact). It
-imports the MSVC environment itself — no developer prompt needed — and locates
-`nvcc` from `CUDA_PATH` (or the default CUDA install).
+### A context you can rescale
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File kernel\build.ps1
-```
+- The checkpoint is trained to **262,144 positions**; `--rope-scaling yarn:F`
+  rescales that envelope, `yarn:4` putting the ceiling at **1,048,576**
+  (factor up to 64). What a long-context probe must ask is a question about
+  *relative* position — a literal needle at 320K is recalled with the flag and
+  without it.
 
-A second argument is an alternate build dir (e.g. `kernel\build.ps1 build-a`),
-so a parallel workstream can verify new `.cu` files without contending on the
-canonical `kernel/build/`.
+### Batteries in the binary
 
-### 2. Rust workspace
+- **The Playground** at `/ui/` — chat with tools and subagents, parallel
+  sessions, image input, a Decide tab and a live Monitor. Built into the
+  server, not a separate service.
+- **Prometheus** on its own listener (`--metrics`), with the VRAM plan, retained
+  state, KV pool occupancy, decision counters and request lifecycle.
+- **It fetches its own model.** Started with no artifact, a GPU build asks, then
+  downloads and verifies it.
+- **`--api-key` and `--expose`** — a keyed public URL through a quick Cloudflare
+  tunnel, key always required.
+- **Linux and Windows**, a `linux/amd64` container image on `ghcr.io`, and
+  release archives cut from the same build.
 
-```
-# GPU-backed (real model, needs the kernel leaf built and IGNIS_ARTIFACT set)
-cargo build --release -p ignis-server --features cuda
+## The Playground
 
-# CPU-only mock (protocol/loop work, no GPU, no kernel leaf needed)
-cargo build --release -p ignis-server
-```
+Agents running in parallel, each on its own lane, with the engine's own timings
+beside every reply:
 
-- **`--features cuda`** enables the production GPU-backed compute backend
-  (`ignis_runtime::CudaLeaf`, driven through `ignis_server::runtime::cuda_scheduler`)
-  — with `IGNIS_ARTIFACT` set, the real model path.
-- **Without `--features cuda`, or without an artifact**, the server runs in
-  ADR 0006 dev mode: a deterministic CPU-only mock (`MockCompute`), for
-  protocol and loop work without a GPU.
-- Drop `--release` for a debug build (slower, faster to compile); the binary
-  then lands under `target/x86_64-pc-windows-msvc/debug/` instead of `release/`.
+![The Playground running four subagents](docs/user/images/chat_agents_salute.png)
 
-The cargo build reuses an already-built `kernel/build/ignis_kernel.lib` when
-present (incremental), so it does not recompile the C++ leaf from scratch each
-time. The resulting binary lands in the workspace target dir — on the MSVC
-triple, `target/x86_64-pc-windows-msvc/debug/ignis-server`.
+A decision over prose — the winner, the whole distribution, and a score read as
+levels — answered out of one prefill with nothing generated:
 
-### 3. Playground (optional)
+![A text decision and its distribution](docs/user/images/decide_1.png)
 
-The Playground (`web/`, React + Vite, ADR 0026) is served at `/ui/` unless
-`--no-ui` (or `IGNIS_UI=false`) says otherwise, but it is embedded into
-`ignis-server` only if `web/dist` exists when cargo builds it — cargo never
-runs npm. Build the frontend first (needs Node.js), then the server:
+The same endpoint over an image: a point, a box, and a yes/no, each a digit at a
+time, with the model's self-reported uncertainty on every axis:
 
-```
-npm --prefix web ci
-npm --prefix web run build
-cargo build --release -p ignis-server
-target\x86_64-pc-windows-msvc\release\ignis-server.exe    # http://127.0.0.1:8000/ui/
-```
+![A decision over an image, with point and box](docs/user/images/decide_2.png)
 
-A server built without `web/dist` still serves `/ui/`, as a page with these
-instructions. For frontend work, `npm --prefix web run dev` proxies `/v1`
-and `/ui/metrics` to a running ignis (`IGNIS_URL`, default
-`http://127.0.0.1:8000`); `npm --prefix web run dev:mock` serves a fake engine
-instead, so no GPU is needed.
+The Monitor scrapes the engine's own metrics: throughput, lane occupancy,
+latency quantiles:
 
-```
-cargo test          # workspace-wide, CPU-only and fast — never touches the GPU
-```
+![The Monitor, live](docs/user/images/metrics_1.png)
 
-GPU work is checked by a separate, **explicit** suite (the GPU profile): it
-requires the 5090 to be free and **fails** — never skips — when the GPU is busy
-or a kernel errors (ADR 0006; a skip is not green for compute work). The kernel
-leaf additionally has its own CTest executable running each vendored op's
-reference test at real 27B geometry (ADR 0010).
+...and what the load actually reserved, against the constants that bound it:
 
-## Releases and the container image
+![The VRAM plan and retained state](docs/user/images/metrcs_2.png)
 
-`.github/workflows/release.yml` builds the GPU engine for both hosts on every
-push to `main` or a `ci/**` branch, and publishes nothing. A `v*` tag — which
-must match `workspace.package.version`, or the job refuses it — turns the same
-run into a GitHub Release (a Windows `.zip` and a Linux `.tar.gz`, each with
-its SHA-256) and pushes the `linux/amd64` image to
-`ghcr.io/gpillon/ignis`.
+## Quick start
 
-```
-podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
-  -v /path/to/models:/models:ro \
-  -e IGNIS_ARTIFACT=/models/qwen3_8_27b_nvfp4full-v2.ninfer \
-  ghcr.io/gpillon/ignis:0.1.0
-```
-
-(`docker`: `--gpus all` in place of `--device`.) Every flag has an `IGNIS_*`
-environment variable (`crates/server/src/config.rs`); anything after the image
-name is passed to the server. The image sets no default command: the
-Playground is on because the server's own default is on. The image carries the CUDA runtime
-but no driver: the host's NVIDIA driver is injected by the container runtime,
-and the model is mounted, never baked in.
-
-Without `IGNIS_ARTIFACT` the image fetches the model into its own working
-directory (`/home/ignis/models`, ADR 0033 — nothing on stdin to ask, so it
-downloads), and loses it with the container. Mount a model directory and
-point the download at it to keep what it fetches:
+### Container
 
 ```
 podman run --rm --device nvidia.com/gpu=all -p 8000:8000 \
   -v /path/to/models:/models \
-  ghcr.io/gpillon/ignis:0.1.0 --model-download-path /models
+  ghcr.io/gpillon/ignis:0.1.2 --model-download-path /models
 ```
 
-To smoke-test the image on its own — no GPU, no model, the deterministic CPU
-mock (ADR 0006) — say so:
+(`docker`: `--gpus all` in place of `--device`.) With no model in that
+directory the server fetches one and verifies it. The Playground is then at
+<http://127.0.0.1:8000/ui/>.
+
+### From a checkout
 
 ```
-podman run --rm -p 8000:8000 ghcr.io/gpillon/ignis:0.1.0 --no-model-download
+make doctor          # toolchain, rust target, artifact, web deps
+make dev             # build web + kernel + GPU server, then run it
+make dev VISION=1    # the same, with the vision tower loaded for image input
+make mock            # the same with no GPU, no kernel, no artifact
 ```
 
-`Containerfile` builds the same thing locally (`podman build -t ignis:dev .`).
-Its `artifacts` stage is what CI exports the Linux tarball from, so the release
-binaries and the image binaries are the same build. Why it is shaped this way —
-one build for both, two workflows that fail independently, a tag only cut on a
-green dry run: ADR 0032.
+`make` alone lists every target; `make config` prints the exact server command a
+run will use.
 
-Cutting one starts with the version, which four files must agree on — the two
-the workflow compares (`Cargo.toml`, `web/package.json`, because the Playground
-ships inside the binary) and the two lockfiles it does not look at, which the
-next build would rewrite:
-
-```
-make version                     # what each of the four declares
-make version-bump T=patch        # or minor, major
-make version-bump V=1.2.3-rc.1   # or an exact version: x.y.z, -prerelease optional
-make version-check               # the workflow's comparison + the lockfiles, before you tag
-```
-
-It edits and stops there: the commit and the tag are printed, not run, because
-pushing a `v*` tag publishes a release.
-
-What the release changed is drafted from the range, not written from memory:
-
-```
-make changelog                   # since the last v* tag, to HEAD
-make changelog FROM=v0.1.1 TO=v0.1.2
-```
-
-It reads the issues the range's commits name, the ADRs added or amended in it,
-and the commits that name no issue at all, and prints Markdown for the body of
-the version-bump commit and of the GitHub release. GitHub's own
-`generate_release_notes` cannot do this — it lists merged PRs, and this repo
-merges locally. It is a draft: the headings are sorted by what the range can
-prove, not by what matters most, so read the follow-ups too.
-
-Both are compiled for **SM120a** only. The Linux tarball needs the CUDA 13
-runtime on the host; the Windows zip carries `cudart64_*.dll`.
-
-## Models (`./models`)
-
-`./models` is a symlink to `F:\ai\q38\ninfer-models` (the shared model store —
-also used by `ninfer` itself, on the same 5090). Current contents:
-
-| File | Size | Notes |
-|---|---|---|
-| `qwen3_8_27b_nvfp4full-v2.ninfer` | ~19.4 GB | **The correct artifact — use this one.** v2: same base tensors as v1 (bit-identical) plus a grafted DFlash2 speculative-decoding drafter module. Has a matching `.sha256` and `.README.md` (full provenance) alongside it. |
-| `qwen3_8_27b_nvfp4full.ninfer` | ~18.3 GB | v1 (pre-DFlash2). Legacy — kept for comparison/rollback, not the one to point `IGNIS_ARTIFACT` at. |
-| `qwen3_8_27b_nvfp4full-v2.ninfer.graft.json` | — | The DFlash2 graft manifest for v2 (which objects were appended, and how). |
-| `qwen3_8_27b_nvfp4full-v2.ninfer.sha256` | — | Checksum for v2; the server verifies it at load and refuses to start if it does not match. |
-| `qwen3_8_27b_nvfp4full.ninfer.conversion.json` | — | v1's conversion manifest. |
-| `.cache/`, `.ninfer-webui.*.tmp/`, `webui/` | — | ninfer's own scratch/webui state — not ours, ignore. |
-
-Point `IGNIS_ARTIFACT` at the v2 file (relative path works since `./models` is
-a symlink into the real store):
-
-```
-set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
-```
-
-### Getting the model without one (ADR 0033)
-
-A GPU build started **without** `--artifact`/`IGNIS_ARTIFACT` looks for the
-model under `--model-download-path` (default `./models`, the same flat
-file names Hugging Face publishes) and fetches it when it is not there:
-
-```
-ignis-server                      # asks first: the size, the source, the destination
-ignis-server --no-model-download  # never fetches: the placeholder template and the CPU mock
-ignis-server --model-download-path D:\weights
-```
-
-On a terminal you are asked (`[y/N]`, on stderr); without one — a container,
-a daemon, CI — nobody can answer, so it just downloads. What it fetches is
-`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`: the artifact and its
-`.graft.json` sidecar, streamed to a `.part` file, checked against the size
-and SHA-256 pinned in the binary, and renamed into place only then. An
-interrupted download resumes; a tampered one is discarded and refuses the
-start. On this machine nothing is ever fetched — `./models` already holds the
-file under exactly that name. A build without `--features cuda` never
-downloads at all.
-
-The grafted DFlash2 drafter module is what phase 5 (gate G5, GitHub #66,
-spec `.scratch/runtime/specs/05-speculative-decoding.md`) loads for
-speculative decoding. Until that phase lands, ignis binds only the text scope:
-the drafter module sits unused in the container and costs no VRAM unless
-materialized.
-
-## Usage (in development)
-
-The server is an **OpenAI-compatible** HTTP server on localhost (no auth,
-localhost-only by design). The current API surface is the v1 OpenAI API and will
-evolve as the engine matures.
-
-> **Real completions on the GPU.** Built with `--features cuda` and a
-> verified `IGNIS_ARTIFACT`, the server loads the ~19 GB of weights into
-> VRAM, builds a paged KV pool from what its VRAM plan leaves across 8 decode
-> slots (logged as `ignis.runtime.vram_plan`, ADR 0030), each
-> sequence capped at the 40960-token default context
-> (`ignis_runtime::CudaLeafConfig`), and drives the real 64-layer
-> program for every request: streaming and non-streaming chat completions
-> stop at the model's own EOS token (`finish_reason: "stop"`) or at
-> `max_tokens` (`finish_reason: "length"`). Without `--features cuda`, or
-> without an artifact, completions come from the deterministic CPU mock
-> (`MockCompute`) instead — the endpoints, streaming, telemetry and
-> scheduler behavior are real, the generated text is not (and every
-> completion reports `finish_reason: "length"`, since the mock has no real
-> EOS token).
-
-### Configuration (environment / CLI flags)
-
-Each variable has a matching CLI flag (a flag overrides its env var, which
-overrides the default — GitHub #77); run `ignis-server --help` for the
-full, always-current table.
-
-| Variable | Flag | Alias | Default | Meaning |
-|---|---|---|---|---|
-| `IGNIS_ARTIFACT` | `--artifact <path>` | `-a` | — (unset) | The `.ninfer` container path (weights + tokenizer + chat template). A configured artifact must exist and verify (checksum clean) or the server refuses to start. **Unset → the model is looked for under `--model-download-path`, and fetched when it is not there.** |
-| `IGNIS_MODEL_DOWNLOAD` | `--model-download` / `--no-model-download` | — | **on** | Fetch a missing model (ADR 0033). On a terminal you are asked first; without one (a container, a daemon) it downloads, since nobody can answer. Only consulted with `--artifact` unset, and only in a `--features cuda` build — a CPU-mock binary never downloads weights it could not run. Off → the built-in placeholder template, whose rendered content is not natural text. |
-| `IGNIS_MODEL_DOWNLOAD_PATH` | `--model-download-path <dir>` | — | `./models` | Where a fetched model lands, and where one fetched earlier is found. Flat, under the names the repo publishes: a `hf download … --local-dir models` done by hand and a download the server did are the same file. |
-| `IGNIS_MODEL` | `--model <id>` | `-m` | `qwen3.8-27b` | The loaded model id (what `/v1/models` reports and what submissions must name) — and the key the download registry is looked up by. |
-| `IGNIS_BIND` | `--bind <addr>` | `-b` | `127.0.0.1:8000` | The bind address (localhost only, no auth). |
-| `IGNIS_ENABLE_THINKING` | `--enable-thinking <true\|false>` | — | `true` | The server-wide default for `enable_thinking`. |
-| `IGNIS_REASONING_EFFORT` | `--reasoning-effort <value>` | — | — (template default) | The server-wide default `reasoning_effort`. |
-| `IGNIS_PREFILL_CHUNK` | `--prefill-chunk <tokens>` | — | `1024` | The prefill chunk width (a nonzero multiple of 128); the program's prefill scratch is reserved for it at load. |
-| `IGNIS_MAX_CONTEXT` | `--max-context <tokens>` | — | `40960` | The max per-sequence context (prompt + generation); the KV pool must be able to hold one of them. |
-| `IGNIS_KV_FORMAT` | `--kv-format <fmt>` | — | `hq-e8-2b` | The KV cache format for this load: `hq-e8-2b` (the serving default) or `bf16` (retained, and the format every correctness oracle runs against) — ADR 0022. Decides what a pool byte budget is worth in tokens. |
-| `IGNIS_KV_POOL_BYTES` | `--kv-pool-bytes <bytes>` | — | the rest of the VRAM budget | The paged-KV pool budget in bytes (accepts a `K`/`M`/`G` suffix). A budget too small for `--max-context`, or past the VRAM budget, fails the load by name. |
-| `IGNIS_VRAM_HEADROOM_BYTES` | `--vram-headroom-bytes <bytes>` | — | `1G` | Derives the VRAM budget: the device memory free at start minus this. Not with `--vram-budget-bytes`. |
-| `IGNIS_VRAM_BUDGET_BYTES` | `--vram-budget-bytes <bytes>` | — | — (derived) | The device memory the whole process may hold, weights included. More than is free refuses the start. |
-| `IGNIS_ALLOW_VRAM_OVERSUBSCRIPTION` | `--allow-vram-oversubscription` | — | off | With `--vram-budget-bytes` only: start above free memory (or below the plan's minimum) with a warning instead of a refusal. On Windows that pages. |
-| `IGNIS_RETAINED_SLOTS` | `--retained-slots <n>` | — | one per decode lane (`N_DECODE_LANES`); `0` with `--prompt-reuse off` (a count given then shares heads between live siblings only) | Retained slots reserved at load (ADR 0030): where every retained prompt checkpoint and shared prefix keeps its state image. When none is free, retained state gives one up — checkpoints before retained prefixes, `agent` before `interactive`, then least recently used; when nothing can, the publish or capture is skipped. Replaces the removed `--retained-pool-bytes`. |
-| `IGNIS_REQUEST_TIMEOUT` | `--request-timeout <secs>` | — | `30` (max 3600) | The deadline for a non-streaming completion; expiry is a 504 `request_timeout`. |
-| `IGNIS_UI` | `--ui` / `--no-ui` | — | **on** | Serve the Playground at `/ui/` (ADR 0026). A binary built without `web/dist` serves the page that says how to build it. |
-| — | `--metrics` | — | off | Serve Prometheus metrics on their own listener, and at `/ui/metrics` unless `--no-ui` (flag only, no env var — ADR 0017). |
-| — | `--metrics-bind <addr>` | — | `127.0.0.1:9464` | The metrics listener's address; needs `--metrics`. No API key, never exposed. |
-| — | `--help` | `-h` | — | Print the flag table and exit. |
-| — | `--version` | `-V` | — | Print the crate version and exit. |
-
-### Launch
-
-```
-set IGNIS_ARTIFACT=./models/qwen3_8_27b_nvfp4full-v2.ninfer
-target\x86_64-pc-windows-msvc\release\ignis-server.exe
-```
-
-At startup the server verifies the artifact, loads the real tokenizer + chat
-template, initializes the compute backend, then binds and serves. It prints
-a one-line readiness note (`model <id> on http://<bind>`) when ready.
-
-### API
-
-| Endpoint | Method | Notes |
-|---|---|---|
-| `/v1/models` | GET | The loaded model. |
-| `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
-| `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
-| `/ui/` | GET | The Playground page — only with `--ui`. |
-| `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--ui` and `--metrics` (ADR 0017). Needs the API key when one is set, like `/v1`. |
-
-Prometheus scrapes `GET /metrics` on the metrics listener (`--metrics-bind`,
-default `127.0.0.1:9464`), not on the API's address: no key, and never
-reachable through `--expose`.
-
-Errors use OpenAI's `{"error": {message, type, code}}` body with the matching
-status: 400 bad request, 404 unknown model, 413 oversized request, 503 engine
-full, 504 the engine did not finish the request in the timeout.
-
-### Examples
+### A request
 
 ```bash
-# the loaded model
-curl http://127.0.0.1:8000/v1/models
-
-# non-streaming chat completion
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"..."}],"max_tokens":256}'
-
-# streaming (SSE)
-curl -N http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"..."}],"stream":true}'
-
-# the responses API
-curl http://127.0.0.1:8000/v1/responses \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"...","max_output_tokens":256}'
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Hello"}],"max_tokens":256}'
 ```
 
-- **Chat completions** accept `messages` (role + content), `model`, `stream`,
-  `max_tokens`, `temperature` (0..2), `top_p` (0..1), `presence_penalty` and
-  `frequency_penalty` (-2..2), and a signed 64-bit `seed`. `top_k` is an
-  **ignis extension**, not an OpenAI Chat Completions parameter: accepted
-  values are 0..20, where 0 selects ignis's 20-candidate sampler cap during
-  stochastic sampling. Values outside these ranges are rejected with
-  `invalid_sampling_parameter`; they are never silently clamped. Absent
-  sampling fields preserve the existing greedy, fixed-seed behavior
-  (`temperature: 0`, `seed: 0`). Because the leaf's greedy branch
-  intentionally does not read stochastic filters or penalties, a non-neutral
-  `top_p`, `top_k`, `presence_penalty`, or `frequency_penalty` requires
-  `temperature > 0` and is otherwise rejected instead of ignored.
-  Non-streaming returns `choices[].message.content` + `usage`; streaming emits
-  `chat.completion.chunk` SSE frames (token deltas, a final `finish_reason`
-  chunk, then `[DONE]`).
-- **The responses API** accepts `input` (a string or a message list), `model`,
-  `max_output_tokens`, `temperature`, and `seed`; it returns the responses API
-  `output` shape with the generated text in an `output_text` part.
+Full flag table, API surface, model handling, container and release detail:
+**[docs/user](docs/user/README.md)**.
 
-### Canary check
+## Building it
 
-`ignis-bench canary` runs the fixed high-signal prompt suite against a live
-server and checks each output is *sane* and *deterministic* (greedy + fixed
-seed ⇒ identical output on a repeat run — ADR 0007's self-check, not a
-reference-token comparison):
+Two parts, in this order: the C++/CUDA kernel leaf, then the Rust workspace that
+links it.
 
-```bash
-cargo run -p ignis-bench -- canary --endpoint http://127.0.0.1:8000
-```
+- **Toolchain** — Rust; MSVC C++ build tools (Windows) or GCC (Linux); the CUDA
+  Toolkit (`nvcc`, target `SM120a`); CMake + Ninja; Node.js for the Playground.
+- **Kernel leaf** — `kernel/build.ps1` on Windows, `kernel/build.sh` on Linux.
+  Both configure and build into `kernel/build/`, which `crates/*/build.rs` link.
+- **Workspace** — `cargo build --release -p ignis-server --features cuda` for
+  the real engine; without `--features cuda` (or without an artifact) the server
+  runs a deterministic CPU-only mock, which is how protocol and scheduler work
+  gets done with no card.
 
-## Telemetry
+### The repo
 
-Everything goes through the one structured log on stdout, in the format
-`IGNIS_LOG_FORMAT` picks (pretty on a terminal, JSON otherwise). The request
-lifecycle is the `ignis.request.*` events (`admitted` / `ttft` / `done`,
-GitHub #79), with the request id doubling as the OTel trace id (ADR 0012).
+| Path | What lives there |
+|---|---|
+| `crates/core/` | Scheduler, admission, paged KV accounting, request state, host tier. |
+| `crates/artifact/` | The `.ninfer` reader: reader, binder, materializer. |
+| `crates/runtime/` | Safe wrapper over the step ABI (`CudaLeaf`, decode graphs). |
+| `crates/server/` | HTTP, OpenAI schemas, decisions, metrics, telemetry. |
+| `crates/logging/` | Structured logging: tracing layers, hotpath lint, trace context. |
+| `crates/bench/` | Trace-replay harness, gate and canary runner. |
+| `crates/vendor/` | The vendoring tool: manifest, hashes, patch records. |
+| `kernel/` | The C++/CUDA leaf: the program and the vendored ops (CMake + nvcc). |
+| `web/` | The Playground: React + Vite, embedded into the server at build time. |
 
-The scheduler counters are the DEBUG event `ignis.scheduler.interval`,
-emitted whenever `waiting`, `running` or `kv_evictions` change (ADR 0025).
-To watch them while load runs, start the server with `IGNIS_LOG_LEVEL=debug`:
+`make` wraps all of it. Tests: `cargo test` is workspace-wide, CPU-only and
+never touches the GPU; GPU work is checked by a separate explicit profile that
+**fails** rather than skips when the card is busy. The 5090 fits one run at a
+time — check `make gpu-status` before starting anything on it.
 
-```text
-2026-09-13T10:00:00.000Z DEBUG ignis.scheduler.interval - scheduler counters changed {tick=123, waiting=2, running=3, kv_evictions=1}
-```
+## Documentation
 
-`prefilling` and KV occupancy are not reported until the scheduler exposes
-them as real values in `ignis-core`.
+| | |
+|---|---|
+| [`docs/user/`](docs/user/README.md) | Running it: flags, API, models, container, releases, telemetry. |
+| [`docs/adr/`](docs/adr/) | Every architectural decision, and why it was taken. |
+| [`docs/findings/`](docs/findings/README.md) | Durable, evidence-backed measurements. |
+| [`docs/agents/`](docs/agents/) | Conventions for agents working in this repo. |
+| [`CONTEXT.md`](CONTEXT.md) | The glossary. One vocabulary, one meaning per term. |
 
----
+An OpenAPI description of the HTTP surface is planned and will supersede the
+API section of the user docs.
+
+## Lineage
+
+Ignis descends from [**NInfer**](https://github.com/Neroued/ninfer), a lineage
+of Windows-oriented local-inference forks, and does not hide it. The pinned
+reference is the fork [`gpillon/ninfer`](https://github.com/gpillon/ninfer),
+itself downstream of [`cometkim/ninfer`](https://github.com/cometkim/ninfer)
+(kernel-perf, hyperquant KV, NVFP4-full, the original DFlash2 port) →
+[`natpate/ninfer-windows`](https://github.com/natpate/ninfer-windows) (the
+Windows port) → [`Neroued/ninfer`](https://github.com/Neroued/ninfer) (the
+original engine). The `.ninfer` model artifact is NInfer's format,
+and the kernel leaf **vendors NInfer's CUDA ops verbatim** under a manifest that
+pins the reference commit and every file's content hash — a port claim you can
+diff. What is ours is the layer above them: the forward pass, the sequence
+state, the step ABI, the scheduler, and by now the kernels that measurement
+asked us to rewrite.
+
+Ignis is **not** a port of NInfer. It is a different architecture that starts
+from proven kernel work.
 
 ## Credits
 
-The `.ninfer` model artifact (weights, tokenizer, and chat-template frontend
-objects) and the CUDA ops originate from the **NInfer** project — a lineage of
-Windows-oriented local-inference forks. The ignis kernel leaf **vendors those
-ops verbatim** (Apache-2.0, under a pinned-commit manifest — ADR 0010; see
-`kernel/NOTICE`) as a proven starting point (ADR 0005); our own kernels come
-later, per op family and gated by measurement. The program layer above them
-(the forward pass, the sequence state, the step ABI) is ours.
-
 With thanks to the NInfer project and its contributors:
 
-- **cometkim** — integration branch: kernel-perf (PDL decode chain, split-K
-  prefill, per-request error boundary), DFlash2 base port, hyperquant KV cache,
-  1M-context envelope, NVFP4-full target.
-- **Mirko Covizzi** — RTX 5090 Laptop compatibility and MTP
-  adaptive verification-width tuning.
-- **mr-september** — warmup/readiness decoupling and frontend streaming fixes.
-- **dylan (dylanbrodiefafard)** — RAM KV cache concept, LRU lane eviction,
-  decode CPU-spin fix.
-- **Neroued** — original NInfer engine.
+- **cometkim** — kernel-perf integration (PDL decode chain, split-K prefill,
+  per-request error boundary), the DFlash2 base port, the hyperquant KV cache,
+  the 1M-context envelope, the NVFP4-full target.
+- **Mirko Covizzi** — RTX 5090 Laptop compatibility, MTP adaptive
+  verification-width tuning.
+- **mr-september** — warmup/readiness decoupling, frontend streaming fixes.
+- **dylan (dylanbrodiefafard)** — the RAM KV cache concept, LRU lane eviction,
+  the decode CPU-spin fix.
+- **Neroued** — the original NInfer engine.
 
 ## License
 
-Apache License 2.0 — `LICENSE`, with the copyright in `NOTICE`.
-
-The vendored reference ops under `kernel/vendor/` keep their upstream terms
-(also Apache-2.0); `kernel/NOTICE` and `kernel/vendor/VENDOR.md` record that
-subtree's provenance, and `kernel/vendor/manifest.json` pins the reference
-commit and every vendored file's content hash (ADR 0010). Release archives and
-the container image carry `LICENSE`, `NOTICE` and `NOTICE-kernel`.
+Apache License 2.0.
