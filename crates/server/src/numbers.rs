@@ -38,6 +38,24 @@ use serde::{Deserialize, Serialize};
 /// p≈0.15 (`docs/findings/2026-09-19-constrained-digit-readout-points.md`).
 /// The ceiling is not physics; it is the point past which the extra rounds
 /// buy nothing but a longer-looking number.
+///
+/// **The width is part of the question, not formatting.** On a bare
+/// [`number`](number_system) the model writes its answer left-aligned and
+/// fills the leftover step with a zero, so a width of exactly *one* more
+/// than the value's own digits multiplies the answer by ten: 7 comes back
+/// 70, 42 comes back 420, 230 comes back 2300. Two or more past it and the
+/// model pads on the left instead and the answer is right again; below it,
+/// the number is truncated, which is the only thing a narrower field could
+/// do. Measured on a live server in
+/// `docs/findings/2026-09-20-number-width-and-decide-e2e.md`, along with the
+/// tell: the **first** digit's probability drops to 0.65-0.71 in the broken
+/// case against 0.94-1.00 when the width fits.
+///
+/// So a caller who knows the magnitude states it exactly, and one who does
+/// not leaves at least two digits of headroom — never exactly one. A
+/// declared `min`/`max` would make this a consequence of the range rather
+/// than a caller's guess; spec 06 leaves that open until somebody measures
+/// whether the model obeys a range other than 0-999.
 pub const DIGITS: Range<u32> = 1..7;
 
 /// Digits per axis when the caller names none: the measured width.
@@ -66,14 +84,16 @@ pub fn point_system(digits: u32) -> String {
 
 /// The system text a **box** question is put under.
 ///
-/// **Unmeasured.** It is `point`'s text extended to four numbers by the
-/// obvious reading of it, and nothing in
-/// `docs/findings/2026-09-19-constrained-digit-readout-points.md` exercised
-/// it: the free probe there *did* answer with boxes, so the model plainly
-/// has the shape, but no run has scored a constrained one. Stated here
-/// rather than in a follow-up nobody reads, because a caller comparing `box`
-/// against `point`'s accuracy figures would be comparing against numbers
-/// that are not about `box`.
+/// `point`'s text extended to four numbers by the obvious reading of it.
+/// Lightly measured, and by less than `point`:
+/// `docs/findings/2026-09-20-number-width-and-decide-e2e.md` ran it through
+/// the served endpoint over the three committed pointing scenes and found
+/// its edges within 6 px on x and 30-80 px on y of the ground truth — the
+/// same y-bias `point` shows, on the same three synthetic scenes with one
+/// obvious target. That is a working shape, not an accuracy figure: nothing
+/// has scored `box` on a real screenshot corpus, and a caller reading across
+/// from `point`'s numbers is reading across from numbers that are not about
+/// `box`.
 pub fn box_system(digits: u32) -> String {
     let max = scale(digits);
     let n = "N".repeat(digits as usize);
@@ -89,14 +109,20 @@ pub fn box_system(digits: u32) -> String {
 
 /// The system text a **number** question is put under.
 ///
-/// **Unmeasured**, like `box`, and for a sharper reason: `point`'s accuracy
-/// rests on 0-999 being the scale this model already thinks in — the finding
-/// establishes that from a free probe with no scale declared anywhere. A
-/// bare `number` declares a range that is the model's own only by
-/// coincidence, and whether it *obeys* a declared range is an open follow-up
-/// in that same finding. The mechanism is exposed plainly because it is the
-/// primitive the other two are made of; the numbers are `point`'s and do not
-/// transfer.
+/// **The weakest of the three, and for a sharper reason than `box`:**
+/// `point`'s accuracy rests on 0-999 being the scale this model already
+/// thinks in — the pointing finding establishes that from a free probe with
+/// no scale declared anywhere. A bare `number` declares a range that is the
+/// model's own only by coincidence, and whether it *obeys* a declared range
+/// is an open follow-up in that same finding.
+///
+/// What has been measured is the failure mode, and it is in [`DIGITS`]: the
+/// width has to match the value or clear it by two, because the model
+/// left-aligns. Its arithmetic is also not to be leaned on — asked for a
+/// total it has to compute, it answered 172 for 230.50 — though it said so,
+/// with a first digit at p=0.63 and a sigma of 46.7. The mechanism is
+/// exposed plainly because it is the primitive the other two are made of;
+/// `point`'s numbers are `point`'s and do not transfer.
 pub fn number_system(digits: u32) -> String {
     let max = scale(digits);
     format!(

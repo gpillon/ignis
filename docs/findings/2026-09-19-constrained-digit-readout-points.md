@@ -234,3 +234,7 @@ checked in the test rather than asserted in prose.
   is where the resolution actually ends.
 - Rerun `decide_point_gpu.rs` on a BF16 load, which splits the two candidates
   above for `small`'s 16-unit y drift: same rotation, different KV format.
+- The y axis is consistently the worse one — `point`'s two uncovered sigmas
+  are both y, and `box`'s edges are within 6 px on x and 30-80 px on y
+  (`2026-09-20-number-width-and-decide-e2e.md`). Three scenes is not enough
+  to call it a bias, and it is the same direction every time.

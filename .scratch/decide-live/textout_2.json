@@ -1,0 +1,1 @@
+{"model":"qwen3.8-27b","answers":{"topic":{"type":"choice","choice":"billing","probabilities":{"auth":0.0011580835883959492,"billing":0.9890714364072893,"bug":0.004580309443661153,"other":0.005190170560652012},"confidence":0.9890714364072893},"urgent":{"type":"noul","noul":0.9626731126558711}},"usage":{"input_tokens":1414,"output_tokens":0}}
