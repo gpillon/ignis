@@ -285,6 +285,10 @@ pub fn cuda_scheduler(
         max_context_tokens: shape.max_context,
         retained_slots: shape.retained_slots,
         kv_pool_bytes: shape.kv_pool_bytes,
+        // GitHub #243: only so a refusal names the knob the operator set.
+        embedding_pool_named: shape
+            .vision
+            .is_some_and(|v| v.requested_pool_bytes() != ignis_core::vision::DEFAULT_EMBEDDING_POOL_BYTES),
         kv_arena_bytes: &kv_arena_bytes,
         // Windows WDDM pages an oversubscribed device allocation to system
         // RAM; elsewhere it fails.
@@ -638,6 +642,7 @@ mod tests {
             max_context_tokens: 262_144,
             retained_slots: crate::config::DEFAULT_RETAINED_SLOTS,
             kv_pool_bytes: None,
+            embedding_pool_named: false,
             kv_arena_bytes: &arena,
             can_page: true,
         })
