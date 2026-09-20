@@ -24,9 +24,16 @@ const MODEL: &str = "qwen3.8-27b";
 /// The answer tokens of a three-option decision.
 const ANSWERS: [TokenId; 3] = [32, 33, 34];
 
-/// A decision: a prompt that ends at its generation opener — which is what a
-/// decision's rendered prompt does, the next token being the answer itself —
-/// carrying the answer tokens it reads out.
+/// A decision: the answer tokens it reads out, over a prompt whose opener is
+/// reported at its very end.
+///
+/// That opener is the **worst case**, not the usual one: the 27B's template
+/// appends a closed think block after the opener with thinking off, so a
+/// real decision prompt runs a few tokens past it
+/// (`crates/server/tests/decide_prompt_tail.rs`). Pinning the extreme here
+/// is deliberate — an opener at the prompt's end is the shape that walks
+/// into the empty-last-chunk trap, and a template that produced one must not
+/// break the engine.
 fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
     let opener = prompt.len() as u32;
     RequestInput {

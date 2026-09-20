@@ -142,11 +142,18 @@ impl RequestInput {
     /// **multimodal** claimant learns its own rope delta only from a prefill
     /// span (ADR 0029), and a **decision** (GitHub #238) reads its answer
     /// off a forward pass — a chunk with nothing left to prefill runs none,
-    /// so there would be no logits at the last position to read. A
-    /// decision's rendered prompt *ends* at the generation opener, so an
-    /// exact repeat would otherwise match state covering every token it has:
-    /// the empty-last-chunk trap, prevented rather than repaired, at the
-    /// cost of one token's prefill.
+    /// so there would be no logits at the last position to read. That is the
+    /// empty-last-chunk trap, prevented rather than repaired, at the cost of
+    /// one token's prefill.
+    ///
+    /// Whether an entry *could* have covered the whole prompt depends on the
+    /// chat template, which is exactly why this does not: the 27B's appends
+    /// a closed, empty think block after the generation opener with thinking
+    /// off, so its decision prompts run four tokens past the opener and
+    /// nothing reaches their end anyway
+    /// (`crates/server/tests/decide_prompt_tail.rs`). A template that *did*
+    /// stop at the opener would walk straight into the trap, and the trim is
+    /// what means nobody has to check which kind they have.
     ///
     /// Not to be confused with [`RequestInput::publish_reach`], which
     /// answers the other half of the same picture and does **not** have the

@@ -2734,20 +2734,30 @@ impl Scheduler for ConcreteScheduler {
                         return 0;
                     }
                     let r = &self.requests[i];
-                    // GitHub #238: a decision captures nothing. Its rendered
-                    // prompt *ends* at the generation opener, so a capture
-                    // there covers every token it has — and `reuse_reach`
-                    // makes sure no decision can ever claim that far, so the
-                    // entry would be retained state claimable by nobody.
+                    // GitHub #238: a decision captures no prompt checkpoint.
                     //
-                    // Said here rather than left to arithmetic. Two facts
-                    // already refuse it — `checkpoint_point` rejects an
-                    // opener with no prompt token after it, and the publish
-                    // head is cut to `reuse_reach` so `rides_the_publish`
-                    // below cannot match an opener it no longer equals — but
-                    // both are properties of *other* features, and the
-                    // second is one page of arithmetic away from silently
-                    // coming back.
+                    // A checkpoint is retained *after* the capturing request
+                    // is gone, so it is a bet on a later request that
+                    // extends this prompt. Nothing extends a decision: it is
+                    // the whole request, answered at its own last position,
+                    // and the only thing that could claim its opener is
+                    // another copy of itself. The conservative call is to
+                    // spend no retained slot on that bet.
+                    //
+                    // **This may be leaving reuse on the table**, and it is
+                    // stated here rather than left to arithmetic because the
+                    // arithmetic is not what refuses it. An earlier version
+                    // of this comment claimed a decision's prompt ends at
+                    // its generation opener, so a capture there would cover
+                    // everything and be claimable by nobody. That is false
+                    // for the 27B's template, which appends a closed think
+                    // block after the opener
+                    // (`crates/server/tests/decide_prompt_tail.rs`): the
+                    // opener sits four tokens inside the prompt, well within
+                    // `reuse_reach`, so an exact repeat *could* claim it and
+                    // prefill only the tail. GitHub #240 owns measuring
+                    // whether that is worth a retained slot; until it does,
+                    // this refuses rather than guesses.
                     if r.input.is_decision() {
                         return 0;
                     }
