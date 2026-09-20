@@ -110,9 +110,48 @@ pub struct RequestInput {
     /// published there, rather than a prefix published at a point the
     /// tokenizer disagrees about.
     pub system_block_tokens: Option<u32>,
+    /// The **answer tokens** this request is a **decision** over (GitHub
+    /// #238, ADR 0034), or `None` for every ordinary request.
+    ///
+    /// Carrying them here is what makes a decision a *kind* of request
+    /// rather than a mode of the engine: the scheduler reads this to decide
+    /// that the request ends where its prefill ends. A decision never takes
+    /// a decode lane, never enters [`RequestState::Running`], generates
+    /// nothing, and finishes with the **readout** of these tokens' logits
+    /// at its prompt's last position.
+    ///
+    /// It also changes what the request reserves. [`DecodeParams::max_tokens`]
+    /// is meaningless here — nothing is generated — so the whole-sequence
+    /// reservation is the prompt alone, and a decision is admitted on a
+    /// prompt that fits however large a `max_tokens` came with it.
+    pub decision: Option<std::sync::Arc<[TokenId]>>,
 }
 
 impl RequestInput {
+    /// Whether this request is a **decision** (GitHub #238): it reads its
+    /// answer tokens out at the end of prefill and generates nothing.
+    pub fn is_decision(&self) -> bool {
+        self.decision.is_some()
+    }
+
+    /// How many leading prompt tokens may be reused from retained state
+    /// (GitHub #238): all of them for an ordinary request, and one short of
+    /// the prompt for a **decision**.
+    ///
+    /// The trim is the empty-last-chunk trap, prevented rather than
+    /// repaired. A decision's rendered prompt *ends* at the generation
+    /// opener, so an exact repeat would match a prompt checkpoint covering
+    /// every token it has — and a chunk with nothing left to prefill runs no
+    /// forward pass, so there would be no logits at the last position to
+    /// read. Reusing one token less leaves exactly the one chunk the readout
+    /// needs, and costs a single token's prefill.
+    pub fn reuse_reach(&self) -> usize {
+        match self.is_decision() {
+            true => self.tokens.len().saturating_sub(1),
+            false => self.tokens.len(),
+        }
+    }
+
     /// The last whole-page boundary at or before `at` that a prefix of this
     /// prompt may end at: the plain page floor, walked back out of any media
     /// item it would land inside (GitHub #193,
@@ -222,6 +261,24 @@ impl RequestClass {
         } else {
             RequestClass::Interactive
         }
+    }
+
+    /// The class a **decision** request is admitted under (GitHub #238,
+    /// ADR 0034): the **Lane tag** it stated, or [`RequestClass::Agent`]
+    /// when it stated none — where every other route defaults to
+    /// [`RequestClass::Interactive`].
+    ///
+    /// The exception is not a claim that decisions matter less
+    /// (`CONTEXT.md`, **Lane tag**). A decision holds no residency for an
+    /// **eviction priority** to take — it prefills, reads and ends — so
+    /// `Interactive` would buy it a protection it cannot use and spend one a
+    /// conversation would. And it never takes a decode lane, only the single
+    /// global **prefill lane**, so a fan-out of twenty questions is twenty
+    /// prefills queued on it; under `Interactive` they would cut ahead of
+    /// every waiting conversation. A caller whose one decision really is
+    /// interactive says so with the tag, and is believed.
+    pub fn for_decision(tag: Option<&str>) -> Self {
+        tag.map_or(RequestClass::Agent, RequestClass::from_extension)
     }
 
     /// The wire string for the `class` extension and the canonical
@@ -394,6 +451,14 @@ pub enum SchedEvent {
         /// `None` when it ran none — a load without speculation — so the
         /// request log never reports placeholder zeros.
         spec: Option<SpecCounters>,
+        /// The **readout** a **decision** finished with (GitHub #238, ADR
+        /// 0034), and `None` for every other request.
+        ///
+        /// This is the whole answer. A decision emits no
+        /// [`SchedEvent::Token`] and its `tokens` is 0, so without this
+        /// field its completion would carry nothing at all — which is why
+        /// the readout rides the finish event rather than a second one.
+        readout: Option<crate::decision::Readout>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

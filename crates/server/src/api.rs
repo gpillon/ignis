@@ -244,6 +244,7 @@ fn request_input(
     // token ids (the #189 match key), so a request that sent another picture
     // never matches past the first placeholder they differ at.
     let input = RequestInput {
+        decision: None,
         multimodal: multimodal.map(Arc::new),
         model: model.clone(),
         tokens: rendered.tokens,

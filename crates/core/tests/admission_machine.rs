@@ -33,6 +33,7 @@ use ignis_core::{ConcreteScheduler, MockCompute, ProtectionPhase, Scheduler, Sch
 /// generation cap of `max` tokens.
 fn input(tokens: &[u32], max: u32) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -348,6 +349,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
     assert_eq!(
         sched.submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -368,6 +370,7 @@ fn sequences_past_the_context_limit_are_rejected_and_uncapped_ones_reserve_the_l
     let uncapped = sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,

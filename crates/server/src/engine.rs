@@ -432,6 +432,11 @@ async fn telemetry_task(
                     tokens,
                     reason,
                     spec,
+                    // GitHub #238: the readout is the decision's answer and
+                    // travels to its caller on the response stream, not into
+                    // the telemetry counters — a decision generates nothing,
+                    // so there is nothing here for `on_done` to count.
+                    readout: _,
                 } => telemetry.on_done(request, tokens, reason, spec),
                 SchedEvent::PrefillChunk {
                     request,
@@ -539,6 +544,7 @@ mod tests {
 
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
+            decision: None,
             multimodal: None,
             opener_tokens: None,
             user_turn_tokens: None,
@@ -675,6 +681,7 @@ mod tests {
                     token: 7,
                 },
                 SchedEvent::Done {
+                    readout: None,
                     request: Self::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,
@@ -744,6 +751,7 @@ mod tests {
                     token: 7,
                 },
                 SchedEvent::Done {
+                    readout: None,
                     request: ProtectedBatchScheduler::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,

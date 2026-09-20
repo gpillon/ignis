@@ -284,7 +284,17 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 
 /// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
 /// absent that — whatever the per-sequence limit leaves after the prompt.
+///
+/// Zero for a **decision** (GitHub #238): it generates nothing, so its
+/// whole-sequence reservation is its prompt. That is one `if` rather than a
+/// second reservation path because every caller of this — `submit`'s context
+/// check and [`sequence_tokens`] both — wants the same answer, and a
+/// decision admitted on prompt + `max_tokens` would be refused for a budget
+/// it was never going to spend.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    if input.is_decision() {
+        return 0;
+    }
     input.params.max_tokens.unwrap_or_else(|| {
         config
             .max_sequence_tokens
@@ -1032,10 +1042,18 @@ impl ConcreteScheduler {
         let input = &self.requests[i].input;
         let media = media_keys(input);
         let prompt = PromptContent::new(&input.tokens, &media);
+        // GitHub #238: a decision's reuse stops one token short of its
+        // prompt, for the same shape of reason a multimodal claim leaves a
+        // token to prefill — a claim covering everything leaves no forward
+        // pass, and a decision's answer *is* a forward pass. Trimming the
+        // walk rather than the claim is what makes it airtight: no
+        // checkpoint, prefix or spilled entry can match past a length the
+        // keys were never computed for.
         let reach = match input.multimodal {
             Some(_) => prompt.tokens().saturating_sub(1),
             None => prompt.tokens(),
-        };
+        }
+        .min(input.reuse_reach() as u32);
         prompt
             .head(reach)
             .keys_for(self.checkpoints.match_lengths().chain(self.prefix.match_lengths()))
@@ -1708,12 +1726,16 @@ impl ConcreteScheduler {
         let _span =
             tracing::info_span!("ignis.completion", request_id = self.requests[idx].id).entered();
         let spec = self.requests[idx].spec;
+        // GitHub #238: a decision's whole answer. Taken before the release,
+        // which resets the request's own fields.
+        let readout = self.requests[idx].readout.take();
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
             reason,
             spec,
+            readout,
         });
     }
 
@@ -2286,7 +2308,12 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        let head = self.prefix.shareable_head_tokens(input.tokens.len());
+        // GitHub #238: a decision's shareable head is cut from its *reuse
+        // reach*, not its prompt — one token less, so the page floor lands a
+        // page below a page-multiple prompt rather than on it. Publishing at
+        // the prompt's own length would create an entry no decision could
+        // ever claim, since no decision may match that far.
+        let head = self.prefix.shareable_head_tokens(input.reuse_reach());
         // GitHub #186 (ADR 0029): with cross-request reuse on, the
         // head is floored to the **opener's** page rather than the
         // prompt's. That is what puts the generation opener inside
@@ -2359,6 +2386,23 @@ impl Scheduler for ConcreteScheduler {
         // (`Request::publish_point` walks both in prompt order). This stays
         // the opener's page floor, and the block joins it there.
         request.publish_tokens = publish_tokens;
+        // GitHub #238: a decision takes no prompt checkpoint. Its rendered
+        // prompt *ends* at the generation opener, so a checkpoint captured
+        // there would cover every token it has — and `reuse_reach` has
+        // already made sure no decision can claim that far, which would
+        // leave a retained entry claimable by nobody. Suppressed through the
+        // request's own copy of the structural offset, exactly the way
+        // `--prompt-reuse off` does it.
+        //
+        // Its **prefix** is another matter and is deliberately left alone:
+        // published a page below what it may claim (the `head` above is cut
+        // to `reuse_reach`), it is the shared evidence a fan-out of
+        // questions stands on — the one reuse this endpoint was shaped
+        // around (`docs/findings/2026-09-19-typed-option-logit-readout.md`:
+        // one `state`, N short suffixes).
+        if request.input.is_decision() {
+            request.input.opener_tokens = None;
+        }
         // And `--prompt-reuse off` publishes at neither boundary. #188 kept
         // that by gating the block where it floored the publish point; with
         // the flooring gone the gate lives here, on the request's own copy of
@@ -2896,10 +2940,16 @@ impl Scheduler for ConcreteScheduler {
                     // request that takes a checkpoint".
                     capture_checkpoint,
                     multimodal: r.input.multimodal.clone(),
-                    // GitHub #237 built the seam; the request kind that
-                    // asks for a readout is GitHub #238's. Nothing the
-                    // scheduler serves today is a decision.
-                    readout: None,
+                    // GitHub #237's seam, asked for by GitHub #238's request
+                    // kind. Only on the chunk that ends at the prompt's last
+                    // position: that is the position whose next-token
+                    // distribution holds the decision, and the chunk is
+                    // never empty because `reuse_reach` left it a token.
+                    readout: r
+                        .input
+                        .decision
+                        .clone()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32),
                 }
             })
             .collect();
@@ -2939,6 +2989,15 @@ impl Scheduler for ConcreteScheduler {
                             r.advance(RequestState::Prefilling);
                         }
                         r.prefill_progress += job.tokens.len() as u32;
+                        // GitHub #238: a decision's answer, off the one
+                        // chunk that asked for it. Held on the request
+                        // rather than emitted here, because a decision
+                        // finishes at the end of this phase and its readout
+                        // rides that finish event — there is nothing else
+                        // for it to ride.
+                        if outcome.readout.is_some() {
+                            r.readout = outcome.readout.clone();
+                        }
                         // P3-01 / ADR 0018: every completed chunk boundary
                         // is a GDN resumable boundary, whether or not it
                         // is this request's last chunk.
@@ -3206,6 +3265,42 @@ impl Scheduler for ConcreteScheduler {
                     return events;
                 }
             }
+        }
+
+        // GitHub #238, ADR 0034 — a **decision** ends where its prefill
+        // ends. It is finished here, between the prefill phase and the lane
+        // deal, which is the only place that means what it says: one step
+        // later it would be a candidate in `run_admission`'s queue, and
+        // being a candidate is the thing it must never be. It never enters
+        // `Running`, never holds a decode lane, emits no token, and carries
+        // its readout out on the finish event.
+        //
+        // `FinishReason::Stop` because the decision is *answered* — nothing
+        // was cut short. Its `tokens` is 0, honestly: it generated nothing.
+        let decided: Vec<usize> = self
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|&(_, r)| {
+                r.state == RequestState::Prefilling
+                    && r.prefill_complete()
+                    && r.input.is_decision()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for idx in decided {
+            // A decision that finished its prefill with no readout is a
+            // bug, not a case: its last chunk always carries at least one
+            // token (`RequestInput::reuse_reach`) and always asks for one,
+            // and a backend that cannot answer fails the job instead
+            // (`scheduler::READOUT_WITHOUT_TOKENS`). Asserted rather than
+            // handled, because the only honest handling would be to invent
+            // an answer.
+            debug_assert!(
+                self.requests[idx].readout.is_some(),
+                "a decision completed its prefill without reading out"
+            );
+            self.mark_done(idx, &mut events, FinishReason::Stop);
         }
 
         // Phase 2 — the admission state machine drives the lane deal

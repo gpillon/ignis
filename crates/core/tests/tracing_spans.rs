@@ -74,6 +74,7 @@ where
 
 fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,

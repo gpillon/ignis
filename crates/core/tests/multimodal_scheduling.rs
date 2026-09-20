@@ -36,6 +36,7 @@ fn image_with_digest(begin: usize, count: usize, digest: u8) -> MediaItem {
 fn multimodal_input(tokens: usize, media: Vec<MediaItem>, max: u32) -> RequestInput {
     let positions = (0..3).flat_map(|_| 0..tokens as i32).collect();
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens: (0..tokens as u32).collect(),
         params: DecodeParams { max_tokens: Some(max), ..DecodeParams::default() },

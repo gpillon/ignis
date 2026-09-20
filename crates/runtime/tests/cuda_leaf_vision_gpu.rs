@@ -62,6 +62,7 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
     let messages = [ChatMessage::text(Role::User, question)];
     let rendered = frontend.chat_template().render_with_thinking_and_tools(&messages, ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).expect("render");
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens: frontend.tokenizer().encode(&rendered).expect("tokenize"),
         params: params(),
@@ -90,6 +91,7 @@ fn image_question(frontend: &FrontendSet, image: &[u8], question: &str) -> Reque
     let prepared = frontend.prepare_prompt(&processor, &messages, &[image], ChatRenderOptions { enable_thinking: false, ..Default::default() }, None).expect("prepare");
     let (tokens, multimodal) = Multimodal::from_prepared(prepared);
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens,
         params: params(),

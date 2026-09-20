@@ -12,6 +12,7 @@ use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
 
 fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -90,6 +91,7 @@ fn token_stream_is_deterministic_and_seed_sensitive() {
         let id = sched
             .submit(
                 RequestInput {
+                    decision: None,
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,
@@ -134,6 +136,7 @@ fn token_stream_depends_on_the_request_seed() {
     let r7 = sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -148,6 +151,7 @@ fn token_stream_depends_on_the_request_seed() {
     let r8 = sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,

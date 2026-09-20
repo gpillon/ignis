@@ -87,6 +87,7 @@ fn text_input(frontend: &FrontendSet, question: &str, max_tokens: u32) -> Reques
     let messages = [ChatMessage::text(Role::User, question)];
     let rendered = frontend.chat_template().render_with_thinking_and_tools(&messages, options(), None).expect("render");
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens: frontend.tokenizer().encode(&rendered).expect("tokenize"),
         params: DecodeParams { max_tokens: Some(max_tokens), ..DecodeParams::default() },
@@ -109,6 +110,7 @@ fn multimodal_input(frontend: &FrontendSet, parts: Vec<ContentPart>, images: &[&
     let prepared = frontend.prepare_prompt(&processor, &messages, images, options(), None).expect("prepare");
     let (tokens, multimodal) = Multimodal::from_prepared(prepared);
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens,
         params: params(),

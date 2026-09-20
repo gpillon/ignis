@@ -797,6 +797,7 @@ mod tests {
         scheduler
             .submit(
                 RequestInput {
+                    decision: None,
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,

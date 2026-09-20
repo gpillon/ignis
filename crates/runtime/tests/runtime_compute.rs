@@ -791,6 +791,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
     scheduler
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -826,6 +827,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
     scheduler
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -866,6 +868,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
         compute,
     );
     let input = |tokens: Vec<u32>| RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -922,6 +925,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
         compute,
     );
     let input = || RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -977,6 +981,7 @@ fn checkpoint_scheduler(leaf: Arc<StubLeaf>) -> ConcreteScheduler {
 /// below it, and two tokens past it, the shape a rendered chat prompt has.
 fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: opener,
         user_turn_tokens: None,
@@ -1259,6 +1264,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
         scheduler
             .submit(
                 RequestInput {
+                    decision: None,
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,
@@ -1598,6 +1604,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
     sched
         .submit(
             RequestInput {
+                decision: None,
                 model: "stub".into(),
                 tokens: (0..40).collect(),
                 params: DecodeParams { max_tokens: Some(2), ..DecodeParams::default() },

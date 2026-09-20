@@ -56,6 +56,7 @@ fn failed_prefill_leaves_the_request_retryable() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -131,6 +132,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
     let id = sched
         .submit(
             ignis_core::types::RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -194,6 +196,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
     let id: RequestId = sched
         .submit(
             ignis_core::types::RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -208,6 +211,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
     let sibling: RequestId = sched
         .submit(
             ignis_core::types::RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,

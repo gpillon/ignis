@@ -195,6 +195,7 @@ impl Loaded {
 
     fn request(&self, tokens: Vec<TokenId>, opener: Option<u32>, block: u32, max: u32) -> RequestInput {
         RequestInput {
+            decision: None,
             model: "kv-ram-gpu".into(),
             tokens,
             params: DecodeParams {

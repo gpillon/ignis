@@ -27,6 +27,7 @@ use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 /// pages — 1 page for `max ≤ 12`.
 fn input(max: u32) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -273,6 +274,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
         Arc::new(MockCompute::new()),
     );
     let prompt = |tokens: Vec<u32>, max: u32| RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -385,6 +387,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
         compute.clone(),
     );
     let prompt = |tokens: Vec<u32>, max: u32| RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -485,6 +488,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
         sched
             .submit(
                 RequestInput {
+                    decision: None,
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,
@@ -507,6 +511,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
     let interactive_a = sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -527,6 +532,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
     let agent_a2 = sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,

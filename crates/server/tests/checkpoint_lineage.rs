@@ -102,6 +102,7 @@ fn tools() -> Vec<serde_json::Value> {
 /// tokens plus the two structural offsets only the renderer knows.
 fn request_input(rendered: RenderedPrompt) -> RequestInput {
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens: rendered.tokens,
         params: DecodeParams {
