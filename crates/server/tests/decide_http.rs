@@ -319,12 +319,21 @@ async fn asking_for_thinking_is_refused_with_the_reason() {
 }
 
 #[tokio::test]
-async fn asking_for_thinking_inside_a_thinking_object_is_refused_too() {
-    let compute = Arc::new(MockCompute::new());
-    let body = r#"{"state":"s","thinking":{"enable_thinking":true},"questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#;
-    let (status, response) = decide(&app(compute), body).await;
-    assert_eq!(status, 422, "{response}");
-    assert_eq!(response["error"]["code"], "thinking_unsupported");
+async fn asking_for_thinking_in_any_shape_this_server_reads_is_refused() {
+    // Every field `thinking.rs` resolves thinking from, not only the
+    // obvious one — a request that asked through `chat_template_kwargs`, or
+    // through an effort level that *implies* thinking, must not be served
+    // by a path that happened to look at a different field.
+    for body in [
+        r#"{"state":"s","chat_template_kwargs":{"enable_thinking":true},"questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#,
+        r#"{"state":"s","reasoning_effort":"high","questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#,
+    ] {
+        let compute = Arc::new(MockCompute::new());
+        let (status, response) = decide(&app(compute.clone()), body).await;
+        assert_eq!(status, 422, "{body} was served: {response}");
+        assert_eq!(response["error"]["code"], "thinking_unsupported", "{response}");
+        assert!(compute.prefill_calls().is_empty(), "and cost no prefill");
+    }
 }
 
 #[tokio::test]
@@ -527,4 +536,119 @@ async fn an_image_state_is_rendered_into_the_prompt() {
          ({prompt_tokens} with it, {without} without)"
     );
     assert_eq!(response["usage"]["output_tokens"], 0);
+}
+
+// ── the model the caller names is the model that answers ────────────────
+
+#[tokio::test]
+async fn a_model_this_engine_does_not_load_is_refused_not_echoed() {
+    // Jev documents the response's `model` as "the model that **performed**
+    // the evaluation". Echoing the caller's string back would make a local
+    // Qwen claim to be `jev-latest`, and would quietly serve a request
+    // addressed somewhere else — which `/v1/chat/completions` refuses.
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"s","model":"jev-latest","questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+
+    assert_eq!(status, 422, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("jev-latest"),
+        "the refusal names the model that was asked for: {response}"
+    );
+    assert!(compute.prefill_calls().is_empty());
+}
+
+#[tokio::test]
+async fn the_answer_reports_the_model_that_performed_it() {
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"s","questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#;
+    let (status, response) = decide(&app(compute), body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["model"], MODEL, "the loaded model, named by the engine");
+}
+
+#[tokio::test]
+async fn a_lane_tag_on_the_model_reaches_the_decision() {
+    // `model@lane` is ignis's second entry point for the **Lane tag**
+    // (GitHub #120). A decision defaults to `Agent`, and a caller who says
+    // otherwise is believed — so the suffix must be read, not echoed.
+    let compute = Arc::new(MockCompute::new());
+    let body = format!(
+        r#"{{"state":"s","model":"{MODEL}@interactive","questions":{{"q":{{"type":"noul","instructions":"Urgent?"}}}}}}"#
+    );
+    let (status, response) = decide(&app(compute), &body).await;
+    assert_eq!(status, 200, "the tag is read off the model, not sent to it: {response}");
+    assert_eq!(
+        response["model"], MODEL,
+        "and the answer names the model, without the suffix"
+    );
+}
+
+// ── everything a caller can get wrong is refused before the first submit ─
+
+#[tokio::test]
+async fn an_image_state_on_a_text_only_load_is_refused_not_answered_with_an_error() {
+    // The request was never servable, so it is the caller's to fix — a 422,
+    // not a 200 carrying an error in an answer slot.
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":[{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}],
+                   "questions":{"q":{"type":"choice","instructions":"Which?","criteria":{"a":null,"b":null}}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "media_unsupported");
+    assert!(response.get("answers").is_none(), "nothing was answered");
+    assert!(compute.prefill_calls().is_empty());
+}
+
+#[tokio::test]
+async fn one_unservable_question_refuses_the_whole_request_before_any_of_them_runs() {
+    // The acceptance's real shape: the *second* question is the bad one, so
+    // a handler that validated-then-asked question by question would have
+    // spent the first question's prefill before finding out.
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{
+      "state": "s",
+      "questions": {
+        "aaa_first": { "type": "noul", "instructions": "Urgent?" },
+        "zzz_second": { "type": "choice", "instructions": "Which?", "criteria": { "": null, "x": null } }
+      }
+    }"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "unclean_option");
+    assert!(
+        compute.prefill_calls().is_empty(),
+        "the first question's prefill was never spent"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_option_is_refused_rather_than_silently_halved() {
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"s","questions":{"q":{"type":"choice","instructions":"Which?","criteria":{"a":"one","a":"two","b":null}}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "duplicate_option");
+    assert!(compute.prefill_calls().is_empty());
+}
+
+#[tokio::test]
+async fn criteria_of_the_wrong_shape_refuses_in_its_own_vocabulary() {
+    // Not serde's "data did not match any variant", which names neither the
+    // question nor the field.
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"s","questions":{"mood":{"type":"score","instructions":"How?","criteria":"high"}}}"#;
+    let (status, response) = decide(&app(compute), body).await;
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "malformed_criteria");
+    let message = response["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains("mood") && message.contains("criteria"),
+        "the refusal names the question and the field: {message}"
+    );
 }

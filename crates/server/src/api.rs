@@ -310,13 +310,26 @@ async fn prepare_request(
 /// ready to stand in a question's slot.
 pub(crate) async fn prepare_decision_request(
     server: &Server,
+    model: Option<String>,
     messages: &[ChatMessage],
     params: DecodeParams,
     thinking: &ThinkingOptions,
-) -> Result<(RequestInput, String, u32, Option<MediaStats>), String> {
-    prepare_request(server, None, messages, params, thinking, &[])
+) -> Result<(RequestInput, String, u32, Option<MediaStats>), (&'static str, String)> {
+    prepare_request(server, model, messages, params, thinking, &[])
         .await
-        .map_err(|response| format!("the decision's prompt was refused ({})", response.status()))
+        .map_err(|response| {
+            // The shared path answers with a rendered `Response`, which is
+            // the wrong shape here: a decision's refusal is one of N, and
+            // has to carry a code the decision's own 422 can name. What
+            // survives the crossing is the status, which is enough to say
+            // *which* of the two things went wrong.
+            let code = if response.status() == StatusCode::BAD_REQUEST {
+                "malformed_request"
+            } else {
+                "render_failed"
+            };
+            (code, format!("its prompt was refused ({})", response.status()))
+        })
 }
 
 /// The response for refused media (GitHub #179): a 400 with the media
@@ -336,7 +349,7 @@ fn media_rejection(rejection: MediaRejection) -> Response {
 /// unrecognized one — since it is never part of the model id the scheduler
 /// looks up; an empty base (`"@agent"`) is treated as having no suffix at
 /// all, leaving the whole string as the model name.
-fn split_model_lane(model: Option<String>) -> (Option<String>, Option<RequestClass>) {
+pub(crate) fn split_model_lane(model: Option<String>) -> (Option<String>, Option<RequestClass>) {
     match model {
         None => (None, None),
         Some(m) => match m.rsplit_once('@') {

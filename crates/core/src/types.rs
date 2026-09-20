@@ -303,11 +303,13 @@ impl RequestClass {
     /// `Interactive` would spend a protection it cannot use on behalf of a
     /// conversation that could.
     ///
-    /// A tag that was *stated* but not understood still means
-    /// `Interactive` — that rule belongs to the tag, not to the route —
-    /// which is why this takes an `Option` rather than a sentinel string.
-    pub fn for_decision(tag: Option<&str>) -> Self {
-        tag.map_or(RequestClass::Agent, RequestClass::from_extension)
+    /// `stated` is the tag the request carried, already read by
+    /// [`RequestClass::from_extension`] — a tag that was stated but not
+    /// understood is `Interactive` before it reaches here, because that
+    /// rule belongs to the tag and not to the route. Only a request that
+    /// stated *nothing* takes the decision's own default.
+    pub fn for_decision(stated: Option<RequestClass>) -> Self {
+        stated.unwrap_or(RequestClass::Agent)
     }
 
     /// The wire string for the `class` extension and the canonical

@@ -15,6 +15,17 @@
 //! how, so ours is defined here and stated in full ([`confidence_of`] and
 //! [`score_confidence`]).
 //!
+//! **What this does not carry: the answer mass.** A decision's one silent
+//! failure is the declared options holding none of the distribution — the
+//! answers are then well-formed noise with a plausible argmax, and neither
+//! `confidence` nor `probabilities` can show it, because both are computed
+//! *after* the restriction throws the rest away (`CONTEXT.md`, **answer
+//! mass**; ADR 0034 calls it "the only failure of this endpoint that nothing
+//! else would show"). It is deliberately not a response field: Jev's answer
+//! shape has none, and an aggregate is the useful form of it. GitHub #241
+//! owns exposing it, as a histogram on the metrics listener beside a
+//! decision counter, and `Readout::answer_mass` is what it reads.
+//!
 //! The prompt is the one the measurements were taken on
 //! (`docs/findings/2026-09-19-typed-option-logit-readout.md`): SemIf's
 //! `DIRECT_SYSTEM` verbatim, plus one user message carrying the decision as
@@ -89,10 +100,14 @@ impl<T> Ordered<T> {
         &self.0
     }
 
+    /// How many entries were written, duplicates counted separately —
+    /// [`Ordered::duplicate`] is what decides whether that matters.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether the object was written empty, which for `questions` means a
+    /// request with nothing to decide.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -150,14 +165,23 @@ pub struct DecideRequest {
     /// The typed questions, keyed by ids the caller chooses. Answers come
     /// back under the same ids.
     pub questions: Ordered<Question>,
-    /// Refused when true (GitHub #239): a decision's prompt ends where the
-    /// answer is read, and a thinking prompt puts a reasoning block there
-    /// instead. Accepted only so the refusal can name it.
+    /// The thinking controls, in every shape this server documents them
+    /// (GitHub #68): the top-level field, the effort level that implies
+    /// one, and the `chat_template_kwargs` object the template reads.
+    ///
+    /// Accepted only so that asking for thinking can be *refused*. A
+    /// decision's prompt ends exactly where its answer is read, and a
+    /// thinking prompt puts an open reasoning block at that position, so a
+    /// readout would report the first token of a reasoning trace as the
+    /// answer. Dropping these fields silently would serve that.
     #[serde(default)]
-    pub enable_thinking: Option<bool>,
-    /// The `thinking` object some clients carry `enable_thinking` inside.
+    pub enable_thinking: Option<JsonValue>,
     #[serde(default)]
-    pub thinking: Option<JsonValue>,
+    pub reasoning_effort: Option<JsonValue>,
+    #[serde(default)]
+    pub preserve_thinking: Option<JsonValue>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<JsonValue>,
 }
 
 /// One typed question.
@@ -187,14 +211,91 @@ pub struct Question {
 /// their declared order would already be gone — and a different option order
 /// is a different prompt. Parsing straight into an [`Ordered`] is what keeps
 /// the order from ever being lost rather than trying to recover it.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 pub enum Criteria {
     /// A `score`'s ordered levels.
     Levels(Vec<JsonValue>),
     /// A `noul`'s two descriptions, or a `choice`'s options in declared
     /// order.
     Map(Ordered<JsonValue>),
+    /// Neither — a string, a number, a bool. Kept rather than rejected at
+    /// the parse, so the refusal can come from validation and name the
+    /// question it belongs to.
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Criteria {
+    /// Written out rather than `#[serde(untagged)]` for the sake of the
+    /// *failure*. Untagged reports "data did not match any variant", at the
+    /// `Json` extractor, before the question it belongs to has a name — so
+    /// `"criteria": "high"` would refuse the whole request without saying
+    /// which question or which field, while every other criteria fault
+    /// names both.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EitherShape;
+
+        impl<'de> Visitor<'de> for EitherShape {
+            type Value = Criteria;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("`criteria` as an object of options or an array of score levels")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Criteria, M::Error> {
+                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some(entry) = access.next_entry::<String, JsonValue>()? {
+                    entries.push(entry);
+                }
+                Ok(Criteria::Map(Ordered(entries)))
+            }
+
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                mut access: S,
+            ) -> Result<Criteria, S::Error> {
+                let mut levels = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some(level) = access.next_element::<JsonValue>()? {
+                    levels.push(level);
+                }
+                Ok(Criteria::Levels(levels))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Criteria, E> {
+                // `"criteria": null` is a noul that supplied none.
+                Ok(Criteria::Map(Ordered(Vec::new())))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Criteria, E> {
+                self.visit_unit()
+            }
+
+            // Everything else parses into `Other` and is refused by name a
+            // moment later. Refusing here instead would produce serde's own
+            // message at the `Json` extractor, which knows neither which
+            // question nor which field it was reading.
+            fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Criteria, E> {
+                Ok(Criteria::Other)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _value: bool) -> Result<Criteria, E> {
+                Ok(Criteria::Other)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _value: i64) -> Result<Criteria, E> {
+                Ok(Criteria::Other)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _value: u64) -> Result<Criteria, E> {
+                Ok(Criteria::Other)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Criteria, E> {
+                Ok(Criteria::Other)
+            }
+        }
+
+        deserializer.deserialize_any(EitherShape)
+    }
 }
 
 /// The three one-position primitives.
@@ -351,7 +452,7 @@ fn noul_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOpt
     let fields = match criteria {
         None => None,
         Some(Criteria::Map(map)) => Some(map),
-        Some(Criteria::Levels(_)) => {
+        Some(Criteria::Levels(_) | Criteria::Other) => {
             return Err(Refusal::new(
                 "malformed_criteria",
                 format!("question {id:?} is a noul, so `criteria` must be an object of `true` and `false`"),
@@ -411,6 +512,16 @@ fn choice_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedO
         .entries()
         .iter()
         .map(|(name, description)| {
+            // An option's key is what the answer comes back under, and —
+            // when it describes itself — what the prompt says it means. A
+            // blank one is neither, and would reach the model as an
+            // option with no text at all.
+            if name.trim().is_empty() {
+                return Err(Refusal::new(
+                    "unclean_option",
+                    format!("question {id:?} declares an option with a blank name"),
+                ));
+            }
             // `null` means the option needs no extra detail, so the id is
             // its own description — Jev's own rule.
             let description = match description {
@@ -545,7 +656,9 @@ fn payload_text(fields: &[(&str, &JsonValue)]) -> String {
         out.push('"');
         out.push_str(name);
         out.push_str("\":");
-        out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned()));
+        out.push_str(
+            &serde_json::to_string(value).expect("a `JsonValue` always serializes"),
+        );
     }
     out.push('}');
     out
@@ -587,14 +700,20 @@ impl Evidence {
         }
     }
 
-    /// Whether this evidence carries a media part — what decides whether the
-    /// request needs the media path at all.
+    /// Whether this evidence carries a media part — what decides whether a
+    /// load without `--vision` can evaluate it at all.
+    ///
+    /// The same rule `crate::media::has_media` applies to a conversation,
+    /// asked of a `state` instead: an `image_url` part that actually has a
+    /// url. Two predicates that disagreed about what media *is* would send
+    /// a request down the media path that the media path then refused, or
+    /// worse, the other way round.
     pub fn has_media(&self) -> bool {
         match self {
             Self::Json(_) => false,
             Self::Parts(parts) => parts
                 .iter()
-                .any(|part| part.kind.as_deref().is_some_and(|kind| kind != "text")),
+                .any(|part| part.kind.as_deref() == Some("image_url") && part.url.is_some()),
         }
     }
 }
@@ -646,9 +765,16 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
-    /// This question alone failed after the GPU was already spent on its
-    /// siblings (spec 04): validation is all-or-nothing and happens earlier,
-    /// so nothing here is a caller's mistake.
+    /// This question alone failed at *runtime*, after the GPU was already
+    /// spent on its siblings (spec 04).
+    ///
+    /// Everything a caller could have got wrong — a malformed question, an
+    /// unnameable option, an image a text-only load cannot take, a prompt
+    /// past the context — refuses the whole request before the first
+    /// submit, so what lands here is the engine: a refused admission, or a
+    /// question the engine did not answer within `--request-timeout`. The
+    /// siblings' answers are already paid for, and discarding them to
+    /// report one fault helps nobody.
     Error { code: String, message: String },
 }
 
@@ -762,46 +888,86 @@ pub async fn decide(
             return refused(&Refusal::new("malformed_request", rejection.body_text()));
         }
     };
-    // Thinking is refused, never ignored. A decision's prompt ends exactly
-    // where its answer is read; a thinking prompt puts an open reasoning
-    // block there instead, so the position whose logits this reads would
-    // hold the first token of a reasoning trace. Serving that silently
-    // would return a well-formed answer computed from the wrong position.
-    if asks_for_thinking(&request) {
-        return refused(&Refusal::new(
-            "thinking_unsupported",
-            "a decision reads one position and generates nothing, so `enable_thinking` cannot be honoured; omit it or set it to false",
+    match serve(&server, request).await {
+        Ok(response) => axum::Json(response).into_response(),
+        Err(refusal) => refused(&refusal),
+    }
+}
+
+/// Everything the endpoint refuses, and then everything it answers.
+///
+/// The split is the acceptance: **nothing reaches the engine until every
+/// question has been validated and rendered**. A caller must never pay a
+/// prefill for nineteen good questions and a refusal on the twentieth, and
+/// "before the GPU" has to mean before the *first* submit, not before each
+/// one.
+async fn serve(
+    server: &crate::Server,
+    request: DecideRequest,
+) -> Result<DecideResponse, Refusal> {
+    refuse_thinking(server, &request)?;
+    let prepared = prepare(&request.questions, &server.alphabet)?;
+    let evidence = Evidence::read(&request.state);
+    // An image `state` on a load that cannot take images is a refusal, not
+    // an error in an answer slot: the request was never servable, and it is
+    // the caller's to fix.
+    if evidence.has_media() && server.media.is_none() {
+        return Err(Refusal::new(
+            "media_unsupported",
+            "this server was loaded without `--vision`, so a `state` carrying an image cannot be evaluated",
         ));
     }
-    // Everything validates before the GPU is touched: a caller must never
-    // pay a prefill for nineteen good questions and a refusal on the
-    // twentieth.
-    let prepared = match prepare(&request.questions, &server.alphabet) {
-        Ok(prepared) => prepared,
-        Err(refusal) => return refused(&refusal),
-    };
-    let evidence = Evidence::read(&request.state);
-    let class = ignis_core::types::RequestClass::for_decision(None);
+    // The **Lane tag**, exactly as every other route reads it — off the
+    // `model` field's `@<lane>` suffix (`CONTEXT.md`). What is left is the
+    // model the caller named, which goes to the scheduler rather than
+    // being echoed back unexamined: a decision addressed to a model this
+    // engine does not load is refused like any other request.
+    let (model, lane) = crate::api::split_model_lane(request.model.clone());
+    let class = ignis_core::types::RequestClass::for_decision(lane);
+    // A model this engine does not load can never be served, so it is a
+    // refusal of the whole request rather than N identical errors in N
+    // answer slots — and it is checked here, before the first submit, for
+    // the same reason everything else is.
+    //
+    // 422 where `/v1/chat/completions` answers 404 `model_not_found`: Jev's
+    // error table has no 404, and its 422 is "the request body failed
+    // validation … The body details the offending field", which is what a
+    // wrong `model` is. A Jev client meets the status its own docs told it
+    // to expect.
+    let loaded = server.engine.model_id();
+    if let Some(named) = model.as_deref().filter(|named| !named.is_empty() && *named != loaded) {
+        return Err(Refusal::new(
+            "model_not_found",
+            format!("`model` names {named:?}, and this engine serves {loaded:?}"),
+        ));
+    }
 
+    // Render every question first. This is the last thing that can refuse
+    // the whole request, and it is all CPU: the chat template, the
+    // instruction policy and — for an image — the media acquisition and
+    // the placeholder expansion.
+    let mut rendered = Vec::with_capacity(prepared.len());
+    for question in &prepared {
+        rendered.push(render(server, &evidence, question, model.clone()).await?);
+    }
+
+    // One question at a time, each under its own `--request-timeout`
+    // (GitHub #95). So a request of N questions may take N times that
+    // timeout, which is worth knowing: the timeout bounds a *decision*, not
+    // this request. GitHub #240 makes the followers parallel, at which
+    // point the two bounds converge.
     let mut answers = BTreeMap::new();
     let mut input_tokens = 0u32;
-    for question in &prepared {
-        match ask(&server, &evidence, question, class).await {
-            Ok((answer, tokens)) => {
-                input_tokens = input_tokens.saturating_add(tokens);
-                answers.insert(question.id.clone(), answer);
-            }
-            Err(error) => {
-                answers.insert(question.id.clone(), error);
-            }
-        }
+    let mut resolved = None;
+    for (question, ready) in prepared.iter().zip(rendered) {
+        input_tokens = input_tokens.saturating_add(ready.prompt_tokens);
+        resolved = Some(ready.model.clone());
+        answers.insert(question.id.clone(), ask(server, question, ready, class).await);
     }
-    let model = request
-        .model
-        .filter(|model| !model.is_empty())
-        .unwrap_or_else(|| server.engine.model_id());
-    axum::Json(DecideResponse {
-        model,
+    Ok(DecideResponse {
+        // The model that *performed* the evaluation, which is the one the
+        // engine resolved — not the string the caller sent.
+        model: resolved.unwrap_or_else(|| server.engine.model_id()),
         answers,
         usage: Usage {
             input_tokens,
@@ -812,71 +978,121 @@ pub async fn decide(
             output_tokens: 0,
         },
     })
-    .into_response()
 }
 
-/// Whether the request asked for thinking, on either of the two fields a
-/// client may carry it on.
-fn asks_for_thinking(request: &DecideRequest) -> bool {
-    request.enable_thinking == Some(true)
-        || request
-            .thinking
-            .as_ref()
-            .and_then(|thinking| thinking.get("enable_thinking"))
-            .and_then(JsonValue::as_bool)
-            == Some(true)
-        || request
-            .thinking
-            .as_ref()
-            .and_then(JsonValue::as_bool)
-            == Some(true)
-}
-
-/// Put one question to the model and shape its answer.
+/// Refuse a request that asked for thinking, in any of the shapes this
+/// server reads it in.
 ///
-/// Returns the answer and the prompt tokens it cost, or — when the engine
-/// could not answer *this* question — an [`Answer::Error`] to stand in its
-/// slot. A failure here is per-question by design (spec 04): the other
-/// questions' answers are already paid for, and throwing them away to
-/// report one failure helps nobody.
-async fn ask(
+/// Resolved rather than pattern-matched, so `reasoning_effort` — which
+/// *implies* thinking (`thinking.rs`) — is caught by the same rule as the
+/// field that says so outright. The defaults handed in are the decision's
+/// own, not the server's: a request that mentioned nothing must resolve to
+/// thinking-off whatever `--enable-thinking` an operator set for chat.
+fn refuse_thinking(server: &crate::Server, request: &DecideRequest) -> Result<(), Refusal> {
+    let fields = crate::thinking::ThinkingRequestFields {
+        enable_thinking: request.enable_thinking.as_ref(),
+        reasoning_effort: request.reasoning_effort.as_ref(),
+        preserve_thinking: request.preserve_thinking.as_ref(),
+        chat_template_kwargs: request.chat_template_kwargs.as_ref(),
+    };
+    let defaults = crate::thinking::ThinkingDefaults {
+        enable_thinking: false,
+        reasoning_effort: None,
+    };
+    let resolved = crate::thinking::resolve(fields, &defaults, &server.template.thinking_capabilities())
+        .map_err(|error| match error {
+            crate::thinking::ThinkingError::Validation(message)
+            | crate::thinking::ThinkingError::Capability(message) => {
+                Refusal::new("malformed_request", message)
+            }
+        })?;
+    if resolved.enable_thinking {
+        return Err(Refusal::new(
+            "thinking_unsupported",
+            "a decision reads one position and generates nothing, so thinking cannot be honoured; omit `enable_thinking` and `reasoning_effort` or turn them off",
+        ));
+    }
+    Ok(())
+}
+
+/// One question's prompt, rendered and ready to submit.
+struct Rendered {
+    input: ignis_core::types::RequestInput,
+    model: String,
+    prompt_tokens: u32,
+    media: Option<crate::media::MediaStats>,
+}
+
+/// Build one question's prompt. Refuses the whole request on failure: a
+/// prompt that cannot be rendered, or one longer than the engine's context,
+/// is the caller's mistake and every sibling shares it.
+async fn render(
     server: &crate::Server,
     evidence: &Evidence,
     question: &PreparedQuestion,
-    class: ignis_core::types::RequestClass,
-) -> Result<(Answer, u32), Answer> {
+    model: Option<String>,
+) -> Result<Rendered, Refusal> {
     let messages = messages_for(evidence, question);
     let thinking = crate::thinking::ThinkingOptions {
         enable_thinking: false,
         ..crate::thinking::ThinkingOptions::default()
     };
     let params = ignis_core::types::DecodeParams::default();
-    let (mut input, _model, prompt_tokens, media) =
-        crate::api::prepare_decision_request(server, &messages, params, &thinking)
+    let (mut input, model, prompt_tokens, media) =
+        crate::api::prepare_decision_request(server, model, &messages, params, &thinking)
             .await
-            .map_err(|error| failed("render_failed", error))?;
+            .map_err(|(code, message)| {
+                Refusal::new(code, format!("question {:?}: {message}", question.id))
+            })?;
+    if prompt_tokens > server.engine.max_model_len() {
+        return Err(Refusal::new(
+            "context_exceeded",
+            format!(
+                "question {:?} renders {prompt_tokens} prompt tokens, past this engine's {} context",
+                question.id,
+                server.engine.max_model_len()
+            ),
+        ));
+    }
     input.decision = Some(std::sync::Arc::from(
         question.answers.iter().map(|answer| answer.id).collect::<Vec<_>>(),
     ));
+    Ok(Rendered { input, model, prompt_tokens, media })
+}
 
-    let (id, mut events) = server
+/// Put one rendered question to the model and shape its answer.
+///
+/// A failure here is per-question by design (spec 04): the engine already
+/// answered this question's siblings, and throwing their paid-for answers
+/// away to report one runtime fault helps nobody. Everything a *caller*
+/// could have got wrong was refused before any of this ran.
+async fn ask(
+    server: &crate::Server,
+    question: &PreparedQuestion,
+    ready: Rendered,
+    class: ignis_core::types::RequestClass,
+) -> Answer {
+    let submitted = server
         .engine
-        .submit_with_media(input, class, media)
-        .await
-        .map_err(|error| failed("submit_failed", format!("{error:?}")))?;
+        .submit_with_media(ready.input, class, ready.media)
+        .await;
+    let (id, mut events) = match submitted {
+        Ok(pair) => pair,
+        Err(error) => return failed("submit_failed", format!("{error:?}")),
+    };
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
-    let readout = crate::engine::collect_readout(&mut events, server.request_timeout)
-        .await
-        .map_err(|_| {
-            failed(
-                "not_completed",
-                "the engine did not answer this question in time".to_owned(),
-            )
-        })?;
-    guard.completed();
-    Ok((answer_for(question, &readout), prompt_tokens))
+    match crate::engine::collect_readout(&mut events, server.request_timeout).await {
+        Ok(readout) => {
+            guard.completed();
+            answer_for(question, &readout)
+        }
+        Err(_) => failed(
+            "not_completed",
+            "the engine did not answer this question in time".to_owned(),
+        ),
+    }
 }
 
 fn failed(code: &str, message: String) -> Answer {
@@ -897,4 +1113,3 @@ fn refused(refusal: &Refusal) -> axum::response::Response {
     )
         .into_response()
 }
-

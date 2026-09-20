@@ -117,22 +117,31 @@ fn a_decision_that_states_no_lane_tag_is_an_agent() {
 #[test]
 fn a_decision_that_states_a_lane_tag_is_believed() {
     assert_eq!(
-        RequestClass::for_decision(Some("interactive")),
+        RequestClass::for_decision(Some(RequestClass::Interactive)),
         RequestClass::Interactive,
         "a caller whose one decision really is interactive says so"
     );
-    assert_eq!(RequestClass::for_decision(Some("agent")), RequestClass::Agent);
+    assert_eq!(
+        RequestClass::for_decision(Some(RequestClass::Agent)),
+        RequestClass::Agent
+    );
 }
 
 #[test]
 fn a_lane_tag_nobody_has_defined_still_means_interactive_on_a_decision() {
     // The unrecognized-value rule is the *tag's*, not the route's: a tag
-    // that was stated but not understood falls back to the safe default
-    // exactly as it does everywhere else. Only a tag that is absent
-    // altogether takes the decision's own default.
+    // that was stated but not understood is already `Interactive` by the
+    // time it reaches here. Only a tag that is absent altogether takes the
+    // decision's own default, which is what the two cases below separate.
     assert_eq!(
-        RequestClass::for_decision(Some("urgent")),
-        RequestClass::Interactive
+        RequestClass::for_decision(Some(RequestClass::from_extension("urgent"))),
+        RequestClass::Interactive,
+        "stated but not understood keeps the tag's own safe default"
+    );
+    assert_eq!(
+        RequestClass::for_decision(None),
+        RequestClass::Agent,
+        "not stated at all takes the decision's"
     );
 }
 
