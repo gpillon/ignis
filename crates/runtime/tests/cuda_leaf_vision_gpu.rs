@@ -272,6 +272,68 @@ fn an_image_prefill_interleaved_with_text_lanes_leaves_them_as_they_run_alone() 
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_fan_out_over_one_image_encodes_it_once_and_answers_the_same() {
+    // GitHub #243, acceptances 1 and 2. Four questions about one picture:
+    // one embedding, four prefills. The answers must be what each question
+    // gets on its own — an embedding reused is the same bytes at the same
+    // columns, so nothing about the answer may move.
+    let Some(Loaded { compute, frontend, pages, .. }) = load() else {
+        return;
+    };
+    let image = image();
+    let questions = [
+        "What number is shown in the image?",
+        "What colour are the digits in the image?",
+        "What colour is the background of the image?",
+        "How many digits are shown in the image?",
+    ];
+    let ask = |qs: &[&str]| -> (Vec<Vec<TokenId>>, std::time::Duration) {
+        let inputs: Vec<_> =
+            qs.iter().map(|q| image_question(&frontend, &image, q)).collect();
+        let started = std::time::Instant::now();
+        let (ids, events) = run(&compute, pages, inputs, 0, Vec::new());
+        let elapsed = started.elapsed();
+        (ids.iter().map(|&id| generated(&events, id)).collect(), elapsed)
+    };
+    let decode = |tokens: &[TokenId]| frontend.tokenizer().decode(tokens).expect("decode");
+
+    // One question first, so the picture is encoded exactly once here and the
+    // entry it leaves is what the fan-out must find.
+    let (first, solo_time) = ask(&questions[..1]);
+    assert_eq!(compute.live_media(), 0, "nothing holds it once the request is done");
+    assert_eq!(compute.cached_media(), 1, "and it is still encoded");
+    let solo = decode(&first[0]);
+    assert!(solo.contains("47"), "the control answers about the image: {solo:?}");
+
+    let (together, fan_out) = ask(&questions);
+    assert_eq!(compute.live_media(), 0, "nothing holds the embedding afterwards");
+    assert_eq!(compute.cached_media(), 1, "four questions, one embedding");
+    for (n, question) in questions.iter().enumerate() {
+        let answer = decode(&together[n]);
+        eprintln!("fan-out lane {n} ({question}): {answer:?}");
+        assert!(!together[n].is_empty(), "lane {n} answered");
+    }
+    assert!(
+        decode(&together[0]).contains("47"),
+        "the number question answers the same off a shared embedding: {:?}",
+        decode(&together[0])
+    );
+
+    // Informational: this canary is a small image, so its encode is
+    // milliseconds and no wall-clock claim here would mean anything.
+    // Acceptance 2 is measured end to end through the server on the
+    // 4096x4096 screenshot, against the 6.84 / 13.50 / 27.92 s baseline in
+    // `docs/findings/2026-09-20-number-width-and-decide-e2e.md`. What this
+    // test owns is the structural half: one entry, four answers.
+    eprintln!(
+        "one question {:.2}s; four over the same picture {:.2}s",
+        solo_time.as_secs_f64(),
+        fan_out.as_secs_f64()
+    );
+}
+
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn an_image_request_evicted_to_kv_ram_continues_as_if_never_evicted() {
     let Some(Loaded { compute, frontend, pages, .. }) = load() else {
         return;

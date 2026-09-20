@@ -73,6 +73,10 @@ struct Calls {
     /// prefill span.
     media_encoded: Vec<u32>,
     media_released: Vec<u32>,
+    /// GitHub #243: the columns each embedding this stub has not released
+    /// occupies, by encode order — the stub's side of the pool, which is
+    /// what lets it answer `MEDIA_ENCODE_POOL_FULL`.
+    media_live: std::collections::HashMap<u32, u64>,
     multimodal_spans: Vec<SpanCall>,
 }
 
@@ -99,6 +103,21 @@ struct StubLeaf {
     /// pool, a sequence it will not capture — and declining must leave the
     /// batch alone.
     capture_error: Option<i32>,
+    /// GitHub #243: the merged columns this stub's embedding pool holds, or
+    /// `None` for a pool nothing fills. A bounded stub is what proves the
+    /// eviction loop, since the real refusal comes from the leaf's bytes and
+    /// this side owns only the policy.
+    media_pool_columns: Option<u64>,
+}
+
+impl StubLeaf {
+    /// The same stub with an embedding pool of `columns` merged columns
+    /// (GitHub #243).
+    fn with_media_pool(mut self, columns: u64) -> Self {
+        self.media_pool_columns = Some(columns);
+        self
+    }
+
 }
 
 impl StubLeaf {
@@ -112,6 +131,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            media_pool_columns: None,
         }
     }
 
@@ -131,6 +151,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            media_pool_columns: None,
         }
     }
 
@@ -144,6 +165,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: None,
             capture_error: None,
+            media_pool_columns: None,
         }
     }
 
@@ -157,6 +179,7 @@ impl StubLeaf {
             prefill_error_on_call: Some((2, code)),
             decode_error: None,
             capture_error: None,
+            media_pool_columns: None,
         }
     }
 
@@ -170,6 +193,7 @@ impl StubLeaf {
             prefill_error_on_call: None,
             decode_error: Some(code),
             capture_error: None,
+            media_pool_columns: None,
         }
     }
 }
@@ -193,12 +217,26 @@ impl StepLeaf for StubLeaf {
 
     fn encode_media(&self, _model: &Self::Model, item: &MediaItem) -> Result<Self::Media, i32> {
         let mut calls = self.calls.lock().unwrap();
+        let columns = item.grid.vision_tokens();
+        // GitHub #243: the pool refuses the item that does not fit what is
+        // free *now*, by the code that means "release something and ask
+        // again". The caller's eviction loop is what this models.
+        if let Some(capacity) = self.media_pool_columns {
+            let live: u64 = calls.media_live.values().sum();
+            if live + columns > capacity {
+                return Err(ignis_core::vision::MEDIA_ENCODE_POOL_FULL);
+            }
+        }
         calls.media_encoded.push(item.token_span.begin as u32);
-        Ok(calls.media_encoded.len() as u32)
+        let handle = calls.media_encoded.len() as u32;
+        calls.media_live.insert(handle, columns);
+        Ok(handle)
     }
 
     fn release_media(&self, _model: &Self::Model, media: Self::Media) {
-        self.calls.lock().unwrap().media_released.push(media);
+        let mut calls = self.calls.lock().unwrap();
+        calls.media_live.remove(&media);
+        calls.media_released.push(media);
     }
 
     fn prefill_multimodal(
@@ -1184,6 +1222,7 @@ fn a_declined_capture_leaves_the_batch_and_the_request_alone() {
     // only trying to prefill its prompt.
     let leaf = Arc::new(StubLeaf {
         capture_error: Some(-1),
+        media_pool_columns: None,
         ..StubLeaf::with_tokens([])
     });
     let mut scheduler = checkpoint_scheduler(leaf.clone());
@@ -1589,12 +1628,25 @@ fn an_empty_run_is_refused_without_losing_the_sequence() {
 // ── GitHub #178: media embeddings across a multimodal prompt's chunks ───────
 
 /// An image of `count` merged tokens at prompt tokens `begin..begin+count`.
+/// A distinct picture at `begin`. The digest is derived from `begin` because
+/// the cache (GitHub #243) keys on it: a fixture that left every item at
+/// `[0; 32]` would make two different pictures one entry and hide the bug it
+/// is meant to catch.
 fn image(begin: usize, count: usize) -> MediaItem {
+    image_of(begin as u8, begin, count)
+}
+
+/// Picture `digest`, whose placeholders start at `begin`. Two calls with one
+/// digest and one `count` are the same bytes at the same grid asked about in
+/// two places — a fan-out.
+fn image_of(digest: u8, begin: usize, count: usize) -> MediaItem {
+    let mut content_digest = [0; 32];
+    content_digest[0] = digest;
     MediaItem {
         grid: Grid { t: 1, h: 2, w: 2 * count as u32 },
         token_span: TokenSpan { begin, count },
         patches: Vec::new(),
-        content_digest: [0; 32],
+        content_digest,
     }
 }
 
@@ -1627,7 +1679,7 @@ fn stub_compute(leaf: StubLeaf) -> (Arc<StubLeaf>, RuntimeCompute<StubLeaf>) {
 }
 
 #[test]
-fn a_media_item_is_encoded_once_and_released_after_its_last_placeholder() {
+fn a_media_item_is_encoded_once_and_let_go_after_its_last_placeholder() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     let prompt = multimodal(40, vec![image(10, 20)]);
 
@@ -1641,10 +1693,15 @@ fn a_media_item_is_encoded_once_and_released_after_its_last_placeholder() {
     // microseconds are whatever the stub leaf took — near zero, so asserting
     // a lower bound on it would only be flaky.)
     assert_eq!(continuation, [PrefillOutcome::default()]);
+    // GitHub #243: the last placeholder ends the *hold*, not the embedding.
+    // Nothing here has asked for the pool's room back, so the picture is
+    // still encoded — which is the whole of what a fan-out reuses.
+    assert_eq!(compute.cached_media(), 1);
+    assert_eq!(compute.cached_media_columns(), 20);
 
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(calls.media_encoded, [10], "one encode for the whole item");
-    assert_eq!(calls.media_released, [1]);
+    assert!(calls.media_released.is_empty(), "nothing needed the room");
     assert_eq!(
         calls.multimodal_spans,
         [
@@ -1678,23 +1735,28 @@ fn a_text_chunk_of_a_multimodal_prompt_carries_positions_but_no_media() {
 }
 
 #[test]
-fn a_cancelled_request_releases_its_live_media() {
+fn a_cancelled_request_lets_go_of_its_media_without_dropping_it() {
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     let prompt = multimodal(40, vec![image(10, 20)]);
     compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
     compute.release(1);
     assert_eq!(compute.live_media(), 0);
     assert_eq!(compute.live_sequences(), 0);
-    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+    // GitHub #243: a cancel is the moment a sibling asking the next question
+    // about the same picture is about to want it, so the entry stays.
+    assert_eq!(compute.cached_media(), 1);
+    assert!(leaf.calls.lock().unwrap().media_released.is_empty());
 }
 
 #[test]
-fn an_evicted_request_releases_its_live_media_and_re_encodes_it_after_restore() {
+fn an_evicted_request_lets_go_of_its_media_and_finds_it_again_after_restore() {
     // GitHub #194: a request evicted mid-item keeps no vision state while it
-    // sits in KV-RAM — the embedding would hold the load's one media
-    // reservation for a request that is not running. Its restored
-    // continuation encodes the item again (the encode is a pure function of
-    // the item) and carries on at the same columns.
+    // sits in KV-RAM — a *hold* on an embedding is state the eviction cannot
+    // carry. GitHub #243: the embedding it let go of is still in the cache,
+    // so the restored continuation picks it back up instead of running the
+    // tower a second time. That was the old behaviour's price, paid because
+    // the load reserved room for exactly one item; the pool is what stopped
+    // it being the only option.
     let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
     let prompt = multimodal(40, vec![image(10, 20)]);
     compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).unwrap();
@@ -1702,24 +1764,31 @@ fn an_evicted_request_releases_its_live_media_and_re_encodes_it_after_restore() 
 
     compute.evict(1).unwrap();
     assert_eq!(compute.live_media(), 0, "an evicted request holds no embedding");
-    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+    assert!(leaf.calls.lock().unwrap().media_released.is_empty());
 
     compute.restore(1, 64).unwrap();
     compute.prefill_step(&[multimodal_job(1, &prompt, 18, 22)]).unwrap();
     assert_eq!(compute.live_media(), 0);
     let calls = leaf.calls.lock().unwrap();
-    assert_eq!(calls.media_encoded, [10, 10], "the continuation encodes the item again");
-    assert_eq!(calls.media_released, [1, 2]);
-    assert_eq!(calls.multimodal_spans[1].media, Some((2, 8, (0..12).collect())));
+    assert_eq!(calls.media_encoded, [10], "the continuation reuses the encode");
+    assert_eq!(calls.multimodal_spans[1].media, Some((1, 8, (0..12).collect())));
 }
 
 #[test]
-fn a_failed_multimodal_chunk_releases_the_media_it_encoded() {
+fn a_failed_multimodal_chunk_keeps_the_media_it_encoded_for_the_retry() {
+    // The encode succeeded and the item has not changed; only the prefill
+    // failed. GitHub #243: the batch unwind gives back the *hold*, so the
+    // retry the scheduler makes (`MAX_PREFILL_ATTEMPTS`) finds the embedding
+    // rather than paying the tower again for the same picture.
     let (leaf, compute) = stub_compute(StubLeaf::failing_prefill(-3));
     let prompt = multimodal(40, vec![image(10, 20)]);
     assert!(compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).is_err());
     assert_eq!(compute.live_media(), 0);
-    assert_eq!(leaf.calls.lock().unwrap().media_released, [1]);
+    assert_eq!(compute.cached_media(), 1);
+    assert!(leaf.calls.lock().unwrap().media_released.is_empty());
+
+    assert!(compute.prefill_step(&[multimodal_job(1, &prompt, 0, 18)]).is_err());
+    assert_eq!(leaf.calls.lock().unwrap().media_encoded, [10], "one encode across both attempts");
 }
 
 #[test]
@@ -1756,8 +1825,131 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
     }
     let calls = leaf.calls.lock().unwrap();
     assert_eq!(calls.media_encoded, [5, 20]);
-    assert_eq!(calls.media_released, [1, 2]);
-    assert_eq!(compute.live_media(), 0);
+    assert_eq!(compute.live_media(), 0, "nothing is holding either item");
+    // GitHub #243: two pictures, two entries. They are two because their
+    // digests differ — the cache keys on the bytes, not on where the
+    // placeholders landed.
+    assert_eq!(compute.cached_media(), 2);
+    assert!(calls.media_released.is_empty());
+}
+
+#[test]
+fn a_second_question_about_one_picture_does_not_encode_it_again() {
+    // GitHub #243, acceptance 1. The two questions never overlap — exactly
+    // one request holds multi-tick prefill progress at a time, and the first
+    // has let its item go before the second's first chunk runs — so this is
+    // not reference counting working. It is the entry outliving its last
+    // holder, which is the mechanism the slice adds.
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let picture = image_of(7, 10, 20);
+    let first = multimodal(40, vec![picture.clone()]);
+    let second = multimodal(40, vec![picture]);
+
+    compute.prefill_step(&[multimodal_job(1, &first, 0, 18)]).unwrap();
+    compute.prefill_step(&[multimodal_job(1, &first, 18, 22)]).unwrap();
+    compute.release(1);
+
+    let opening = compute.prefill_step(&[multimodal_job(2, &second, 0, 18)]).unwrap();
+    assert_eq!(
+        opening,
+        [PrefillOutcome::default()],
+        "the second question reports no encode time"
+    );
+    compute.prefill_step(&[multimodal_job(2, &second, 18, 22)]).unwrap();
+
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.media_encoded, [10], "one encode for both questions");
+    // Both questions were prefilled against the same embedding, at the same
+    // columns: the answer cannot differ because the columns did not.
+    assert_eq!(calls.multimodal_spans[0].media, calls.multimodal_spans[2].media);
+    assert_eq!(calls.multimodal_spans[1].media, calls.multimodal_spans[3].media);
+}
+
+#[test]
+fn the_same_bytes_at_another_grid_are_another_embedding() {
+    // The digest alone is not the key: the same picture packed into a
+    // different grid expands to different placeholders, so the encoder's
+    // output is a different thing (GitHub #243, and `concrete::media_keys`
+    // for the same reasoning on the prefix side).
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let wide = multimodal(40, vec![image_of(7, 10, 20)]);
+    let narrow = multimodal(40, vec![image_of(7, 10, 10)]);
+
+    compute.prefill_step(&[multimodal_job(1, &wide, 0, 18)]).unwrap();
+    compute.prefill_step(&[multimodal_job(1, &wide, 18, 22)]).unwrap();
+    compute.prefill_step(&[multimodal_job(2, &narrow, 0, 18)]).unwrap();
+
+    assert_eq!(leaf.calls.lock().unwrap().media_encoded, [10, 10]);
+    assert_eq!(compute.cached_media(), 2);
+}
+
+#[test]
+fn a_full_pool_gives_up_an_unheld_embedding_rather_than_refusing() {
+    // GitHub #243: the leaf owns the bytes and answers only "full"; the
+    // policy is `RuntimeCompute`'s. A pool of exactly one item, then a
+    // second picture: the first is nobody's, so it goes.
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]).with_media_pool(20));
+    let first = multimodal(40, vec![image_of(1, 10, 20)]);
+    let second = multimodal(40, vec![image_of(2, 10, 20)]);
+
+    compute.prefill_step(&[multimodal_job(1, &first, 0, 18)]).unwrap();
+    compute.prefill_step(&[multimodal_job(1, &first, 18, 22)]).unwrap();
+    assert_eq!(compute.cached_media(), 1);
+
+    compute.prefill_step(&[multimodal_job(2, &second, 0, 18)]).unwrap();
+    // Acceptance 3: a fan-out over a *different* image replaces, it does not
+    // grow. The bound is the leaf's pool, and nothing here counts bytes.
+    assert_eq!(compute.cached_media(), 1);
+    assert_eq!(compute.cached_media_columns(), 20);
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(calls.media_encoded, [10, 10]);
+    assert_eq!(calls.media_released, [1], "the unheld first picture paid for the second");
+    assert_eq!(
+        calls.media_live.values().sum::<u64>(),
+        20,
+        "the leaf's pool never held two at once"
+    );
+}
+
+#[test]
+fn a_full_pool_gives_up_the_least_recently_used_embedding() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]).with_media_pool(40));
+    let a = multimodal(40, vec![image_of(1, 10, 20)]);
+    let b = multimodal(40, vec![image_of(2, 10, 20)]);
+    let c = multimodal(40, vec![image_of(3, 10, 20)]);
+
+    for (request, prompt) in [(1u64, &a), (2, &b)] {
+        compute.prefill_step(&[multimodal_job(request, prompt, 0, 18)]).unwrap();
+        compute.prefill_step(&[multimodal_job(request, prompt, 18, 22)]).unwrap();
+    }
+    // Touch A again, so B is the older release.
+    compute.prefill_step(&[multimodal_job(3, &a, 0, 18)]).unwrap();
+    compute.prefill_step(&[multimodal_job(3, &a, 18, 22)]).unwrap();
+
+    compute.prefill_step(&[multimodal_job(4, &c, 0, 18)]).unwrap();
+    assert_eq!(
+        leaf.calls.lock().unwrap().media_released,
+        [2],
+        "B was released longest ago, so B pays"
+    );
+}
+
+#[test]
+fn a_pool_that_cannot_be_freed_returns_the_leafs_refusal() {
+    // The loop that evicts has to end. Every entry held and no room is the
+    // only shape in which it cannot, so the refusal comes back out as a leaf
+    // error rather than spinning. A load floors the pool at one
+    // envelope-wide item, so reaching this needs two items in one prefill
+    // batch that together overflow it.
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]).with_media_pool(20));
+    let a = multimodal(40, vec![image_of(1, 10, 20)]);
+    let b = multimodal(40, vec![image_of(2, 10, 20)]);
+    // Both jobs in one batch: the first keeps its hold while the second asks.
+    let batch = [multimodal_job(1, &a, 0, 18), multimodal_job(2, &b, 0, 18)];
+    let failed = compute.prefill_step(&batch).unwrap_err();
+    assert!(format!("{failed}").contains("-2"), "the leaf's code reaches the caller: {failed}");
+    assert_eq!(compute.live_media(), 0, "the unwind gave every hold back");
+    assert_eq!(leaf.calls.lock().unwrap().media_encoded, [10]);
 }
 
 #[test]

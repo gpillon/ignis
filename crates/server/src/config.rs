@@ -49,6 +49,14 @@ pub const DEFAULT_MODEL_DOWNLOAD_PATH: &str = "./models";
 /// never hours.
 pub const MAX_REQUEST_TIMEOUT_SECS: u32 = 3600;
 
+/// The upper bound `--vision-embedding-pool-mib` /
+/// `IGNIS_VISION_EMBEDDING_POOL_MIB` accepts (GitHub #243): a ceiling
+/// against a fat-fingered value, not the real limit. The real limit is the
+/// VRAM plan — a pool the budget cannot hold fails the load by name
+/// (ADR 0030) — and 64 GiB is past the largest card this engine runs on, so
+/// this only catches a unit mistake.
+pub const MAX_VISION_EMBEDDING_POOL_MIB: u64 = 64 * 1024;
+
 // The prefill-chunk and per-sequence-context defaults live in
 // `ignis_runtime` (re-exported below), the same numbers `CudaLeafConfig`
 // falls back to — one source of truth for what `ignis-server` runs with
@@ -336,6 +344,7 @@ pub fn resolve(
     let mut draft_tokens = None;
     let mut vision = false;
     let mut vision_max_tokens = None;
+    let mut vision_embedding_pool_mib = None;
     let mut rope_scaling = None;
     let mut media_allow_private_network = false;
     let mut media_cache_mib = None;
@@ -382,6 +391,9 @@ pub fn resolve(
             "--rope-scaling" => rope_scaling = Some(take_value(args, &mut i, flag)?),
             "--vision" => vision = true,
             "--vision-max-tokens" => vision_max_tokens = Some(take_value(args, &mut i, flag)?),
+            "--vision-embedding-pool-mib" => {
+                vision_embedding_pool_mib = Some(take_value(args, &mut i, flag)?);
+            }
             "--media-allow-private-network" => media_allow_private_network = true,
             "--media-cache-mib" => media_cache_mib = Some(take_value(args, &mut i, flag)?),
             "--ui" => ui = Some(true),
@@ -461,7 +473,7 @@ pub fn resolve(
     };
     let request_timeout_secs = resolve_request_timeout_secs(request_timeout, &env)?;
     let speculation = resolve_speculation(spec, draft_tokens, &env)?;
-    let vision = resolve_vision(vision, vision_max_tokens, &env)?;
+    let vision = resolve_vision(vision, vision_max_tokens, vision_embedding_pool_mib, &env)?;
     let rope_scaling = resolve_rope_scaling(rope_scaling, &env)?;
     // GitHub #195 lifted #178's refusal of the two together: the drafter
     // follows a multimodal prompt now (its context append takes the span's KV
@@ -598,14 +610,18 @@ fn resolve_rope_scaling(
     RopeScaling::parse(&raw).map_err(|e| ConfigError(format!("`--rope-scaling`: {e}")))
 }
 
-/// `--vision` / `IGNIS_VISION` and `--vision-max-tokens` /
-/// `IGNIS_VISION_MAX_TOKENS` (GitHub #177). Vision is off unless asked for;
-/// an envelope with vision off has nothing to size, so naming one alone is
-/// refused rather than ignored. With vision on, the envelope defaults to
-/// [`DEFAULT_VISION_MAX_TOKENS`].
+/// `--vision` / `IGNIS_VISION`, `--vision-max-tokens` /
+/// `IGNIS_VISION_MAX_TOKENS` (GitHub #177) and `--vision-embedding-pool-mib`
+/// / `IGNIS_VISION_EMBEDDING_POOL_MIB` (GitHub #243). Vision is off unless
+/// asked for; neither of the other two has anything to size with vision off,
+/// so naming one alone is refused rather than ignored. With vision on, the
+/// envelope defaults to [`DEFAULT_VISION_MAX_TOKENS`] and the pool to one
+/// envelope-wide embedding — which is exactly what GitHub #177 always
+/// reserved, so a load that says nothing does not move the VRAM plan.
 fn resolve_vision(
     flag: bool,
     max_tokens: Option<String>,
+    pool_mib: Option<String>,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Vision>, ConfigError> {
     let on = if flag {
@@ -625,24 +641,50 @@ fn resolve_vision(
         }
     };
     let max_tokens = max_tokens.or_else(|| non_empty(env("IGNIS_VISION_MAX_TOKENS")));
+    let pool_mib = pool_mib.or_else(|| non_empty(env("IGNIS_VISION_EMBEDDING_POOL_MIB")));
     if !on {
-        return match max_tokens {
-            Some(raw) => Err(ConfigError(format!(
+        if let Some(raw) = max_tokens {
+            return Err(ConfigError(format!(
                 "`--vision-max-tokens {raw}` requires `--vision` (vision is off without it)"
-            ))),
-            None => Ok(None),
-        };
+            )));
+        }
+        if let Some(raw) = pool_mib {
+            return Err(ConfigError(format!(
+                "`--vision-embedding-pool-mib {raw}` requires `--vision` (vision is off without it)"
+            )));
+        }
+        return Ok(None);
     }
-    let Some(raw) = max_tokens else {
-        return Ok(Some(Vision::default()));
+    let vision = match max_tokens {
+        None => Vision::default(),
+        Some(raw) => {
+            let out_of_range = || {
+                ConfigError(format!(
+                    "`--vision-max-tokens` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got `{raw}`"
+                ))
+            };
+            let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
+            Vision::new(n).map_err(|_| out_of_range())?
+        }
     };
-    let out_of_range = || {
-        ConfigError(format!(
-            "`--vision-max-tokens` must be in 1..={VISION_MAX_TOKENS_LIMIT}, got `{raw}`"
-        ))
+    let Some(raw) = pool_mib else {
+        return Ok(Some(vision));
     };
-    let n = raw.trim().parse::<u32>().map_err(|_| out_of_range())?;
-    Vision::new(n).map(Some).map_err(|_| out_of_range())
+    // The floor is the leaf's, not this parser's: a pool below one
+    // envelope-wide embedding is raised there rather than refused here, so
+    // an operator who lowers it does not have to recompute the envelope's
+    // bytes to keep the load working. 0 is still a typo, not a request.
+    let mib = raw
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0 && n <= MAX_VISION_EMBEDDING_POOL_MIB)
+        .ok_or_else(|| {
+            ConfigError(format!(
+                "`--vision-embedding-pool-mib` must be in 1..={MAX_VISION_EMBEDDING_POOL_MIB}, got `{raw}`"
+            ))
+        })?;
+    Ok(Some(vision.with_pool_bytes(mib * 1024 * 1024)))
 }
 
 /// `--media-allow-private-network` / `IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK` and
@@ -1111,6 +1153,7 @@ fn help_text() -> String {
          \x20       --rope-scaling <spec>     env: IGNIS_ROPE_SCALING   (default: none; `yarn:F[,t=..][,bf=..][,bs=..]` rescales the checkpoint's trained 262144-position envelope, F in (1, {MAX_YARN_FACTOR}])\n\
          \x20       --vision                  env: IGNIS_VISION         (default: off; load the vision tower and reserve its workspace)\n\
          \x20       --vision-max-tokens <n>   env: IGNIS_VISION_MAX_TOKENS (default: {DEFAULT_VISION_MAX_TOKENS} with --vision; merged vision tokens per request, 1..={VISION_MAX_TOKENS_LIMIT})\n\
+         \x20       --vision-embedding-pool-mib <n>  env: IGNIS_VISION_EMBEDDING_POOL_MIB (default: one envelope-wide embedding; encoded images kept for reuse, 1..={MAX_VISION_EMBEDDING_POOL_MIB})\n\
          \x20       --media-allow-private-network env: IGNIS_MEDIA_ALLOW_PRIVATE_NETWORK (default: off; needs --vision; fetch image URLs on private, loopback and link-local addresses)\n\
          \x20       --media-cache-mib <n>     env: IGNIS_MEDIA_CACHE_MIB (default: {DEFAULT_MEDIA_CACHE_MIB} with --vision; prepared images kept for reuse, 0 disables, max {MEDIA_CACHE_MIB_LIMIT})\n\
          \x20       --ui / --no-ui            env: IGNIS_UI             (default: on; serve the Playground at /ui/)\n\
@@ -2028,6 +2071,58 @@ mod tests {
         assert!(err.0.contains("--vision"), "{}", err.0);
         let env = env_map(&[("IGNIS_VISION_MAX_TOKENS", "8192")]);
         assert!(resolve(&[], env).is_err(), "the env form too");
+    }
+
+    #[test]
+    fn the_embedding_pool_defaults_to_one_envelope_wide_item() {
+        // GitHub #243 must not move the VRAM plan for an operator who does
+        // not ask: the default pool is the reservation vision always took.
+        let config = expect_config(resolve(&args(&["--vision"]), no_env).expect("resolve"));
+        let vision = config.vision.expect("vision on");
+        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+    }
+
+    #[test]
+    fn the_embedding_pool_can_be_widened() {
+        let a = args(&["--vision", "--vision-embedding-pool-mib", "1280"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        let vision = config.vision.expect("vision on");
+        assert_eq!(vision.pool_bytes(262_144), 1280 * 1024 * 1024);
+
+        let env = env_map(&[("IGNIS_VISION", "1"), ("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")]);
+        let config = expect_config(resolve(&[], env).expect("resolve"));
+        assert_eq!(config.vision.unwrap().pool_bytes(262_144), 640 * 1024 * 1024);
+    }
+
+    #[test]
+    fn an_embedding_pool_below_the_envelope_is_raised_not_refused() {
+        // An operator lowering the pool should not have to recompute the
+        // envelope's bytes to keep the load working: the floor is applied,
+        // and the plan reports what was actually reserved.
+        let a = args(&["--vision", "--vision-embedding-pool-mib", "1"]);
+        let config = expect_config(resolve(&a, no_env).expect("resolve"));
+        let vision = config.vision.expect("vision on");
+        assert_eq!(vision.requested_pool_bytes(), 1024 * 1024);
+        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+    }
+
+    #[test]
+    fn an_embedding_pool_without_vision_is_refused_rather_than_ignored() {
+        let err = resolve(&args(&["--vision-embedding-pool-mib", "640"]), no_env)
+            .expect_err("no vision");
+        assert!(err.0.contains("--vision"), "{}", err.0);
+        let env = env_map(&[("IGNIS_VISION_EMBEDDING_POOL_MIB", "640")]);
+        assert!(resolve(&[], env).is_err(), "the env form too");
+    }
+
+    #[test]
+    fn an_embedding_pool_outside_the_range_is_refused_naming_it() {
+        for raw in ["0", "65537", "-1", "lots"] {
+            let a = args(&["--vision", "--vision-embedding-pool-mib", raw]);
+            let err = resolve(&a, no_env).expect_err("out of range");
+            assert!(err.0.contains("--vision-embedding-pool-mib"), "{}", err.0);
+            assert!(err.0.contains(raw), "{}", err.0);
+        }
     }
 
     #[test]

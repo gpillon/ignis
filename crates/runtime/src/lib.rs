@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ignis_core::vision::{MediaItem, Multimodal};
+use ignis_core::vision::{MEDIA_ENCODE_POOL_FULL, MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
     N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RequestId, RetainedAt, SpecCounters,
@@ -555,10 +555,118 @@ struct LiveSequence<S> {
     generated: u32,
 }
 
-/// A request's live media embedding (GitHub #178): the item it encodes.
-struct LiveMedia<M> {
-    item: usize,
+/// What decides an encoder run's output, and so what two requests have to
+/// share to share its result (GitHub #243).
+///
+/// Deliberately *not* [`ignis_core::identity::MediaKey`], which also carries
+/// where the item sits in the prompt. Two siblings of a fan-out ask different
+/// questions about one picture; a question that comes before the image moves
+/// its placeholders. The encoder sees neither — it sees these bytes at this
+/// grid — so these two fields are the identity and the offset is not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MediaEmbeddingKey {
+    digest: [u8; 32],
+    grid: [u32; 3],
+}
+
+impl From<&MediaItem> for MediaEmbeddingKey {
+    fn from(item: &MediaItem) -> Self {
+        Self {
+            digest: item.content_digest,
+            grid: [item.grid.t, item.grid.h, item.grid.w],
+        }
+    }
+}
+
+/// One encoded item the cache holds (GitHub #243).
+struct CachedMedia<M> {
     handle: M,
+    /// Requests whose current prefill chunk covers this item. Zero is an
+    /// entry nobody is using *right now* — which is not an entry to drop,
+    /// it is the whole point: the next question about the same picture is
+    /// the one that finds it.
+    holders: usize,
+    /// The cache clock when the last holder let go, for LRU among unheld
+    /// entries. Meaningless while `holders > 0`.
+    released_at: u64,
+    /// The item's merged columns, for the resident-bytes fact (GitHub #216).
+    columns: u64,
+}
+
+/// The media embedding cache (GitHub #243): encoded items, kept past the
+/// request that encoded them.
+///
+/// The miss this closes is a fan-out — N questions over one image. It cannot
+/// be closed by reference counting alone, because the siblings never overlap:
+/// exactly one request holds multi-tick prefill progress at a time
+/// (`ignis_core::concrete`), and the embedding is given up at its item's last
+/// placeholder, before the sibling's first chunk runs. So an entry outliving
+/// its last holder *is* the mechanism, not a tuning knob on top of one.
+///
+/// Bounded by the leaf's pool and nothing here: this side never counts bytes
+/// or pages. It asks the leaf to encode, and a leaf that answers
+/// [`MEDIA_ENCODE_POOL_FULL`] gets an unheld entry released and the same
+/// question again ([`RuntimeCompute::encode_into`]). Policy here, bytes
+/// there.
+struct MediaCache<M> {
+    entries: HashMap<MediaEmbeddingKey, CachedMedia<M>>,
+    /// What each request is holding. At most one entry per request: a prefill
+    /// chunk covers at most one media item.
+    held: HashMap<RequestId, MediaEmbeddingKey>,
+    clock: u64,
+}
+
+impl<M> MediaCache<M> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            held: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    /// Entries a request is prefilling against right now.
+    fn live(&self) -> usize {
+        self.entries.values().filter(|e| e.holders > 0).count()
+    }
+
+    /// Take a hold on `key` for `request`, which must be in `entries`.
+    fn acquire(&mut self, request: RequestId, key: MediaEmbeddingKey) {
+        if self.held.get(&request) == Some(&key) {
+            return;
+        }
+        self.release(request);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.holders += 1;
+            self.held.insert(request, key);
+        }
+    }
+
+    /// Drop `request`'s hold, if it has one. The entry stays.
+    fn release(&mut self, request: RequestId) {
+        let Some(key) = self.held.remove(&request) else {
+            return;
+        };
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.holders = entry.holders.saturating_sub(1);
+            if entry.holders == 0 {
+                entry.released_at = self.clock;
+            }
+        }
+    }
+
+    /// Give up the least recently released unheld entry, or `None` when
+    /// every entry is held.
+    fn evict_lru(&mut self) -> Option<M> {
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.holders == 0)
+            .min_by_key(|(_, e)| e.released_at)
+            .map(|(key, _)| *key)?;
+        self.entries.remove(&victim).map(|e| e.handle)
+    }
 }
 
 /// A request evicted to the host tier (P4-07, GitHub #125): its snapshot
@@ -606,10 +714,11 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// as `prefixes` is. Non-consuming too: a prefix brought back onto the
     /// device keeps its blob, so giving it up again copies nothing.
     spilled_prefixes: Mutex<HashMap<(RequestId, u32), L::SnapshotBuf>>,
-    /// Media embeddings still needed by a request's next chunk (GitHub
-    /// #178): at most one per request, held from its item's first covered
-    /// chunk until its last placeholder is prefilled.
-    media: Mutex<HashMap<RequestId, LiveMedia<L::Media>>>,
+    /// Encoded media items (GitHub #178, cached across requests by GitHub
+    /// #243): held from an item's first covered chunk until the leaf's pool
+    /// needs the room, so the next question about the same picture does not
+    /// run the tower again.
+    media: Mutex<MediaCache<L::Media>>,
     /// The probability of the token a **constrained decode** request has drawn and not
     /// yet emitted (GitHub #242), per request.
     ///
@@ -638,42 +747,104 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             evicted: Mutex::new(HashMap::new()),
             retained: Mutex::new(HashMap::new()),
             spilled_prefixes: Mutex::new(HashMap::new()),
-            media: Mutex::new(HashMap::new()),
+            media: Mutex::new(MediaCache::new()),
             drawn: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Number of live media embeddings (the CPU-stub observation point for
-    /// their lifetime, GitHub #178).
+    /// Media embeddings a request is prefilling against right now (the
+    /// CPU-stub observation point for their lifetime, GitHub #178).
+    ///
+    /// Not the cache's size: since GitHub #243 an embedding outlives the
+    /// request that encoded it, and this counts holders, not residents. A
+    /// fan-out still brings it back to zero — see [`Self::cached_media`] for
+    /// what is left behind.
     pub fn live_media(&self) -> usize {
-        self.media.lock().unwrap().len()
+        self.media.lock().unwrap().live()
+    }
+
+    /// Encoded items the cache holds, held or not (GitHub #243).
+    pub fn cached_media(&self) -> usize {
+        self.media.lock().unwrap().entries.len()
+    }
+
+    /// The merged columns the cache's entries occupy (GitHub #243) — the
+    /// shape of what it costs, in the one unit both sides of the seam agree
+    /// on. The bytes are the leaf's: a column is `hidden x 2`.
+    pub fn cached_media_columns(&self) -> u64 {
+        self.media.lock().unwrap().entries.values().map(|e| e.columns).sum()
     }
 
     fn release_media_handle(&self, media: L::Media) {
         self.model.leaf.release_media(self.model.handle(), media);
     }
 
-    /// Release `request`'s live media embedding, if it holds one.
+    /// Drop `request`'s hold on its embedding, if it has one.
+    ///
+    /// The embedding stays cached (GitHub #243). A request finishing,
+    /// failing or being evicted is exactly the moment a sibling asking the
+    /// next question about the same picture is about to want it.
     fn release_media_of(&self, request: RequestId) {
-        let media = self.media.lock().unwrap().remove(&request);
-        if let Some(media) = media {
-            self.release_media_handle(media.handle);
+        self.media.lock().unwrap().release(request);
+    }
+
+    /// Encode `item` under `key`, making room by releasing unheld entries
+    /// until the leaf's pool takes it (GitHub #243).
+    ///
+    /// The eviction policy is here and the bytes are the leaf's: it answers
+    /// [`MEDIA_ENCODE_POOL_FULL`] and this decides what to give up. The loop
+    /// terminates because the load floors the pool at one envelope-wide item
+    /// and a chunk covers one item, so releasing every unheld entry leaves
+    /// room for the one item being prefilled right now. It cannot spin: each
+    /// turn removes an entry, and a turn with nothing left to remove returns
+    /// the refusal.
+    fn encode_into(
+        &self,
+        media: &mut MediaCache<L::Media>,
+        item: &MediaItem,
+        key: MediaEmbeddingKey,
+    ) -> Result<(), i32> {
+        loop {
+            match self.model.leaf.encode_media(self.model.handle(), item) {
+                Ok(handle) => {
+                    media.entries.insert(
+                        key,
+                        CachedMedia {
+                            handle,
+                            holders: 0,
+                            released_at: media.clock,
+                            columns: item.grid.vision_tokens(),
+                        },
+                    );
+                    return Ok(());
+                }
+                Err(MEDIA_ENCODE_POOL_FULL) => match media.evict_lru() {
+                    Some(handle) => self.release_media_handle(handle),
+                    None => return Err(MEDIA_ENCODE_POOL_FULL),
+                },
+                Err(code) => return Err(code),
+            }
         }
     }
 
     /// One chunk of a multimodal prompt (GitHub #178): encode the media item
-    /// the chunk covers unless its embedding is already live, prefill the
-    /// span at its three-axis positions with the item's columns, and release
-    /// the embedding once the chunk covered its last placeholder.
+    /// the chunk covers unless the cache already holds it, prefill the span
+    /// at its three-axis positions with the item's columns, and let the
+    /// embedding go once the chunk covered its last placeholder.
+    ///
+    /// "Let go" is a hold, not a free, since GitHub #243: the entry stays in
+    /// the cache for the next request that names the same picture, and only
+    /// the leaf's pool running out takes it away.
     ///
     /// Returns the microseconds the encode took (GitHub #192), 0 when this
-    /// chunk encoded nothing — the same clock read `ConcreteScheduler` takes
-    /// around `evict`, and taken unconditionally, so this path never varies
-    /// with what an operator turned on.
+    /// chunk encoded nothing — which is now the common case in a fan-out, and
+    /// exactly what acceptance 1 reads. The same clock read
+    /// `ConcreteScheduler` takes around `evict`, and taken unconditionally,
+    /// so this path never varies with what an operator turned on.
     fn prefill_multimodal_job(
         &self,
         sequence: &mut L::Sequence,
-        media: &mut HashMap<RequestId, LiveMedia<L::Media>>,
+        media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
         out_logits: Option<&mut [f32]>,
@@ -681,13 +852,11 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
         let mut encode_micros = 0;
+        let mut held = None;
         if let Some(chunk) = &chunk {
-            if media.get(&job.request).is_some_and(|live| live.item != chunk.item) {
-                let stale = media.remove(&job.request).expect("checked above");
-                self.release_media_handle(stale.handle);
-            }
-            if !media.contains_key(&job.request) {
-                let item = &multimodal.media[chunk.item];
+            let item = &multimodal.media[chunk.item];
+            let key = MediaEmbeddingKey::from(item);
+            if !media.entries.contains_key(&key) {
                 let _span = tracing::debug_span!(
                     "ignis.media.encode",
                     request_id = job.request,
@@ -696,14 +865,19 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 )
                 .entered();
                 let started = std::time::Instant::now();
-                let handle = self.model.leaf.encode_media(self.model.handle(), item)?;
+                // A hold this request already has is not in the way: the
+                // cache takes the new one only after dropping the old, and
+                // an eviction inside the encode may need the old one's room.
+                media.release(job.request);
+                self.encode_into(media, item, key)?;
                 encode_micros = started.elapsed().as_micros() as u64;
-                media.insert(job.request, LiveMedia { item: chunk.item, handle });
             }
+            media.acquire(job.request, key);
+            held = Some(key);
         }
         let positions = multimodal.span_positions(start as usize, len as usize);
         let span_media = chunk.as_ref().map(|chunk| SpanMedia {
-            embedding: &media[&job.request].handle,
+            embedding: &media.entries[&held.expect("a covered chunk took a hold")].handle,
             first_column: chunk.first_column,
             scatter_indices: &chunk.scatter_indices,
         });
@@ -722,10 +896,8 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             },
             out_logits,
         )?;
-        if chunk.is_some_and(|chunk| chunk.completes_item)
-            && let Some(done) = media.remove(&job.request)
-        {
-            self.release_media_handle(done.handle);
+        if chunk.is_some_and(|chunk| chunk.completes_item) {
+            media.release(job.request);
         }
         Ok((encode_micros, probability))
     }
@@ -811,17 +983,17 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             .and_then(|publish| prefixes.remove(&(job.request, publish.tokens)))
                     })
                     .collect();
-                // GitHub #178: the retry re-encodes whatever it needs.
-                let unencoded: Vec<_> = jobs
-                    .iter()
-                    .filter_map(|job| media.remove(&job.request))
-                    .collect();
+                // GitHub #178: every job in the batch gives its embedding
+                // back. GitHub #243: gives back its *hold* — the encode
+                // succeeded, the item has not changed, and the retry that
+                // follows finds it in the cache instead of running the tower
+                // a second time.
+                for job in jobs {
+                    media.release(job.request);
+                }
                 drop(media);
                 drop(prefixes);
                 drop(sequences);
-                for live in unencoded {
-                    self.release_media_handle(live.handle);
-                }
                 for sequence in released {
                     self.release_sequence(sequence.handle);
                 }
@@ -1331,8 +1503,10 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     }
 
     fn release(&self, request: RequestId) {
-        // GitHub #178: a request completed or cancelled mid-item releases
-        // the item's embedding with its sequence.
+        // GitHub #178: a request completed or cancelled mid-item lets its
+        // item's embedding go with its sequence. GitHub #243: lets its
+        // *hold* go — the picture it was asked about is very often the
+        // picture the next request is about.
         self.release_media_of(request);
         // GitHub #242: and a constrained decode cancelled mid-run leaves a draw nobody
         // will ever emit. One `f32`, but the id is never reused, so an entry
@@ -1461,12 +1635,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
     fn drop(&mut self) {
         let media = std::mem::take(
-            self.media
+            &mut self
+                .media
                 .get_mut()
-                .expect("RuntimeCompute is not dropped while its media lock is held"),
+                .expect("RuntimeCompute is not dropped while its media lock is held")
+                .entries,
         );
-        for (_, media) in media {
-            self.release_media_handle(media.handle);
+        for (_, entry) in media {
+            self.release_media_handle(entry.handle);
         }
         let sequences = std::mem::take(
             self.sequences
