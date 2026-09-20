@@ -40,10 +40,20 @@ library behind a flat, device-resident step-level C ABI. The engine is its own
 dogfood target, and partly there already: it serves some of the coding agents
 that build it, and the rest of that is what the remaining work is for.
 
-**TL;DR** — grab a build from
-[Releases](https://github.com/gpillon/ignis/releases): a Windows `.zip`, a
-Linux `.tar.gz`, or the container image. Point it at a Blackwell card and open
-<http://127.0.0.1:8000/ui/>. The longer path is [Quick start](#quick-start).
+## TL;DR
+
+Take a build from **[Releases](https://github.com/gpillon/ignis/releases)** — a
+Windows `.zip`, a Linux `.tar.gz`, or the `linux/amd64` container image on
+`ghcr.io/gpillon/ignis`. Run it on a Blackwell card:
+
+```
+ignis-server                       # no model yet? it offers to fetch one
+```
+
+Then the OpenAI API is on <http://127.0.0.1:8000/v1> and the Playground on
+<http://127.0.0.1:8000/ui/>. Everything else — the container, building from a
+checkout, every flag — is [Quick start](#quick-start) and
+[docs/user](docs/user/README.md).
 
 ## What sets it apart
 
