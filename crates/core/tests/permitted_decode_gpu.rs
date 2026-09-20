@@ -173,6 +173,7 @@ fn a_permitted_set_is_the_only_thing_a_lane_can_commit() {
                 0,
                 $sampling,
                 $set,
+                None,
             )
             .unwrap_or_else(|e| panic!("constrained prefill: {e}"));
             let (tokens, _) = decode_program_batch_permitted(

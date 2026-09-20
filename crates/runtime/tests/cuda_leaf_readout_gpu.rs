@@ -128,7 +128,8 @@ fn a_readout_crosses_the_real_compute_seam() {
         capture_checkpoint: None,
         multimodal: None,
         readout: readout.map(Arc::from),
-    };
+        permitted: None,
+};
 
     // ── the readout itself ───────────────────────────────────────────────
     let answer_ids: Vec<u32> = answers.iter().map(|a| a.id).collect();
@@ -221,7 +222,8 @@ fn a_readout_crosses_the_real_compute_seam() {
             lane: 0,
             params,
             remaining_tokens: 1,
-        }])
+            permitted: None,
+}])
         .unwrap_or_else(|e| panic!("decode_step: {e}"));
     let committed = decoded
         .into_iter()

@@ -191,8 +191,11 @@ fn decide_body(row: &Row) -> String {
 fn shipped_messages(row: &Row, alphabet: &AnswerAlphabet) -> Result<Vec<ChatMessage>, String> {
     let request: DecideRequest =
         serde_json::from_str(&decide_body(row)).map_err(|e| format!("body: {e}"))?;
-    let prepared =
-        prepare(&request.questions, alphabet).map_err(|refusal| format!("prepare: {}", refusal.message))?;
+    // No program here (GitHub #242): these are readout rows, and a readout
+    // forces no alphabet — an encoder that refuses everything would do.
+    let encode = |_: &str| None;
+    let prepared = prepare(&request.questions, alphabet, &encode)
+        .map_err(|refusal| format!("prepare: {}", refusal.message))?;
     Ok(messages_for(&Evidence::read(&request.state), &prepared[0]))
 }
 

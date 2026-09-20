@@ -442,6 +442,29 @@ pub trait TemplateProvider: Send + Sync {
         ignis_core::decision::AnswerAlphabet::default()
     }
 
+    /// Encode `text` as the loaded tokenizer does, with no chat template
+    /// around it (GitHub #242): the token ids a **program** forces.
+    ///
+    /// A program's prompt ends in a literal the model is made to have
+    /// written — spec 06's `{"x":` — and its schedule restricts each
+    /// following step to an alphabet of single tokens. Both are token ids,
+    /// not text, and only a tokenizer can produce them. It is the same seam
+    /// [`TemplateProvider::answer_alphabet`] exists for, asked a different
+    /// question.
+    ///
+    /// Per request rather than precomputed at the `Server`, unlike the
+    /// alphabet: that one is 624 encode round-trips and this one is a dozen
+    /// — ten digits and two literals beside a prompt of hundreds, or of
+    /// sixteen thousand when the evidence is a screenshot.
+    ///
+    /// `None` for a provider with no real tokenizer, which is the honest
+    /// answer: `/v1/decide` then refuses a program rather than forcing ids
+    /// it invented.
+    fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
+        let _ = text;
+        None
+    }
+
     /// Render generated tokens to the response text (`content` / `text`) —
     /// a whole-list decode, unaware of the reasoning/content split.
     fn render_tokens(&self, tokens: &[TokenId]) -> String;

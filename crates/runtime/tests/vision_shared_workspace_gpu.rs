@@ -95,6 +95,7 @@ fn text_input(frontend: &FrontendSet, question: &str, max_tokens: u32) -> Reques
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        program: None,
     }
 }
 
@@ -118,6 +119,7 @@ fn multimodal_input(frontend: &FrontendSet, parts: Vec<ContentPart>, images: &[&
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        program: None,
     }
 }
 

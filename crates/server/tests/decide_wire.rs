@@ -13,7 +13,7 @@ use serde_json::{Value as JsonValue, json};
 
 use ignis_server::decide::{
     Answer, DecideRequest, Evidence, MAX_OPTIONS, Ordered, PreparedQuestion, Question,
-    QuestionKind, answer_for, expected_level, messages_for, prepare, score_confidence,
+    QuestionKind, Refusal, answer_for, expected_level, messages_for, prepare, score_confidence,
 };
 
 /// A tokenizer that names every single character and every uppercase bigram
@@ -61,6 +61,16 @@ fn alphabet() -> AnswerAlphabet {
     AnswerAlphabet::from_tokenizer(&WideTokenizer::new())
 }
 
+/// The literal encoder a **program** question's plan needs (GitHub #242):
+/// one token per character, so every digit is a single vocabulary entry and
+/// an arbitrary forced literal has an encoding.
+///
+/// Separate from [`WideTokenizer`], which only knows the labels it was built
+/// from and would refuse `{"x":` — the real tokenizer encodes anything.
+fn encoder(text: &str) -> Option<Vec<TokenId>> {
+    Some(text.chars().map(|c| c as TokenId).collect())
+}
+
 /// Parse a request from **raw JSON text**, the way axum's extractor will.
 ///
 /// Never from a `serde_json::Value`: this build's `Value::Object` is a
@@ -73,7 +83,7 @@ fn parse(body: &str) -> DecideRequest {
 }
 
 fn prepared(body: &str) -> Vec<PreparedQuestion> {
-    prepare(&parse(body).questions, &alphabet()).expect("a valid request prepares")
+    prepare(&parse(body).questions, &alphabet(), &encoder).expect("a valid request prepares")
 }
 
 /// [`prepared`] for a body built with `json!`, where no declared order is
@@ -393,13 +403,13 @@ fn wide_choice(count: usize) -> String {
 
 #[test]
 fn the_measured_ceiling_is_served_and_one_past_it_is_refused() {
-    let at_ceiling = prepare(&parse(&wide_choice(MAX_OPTIONS)).questions, &alphabet());
+    let at_ceiling = prepare(&parse(&wide_choice(MAX_OPTIONS)).questions, &alphabet(), &encoder);
     assert!(
         at_ceiling.is_ok(),
         "{MAX_OPTIONS} options is measured and served: {:?}",
         at_ceiling.err()
     );
-    let past = prepare(&parse(&wide_choice(MAX_OPTIONS + 1)).questions, &alphabet())
+    let past = prepare(&parse(&wide_choice(MAX_OPTIONS + 1)).questions, &alphabet(), &encoder)
         .expect_err("one past the ceiling is refused");
     assert_eq!(past.code, "too_many_options");
     assert!(
@@ -432,7 +442,7 @@ fn a_model_whose_tokenizer_cannot_name_the_options_refuses_rather_than_collides(
     }
     let narrow = AnswerAlphabet::from_tokenizer(&OnlyTwo);
     assert_eq!(narrow.len(), 2);
-    let refusal = prepare(&parse(&wide_choice(3)).questions, &narrow)
+    let refusal = prepare(&parse(&wide_choice(3)).questions, &narrow, &encoder)
         .expect_err("three options do not fit a two-label alphabet");
     assert_eq!(refusal.code, "alphabet_exhausted");
 }
@@ -488,7 +498,7 @@ fn a_malformed_question_refuses_the_whole_request() {
             all.insert(id.clone(), question.clone());
         }
         let body = json!({ "state": "s", "questions": all }).to_string();
-        let refusal = prepare(&parse(&body).questions, &alphabet())
+        let refusal = prepare(&parse(&body).questions, &alphabet(), &encoder)
             .err()
             .unwrap_or_else(|| panic!("{code}: expected a refusal"));
         assert_eq!(refusal.code, code, "{}", refusal.message);
@@ -502,7 +512,7 @@ fn a_malformed_question_refuses_the_whole_request() {
 
 #[test]
 fn a_request_with_no_questions_is_refused() {
-    let refusal = prepare(&Ordered(Vec::<(String, Question)>::new()), &alphabet())
+    let refusal = prepare(&Ordered(Vec::<(String, Question)>::new()), &alphabet(), &encoder)
         .expect_err("nothing to decide");
     assert_eq!(refusal.code, "no_questions");
 }
@@ -515,7 +525,7 @@ fn a_duplicate_question_id_is_refused_rather_than_silently_halved() {
     )
     .expect("parses");
     assert_eq!(body.questions.len(), 2, "both copies survive the parse");
-    let refusal = prepare(&body.questions, &alphabet()).expect_err("ambiguous");
+    let refusal = prepare(&body.questions, &alphabet(), &encoder).expect_err("ambiguous");
     assert_eq!(refusal.code, "duplicate_question");
 }
 
@@ -703,4 +713,117 @@ fn a_structured_instruction_reaches_the_prompt_whole() {
     let text = messages_for(&Evidence::Json(json!("s")), &questions[0]).remove(1).content.text();
     let payload: JsonValue = serde_json::from_str(&text).expect("JSON");
     assert_eq!(payload["criterion"]["ask"], "Is it urgent?");
+}
+
+// ── number, point and box: the wire rules (GitHub #242) ─────────────────
+
+/// Prepare one question from raw JSON text, or the refusal it earned.
+fn prepare_one_wire(body: &str) -> Result<Vec<PreparedQuestion>, Refusal> {
+    prepare(&parse(body).questions, &alphabet(), &encoder)
+}
+
+fn program_body(kind: &str, extra: &str) -> String {
+    format!(
+        r#"{{"state":"s","questions":{{"q":{{"type":"{kind}","instructions":"where?"{extra}}}}}}}"#
+    )
+}
+
+/// Acceptance 6: `digits` outside 1..=6 is refused, and the refusal names
+/// the field.
+#[test]
+fn digits_outside_the_served_range_is_refused() {
+    for digits in ["0", "7", "64"] {
+        let refusal = prepare_one_wire(&program_body("number", &format!(r#","digits":{digits}"#)))
+            .expect_err("a width this endpoint does not serve");
+        assert_eq!(refusal.code, "digits_out_of_range", "{digits}: {}", refusal.message);
+        assert!(
+            refusal.message.contains("digits"),
+            "and names the field: {}",
+            refusal.message
+        );
+    }
+    for digits in ["1", "3", "6"] {
+        prepare_one_wire(&program_body("number", &format!(r#","digits":{digits}"#)))
+            .unwrap_or_else(|e| panic!("{digits} digits is served: {}", e.message));
+    }
+}
+
+/// The width the caller did not name is the width that was measured.
+#[test]
+fn a_program_without_digits_takes_the_measured_width() {
+    let prepared = prepare_one_wire(&program_body("point", "")).expect("a point");
+    assert_eq!(prepared[0].digits, ignis_server::program::DEFAULT_DIGITS);
+    let plan = prepared[0].plan.as_ref().expect("a point carries a schedule");
+    // Two axes of three digits, with the separator's tokens between them.
+    assert_eq!(plan.axes.len(), 2);
+    assert_eq!(plan.axes[0].digits.len(), 3);
+    assert_eq!(plan.axes[1].digits.len(), 3);
+}
+
+/// A field this primitive cannot honour is refused, never dropped.
+#[test]
+fn a_field_the_primitive_cannot_honour_is_refused_not_ignored() {
+    let on_a_readout = prepare_one_wire(
+        r#"{"state":"s","questions":{"q":{"type":"noul","instructions":"urgent?","digits":3}}}"#,
+    )
+    .expect_err("a readout has no digits");
+    assert_eq!(on_a_readout.code, "digits_unsupported", "{}", on_a_readout.message);
+
+    let on_a_program = prepare_one_wire(&program_body("number", r#","criteria":{"a":"b"}"#))
+        .expect_err("a program declares no options");
+    assert_eq!(on_a_program.code, "criteria_unsupported", "{}", on_a_program.message);
+}
+
+/// The system text a program is put under declares the shape and the scale,
+/// and its user turn carries the instruction alone.
+#[test]
+fn a_programs_prompt_declares_its_shape_and_asks_the_instruction_alone() {
+    let prepared = prepare_one_wire(&program_body("point", "")).expect("a point");
+    let messages = messages_for(&Evidence::Json(json!("s")), &prepared[0]);
+    let system = messages[0].content.text();
+    assert!(
+        system.starts_with(&ignis_server::program::point_system(3)),
+        "the measured point instruction leads the system block: {system}"
+    );
+    assert!(
+        system.contains("\"evidence\""),
+        "with the evidence after it, as every decision's is (GitHub #240)"
+    );
+    let ask: JsonValue =
+        serde_json::from_str(&messages[1].content.text()).expect("the user turn is JSON");
+    assert_eq!(ask["instruction"], "where?");
+    assert!(
+        ask.get("options").is_none(),
+        "a program declares no options: the alphabet is forced, not listed"
+    );
+}
+
+/// Each primitive's forced layout, spelled out where a reader can check it
+/// against the finding.
+#[test]
+fn each_primitive_forces_the_json_shape_its_prompt_declared() {
+    let ids = |text: &str| encoder(text).expect("the stand-in tokenizer encodes anything");
+    for (kind, prefix, separators) in [
+        ("number", "{\"value\":", vec![]),
+        ("point", "{\"x\":", vec![",\"y\":"]),
+        ("box", "{\"x0\":", vec![",\"y0\":", ",\"x1\":", ",\"y1\":"]),
+    ] {
+        let prepared = prepare_one_wire(&program_body(kind, r#","digits":2"#))
+            .unwrap_or_else(|e| panic!("{kind}: {}", e.message));
+        let plan = prepared[0].plan.as_ref().expect("a schedule");
+        assert_eq!(plan.prefix, ids(prefix), "{kind}'s opening literal is prompt");
+        let forced: usize = separators.iter().map(|s| ids(s).len()).sum();
+        let axes = separators.len() + 1;
+        assert_eq!(
+            plan.program.len(),
+            axes * 2 + forced,
+            "{kind}: two digits per axis plus every separator, one step per token"
+        );
+        for step in plan.program.steps() {
+            assert!(
+                step.len() == 10 || step.len() == 1,
+                "{kind}: a step is the ten digits or one forced token"
+            );
+        }
+    }
 }

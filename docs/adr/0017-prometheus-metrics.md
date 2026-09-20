@@ -39,7 +39,12 @@ recorded by the HTTP handler the way the rejection counter is, and both
 carrying **the first exception to this ADR's "zeros are exported too"** —
 they are absent until a decision has been served. The reasoning is below
 the table; the exception is named here because an operator reading only
-this section should not meet it as a surprise.
+this section should not meet it as a surprise. Amended 2026-09-20 (#242):
+three more `type` values — `number`, `point` and `box` — which are counted
+like any other question and observe **no** answer mass, so the histogram is
+readout-only and its `_count` sits below the counter's sum by exactly the
+number of programs served. That asymmetry is stated below the table too, for
+the same reason.
 
 ## Context
 
@@ -200,8 +205,8 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
-| `ignis_decisions_total` | counter | `type=noul\|choice\|score` | Questions answered by a readout, by typed primitive (#241, ADR 0034). **Absent until the first one** — see below |
-| `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a decision's declared options. **Absent until the first one** |
+| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
+| `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 eleven reserved lines, the budget, the KV pool's pages and page bytes, the
@@ -251,6 +256,26 @@ whatever happened; the resolution is where the signal is, and the two coarse
 buckets below exist to make a collapse unmissable rather than to resolve it.
 `le="1"` equals `_count` on a correct readout, and that redundancy is the
 assertion the exposition carries.
+
+**The histogram is readout-only, and its `_count` is therefore below the
+counter's sum.** `number`, `point` and `box` (#242) are counted in
+`ignis_decisions_total` like any other question — a decision is a decision,
+whatever primitive answered it, and a `type` a panel could not see would
+make a fan-out's volume unattributable. They observe **no answer mass**,
+because they have none: their answer is a run of sampled tokens, each drawn
+from a permitted set, not a restricted softmax over one position's
+distribution, so there is no denominator for the mass to be a share *of*.
+Reporting 1 would be a lie about the arithmetic and reporting 0 would put a
+false alarm in the bucket a real collapse lands in.
+
+So `sum(ignis_decisions_total) - ignis_decision_answer_mass_count` is the
+number of programs served, and it is expected to be nonzero rather than a
+sign of a dropped observation. Stated here because the obvious reading of a
+counter and a histogram exported side by side is that they count the same
+events, and on this pair they do not. The per-digit confidence a program
+*does* produce is in its answer, not in this family: it is a resolution
+readout in the units of the value — see `crate::program::Reading::sigma` —
+and it is not comparable across primitives the way answer mass is.
 
 **`confidence` is not exported.** The endpoint reports a per-answer
 confidence, and aggregating it would produce a histogram over callers who

@@ -101,6 +101,16 @@ pub struct PreparedMedia {
     pub content_digest: [u8; 32],
     /// Size of the acquired bytes.
     pub encoded_bytes: usize,
+    /// The **submitted** image's pixel size, `(width, height)`, before
+    /// `smart_resize` (GitHub #242).
+    ///
+    /// Not recoverable from `grid`, which describes the resized image in
+    /// patches and has lost both the original scale and, to rounding, its
+    /// exact aspect ratio. A **point** answers in pixels of the image the
+    /// caller sent — that is the whole reason the endpoint does the
+    /// rescaling rather than handing a caller a 0-999 pair and letting them
+    /// get a non-square image wrong once.
+    pub source_pixels: (u32, u32),
 }
 
 /// A prepared image placed in the prompt.
@@ -364,6 +374,7 @@ impl VisionProcessor {
                 requested,
             },
         })?;
+        let (source_width, source_height) = (image.width, image.height);
         let size = resize::smart_resize(image.height, image.width, options.min_pixels, options.max_pixels)
             .map_err(|error| match error {
                 resize::ResizeError::AspectRatio => ProcessorError::InvalidMedia {
@@ -378,7 +389,13 @@ impl VisionProcessor {
         check_budget(Budget::RawPatches, options.max_raw_patches, grid.raw_patches())?;
         check_budget(Budget::VisionTokens, options.max_vision_tokens, grid.vision_tokens())?;
         let resized = resize::resize_bicubic(image, size);
-        Ok(PreparedMedia { grid, patches: patches::pack_patches(&resized), content_digest, encoded_bytes: bytes.len() })
+        Ok(PreparedMedia {
+            grid,
+            source_pixels: (source_width, source_height),
+            patches: patches::pack_patches(&resized),
+            content_digest,
+            encoded_bytes: bytes.len(),
+        })
     }
 
     /// Lay prepared media out in `rendered` (the chat template's output,

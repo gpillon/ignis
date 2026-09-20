@@ -117,6 +117,14 @@ impl TemplateProvider for DecidingTemplate {
         Ok((rendered, multimodal))
     }
 
+    /// One token per character (GitHub #242): every digit is a single
+    /// vocabulary entry, which is what a forced alphabet needs, and an
+    /// arbitrary literal has an encoding. The ids are the characters' own,
+    /// so a test can read a forced prefix straight out of the prompt.
+    fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
+        Some(text.chars().map(|c| c as TokenId).collect())
+    }
+
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
         SimpleTemplateProvider.render_tokens(tokens)
     }
@@ -570,6 +578,259 @@ async fn an_image_state_is_rendered_into_the_prompt() {
         "the image's {vision_tokens} placeholders are in the prompt"
     );
     assert_eq!(response["usage"]["output_tokens"], 0);
+}
+
+// ── number, point and box: the primitives that generate (GitHub #242) ───
+//
+// The `Compute` seam's mock honours a permitted set and reports a
+// probability inside it (`MockCompute`), so everything above the seam —
+// the schedule, the forced prefix, the place-weighted uncertainty and the
+// rescaling onto the submitted image — is testable here without a GPU (ADR
+// 0006). What is *not* testable here is whether the model points at the
+// right button, which is `classify_pointing_gpu.rs`.
+
+/// The media stack the spatial tests need, at a size that leaves the
+/// placeholder template room to work.
+fn vision_limits() -> ignis_artifact::vision::ProcessorOptions {
+    ignis_artifact::vision::ProcessorOptions {
+        min_pixels: 32 * 32,
+        max_pixels: 1 << 20,
+        max_encoded_media_bytes: 1 << 20,
+        max_decoded_pixels: 1 << 20,
+        max_raw_patches: 1 << 16,
+        max_vision_tokens: 1 << 14,
+    }
+}
+
+fn seeing_server(compute: Arc<MockCompute>) -> Server {
+    use ignis_server::media::{MediaAcquirer, MediaPolicy};
+    use support::media::processor;
+
+    let limits = vision_limits();
+    server(compute)
+        .with_request_timeout(std::time::Duration::from_secs(10))
+        .with_media(Arc::new(MediaAcquirer::new(
+            Arc::new(processor(limits.clone())),
+            limits,
+            MediaPolicy::new(false, 1 << 20),
+        )))
+}
+
+/// The place-weighted sum a trace implies, recomputed from the response's
+/// own digits — the acceptance, restated as arithmetic a reader can check.
+fn sigma_of(digits: &JsonValue) -> f64 {
+    let digits = digits.as_array().expect("a digit trace is an array");
+    let width = digits.len();
+    digits
+        .iter()
+        .enumerate()
+        .map(|(place, digit)| {
+            let probability = digit["probability"].as_f64().expect("a probability");
+            (1.0 - probability) * 10f64.powi((width - 1 - place) as i32)
+        })
+        .sum()
+}
+
+/// Acceptance 4: `uncertainty` is the trace's place-weighted sum, in units
+/// of the value itself.
+#[tokio::test]
+async fn a_numbers_uncertainty_is_its_own_trace_summed_by_place() {
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"The queue is backing up.",
+        "questions":{"depth":{"type":"number","instructions":"How many items are waiting?"}}}"#;
+    let (status, response) = decide(&app(compute), body).await;
+
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["depth"];
+    assert_eq!(answer["type"], "number", "{response}");
+    let digits = &answer["digits"];
+    assert_eq!(digits.as_array().expect("a trace").len(), 3, "the default width");
+
+    // The number really is its digits, read left to right.
+    let spelled: u64 = digits
+        .as_array()
+        .unwrap()
+        .iter()
+        .fold(0, |value, digit| value * 10 + digit["digit"].as_u64().expect("a digit"));
+    assert_eq!(answer["number"].as_u64().expect("a number"), spelled);
+
+    let reported = answer["uncertainty"].as_f64().expect("an uncertainty");
+    let expected = sigma_of(digits);
+    assert!(
+        (reported - expected).abs() < 1e-6,
+        "uncertainty {reported} must be the trace's place-weighted sum {expected}: an \
+         unsure hundreds digit is worth a hundred times an unsure units one"
+    );
+    assert!(
+        reported > 0.0,
+        "and it is a real number: the mock draws at a real confidence, so a handler \
+         that never read the trace could not pass by reporting zero"
+    );
+    // A program generates, and says so.
+    assert_eq!(response["usage"]["output_tokens"], 3, "{response}");
+}
+
+/// Acceptance 5: a non-square image returns pixels consistent with **its
+/// own** dimensions on both axes.
+#[tokio::test]
+async fn a_point_on_a_non_square_image_is_in_that_images_pixels() {
+    use support::media::{data_uri, png};
+
+    // 16:9, and inside the fixture processor's decoded-pixel budget.
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 360;
+
+    let compute = Arc::new(MockCompute::new());
+    let body = format!(
+        r#"{{"state":[{{"type":"image_url","image_url":{{"url":"{}"}}}}],
+            "questions":{{"where":{{"type":"point","instructions":"click the blue button"}}}}}}"#,
+        data_uri(&png(WIDTH, HEIGHT))
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["where"];
+    assert_eq!(answer["type"], "point", "{response}");
+
+    // The two axes are read on the same 0-999 scale and land on different
+    // pixel scales, which is the whole reason the server does this rather
+    // than the caller.
+    for (axis, side) in [("x", WIDTH), ("y", HEIGHT)] {
+        let normalized = answer["normalized"][axis].as_u64().expect("a normalized reading");
+        let pixels = answer["pixels"][axis].as_i64().expect("a pixel reading");
+        assert!(normalized <= 999, "{axis} is on the declared 0-999 scale: {normalized}");
+        let expected = (normalized as f64 / 999.0 * f64::from(side)).round() as i64;
+        assert_eq!(
+            pixels, expected,
+            "{axis}={normalized} of 999 on a {side}px axis is {expected} px, not {pixels}"
+        );
+        assert!(pixels >= 0 && pixels <= i64::from(side), "and inside the image");
+
+        // The uncertainty travels with it, in the same units.
+        let sigma = answer["uncertainty"][axis].as_f64().expect("an uncertainty");
+        let native = sigma_of(&answer["digits"][axis]);
+        assert!(
+            (sigma - native * f64::from(side) / 999.0).abs() < 1e-6,
+            "{axis}'s uncertainty is its trace's sum rescaled onto {side} px: {sigma}"
+        );
+    }
+
+    // The forced prefix is in the prompt, and the prompt's MRoPE positions
+    // grew with it. The leaf refuses a chunk whose positions and tokens
+    // disagree, so a prefix appended without them is a 400 on the card and
+    // nothing at all here — which is why this is asserted rather than left
+    // to the GPU test to discover.
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let prompt_tokens: usize = jobs.iter().map(|job| job.tokens.len()).sum();
+    let multimodal = jobs
+        .iter()
+        .find_map(|job| job.multimodal.clone())
+        .expect("a point over an image carries one");
+    assert_eq!(
+        multimodal.prompt_tokens(),
+        prompt_tokens,
+        "three positions per token, forced prefix included"
+    );
+    assert!(
+        jobs.iter().any(|job| job.permitted.is_some()),
+        "and the prefill drew the run's first digit, which is where a constrained          run starts"
+    );
+
+    // The same normalized pair would be two different points on a square
+    // image, which is exactly the mistake this prevents.
+    let (x, y) = (
+        answer["normalized"]["x"].as_u64().unwrap(),
+        answer["normalized"]["y"].as_u64().unwrap(),
+    );
+    if x == y {
+        assert_eq!(
+            answer["pixels"]["x"], answer["pixels"]["y"],
+            "equal readings on a non-square image can only agree in pixels by accident"
+        );
+    }
+    assert_eq!(
+        response["usage"]["output_tokens"], 11,
+        "three digits, the forced separator, three digits — and no prefix, which \
+         rides in the prompt"
+    );
+}
+
+/// The forced prefix is in the **prompt**, not the schedule: it costs
+/// prefill, not a decode round each.
+#[tokio::test]
+async fn the_opening_literal_is_prefilled_and_the_separator_is_forced() {
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"The queue is backing up.",
+        "questions":{"depth":{"type":"number","instructions":"How many items are waiting?",
+        "digits":2}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+    assert_eq!(status, 200, "{response}");
+
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let prompt: Vec<u32> = jobs.iter().flat_map(|job| job.tokens.iter().copied()).collect();
+    // `DecidingTemplate::encode_literal` is one token per character.
+    let prefix: Vec<u32> = "{\"value\":".chars().map(|c| c as u32).collect();
+    assert!(
+        prompt.windows(prefix.len()).any(|window| window == prefix),
+        "the opening literal is prefilled with the prompt"
+    );
+    assert_eq!(
+        compute.decode_calls().len(),
+        2,
+        "and only the digits cost rounds: two digits, two rounds, the last of \
+         which carries no set"
+    );
+    assert_eq!(response["answers"]["depth"]["digits"].as_array().unwrap().len(), 2);
+    assert_eq!(response["usage"]["output_tokens"], 2);
+}
+
+/// A `box` is four numbers over one prefill, not four questions.
+#[tokio::test]
+async fn a_box_reads_four_axes_from_one_run() {
+    use support::media::{data_uri, png};
+
+    let compute = Arc::new(MockCompute::new());
+    let body = format!(
+        r#"{{"state":[{{"type":"image_url","image_url":{{"url":"{}"}}}}],
+            "questions":{{"frame":{{"type":"box","instructions":"the blue button","digits":2}}}}}}"#,
+        data_uri(&png(256, 128))
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["frame"];
+    assert_eq!(answer["type"], "box", "{response}");
+    for axis in ["x0", "y0", "x1", "y1"] {
+        assert!(answer["pixels"][axis].is_i64(), "{axis} has a pixel reading: {answer}");
+        assert_eq!(answer["digits"][axis].as_array().expect("a trace").len(), 2);
+    }
+    // x scales by the width and y by the height, on the same reading.
+    for (axis, side) in [("x0", 256u32), ("y0", 128), ("x1", 256), ("y1", 128)] {
+        let normalized = answer["normalized"][axis].as_u64().unwrap();
+        let expected = (normalized as f64 / 99.0 * f64::from(side)).round() as i64;
+        assert_eq!(answer["pixels"][axis].as_i64().unwrap(), expected, "{axis}");
+    }
+    assert_eq!(
+        compute.prefill_calls().iter().flatten().map(|job| job.request).collect::<Vec<_>>()
+            .windows(2).all(|pair| pair[0] == pair[1]),
+        true,
+        "one request, not four: the y digits are read after x has been forced, so \
+         the model knows where it put x"
+    );
+}
+
+/// A `point` needs an image to be a position on, and says so rather than
+/// answering in pixels of nothing.
+#[tokio::test]
+async fn a_point_over_a_text_state_is_an_error_not_a_guess() {
+    let compute = Arc::new(MockCompute::new());
+    let body = r#"{"state":"a paragraph of text",
+        "questions":{"where":{"type":"point","instructions":"the button"}}}"#;
+    let (status, response) = decide(&app(compute), body).await;
+
+    assert_eq!(status, 200, "a per-question failure, not a refused request: {response}");
+    assert_eq!(response["answers"]["where"]["type"], "error", "{response}");
+    assert_eq!(response["answers"]["where"]["code"], "state_carries_no_image");
 }
 
 // ── the model the caller names is the model that answers ────────────────

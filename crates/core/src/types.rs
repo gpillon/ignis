@@ -341,6 +341,14 @@ impl RequestClass {
     /// `Interactive` would spend a protection it cannot use on behalf of a
     /// conversation that could.
     ///
+    /// A **program** question (GitHub #242) takes this default too, and the
+    /// reasoning above is not why. It *does* hold a decode lane, for as many
+    /// rounds as its number has digits. It takes `Agent` because it arrives
+    /// on the same route as its siblings — a fan-out of questions over one
+    /// `state` is agent-shaped work whichever primitive answers each one, and
+    /// splitting the class by primitive would make a `point` outrank the
+    /// `choice` beside it in the same request.
+    ///
     /// `stated` is the tag the request carried, already read by
     /// [`RequestClass::from_extension`] — a tag that was stated but not
     /// understood is `Interactive` before it reaches here, because that

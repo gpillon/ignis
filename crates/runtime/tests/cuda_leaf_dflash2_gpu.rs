@@ -101,7 +101,8 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             params,
             shared_prefix: None,
             publish_prefix: None,
-        }])
+            permitted: None,
+}])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 
     // The prefill committed the first token; every decode round after it is
@@ -112,9 +113,9 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
     while generated < MAX_GENERATED {
         let remaining = MAX_GENERATED - generated;
         let out = compute
-            .decode_step(&[DecodeJob { request, lane: 0, params, remaining_tokens: remaining }])
+            .decode_step(&[DecodeJob { request, lane: 0, params, remaining_tokens: remaining, permitted: None }])
             .unwrap_or_else(|e| panic!("decode_step: {e}"));
-        let Some(DecodeOutcome { tokens, finish, spec }) = out.into_iter().next() else {
+        let Some(DecodeOutcome { tokens, finish, spec, .. }) = out.into_iter().next() else {
             break;
         };
         if tokens.is_empty() && finish.is_some() && spec.is_none() {

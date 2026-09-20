@@ -110,11 +110,36 @@ pub enum Primitive {
     Noul,
     Choice,
     Score,
+    Number,
+    Point,
+    Box,
 }
 
 impl Primitive {
     /// Every primitive, in the order their series are rendered.
-    pub const ALL: [Primitive; 3] = [Self::Noul, Self::Choice, Self::Score];
+    pub const ALL: [Primitive; 6] = [
+        Self::Noul,
+        Self::Choice,
+        Self::Score,
+        Self::Number,
+        Self::Point,
+        Self::Box,
+    ];
+
+    /// Whether this primitive's answer has an **answer mass** to observe
+    /// (GitHub #242).
+    ///
+    /// The three readouts do: their answer is a restricted softmax over
+    /// declared option tokens, and the mass is how much of the real
+    /// distribution those options held — the one silent failure the family
+    /// exists to show. The three **programs** do not: their answer is a run
+    /// of sampled tokens, each drawn from a permitted set, and there is no
+    /// single position whose distribution the answer stands on. A number
+    /// reported as mass 1 would be a lie, and one reported as 0 would put a
+    /// false alarm in the bucket a real one lands in.
+    pub(crate) fn has_answer_mass(self) -> bool {
+        matches!(self, Self::Noul | Self::Choice | Self::Score)
+    }
 
     /// The label value this primitive is exported under — and the word the
     /// request log calls it by, so the two are the same string by
@@ -124,6 +149,9 @@ impl Primitive {
             Self::Noul => "noul",
             Self::Choice => "choice",
             Self::Score => "score",
+            Self::Number => "number",
+            Self::Point => "point",
+            Self::Box => "box",
         }
     }
 }
@@ -388,14 +416,25 @@ impl Metrics {
     /// Called once per *question*, not once per request: twenty questions
     /// over one `state` are twenty decisions, and the mass of each is a
     /// separate reading of the same failure.
-    pub fn record_decision(&self, primitive: Primitive, answer_mass: f64) {
+    ///
+    /// `answer_mass` is `None` for a **program** (GitHub #242): a `number`,
+    /// `point` or `box` is counted like any other decision and observes no
+    /// mass, because it has none to observe
+    /// ([`Primitive::has_answer_mass`]). The histogram is therefore
+    /// deliberately **readout-only**, and its `_count` sits below the
+    /// counter's sum by exactly the number of programs served — stated in
+    /// ADR 0017's row rather than left for a reader to infer from a graph
+    /// that does not add up.
+    pub fn record_decision(&self, primitive: Primitive, answer_mass: Option<f64>) {
         // Two atomics, so a scrape can land between them. The mass goes
         // first on purpose: the histogram may then be one ahead of the
         // counter for a moment, which reads as "a decision whose count has
         // not arrived yet", where the other order reads as "a decision with
         // no mass" — the shape of the failure this whole family exists to
         // show.
-        self.answer_mass.observe(answer_mass);
+        if let Some(answer_mass) = answer_mass {
+            self.answer_mass.observe(answer_mass);
+        }
         // `ALL` lists the primitives in declaration order, so a primitive's
         // discriminant is its slot.
         self.decisions[primitive as usize].fetch_add(1, Ordering::Relaxed);
@@ -809,7 +848,7 @@ mod tests {
         // been served (GitHub #241) — its declarations have to be as
         // well-formed as the ones that are always there.
         let served = Metrics::new();
-        served.record_decision(Primitive::Choice, 0.998);
+        served.record_decision(Primitive::Choice, Some(0.998));
         declared_once(
             &served.render(),
             &[("ignis_decisions_total", "counter"), ("ignis_decision_answer_mass", "histogram")],
@@ -1150,7 +1189,7 @@ mod tests {
         // *is* a ratio — answer mass has no second term, which is the ADR's
         // own distinction and worth having under a test.
         let served = Metrics::new();
-        served.record_decision(Primitive::Score, 0.996);
+        served.record_decision(Primitive::Score, Some(0.996));
         for text in [Metrics::new().render(), served.render()] {
             for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
                 let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
@@ -1171,7 +1210,7 @@ mod tests {
         assert!(!text.contains("ignis_decisions_total"), "{text}");
         assert!(!text.contains("ignis_decision_answer_mass"), "{text}");
 
-        metrics.record_decision(Primitive::Noul, 0.9983);
+        metrics.record_decision(Primitive::Noul, Some(0.9983));
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_decisions_total", "type=\"noul\""), "1");
         // The other two primitives appear at zero *now*, because the family
@@ -1189,9 +1228,9 @@ mod tests {
         // for one. Asserted together, because `ignis_decoded_tokens_total 0`
         // beside no decisions at all would prove nothing.
         let metrics = Metrics::new();
-        metrics.record_decision(Primitive::Choice, 0.997);
-        metrics.record_decision(Primitive::Choice, 0.999);
-        metrics.record_decision(Primitive::Score, 0.9);
+        metrics.record_decision(Primitive::Choice, Some(0.997));
+        metrics.record_decision(Primitive::Choice, Some(0.999));
+        metrics.record_decision(Primitive::Score, Some(0.9));
 
         let text = metrics.render();
         assert_eq!(value(&text, "ignis_decisions_total", "type=\"choice\""), "2");
@@ -1202,14 +1241,49 @@ mod tests {
         assert_eq!(value(&text, "ignis_generated_tokens_total", ""), "0");
     }
 
+    /// GitHub #242: a program is counted and observes no mass, so the
+    /// histogram's `_count` is deliberately below the counter's sum.
+    ///
+    /// The owner's call, and an asymmetry a reader would otherwise have to
+    /// infer from a graph that does not add up — ADR 0017's row says it in
+    /// words and this says it in numbers.
+    #[test]
+    fn a_program_is_counted_and_observes_no_answer_mass() {
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Noul, Some(0.998));
+        metrics.record_decision(Primitive::Point, None);
+        metrics.record_decision(Primitive::Number, None);
+        metrics.record_decision(Primitive::Box, None);
+
+        let text = metrics.render();
+        for (primitive, expected) in [("noul", "1"), ("number", "1"), ("point", "1"), ("box", "1")]
+        {
+            assert_eq!(
+                value(&text, "ignis_decisions_total", &format!("type=\"{primitive}\"")),
+                expected,
+                "every primitive is counted, whatever answered it"
+            );
+        }
+        assert_eq!(
+            value(&text, "ignis_decision_answer_mass_count", ""),
+            "1",
+            "and only the readout observed a mass: a program's answer is a run of              sampled tokens, with no single position's distribution to be a share of"
+        );
+        assert_eq!(
+            value(&text, "ignis_decision_answer_mass_sum", ""),
+            "0.998",
+            "a program contributing 0 would put a false alarm in the bucket a real              collapse lands in"
+        );
+    }
+
     #[test]
     fn a_mass_observation_lands_in_every_bucket_at_or_above_it() {
         let metrics = Metrics::new();
         // 0.998 sits *on* a boundary (`le` is inclusive), 0.9 on the second,
         // and a collapse below the coarsest bound lands only above 0.5.
-        metrics.record_decision(Primitive::Noul, 0.9);
-        metrics.record_decision(Primitive::Noul, 0.998);
-        metrics.record_decision(Primitive::Noul, 0.03);
+        metrics.record_decision(Primitive::Noul, Some(0.9));
+        metrics.record_decision(Primitive::Noul, Some(0.998));
+        metrics.record_decision(Primitive::Noul, Some(0.03));
 
         let text = metrics.render();
         let at = |le: &str| {
@@ -1233,10 +1307,10 @@ mod tests {
         // construction; so would filing a NaN under 0, which would also
         // report a collapse that did not happen.
         let metrics = Metrics::new();
-        metrics.record_decision(Primitive::Choice, 0.998);
-        metrics.record_decision(Primitive::Choice, 1.5);
-        metrics.record_decision(Primitive::Choice, -0.2);
-        metrics.record_decision(Primitive::Choice, f64::NAN);
+        metrics.record_decision(Primitive::Choice, Some(0.998));
+        metrics.record_decision(Primitive::Choice, Some(1.5));
+        metrics.record_decision(Primitive::Choice, Some(-0.2));
+        metrics.record_decision(Primitive::Choice, Some(f64::NAN));
 
         let text = metrics.render();
         let at = |le: &str| {
@@ -1260,7 +1334,7 @@ mod tests {
         // omission cannot be undone by somebody adding "the other number
         // the endpoint already has".
         let metrics = Metrics::new();
-        metrics.record_decision(Primitive::Score, 0.9);
+        metrics.record_decision(Primitive::Score, Some(0.9));
         let text = metrics.render();
         assert!(!text.contains("confidence"), "{text}");
     }
@@ -1302,7 +1376,7 @@ mod tests {
         // The mass histogram exists only after a decision, so it is read off
         // a projection that has seen one.
         let metrics = Metrics::new();
-        metrics.record_decision(Primitive::Noul, 1.0);
+        metrics.record_decision(Primitive::Noul, Some(1.0));
         let text = metrics.render();
         let mut expected: Vec<String> = MASS_BOUNDS.iter().map(|b| (*b).to_owned()).collect();
         expected.push("+Inf".to_owned());

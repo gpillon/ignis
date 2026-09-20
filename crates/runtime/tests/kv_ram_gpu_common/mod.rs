@@ -206,6 +206,7 @@ impl Loaded {
             opener_tokens: opener,
             user_turn_tokens: None,
             system_block_tokens: Some(block),
+            program: None,
         }
     }
 }
@@ -505,7 +506,8 @@ fn decode_alone(compute: &RuntimeCompute<CudaLeaf>, request: RequestId, count: u
                 lane: 0,
                 params,
                 remaining_tokens: count - tokens.len() as u32,
-            }])
+                permitted: None,
+}])
             .unwrap_or_else(|e| panic!("decode {request}: {e:?}"))
             .remove(0);
         tokens.extend(outcome.tokens);
@@ -550,7 +552,8 @@ pub fn a_turn_from_a_retained_slot_generates_what_a_split_cold_prefill_generates
         capture_checkpoint: None,
         multimodal: None,
         readout: None,
-    };
+        permitted: None,
+};
 
     // Turn N: publish the block and the chained link, capture at the opener,
     // each image in the retained slot the scheduler would name.

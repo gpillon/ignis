@@ -99,6 +99,8 @@ fn prefill_multimodal_and_decode<'p>(
         prompt,
         0,
         SamplingParams::greedy(),
+        // No permitted set (GitHub #242): this prefills a prompt.
+        &[],
         MultimodalPrefill { positions, rope_delta, media: None },
         None,
     )

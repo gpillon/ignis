@@ -82,7 +82,9 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
     // would have sorted the options away from their declared order.
     let request: ignis_server::decide::DecideRequest =
         serde_json::from_str(BODY).expect("the request parses");
-    let prepared = prepare(&request.questions, &alphabet).expect("a valid decision");
+    let encode = |text: &str| provider.encode_literal(text);
+    let prepared =
+        prepare(&request.questions, &alphabet, &encode).expect("a valid decision");
 
     let messages = messages_for(&Evidence::read(&request.state), &prepared[0]);
     // Exactly what the endpoint asks for.

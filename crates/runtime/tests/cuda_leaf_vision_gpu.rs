@@ -70,6 +70,7 @@ fn text_input(frontend: &FrontendSet, question: &str) -> RequestInput {
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        program: None,
     }
 }
 
@@ -99,6 +100,7 @@ fn image_question(frontend: &FrontendSet, image: &[u8], question: &str) -> Reque
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
+        program: None,
     }
 }
 

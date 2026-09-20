@@ -62,6 +62,16 @@ pub struct MediaStats {
     pub cache_hits: u32,
     /// Items this request prepared itself.
     pub cache_misses: u32,
+    /// The **first** item's submitted pixel size, `(width, height)`, before
+    /// any resize (GitHub #242); `None` when the request carried no media.
+    ///
+    /// The first because that is the one a spatial question is about: a
+    /// `point` is put to one screenshot, and a `state` carrying several
+    /// images has no single frame for its answer to be in. It rides here
+    /// rather than on the request input because it is a property of what was
+    /// *submitted*, which the engine neither knows nor needs — the engine
+    /// sees patches.
+    pub source_pixels: Option<(u32, u32)>,
 }
 
 /// Turns one image's acquired bytes into its prepared patches — the unit of
@@ -791,6 +801,9 @@ impl MediaAcquirer {
                     stats.preprocess_seconds += seconds;
                 }
                 Disposition::Hit | Disposition::Joined => stats.cache_hits += 1,
+            }
+            if item == 0 {
+                stats.source_pixels = Some(prepared.source_pixels);
             }
             raw_patches += prepared.grid.raw_patches();
             vision_tokens += prepared.grid.vision_tokens();

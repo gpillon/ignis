@@ -540,6 +540,32 @@ pub async fn collect_readout(
     }
 }
 
+/// Drain a **program** request's stream to its completion (GitHub #242) and
+/// return the trace it finished with: one draw per emitted token, in order.
+///
+/// The mirror of [`collect_readout`], and a separate function for the same
+/// reason the two request kinds are separate: a program's `Done` carries no
+/// readout, so `collect_readout` would report every program as
+/// `NotCompleted`. The tokens themselves are in the `SchedEvent::Token`s
+/// that preceded it and are not collected here — a program's caller wants
+/// the digits and their confidences, which the trace already pairs, and the
+/// token ids are the same numbers in the model's id space.
+pub async fn collect_program(
+    rx: &mut EventStream,
+    timeout: Duration,
+) -> Result<Vec<ignis_core::program::Draw>, CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SchedEvent::Done { drawn, .. })) => {
+                return drawn.ok_or(CollectError::NotCompleted);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
+        }
+    }
+}
+
 /// The request's stream ended without a completion.
 #[derive(Debug)]
 pub enum CollectError {

@@ -1,8 +1,17 @@
 //! `POST /v1/decide` — the decision endpoint (GitHub #239, ADR 0034).
 //!
-//! One `state` and a map of typed `questions`, answered from the logits of
-//! named **answer tokens** at one position. Nothing is generated: a decision
-//! costs one prefill and `usage.output_tokens` is 0, honestly.
+//! One `state` and a map of typed `questions`. Jev's three primitives are
+//! answered from the logits of named **answer tokens** at one position:
+//! nothing is generated, they cost one prefill, and `usage.output_tokens` is
+//! 0 for a request of them, honestly.
+//!
+//! GitHub #242 adds three that *do* generate — `number`, `point` and `box` —
+//! by restricting each step to a declared alphabet instead of reading one
+//! position ([`crate::program`]). They cost one prefill and a round per
+//! digit, they move `usage.output_tokens` and the throughput panels, and
+//! they are counted in `ignis_decisions_total` beside the readouts. What
+//! they do not have is an **answer mass**, which is why the histogram beside
+//! that counter is readout-only (ADR 0017).
 //!
 //! The wire shape is TypeSafe's Jev (`POST /v1/systemone`) copied rather
 //! than invented, so an unmodified Jev client reaches this by changing the
@@ -41,6 +50,7 @@ use axum::response::IntoResponse;
 use serde_json::{Value as JsonValue, json};
 
 use ignis_core::decision::{AnswerAlphabet, AnswerToken, Readout};
+use ignis_core::types::TokenId;
 
 use crate::template::{ChatMessage, ContentPart, MessageContent};
 
@@ -202,6 +212,15 @@ pub struct Question {
     /// `choice`, an ordered array for a `score`.
     #[serde(default, alias = "options")]
     pub criteria: Option<Criteria>,
+    /// Digits per axis for a `number`, `point` or `box` (GitHub #242);
+    /// [`crate::program::DEFAULT_DIGITS`] when absent, and refused outside
+    /// [`crate::program::DIGITS`].
+    ///
+    /// Refused rather than ignored on a readout question, like every other
+    /// field this endpoint cannot honour: a caller who wrote `digits` on a
+    /// `choice` meant something by it.
+    #[serde(default)]
+    pub digits: Option<u32>,
 }
 
 /// A question's `criteria`, read in the order it was written.
@@ -298,7 +317,8 @@ impl<'de> Deserialize<'de> for Criteria {
     }
 }
 
-/// The three one-position primitives.
+/// The six primitives: Jev's three, which read one position, and the three
+/// that **generate** one digit at a time (GitHub #242).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionKind {
@@ -309,6 +329,13 @@ pub enum QuestionKind {
     Choice,
     /// A probability-weighted value across ordered levels.
     Score,
+    /// A whole number, read digit by digit.
+    Number,
+    /// Two numbers: a position on the submitted image.
+    Point,
+    /// Four numbers: a bounding box on the submitted image.
+    #[serde(rename = "box")]
+    Box,
 }
 
 impl QuestionKind {
@@ -323,7 +350,32 @@ impl QuestionKind {
             Self::Noul => crate::metrics::Primitive::Noul,
             Self::Choice => crate::metrics::Primitive::Choice,
             Self::Score => crate::metrics::Primitive::Score,
+            Self::Number => crate::metrics::Primitive::Number,
+            Self::Point => crate::metrics::Primitive::Point,
+            Self::Box => crate::metrics::Primitive::Box,
         }
+    }
+
+    /// The axis layout this primitive generates under, or `None` for a
+    /// readout (GitHub #242).
+    fn layout(self) -> Option<crate::program::Layout> {
+        match self {
+            Self::Noul | Self::Choice | Self::Score => None,
+            Self::Number => Some(crate::program::NUMBER_LAYOUT),
+            Self::Point => Some(crate::program::POINT_LAYOUT),
+            Self::Box => Some(crate::program::BOX_LAYOUT),
+        }
+    }
+
+    /// Whether this primitive's answer is in **pixels of the submitted
+    /// image** (GitHub #242), and therefore needs one.
+    fn is_spatial(self) -> bool {
+        matches!(self, Self::Point | Self::Box)
+    }
+
+    /// Whether this primitive generates rather than reading one position.
+    pub fn is_program(self) -> bool {
+        self.layout().is_some()
     }
 }
 
@@ -366,6 +418,12 @@ pub struct PreparedQuestion {
     pub options: Vec<PreparedOption>,
     /// The answer token per option, parallel to `options`.
     pub answers: Vec<AnswerToken>,
+    /// The schedule a **program** question generates under (GitHub #242),
+    /// and `None` for a readout. `options` and `answers` are then empty: a
+    /// program names no options, it forces an alphabet.
+    pub plan: Option<std::sync::Arc<crate::program::Plan>>,
+    /// Digits per axis, for a program question.
+    pub digits: u32,
 }
 
 /// One option of a prepared question.
@@ -390,6 +448,7 @@ const NOUL_DEFAULT: [(&str, &str); 2] = [("true", "Yes"), ("false", "No")];
 pub fn prepare(
     questions: &Ordered<Question>,
     alphabet: &AnswerAlphabet,
+    encode: Encoder<'_>,
 ) -> Result<Vec<PreparedQuestion>, Refusal> {
     if questions.is_empty() {
         return Err(Refusal::new("no_questions", "`questions` must carry at least one question"));
@@ -403,14 +462,20 @@ pub fn prepare(
     questions
         .entries()
         .iter()
-        .map(|(id, question)| prepare_one(id, question, alphabet))
+        .map(|(id, question)| prepare_one(id, question, alphabet, encode))
         .collect()
 }
+
+/// The loaded tokenizer, as a program's plan needs it: text to token ids
+/// (GitHub #242). [`crate::template::TemplateProvider::encode_literal`] is
+/// what supplies one.
+pub type Encoder<'a> = &'a dyn Fn(&str) -> Option<Vec<TokenId>>;
 
 fn prepare_one(
     id: &str,
     question: &Question,
     alphabet: &AnswerAlphabet,
+    encode: Encoder<'_>,
 ) -> Result<PreparedQuestion, Refusal> {
     if instructions_are_empty(&question.instructions) {
         return Err(Refusal::new(
@@ -418,10 +483,25 @@ fn prepare_one(
             format!("question {id:?} has empty `instructions`"),
         ));
     }
+    if let Some(layout) = question.kind.layout() {
+        return prepare_program(id, question, layout, encode);
+    }
+    if question.digits.is_some() {
+        return Err(Refusal::new(
+            "digits_unsupported",
+            format!(
+                "question {id:?} is a {} and reads one position, so `digits` cannot be honoured",
+                question.kind.primitive().label()
+            ),
+        ));
+    }
     let options = match question.kind {
         QuestionKind::Noul => noul_options(id, question.criteria.as_ref())?,
         QuestionKind::Choice => choice_options(id, question.criteria.as_ref())?,
         QuestionKind::Score => score_options(id, question.criteria.as_ref())?,
+        // Unreachable: `prepare_one` returns above for every kind with a
+        // layout, which is exactly these three.
+        QuestionKind::Number | QuestionKind::Point | QuestionKind::Box => Vec::new(),
     };
     if options.len() > MAX_OPTIONS {
         return Err(Refusal::new(
@@ -448,6 +528,57 @@ fn prepare_one(
         instructions: question.instructions.clone(),
         options,
         answers: answers.to_vec(),
+        plan: None,
+        digits: 0,
+    })
+}
+
+/// Validate and plan a **program** question (GitHub #242): a `number`,
+/// `point` or `box`.
+///
+/// It declares no options — it forces the digit alphabet — so nothing here
+/// touches the answer alphabet, and `criteria` is refused rather than
+/// ignored: a caller who wrote one meant this to be a choice.
+fn prepare_program(
+    id: &str,
+    question: &Question,
+    layout: crate::program::Layout,
+    encode: Encoder<'_>,
+) -> Result<PreparedQuestion, Refusal> {
+    if question.criteria.is_some() {
+        return Err(Refusal::new(
+            "criteria_unsupported",
+            format!(
+                "question {id:?} is a {} and declares no options, so `criteria` cannot be honoured",
+                question.kind.primitive().label()
+            ),
+        ));
+    }
+    let digits = question.digits.unwrap_or(crate::program::DEFAULT_DIGITS);
+    if !crate::program::DIGITS.contains(&digits) {
+        return Err(Refusal::new(
+            "digits_out_of_range",
+            format!(
+                "question {id:?} asks for {digits} digits; {}..={} is the range this endpoint                  serves — one digit is a choice between ten answers, and six is already far                  past the resolution the model reports for itself",
+                crate::program::DIGITS.start,
+                crate::program::DIGITS.end - 1
+            ),
+        ));
+    }
+    let plan = crate::program::plan(layout, digits, encode).map_err(|error| {
+        // Every one of these is a property of the load, not of the request:
+        // this tokenizer cannot spell a digit as one token, so this model
+        // cannot answer a number at all.
+        Refusal::new("digits_unnameable", format!("question {id:?}: {error}"))
+    })?;
+    Ok(PreparedQuestion {
+        id: id.to_owned(),
+        kind: question.kind,
+        instructions: question.instructions.clone(),
+        options: Vec::new(),
+        answers: Vec::new(),
+        plan: Some(std::sync::Arc::new(plan)),
+        digits,
     })
 }
 
@@ -643,24 +774,33 @@ fn score_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOp
 /// layout to measure. That is a design fork for #240's owner or GitHub
 /// #235, not something to decide in a prompt builder.
 pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMessage> {
-    let options: Vec<JsonValue> = question
-        .options
-        .iter()
-        .zip(&question.answers)
-        .map(|(option, answer)| {
-            json!({ "letter": answer.label, "description": option.description })
-        })
-        .collect();
-    let ask = payload_text(&[
-        ("criterion", &question.instructions),
-        ("options", &JsonValue::Array(options)),
-    ]);
+    // GitHub #242: a program's user turn is the instruction alone — it
+    // declares no options, and the shape its answer must take lives in the
+    // system text, which is the shape the finding measured.
+    let ask = match question.kind.is_program() {
+        true => payload_text(&[("instruction", &question.instructions)]),
+        false => {
+            let options: Vec<JsonValue> = question
+                .options
+                .iter()
+                .zip(&question.answers)
+                .map(|(option, answer)| {
+                    json!({ "letter": answer.label, "description": option.description })
+                })
+                .collect();
+            payload_text(&[
+                ("criterion", &question.instructions),
+                ("options", &JsonValue::Array(options)),
+            ])
+        }
+    };
+    let instruction = system_for(question);
     match state {
         Evidence::Json(value) => {
             // One blank line between the instruction and the evidence: the
             // instruction is the same bytes for every question over every
             // state, so a reader — and a retained prefix — meets it first.
-            let system = format!("{DIRECT_SYSTEM}\n\n{}", payload_text(&[("evidence", value)]));
+            let system = format!("{instruction}\n\n{}", payload_text(&[("evidence", value)]));
             vec![
                 ChatMessage::text("system", system),
                 ChatMessage::text("user", ask),
@@ -674,7 +814,7 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
                 url: None,
             });
             vec![
-                ChatMessage::text("system", DIRECT_SYSTEM),
+                ChatMessage::text("system", instruction),
                 ChatMessage {
                     role: "user".to_owned(),
                     content: MessageContent::Parts(content),
@@ -684,6 +824,23 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
                 },
             ]
         }
+    }
+}
+
+/// The system text a question is put under: [`DIRECT_SYSTEM`] for a
+/// readout, and the shape-declaring text of each program primitive (GitHub
+/// #242, [`crate::program`]).
+///
+/// A program's is not `DIRECT_SYSTEM` with a clause bolted on. It has to
+/// declare the **scale**, which is what the finding established its accuracy
+/// against, and `DIRECT_SYSTEM` says "choose exactly one listed option" —
+/// which a number does not do.
+fn system_for(question: &PreparedQuestion) -> String {
+    match question.kind {
+        QuestionKind::Number => crate::program::number_system(question.digits),
+        QuestionKind::Point => crate::program::point_system(question.digits),
+        QuestionKind::Box => crate::program::box_system(question.digits),
+        _ => DIRECT_SYSTEM.to_owned(),
     }
 }
 
@@ -824,6 +981,37 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
+    /// A whole number, read digit by digit (GitHub #242).
+    ///
+    /// `uncertainty` is in units of the number itself — not a 0-1 score —
+    /// and `digits` is the trace it is computed from, so a caller can see
+    /// *which* place the model is unsure about rather than only how much.
+    Number {
+        number: u64,
+        uncertainty: f64,
+        digits: Vec<crate::program::DigitDraw>,
+    },
+    /// A position on the submitted image, in **its** pixels.
+    ///
+    /// `normalized` is the model's own 0-`scale` reading beside it, and
+    /// `uncertainty` is in pixels on each axis. The server does the
+    /// rescaling because per-axis normalization on a non-square image is the
+    /// mistake everyone makes once.
+    Point {
+        pixels: BTreeMap<String, i64>,
+        normalized: BTreeMap<String, u64>,
+        uncertainty: BTreeMap<String, f64>,
+        digits: BTreeMap<String, Vec<crate::program::DigitDraw>>,
+    },
+    /// A bounding box on the submitted image: [`Answer::Point`]'s shape over
+    /// `x0`, `y0`, `x1`, `y1`.
+    #[serde(rename = "box")]
+    Box {
+        pixels: BTreeMap<String, i64>,
+        normalized: BTreeMap<String, u64>,
+        uncertainty: BTreeMap<String, f64>,
+        digits: BTreeMap<String, Vec<crate::program::DigitDraw>>,
+    },
     /// This question alone failed at *runtime*, after the GPU was already
     /// spent on its siblings (spec 04).
     ///
@@ -835,6 +1023,88 @@ pub enum Answer {
     /// siblings' answers are already paid for, and discarding them to
     /// report one fault helps nobody.
     Error { code: String, message: String },
+}
+
+/// Shape a **program**'s finished run into `question`'s answer (GitHub
+/// #242).
+///
+/// `pixels` is the submitted image's `(width, height)`, needed by `point`
+/// and `box` and ignored by `number`.
+///
+/// A run shorter than the schedule is an **error**, not a smaller
+/// uncertainty: `SchedEvent::Done`'s trace says how far a cut-off run got,
+/// and a place-weighted sum over a partial number is a plausible-looking
+/// wrong answer rather than a missing one — the exact failure mode this
+/// endpoint exists to remove.
+pub fn program_answer_for(
+    question: &PreparedQuestion,
+    drawn: &[ignis_core::program::Draw],
+    pixels: Option<(u32, u32)>,
+) -> Answer {
+    let Some(plan) = &question.plan else {
+        return failed("not_a_program", "this question generates nothing".to_owned());
+    };
+    if drawn.len() != plan.program.len() {
+        return failed(
+            "run_cut_short",
+            format!(
+                "the engine committed {} of this question's {} forced tokens, so its answer                  would be a number with digits missing from the middle",
+                drawn.len(),
+                plan.program.len()
+            ),
+        );
+    }
+    let Some(readings) = crate::program::read(plan, drawn) else {
+        return failed(
+            "run_off_alphabet",
+            "a forced step committed a token outside its own permitted set".to_owned(),
+        );
+    };
+    let digits: BTreeMap<String, Vec<crate::program::DigitDraw>> = readings
+        .iter()
+        .map(|(axis, reading)| (axis.clone(), reading.digits.clone()))
+        .collect();
+    if question.kind == QuestionKind::Number {
+        let reading = &readings["value"];
+        return Answer::Number {
+            number: reading.value,
+            uncertainty: reading.sigma,
+            digits: reading.digits.clone(),
+        };
+    }
+    // Spatial: the answer is in pixels of the image the caller submitted,
+    // and each axis is scaled by its own side.
+    let Some((width, height)) = pixels else {
+        return failed(
+            "state_carries_no_image",
+            "a point is a position on an image, and this `state` carried none".to_owned(),
+        );
+    };
+    let mut in_pixels = BTreeMap::new();
+    let mut normalized = BTreeMap::new();
+    let mut uncertainty = BTreeMap::new();
+    for (axis, reading) in &readings {
+        let side = if axis.starts_with('x') { width } else { height };
+        let (value, sigma) =
+            crate::program::to_pixels(reading.value, reading.sigma, question.digits, side);
+        in_pixels.insert(axis.clone(), value);
+        normalized.insert(axis.clone(), reading.value);
+        uncertainty.insert(axis.clone(), sigma);
+    }
+    match question.kind {
+        QuestionKind::Box => Answer::Box {
+            pixels: in_pixels,
+            normalized,
+            uncertainty,
+            digits,
+        },
+        _ => Answer::Point {
+            pixels: in_pixels,
+            normalized,
+            uncertainty,
+            digits,
+        },
+    }
 }
 
 /// Shape `readout` into `question`'s answer.
@@ -853,6 +1123,15 @@ pub fn answer_for(question: &PreparedQuestion, readout: &Readout) -> Answer {
                 confidence: confidence_of(&probabilities),
             }
         }
+        // A program never reaches here: `ask` routes it to
+        // `program_answer_for`, which is the only function that has a run to
+        // shape. Answered rather than `unreachable!()` because this is the
+        // request path and a wrong route is a bug to report, not a panic on
+        // the model's thread.
+        QuestionKind::Number | QuestionKind::Point | QuestionKind::Box => failed(
+            "not_a_readout",
+            "this question generates its answer and reads no position".to_owned(),
+        ),
         QuestionKind::Score => Answer::Score {
             score: expected_level(&probabilities),
             legend: question
@@ -966,7 +1245,11 @@ async fn serve(
 ) -> Result<DecideResponse, Refusal> {
     let started = std::time::Instant::now();
     refuse_thinking(server, &request)?;
-    let prepared = prepare(&request.questions, &server.alphabet)?;
+    // The tokenizer, for any program question's forced alphabet (GitHub
+    // #242). A load with no real tokenizer answers `None` and the question
+    // is refused, rather than forcing ids this server invented.
+    let encode = |text: &str| server.template.encode_literal(text);
+    let prepared = prepare(&request.questions, &server.alphabet, &encode)?;
     let evidence = Evidence::read(&request.state);
     // An image `state` on a load that cannot take images is a refusal, not
     // an error in an answer slot: the request was never servable, and it is
@@ -1081,6 +1364,7 @@ async fn serve(
         }
     }
     log_decision(&prepared, &answers, class, input_tokens, started);
+    let output_tokens = generated(&prepared, &answers);
     Ok(DecideResponse {
         // The model that *performed* the evaluation, which is the one the
         // engine resolved — not the string the caller sent.
@@ -1088,13 +1372,35 @@ async fn serve(
         answers,
         usage: Usage {
             input_tokens,
-            // Zero, honestly. A decision reads one position's logits and
-            // samples nothing, so `ignis_decoded_tokens_total` does not move
-            // for it either — which is correct, and makes decisions
-            // invisible to the existing throughput panels (ADR 0034).
-            output_tokens: 0,
+            // Zero for a request of readouts, honestly: a decision reads one
+            // position's logits and samples nothing, so
+            // `ignis_decoded_tokens_total` does not move for it either.
+            //
+            // A **program** does generate (GitHub #242), and this counts
+            // what it generated. Saying 0 for a `point` would be the one lie
+            // this endpoint could tell that nothing downstream would catch —
+            // and the throughput panels, which a program *does* move, would
+            // disagree with the usage a caller was billed by.
+            output_tokens,
         },
     })
+}
+
+/// The tokens this request's **programs** generated (GitHub #242): each
+/// answered program question's whole schedule, and nothing for a readout.
+///
+/// The schedule's length rather than a count of emitted tokens, because they
+/// are the same number by construction — a program ends when its schedule is
+/// spent — and a question that did *not* end that way is an error in its
+/// slot, with nothing to bill for.
+fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) -> u32 {
+    prepared
+        .iter()
+        .filter(|question| !matches!(answers.get(&question.id), None | Some(Answer::Error { .. })))
+        .filter_map(|question| question.plan.as_ref())
+        .fold(0u32, |total, plan| {
+            total.saturating_add(u32::try_from(plan.program.len()).unwrap_or(u32::MAX))
+        })
 }
 
 /// The request log's line for one served `POST /v1/decide` (GitHub #241,
@@ -1218,7 +1524,7 @@ async fn render(
         ..crate::thinking::ThinkingOptions::default()
     };
     let params = ignis_core::types::DecodeParams::default();
-    let (mut input, model, prompt_tokens, media) =
+    let (mut input, model, mut prompt_tokens, media) =
         crate::api::prepare_decision_request(server, model, &messages, params, &thinking)
             .await
             .map_err(|(code, message)| {
@@ -1234,9 +1540,50 @@ async fn render(
             ),
         ));
     }
-    input.decision = Some(std::sync::Arc::from(
-        question.answers.iter().map(|answer| answer.id).collect::<Vec<_>>(),
-    ));
+    match &question.plan {
+        // GitHub #237/#238: a readout names its answer tokens and ends where
+        // its prefill ends.
+        None => {
+            input.decision = Some(std::sync::Arc::from(
+                question.answers.iter().map(|answer| answer.id).collect::<Vec<_>>(),
+            ));
+        }
+        // GitHub #242: a program appends its opening literal to the prompt —
+        // forced text the model appears to have written, costing prefill
+        // rather than a decode round each — and carries the schedule for
+        // everything after it.
+        Some(plan) => {
+            prompt_tokens = prompt_tokens.saturating_add(plan.prefix.len() as u32);
+            if prompt_tokens > server.engine.max_model_len() {
+                return Err(Refusal::new(
+                    "context_exceeded",
+                    format!(
+                        "question {:?} renders {prompt_tokens} prompt tokens with its forced                          prefix, past this engine's {} context",
+                        question.id,
+                        server.engine.max_model_len()
+                    ),
+                ));
+            }
+            input.tokens.extend_from_slice(&plan.prefix);
+            if let Some(multimodal) = &mut input.multimodal {
+                // The MRoPE positions have to grow with the tokens or the
+                // leaf refuses the chunk outright. A prompt that cannot be
+                // extended is one ending in a placeholder, which no template
+                // renders — refused rather than sent with positions nobody
+                // can check.
+                if !std::sync::Arc::make_mut(multimodal).append_text(plan.prefix.len()) {
+                    return Err(Refusal::new(
+                        "prompt_not_extendable",
+                        format!(
+                            "question {:?} renders a prompt ending inside an image, which                              leaves no position for its forced prefix to continue from",
+                            question.id
+                        ),
+                    ));
+                }
+            }
+            input.program = Some(std::sync::Arc::new(plan.program.clone()));
+        }
+    }
     Ok(Rendered { input, model, prompt_tokens, media })
 }
 
@@ -1269,6 +1616,31 @@ async fn ask(
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
+    // GitHub #242: a program's completion carries a trace, not a readout,
+    // so `collect_readout` would report every one of them as never
+    // completed.
+    if question.kind.is_program() {
+        let pixels = ready.media.and_then(|stats| stats.source_pixels);
+        return Attempt::Answered(
+            match crate::engine::collect_program(&mut events, server.request_timeout).await {
+                Ok(drawn) => {
+                    guard.completed();
+                    if let Some(metrics) = &server.metrics {
+                        // Counted like any other decision and observing no
+                        // answer mass, because it has none: its answer is a
+                        // run of sampled tokens, not a restricted softmax
+                        // over one position (ADR 0017's row says so).
+                        metrics.record_decision(question.kind.primitive(), None);
+                    }
+                    program_answer_for(question, &drawn, pixels)
+                }
+                Err(_) => failed(
+                    "not_completed",
+                    "the engine did not answer this question in time".to_owned(),
+                ),
+            },
+        );
+    }
     Attempt::Answered(
         match crate::engine::collect_readout(&mut events, server.request_timeout).await {
             Ok(readout) => {
@@ -1279,7 +1651,7 @@ async fn ask(
                 // on — a `choice` of 0.03 answer mass and one of 0.999 are
                 // the same JSON.
                 if let Some(metrics) = &server.metrics {
-                    metrics.record_decision(question.kind.primitive(), readout.answer_mass());
+                    metrics.record_decision(question.kind.primitive(), Some(readout.answer_mass()));
                 }
                 answer_for(question, &readout)
             }
