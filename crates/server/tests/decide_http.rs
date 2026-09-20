@@ -1202,6 +1202,35 @@ async fn a_wave_wider_than_the_engine_is_retried_rather_than_failed() {
 
 // ── decisions on the metrics listener (GitHub #241, spec 05) ────────────
 
+/// What `MockCompute`'s readout puts inside the declared options:
+/// `exp(-0.002)`, from the `OUTSIDE_THE_ANSWERS` nats it holds back
+/// (`ignis_core::mock`). Every question gets the same one, which is what
+/// makes the histogram's `_sum` an exact string rather than a range.
+const MOCK_MASS: &str = "0.998002";
+
+/// Scrapes until `done` holds, within a few seconds.
+///
+/// The telemetry consumer is asynchronous, so a series it feeds —
+/// `ignis_decoded_tokens_total` among them — lands *after* the HTTP
+/// response that caused it. Reading one straight after the response and
+/// finding a zero says nothing at all: it would be zero for a readout that
+/// decoded a hundred tokens too.
+async fn scrape_until(metrics: &axum::Router, done: impl Fn(&str) -> bool) -> String {
+    let mut last = String::new();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            last = scrape(metrics).await;
+            if done(&last) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "the projection never settled; last scrape:\n{last}");
+    last
+}
+
 /// `GET /metrics` off the metrics listener's own app.
 async fn scrape(metrics: &axum::Router) -> String {
     let request = Request::builder()
@@ -1253,23 +1282,38 @@ async fn a_served_decision_is_counted_under_its_type_and_its_mass_observed() {
     assert_eq!(sample(&after, "ignis_decisions_total", "type=\"noul\""), "0");
     assert_eq!(sample(&after, "ignis_decisions_total", "type=\"score\""), "0");
 
-    // And the mass was observed once. Which bucket is the mock's business —
-    // its readout is deterministic but arbitrary (it models a distribution,
-    // not this model's) — so what is asserted is that a reading was taken
-    // and that it is a probability.
+    // And the observation is the **answer mass**, not one of the other
+    // numbers a readout carries. The mock holds back a fixed 0.002 nats
+    // outside the declared options, so the reading is exactly `exp(-0.002)`
+    // — pinned, because `_count == 1` and "it is a probability" would pass
+    // just as well if the top option's probability, or the confidence, or a
+    // constant had been observed instead.
     assert_eq!(sample(&after, "ignis_decision_answer_mass_count", ""), "1");
+    assert_eq!(sample(&after, "ignis_decision_answer_mass_sum", ""), MOCK_MASS);
+    assert_eq!(
+        sample(&after, "ignis_decision_answer_mass_bucket", "le=\"0.999\""),
+        "1",
+        "and it lands in the bucket that reading belongs to"
+    );
+    assert_eq!(sample(&after, "ignis_decision_answer_mass_bucket", "le=\"0.995\""), "0");
     assert_eq!(
         sample(&after, "ignis_decision_answer_mass_bucket", "le=\"1\""),
         "1",
-        "the observation is inside the unit interval"
+        "every reading was a probability"
     );
-    let mass: f64 = sample(&after, "ignis_decision_answer_mass_sum", "").parse().unwrap();
-    assert!((0.0..=1.0).contains(&mass), "one observation, a probability: {mass}");
 
-    // 2. A readout generates nothing, so neither token counter moved — and
-    //    that only means something beside the count above.
-    assert_eq!(sample(&after, "ignis_decoded_tokens_total", ""), "0");
-    assert_eq!(sample(&after, "ignis_generated_tokens_total", ""), "0");
+    // 2. A readout generates nothing, so neither token counter moved.
+    //
+    // Waited for rather than read: those two are fed by the asynchronous
+    // telemetry consumer, so a scrape taken the instant the response
+    // returns reports a zero whatever the request did. The settle is on a
+    // series the decision *does* move through that same consumer.
+    let settled = scrape_until(&metrics, |text| {
+        text.contains("\nignis_requests_completed_total 1\n")
+    })
+    .await;
+    assert_eq!(sample(&settled, "ignis_decoded_tokens_total", ""), "0");
+    assert_eq!(sample(&settled, "ignis_generated_tokens_total", ""), "0");
     assert_eq!(response["usage"]["output_tokens"], 0);
 }
 
@@ -1301,6 +1345,9 @@ async fn every_question_of_a_fan_out_is_a_decision_of_its_own() {
     assert_eq!(sample(&text, "ignis_decisions_total", "type=\"choice\""), "1");
     assert_eq!(sample(&text, "ignis_decisions_total", "type=\"score\""), "1");
     assert_eq!(sample(&text, "ignis_decision_answer_mass_count", ""), "4");
+    // Four readings of the mock's one mass, summed — the histogram counts
+    // questions, so a fan-out is four observations and not one.
+    assert_eq!(sample(&text, "ignis_decision_answer_mass_sum", ""), "3.992008");
 }
 
 #[tokio::test]

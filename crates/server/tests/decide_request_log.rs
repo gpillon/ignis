@@ -1,12 +1,12 @@
-//! A decision on the request log (GitHub #241, spec 05): one
-//! `ignis.decision.done` line per served `POST /v1/decide`, carrying the
+//! A decide request on the log (GitHub #241, spec 05): one
+//! `ignis.decide.done` line per served `POST /v1/decide`, carrying the
 //! question count and the primitive types.
 //!
-//! Why the endpoint emits one at all. A decision's N questions are N
-//! internal requests, and each earns its own `ignis.request.admitted` /
-//! `done` pair from the telemetry consumer — but twenty of those is not a
-//! reading of "one decision of twenty questions", and the fan-out is what
-//! the caller asked for. Nothing else in the log ties them back together.
+//! Why the endpoint emits one at all. A *decision* is the engine's unit —
+//! one readout, one internal request, one question — and each of them
+//! earns its own `ignis.request.admitted` / `done` pair from the telemetry
+//! consumer. Twenty of those is not a reading of the one request a caller
+//! sent, and nothing else in the log summarises it.
 //!
 //! Its own binary, like `media_request_log.rs`: tracing caches a callsite's
 //! interest process-wide, so a test running beside this one without a
@@ -37,9 +37,9 @@ const MODEL: &str = "test-model";
 
 /// Just enough tokenizer to name three options: `/v1/decide` refuses a load
 /// whose tokenizer can label none, and nothing here asks for a fourth.
-struct Letters;
+struct ThreeLetters;
 
-impl LabelTokenizer for Letters {
+impl LabelTokenizer for ThreeLetters {
     fn encode(&self, text: &str) -> Option<Vec<TokenId>> {
         match text {
             "A" => Some(vec![1]),
@@ -59,11 +59,15 @@ impl LabelTokenizer for Letters {
     }
 }
 
-/// [`SimpleTemplateProvider`] with an answer alphabet, which the real
-/// provider gets from the loaded artifact's tokenizer.
-struct DecidingTemplate;
+/// [`SimpleTemplateProvider`] with a three-label answer alphabet.
+///
+/// Not `decide_http.rs`'s fixture of the same shape, which carries 738
+/// labels and reports a system block: this binary asks about a log line,
+/// and a fixture that answered more questions than the test asks would
+/// only make the two harder to tell apart.
+struct ThreeLetterTemplate;
 
-impl TemplateProvider for DecidingTemplate {
+impl TemplateProvider for ThreeLetterTemplate {
     fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
@@ -74,7 +78,7 @@ impl TemplateProvider for DecidingTemplate {
     }
 
     fn answer_alphabet(&self) -> AnswerAlphabet {
-        AnswerAlphabet::from_tokenizer(&Letters)
+        AnswerAlphabet::from_tokenizer(&ThreeLetters)
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -95,7 +99,7 @@ fn app() -> axum::Router {
         SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
         Arc::new(MockCompute::new()),
     );
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate)).app()
+    Server::new(Engine::new(Box::new(scheduler)), Box::new(ThreeLetterTemplate)).app()
 }
 
 async fn decide(app: &axum::Router, body: &str) -> (u16, Value) {
@@ -112,12 +116,12 @@ async fn decide(app: &axum::Router, body: &str) -> (u16, Value) {
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
-/// The `attributes` of every `ignis.decision.done` event captured, in order.
+/// The `attributes` of every `ignis.decide.done` event captured, in order.
 fn decisions(sink: &MemorySink) -> Vec<Value> {
     sink.lines()
         .iter()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|event| event["event_name"] == "ignis.decision.done")
+        .filter(|event| event["event_name"] == "ignis.decide.done")
         .map(|event| event["attributes"].clone())
         .collect()
 }

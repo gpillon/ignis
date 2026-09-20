@@ -4,6 +4,13 @@ import type { Exposition, Sample } from "./exposition.ts";
 // §Observability: the series the panel knows how to draw, by name. Anything
 // else ignis serves is kept in `unknown` and listed raw, never dropped
 // silently.
+//
+// The decision family (#241) is in the contract but has no panel yet: it is
+// recognised here so the page does not badge it "not in ADR 0017" — which
+// would be a false statement about a series the ADR lists — and it is
+// otherwise not read into the snapshot. Drawing it is the Monitor's own
+// work. Note it is absent from a load that has served no decision, so a
+// panel must treat it as missing rather than zero.
 
 export const REJECT_REASONS = ["full", "unknown_model", "oversized"] as const;
 export type RejectReason = (typeof REJECT_REASONS)[number];
@@ -118,8 +125,14 @@ const MEMORY_GAUGES = {
   kvPoolUsedPages: "ignis_kv_pool_used_pages",
 } as const;
 
+/** The typed primitives a decision's question asks for (GitHub #241, ADR 0034). */
+export const DECISION_TYPES = ["noul", "choice", "score"] as const;
+export type DecisionType = (typeof DECISION_TYPES)[number];
+
 const KNOWN = new Set<string>([
   "ignis_build_info",
+  "ignis_decisions_total",
+  "ignis_decision_answer_mass",
   "ignis_scheduler_requests",
   "ignis_requests_rejected_total",
   "ignis_request_ttft_seconds",
@@ -223,7 +236,10 @@ function inContract(family: string, s: Sample): boolean {
       return oneOf(REJECT_REASONS, s.labels.reason);
     case "ignis_request_ttft_seconds":
     case "ignis_request_duration_seconds":
+    case "ignis_decision_answer_mass":
       return true;
+    case "ignis_decisions_total":
+      return oneOf(DECISION_TYPES, s.labels.type);
     case "ignis_vram_reserved_bytes":
       return oneOf(VRAM_LINES, s.labels.line);
     case "ignis_kv_ram_arena_bytes":

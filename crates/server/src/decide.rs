@@ -1097,13 +1097,23 @@ async fn serve(
     })
 }
 
-/// The request log's line for one served decision (GitHub #241, ADR 0011).
+/// The request log's line for one served `POST /v1/decide` (GitHub #241,
+/// ADR 0011).
 ///
-/// A decision's N internal requests each get the `ignis.request.*` lifecycle
-/// they earn, from the telemetry consumer, but nothing ties them back
-/// together: twenty `admitted`/`done` pairs is not a reading of "one
-/// decision of twenty questions", and the fan-out is what a caller asked
-/// for. This is that reading, and the only one emitted from the endpoint.
+/// **`ignis.decide.done`, not `ignis.decision.done`.** A *decision* is the
+/// engine's unit — one readout, one internal request, one question
+/// (GitHub #238, and what `ignis_decisions_total` counts). A *decide
+/// request* is what a caller sent, and twenty `ignis.request.admitted` /
+/// `done` pairs is not a reading of it. This is that reading.
+///
+/// It **summarises** the fan-out; it does not tie it together. No request
+/// id crosses the endpoint boundary — the ids are minted inside the engine
+/// and the `ignis.request.*` events are emitted on the model thread's own
+/// side — so a reader can see that a decide request asked three questions
+/// and cannot join this line to the three it caused. Carrying up to 256
+/// ids in a log field would not be that join either. Stated rather than
+/// implied, because the obvious reading of a summary line is that it has
+/// one.
 ///
 /// `types` is the distinct primitives in declared order, spelled by
 /// [`crate::metrics::Primitive::label`] so a log field and a metric label
@@ -1133,7 +1143,7 @@ fn log_decision(
         .filter(|answer| matches!(answer, Answer::Error { .. }))
         .count();
     tracing::info!(
-        name: "ignis.decision.done",
+        name: "ignis.decide.done",
         questions = prepared.len(),
         types = types.join(","),
         // The same spelling the `ignis.request.*` events give it, since a
@@ -1146,7 +1156,7 @@ fn log_decision(
         input_tokens,
         output_tokens = 0,
         duration_ms = started.elapsed().as_millis() as u64,
-        "decision done"
+        "decide request done"
     );
 }
 

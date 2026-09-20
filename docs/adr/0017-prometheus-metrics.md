@@ -33,7 +33,13 @@ the retained slots as gauges (#216, #217). The same amendment splits the six
 retained-state families by `kind="checkpoint|prefix"` as well as by `tier`,
 so the six rows below read "by tier and kind"; a prompt checkpoint and a
 shared prefix are no longer counted as one thing. Lane and sequence labels
-stay forbidden.
+stay forbidden. Amended 2026-09-20 (#241): two rows for the decision
+endpoint, `ignis_decisions_total` and `ignis_decision_answer_mass`, both
+recorded by the HTTP handler the way the rejection counter is, and both
+carrying **the first exception to this ADR's "zeros are exported too"** —
+they are absent until a decision has been served. The reasoning is below
+the table; the exception is named here because an operator reading only
+this section should not meet it as a surprise.
 
 ## Context
 
@@ -154,6 +160,13 @@ critical-path performance regression. The only numerical allowance is at most
   completed plus cancelled plus the requests still in flight.
 - Aggregation runs only when metrics are enabled. A disabled server installs
   neither the Prometheus projection nor the route.
+- Two families are recorded outside the telemetry consumer, by the HTTP
+  handler that already holds their values: the rejection counter (a submit
+  error never reaches the fact stream) and the decision pair (#241 — a
+  readout's answer mass is read in the handler, and raising a fact for it
+  would put a decision's arithmetic on the inference path to observe
+  something the control plane already has). Neither touches the model
+  thread; both are the same atomics a scrape formats.
 - Aggregate state may use fixed atomics or immutable snapshots owned by the
   asynchronous telemetry side. No lock is shared with inference, and a scrape
   never sends a command to or waits for the model thread.
@@ -203,10 +216,21 @@ decision has been served, and that is this ADR's other rule — *only
 authoritative values are exported* — applied to a route most loads never
 call: three permanently-zero series and an eleven-bucket histogram on every
 scrape of every server would be clutter that says nothing about the server
-it is scraped from. Prometheus handles a series that appears mid-window the
-way it handles a new target. Once the family exists, **all three `type`
+it is scraped from. A series that appears mid-window is the same
+problem as a new target and Prometheus treats it the same way, with one
+consequence worth knowing: `rate()` and `increase()` cannot see the step
+from nothing to the first sample, so the very first decision a load serves
+is not in its own rate. Once the family exists, **all three `type`
 values are exported**, including the zeros: a label value that vanishes with
 its count is a series that breaks `sum by (type)` the moment traffic shifts.
+
+**The unit is the question, not the request.** `ignis_decisions_total`
+counts *decisions* in the engine's sense — one readout, one internal
+request (#238) — so a decide request of twenty questions moves it by
+twenty. A request has no single `type` to be counted under, and a single
+question's options collapsing while its nineteen siblings are fine is
+exactly what the histogram exists to show. The endpoint's own unit is on
+the request log instead, as `ignis.decide.done`.
 
 The pair is recorded by the HTTP handler, like `ignis_requests_rejected_total`
 and for the same reason: there is no fact for it on the model thread's
