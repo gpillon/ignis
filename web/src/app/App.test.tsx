@@ -18,9 +18,13 @@ describe("App", () => {
     expect(html).toContain("Warming up");
   });
 
-  it("offers no Monitor until /ui/metrics has answered", () => {
+  it("offers the Decide tab from the start and the Monitor only once /ui/metrics has answered", () => {
     const html = renderToStaticMarkup(<App />);
-    expect(html).not.toContain('aria-label="View"');
+    // The Decide tab talks to /v1/decide, so it never waits on the metrics
+    // listener; the Monitor is the one view that does.
+    expect(html).toContain('aria-label="View"');
+    expect(html).toContain(">Decide<");
+    expect(html).not.toContain(">Monitor<");
     expect(html).not.toContain('aria-label="Monitor"');
   });
 

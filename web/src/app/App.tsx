@@ -3,6 +3,7 @@ import { forgetKey, useAuth } from "../api/auth.ts";
 import { useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
+import { DecideView } from "../decide/DecideView.tsx";
 import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
 import { contextUsage } from "../metrics/context.ts";
 import { Readout } from "../metrics/Readout.tsx";
@@ -26,8 +27,9 @@ import { useConversation } from "./useConversation.ts";
 // Sessions, settings and figures live in memory; a reload starts over, apart
 // from the switches this browser stores (`storedFlag.ts`).
 // This is the page's layout; the conversation loop is useConversation.
-// With metrics on, the header switches to the Monitor (GitHub #165); the
-// chat stays mounted underneath, so a streaming reply carries on.
+// The header switches between the chat, the Decide tab (GitHub #247) and —
+// when ignis serves metrics — the Monitor (GitHub #165). Whichever is showing,
+// the chat stays mounted underneath, so a streaming reply carries on.
 
 type Drawer = "sessions" | "settings" | null;
 
@@ -56,14 +58,17 @@ export function App() {
   const chat = useConversation({ model, settings, tools, parallel });
   const { active } = chat;
   const monitoring = view === "monitor" && monitorVisible;
+  const deciding = view === "decide";
 
   const readerRun: AgentRun | undefined = reader
     ? active.messages.find((m) => m.id === reader.messageId)?.agents?.find((r) => r.callId === reader.callId)
     : undefined;
 
-  // Metrics going away drops back to the chat, so their return never flips the page on its own.
+  // Metrics going away drops back to the chat *from the Monitor*, so their
+  // return never flips the page on its own — and a reader in the Decide tab,
+  // which needs no metrics, is left where they are.
   useEffect(() => {
-    if (!monitorVisible) setView("chat");
+    if (!monitorVisible) setView((current) => (current === "monitor" ? "chat" : current));
   }, [monitorVisible]);
 
   useEffect(() => {
@@ -111,11 +116,13 @@ export function App() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : "chat"} onView={monitorVisible ? setView : undefined} />
+      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : deciding ? "decide" : "chat"} onView={setView} monitorAvailable={monitorVisible} />
 
       {monitoring && <Monitor />}
 
-      <div className={monitoring ? "hidden" : "contents"}>
+      {deciding && <DecideView ready={model.state === "ready"} />}
+
+      <div className={monitoring || deciding ? "hidden" : "contents"}>
         <div className="relative flex min-h-0 flex-1">
           {drawer && (
             <div className="fixed inset-0 z-30 bg-[#1c2026]/60 lg:hidden" onClick={() => setDrawer(null)} aria-hidden />
