@@ -130,10 +130,16 @@ model that would have written the sentence.
 - The sampling ABI gains a per-lane token set, which every future sampling
   change has to carry. That is the cost of not having the host in the loop.
 - `ignis_decoded_tokens_total` does not move for a readout, which is correct and
-  makes decisions invisible to the existing panels. The decision counters and
-  the **answer mass** histogram exist because of it: a silent collapse of answer
+  makes decisions invisible to the existing panels. `ignis_decisions_total`
+  (`type=noul|choice|score`) and the **answer mass** histogram
+  `ignis_decision_answer_mass` exist because of it: a silent collapse of answer
   mass in production means well-formed noise, and it is the only failure of this
-  endpoint that nothing else would show.
+  endpoint that nothing else would show. Both are counted per *question* and
+  both are absent from the exposition until a decision has been served; ADR
+  0017's contract table carries them, and the reasoning for the absence is
+  there (#241). `confidence` is deliberately not exported — it is per-caller
+  and per-domain, and an aggregate over callers with different thresholds means
+  nothing.
 - The endpoint can be reached by an unmodified Jev client, which is the reason
   to copy their wire shape rather than invent one. Their vocabulary (`noul`,
   `criteria`, `instructions`) therefore enters our glossary as imported, not

@@ -1199,3 +1199,156 @@ async fn a_wave_wider_than_the_engine_is_retried_rather_than_failed() {
         );
     }
 }
+
+// ── decisions on the metrics listener (GitHub #241, spec 05) ────────────
+
+/// `GET /metrics` off the metrics listener's own app.
+async fn scrape(metrics: &axum::Router) -> String {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let response = metrics.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// The value of the sample named `name` with exactly `labels`.
+fn sample(text: &str, name: &str, labels: &str) -> String {
+    let key = match labels.is_empty() {
+        true => format!("{name} "),
+        false => format!("{name}{{{labels}}} "),
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix(&key))
+        .unwrap_or_else(|| panic!("no sample {name}{{{labels}}} in:\n{text}"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_served_decision_is_counted_under_its_type_and_its_mass_observed() {
+    // Spec 05's acceptances 1, 2 and 3, through the two routers an operator
+    // actually has: the decision goes to the API listener and the reading
+    // comes off the metrics listener.
+    let compute = Arc::new(MockCompute::new());
+    let server = server(compute).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let app = server.app();
+
+    // 3. Absent before any decision — a server that never sees one exports
+    //    no decision series at all.
+    let before = scrape(&metrics).await;
+    assert!(!before.contains("ignis_decisions_total"), "{before}");
+    assert!(!before.contains("ignis_decision_answer_mass"), "{before}");
+    assert_eq!(sample(&before, "ignis_decoded_tokens_total", ""), "0");
+
+    let (status, response) = decide(&app, JEV_CHOICE).await;
+    assert_eq!(status, 200, "{response}");
+
+    // 1. The counter moved, under this question's own primitive.
+    let after = scrape(&metrics).await;
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"choice\""), "1");
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"noul\""), "0");
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"score\""), "0");
+
+    // And the mass was observed once. Which bucket is the mock's business —
+    // its readout is deterministic but arbitrary (it models a distribution,
+    // not this model's) — so what is asserted is that a reading was taken
+    // and that it is a probability.
+    assert_eq!(sample(&after, "ignis_decision_answer_mass_count", ""), "1");
+    assert_eq!(
+        sample(&after, "ignis_decision_answer_mass_bucket", "le=\"1\""),
+        "1",
+        "the observation is inside the unit interval"
+    );
+    let mass: f64 = sample(&after, "ignis_decision_answer_mass_sum", "").parse().unwrap();
+    assert!((0.0..=1.0).contains(&mass), "one observation, a probability: {mass}");
+
+    // 2. A readout generates nothing, so neither token counter moved — and
+    //    that only means something beside the count above.
+    assert_eq!(sample(&after, "ignis_decoded_tokens_total", ""), "0");
+    assert_eq!(sample(&after, "ignis_generated_tokens_total", ""), "0");
+    assert_eq!(response["usage"]["output_tokens"], 0);
+}
+
+#[tokio::test]
+async fn every_question_of_a_fan_out_is_a_decision_of_its_own() {
+    // Twenty questions over one `state` are twenty readouts, so they are
+    // twenty decisions and twenty readings of answer mass. Counting the
+    // HTTP request instead would hide the thing the histogram exists for:
+    // one question's options collapsing while its siblings are fine.
+    let compute = Arc::new(MockCompute::new());
+    let server = server(compute).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let app = server.app();
+    let body = r#"{
+      "state": "Help! My payouts have been failing for 3 days.",
+      "model": "test-model",
+      "questions": {
+        "a": { "type": "noul", "instructions": "Urgent?" },
+        "b": { "type": "noul", "instructions": "Angry?" },
+        "c": { "type": "choice", "instructions": "Which team?", "criteria": { "billing": null, "technical": null } },
+        "d": { "type": "score", "instructions": "How frustrated?", "criteria": ["Calm", "Angry"] }
+      }
+    }"#;
+
+    let (status, response) = decide(&app, body).await;
+    assert_eq!(status, 200, "{response}");
+    let text = scrape(&metrics).await;
+    assert_eq!(sample(&text, "ignis_decisions_total", "type=\"noul\""), "2");
+    assert_eq!(sample(&text, "ignis_decisions_total", "type=\"choice\""), "1");
+    assert_eq!(sample(&text, "ignis_decisions_total", "type=\"score\""), "1");
+    assert_eq!(sample(&text, "ignis_decision_answer_mass_count", ""), "4");
+}
+
+#[tokio::test]
+async fn a_question_that_failed_is_not_counted_as_a_decision() {
+    // A counter of decisions is a counter of readouts. A question whose
+    // engine never answered has no mass to observe, and counting it would
+    // put a hole in the histogram's own denominator — the rate of answered
+    // questions would look right while the masses under it were one short.
+    const QUESTIONS: usize = 8;
+    let compute = Arc::new(DropReadout {
+        inner: MockCompute::new(),
+        victim: 3,
+    });
+    let server = server_over(compute as Arc<dyn ignis_core::Compute>).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let app = server.app();
+
+    let (status, response) = decide(&app, &fan_out(300, QUESTIONS)).await;
+    assert_eq!(status, 200, "{response}");
+    let errors = response["answers"]
+        .as_object()
+        .expect("a map")
+        .values()
+        .filter(|answer| answer["type"] == "error")
+        .count();
+    assert_eq!(errors, 1, "{response}");
+
+    let text = scrape(&metrics).await;
+    assert_eq!(
+        sample(&text, "ignis_decisions_total", "type=\"noul\""),
+        (QUESTIONS - 1).to_string(),
+        "the seven that were answered, not the eight that were asked"
+    );
+    assert_eq!(
+        sample(&text, "ignis_decision_answer_mass_count", ""),
+        (QUESTIONS - 1).to_string()
+    );
+}
+
+#[tokio::test]
+async fn a_server_without_metrics_serves_decisions_just_the_same() {
+    // The projection is opt-in (ADR 0017) and the endpoint must not care:
+    // `--metrics` off installs no `Metrics`, and the recording site is the
+    // only thing that changes.
+    let compute = Arc::new(MockCompute::new());
+    let plain = server(compute);
+    assert!(plain.metrics_app().is_none(), "metrics are off");
+    let (status, response) = decide(&plain.app(), JEV_CHOICE).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["department"]["type"], "choice");
+}

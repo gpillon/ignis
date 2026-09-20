@@ -311,6 +311,22 @@ pub enum QuestionKind {
     Score,
 }
 
+impl QuestionKind {
+    /// The label this primitive is counted under (GitHub #241).
+    ///
+    /// Stated here, at the wire type, rather than in the projection: the
+    /// projection owns the label set and this owns which of its values a
+    /// question maps to, so a primitive added to the wire fails to compile
+    /// until somebody decides what it is counted as.
+    fn primitive(self) -> crate::metrics::Primitive {
+        match self {
+            Self::Noul => crate::metrics::Primitive::Noul,
+            Self::Choice => crate::metrics::Primitive::Choice,
+            Self::Score => crate::metrics::Primitive::Score,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -948,6 +964,7 @@ async fn serve(
     server: &crate::Server,
     request: DecideRequest,
 ) -> Result<DecideResponse, Refusal> {
+    let started = std::time::Instant::now();
     refuse_thinking(server, &request)?;
     let prepared = prepare(&request.questions, &server.alphabet)?;
     let evidence = Evidence::read(&request.state);
@@ -1063,6 +1080,7 @@ async fn serve(
             }
         }
     }
+    log_decision(&prepared, &answers, input_tokens, started);
     Ok(DecideResponse {
         // The model that *performed* the evaluation, which is the one the
         // engine resolved — not the string the caller sent.
@@ -1077,6 +1095,51 @@ async fn serve(
             output_tokens: 0,
         },
     })
+}
+
+/// The request log's line for one served decision (GitHub #241, ADR 0011).
+///
+/// A decision's N internal requests each get the `ignis.request.*` lifecycle
+/// they earn, from the telemetry consumer, but nothing ties them back
+/// together: twenty `admitted`/`done` pairs is not a reading of "one
+/// decision of twenty questions", and the fan-out is what a caller asked
+/// for. This is that reading, and the only one emitted from the endpoint.
+///
+/// `types` is the distinct primitives in declared order, so it is one of
+/// seven strings and never unbounded — the log is not a metric, but a field
+/// somebody will eventually group by should be groupable.
+fn log_decision(
+    prepared: &[PreparedQuestion],
+    answers: &BTreeMap<String, Answer>,
+    input_tokens: u32,
+    started: std::time::Instant,
+) {
+    let mut types: Vec<&str> = Vec::with_capacity(3);
+    for question in prepared {
+        let label = match question.kind {
+            QuestionKind::Noul => "noul",
+            QuestionKind::Choice => "choice",
+            QuestionKind::Score => "score",
+        };
+        if !types.contains(&label) {
+            types.push(label);
+        }
+    }
+    let errors = answers
+        .values()
+        .filter(|answer| matches!(answer, Answer::Error { .. }))
+        .count();
+    tracing::info!(
+        name: "ignis.decision.done",
+        questions = prepared.len(),
+        types = types.join(","),
+        answered = prepared.len() - errors,
+        errors,
+        input_tokens,
+        output_tokens = 0,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "decision done"
+    );
 }
 
 /// Refuse a request that asked for thinking, in any of the shapes this
@@ -1192,6 +1255,14 @@ async fn ask(
         match crate::engine::collect_readout(&mut events, server.request_timeout).await {
             Ok(readout) => {
                 guard.completed();
+                // GitHub #241. Here rather than in `serve` because this is
+                // where the `Readout` is, and the answer built from it
+                // keeps no trace of how much of the distribution it stood
+                // on — a `choice` of 0.03 answer mass and one of 0.999 are
+                // the same JSON.
+                if let Some(metrics) = &server.metrics {
+                    metrics.record_decision(question.kind.primitive(), readout.answer_mass());
+                }
                 answer_for(question, &readout)
             }
             Err(_) => failed(

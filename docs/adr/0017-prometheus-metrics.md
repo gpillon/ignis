@@ -187,12 +187,52 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
+| `ignis_decisions_total` | counter | `type=noul\|choice\|score` | Questions answered by a readout, by typed primitive (#241, ADR 0034). **Absent until the first one** — see below |
+| `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a decision's declared options. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 eleven reserved lines, the budget, the KV pool's pages and page bytes, the
 pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
+
+**The decision family is the one thing here that is absent when it is zero
+(#241).** Every other series is exported from the first scrape, zeros
+included, because a zero is a reading. A decision's are not exported until a
+decision has been served, and that is this ADR's other rule — *only
+authoritative values are exported* — applied to a route most loads never
+call: four permanently-zero series and an eleven-bucket histogram on every
+scrape of every server would be clutter that says nothing about the server
+it is scraped from. Prometheus handles a series that appears mid-window the
+way it handles a new target. Once the family exists, **all three `type`
+values are exported**, including the zeros: a label value that vanishes with
+its count is a series that breaks `sum by (type)` the moment traffic shifts.
+
+The pair is recorded by the HTTP handler, like `ignis_requests_rejected_total`
+and for the same reason: there is no fact for it on the model thread's
+stream, and inventing one would put a decision's arithmetic on the inference
+path to observe something the handler already holds. It is counted **per
+question**, not per request — twenty questions over one `state` are twenty
+readouts, and one of them collapsing while its siblings are fine is exactly
+what the histogram exists to show.
+
+`ignis_decision_answer_mass` is a ratio in `[0, 1]`, which is not the
+percentage this ADR forbids: the forbidden thing is a ratio *standing in for*
+two terms a reader needs separately, and answer mass has no second term — it
+is the quantity itself. Its buckets are 0.5, 0.9, 0.95, 0.98, 0.99, 0.995,
+0.998, 0.999, 0.9995 and 1, plus the implicit `+Inf`. The measured baseline
+is a median of 0.996 and above from 8 to 256 options, so an evenly spaced
+scale would put every healthy reading in one bucket and show a flat line
+whatever happened; the resolution is where the signal is, and the two coarse
+buckets below exist to make a collapse unmissable rather than to resolve it.
+`le="1"` equals `_count` on a correct readout, and that redundancy is the
+assertion the exposition carries.
+
+**`confidence` is not exported.** The endpoint reports a per-answer
+confidence, and aggregating it would produce a histogram over callers who
+each mean something different by it — a threshold is a property of a domain,
+not of a server. Answer mass is the server's own reading of the same prompt
+and is comparable across every caller.
 
 **Eviction is a departure from a tier, and there are five of them (#224).**
 The contract names each one separately rather than summing them, because they
