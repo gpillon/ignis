@@ -1,5 +1,5 @@
 import { caption, field } from "../ui/classes.ts";
-import { IconClose, IconPlus } from "../ui/icons.tsx";
+import { IconClose, IconPlus, IconTrash } from "../ui/icons.tsx";
 import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
   emptyOption,
@@ -43,15 +43,9 @@ export function QuestionCard({
 
   return (
     <li className={`cut border-l-2 bg-surface p-3 ${bad ? "border-l-warn" : "border-l-line"}`}>
+      {/* The type and the controls; what the question *asks* is the field
+          below, because that is what a reader is here to write. */}
       <div className="flex items-center gap-2">
-        <input
-          value={question.id}
-          onChange={(e) => set("id", e.target.value)}
-          name={`${question.uid}-id`}
-          aria-label="Answer name"
-          placeholder="answer_name"
-          className={`${field} min-w-0 flex-1 font-mono text-[13px]`}
-        />
         <select
           value={question.kind}
           onChange={(e) => set("kind", e.target.value as Primitive)}
@@ -65,7 +59,8 @@ export function QuestionCard({
             </option>
           ))}
         </select>
-        <div className="flex shrink-0">
+        <span className="min-w-0 flex-1" />
+        <div className="flex shrink-0 items-center">
           <MoveButton label="Move up" disabled={first} onClick={() => onMove(-1)}>
             ↑
           </MoveButton>
@@ -74,12 +69,12 @@ export function QuestionCard({
           </MoveButton>
           <button
             type="button"
-            aria-label="Remove this question"
-            title="Remove this question"
+            aria-label="Delete this question"
+            title="Delete this question"
             onClick={onRemove}
-            className="grid size-7 place-items-center text-ash hover:bg-line hover:text-fault"
+            className="grid size-8 place-items-center text-ash hover:bg-fault hover:text-ground"
           >
-            <IconClose />
+            <IconTrash />
           </button>
         </div>
       </div>
@@ -94,7 +89,7 @@ export function QuestionCard({
           aria-label="What the model should decide"
           placeholder="What should the model decide?"
           rows={2}
-          className={`${field} mt-2 resize-y`}
+          className={`${field} mt-2 resize-y text-[15px]`}
         />
       ) : (
         <div className="mt-2">
@@ -149,6 +144,18 @@ export function QuestionCard({
           </p>
         </div>
       )}
+
+      <label className="mt-3 flex items-baseline gap-2">
+        <span className={`${caption} shrink-0`}>Answer name</span>
+        <input
+          value={question.id}
+          onChange={(e) => set("id", e.target.value)}
+          name={`${question.uid}-id`}
+          title="The key this question's answer comes back under"
+          placeholder="answer_name"
+          className={`${field} min-w-0 flex-1 py-1 font-mono text-[12px]`}
+        />
+      </label>
 
       {bad && (
         <ul className="mt-2 flex flex-col gap-1">

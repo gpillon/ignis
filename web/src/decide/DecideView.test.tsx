@@ -62,6 +62,19 @@ describe("DecideView", () => {
 });
 
 describe("QuestionCard", () => {
+  it("leads with what the question asks, and labels the answer name it keys", () => {
+    const html = card(ask("choice", { options: [{ key: "a", description: "the a" }] }));
+    // The name is a key, so it is labelled and it comes last; the field that
+    // is prominent and unlabelled is the one whose placeholder explains itself.
+    expect(html).toContain('placeholder="What should the model decide?"');
+    expect(html).toContain("Answer name");
+    expect(html.indexOf("What should the model decide?")).toBeLessThan(html.indexOf("Answer name"));
+  });
+
+  it("offers a plain way to delete the question", () => {
+    expect(card(ask("noul"))).toContain('aria-label="Delete this question"');
+  });
+
   it("shows a noul's two descriptions, with the server's defaults as the placeholders", () => {
     const html = card(ask("noul"));
     expect(html).toContain("A yes means");

@@ -1,5 +1,6 @@
 import { type CSSProperties, type ReactNode, useEffect, useState } from "react";
 import type { PromptImage } from "../conversation/images.ts";
+import { IconClose, IconExpand } from "../ui/icons.tsx";
 import type { DigitDraw } from "./request.ts";
 
 // The marks the answers are drawn with (GitHub #247), in the palette's tokens
@@ -186,9 +187,16 @@ export function DigitTrace({ digits, offset = 0 }: { digits: DigitDraw[]; offset
  * A point or a box on the image the request submitted.
  *
  * The SVG shares the image's own coordinate system, so the answer's pixels are
- * drawn as pixels whatever size the image is displayed at. The halo is the
- * model's declared uncertainty and is labelled as that, never as a bound: on
- * the measured sample it covers the true error on four axes of six.
+ * drawn as pixels whatever size the image is displayed at — which is how the
+ * same drawing serves both the preview and the full-size view.
+ *
+ * A preview, because an answer panel is a column of answers and one picture
+ * should not own the column. Clicking it opens the picture at its own size,
+ * where a crosshair a few pixels wide is actually readable.
+ *
+ * The halo is the model's declared uncertainty and is labelled as that, never
+ * as a bound: on the measured sample it covers the true error on four axes of
+ * six.
  */
 export function ImageMark({
   image,
@@ -203,28 +211,70 @@ export function ImageMark({
   const [natural, setNatural] = useState<{ width: number; height: number } | null>(
     image.width > 0 && image.height > 0 ? { width: image.width, height: image.height } : null,
   );
+  const [open, setOpen] = useState(false);
+
+  // One plate, drawn twice: the preview and the full-size view differ only in
+  // how tall the image is allowed to be, so the marks cannot drift apart.
+  const plate = (limit: string) => (
+    <span className="relative inline-block align-top bg-ground">
+      <img
+        src={image.url}
+        alt=""
+        className={`block w-auto max-w-full ${limit}`}
+        onLoad={(e) => setNatural({ width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight })}
+      />
+      {natural && (
+        <svg viewBox={`0 0 ${natural.width} ${natural.height}`} preserveAspectRatio="none" className="absolute inset-0 size-full" aria-hidden>
+          {children(natural)}
+        </svg>
+      )}
+    </span>
+  );
+
   return (
     <figure className="m-0">
-      <div className="relative w-full bg-ground">
-        <img
-          src={image.url}
-          alt=""
-          className="block h-auto w-full"
-          onLoad={(e) => setNatural({ width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight })}
-        />
-        {natural && (
-          <svg
-            viewBox={`0 0 ${natural.width} ${natural.height}`}
-            preserveAspectRatio="none"
-            className="absolute inset-0 size-full"
-            aria-hidden
-          >
-            {children(natural)}
-          </svg>
-        )}
-      </div>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        title="Open the picture at its own size"
+        className="group relative block max-w-full cursor-zoom-in"
+      >
+        {plate("max-h-56")}
+        <span className="absolute bottom-1 right-1 flex items-center gap-1 bg-kiln/85 px-1.5 py-0.5 font-display text-[11px] text-[#eae8e4] opacity-70 transition-opacity group-hover:opacity-100">
+          <IconExpand />
+          Full size
+        </span>
+      </button>
       <figcaption className="mt-2 text-[12px] leading-snug text-ash">{caption}</figcaption>
+      {open && <Lightbox onClose={() => setOpen(false)}>{plate("max-h-[82vh]")}</Lightbox>}
     </figure>
+  );
+}
+
+/**
+ * A picture at its own size, over the page. Escape and a click outside close
+ * it; nothing under it moves, so going back is exactly where you were.
+ */
+export function Lightbox({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  useEffect(() => {
+    const key = (e: globalThis.KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-[#1c2026]/88 p-4" onClick={onClose} role="presentation">
+      <div className="relative max-h-full max-w-full" onClick={(e) => e.stopPropagation()}>
+        {children}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close the picture"
+          className="absolute right-0 top-0 grid size-8 place-items-center bg-kiln text-[#eae8e4] hover:bg-ember"
+        >
+          <IconClose />
+        </button>
+      </div>
+    </div>
   );
 }
 

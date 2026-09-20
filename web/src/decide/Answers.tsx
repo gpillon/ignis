@@ -56,15 +56,21 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
 }
 
 function AnswerPanel({ question, answer, draft }: { question: Question; answer: Answer | undefined; draft: Draft }) {
+  // What was asked is the heading. The name is how the answer is *keyed*,
+  // which matters to the caller writing code against it and not to the reader
+  // looking at the answer, so it sits beside the primitive as a label.
+  const asked = asText(question.instructions).trim();
   return (
     <section>
       <header className="flex items-baseline justify-between gap-3">
-        <h3 className="min-w-0 font-display text-[15px] font-semibold text-ink">
-          <span className="truncate">{question.id}</span>
-        </h3>
-        <span className="cut shrink-0 bg-surface px-2 py-0.5 font-display text-[11px] text-ash [--cut-size:5px]">{question.kind}</span>
+        <h3 className="min-w-0 font-display text-[17px] font-semibold leading-snug text-ink">{asked || question.id}</h3>
+        <span className="flex shrink-0 items-baseline gap-2 font-display text-[11px] text-ash">
+          <span className="font-mono" title="The key this answer came back under">
+            {question.id}
+          </span>
+          <span className="cut bg-surface px-2 py-0.5 [--cut-size:5px]">{question.kind}</span>
+        </span>
       </header>
-      <p className="mt-0.5 max-w-[68ch] text-[13px] leading-snug text-ash">{asText(question.instructions)}</p>
       <div className="mt-3">
         {answer === undefined ? (
           <Missing id={question.id} />

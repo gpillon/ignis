@@ -27,6 +27,33 @@ function render(questions: Question[], answers: Record<string, Answer>, evidence
 const order = (html: string, needles: string[]) => [...needles].sort((a, b) => html.indexOf(a) - html.indexOf(b));
 
 describe("Answers", () => {
+  it("heads a panel with what was asked, and keeps the answer name as a label beside it", () => {
+    const asked = "Which team should handle this?";
+    const html = render([{ ...question("department", "choice", { options: [{ key: "a", description: "" }] }), instructions: jsonString(asked) }], {
+      department: { type: "choice", choice: "a", probabilities: { a: 1 }, confidence: 1 },
+    });
+    expect(html).toContain(`>${asked}</h3>`);
+    expect(html).toContain('title="The key this answer came back under"');
+    expect(html).toContain("department");
+  });
+
+  it("falls back to the answer name when a question asked nothing", () => {
+    const html = render([{ ...question("bare", "noul"), instructions: jsonString("") }], { bare: { type: "noul", noul: 0.5 } });
+    expect(html).toMatch(/<h3[^>]*>bare<\/h3>/);
+  });
+
+  it("shows the image as a preview that opens at full size, not as a column-wide picture", () => {
+    const html = render(
+      [question("p", "point")],
+      { p: { type: "point", pixels: { x: 12, y: 8 }, normalized: { x: 30, y: 40 }, uncertainty: { x: 1, y: 1 }, digits: {} } },
+      { mode: "image", images: [image], text: "" },
+      6,
+    );
+    expect(html).toContain("max-h-56");
+    expect(html).toContain("Full size");
+    expect(html).toContain("cursor-zoom-in");
+  });
+
   it("leads with the cost and says a readout generated nothing", () => {
     const html = render([question("a", "noul")], { a: { type: "noul", noul: 0.86 } });
     expect(html).toContain("312");

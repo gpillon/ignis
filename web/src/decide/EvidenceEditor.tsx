@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { caption, field } from "../ui/classes.ts";
 import { IconClose, IconImage } from "../ui/icons.tsx";
+import { Lightbox } from "./marks.tsx";
 import { type Evidence, type EvidenceMode, restore, setAside, type Spare } from "./model.ts";
 
 // The evidence (GitHub #247): what every question in the request is asked
@@ -141,6 +142,8 @@ function ImagePicker({
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [over, setOver] = useState(false);
+  // The thumbnail is a thumbnail; the evidence itself is worth a proper look.
+  const [zoom, setZoom] = useState<PromptImage | null>(null);
   return (
     <div className="mt-2">
       <div
@@ -158,7 +161,9 @@ function ImagePicker({
       >
         {images.map((image, index) => (
           <span key={index} className="relative block">
-            <img src={image.url} alt={image.name} className="cut block h-20 w-auto border border-line [--cut-size:6px]" />
+            <button type="button" onClick={() => setZoom(image)} title={`Open ${image.name} at its own size`} className="block cursor-zoom-in">
+              <img src={image.url} alt={image.name} className="cut block h-20 w-auto border border-line [--cut-size:6px]" />
+            </button>
             <button
               type="button"
               aria-label={`Remove ${image.name}`}
@@ -192,6 +197,11 @@ function ImagePicker({
         />
       </div>
       {error && <p className="mt-1 text-[12px] leading-snug text-warn">{error}</p>}
+      {zoom && (
+        <Lightbox onClose={() => setZoom(null)}>
+          <img src={zoom.url} alt={zoom.name} className="block max-h-[82vh] w-auto max-w-full" />
+        </Lightbox>
+      )}
       <label className="mt-2 block">
         <span className={`${caption} block`}>Words with the image, if any</span>
         <input
