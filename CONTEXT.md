@@ -477,9 +477,10 @@ When output names a domain concept, use the term as defined here.
   memoized by content digest. A refused image refuses its request before
   admission; nothing reaches the scheduler.
 - **Media encode** — the prefill step that runs the **vision encoder** over
-  one **media item** and leaves its **media embedding** on the device, in the
-  first chunk that reaches the item. Its wall time is reported on the
-  request, apart from the prefill's.
+  one **media item** and leaves its **media embedding** in the **embedding
+  pool**, in the first chunk that reaches the item — unless the pool already
+  holds that item's, in which case the chunk does no encoding at all. Its
+  wall time is reported on the request, apart from the prefill's.
 - **Media item** — one image in a prompt: its patch grid, the run of
   placeholder tokens it expands to, its BF16 patch rows and the digest of the
   bytes it came from. The unit the processor prepares, the encoder encodes and
@@ -488,8 +489,21 @@ When output names a domain concept, use the term as defined here.
   patches: the placeholder run's length, and what the per-request envelope
   (`--vision-max-tokens`) is counted in.
 - **Media embedding** — a media item's encoder output, `[hidden, vision
-  tokens]`, device-resident and leaf-owned. Live from its encode until the
-  item's last placeholder is prefilled; the load reserves room for one.
+  tokens]`, device-resident and leaf-owned. **Held** by a request from its
+  encode until the item's last placeholder is prefilled, and **resident** in
+  the **embedding pool** past that, until something needs its room: a fan-out
+  of N questions over one image encodes it once (ADR 0035). Identified by the
+  item's content digest and grid — not by the request, and not by where the
+  placeholders landed.
+- **Embedding pool** — the load's one device reservation for **media
+  embeddings** (`--vision-embedding-pool-mib`, defaulting to one
+  envelope-wide item), carved into fixed-width **column pages** so an item
+  takes the pages its own columns need rather than a slot sized for the
+  envelope. An embedding is contiguous in column space and not in memory:
+  the encoder writes it a page at a time and a prefill chunk scatters it back
+  a page run at a time, with the same ops either did over one flat buffer.
+  The leaf owns the bytes and refuses when they are gone; the runtime owns
+  which resident embedding is given up (least recently unheld).
 - **Vision encoder** — the 27-block tower plus the 2x2 merger that turns patch
   rows into a media embedding. Run once per item by the **media encode** step,
   never per chunk.
@@ -529,6 +543,29 @@ When output names a domain concept, use the term as defined here.
   a declared set of tokens. What a **readout** is to one position, this is to
   a run of them: the answer's shape is the caller's, so nothing has to parse
   what comes back. It is the only decision primitive that generates tokens.
+  The wire exposes it as `number`, `point` and `box` (GitHub #242): a number
+  read digit by digit, and two or four of those.
+- **Permitted set** — the vocabulary entries one step of a **constrained
+  decode** may draw from, at most 32 of them. The leaf drives every other
+  column of the logits row to `-1e30` before the vendored sampler runs, so
+  the constraint composes with temperature, top-k, seeds and penalties
+  instead of replacing them, and what comes back is a token id like any
+  other. A set the leaf cannot honour is **refused, never truncated**: a
+  constraint silently narrowed is a wrong answer that looks like a right one.
+- **Schedule** — one **permitted set** per token a **constrained decode**
+  will emit, in order. It is that request's whole generation budget and its
+  whole stopping condition: the run ends when the schedule is spent, with
+  `stop`, and never on EOS, because a token drawn from a set of digits cannot
+  be one. Not the request **scheduler's** anything — it schedules alphabets,
+  not requests. A set of cardinality one is how a literal is forced
+  mid-generation.
+- **Draw** — one token a **constrained decode** emitted, and its probability
+  *within that step's **permitted set*** — a restricted softmax over at most
+  32 logits, computed on the device and temperature-free on purpose: it is
+  the model's confidence in the token, not the chance the sampler happened to
+  pick it. A run's draws, in order, are its **trace**. The first token of a
+  run is drawn by its **prefill**, not by its first decode round, because a
+  round returns the token the previous call made ready.
 - **Answer mass** — how much of the whole next-token distribution the answer
   tokens hold, `exp(logsumexp(answer logits) - logsumexp(all logits))`. It is
   what says whether a restricted softmax is reading the model or renormalizing

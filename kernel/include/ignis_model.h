@@ -141,9 +141,9 @@ struct ignis_model_load_options {
   uint32_t draft_tokens;
   /* The vision envelope in merged vision tokens per request (GitHub #177);
    * 0 = no vision. Nonzero binds every `vision/*` tensor and reserves, at
-   * load, the encoder workspace and the per-item `[5120, V]` output
-   * transient for V = min(max_context_tokens, vision_max_tokens) -- before
-   * the caller builds its sequence pool. The workspace is not an arena of
+   * load, the encoder workspace for V = min(max_context_tokens,
+   * vision_max_tokens) and the embedding pool below -- before the caller
+   * builds its sequence pool. The workspace is not an arena of
    * its own (GitHub #212): the load's scratch arena is sized for the larger
    * of a prefill chunk's scratch and the encoder's workspace, and media
    * encode runs out of it between prefill steps. At most
@@ -152,6 +152,19 @@ struct ignis_model_load_options {
    * rotates its columns at `position + rope_delta` the way a decode round
    * already does. */
   uint32_t vision_max_tokens;
+  /* GitHub #243: bytes reserved for the media embedding pool, carved into
+   * fixed-width column pages (IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS columns of
+   * `[hidden]` BF16 each). An item takes the pages its own columns need, so a
+   * pool holds as many embeddings as fit rather than a fixed count: at 5120
+   * hidden a page is 1,280 KiB, a 320x240 thumbnail is one page and a
+   * 4096x4096 screenshot is 128. 0 with `vision_max_tokens` 0; otherwise at
+   * least the envelope's own output (one item must always fit once everything
+   * else is released), and `ignis_media_encode` refuses with
+   * IGNIS_MEDIA_ENCODE_POOL_FULL while live embeddings hold the rest. This is
+   * where the reference keeps a single output transient: the pool is a
+   * departure (ADR 0035), because an embedding outliving its encode is what
+   * lets a fan-out over one image encode it once. */
+  uint64_t vision_embedding_pool_bytes;
   /* GitHub #227: YaRN RoPE scaling, the text frequency table this load
    * rotates at. 0 (or 1) is no scaling -- the linear table the engine has
    * always used, whose `attention_factor` of 1 keeps `ops::rope`'s exact
@@ -185,7 +198,10 @@ struct ignis_model_reservations {
    * the drafter's context append under DFLASH2), or with vision the encoder
    * workspace when that is larger. The two are never live at once. */
   uint64_t workspace_bytes;
-  /* One media item's `[hidden, V]` encoder output; 0 without vision. */
+  /* The media embedding pool (GitHub #243): the load's
+   * `vision_embedding_pool_bytes`, rounded up to a whole number of column
+   * pages. 0 without vision. Holds as many items as their own columns fit,
+   * not a fixed count -- see `ignis_model_load_options`. */
   uint64_t media_embedding_bytes;
   /* Device sampling's staging buffers and candidate-selection workspace. */
   uint64_t sampling_bytes;

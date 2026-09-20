@@ -432,6 +432,14 @@ async fn telemetry_task(
                     tokens,
                     reason,
                     spec,
+                    // GitHub #238: the readout is the decision's answer and
+                    // travels to its caller on the response stream, not into
+                    // the telemetry counters — a decision generates nothing,
+                    // so there is nothing here for `on_done` to count.
+                    // GitHub #242: and a run's trace, for the same
+                    // reason — its tokens were already counted one by one.
+                    readout: _,
+                    drawn: _,
                 } => telemetry.on_done(request, tokens, reason, spec),
                 SchedEvent::PrefillChunk {
                     request,
@@ -506,6 +514,58 @@ pub async fn collect_tokens(
     }
 }
 
+/// Drive a submitted **decision** to its answer (GitHub #239): wait for its
+/// [`SchedEvent::Done`] and hand back the readout it finished with.
+///
+/// The mirror of [`collect_tokens`], and deliberately not a special case of
+/// it: a decision emits no token, so there is nothing to collect but the
+/// readout. A `Done` that carries none is a request the engine could not
+/// answer — [`FinishReason::Error`] from the scheduler's own guard — and is
+/// reported as not completed rather than as an empty answer.
+pub async fn collect_readout(
+    rx: &mut EventStream,
+    timeout: Duration,
+) -> Result<ignis_core::decision::Readout, CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SchedEvent::Done { readout, .. })) => {
+                return readout.ok_or(CollectError::NotCompleted);
+            }
+            // Every other event for this request — its admission, its
+            // prefill chunks, a restore — says nothing about the answer.
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
+        }
+    }
+}
+
+/// Drain a **constrained decode** request's stream to its completion (GitHub #242) and
+/// return the trace it finished with: one draw per emitted token, in order.
+///
+/// The mirror of [`collect_readout`], and a separate function for the same
+/// reason the two request kinds are separate: a run's `Done` carries no
+/// readout, so `collect_readout` would report every constrained decode as
+/// `NotCompleted`. The tokens themselves are in the `SchedEvent::Token`s
+/// that preceded it and are not collected here — a run's caller wants
+/// the digits and their confidences, which the trace already pairs, and the
+/// token ids are the same numbers in the model's id space.
+pub async fn collect_draws(
+    rx: &mut EventStream,
+    timeout: Duration,
+) -> Result<Vec<ignis_core::constrained::Draw>, CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SchedEvent::Done { drawn, .. })) => {
+                return drawn.ok_or(CollectError::NotCompleted);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
+        }
+    }
+}
+
 /// The request's stream ended without a completion.
 #[derive(Debug)]
 pub enum CollectError {
@@ -539,6 +599,8 @@ mod tests {
 
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
+            decision: None,
+            constrained: None,
             multimodal: None,
             opener_tokens: None,
             user_turn_tokens: None,
@@ -675,6 +737,8 @@ mod tests {
                     token: 7,
                 },
                 SchedEvent::Done {
+                    readout: None,
+                    drawn: None,
                     request: Self::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,
@@ -744,6 +808,8 @@ mod tests {
                     token: 7,
                 },
                 SchedEvent::Done {
+                    readout: None,
+                    drawn: None,
                     request: ProtectedBatchScheduler::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,

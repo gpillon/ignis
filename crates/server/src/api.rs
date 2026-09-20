@@ -85,6 +85,17 @@ pub fn router(state: Arc<Server>) -> Router {
             post(chat_completions).options(cors_preflight),
         )
         .route("/v1/responses", post(responses_api).options(cors_preflight))
+        // GitHub #239 — the decision endpoint, and the Jev name for it so an
+        // unmodified Jev client reaches this server by changing the URL.
+        // Inside the key layer below, like every other `/v1` route.
+        .route(
+            "/v1/decide",
+            post(crate::decide::decide).options(cors_preflight),
+        )
+        .route(
+            "/v1/systemone",
+            post(crate::decide::decide).options(cors_preflight),
+        )
         // Only the `/v1` routes above: the Playground's static pages stay
         // reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
@@ -244,6 +255,7 @@ fn request_input(
     // token ids (the #189 match key), so a request that sent another picture
     // never matches past the first placeholder they differ at.
     let input = RequestInput {
+        decision: None,
         multimodal: multimodal.map(Arc::new),
         model: model.clone(),
         tokens: rendered.tokens,
@@ -251,7 +263,8 @@ fn request_input(
         opener_tokens: rendered.opener_tokens,
         user_turn_tokens: rendered.user_turn_tokens,
         system_block_tokens: rendered.system_block_tokens,
-    };
+        constrained: None,
+};
     Ok((input, model, prompt_tokens))
 }
 
@@ -288,6 +301,38 @@ async fn prepare_request(
     Ok((input, model, prompt_tokens, Some(acquired.stats)))
 }
 
+/// [`prepare_request`] for one question of a decision (GitHub #239): no
+/// model override, no tools, thinking already forced off by the caller.
+///
+/// Shares the conversation path rather than duplicating it, so a decision's
+/// prompt goes through the same instruction policy, the same media
+/// acquisition and the same multimodal render as a chat turn — an image is
+/// evidence here exactly as it is there. The error is a rendered response,
+/// ready to stand in a question's slot.
+pub(crate) async fn prepare_decision_request(
+    server: &Server,
+    model: Option<String>,
+    messages: &[ChatMessage],
+    params: DecodeParams,
+    thinking: &ThinkingOptions,
+) -> Result<(RequestInput, String, u32, Option<MediaStats>), (&'static str, String)> {
+    prepare_request(server, model, messages, params, thinking, &[])
+        .await
+        .map_err(|response| {
+            // The shared path answers with a rendered `Response`, which is
+            // the wrong shape here: a decision's refusal is one of N, and
+            // has to carry a code the decision's own 422 can name. What
+            // survives the crossing is the status, which is enough to say
+            // *which* of the two things went wrong.
+            let code = if response.status() == StatusCode::BAD_REQUEST {
+                "malformed_request"
+            } else {
+                "render_failed"
+            };
+            (code, format!("its prompt was refused ({})", response.status()))
+        })
+}
+
 /// The response for refused media (GitHub #179): a 400 with the media
 /// code, or the handler's own 504 when the request deadline passed.
 fn media_rejection(rejection: MediaRejection) -> Response {
@@ -305,7 +350,7 @@ fn media_rejection(rejection: MediaRejection) -> Response {
 /// unrecognized one — since it is never part of the model id the scheduler
 /// looks up; an empty base (`"@agent"`) is treated as having no suffix at
 /// all, leaving the whole string as the model name.
-fn split_model_lane(model: Option<String>) -> (Option<String>, Option<RequestClass>) {
+pub(crate) fn split_model_lane(model: Option<String>) -> (Option<String>, Option<RequestClass>) {
     match model {
         None => (None, None),
         Some(m) => match m.rsplit_once('@') {
@@ -1225,20 +1270,20 @@ struct ChunkStream {
 /// Cancels its request when dropped before the request has completed. An SSE
 /// client that hangs up mid-generation would otherwise leave its lane and KV
 /// reservation generating to `max_tokens` for nobody.
-struct CancelOnDrop {
+pub(crate) struct CancelOnDrop {
     engine: Engine,
     request: RequestId,
     completed: bool,
 }
 
 impl CancelOnDrop {
-    fn new(engine: Engine, request: RequestId) -> Self {
+    pub(crate) fn new(engine: Engine, request: RequestId) -> Self {
         Self { engine, request, completed: false }
     }
 
     /// The request reached its own terminal event: dropping is now a
     /// clean end of stream, not a disconnect.
-    fn completed(&mut self) {
+    pub(crate) fn completed(&mut self) {
         self.completed = true;
     }
 }

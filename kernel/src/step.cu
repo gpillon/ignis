@@ -16,6 +16,7 @@
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "permitted_tokens.h"
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/embedding.h"
@@ -65,6 +66,13 @@ float bf16_to_f32(std::uint16_t bits) {
   return value;
 }
 
+// P6-06 (GitHub #242): a lane's permitted set is refused wherever it cannot
+// be honoured, rather than ignored -- a constraint silently dropped is a
+// wrong answer that looks like a right one.
+bool unconstrained(const ignis_sampling_params &sampling) {
+  return sampling.permitted_count == 0;
+}
+
 // P3-03 (GitHub #99): `sampling->size` must match what this leaf compiled
 // against (ADR 0016) -- checked wherever a caller-supplied
 // ignis_sampling_params is read.
@@ -104,7 +112,55 @@ ninfer::ops::SamplingConfig to_sampling_config(const ignis_sampling_params &abi,
 // error.
 int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       const ninfer::Tensor &logits, const ignis_sampling_params &sampling,
-                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id) {
+                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id,
+                      float *out_permitted_prob) {
+  // GitHub #242: the prefill's own draw is the first token of a constrained
+  // run, so this path masks too -- staged through the decode buffers' lane
+  // 0, which no decode round is using while a prefill holds the stream.
+  const bool constrained = !unconstrained(sampling);
+  if (constrained) {
+    if (sampling.permitted_count > IGNIS_MAX_PERMITTED_TOKENS) {
+      set_error("ignis_program: permitted_count " + std::to_string(sampling.permitted_count) +
+                " exceeds IGNIS_MAX_PERMITTED_TOKENS (" +
+                std::to_string(IGNIS_MAX_PERMITTED_TOKENS) + ")");
+      return -1;
+    }
+    if (sampling.permitted_ids == nullptr) {
+      set_error("ignis_program: permitted_ids is null with a nonzero count");
+      return -1;
+    }
+    std::vector<std::int32_t> row(IGNIS_MAX_PERMITTED_TOKENS, -1);
+    const auto vocab = static_cast<std::int32_t>(model->vocab);
+    for (uint32_t k = 0; k < sampling.permitted_count; ++k) {
+      const int32_t id = sampling.permitted_ids[k];
+      if (id < 0 || id >= vocab) {
+        set_error("ignis_program: permitted id " + std::to_string(id) +
+                  " is outside the vocabulary");
+        return -1;
+      }
+      row[k] = id;
+    }
+    const std::int32_t count = static_cast<std::int32_t>(sampling.permitted_count);
+    cudaError_t staged =
+        cudaMemcpyAsync(model->sampling_decode_permitted->p, row.data(),
+                        row.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, model->stream);
+    if (staged == cudaSuccess) {
+      staged = cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, &count, sizeof(count),
+                               cudaMemcpyHostToDevice, model->stream);
+    }
+    if (staged != cudaSuccess) {
+      set_error(std::string("ignis_program: cudaMemcpyAsync(permitted set) failed: ") +
+                cudaGetErrorString(staged));
+      return -1;
+    }
+    if (ignis_permit_mask(logits.data, vocab, 1,
+                          static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+                          static_cast<const int32_t *>(model->sampling_decode_permitted_counts->p),
+                          IGNIS_MAX_PERMITTED_TOKENS, model->stream) != 0) {
+      set_error("ignis_program: permitted-set mask launch failed");
+      return -1;
+    }
+  }
   const ninfer::ops::SamplingConfig cfg =
       to_sampling_config(sampling, pool->token_counts_for(seq->slot));
   cudaError_t err = cudaMemcpyAsync(model->sampling_single_configs->p, &cfg, sizeof(cfg),
@@ -133,6 +189,30 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program: sample() failed: ") + e.what());
     return -1;
+  }
+  // GitHub #242: the drawn token's share of its own set, while the logits
+  // are still here. Read from lane 0's staging, the same row the mask used.
+  if (constrained && out_permitted_prob != nullptr) {
+    if (ignis_permit_probability(
+            logits.data, static_cast<std::int32_t>(model->vocab), 1,
+            static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+            static_cast<const int32_t *>(model->sampling_decode_permitted_counts->p),
+            IGNIS_MAX_PERMITTED_TOKENS,
+            static_cast<const int32_t *>(model->sampling_single_out->p),
+            static_cast<float *>(model->sampling_decode_permitted_probs->p),
+            model->stream) != 0) {
+      set_error("ignis_program: permitted-set probability launch failed");
+      return -1;
+    }
+    err = cudaMemcpyAsync(out_permitted_prob, model->sampling_decode_permitted_probs->p,
+                          sizeof(float), cudaMemcpyDeviceToHost, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program: cudaMemcpyAsync(permitted probability) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+  } else if (out_permitted_prob != nullptr) {
+    *out_permitted_prob = 0.0f;
   }
   err = cudaMemcpyAsync(out_token_id, model->sampling_single_out->p, sizeof(*out_token_id),
                         cudaMemcpyDeviceToHost, model->stream);
@@ -260,7 +340,8 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
 // after this call returns).
 int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           int32_t token_id, const ignis_sampling_params &sampling,
-                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode) {
+                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode,
+                          float *permitted_prob_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
@@ -305,7 +386,8 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
     ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
     if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
-                      static_cast<std::int32_t>(seq->position), out_token_id) != 0) {
+                      static_cast<std::int32_t>(seq->position), out_token_id,
+                      permitted_prob_out) != 0) {
       return -1;
     }
 
@@ -671,7 +753,7 @@ bool validate_span_multimodal(const ignis_model *model, int32_t route, const Spa
     return (span.media == nullptr && span.count == 0) ||
            refuse("media columns need the span's multimodal positions");
   }
-  if (model->vision_output == nullptr) {
+  if (!model->vision_pool.present()) {
     return refuse("a multimodal span on a model loaded without vision");
   }
   if (route != IGNIS_PREFILL_ROUTE_CHUNKED) {
@@ -726,7 +808,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           uint64_t dflash2_tap_from, bool compute_output,
                           const ignis_sampling_params &sampling, int32_t *out_token_id,
                           float *out_logits, LinearPolicyMode mode,
-                          const SpanMultimodal &multimodal) {
+                          const SpanMultimodal &multimodal, float *permitted_prob_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -811,13 +893,28 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                     cudaGetErrorString(err));
           return -1;
         }
-        const std::size_t column =
-            multimodal.first_column + static_cast<std::size_t>(first - multimodal.scatter);
-        const ninfer::Tensor columns(static_cast<std::uint8_t *>(model->vision_output->p) +
-                                         column * static_cast<std::size_t>(hidden) *
-                                             sizeof(std::uint16_t),
-                                     ninfer::DType::BF16, {hidden, count, 1, 1});
-        ninfer::ops::scatter(columns, indices, left, model->stream);
+        const auto column =
+            static_cast<std::int32_t>(multimodal.first_column) +
+            static_cast<std::int32_t>(first - multimodal.scatter);
+        // GitHub #243: the chunk's columns are contiguous in the embedding's
+        // column space but sit in its pool pages, so the scatter runs once
+        // per page run. Same `ops::scatter` the single output transient
+        // took, over a narrower column range and the matching slice of the
+        // indices -- no kernel here reads a page table.
+        const VisionEmbeddingPool &pool = model->vision_pool;
+        for (std::int32_t done = 0; done < count;) {
+          const std::int32_t at = column + done;
+          const std::int32_t page = at / pool.page_columns;
+          const std::int32_t within = at % pool.page_columns;
+          const std::int32_t take = std::min(count - done, pool.page_columns - within);
+          const ninfer::Tensor columns(
+              pool.page_ptr(multimodal.media->pages[static_cast<std::size_t>(page)]) +
+                  static_cast<std::size_t>(within) * static_cast<std::size_t>(hidden) *
+                      sizeof(std::uint16_t),
+              ninfer::DType::BF16, {hidden, take, 1, 1});
+          ninfer::ops::scatter(columns, indices.slice(0, done, take), left, model->stream);
+          done += take;
+        }
       }
     }
 
@@ -907,7 +1004,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       // here (the caller advances it only after this function returns 0).
       const auto last_position = static_cast<std::int32_t>(seq->position + T - 1);
       if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
-                        last_position, out_token_id) != 0) {
+                        last_position, out_token_id, permitted_prob_out) != 0) {
         return -1;
       }
       if (out_logits != nullptr) {
@@ -999,7 +1096,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
-                                    LinearPolicyMode mode, const SpanMultimodal &multimodal) {
+                                    LinearPolicyMode mode, const SpanMultimodal &multimodal,
+                                    float *permitted_prob) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
@@ -1010,7 +1108,8 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
-                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal) != 0) {
+                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal,
+                          is_last_chunk ? permitted_prob : nullptr) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1140,6 +1239,9 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   }
 
   const auto began = std::chrono::steady_clock::now();
+  // GitHub #242: where the span's own draw reports its restricted
+  // probability, when the caller asked and declared a set.
+  float *permitted_prob = (options != nullptr) ? options->out_permitted_prob : nullptr;
   int32_t rc = 0;
   if (route == IGNIS_PREFILL_ROUTE_PER_TOKEN) {
     // Test-only self-oracle route (ADR 0016): the per-token loop, one
@@ -1152,7 +1254,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       // every earlier position stays argmax-only.
       float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
       if (run_program_token(model, pool, seq, token_ids[i], *sampling, &successor, slot_logits,
-                            mode) != 0) {
+                            mode, (i + 1 == num_tokens) ? permitted_prob : nullptr) != 0) {
         rc = -1;
         break;
       }
@@ -1161,7 +1263,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     }
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
-                                     out_logits, mode, multimodal);
+                                     out_logits, mode, multimodal, permitted_prob);
   }
   if (rc != 0) {
     return rc;
@@ -1652,6 +1754,18 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         set_error("ignis_program_decode: out_committed_counts is null for a verify round");
         return -1;
       }
+      // GitHub #242: a drafted column is proposed by a second model and
+      // accepted by a kernel that knows nothing of a permitted set, so a
+      // verify round cannot honour one. Refused rather than applied to the
+      // anchor alone, which would constrain one token of a run and leave
+      // the drafts free.
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        if (!unconstrained(sampling[i])) {
+          set_error("ignis_program_decode: a permitted token set cannot ride a verify round (index " +
+                    std::to_string(i) + ")");
+          return -1;
+        }
+      }
       const auto began = std::chrono::steady_clock::now();
       const int32_t rc =
           run_verify_round(model, pool, sequences, batch_size, sampling, *options, out_token_ids);
@@ -1672,6 +1786,13 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
   std::vector<std::int32_t> positions(batch_size, 0);
   std::vector<std::int32_t> rope_positions(batch_size, 0);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
+  // GitHub #242: this round's permitted sets, flattened into the fixed
+  // per-lane row the staging buffer holds. `-1` is the filler for a lane's
+  // unused entries -- never a vocabulary id, and never read, since the
+  // device reads only the first `permitted_counts[lane]` of them.
+  std::vector<std::int32_t> permitted(batch_size * IGNIS_MAX_PERMITTED_TOKENS, -1);
+  std::vector<std::int32_t> permitted_counts(batch_size, 0);
+  bool any_constrained = false;
 
   try {
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -1688,6 +1809,34 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       positions[i] = static_cast<std::int32_t>(seq->position);
       rope_positions[i] = positions[i] + seq->rope_delta;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
+
+      const ignis_sampling_params &lane = sampling[i];
+      if (lane.permitted_count == 0) {
+        continue;
+      }
+      if (lane.permitted_count > IGNIS_MAX_PERMITTED_TOKENS) {
+        set_error("ignis_program_decode: permitted_count " +
+                  std::to_string(lane.permitted_count) + " at index " + std::to_string(i) +
+                  " exceeds IGNIS_MAX_PERMITTED_TOKENS (" +
+                  std::to_string(IGNIS_MAX_PERMITTED_TOKENS) + ")");
+        return -1;
+      }
+      if (lane.permitted_ids == nullptr) {
+        set_error("ignis_program_decode: permitted_ids is null with a nonzero count at index " +
+                  std::to_string(i));
+        return -1;
+      }
+      for (uint32_t k = 0; k < lane.permitted_count; ++k) {
+        const int32_t id = lane.permitted_ids[k];
+        if (id < 0 || id >= vocab) {
+          set_error("ignis_program_decode: permitted id " + std::to_string(id) + " at index " +
+                    std::to_string(i) + " is outside the vocabulary");
+          return -1;
+        }
+        permitted[i * IGNIS_MAX_PERMITTED_TOKENS + k] = id;
+      }
+      permitted_counts[i] = static_cast<std::int32_t>(lane.permitted_count);
+      any_constrained = true;
     }
 
     // P3-05 (GitHub #102, ADR 0019): a decode graph is captured per exact
@@ -1696,9 +1845,18 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     // below unchanged. Both paths share the same sampling staging buffers
     // and the same round semantics (atomic: no sequence's
     // pending_token/position advances unless the whole round succeeds).
+    //
+    // GitHub #242: a round carrying a constrained lane takes the eager path
+    // whatever the graph offers. The mask has to run between the traversal
+    // and the sampler, and adding a node to a graph captured at load -- for
+    // a path that runs six rounds per number and never in a throughput
+    // workload -- would put new failure modes on every decode in the
+    // process to save a graph launch on almost none. The eager path is the
+    // same op sequence; what it costs is the submission, measured at 2.2%
+    // of a round (`docs/findings/2026-09-18-decode-round-anatomy.md`).
     const bool use_graph =
         batch_size >= 1 && batch_size <= IGNIS_DECODE_MAX_BATCH &&
-        model->decode_graph_ready[batch_size - 1];
+        model->decode_graph_ready[batch_size - 1] && !any_constrained;
 
     cudaError_t err =
         cudaMemcpyAsync(model->sampling_decode_configs->p, configs.data(),
@@ -1717,6 +1875,23 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           std::string("ignis_program_decode: cudaMemcpyAsync(sampling positions) failed: ") +
           cudaGetErrorString(err));
       return -1;
+    }
+    // GitHub #242: staged only when some lane is constrained, so an
+    // ordinary round issues exactly the copies it issued before.
+    if (any_constrained) {
+      err = cudaMemcpyAsync(model->sampling_decode_permitted->p, permitted.data(),
+                            permitted.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                            model->stream);
+      if (err == cudaSuccess) {
+        err = cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, permitted_counts.data(),
+                              batch_size * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                              model->stream);
+      }
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_decode: cudaMemcpyAsync(permitted sets) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
     }
     // GitHub #178: a vision load's rounds rotate at `position + rope_delta`,
     // staged at the address its graphs read.
@@ -1775,6 +1950,19 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         set_error(std::string("ignis_program_decode: ") + ignis_decode_graph_last_error());
         return -1;
       }
+      // GitHub #242: the constraint is applied to the logits the sampler is
+      // about to read, so the vendored op is unchanged (ADR 0010) and every
+      // parameter above still means what it meant.
+      if (any_constrained &&
+          ignis_permit_mask(model->sampling_decode_logits->p, vocab,
+                            static_cast<uint32_t>(batch_size),
+                            static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+                            static_cast<const int32_t *>(
+                                model->sampling_decode_permitted_counts->p),
+                            IGNIS_MAX_PERMITTED_TOKENS, model->stream) != 0) {
+        set_error("ignis_program_decode: permitted-set mask launch failed");
+        return -1;
+      }
       const ninfer::Tensor logits_tensor(model->sampling_decode_logits->p, ninfer::DType::BF16,
                                          {vocab, batch, 1, 1});
       ninfer::Tensor out_tensor(model->sampling_decode_out->p, ninfer::DType::I32, {batch, 1, 1, 1});
@@ -1786,6 +1974,20 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p),
           positions_tensor, ninfer::ops::kSamplePurposeDecode, *model->sampling_workspace,
           model->stream);
+      // GitHub #242: and the committed token's share of the set it was drawn
+      // from, one float per lane, while the logits are still here.
+      if (any_constrained && options != nullptr && options->out_permitted_probs != nullptr &&
+          ignis_permit_probability(
+              model->sampling_decode_logits->p, vocab, static_cast<uint32_t>(batch_size),
+              static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+              static_cast<const int32_t *>(model->sampling_decode_permitted_counts->p),
+              IGNIS_MAX_PERMITTED_TOKENS,
+              static_cast<const int32_t *>(model->sampling_decode_out->p),
+              static_cast<float *>(model->sampling_decode_permitted_probs->p),
+              model->stream) != 0) {
+        set_error("ignis_program_decode: permitted-set probability launch failed");
+        return -1;
+      }
     }
 
     std::vector<int32_t> successors(batch_size, -1);
@@ -1795,6 +1997,26 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       set_error(std::string("ignis_program_decode: cudaMemcpyAsync(sampled tokens) failed: ") +
                 cudaGetErrorString(err));
       return -1;
+    }
+    // GitHub #242: a caller that asked for the probabilities always gets an
+    // answer for every lane -- zeros for a round nothing constrained, so the
+    // field never carries the previous round's numbers.
+    if (options != nullptr && options->out_permitted_probs != nullptr) {
+      if (any_constrained) {
+        err = cudaMemcpyAsync(options->out_permitted_probs,
+                              model->sampling_decode_permitted_probs->p,
+                              batch_size * sizeof(float), cudaMemcpyDeviceToHost, model->stream);
+        if (err != cudaSuccess) {
+          set_error(
+              std::string("ignis_program_decode: cudaMemcpyAsync(permitted probabilities) failed: ") +
+              cudaGetErrorString(err));
+          return -1;
+        }
+      } else {
+        for (uint64_t i = 0; i < batch_size; ++i) {
+          options->out_permitted_probs[i] = 0.0f;
+        }
+      }
     }
     err = cudaStreamSynchronize(model->stream);
     if (err != cudaSuccess) {
@@ -1881,10 +2103,10 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   if (model->verify != nullptr) {
     out_stats->vram_bytes += model->verify->device_bytes();
   }
-  // GitHub #177: the vision output transient (its weights are already in
+  // GitHub #177: the media embedding pool (its weights are already in
   // `model->vram_bytes`, and its encoder workspace in `scratch`, GitHub #212).
-  if (model->vision_output != nullptr) {
-    out_stats->vram_bytes += model->vision_output->bytes;
+  if (model->vision_pool.buffer != nullptr) {
+    out_stats->vram_bytes += model->vision_pool.buffer->bytes;
   }
   out_stats->last_step_micros = model->last_step_micros;
   out_stats->kernel_count = model->last_step_kernel_count;

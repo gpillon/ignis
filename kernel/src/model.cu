@@ -846,10 +846,32 @@ struct LoadOptions {
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  // GitHub #243: the embedding pool's bytes, already floored at the
+  // envelope's own output by `validate_and_bind`.
+  uint64_t vision_embedding_pool_bytes = 0;
   // GitHub #227: the text rotary table's scaling; the default is no scaling,
   // the linear table.
   ignis::RopeScaling rope_scaling{};
 };
+
+// GitHub #243: one embedding pool page, in bytes -- the width every side of
+// the leaf agrees on (kernel/include/ignis_step.h).
+std::size_t vision_embedding_page_bytes(std::int64_t hidden) {
+  return static_cast<std::size_t>(hidden) * IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS *
+         sizeof(std::uint16_t);
+}
+
+// The pool's bytes, rounded up to whole pages and floored at the envelope's
+// own output: an item that fits the envelope must always fit the pool once
+// everything else is released, or a caller told to "release and retry" would
+// never make progress.
+std::size_t vision_embedding_pool_bytes(std::int64_t hidden, std::int32_t envelope_tokens,
+                                        std::uint64_t requested) {
+  const std::size_t page = vision_embedding_page_bytes(hidden);
+  const std::size_t floor_bytes = vision_output_transient_bytes(hidden, envelope_tokens);
+  const std::size_t want = std::max<std::size_t>(static_cast<std::size_t>(requested), floor_bytes);
+  return ((want + page - 1) / page) * page;
+}
 
 // The argument checks and the tensor binding of a load, shared by the load
 // itself and by its plan (GitHub #210) so the two refuse the same calls with
@@ -909,6 +931,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   int32_t speculative_backend = IGNIS_SPECULATIVE_NONE;
   uint32_t draft_tokens = 0;
   uint32_t vision_max_tokens = 0;
+  uint64_t vision_embedding_pool_request = 0;
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -919,6 +942,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     speculative_backend = options->speculative_backend;
     draft_tokens = options->draft_tokens;
     vision_max_tokens = options->vision_max_tokens;
+    vision_embedding_pool_request = options->vision_embedding_pool_bytes;
     rope_scaling.factor = options->rope_scaling_factor;
     rope_scaling.temperature = options->rope_scaling_temperature;
     rope_scaling.beta_fast = options->rope_scaling_beta_fast;
@@ -934,6 +958,14 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   if (vision_max_tokens > IGNIS_VISION_MAX_TOKENS_LIMIT) {
     set_error("ignis_model_load: vision_max_tokens " + std::to_string(vision_max_tokens) +
               " exceeds " + std::to_string(IGNIS_VISION_MAX_TOKENS_LIMIT));
+    return nullptr;
+  }
+  // GitHub #243: a pool asked for without vision is a caller that thinks it
+  // configured something. The floor is applied where the geometry is known;
+  // here only the contradiction is refused.
+  if (vision_max_tokens == 0 && vision_embedding_pool_request != 0) {
+    set_error("ignis_model_load: vision_embedding_pool_bytes " +
+              std::to_string(vision_embedding_pool_request) + " needs vision_max_tokens");
     return nullptr;
   }
   if (speculative_backend != IGNIS_SPECULATIVE_NONE &&
@@ -965,6 +997,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.speculative_backend = speculative_backend;
   out.draft_tokens = draft_tokens;
   out.vision_max_tokens = vision_max_tokens;
+  out.vision_embedding_pool_bytes = vision_embedding_pool_request;
   out.rope_scaling = rope_scaling;
 
   ModelBinder binder(tensors, count);
@@ -1060,8 +1093,12 @@ struct LoadSizes {
     out.media_embedding_bytes = media_embedding;
     // sampling_single_{configs, positions, out}, sampling_decode_{configs,
     // positions, out, logits} and the workspace, as the load allocates them.
+    // GitHub #242 adds the permitted-set staging to the same line: ids
+    // [lanes][cap], counts [lanes] and the committed probabilities [lanes].
     out.sampling_bytes = sizeof(ninfer::ops::SamplingConfig) + 2 * sizeof(int32_t) +
                          sizeof(ninfer::ops::SamplingConfig) * lanes + 2 * sizeof(int32_t) * lanes +
+                         sizeof(int32_t) * lanes * IGNIS_MAX_PERMITTED_TOKENS +
+                         sizeof(int32_t) * lanes + sizeof(float) * lanes +
                          sampling_logits + sampling_workspace;
     // decode_graph_{scratch, token_ids, slots}, and decode_rope_positions
     // with vision.
@@ -1091,13 +1128,14 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   }
 
   // GitHub #177: the encoder workspace for the envelope's merged tokens
-  // (capped by the context) and one item's output transient.
+  // (capped by the context), and GitHub #243 the embedding pool.
   if (options.vision_max_tokens > 0) {
     const auto tokens =
         static_cast<std::int32_t>(std::min(options.vision_max_tokens, max_context_tokens));
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
-    sizes.media_embedding = vision_output_transient_bytes(g.hidden, tokens);
+    sizes.media_embedding =
+        vision_embedding_pool_bytes(g.hidden, tokens, options.vision_embedding_pool_bytes);
   }
 
   // P3-03 (GitHub #99): device sampling's workspace and its decode logits.
@@ -1144,11 +1182,15 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   };
   ignis_model_reservations out{};
   out.workspace_bytes = capacity(model.scratch);
-  out.media_embedding_bytes = bytes(model.vision_output);
+  out.media_embedding_bytes = bytes(model.vision_pool.buffer);
   out.sampling_bytes = bytes(model.sampling_single_configs) + bytes(model.sampling_single_positions) +
                        bytes(model.sampling_single_out) + bytes(model.sampling_decode_configs) +
                        bytes(model.sampling_decode_positions) + bytes(model.sampling_decode_out) +
-                       bytes(model.sampling_decode_logits) + capacity(model.sampling_workspace);
+                       bytes(model.sampling_decode_logits) +
+                       bytes(model.sampling_decode_permitted) +
+                       bytes(model.sampling_decode_permitted_counts) +
+                       bytes(model.sampling_decode_permitted_probs) +
+                       capacity(model.sampling_workspace);
   out.decode_graph_bytes = capacity(model.decode_graph_scratch) + bytes(model.decode_graph_token_ids) +
                            bytes(model.decode_graph_slots) + bytes(model.decode_rope_positions);
   if (model.verify != nullptr) {
@@ -1297,10 +1339,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
 
   // GitHub #177: the vision reservation, taken here at load -- before the
   // caller builds its sequence pool -- so enabling vision can never OOM a
-  // later request: one item's output transient for the envelope's merged
-  // tokens (capped by the context), beside the scratch above that already
-  // fits the encoder's workspace (GitHub #212). A reservation that does not
-  // fit the free memory fails the load naming it.
+  // later request: GitHub #243's embedding pool, beside the scratch above
+  // that already fits the encoder's workspace (GitHub #212). A reservation
+  // that does not fit the free memory fails the load naming it.
   if (vision_max_tokens > 0) {
     model->vision_max_tokens = vision_max_tokens;
     try {
@@ -1309,12 +1350,17 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       std::size_t vision_total = 0;
       if (cudaMemGetInfo(&vision_free, &vision_total) == cudaSuccess && output_bytes > vision_free) {
         throw std::runtime_error("a " + std::to_string(vision_tokens) +
-                                 "-token vision envelope's output needs " +
+                                 "-token vision envelope's embedding pool needs " +
                                  std::to_string(output_bytes) + " bytes, but only " +
                                  std::to_string(vision_free) +
-                                 " are free -- lower --vision-max-tokens");
+                                 " are free -- lower --vision-embedding-pool or"
+                                 " --vision-max-tokens");
       }
-      model->vision_output = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      const std::size_t page_bytes = vision_embedding_page_bytes(g.hidden);
+      model->vision_pool.buffer = std::make_unique<ninfer::DeviceBuffer>(output_bytes);
+      model->vision_pool.page_columns = IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS;
+      model->vision_pool.page_bytes = page_bytes;
+      model->vision_pool.owner.assign(output_bytes / page_bytes, nullptr);
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: vision reservation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -1345,6 +1391,16 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     model->sampling_decode_out =
         std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_decode_logits = std::make_unique<ninfer::DeviceBuffer>(sizes.sampling_logits);
+    // GitHub #242: three small per-lane rows, allocated whether or not any
+    // request ever constrains a draw -- 4 KB against a plan in gigabytes,
+    // and an allocation that depends on traffic is one the VRAM plan cannot
+    // state at load (ADR 0030).
+    model->sampling_decode_permitted = std::make_unique<ninfer::DeviceBuffer>(
+        sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH * IGNIS_MAX_PERMITTED_TOKENS);
+    model->sampling_decode_permitted_counts =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(int32_t) * IGNIS_DECODE_MAX_BATCH);
+    model->sampling_decode_permitted_probs =
+        std::make_unique<ninfer::DeviceBuffer>(sizeof(float) * IGNIS_DECODE_MAX_BATCH);
     model->sampling_workspace = std::make_unique<ninfer::DeviceArena>(sizes.sampling_workspace);
   } catch (const std::exception &e) {
     set_error(std::string("ignis_model_load: sampling buffer allocation failed: ") + e.what());

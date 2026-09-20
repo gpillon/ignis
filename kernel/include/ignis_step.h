@@ -74,6 +74,27 @@ extern "C" {
  * exposed at this ABI (disabled) -- not one of this ticket's six
  * parameters.
  *
+ * P6-06 (GitHub #242, ADR 0034) appends the **permitted token set**, the
+ * same way. `permitted_count` of 0 is today's unconstrained draw, bit for
+ * bit. A nonzero count restricts this lane's draw to `permitted_ids` — at
+ * most `IGNIS_MAX_PERMITTED_TOKENS`, each a valid vocabulary id, duplicates
+ * allowed and harmless — by driving every other column of the lane's logits
+ * out of reach before the sampler runs. It therefore *composes* with the
+ * parameters above rather than replacing them: `greedy` takes the set's
+ * argmax, a temperature draw is a draw from the set, `top_k`/`top_p` cut the
+ * set further, and the penalties still read the sequence's own counts. No
+ * logits cross this ABI for it, which is the whole reason it is here and not
+ * in the host (ADR 0034).
+ *
+ * `ignis_program_prefill` and `ignis_program_decode` both read it, and they
+ * have to: a decode round returns the successor the *previous* call made
+ * ready, so the first token of a constrained run is the one the prefill
+ * itself draws. A run of K constrained tokens is one prefill carrying the
+ * first set and K-1 rounds carrying the rest. The degenerate `ignis_prefill`
+ * / `ignis_decode` entry points reject a nonzero count rather than ignoring
+ * it, because a constraint silently dropped is a wrong answer that looks
+ * like a right one.
+ *
  * P5-04 (GitHub #153) appends the verify round's per-lane inputs (ADR 0016:
  * a field append and a size bump, never a parameter). Both are read only by
  * a decode call whose `ignis_decode_options::speculative_window` is nonzero;
@@ -83,6 +104,13 @@ extern "C" {
  * means no budget. `stop_ids` (caller-owned, `stop_id_count` entries, valid
  * for the call) cut the committed run at the first stop id inclusive: the
  * sequence's state never runs past the text the caller emits. */
+/* The most ids one lane's permitted set may carry (P6-06, GitHub #242).
+ * Ten digits and a handful of forced literals is what the constrained
+ * decode needs; the cap is what lets the set live in a fixed per-lane
+ * staging row instead of an allocation per round, and a larger set is
+ * rejected rather than truncated. */
+#define IGNIS_MAX_PERMITTED_TOKENS 32
+
 struct ignis_sampling_params {
   uint32_t size;    /* sizeof(struct ignis_sampling_params) */
   int32_t greedy;   /* nonzero: argmax, ignoring every field below */
@@ -95,6 +123,8 @@ struct ignis_sampling_params {
   uint32_t remaining_tokens; /* P5-04: this lane's budget, anchor included; 0 = none */
   uint32_t stop_id_count;    /* P5-04: entries in `stop_ids` (0: no stop id) */
   const int32_t *stop_ids;   /* P5-04: caller-owned; NULL when the count is 0 */
+  uint32_t permitted_count;    /* P6-06: entries in `permitted_ids` (0: unconstrained) */
+  const int32_t *permitted_ids; /* P6-06: caller-owned; NULL when the count is 0 */
 };
 
 /* The largest `batch_size` `ignis_program_decode` accepts: the decode
@@ -158,6 +188,11 @@ struct ignis_prefill_options {
   const struct ignis_media_embedding *media;
   const int32_t *media_scatter_indices;
   uint32_t media_first_column;
+  /* P6-06 (GitHub #242): the drawn token's probability within this call's
+   * permitted set, or NULL. 0 when the call declared no set. One float, not
+   * a logits row -- the first digit of a constrained run is drawn here, and
+   * its confidence has to come back with it (ADR 0034). */
+  float *out_permitted_prob;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus
@@ -171,12 +206,26 @@ struct ignis_prefill_options {
  * column); `cu_seqlens` `[t+1]` segment bounds; `position_table_indices` /
  * `_weights` `[4*P]`, four bilinear corners per patch. `h` and `w` are even.
  *
- * The load's vision reservation holds one embedding at a time: an encode
- * while one is live is refused (release it first), and so is an item wider
- * than the load's envelope. The encoder runs out of the load's scratch
- * arena, which prefill steps share (GitHub #212), so it is never called
- * from inside one. Returns 0 and the handle, or -1 (see
- * ignis_media_last_error) on a load without vision or any invalid input. */
+ * The load's embedding pool (GitHub #243) holds as many embeddings at a time
+ * as their columns fit. An item wider than the load's envelope is refused
+ * with -1; an item that would fit an empty pool but not the free pages left
+ * is refused with IGNIS_MEDIA_ENCODE_POOL_FULL, which says "release
+ * something and call again" rather than "this can never work" -- the caller
+ * owns the eviction policy, this side owns only the pages. The encoder runs
+ * out of the load's scratch arena, which prefill steps share (GitHub #212),
+ * so it is never called from inside one. Returns 0 and the handle, -1 (see
+ * ignis_media_last_error) on a load without vision or any invalid input, or
+ * IGNIS_MEDIA_ENCODE_POOL_FULL. */
+
+/* An embedding's width in merged columns per pool page (GitHub #243). One
+ * page is this many `[hidden]` BF16 columns: 1,280 KiB at 5120 hidden, whose
+ * 10,240-byte column keeps every page 256-aligned. */
+#define IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS 128
+
+/* ignis_media_encode: the item fits the pool but not the pages free right
+ * now. Distinct from -1 because it is the only failure a caller can clear by
+ * releasing another embedding and retrying. */
+#define IGNIS_MEDIA_ENCODE_POOL_FULL (-2)
 struct ignis_media_encode_input {
   uint32_t size; /* sizeof(struct ignis_media_encode_input) */
   uint32_t grid_t;
@@ -369,6 +418,12 @@ struct ignis_decode_options {
   const uint32_t *draft_counts; /* [batch_size], or NULL (every lane proposes the window) */
   int32_t *out_committed_counts; /* [batch_size]; required when speculative_window > 0 */
   uint32_t *out_extents;  /* [batch_size], or NULL: each lane's extent this round */
+  /* P6-06 (GitHub #242): each lane's committed token's probability within its
+   * own permitted set, or 0 for a lane that declared none. NULL asks for
+   * nothing. One float per lane rather than a logits row -- see
+   * `ignis_sampling_params::permitted_ids`. Filled only for the anchor, so a
+   * verify round reports the anchor's and says nothing about its drafts. */
+  float *out_permitted_probs; /* [batch_size], or NULL */
 };
 
 /* Complete one decode round for a batch of sequence handles.  Each output is

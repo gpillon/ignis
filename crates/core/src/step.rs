@@ -19,7 +19,7 @@ use crate::model_load::Model;
 use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
 use crate::vision::{Grid, VisionItemControl};
 
-mod ffi {
+pub(crate) mod ffi {
     use std::os::raw::c_char;
 
     use crate::model_load::ffi::IgnisModel;
@@ -47,7 +47,24 @@ mod ffi {
         pub stop_id_count: u32,
         /// P5-04: caller-owned, valid for the call.
         pub stop_ids: *const i32,
+        /// P6-06 (GitHub #242, ADR 0034): entries in `permitted_ids`; 0 with
+        /// a null pointer is an unconstrained draw, bit for bit what this
+        /// ABI did before the field existed.
+        pub permitted_count: u32,
+        /// P6-06: caller-owned, valid for the call. At most
+        /// `IGNIS_MAX_PERMITTED_TOKENS` ids; the leaf drives every other
+        /// column of this lane's logits out of reach before it samples, so
+        /// the constraint composes with temperature, top-k and the seed
+        /// instead of replacing them.
+        pub permitted_ids: *const i32,
     }
+
+    /// `IGNIS_MAX_PERMITTED_TOKENS` (GitHub #242): the most ids one lane's
+    /// permitted set may carry. Ten digits and a few forced literals is what
+    /// a constrained decode needs, and the cap is what lets the set live in
+    /// a fixed per-lane staging row; a larger set is refused, never
+    /// truncated.
+    pub const MAX_PERMITTED_TOKENS: usize = 32;
 
     /// 1:1 with `struct ignis_decode_options` (ADR 0016; P5-04, GitHub
     /// #153). `size` must be `sizeof(struct ignis_decode_options)`; a null
@@ -62,6 +79,13 @@ mod ffi {
         pub out_committed_counts: *mut i32,
         /// P5-05 (GitHub #155): each lane's extent this round, or null.
         pub out_extents: *mut u32,
+        /// P6-06 (GitHub #242): each lane's committed token's probability
+        /// within its own permitted set, or 0 for a lane that declared
+        /// none. Null asks for nothing. One float per lane rather than a
+        /// logits row — the per-digit confidence a number's uncertainty is
+        /// summed from has to come from somewhere, and this is the cheapest
+        /// thing that is not the host reading logits (ADR 0034).
+        pub out_permitted_probs: *mut f32,
     }
 
     /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -81,6 +105,11 @@ mod ffi {
         pub media: *const IgnisMediaEmbedding,
         pub media_scatter_indices: *const i32,
         pub media_first_column: u32,
+        /// P6-06 (GitHub #242): the span's own draw's probability within its
+        /// permitted set, or null. A constrained run's **first** token is
+        /// drawn here — a decode round returns the successor the previous
+        /// call made ready — so this is where its confidence comes back.
+        pub out_permitted_prob: *mut f32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -223,6 +252,10 @@ const GREEDY: ffi::IgnisSamplingParams = ffi::IgnisSamplingParams {
     remaining_tokens: 0,
     stop_id_count: 0,
     stop_ids: std::ptr::null(),
+    // GitHub #242: an unconstrained draw, which is what every caller of
+    // this constant wants — the constraint is a decode-round parameter.
+    permitted_count: 0,
+    permitted_ids: std::ptr::null(),
 };
 
 /// A sequence's real sampling parameters for one program-layer call (P3-03,
@@ -270,6 +303,11 @@ impl SamplingParams {
             remaining_tokens: 0,
             stop_id_count: 0,
             stop_ids: std::ptr::null(),
+            // GitHub #242: the permitted set rides the decode job, not the
+            // sampling parameters a request carries — `step::decode_*`
+            // fills it per round.
+            permitted_count: 0,
+            permitted_ids: std::ptr::null(),
         }
     }
 }
@@ -511,6 +549,7 @@ impl PrefillRoute {
             media: std::ptr::null(),
             media_scatter_indices: std::ptr::null(),
             media_first_column: 0,
+            out_permitted_prob: std::ptr::null_mut(),
         }
     }
 }
@@ -734,6 +773,183 @@ pub fn decode_program_batch_sampled(
     Ok(tokens)
 }
 
+/// Prefill `token_ids` and draw the span's successor from `permitted`
+/// alone (P6-06, GitHub #242, ADR 0034), returning that draw's probability
+/// within the set.
+///
+/// **This is where a constrained run starts.** `ignis_program_decode`
+/// returns the successor the *previous* call made ready, so the first token
+/// of a K-token run is the one this prefill draws; the rounds after it carry
+/// the sets for tokens 2..K. A run that constrained only its decode rounds
+/// would commit one free token in the middle of its own forced text.
+///
+/// The successor itself is not returned here — it is the sequence's pending
+/// token, which the next round emits. What comes back is its **probability
+/// within the permitted set**, which the round that emits it has no way to
+/// recompute: by then the sequence has moved on.
+///
+/// `out_logits` is [`prefill_program_sampled`]'s, unchanged in meaning. A
+/// call may ask for both — the readout observes the prefill and the
+/// constraint decides its draw — although nothing in the engine does: a
+/// decision reads a position and a program generates from one.
+/// The sampling parameters of a lane restricted to `permitted` (P6-06,
+/// GitHub #242), or the refusal a set the leaf cannot honour earns.
+///
+/// One function rather than the same six lines at each of the three entry
+/// points that take a set: the cap check, the null-vs-pointer rule and the
+/// count all have to agree with `ignis_step.h`, and three copies of a rule
+/// is three places for it to stop agreeing. `what` names the caller so the
+/// message still says which entry point refused.
+///
+/// The set is **refused, never truncated**: a constraint silently narrowed
+/// is a wrong answer that looks like a right one.
+fn permitted_params(
+    what: &str,
+    sampling: SamplingParams,
+    permitted: &[i32],
+) -> Result<ffi::IgnisSamplingParams, String> {
+    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+        return Err(format!(
+            "{what}: {} ids, past the leaf's {} (a set is refused, never truncated)",
+            permitted.len(),
+            ffi::MAX_PERMITTED_TOKENS
+        ));
+    }
+    Ok(ffi::IgnisSamplingParams {
+        permitted_count: permitted.len() as u32,
+        // The ABI reads the pointer only when the count is nonzero, and a
+        // dangling one beside a zero count is the kind of thing that works
+        // until it does not.
+        permitted_ids: match permitted.is_empty() {
+            true => std::ptr::null(),
+            false => permitted.as_ptr(),
+        },
+        ..sampling.to_ffi()
+    })
+}
+
+pub fn prefill_program_permitted(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    permitted: &[i32],
+    out_logits: Option<&mut [f32]>,
+) -> Result<f32, String> {
+    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+        return Err(format!(
+            "prefill_program_permitted: {} ids, past the leaf's {} (a set is refused, never truncated)",
+            permitted.len(),
+            ffi::MAX_PERMITTED_TOKENS
+        ));
+    }
+    let params = permitted_params("prefill_program_permitted", sampling, permitted)?;
+    let mut probability = 0f32;
+    let mut options = PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault);
+    options.out_permitted_prob = &mut probability;
+    let logits_ptr = match out_logits {
+        Some(buf) => buf.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            &options,
+            logits_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(probability)
+}
+
+/// One lane of a **constrained** decode round (P6-06, GitHub #242).
+pub struct PermittedLane<'a> {
+    /// The lane's sampling parameters, unchanged in meaning: the constraint
+    /// composes with them rather than replacing them.
+    pub sampling: SamplingParams,
+    /// The ids this lane may commit, or empty for an ordinary draw. At most
+    /// [`ffi::MAX_PERMITTED_TOKENS`]; the leaf refuses a larger set rather
+    /// than truncating it.
+    pub permitted: &'a [i32],
+}
+
+/// [`decode_program_batch_sampled`] with a **permitted token set** per lane
+/// (P6-06, GitHub #242, ADR 0034).
+///
+/// Returns each lane's committed token and, beside it, how much of that
+/// lane's permitted set the token held — the model's own confidence in what
+/// it just committed, computed on the device from at most 32 logits. A lane
+/// that declared no set commits as it always has and reports 0.
+///
+/// This is the only entry point that honours a set: the single-sequence
+/// paths and the verify round refuse one, because a constraint silently
+/// dropped is a wrong answer that looks like a right one.
+pub fn decode_program_batch_permitted(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[PermittedLane<'_>],
+) -> Result<(Vec<i32>, Vec<f32>), String> {
+    if lanes.len() != sequences.len() {
+        return Err(format!(
+            "decode_program_batch_permitted: {} lanes for {} sequences",
+            lanes.len(),
+            sequences.len()
+        ));
+    }
+
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    // The id slices are the caller's and stay borrowed for the call, which
+    // is exactly the lifetime the ABI asks for.
+    let params: Vec<ffi::IgnisSamplingParams> = lanes
+        .iter()
+        .enumerate()
+        .map(|(index, lane)| {
+            permitted_params(
+                &format!("decode_program_batch_permitted: lane {index}"),
+                lane.sampling,
+                lane.permitted,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let mut tokens = vec![-1i32; handles.len()];
+    let mut probabilities = vec![0f32; handles.len()];
+    let options = ffi::IgnisDecodeOptions {
+        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
+        speculative_window: 0,
+        drafts: std::ptr::null(),
+        draft_counts: std::ptr::null(),
+        out_committed_counts: std::ptr::null_mut(),
+        out_extents: std::ptr::null_mut(),
+        out_permitted_probs: probabilities.as_mut_ptr(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+            &options,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok((tokens, probabilities))
+}
+
 /// One verify round over `sequences` at the load's draft `window` (P5-04,
 /// GitHub #153, spec 05): every lane's anchor and drafts are verified in one
 /// traversal, the vendored accept kernel licenses the accepted prefix, the
@@ -840,6 +1056,9 @@ pub fn decode_program_verify_runs(
         draft_counts: if proposes { draft_counts.as_ptr() } else { std::ptr::null() },
         out_committed_counts: committed.as_mut_ptr(),
         out_extents: extents.as_mut_ptr(),
+        // GitHub #242: a verify round refuses a permitted set outright, so
+        // there is no probability for it to report.
+        out_permitted_probs: std::ptr::null_mut(),
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -915,23 +1134,32 @@ fn media_last_error() -> String {
     message.to_string_lossy().into_owned()
 }
 
+pub use crate::vision::MEDIA_ENCODE_POOL_FULL;
+
 /// Run the media encode step (GitHub #178) over one item: its row-major BF16
 /// patch rows on `grid` and the encoder control
 /// ([`crate::vision::vision_item_control`]) computed for that grid.
+///
+/// The error carries the leaf's return code beside its message, because
+/// [`MEDIA_ENCODE_POOL_FULL`] is the one a caller acts on rather than
+/// reports (GitHub #243).
 pub fn encode_media<'m>(
     model: &'m Model,
     grid: Grid,
     patches: &[u16],
     control: &VisionItemControl,
-) -> Result<MediaEmbedding<'m>, String> {
+) -> Result<MediaEmbedding<'m>, (i32, String)> {
     let raw = grid.raw_patches() as usize;
     if patches.len() != raw * ignis_artifact::vision::PATCH_FEATURES {
-        return Err(format!(
-            "encode_media: {} patch values for a {}x{}x{} grid",
-            patches.len(),
-            grid.t,
-            grid.h,
-            grid.w
+        return Err((
+            -1,
+            format!(
+                "encode_media: {} patch values for a {}x{}x{} grid",
+                patches.len(),
+                grid.t,
+                grid.h,
+                grid.w
+            ),
         ));
     }
     if control.patches as usize != raw
@@ -940,7 +1168,10 @@ pub fn encode_media<'m>(
         || control.position_table_weights.len() != 4 * raw
         || control.cu_seqlens.len() != grid.t as usize + 1
     {
-        return Err("encode_media: the control does not describe the grid".to_string());
+        return Err((
+            -1,
+            "encode_media: the control does not describe the grid".to_string(),
+        ));
     }
     let input = ffi::IgnisMediaEncodeInput {
         size: std::mem::size_of::<ffi::IgnisMediaEncodeInput>() as u32,
@@ -956,7 +1187,7 @@ pub fn encode_media<'m>(
     let mut handle = std::ptr::null_mut();
     let rc = unsafe { ffi::ignis_media_encode(model.handle(), &input, &mut handle) };
     if rc != 0 {
-        return Err(media_last_error());
+        return Err((rc, media_last_error()));
     }
     Ok(MediaEmbedding {
         handle,
@@ -990,6 +1221,12 @@ pub struct SpanMediaColumns<'a> {
 /// #178): the chunked route, rotated at the span's three-axis positions, with
 /// the media columns scattered over its placeholder rows. The sequence keeps
 /// the span's rope delta for every later decode round.
+///
+/// `permitted` is [`prefill_program_permitted`]'s, and is here because the
+/// evidence a **program** is put to is normally an image: spec 06's `point`
+/// is a screenshot and a question, and a constrained run wired only to the
+/// text path could not answer one. Empty for an ordinary prefill, and the
+/// returned probability is then 0.
 pub fn prefill_program_multimodal(
     model: &Model,
     pool: &SeqPool,
@@ -997,9 +1234,11 @@ pub fn prefill_program_multimodal(
     token_ids: &[i32],
     start_position: u64,
     sampling: SamplingParams,
+    permitted: &[i32],
     span: MultimodalPrefill<'_>,
     out_logits: Option<&mut [f32]>,
-) -> Result<(), String> {
+) -> Result<f32, String> {
+    let params = permitted_params("prefill_program_multimodal", sampling, permitted)?;
     if span.positions.len() != 3 * token_ids.len() {
         return Err(format!(
             "prefill_program_multimodal: {} positions for {} tokens",
@@ -1016,6 +1255,7 @@ pub fn prefill_program_multimodal(
         ),
         None => (std::ptr::null(), std::ptr::null(), 0, 0),
     };
+    let mut probability = 0f32;
     let options = ffi::IgnisPrefillOptions {
         mrope_positions: span.positions.as_ptr(),
         rope_delta: span.rope_delta,
@@ -1023,13 +1263,13 @@ pub fn prefill_program_multimodal(
         media,
         media_scatter_indices: scatter,
         media_first_column: first_column,
+        out_permitted_prob: &mut probability,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
     };
-    let params = sampling.to_ffi();
     let rc = unsafe {
         ffi::ignis_program_prefill(
             model.handle(),
@@ -1046,7 +1286,7 @@ pub fn prefill_program_multimodal(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(())
+    Ok(probability)
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.

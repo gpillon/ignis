@@ -110,9 +110,115 @@ pub struct RequestInput {
     /// published there, rather than a prefix published at a point the
     /// tokenizer disagrees about.
     pub system_block_tokens: Option<u32>,
+    /// The **answer tokens** this request is a **decision** over (GitHub
+    /// #238, ADR 0034), or `None` for every ordinary request.
+    ///
+    /// Carrying them here is what makes a decision a *kind* of request
+    /// rather than a mode of the engine: the scheduler reads this to decide
+    /// that the request ends where its prefill ends. A decision never takes
+    /// a decode lane, never enters [`RequestState::Running`], generates
+    /// nothing, and finishes with the **readout** of these tokens' logits
+    /// at its prompt's last position.
+    ///
+    /// It also changes what the request reserves. [`DecodeParams::max_tokens`]
+    /// is meaningless here — nothing is generated — so the whole-sequence
+    /// reservation is the prompt alone, and a decision is admitted on a
+    /// prompt that fits however large a `max_tokens` came with it.
+    pub decision: Option<std::sync::Arc<[TokenId]>>,
+    /// The **constrained decode** this request generates under (GitHub #242, ADR
+    /// 0034), or `None` for every request that generates freely.
+    ///
+    /// One permitted token set per token it will emit, in order
+    /// ([`crate::constrained::Schedule`]). It is the request's whole generation
+    /// budget and its whole stopping condition: a constrained decode ends when its
+    /// schedule is exhausted, with [`FinishReason::Stop`], and **never on
+    /// EOS** — a token drawn from a set of digits cannot be the EOS token,
+    /// and [`DecodeParams::max_tokens`] is ignored, since a number with
+    /// fewer digits than the caller asked for is not a shorter answer but a
+    /// wrong one.
+    ///
+    /// Never set together with [`RequestInput::decision`]: a decision reads
+    /// one position and generates nothing, a constrained decode generates from one.
+    /// They are the two halves of ADR 0034, and a request is one or the
+    /// other.
+    pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
 }
 
 impl RequestInput {
+    /// Whether this request is a **decision** (GitHub #238): it reads its
+    /// answer tokens out at the end of prefill and generates nothing.
+    pub fn is_decision(&self) -> bool {
+        self.decision.is_some()
+    }
+
+    /// Whether this request is a **constrained decode** (GitHub #242,
+    /// `CONTEXT.md`): it emits exactly its schedule's length in tokens, each
+    /// drawn from that step's permitted set.
+    pub fn is_constrained(&self) -> bool {
+        self.constrained.is_some()
+    }
+
+    /// How many leading prompt tokens this request may **match** retained
+    /// state over: all of them, or one short of the prompt for a request
+    /// that must be left something to prefill.
+    ///
+    /// Two kinds of request must, for the same shape of reason. A
+    /// **multimodal** claimant learns its own rope delta only from a prefill
+    /// span (ADR 0029), and a **decision** (GitHub #238) reads its answer
+    /// off a forward pass — a chunk with nothing left to prefill runs none,
+    /// so there would be no logits at the last position to read. That is the
+    /// empty-last-chunk trap, prevented rather than repaired, at the cost of
+    /// one token's prefill.
+    ///
+    /// A **constrained decode** (GitHub #242) is in the set for the same reason wearing
+    /// a different hat: its first token is *drawn by its prefill*, so a
+    /// chunk with nothing to prefill draws nothing and the run would begin
+    /// with whatever the claimed state left pending — a free token in the
+    /// middle of forced text, which is the failure
+    /// `crates/core/tests/permitted_decode_gpu.rs` was written after.
+    ///
+    /// Whether an entry *could* have covered the whole prompt depends on the
+    /// chat template, which is exactly why this does not: the 27B's appends
+    /// a closed, empty think block after the generation opener with thinking
+    /// off, so its decision prompts run four tokens past the opener and
+    /// nothing reaches their end anyway
+    /// (`crates/server/tests/decide_prompt_tail.rs`). A template that *did*
+    /// stop at the opener would walk straight into the trap, and the trim is
+    /// what means nobody has to check which kind they have.
+    ///
+    /// Not to be confused with [`RequestInput::publish_reach`], which
+    /// answers the other half of the same picture and does **not** have the
+    /// same membership.
+    pub fn reuse_reach(&self) -> usize {
+        match self.is_decision() || self.is_constrained() || self.multimodal.is_some() {
+            true => self.tokens.len().saturating_sub(1),
+            false => self.tokens.len(),
+        }
+    }
+
+    /// How many leading prompt tokens this request may **publish** as a
+    /// shared prefix: all of them, or one short of the prompt for a
+    /// **decision** (GitHub #238).
+    ///
+    /// The same arithmetic as [`RequestInput::reuse_reach`] over a
+    /// deliberately different set, which is why they are two functions. A
+    /// multimodal request publishes its whole head — it is a *claimant* that
+    /// needs a tail to prefill, not a publisher — and folding the two
+    /// together silently cut every multimodal prefix by a page.
+    ///
+    /// A decision is in this set because the two halves compose: what it
+    /// publishes must be something it can also claim, and it may claim only
+    /// `reuse_reach`. Publishing at its own prompt length would create an
+    /// entry no decision could ever match, and — through the capture that
+    /// rides a page-aligned publish — a prompt checkpoint covering the whole
+    /// prompt.
+    pub fn publish_reach(&self) -> usize {
+        match self.is_decision() || self.is_constrained() {
+            true => self.tokens.len().saturating_sub(1),
+            false => self.tokens.len(),
+        }
+    }
+
     /// The last whole-page boundary at or before `at` that a prefix of this
     /// prompt may end at: the plain page floor, walked back out of any media
     /// item it would land inside (GitHub #193,
@@ -222,6 +328,34 @@ impl RequestClass {
         } else {
             RequestClass::Interactive
         }
+    }
+
+    /// The class a **decision** request is admitted under (GitHub #238,
+    /// ADR 0034): the **Lane tag** it stated, or [`RequestClass::Agent`]
+    /// when it stated none — where every other route defaults to
+    /// [`RequestClass::Interactive`].
+    ///
+    /// `CONTEXT.md`'s **Lane tag** entry carries why, and carries it once:
+    /// the short of it is that a decision has no residency an **eviction
+    /// priority** could take and no decode lane to protect, so
+    /// `Interactive` would spend a protection it cannot use on behalf of a
+    /// conversation that could.
+    ///
+    /// A **constrained decode** question (GitHub #242) takes this default too, and the
+    /// reasoning above is not why. It *does* hold a decode lane, for as many
+    /// rounds as its number has digits. It takes `Agent` because it arrives
+    /// on the same route as its siblings — a fan-out of questions over one
+    /// `state` is agent-shaped work whichever primitive answers each one, and
+    /// splitting the class by primitive would make a `point` outrank the
+    /// `choice` beside it in the same request.
+    ///
+    /// `stated` is the tag the request carried, already read by
+    /// [`RequestClass::from_extension`] — a tag that was stated but not
+    /// understood is `Interactive` before it reaches here, because that
+    /// rule belongs to the tag and not to the route. Only a request that
+    /// stated *nothing* takes the decision's own default.
+    pub fn for_decision(stated: Option<RequestClass>) -> Self {
+        stated.unwrap_or(RequestClass::Agent)
     }
 
     /// The wire string for the `class` extension and the canonical
@@ -394,6 +528,31 @@ pub enum SchedEvent {
         /// `None` when it ran none — a load without speculation — so the
         /// request log never reports placeholder zeros.
         spec: Option<SpecCounters>,
+        /// The **readout** a **decision** finished with (GitHub #238, ADR
+        /// 0034), and `None` for every other request.
+        ///
+        /// This is the whole answer. A decision emits no
+        /// [`SchedEvent::Token`] and its `tokens` is 0, so without this
+        /// field its completion would carry nothing at all — which is why
+        /// the readout rides the finish event rather than a second one.
+        readout: Option<crate::decision::Readout>,
+        /// The **trace** a **constrained decode** finished with (GitHub #242, ADR
+        /// 0034), and `None` for every other request: one
+        /// [`crate::constrained::Draw`] per emitted token, in order, each with
+        /// its probability inside that step's permitted set.
+        ///
+        /// It rides the finish event beside the readout, and for the same
+        /// reason: a run's answer is the whole run — the digits *and*
+        /// the confidences that make it a reading rather than a guess — and
+        /// there is no useful partial form of it. A per-token field on
+        /// [`SchedEvent::Token`] would instead put a `None` on every token
+        /// event this engine emits, forever, to carry a number that only
+        /// means anything six at a time.
+        ///
+        /// `Some` with fewer draws than the constrained decode has steps is a run the
+        /// engine cut short; the tokens are still the `SchedEvent::Token`s
+        /// that preceded it, and this says how far it got.
+        drawn: Option<Vec<crate::constrained::Draw>>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

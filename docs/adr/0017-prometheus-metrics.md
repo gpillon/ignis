@@ -33,7 +33,18 @@ the retained slots as gauges (#216, #217). The same amendment splits the six
 retained-state families by `kind="checkpoint|prefix"` as well as by `tier`,
 so the six rows below read "by tier and kind"; a prompt checkpoint and a
 shared prefix are no longer counted as one thing. Lane and sequence labels
-stay forbidden.
+stay forbidden. Amended 2026-09-20 (#241): two rows for the decision
+endpoint, `ignis_decisions_total` and `ignis_decision_answer_mass`, both
+recorded by the HTTP handler the way the rejection counter is, and both
+carrying **the first exception to this ADR's "zeros are exported too"** —
+they are absent until a decision has been served. The reasoning is below
+the table; the exception is named here because an operator reading only
+this section should not meet it as a surprise. Amended 2026-09-20 (#242):
+three more `type` values — `number`, `point` and `box` — which are counted
+like any other question and observe **no** answer mass, so the histogram is
+readout-only and its `_count` sits below the counter's sum by exactly the
+number of programs served. That asymmetry is stated below the table too, for
+the same reason.
 
 ## Context
 
@@ -154,6 +165,13 @@ critical-path performance regression. The only numerical allowance is at most
   completed plus cancelled plus the requests still in flight.
 - Aggregation runs only when metrics are enabled. A disabled server installs
   neither the Prometheus projection nor the route.
+- Two families are recorded outside the telemetry consumer, by the HTTP
+  handler that already holds their values: the rejection counter (a submit
+  error never reaches the fact stream) and the decision pair (#241 — a
+  readout's answer mass is read in the handler, and raising a fact for it
+  would put a decision's arithmetic on the inference path to observe
+  something the control plane already has). Neither touches the model
+  thread; both are the same atomics a scrape formats.
 - Aggregate state may use fixed atomics or immutable snapshots owned by the
   asynchronous telemetry side. No lock is shared with inference, and a scrape
   never sends a command to or waits for the model thread.
@@ -187,12 +205,83 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
+| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
+| `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
 eleven reserved lines, the budget, the KV pool's pages and page bytes, the
 pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.
+
+**The decision family is the one thing here that is absent when it is zero
+(#241).** Every other series is exported from the first scrape, zeros
+included, because a zero is a reading. A decision's are not exported until a
+decision has been served, and that is this ADR's other rule — *only
+authoritative values are exported* — applied to a route most loads never
+call: three permanently-zero series and an eleven-bucket histogram on every
+scrape of every server would be clutter that says nothing about the server
+it is scraped from. A series that appears mid-window is the same
+problem as a new target and Prometheus treats it the same way, with one
+consequence worth knowing: `rate()` and `increase()` cannot see the step
+from nothing to the first sample, so the very first decision a load serves
+is not in its own rate. Once the family exists, **all three `type`
+values are exported**, including the zeros: a label value that vanishes with
+its count is a series that breaks `sum by (type)` the moment traffic shifts.
+
+**The unit is the question, not the request.** `ignis_decisions_total`
+counts *decisions* in the engine's sense — one readout, one internal
+request (#238) — so a decide request of twenty questions moves it by
+twenty. A request has no single `type` to be counted under, and a single
+question's options collapsing while its nineteen siblings are fine is
+exactly what the histogram exists to show. The endpoint's own unit is on
+the request log instead, as `ignis.decide.done`.
+
+The pair is recorded by the HTTP handler, like `ignis_requests_rejected_total`
+and for the same reason: there is no fact for it on the model thread's
+stream, and inventing one would put a decision's arithmetic on the inference
+path to observe something the handler already holds. It is counted **per
+question**, not per request — twenty questions over one `state` are twenty
+readouts, and one of them collapsing while its siblings are fine is exactly
+what the histogram exists to show.
+
+`ignis_decision_answer_mass` is a ratio in `[0, 1]`, which is not the
+percentage this ADR forbids: the forbidden thing is a ratio *standing in for*
+two terms a reader needs separately, and answer mass has no second term — it
+is the quantity itself. Its buckets are 0.5, 0.9, 0.95, 0.98, 0.99, 0.995,
+0.998, 0.999, 0.9995 and 1, plus the implicit `+Inf`. The measured baseline
+is a median of 0.996 and above from 8 to 256 options, so an evenly spaced
+scale would put every healthy reading in one bucket and show a flat line
+whatever happened; the resolution is where the signal is, and the two coarse
+buckets below exist to make a collapse unmissable rather than to resolve it.
+`le="1"` equals `_count` on a correct readout, and that redundancy is the
+assertion the exposition carries.
+
+**The histogram is readout-only, and its `_count` is therefore below the
+counter's sum.** `number`, `point` and `box` (#242) are counted in
+`ignis_decisions_total` like any other question — a decision is a decision,
+whatever primitive answered it, and a `type` a panel could not see would
+make a fan-out's volume unattributable. They observe **no answer mass**,
+because they have none: their answer is a run of sampled tokens, each drawn
+from a permitted set, not a restricted softmax over one position's
+distribution, so there is no denominator for the mass to be a share *of*.
+Reporting 1 would be a lie about the arithmetic and reporting 0 would put a
+false alarm in the bucket a real collapse lands in.
+
+So `sum(ignis_decisions_total) - ignis_decision_answer_mass_count` is the
+number of programs served, and it is expected to be nonzero rather than a
+sign of a dropped observation. Stated here because the obvious reading of a
+counter and a histogram exported side by side is that they count the same
+events, and on this pair they do not. The per-digit confidence a program
+*does* produce is in its answer, not in this family: it is a resolution
+readout in the units of the value — see `crate::program::Reading::sigma` —
+and it is not comparable across primitives the way answer mass is.
+
+**`confidence` is not exported.** The endpoint reports a per-answer
+confidence, and aggregating it would produce a histogram over callers who
+each mean something different by it — a threshold is a property of a domain,
+not of a server. Answer mass is the server's own reading of the same prompt
+and is comparable across every caller.
 
 **Eviction is a departure from a tier, and there are five of them (#224).**
 The contract names each one separately rather than summing them, because they

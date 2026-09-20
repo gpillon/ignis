@@ -155,14 +155,16 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
         );
         let control = vision_item_control(item.grid);
         let embedding = step::encode_media(&model, item.grid, &item.patches, &control)
-            .unwrap_or_else(|e| panic!("{}: encode: {e}", canary.id));
+            .unwrap_or_else(|(_, e)| panic!("{}: encode: {e}", canary.id));
         assert_eq!(embedding.columns() as usize, item.token_span.count);
-        let refused = step::encode_media(&model, item.grid, &item.patches, &control);
-        assert!(
-            matches!(&refused, Err(e) if e.contains("already live")),
-            "one embedding at a time: {:?}",
-            refused.as_ref().err()
-        );
+        // GitHub #243: the load no longer holds one embedding at a time. A
+        // second encode of the same item is a second, independent embedding
+        // in its own pool pages — the dedup is the runtime's cache, not the
+        // leaf's, and this seam only owns the bytes.
+        let second = step::encode_media(&model, item.grid, &item.patches, &control)
+            .unwrap_or_else(|(_, e)| panic!("{}: second encode: {e}", canary.id));
+        assert_eq!(second.columns(), embedding.columns());
+        drop(second);
 
         let compared = FIRST_N.min(canary.expected.len());
         for (label, chunk) in [("whole", PREFILL_CHUNK), ("spanning", SPANNING_CHUNK)] {
@@ -256,7 +258,7 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
     let control = vision_item_control(item.grid);
     for cycle in 0..100 {
         let embedding = step::encode_media(&model, item.grid, &item.patches, &control)
-            .unwrap_or_else(|e| panic!("encode cycle {cycle}: {e}"));
+            .unwrap_or_else(|(_, e)| panic!("encode cycle {cycle}: {e}"));
         drop(embedding);
     }
     assert_eq!(step::program_stats(&model, &pool).expect("stats").vram_bytes, before);

@@ -284,7 +284,27 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 
 /// The tokens `input` may generate (GitHub #166): its `max_tokens`, or —
 /// absent that — whatever the per-sequence limit leaves after the prompt.
+///
+/// Zero for a **decision** (GitHub #238): it generates nothing, so its
+/// whole-sequence reservation is its prompt. That is one `if` rather than a
+/// second reservation path because every caller of this — `submit`'s context
+/// check and [`sequence_tokens`] both — wants the same answer, and a
+/// decision admitted on prompt + `max_tokens` would be refused for a budget
+/// it was never going to spend.
+///
+/// The schedule's length for a **constrained decode** (GitHub #242), for the mirror of
+/// that reason: it emits exactly one token per step and `max_tokens` is
+/// meaningless to it, so a constrained decode admitted on some other number would
+/// either reserve pages it cannot use or be cut off mid-number. The budget
+/// is also what ends it — `remaining_work` reaching 0 is the schedule being
+/// spent — which is why the two are one number and not two.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
+    if input.is_decision() {
+        return 0;
+    }
+    if let Some(schedule) = &input.constrained {
+        return u32::try_from(schedule.len()).unwrap_or(u32::MAX);
+    }
     input.params.max_tokens.unwrap_or_else(|| {
         config
             .max_sequence_tokens
@@ -1032,10 +1052,13 @@ impl ConcreteScheduler {
         let input = &self.requests[i].input;
         let media = media_keys(input);
         let prompt = PromptContent::new(&input.tokens, &media);
-        let reach = match input.multimodal {
-            Some(_) => prompt.tokens().saturating_sub(1),
-            None => prompt.tokens(),
-        };
+        // GitHub #238: trimming the *walk* rather than the claim is what
+        // makes a decision's reuse limit airtight — no checkpoint, prefix or
+        // spilled entry can match past a length the keys were never computed
+        // for, so no claim-taking path has to know about decisions at all.
+        // `reuse_reach` is where both reasons for stopping a token short
+        // now live.
+        let reach = input.reuse_reach() as u32;
         prompt
             .head(reach)
             .keys_for(self.checkpoints.match_lengths().chain(self.prefix.match_lengths()))
@@ -1697,6 +1720,22 @@ impl ConcreteScheduler {
         (request_id, tokens)
     }
 
+    /// Why a request whose generation budget is spent stopped.
+    ///
+    /// [`FinishReason::Length`] for every ordinary request: it had more to
+    /// say and the reservation cap cut it off, which is what `length` means
+    /// on the OpenAI surface. [`FinishReason::Stop`] for a **constrained decode**
+    /// (GitHub #242), because its budget *is* its schedule — a number that
+    /// has read its last digit is finished, not truncated, and reporting
+    /// `length` for it would tell a caller their answer may be incomplete
+    /// every single time.
+    fn budget_spent_reason(&self, idx: usize) -> FinishReason {
+        match self.requests[idx].input.is_constrained() {
+            true => FinishReason::Stop,
+            false => FinishReason::Length,
+        }
+    }
+
     /// Complete request `idx` (its lane and KV reservation are released).
     /// `reason` is why it stopped — carried into the emitted
     /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
@@ -1708,12 +1747,27 @@ impl ConcreteScheduler {
         let _span =
             tracing::info_span!("ignis.completion", request_id = self.requests[idx].id).entered();
         let spec = self.requests[idx].spec;
+        // GitHub #238: a decision's whole answer, moved out rather than
+        // cloned — the released request stays in `self.requests` until it is
+        // reaped, and an answer left behind on it would be a second copy of
+        // the only thing this event exists to carry.
+        let readout = self.requests[idx].readout.take();
+        // GitHub #242: a run's answer, moved out for the same reason —
+        // and `None` rather than an empty vector for a request that never
+        // had one, so a reader can tell "this was not a constrained decode" from "this
+        // program emitted nothing".
+        let drawn = match self.requests[idx].input.is_constrained() {
+            true => Some(std::mem::take(&mut self.requests[idx].drawn)),
+            false => None,
+        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
             reason,
             spec,
+            readout,
+            drawn,
         });
     }
 
@@ -1872,6 +1926,10 @@ impl ConcreteScheduler {
         let prefix_entry = r.prefix_entry;
         r.requeue(); // Evicted → Admitted, lane released (there is none).
         r.tokens = 0;
+        // GitHub #242: and the trace it built, since the re-prefill draws
+        // step 0 again — a constrained decode that kept it would answer with twice its
+        // own digits.
+        r.drawn.clear();
         let effective_max = generation_budget(&self.config, &r.input);
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
@@ -2243,11 +2301,22 @@ impl ConcreteScheduler {
 impl Scheduler for ConcreteScheduler {
     fn submit(
         &mut self,
-        input: RequestInput,
+        mut input: RequestInput,
         class: RequestClass,
     ) -> Result<RequestId, SubmitError> {
         if input.model != self.config.model {
             return Err(SubmitError::UnknownModel(input.model));
+        }
+        // GitHub #242: a **constrained decode**'s budget is its schedule, and nothing
+        // else may cut it short. Dropped here, once, rather than checked at
+        // each of the places `max_tokens` is read: the backend enforces it
+        // too (`RuntimeCompute::decode_step` finishes a lane whose
+        // `generated` has reached it *before* the leaf runs, and cannot tell
+        // a run's last round from an ordinary one), so a request that
+        // carried one would return a number with fewer digits than the
+        // caller asked for — which is not a shorter answer but a wrong one.
+        if input.is_constrained() {
+            input.params.max_tokens = None;
         }
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);
@@ -2286,7 +2355,11 @@ impl Scheduler for ConcreteScheduler {
         // now rather than after its prefill. A prefix is published at the
         // chunk boundary that lands on it, so the chunk decomposition has to
         // know where that is before it cuts the first chunk.
-        let head = self.prefix.shareable_head_tokens(input.tokens.len());
+        // GitHub #238: a decision's shareable head is cut from its *publish
+        // reach* — one token less, so the page floor lands a page below a
+        // page-multiple prompt rather than on it. Publishing at the prompt's
+        // own length would create an entry no decision could ever claim.
+        let head = self.prefix.shareable_head_tokens(input.publish_reach());
         // GitHub #186 (ADR 0029): with cross-request reuse on, the
         // head is floored to the **opener's** page rather than the
         // prompt's. That is what puts the generation opener inside
@@ -2359,6 +2432,7 @@ impl Scheduler for ConcreteScheduler {
         // (`Request::publish_point` walks both in prompt order). This stays
         // the opener's page floor, and the block joins it there.
         request.publish_tokens = publish_tokens;
+
         // And `--prompt-reuse off` publishes at neither boundary. #188 kept
         // that by gating the block where it floored the publish point; with
         // the flooring gone the gate lives here, on the request's own copy of
@@ -2710,6 +2784,33 @@ impl Scheduler for ConcreteScheduler {
                         return 0;
                     }
                     let r = &self.requests[i];
+                    // GitHub #238: a decision captures no prompt checkpoint.
+                    //
+                    // A checkpoint is retained *after* the capturing request
+                    // is gone, so it is a bet on a later request that
+                    // extends this prompt. Nothing extends a decision: it is
+                    // the whole request, answered at its own last position,
+                    // and the only thing that could claim its opener is
+                    // another copy of itself. The conservative call is to
+                    // spend no retained slot on that bet.
+                    //
+                    // **This may be leaving reuse on the table**, and it is
+                    // stated here rather than left to arithmetic because the
+                    // arithmetic is not what refuses it. An earlier version
+                    // of this comment claimed a decision's prompt ends at
+                    // its generation opener, so a capture there would cover
+                    // everything and be claimable by nobody. That is false
+                    // for the 27B's template, which appends a closed think
+                    // block after the opener
+                    // (`crates/server/tests/decide_prompt_tail.rs`): the
+                    // opener sits four tokens inside the prompt, well within
+                    // `reuse_reach`, so an exact repeat *could* claim it and
+                    // prefill only the tail. GitHub #240 owns measuring
+                    // whether that is worth a retained slot; until it does,
+                    // this refuses rather than guesses.
+                    if r.input.is_decision() {
+                        return 0;
+                    }
                     let at = match r.checkpoint_point(self.config.kv_page_tokens) {
                         // A **page-aligned** opener falls exactly on the
                         // publish point, and this is the chunk that creates
@@ -2896,6 +2997,27 @@ impl Scheduler for ConcreteScheduler {
                     // request that takes a checkpoint".
                     capture_checkpoint,
                     multimodal: r.input.multimodal.clone(),
+                    // GitHub #237's seam, asked for by GitHub #238's request
+                    // kind. Only on the chunk that ends at the prompt's last
+                    // position: that is the position whose next-token
+                    // distribution holds the decision, and the chunk is
+                    // never empty because `reuse_reach` left it a token.
+                    readout: r
+                        .input
+                        .decision
+                        .clone()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32),
+                    // GitHub #242: and the run's first step, on the same
+                    // chunk and for a related reason — this prefill draws the
+                    // token the first decode round emits, so step 0's set
+                    // belongs here and nowhere else. `reuse_reach` is what
+                    // guarantees the chunk is not empty.
+                    permitted: r
+                        .input
+                        .constrained
+                        .as_ref()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32)
+                        .and_then(|schedule| schedule.step(0)),
                 }
             })
             .collect();
@@ -2907,7 +3029,7 @@ impl Scheduler for ConcreteScheduler {
                     // by the zip below rather than caught.
                     debug_assert_eq!(outcomes.len(), jobs.len(), "one prefill outcome per job");
                     for ((&i, job), outcome) in batch.iter().zip(&jobs).zip(
-                        outcomes.iter().copied().chain(std::iter::repeat(PrefillOutcome::default())),
+                        outcomes.iter().cloned().chain(std::iter::repeat(PrefillOutcome::default())),
                     ) {
                         // GitHub #81 / ADR 0012: the prefill span — one per
                         // request per `prefill_step` call (the chunked-
@@ -2935,6 +3057,15 @@ impl Scheduler for ConcreteScheduler {
                             r.advance(RequestState::Prefilling);
                         }
                         r.prefill_progress += job.tokens.len() as u32;
+                        // GitHub #238: a decision's answer, off the one
+                        // chunk that asked for it. Held on the request
+                        // rather than emitted here, because a decision
+                        // finishes at the end of this phase and its readout
+                        // rides that finish event — there is nothing else
+                        // for it to ride.
+                        if outcome.readout.is_some() {
+                            r.readout = outcome.readout.clone();
+                        }
                         // P3-01 / ADR 0018: every completed chunk boundary
                         // is a GDN resumable boundary, whether or not it
                         // is this request's last chunk.
@@ -3204,6 +3335,61 @@ impl Scheduler for ConcreteScheduler {
             }
         }
 
+        // GitHub #238, ADR 0034 — a **decision** ends where its prefill
+        // ends. It is finished here, between the prefill phase and the lane
+        // deal, which is the only place that means what it says: one step
+        // later it would be a candidate in `run_admission`'s queue, and
+        // being a candidate is the thing it must never be. It never enters
+        // `Running`, never holds a decode lane, emits no token, and carries
+        // its readout out on the finish event.
+        //
+        // The placement is load-bearing for ADR 0004, not only for tidiness.
+        // A decision's `remaining_work` is 0 — it has no tokens to generate
+        // — so it would satisfy `run_admission`'s temporal-backfill test
+        // (`remaining_work <= frontier && <= temporal_credit`) trivially and
+        // spend no credit doing it, taking a protected lane away from the
+        // conversation the protection was opened for. Emptying it from the
+        // candidate set here is what makes that unreachable.
+        //
+        // `FinishReason::Stop` because the decision is *answered* — nothing
+        // was cut short. Its `tokens` is 0, honestly: it generated nothing.
+        let decided: Vec<usize> = self
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|&(_, r)| {
+                r.state == RequestState::Prefilling
+                    && r.prefill_complete()
+                    && r.input.is_decision()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for idx in decided {
+            // A decision that finished its prefill with no readout should be
+            // impossible: its last chunk always carries at least one token
+            // (`RequestInput::reuse_reach`) and always asks for one, and a
+            // backend that cannot answer fails the job outright
+            // (`scheduler::READOUT_WITHOUT_TOKENS`). If it happens anyway,
+            // the one thing this must not do is report `Stop` with an empty
+            // answer — that is a decision answered by nothing, dressed as a
+            // decision answered. It ends with `Error`, which is what a
+            // request that could not be served ends with everywhere else.
+            let reason = match self.requests[idx].readout.is_some() {
+                true => FinishReason::Stop,
+                false => {
+                    // hotpath-lint-allow: failure-only path (a decision that cannot be answered ends here), reviewed exception (GitHub #238).
+                    tracing::error!(
+                        name: "ignis.decision.no_readout",
+                        request_id = self.requests[idx].id,
+                        prompt_tokens = self.requests[idx].input.tokens.len(),
+                        "a decision completed its prefill without reading out"
+                    );
+                    FinishReason::Error
+                }
+            };
+            self.mark_done(idx, &mut events, reason);
+        }
+
         // Phase 2 — the admission state machine drives the lane deal
         // (core-05; see `run_admission`). Restored (suspended) requests
         // take a free lane before a fresh prefill (core-06: a sibling
@@ -3230,7 +3416,8 @@ impl Scheduler for ConcreteScheduler {
             if self.requests[i].remaining_work == 0 {
                 // The reservation cap was reached (core-05): complete
                 // now, releasing the lane and the reservation.
-                self.mark_done(i, &mut events, FinishReason::Length);
+                let reason = self.budget_spent_reason(i);
+                self.mark_done(i, &mut events, reason);
             }
         }
         let to_decode: Vec<usize> = running
@@ -3245,6 +3432,15 @@ impl Scheduler for ConcreteScheduler {
                     lane: self.requests[i].lane.expect("running requests hold a lane"),
                     params: self.requests[i].input.params,
                     remaining_tokens: self.requests[i].remaining_work.min(u32::MAX as u64) as u32,
+                    // GitHub #242: the set for the draw this round makes,
+                    // which is the step *after* the one it emits — the
+                    // prefill drew step 0, so a request that has emitted `n`
+                    // tokens draws step `n + 1` here. The last round asks for
+                    // a step past the end and gets `None`: its draw is
+                    // discarded with the sequence.
+                    permitted: self.requests[i].input.constrained.as_ref().and_then(|schedule| {
+                        schedule.step(self.requests[i].tokens as usize + 1)
+                    }),
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -3270,6 +3466,7 @@ impl Scheduler for ConcreteScheduler {
                         .entered();
                         let DecodeOutcome {
                             tokens,
+                            probabilities,
                             finish,
                             spec,
                         } = res;
@@ -3285,6 +3482,16 @@ impl Scheduler for ConcreteScheduler {
                         // emitted one event per token, in order.
                         let mut run_truncated_by_budget = false;
                         for (n, &token) in tokens.iter().enumerate() {
+                            // GitHub #242: the probability this token held
+                            // inside its own step's set, which only the
+                            // backend could pair with it (the round that
+                            // drew it is not the round that returned it).
+                            // Absent on every unconstrained lane.
+                            if let Some(&probability) = probabilities.get(n) {
+                                self.requests[i]
+                                    .drawn
+                                    .push(crate::constrained::Draw { token, probability });
+                            }
                             self.requests[i].tokens += 1;
                             // Service-work decay (core-05): one quantum per
                             // generated token.
@@ -3329,7 +3536,8 @@ impl Scheduler for ConcreteScheduler {
                             // The request completes on its final reserved
                             // token.
                             _ if self.requests[i].remaining_work == 0 => {
-                                self.mark_done(i, &mut events, FinishReason::Length)
+                                let reason = self.budget_spent_reason(i);
+                                self.mark_done(i, &mut events, reason)
                             }
                             _ => {}
                         }

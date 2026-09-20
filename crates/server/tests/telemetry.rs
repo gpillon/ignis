@@ -51,6 +51,7 @@ fn engine_with_chunk(chunk: u32) -> Engine {
 
 fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
     RequestInput {
+        decision: None,
         multimodal: None,
         opener_tokens: None,
         user_turn_tokens: None,
@@ -61,6 +62,7 @@ fn input(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
             max_tokens: Some(max_tokens),
             ..DecodeParams::default()
         },
+        constrained: None,
     }
 }
 

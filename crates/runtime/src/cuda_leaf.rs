@@ -378,7 +378,18 @@ impl StepLeaf for CudaLeaf {
     fn encode_media(&self, model: &Self::Model, item: &MediaItem) -> Result<Self::Media, i32> {
         let control = ignis_core::vision::vision_item_control(item.grid);
         let embedding = step::encode_media(&model.model, item.grid, &item.patches, &control)
-            .map_err(|e| leaf_error("media encode", e))?;
+            // GitHub #243: a full pool is not a leaf error — it is the leaf
+            // telling the caller to release an embedding and call again, and
+            // `RuntimeCompute` does exactly that. Logging it as an error
+            // would put a line in the log for every cache miss under
+            // pressure.
+            .map_err(|(rc, message)| {
+                if rc == step::MEDIA_ENCODE_POOL_FULL {
+                    rc
+                } else {
+                    leaf_error("media encode", message)
+                }
+            })?;
         // Safety: as for sequences -- `RuntimeCompute` releases every live
         // embedding before its `Arc<Model<L>>` (and so this model) can drop.
         Ok(unsafe { embedding.into_static() })
@@ -395,9 +406,12 @@ impl StepLeaf for CudaLeaf {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
+        permitted: &[TokenId],
         span: MultimodalSpan<'_, Self::Media>,
-    ) -> Result<(), i32> {
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
         step::prefill_program_multimodal(
             &model.model,
             &model.pool,
@@ -405,6 +419,7 @@ impl StepLeaf for CudaLeaf {
             &token_ids,
             u64::from(start_position),
             sampling_params(params),
+            &permitted_ids,
             step::MultimodalPrefill {
                 positions: span.positions,
                 rope_delta: span.rope_delta,
@@ -414,7 +429,7 @@ impl StepLeaf for CudaLeaf {
                     scatter_indices: media.scatter_indices,
                 }),
             },
-            None,
+            out_logits,
         )
         .map_err(|e| leaf_error("prefill", e))
     }
@@ -722,18 +737,47 @@ impl StepLeaf for CudaLeaf {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
-    ) -> Result<(), i32> {
+        permitted: &[TokenId],
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        step::prefill_program_sampled(
+        // The unconstrained path is left exactly as it was — every request
+        // this engine serves takes it, and a constrained prefill is a
+        // different options struct, not a flag on this one.
+        if permitted.is_empty() {
+            return step::prefill_program_sampled(
+                &model.model,
+                &model.pool,
+                sequence,
+                &token_ids,
+                u64::from(start_position),
+                sampling_params(params),
+                out_logits,
+            )
+            .map(|()| 0.0)
+            .map_err(|e| leaf_error("prefill", e));
+        }
+        let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
+        step::prefill_program_permitted(
             &model.model,
             &model.pool,
             sequence,
             &token_ids,
             u64::from(start_position),
             sampling_params(params),
-            None,
+            &permitted_ids,
+            out_logits,
         )
         .map_err(|e| leaf_error("prefill", e))
+    }
+
+    /// The output head's width — 248,320 columns, which is what the kernel
+    /// writes into a readout buffer (GitHub #237). ignis is specialized for
+    /// this one topology (`CONTEXT.md`), so the number comes from the same
+    /// `ModelConfig` the load itself is built from rather than being asked
+    /// of the leaf.
+    fn vocab(&self, _model: &Self::Model) -> u32 {
+        ModelConfig::qwen38_27b().vocab as u32
     }
 
     fn decode(
@@ -750,6 +794,48 @@ impl StepLeaf for CudaLeaf {
                     lanes.len()
                 ),
             ));
+        }
+        // GitHub #242: a **constrained** round, which is a different round
+        // in two ways. It commits one token per lane — no drafts, because a
+        // draft is proposed by a second model that knows nothing of a set,
+        // and the leaf refuses a constrained lane in a verify round outright
+        // rather than accepting one it cannot honour. And it takes the plain
+        // path for the *whole batch*: a speculative load runs every round as
+        // a verify round, so one `number` in flight would otherwise fail
+        // every lane's round. The siblings lose that round's drafts, which
+        // is a number's six rounds' worth and not a mode the engine stays
+        // in.
+        if lanes.iter().any(|lane| !lane.permitted.is_empty()) {
+            let permitted: Vec<Vec<i32>> = lanes
+                .iter()
+                .map(|lane| lane.permitted.iter().map(|&id| id as i32).collect())
+                .collect();
+            let constrained: Vec<step::PermittedLane<'_>> = lanes
+                .iter()
+                .zip(&permitted)
+                .map(|(lane, ids)| step::PermittedLane {
+                    sampling: sampling_params(lane.params),
+                    permitted: ids,
+                })
+                .collect();
+            let (ids, probabilities) = step::decode_program_batch_permitted(
+                &model.model,
+                &model.pool,
+                sequences,
+                &constrained,
+            )
+            .map_err(|e| leaf_error("decode", e))?;
+            return Ok(ids
+                .into_iter()
+                .zip(probabilities)
+                .zip(lanes)
+                .map(|((id, probability), lane)| {
+                    LaneRun::drawn(
+                        id as TokenId,
+                        (!lane.permitted.is_empty()).then_some(probability),
+                    )
+                })
+                .collect());
         }
         let Some(speculation) = self.config.speculation else {
             let mut sampling = [step::SamplingParams::greedy(); N_DECODE_LANES];
@@ -800,6 +886,7 @@ impl StepLeaf for CudaLeaf {
                 LaneRun {
                     tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
                     spec: Some(SpecCounters::round(run.extent, accepted)),
+                    drawn_probability: None,
                 }
             })
             .collect())

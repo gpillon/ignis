@@ -11,6 +11,7 @@
 //!   scheduler (admission, lanes, batched prefill, eviction) CPU-testable
 //!   without a GPU (ADR 0006).
 
+use crate::decision::Readout;
 use crate::types::{
     ComputeError, DecodeParams, FinishReason, LaneId, RequestClass, RequestId, RequestInput,
     SchedEvent, SpecCounters, SubmitError, TokenId,
@@ -131,6 +132,39 @@ pub struct PrefillJob {
     /// holds at most one media item's placeholders
     /// ([`crate::vision::Multimodal::cap_chunk`]).
     pub multimodal: Option<std::sync::Arc<crate::vision::Multimodal>>,
+    /// The **answer tokens** this job reads out (GitHub #237, ADR 0034):
+    /// the vocabulary entries naming the options of a decision, whose
+    /// logits at this chunk's last position are the answer. `None` on every
+    /// job that is not a decision's last chunk — which is every job the
+    /// engine has today — and a job that asks for no readout pays for none:
+    /// the backend allocates no logits buffer and gathers nothing.
+    ///
+    /// Set only on the chunk that ends at the prompt's **last position**,
+    /// because that is the position whose next-token distribution holds the
+    /// decision. The chunk must also carry at least one token: a chunk with
+    /// nothing to prefill runs no forward pass, so there would be no logits
+    /// to read (GitHub #238 trims a reuse claim for exactly this reason).
+    ///
+    /// The order is the answer's order — [`PrefillOutcome::readout`]'s
+    /// `logits[i]` is the logit of `readout[i]`.
+    pub readout: Option<std::sync::Arc<[TokenId]>>,
+    /// The **permitted token set** this chunk's own draw is restricted to
+    /// (GitHub #242, ADR 0034), if this is a **constrained decode** request's last
+    /// chunk.
+    ///
+    /// Set for the same reason and on the same chunk as
+    /// [`PrefillJob::readout`], and for one more: a prefill *draws the first
+    /// token of the run that follows it*, which the first decode round then
+    /// returns ([`crate::constrained`]). A constrained decode that constrained only its
+    /// rounds would commit the prompt's own free successor as the first
+    /// token of its forced text.
+    ///
+    /// `None` on every other job, and an ordinary job pays a borrow for it:
+    /// the backend reads it as an empty slice rather than building one
+    /// (`RuntimeCompute::prefill_step`), masks nothing, and takes whatever
+    /// path it would have taken. The measured claim is only that — no
+    /// allocation and no device work — not that the field is free to name.
+    pub permitted: Option<crate::constrained::PermittedSet>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -148,6 +182,22 @@ pub struct DecodeJob {
     /// its lane's extent to so the sequence never commits past the text the
     /// request can emit.
     pub remaining_tokens: u32,
+    /// The **permitted token set for the draw this round makes** (GitHub
+    /// #242) — whose token this lane returns **next** round, not this one.
+    ///
+    /// The lag is the leaf's, and the seam states it rather than hiding it
+    /// ([`crate::constrained`]): a round returns the token the previous call
+    /// drew. So a K-step run's round `i` carries step `i`'s set and
+    /// returns step `i-1`'s token; its first round carries step 1 and
+    /// returns the token [`PrefillJob::permitted`] drew; and its last round
+    /// carries `None`, drawing a token nobody reads.
+    ///
+    /// [`DecodeOutcome::probabilities`] is paired with the tokens the round
+    /// *emits*, so it is the backend that holds the lag — a `Compute`
+    /// implementation that reported this round's draw probability beside
+    /// the previous round's token would be off by one step, which on a
+    /// number is off by a factor of ten.
+    pub permitted: Option<crate::constrained::PermittedSet>,
 }
 
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
@@ -167,7 +217,7 @@ pub struct DecodeJob {
 /// failure, once from the retry. What a request's total answers is "how
 /// much encode work did this request cause", not "what did this image cost
 /// to encode".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrefillOutcome {
     /// Wall time this chunk spent encoding a media item, in microseconds.
     pub encode_micros: u64,
@@ -187,6 +237,17 @@ pub struct PrefillOutcome {
     /// only on `true`, and gives the slot back on `false`, so its ledger and
     /// the device never disagree about what exists.
     pub checkpoint_captured: bool,
+    /// The **readout** this job asked for (GitHub #237, ADR 0034), if it
+    /// asked for one: the logits of its [`PrefillJob::readout`] answer
+    /// tokens at the chunk's last position, the full-vocabulary log-sum-exp
+    /// behind them, and the unrestricted argmax.
+    ///
+    /// This is the only thing a decision ever produces — no token is
+    /// sampled for it and none is emitted. What does *not* cross this seam
+    /// is the buffer it was read from: one f32 per vocabulary column, near
+    /// a megabyte per decision, gathered on the backend's side and dropped
+    /// there.
+    pub readout: Option<Readout>,
 }
 
 impl PrefillOutcome {
@@ -208,10 +269,22 @@ impl PrefillOutcome {
 /// after whatever tokens preceded it in the round: a run cut at EOS is the
 /// tokens before the EOS plus [`FinishReason::Stop`]. `tokens` is empty only
 /// on a finished outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent: `probabilities` is `f32`, and a decode
+/// outcome is compared for equality in tests and nowhere else.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodeOutcome {
     /// The committed tokens to emit, in order.
     pub tokens: Vec<TokenId>,
+    /// The probability of each token in `tokens`, within the permitted set
+    /// **that token** was drawn from (GitHub #242): parallel to `tokens`,
+    /// and **empty** for every lane that drew unconstrained — which is every
+    /// lane the engine has apart from a run's.
+    ///
+    /// A backend fills this from the draw one round earlier than the one
+    /// reporting it, because that is the round the token came from
+    /// ([`DecodeJob::permitted`]).
+    pub probabilities: Vec<f32>,
     /// Why the request finished this round, after `tokens`; `None` while it
     /// keeps running.
     pub finish: Option<FinishReason>,
@@ -230,8 +303,23 @@ impl DecodeOutcome {
     pub fn run(tokens: Vec<TokenId>) -> Self {
         Self {
             tokens,
+            probabilities: Vec::new(),
             finish: None,
             spec: None,
+        }
+    }
+
+    /// A run of constrained tokens, each with its own probability within
+    /// the set it was drawn from (GitHub #242).
+    pub fn constrained_run(tokens: Vec<TokenId>, probabilities: Vec<f32>) -> Self {
+        debug_assert_eq!(
+            tokens.len(),
+            probabilities.len(),
+            "a probability belongs to a token, so there is one of each"
+        );
+        Self {
+            probabilities,
+            ..Self::run(tokens)
         }
     }
 
@@ -243,9 +331,8 @@ impl DecodeOutcome {
     /// `tokens`, then the request finished.
     pub fn run_then_finished(tokens: Vec<TokenId>, reason: FinishReason) -> Self {
         Self {
-            tokens,
             finish: Some(reason),
-            spec: None,
+            ..Self::run(tokens)
         }
     }
 
@@ -268,6 +355,20 @@ impl DecodeOutcome {
 /// the arena changed hands between the probe and the call, and the refusal
 /// path is the same one every other failed spill takes.
 pub const NO_HOST_ROOM: i32 = -6;
+
+/// The [`ComputeError::Kernel`] code a backend reports when a job asked for
+/// a [`PrefillJob::readout`] on a chunk that carries no tokens (GitHub
+/// #237): no forward pass runs, so there are no logits at that position to
+/// read.
+///
+/// Numbered far outside the leaf ABI's own codes (`-1..-6`) because nothing
+/// in the leaf produces it: it is the adapter refusing an incoherent job,
+/// the way it refuses a claim on a prefix it holds no handle for. The
+/// scheduler does not branch on it — the job is deterministic, so the
+/// `MAX_PREFILL_ATTEMPTS` retries fail identically and the request ends with
+/// [`FinishReason::Error`], which is the right end for a request that can
+/// never be served. GitHub #238 owes the trim that keeps it from arising.
+pub const READOUT_WITHOUT_TOKENS: i32 = -1001;
 
 /// The compute seam the scheduler drives for actual token generation.
 ///

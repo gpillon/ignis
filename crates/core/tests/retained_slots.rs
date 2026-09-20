@@ -38,6 +38,7 @@ fn tokens(start: u32, n: u32) -> Vec<u32> {
 /// its generation opener.
 fn input(prompt: Vec<u32>, block: Option<u32>, opener: Option<u32>, max: u32) -> RequestInput {
     RequestInput {
+        decision: None,
         model: MODEL.into(),
         tokens: prompt,
         params: DecodeParams {
@@ -48,6 +49,7 @@ fn input(prompt: Vec<u32>, block: Option<u32>, opener: Option<u32>, max: u32) ->
         opener_tokens: opener,
         user_turn_tokens: None,
         system_block_tokens: block,
+        constrained: None,
     }
 }
 

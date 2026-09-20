@@ -94,6 +94,8 @@ pub(crate) mod ffi {
         pub draft_tokens: u32,
         /// GitHub #177: the vision envelope, 0 = no vision.
         pub vision_max_tokens: u32,
+        /// GitHub #243: the embedding pool's bytes, 0 without vision.
+        pub vision_embedding_pool_bytes: u64,
         /// GitHub #227: the text rotary table. A factor of 0 or 1 is no
         /// scaling (the linear table); the three below are the YaRN ramp's
         /// and are read only with a factor.
@@ -309,6 +311,7 @@ fn load_options(
             speculative_backend: speculation.map_or(0, |s| s.backend().abi_code()),
             draft_tokens: speculation.map_or(0, |s| s.draft_tokens()),
             vision_max_tokens: vision.map_or(0, |v| v.max_tokens()),
+            vision_embedding_pool_bytes: vision.map_or(0, |v| v.requested_pool_bytes()),
             // GitHub #227: `none` crosses as a zero factor, which is the
             // leaf's linear branch -- the same table a NULL options pointer
             // gets, so a load that scales nothing is untouched by this.
@@ -866,8 +869,10 @@ mod tests {
     #[test]
     fn the_options_mirror_is_the_leaf_structs_size() {
         // uint32 size, int32 backend, uint32 draft_tokens, uint32
-        // vision_max_tokens, and (GitHub #227) four float rope scalars.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 32);
+        // vision_max_tokens, (GitHub #243) uint64 pool bytes — which the four
+        // uint32s above align for free — and (GitHub #227) four float rope
+        // scalars.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 40);
         // uint64 x 3.
         assert_eq!(std::mem::size_of::<IgnisModelStats>(), 24);
     }

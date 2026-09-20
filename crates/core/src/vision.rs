@@ -35,10 +35,36 @@ const HIDDEN: u64 = 5120;
 /// The leaf's vision allocation alignment (`kVisionWorkspaceAlignment`).
 const VISION_ALIGN: u64 = 256;
 
-/// The vision envelope a load reserves for.
+/// The leaf's `IGNIS_MEDIA_ENCODE_POOL_FULL` (GitHub #243): the embedding
+/// pool cannot take another item until one is released.
+///
+/// The one encode refusal a caller acts on rather than reports — every other
+/// is -1 and means the call can never work. It lives here, and not beside
+/// the rest of the step ABI, because the policy that clears it
+/// (`RuntimeCompute`'s cache) is built without the `cuda` feature.
+pub const MEDIA_ENCODE_POOL_FULL: i32 = -2;
+
+/// Merged columns per embedding pool page (`IGNIS_MEDIA_EMBEDDING_PAGE_COLUMNS`,
+/// GitHub #243). At [`HIDDEN`] a page is 1,280 KiB.
+pub const EMBEDDING_PAGE_COLUMNS: u64 = 128;
+
+/// One embedding pool page, in bytes.
+pub const EMBEDDING_PAGE_BYTES: u64 = HIDDEN * EMBEDDING_PAGE_COLUMNS * 2;
+
+/// The embedding pool a load that names none asks for (GitHub #243): zero,
+/// which [`Vision::pool_bytes`] raises to its floor — one envelope-wide
+/// item, at *this* load's envelope. Exactly what GitHub #177 always
+/// reserved, so a load that says nothing does not move the VRAM plan, and a
+/// short-context load does not suddenly reserve for a context it cannot
+/// serve.
+pub const DEFAULT_EMBEDDING_POOL_BYTES: u64 = 0;
+
+/// The vision envelope a load reserves for, and the embedding pool it holds
+/// encoded items in (GitHub #243).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vision {
     max_tokens: u32,
+    pool_bytes: u64,
 }
 
 /// A vision envelope outside `1..=VISION_MAX_TOKENS_LIMIT`.
@@ -61,22 +87,59 @@ impl Default for Vision {
     fn default() -> Self {
         Self {
             max_tokens: DEFAULT_VISION_MAX_TOKENS,
+            pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
         }
     }
 }
 
 impl Vision {
-    /// An envelope of `max_tokens` merged vision tokens per request.
+    /// An envelope of `max_tokens` merged vision tokens per request, with the
+    /// default embedding pool.
     pub fn new(max_tokens: u32) -> Result<Self, VisionEnvelopeOutOfRange> {
         if max_tokens == 0 || max_tokens > VISION_MAX_TOKENS_LIMIT {
             return Err(VisionEnvelopeOutOfRange(max_tokens));
         }
-        Ok(Self { max_tokens })
+        Ok(Self {
+            max_tokens,
+            pool_bytes: DEFAULT_EMBEDDING_POOL_BYTES,
+        })
+    }
+
+    /// The same envelope holding encoded items in a `pool_bytes` pool
+    /// (GitHub #243).
+    ///
+    /// The value is what the operator asked for; the leaf rounds it up to
+    /// whole pages and floors it at the envelope's own output, because an
+    /// item that fits the envelope has to fit the pool once everything else
+    /// is released — a caller told "release something and retry" must be able
+    /// to make progress. [`Self::pool_bytes`] reports the floored, rounded
+    /// number, which is what the VRAM plan carries.
+    pub fn with_pool_bytes(self, pool_bytes: u64) -> Self {
+        Self { pool_bytes, ..self }
     }
 
     /// The configured envelope, in merged vision tokens.
     pub fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    /// The embedding pool the leaf reserves, in bytes: whole pages, never
+    /// below one envelope-wide item (GitHub #243).
+    pub fn pool_bytes(&self, max_context_tokens: u32) -> u64 {
+        let floor = self.output_transient_bytes(max_context_tokens);
+        let want = self.pool_bytes.max(floor);
+        want.div_ceil(EMBEDDING_PAGE_BYTES) * EMBEDDING_PAGE_BYTES
+    }
+
+    /// The pool's pages at `max_context_tokens`.
+    pub fn pool_pages(&self, max_context_tokens: u32) -> u64 {
+        self.pool_bytes(max_context_tokens) / EMBEDDING_PAGE_BYTES
+    }
+
+    /// What the operator asked for, before the floor and the rounding — what
+    /// the load option carries across the ABI.
+    pub fn requested_pool_bytes(&self) -> u64 {
+        self.pool_bytes
     }
 
     /// The envelope the leaf actually reserves for: no request can carry more
@@ -86,7 +149,8 @@ impl Vision {
     }
 
     /// One item's `[5120, V]` BF16 encoder output at the envelope, rounded to
-    /// the leaf's alignment (the output transient half of the reservation).
+    /// the leaf's alignment — the widest single embedding, and so (GitHub
+    /// #243) the floor under [`Self::pool_bytes`].
     pub fn output_transient_bytes(&self, max_context_tokens: u32) -> u64 {
         let bytes = HIDDEN * u64::from(self.envelope_tokens(max_context_tokens)) * 2;
         bytes.div_ceil(VISION_ALIGN) * VISION_ALIGN
@@ -157,6 +221,64 @@ impl Multimodal {
     /// Prompt tokens the positions cover.
     pub fn prompt_tokens(&self) -> usize {
         self.positions.len() / 3
+    }
+
+    /// Extend the prompt by `count` **text** tokens appended after it
+    /// (GitHub #242), continuing its MRoPE positions and recomputing
+    /// `rope_delta`. `false` when this prompt cannot be extended.
+    ///
+    /// A **constrained decode** forces a literal prefix — spec 06's `{"x":` — by
+    /// putting it in the prompt rather than spending a constrained round per
+    /// token on it. For a text prompt that is a `Vec::extend` and nothing
+    /// else; for a multimodal one the positions have to grow with the
+    /// tokens, or the leaf refuses the chunk outright (it checks
+    /// `positions.len() == 3 * tokens`). The measured test
+    /// (`classify_pointing_gpu.rs`) never met this: it forced its literal
+    /// through a *second, text* prefill call after the multimodal one, which
+    /// the server's chunker does not do.
+    ///
+    /// The rule is `assign_positions`' own, read off it rather than guessed:
+    /// a run of text tokens takes consecutive positions on all three axes,
+    /// continuing from where the run before it left off. The last token of a
+    /// rendered prompt is the generation opener, which is text, so its
+    /// position — identical on all three axes — is what the appended run
+    /// continues from. `rope_delta` is `maximum + 1 - length`, and both
+    /// terms move: the appended tokens may or may not raise the maximum
+    /// (after a wide image they do not), so it is recomputed rather than
+    /// left alone.
+    ///
+    /// Refuses when the prompt is empty or its last token is a media
+    /// placeholder — then the last position is a *grid* coordinate, the
+    /// three axes disagree, and continuing from any one of them would be a
+    /// guess. Nothing renders such a prompt today (a template always ends in
+    /// text), and a refusal is what an impossible prompt deserves rather
+    /// than positions nobody can check.
+    pub fn append_text(&mut self, count: usize) -> bool {
+        let tokens = self.prompt_tokens();
+        if tokens == 0 || count == 0 {
+            return tokens > 0;
+        }
+        let last = tokens - 1;
+        let axes: [i32; 3] = [
+            self.positions[last],
+            self.positions[tokens + last],
+            self.positions[2 * tokens + last],
+        ];
+        if axes[0] != axes[1] || axes[1] != axes[2] {
+            return false;
+        }
+        let maximum = self.rope_delta + tokens as i32;
+        let appended: Vec<i32> = (1..=count as i32).map(|step| axes[0] + step).collect();
+        let grown = tokens + count;
+        let mut positions = Vec::with_capacity(3 * grown);
+        for axis in 0..3 {
+            positions.extend_from_slice(&self.positions[axis * tokens..(axis + 1) * tokens]);
+            positions.extend_from_slice(&appended);
+        }
+        self.positions = positions;
+        self.rope_delta =
+            maximum.max(*appended.last().expect("count > 0")) + 1 - grown as i32;
+        true
     }
 
     /// Axis-major `[3, len]` positions of the span `[start, start + len)`.
@@ -337,6 +459,57 @@ mod tests {
         Multimodal { positions, rope_delta: -3, media }
     }
 
+    /// GitHub #242: appending a forced literal must produce exactly the
+    /// positions the processor would have produced had the literal been part
+    /// of the render.
+    ///
+    /// The oracle is `assign_positions` itself, run over the longer prompt —
+    /// not a restatement of its rule here. A prompt with an image in it is
+    /// where the two could disagree: after a wide image `current` and
+    /// `maximum` have parted company, and continuing from the wrong one
+    /// shifts every appended token.
+    #[test]
+    fn appended_text_takes_the_positions_the_processor_would_have_given_it() {
+        use ignis_artifact::vision::layout::{IMAGE, TEXT, assign_positions};
+
+        // A 4x6 merged grid: `maximum` runs ahead of `current` on the width
+        // axis, which is the case a naive `maximum + 1` gets wrong.
+        let grid = Grid { t: 1, h: 4 * 2, w: 6 * 2 };
+        let placeholders = 4 * 6;
+        let build = |tail: usize| {
+            let mut types = vec![TEXT; 3];
+            types.extend(std::iter::repeat_n(IMAGE, placeholders));
+            types.extend(std::iter::repeat_n(TEXT, tail));
+            let (positions, spans, rope_delta) =
+                assign_positions(&types, &[grid]).expect("a legal layout");
+            Multimodal {
+                positions,
+                rope_delta,
+                media: vec![MediaItem {
+                    grid,
+                    token_span: spans[0],
+                    patches: Vec::new(),
+                    content_digest: [0; 32],
+                }],
+            }
+        };
+
+        for appended in [1, 5, 9] {
+            let mut grown = build(2);
+            assert!(grown.append_text(appended), "a prompt ending in text extends");
+            assert_eq!(
+                grown,
+                build(2 + appended),
+                "appending {appended} token(s) must give the render's own positions"
+            );
+        }
+
+        // A prompt whose last token is a placeholder has no single position
+        // to continue from, and says so rather than guessing one.
+        let mut ends_in_media = build(0);
+        assert!(!ends_in_media.append_text(1));
+    }
+
     #[test]
     fn a_chunk_holds_at_most_one_media_item() {
         let prompt = multimodal(100, vec![item(10, 20), item(40, 20), item(70, 5)]);
@@ -471,5 +644,59 @@ mod tests {
     #[test]
     fn the_vision_object_count_is_the_artifacts() {
         assert_eq!(VISION_OBJECTS, 333);
+    }
+
+    #[test]
+    fn a_page_is_a_whole_number_of_columns_and_of_alignment_units() {
+        // A column is 5120 x 2 = 10,240 bytes = 40 x 256, so every page
+        // boundary is a 256-aligned address whatever the page width is —
+        // which is what lets the encoder write and the prefill read at a
+        // page pointer with the same ops they used on one flat buffer.
+        assert_eq!(EMBEDDING_PAGE_BYTES, 1_310_720);
+        assert_eq!(EMBEDDING_PAGE_BYTES % VISION_ALIGN, 0);
+        assert_eq!(HIDDEN * 2 % VISION_ALIGN, 0);
+    }
+
+    #[test]
+    fn the_default_pool_is_exactly_what_the_output_transient_always_was() {
+        // GitHub #243 must not move the VRAM plan for a load that asks for
+        // nothing: the default pool is one envelope-wide embedding, which is
+        // the reservation GitHub #177 took.
+        let vision = Vision::default();
+        assert_eq!(DEFAULT_EMBEDDING_POOL_BYTES, 0, "zero asks for the floor");
+        assert_eq!(vision.pool_bytes(262_144), vision.output_transient_bytes(262_144));
+        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
+        assert_eq!(vision.pool_pages(262_144), 256);
+        // And at a short context the floor moves with the envelope, rather
+        // than reserving 320 MiB for tokens this load can never carry.
+        assert_eq!(vision.pool_bytes(2048), vision.output_transient_bytes(2048));
+        assert_eq!(vision.pool_bytes(2048), 16 * EMBEDDING_PAGE_BYTES);
+    }
+
+    #[test]
+    fn a_pool_is_floored_at_one_envelope_wide_item_and_rounded_to_pages() {
+        // The floor is the termination argument for the caller's eviction
+        // loop: an item that fits the envelope has to fit the pool once
+        // everything else is released, or "release something and retry"
+        // never ends. Asking for less is raised, not refused.
+        let vision = Vision::default().with_pool_bytes(1024);
+        assert_eq!(vision.requested_pool_bytes(), 1024);
+        assert_eq!(vision.pool_bytes(262_144), 335_544_320);
+
+        // Above the floor it is the request, rounded up to whole pages.
+        let big = Vision::default().with_pool_bytes(335_544_320 + 1);
+        assert_eq!(big.pool_bytes(262_144), 335_544_320 + EMBEDDING_PAGE_BYTES);
+        assert_eq!(big.pool_pages(262_144), 257);
+    }
+
+    #[test]
+    fn a_small_context_lowers_the_floor_with_the_envelope() {
+        // The envelope is capped by the context, so a short-context load
+        // floors the pool far lower — and a pool asked for in bytes is then
+        // as many items as fit, not one.
+        let vision = Vision::new(1024).unwrap().with_pool_bytes(0);
+        assert_eq!(vision.pool_bytes(4096), 8 * EMBEDDING_PAGE_BYTES);
+        assert_eq!(vision.output_transient_bytes(4096), 1024 * HIDDEN * 2);
+        assert_eq!(vision.pool_bytes(4096), vision.output_transient_bytes(4096));
     }
 }

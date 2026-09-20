@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use ignis_artifact::{FrontendSet, Reader, Tokenizer};
+use ignis_core::decision::AnswerAlphabet;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 
@@ -152,4 +153,60 @@ fn count_the_single_token_answer_slots() {
     );
     let sample: Vec<&str> = slots.iter().skip(62).take(12).map(|&(l, _)| l).collect();
     eprintln!("ignis slots: first bigram slots past the 62 singles: {sample:?}");
+}
+
+/// The **answer alphabet** this artifact's tokenizer actually yields
+/// (GitHub #237, ADR 0034), against the same tokenizer the counts above are
+/// measured on.
+///
+/// The counts are pinned rather than merely reported because the rule they
+/// come from is a correctness rule: `BQ` is two tokens here, and an
+/// alphabet that admitted it would read the logit of `B` at `BQ`'s slot —
+/// `B` being option 2's own answer token. Two options reading one logit
+/// cannot be told apart without a second forward pass, which is the one
+/// thing a zero-decode decision must not need.
+#[test]
+fn the_answer_alphabet_rejects_the_labels_this_tokenizer_splits() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() {
+        eprintln!("skip: {ARTIFACT} does not exist");
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
+    let set = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let tokenizer = set.tokenizer();
+    let alphabet = AnswerAlphabet::from_tokenizer(tokenizer);
+
+    // The named case. `BQ` splits, and its first piece is exactly `B`.
+    assert!(
+        alphabet.position("BQ").is_none(),
+        "`BQ` is two tokens in this tokenizer and must not be an answer token"
+    );
+    let split = tokenizer.encode("BQ").expect("encode BQ");
+    assert_eq!(split.len(), 2, "the premise: `BQ` is two tokens here");
+    let b = alphabet.position("B").map(|i| alphabet.tokens()[i].id).expect("`B` is one token");
+    assert_eq!(
+        split[0], b,
+        "admitting `BQ` would have read option `B`'s own logit at `BQ`'s slot"
+    );
+
+    // The singles are all clean, and the bigrams are not: 562 of 676.
+    for label in ('A'..='Z').chain('a'..='z').chain('0'..='9').map(|c| c.to_string()) {
+        assert!(alphabet.position(&label).is_some(), "the single {label:?} is one token");
+    }
+    let bigrams = alphabet.len() - 62;
+    assert_eq!(
+        bigrams, 562,
+        "114 of the 676 uppercase bigrams are two tokens in this tokenizer"
+    );
+    assert_eq!(alphabet.len(), 624, "the alphabet the endpoint can offer");
+
+    // No two slots name one token — the property the whole readout rests on.
+    let ids: BTreeSet<u32> = alphabet.tokens().iter().map(|token| token.id).collect();
+    assert_eq!(ids.len(), alphabet.len(), "no two answer tokens share an id");
+
+    eprintln!(
+        "ignis alphabet: {} answer tokens (62 singles + {bigrams} uppercase bigrams); Jev's ceiling is 255",
+        alphabet.len()
+    );
 }

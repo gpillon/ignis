@@ -22,6 +22,7 @@
 pub mod api;
 pub mod artifact_template;
 pub mod config;
+pub mod decide;
 pub mod decoder;
 pub mod download;
 pub mod engine;
@@ -31,6 +32,7 @@ pub mod loader;
 pub mod media;
 pub mod metrics;
 pub mod playground;
+pub mod numbers;
 pub mod runtime;
 pub mod telemetry;
 pub mod template;
@@ -82,14 +84,24 @@ pub struct Server {
     /// templated (`--system-message-policy` / `--developer-message-policy`,
     /// GitHub #209).
     pub instruction_policy: instruction::InstructionPolicy,
+    /// The labels `/v1/decide` may give a decision's options (GitHub #237,
+    /// #239), computed once from the loaded tokenizer.
+    ///
+    /// Once, because it is a property of the load and not of a request:
+    /// deriving it per request would re-encode 624 candidate labels on the
+    /// way to serving a prompt of 132. Empty on a provider with no real
+    /// tokenizer, and `/v1/decide` refuses rather than guessing.
+    pub alphabet: std::sync::Arc<ignis_core::decision::AnswerAlphabet>,
 }
 
 impl Server {
     /// A server over `engine`'s scheduler with the given template provider.
     pub fn new(engine: Engine, template: Box<dyn TemplateProvider>) -> Self {
+        let template: std::sync::Arc<dyn TemplateProvider> = std::sync::Arc::from(template);
         Self {
             engine,
-            template: std::sync::Arc::from(template),
+            alphabet: std::sync::Arc::new(template.answer_alphabet()),
+            template,
             request_timeout: Duration::from_secs(crate::config::DEFAULT_REQUEST_TIMEOUT_SECS as u64),
             default_enable_thinking: true,
             default_reasoning_effort: None,

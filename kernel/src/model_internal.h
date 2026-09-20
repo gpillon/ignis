@@ -140,6 +140,71 @@ struct VisionWeights {
   ninfer::Weight merger_norm_bias;
 };
 
+struct ignis_media_embedding;
+
+// GitHub #243: the media embedding pool -- one device reservation carved
+// into fixed-width column pages.
+//
+// Paging rather than slots because an embedding's width spans two orders of
+// magnitude: at 5120 hidden a 320x240 thumbnail is 80 columns (one page) and
+// a 4096x4096 screenshot is 16,384 (128 pages). Slots wide enough for the
+// second waste almost all of themselves on the first, and the whole point of
+// holding embeddings past their encode is to hold *several*.
+//
+// The page width is the one thing the rest of the leaf has to agree on: the
+// encoder writes an item's columns page by page (kernel/src/vision_encode.cu)
+// and a prefill chunk scatters them back page by page
+// (kernel/src/step.cu). Both are plain column ranges over the ops that
+// already existed -- no kernel reads a page table.
+struct VisionEmbeddingPool {
+  std::unique_ptr<ninfer::DeviceBuffer> buffer;
+  // `[hidden]` BF16 columns per page, and so the bytes of one.
+  std::int32_t page_columns = 0;
+  std::size_t page_bytes = 0;
+  // Per page: the embedding holding it, or nullptr. A raw pointer and not a
+  // bool because a release names its embedding, not its pages.
+  std::vector<const ignis_media_embedding *> owner;
+
+  bool present() const { return buffer != nullptr; }
+  std::int32_t pages() const { return static_cast<std::int32_t>(owner.size()); }
+  std::int32_t free_pages() const {
+    std::int32_t n = 0;
+    for (const ignis_media_embedding *o : owner) {
+      n += (o == nullptr) ? 1 : 0;
+    }
+    return n;
+  }
+  // The pages `columns` merged columns need.
+  std::int32_t pages_for(std::int32_t columns) const {
+    return page_columns > 0 ? (columns + page_columns - 1) / page_columns : 0;
+  }
+  std::uint8_t *page_ptr(std::int32_t page) const {
+    return static_cast<std::uint8_t *>(buffer->p) + static_cast<std::size_t>(page) * page_bytes;
+  }
+  // Claim `count` pages for `owner_of`, or return empty. The pages need not
+  // be adjacent -- that is the whole point of paging them.
+  std::vector<std::int32_t> take(std::int32_t count, const ignis_media_embedding *owner_of) {
+    std::vector<std::int32_t> taken;
+    if (count > free_pages()) {
+      return taken;
+    }
+    taken.reserve(static_cast<std::size_t>(count));
+    for (std::int32_t page = 0; page < pages() && taken.size() < static_cast<std::size_t>(count);
+         ++page) {
+      if (owner[static_cast<std::size_t>(page)] == nullptr) {
+        owner[static_cast<std::size_t>(page)] = owner_of;
+        taken.push_back(page);
+      }
+    }
+    return taken;
+  }
+  void give(const std::vector<std::int32_t> &pages_held) {
+    for (const std::int32_t page : pages_held) {
+      owner[static_cast<std::size_t>(page)] = nullptr;
+    }
+  }
+};
+
 struct LayerWeights {
   ignis_layer_kind kind = IGNIS_LAYER_GDN;
   GqaLayerWeights gqa{};
@@ -309,6 +374,15 @@ struct ignis_model {
   // sampling is one `ninfer::ops::sample` call over every lane, not one call
   // per lane.
   std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_logits;
+  // P6-06 (GitHub #242): the round's per-lane permitted token sets, staged
+  // like the configs above and at stable addresses for the same reason.
+  // `permitted` is I32 [IGNIS_DECODE_MAX_BATCH][IGNIS_MAX_PERMITTED_TOKENS],
+  // `permitted_counts` is I32 [lanes] (0 = that lane is unconstrained), and
+  // `permitted_probs` is the F32 [lanes] the post-sample kernel writes the
+  // committed token's restricted probability into.
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted_counts;
+  std::unique_ptr<ninfer::DeviceBuffer> sampling_decode_permitted_probs;
   std::unique_ptr<ninfer::DeviceArena> sampling_workspace;
 
   // P3-05 (GitHub #102, ADR 0019): the decode CUDA graphs' own resources,
@@ -368,22 +442,23 @@ struct ignis_model {
   // `scratch` above, grown to fit it (GitHub #212).
   uint32_t vision_max_tokens = 0;
   VisionWeights vision{};
-  std::unique_ptr<ninfer::DeviceBuffer> vision_output;
-  // GitHub #178: whether `vision_output` holds a live media embedding. One
-  // item at a time, like the reference's single output transient.
-  bool vision_output_live = false;
+  // GitHub #243: the embedding pool, carved into fixed-width column pages.
+  // Where the reference (and GitHub #178 after it) keeps one output
+  // transient, this holds as many embeddings as their own columns fit --
+  // which is what lets an embedding outlive the encode that made it.
+  VisionEmbeddingPool vision_pool{};
   // GitHub #178: the decode round's per-lane rope positions (I32 x
   // IGNIS_DECODE_MAX_BATCH), `position + rope_delta`, staged beside
   // `sampling_decode_positions` and read by the graphs from this stable
   // address. Only a vision load has one: a text load's rounds rotate at the
   // positions themselves, exactly as before.
   std::unique_ptr<ninfer::DeviceBuffer> decode_rope_positions;
-  // What vision adds beside a text load: the output transient, and what the
+  // What vision adds beside a text load: the embedding pool, and what the
   // encoder's workspace grew `scratch` by.
   uint64_t vision_reserved_bytes() const {
     const uint64_t shared = scratch ? scratch->capacity() : 0;
     return (shared > prefill_scratch_bytes ? shared - prefill_scratch_bytes : 0) +
-           (vision_output ? vision_output->bytes : 0);
+           (vision_pool.buffer ? vision_pool.buffer->bytes : 0);
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, present exactly when
@@ -393,10 +468,13 @@ struct ignis_model {
 };
 
 // GitHub #178: a media embedding -- the `[hidden, columns]` BF16 encoder
-// output in its model's `vision_output`, live until released.
+// output, live until released. GitHub #243: its columns sit in the pages
+// `pages` names, in order, `page_columns` of them per page and the last one
+// short; the embedding is contiguous in column space and not in memory.
 struct ignis_media_embedding {
   ignis_model *model = nullptr;
   std::int32_t columns = 0;
+  std::vector<std::int32_t> pages;
 };
 
 // GitHub #178: the encoder workspace for `tokens` merged tokens over

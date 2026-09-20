@@ -52,6 +52,21 @@ pub struct Request {
     /// The speculative rounds this request ran, summed (P5-06, GitHub
     /// #154); `None` until its first one.
     pub spec: Option<SpecCounters>,
+    /// The **readout** this request's last prefill chunk produced (GitHub
+    /// #238, ADR 0034), held from the chunk that read it to the completion
+    /// that reports it. `None` on every request that is not a **decision**,
+    /// and on a decision whose last chunk has not landed yet.
+    pub readout: Option<crate::decision::Readout>,
+    /// The **trace** a **constrained decode** has built so far (GitHub #242): one draw
+    /// per token it has emitted, in order, each with the probability it held
+    /// inside its own step's permitted set.
+    ///
+    /// Accumulated round by round rather than reported per token, because
+    /// the answer is the whole run: three digits and their confidences are a
+    /// reading with a resolution, and any one of them alone is a digit. It
+    /// leaves on [`crate::types::SchedEvent::Done`], beside the readout a
+    /// decision leaves on. Empty on every request that is not a constrained decode.
+    pub drawn: Vec<crate::constrained::Draw>,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -186,6 +201,8 @@ impl Request {
             resident: false,
             tokens: 0,
             spec: None,
+            readout: None,
+            drawn: Vec::new(),
             resources,
             remaining_work,
             backfill_epoch: 0,
@@ -654,6 +671,8 @@ mod tests {
             id,
             class,
             RequestInput {
+                decision: None,
+                constrained: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),

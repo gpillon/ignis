@@ -98,6 +98,187 @@ impl Rejection {
     }
 }
 
+/// Which typed primitive a question asked for: `ignis_decisions_total`'s
+/// fixed `type` label (GitHub #241, ADR 0034).
+///
+/// Its own enum rather than `decide::QuestionKind` so the projection keeps
+/// owning its label sets — the same separation `Rejection` keeps from
+/// `SubmitError`. The wire vocabulary is Jev's and may grow a primitive
+/// without the contract growing a label value in the same release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Primitive {
+    Noul,
+    Choice,
+    Score,
+    Number,
+    Point,
+    Box,
+}
+
+impl Primitive {
+    /// Every primitive, in the order their series are rendered.
+    pub const ALL: [Primitive; 6] = [
+        Self::Noul,
+        Self::Choice,
+        Self::Score,
+        Self::Number,
+        Self::Point,
+        Self::Box,
+    ];
+
+    /// Whether this primitive's answer has an **answer mass** to observe
+    /// (GitHub #242).
+    ///
+    /// The three readouts do: their answer is a restricted softmax over
+    /// declared option tokens, and the mass is how much of the real
+    /// distribution those options held — the one silent failure the family
+    /// exists to show. The three **constrained decodes** do not: their answer is a run
+    /// of sampled tokens, each drawn from a permitted set, and there is no
+    /// single position whose distribution the answer stands on. A number
+    /// reported as mass 1 would be a lie, and one reported as 0 would put a
+    /// false alarm in the bucket a real one lands in.
+    pub(crate) fn has_answer_mass(self) -> bool {
+        matches!(self, Self::Noul | Self::Choice | Self::Score)
+    }
+
+    /// The label value this primitive is exported under — and the word the
+    /// request log calls it by, so the two are the same string by
+    /// construction rather than by coincidence.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Noul => "noul",
+            Self::Choice => "choice",
+            Self::Score => "score",
+            Self::Number => "number",
+            Self::Point => "point",
+            Self::Box => "box",
+        }
+    }
+}
+
+/// `ignis_decision_answer_mass`' bucket boundaries (ADR 0017 as amended by
+/// #241), in millionths.
+///
+/// Not a latency scale reused for a ratio. The measured baseline is a median
+/// of 0.996 and above from 8 to 256 options
+/// (`docs/findings/2026-09-19-typed-option-logit-readout.md`), so every
+/// healthy observation would land in one bucket under any evenly spaced
+/// scale and the panel would show a flat line whatever happened. The
+/// resolution is where the signal is — between 0.99 and 1 — and the two
+/// coarse buckets below exist to make a collapse unmissable rather than to
+/// resolve it.
+const ANSWER_MASS_BOUNDS: [u64; 10] =
+    [500_000, 900_000, 950_000, 980_000, 990_000, 995_000, 998_000, 999_000, 999_500, 1_000_000];
+
+/// A fixed-bucket histogram over observations in `[0, 1]`, counted in
+/// millionths.
+///
+/// Millionths rather than `f64` for the same reason the latency histograms
+/// count milliseconds: a sum of integers is exact and a sum of floats is
+/// whatever the order of arrival made it, and two scrapes of the same
+/// observations must agree.
+#[derive(Debug)]
+struct Ratio {
+    bounds: &'static [u64; 10],
+    /// Observations per bucket, not cumulative; the last is `+Inf`'s own.
+    buckets: [AtomicU64; 11],
+    sum_millionths: AtomicU64,
+}
+
+impl Ratio {
+    fn new(bounds: &'static [u64; 10]) -> Self {
+        Self { bounds, buckets: Default::default(), sum_millionths: AtomicU64::new(0) }
+    }
+
+    /// Observe `value`, a probability.
+    ///
+    /// Anything that is **not** a probability — negative, above one, or not
+    /// a number — is counted in `+Inf` and nowhere else. It is not clamped:
+    /// the last bound is `1`, so `le="1"` equalling `_count` is the
+    /// exposition's own statement that every reading was in range, and
+    /// clamping would make that statement true by construction and
+    /// therefore worth nothing. `_count - le="1"` is the number of
+    /// readings that were not probabilities.
+    ///
+    /// It is not dropped either, because a readout producing a NaN is a
+    /// failure of exactly the kind this histogram exists to show, and a
+    /// clamp to zero would file it under "the options collapsed" — a
+    /// different diagnosis with a different cause.
+    ///
+    /// `_sum` takes the value when it is one a sum can hold, so a mass of
+    /// 1.5 inflates the mean the way it should; a NaN or a negative
+    /// contributes nothing to it, and the bucket count is where they are
+    /// visible.
+    fn observe(&self, value: f64) {
+        let millionths = match value.is_finite() && value >= 0.0 {
+            true => (value * 1e6).round() as u64,
+            false => 0,
+        };
+        let in_range = value.is_finite() && (0.0..=1.0).contains(&value);
+        let bucket = match in_range {
+            true => self
+                .bounds
+                .iter()
+                .position(|&bound| millionths <= bound)
+                .unwrap_or(self.bounds.len()),
+            false => self.bounds.len(),
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_millionths.fetch_add(millionths, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        render_buckets(out, name, help, self.bounds, &self.buckets, &self.sum_millionths, MILLIONTHS);
+    }
+}
+
+/// The scale an observation is counted in: thousandths of a second for the
+/// latency histograms, millionths for a ratio.
+const THOUSANDTHS: u64 = 1_000;
+const MILLIONTHS: u64 = 1_000_000;
+
+/// Cumulative `_bucket` lines, then `_sum` and `_count`, for a histogram
+/// whose observations are integers of `1 / scale`.
+///
+/// One function for both shapes because the exposition format is the
+/// format whatever the unit is — the two histogram types differ in their
+/// bucket count, their scale and what they accept, and not in a single
+/// character of what they print. The count is the `+Inf` bucket as read
+/// here, so `_count` and the last bucket always agree.
+fn render_buckets(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    bounds: &[u64],
+    buckets: &[AtomicU64],
+    sum: &AtomicU64,
+    scale: u64,
+) {
+    declare(out, name, "histogram", help);
+    let mut cumulative = 0;
+    for (bucket, count) in buckets.iter().enumerate() {
+        cumulative += count.load(Ordering::Relaxed);
+        let le = match bounds.get(bucket) {
+            Some(&bound) => decimal(bound, scale),
+            None => "+Inf".to_owned(),
+        };
+        let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {cumulative}");
+    }
+    let _ = writeln!(out, "{name}_sum {}", decimal(sum.load(Ordering::Relaxed), scale));
+    let _ = writeln!(out, "{name}_count {cumulative}");
+}
+
+/// `value` units of `1 / scale`, as a decimal without trailing zeros.
+fn decimal(value: u64, scale: u64) -> String {
+    let (whole, frac) = (value / scale, value % scale);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let digits = scale.ilog10() as usize;
+    let frac = format!("{frac:0digits$}");
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
 /// A fixed-bucket histogram over millisecond observations.
 #[derive(Debug)]
 struct Histogram {
@@ -118,32 +299,9 @@ impl Histogram {
         self.sum_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
-    /// Cumulative `_bucket` lines, then `_sum` and `_count`. The count is the
-    /// `+Inf` bucket as read here, so the two always agree.
     fn render(&self, out: &mut String, name: &str, help: &str) {
-        declare(out, name, "histogram", help);
-        let mut cumulative = 0;
-        for (bucket, count) in self.buckets.iter().enumerate() {
-            cumulative += count.load(Ordering::Relaxed);
-            let le = match self.bounds_ms.get(bucket) {
-                Some(&bound) => seconds(bound),
-                None => "+Inf".to_owned(),
-            };
-            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {cumulative}");
-        }
-        let _ = writeln!(out, "{name}_sum {}", seconds(self.sum_ms.load(Ordering::Relaxed)));
-        let _ = writeln!(out, "{name}_count {cumulative}");
+        render_buckets(out, name, help, self.bounds_ms, &self.buckets, &self.sum_ms, THOUSANDTHS);
     }
-}
-
-/// `ms` milliseconds as a decimal number of seconds, without trailing zeros.
-fn seconds(ms: u64) -> String {
-    let (whole, frac) = (ms / 1000, ms % 1000);
-    if frac == 0 {
-        return whole.to_string();
-    }
-    let frac = format!("{frac:03}");
-    format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
 /// The aggregate the telemetry consumer maintains while metrics are on —
@@ -187,6 +345,10 @@ pub struct Metrics {
     kv_ram_arena_used_bytes: AtomicU64,
     ttft: Histogram,
     duration: Histogram,
+    /// Per [`Primitive::ALL`] (GitHub #241). Absent from the exposition
+    /// until one of them moves — see [`Metrics::render`].
+    decisions: [AtomicU64; Primitive::ALL.len()],
+    answer_mass: Ratio,
 }
 
 /// One retained-state family: a count per residency tier and per kind of
@@ -237,7 +399,50 @@ impl Metrics {
             kv_ram_arena_used_bytes: AtomicU64::new(0),
             ttft: Histogram::new(&TTFT_BOUNDS_MS),
             duration: Histogram::new(&DURATION_BOUNDS_MS),
+            decisions: Default::default(),
+            answer_mass: Ratio::new(&ANSWER_MASS_BOUNDS),
         }
+    }
+
+    /// One question of a decision was answered (GitHub #241, ADR 0034):
+    /// count it under its primitive and observe the **answer mass** its
+    /// readout carried.
+    ///
+    /// Recorded by the HTTP handler, like [`Metrics::record_rejected`] and
+    /// for the same reason: there is no fact for it on the model thread's
+    /// stream and inventing one would put a decision's arithmetic on the
+    /// inference path to observe something the handler already holds.
+    ///
+    /// Called once per *question*, not once per request: twenty questions
+    /// over one `state` are twenty decisions, and the mass of each is a
+    /// separate reading of the same failure.
+    ///
+    /// `answer_mass` is `None` for a **constrained decode** (GitHub #242): a `number`,
+    /// `point` or `box` is counted like any other decision and observes no
+    /// mass, because it has none to observe
+    /// ([`Primitive::has_answer_mass`]). The histogram is therefore
+    /// deliberately **readout-only**, and its `_count` sits below the
+    /// counter's sum by exactly the number of constrained decodes served — stated in
+    /// ADR 0017's row rather than left for a reader to infer from a graph
+    /// that does not add up.
+    pub fn record_decision(&self, primitive: Primitive, answer_mass: Option<f64>) {
+        // Two atomics, so a scrape can land between them. The mass goes
+        // first on purpose: the histogram may then be one ahead of the
+        // counter for a moment, which reads as "a decision whose count has
+        // not arrived yet", where the other order reads as "a decision with
+        // no mass" — the shape of the failure this whole family exists to
+        // show.
+        debug_assert_eq!(
+            answer_mass.is_some(),
+            primitive.has_answer_mass(),
+            "a primitive observes a mass exactly when it has one to observe"
+        );
+        if let Some(answer_mass) = answer_mass {
+            self.answer_mass.observe(answer_mass);
+        }
+        // `ALL` lists the primitives in declaration order, so a primitive's
+        // discriminant is its slot.
+        self.decisions[primitive as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A submission was rejected, for `reason`.
@@ -557,6 +762,35 @@ impl Metrics {
         }
         self.ttft.render(&mut out, "ignis_request_ttft_seconds", "Submission-to-first-token latency.");
         self.duration.render(&mut out, "ignis_request_duration_seconds", "Submission-to-completion latency.");
+        // The decision family, **only once there has been a decision**
+        // (GitHub #241). ADR 0017 exports zeros for everything else; this
+        // follows its other rule instead — "only authoritative values are
+        // exported" — because a load that serves no decisions is the normal
+        // one, and three permanently-zero series plus an eleven-bucket
+        // histogram on every scrape of every server would be clutter that
+        // says nothing. A `rate()` over a series that appears mid-window is
+        // handled by Prometheus the same way a new target is.
+        if self.decisions.iter().map(read).sum::<u64>() > 0 {
+            declare(
+                &mut out,
+                "ignis_decisions_total",
+                "counter",
+                "Questions answered by a readout, by typed primitive.",
+            );
+            for (primitive, series) in Primitive::ALL.iter().zip(&self.decisions) {
+                let _ = writeln!(
+                    out,
+                    "ignis_decisions_total{{type=\"{}\"}} {}",
+                    primitive.label(),
+                    read(series)
+                );
+            }
+            self.answer_mass.render(
+                &mut out,
+                "ignis_decision_answer_mass",
+                "Share of the next-token distribution held by a decision's declared options.",
+            );
+        }
         out
     }
 }
@@ -614,7 +848,21 @@ mod tests {
 
     #[test]
     fn every_metric_is_declared_once_with_help_and_type_before_its_samples() {
-        let text = Metrics::new().render();
+        declared_once(&Metrics::new().render(), &[]);
+        // And the decision family, which only exists once a decision has
+        // been served (GitHub #241) — its declarations have to be as
+        // well-formed as the ones that are always there.
+        let served = Metrics::new();
+        served.record_decision(Primitive::Choice, Some(0.998));
+        declared_once(
+            &served.render(),
+            &[("ignis_decisions_total", "counter"), ("ignis_decision_answer_mass", "histogram")],
+        );
+    }
+
+    /// Every metric in the base contract, plus `also`, declared once with
+    /// `HELP` and `TYPE` before its first sample.
+    fn declared_once(text: &str, also: &[(&str, &str)]) {
         let expected = [
             ("ignis_build_info", "gauge"),
             ("ignis_scheduler_requests", "gauge"),
@@ -645,7 +893,7 @@ mod tests {
             ("ignis_request_duration_seconds", "histogram"),
         ];
         let lines: Vec<&str> = text.lines().collect();
-        for (name, kind) in expected {
+        for (name, kind) in expected.iter().chain(also).copied() {
             let help = lines
                 .iter()
                 .position(|l| l.starts_with(&format!("# HELP {name} ")))
@@ -705,12 +953,21 @@ mod tests {
     }
 
     #[test]
-    fn seconds_are_rendered_without_trailing_zeros() {
-        assert_eq!(seconds(0), "0");
-        assert_eq!(seconds(50), "0.05");
-        assert_eq!(seconds(2_500), "2.5");
-        assert_eq!(seconds(600_000), "600");
-        assert_eq!(seconds(1_001), "1.001");
+    fn a_scaled_integer_is_rendered_without_trailing_zeros() {
+        // Milliseconds as seconds, the latency histograms' unit.
+        assert_eq!(decimal(0, THOUSANDTHS), "0");
+        assert_eq!(decimal(50, THOUSANDTHS), "0.05");
+        assert_eq!(decimal(2_500, THOUSANDTHS), "2.5");
+        assert_eq!(decimal(600_000, THOUSANDTHS), "600");
+        assert_eq!(decimal(1_001, THOUSANDTHS), "1.001");
+        // And millionths as a ratio, which needs the width to come from the
+        // scale rather than from a literal: `{frac:03}` would render
+        // 998,002 millionths as "0.998002" by luck and 2 as "0.2".
+        assert_eq!(decimal(1_000_000, MILLIONTHS), "1");
+        assert_eq!(decimal(998_002, MILLIONTHS), "0.998002");
+        assert_eq!(decimal(999_500, MILLIONTHS), "0.9995");
+        assert_eq!(decimal(2, MILLIONTHS), "0.000002");
+        assert_eq!(decimal(3_992_008, MILLIONTHS), "3.992008");
     }
 
     #[test]
@@ -931,14 +1188,160 @@ mod tests {
         // ADR 0030: every memory series is bytes, pages or slots, so a
         // reader always has both terms and never a ratio that hides which
         // of them moved.
-        let text = Metrics::new().render();
-        for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
-            let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
-            assert!(
-                !name.contains("_pct") && !name.contains("percent") && !name.contains("_ratio"),
-                "{name} is a percentage"
+        //
+        // Both shapes of exposition, because the decision family is absent
+        // from a fresh one (GitHub #241) and it is the one series here that
+        // *is* a ratio — answer mass has no second term, which is the ADR's
+        // own distinction and worth having under a test.
+        let served = Metrics::new();
+        served.record_decision(Primitive::Score, Some(0.996));
+        for text in [Metrics::new().render(), served.render()] {
+            for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
+                let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
+                assert!(
+                    !name.contains("_pct") && !name.contains("percent") && !name.contains("_ratio"),
+                    "{name} is a percentage"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_decision_family_is_absent_until_a_decision_is_served() {
+        // Spec 05's acceptance 3: no zero-valued clutter for a server that
+        // never sees a decision, which is most of them.
+        let metrics = Metrics::new();
+        let text = metrics.render();
+        assert!(!text.contains("ignis_decisions_total"), "{text}");
+        assert!(!text.contains("ignis_decision_answer_mass"), "{text}");
+
+        metrics.record_decision(Primitive::Noul, Some(0.9983));
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"noul\""), "1");
+        // The other two primitives appear at zero *now*, because the family
+        // exists: a label value that vanishes when its count is zero is a
+        // series that breaks `sum by (type)` the moment traffic shifts.
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"choice\""), "0");
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"score\""), "0");
+        assert_eq!(value(&text, "ignis_decision_answer_mass_count", ""), "1");
+    }
+
+    #[test]
+    fn a_decision_counts_under_its_own_primitive_and_leaves_the_token_counters_alone() {
+        // Spec 05's acceptance 1 and 2, at the projection: a readout
+        // generates nothing, so the series that count tokens must not move
+        // for one. Asserted together, because `ignis_decoded_tokens_total 0`
+        // beside no decisions at all would prove nothing.
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Choice, Some(0.997));
+        metrics.record_decision(Primitive::Choice, Some(0.999));
+        metrics.record_decision(Primitive::Score, Some(0.9));
+
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"choice\""), "2");
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"score\""), "1");
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"noul\""), "0");
+        assert_eq!(value(&text, "ignis_decision_answer_mass_count", ""), "3");
+        assert_eq!(value(&text, "ignis_decoded_tokens_total", ""), "0");
+        assert_eq!(value(&text, "ignis_generated_tokens_total", ""), "0");
+    }
+
+    /// GitHub #242: a constrained decode is counted and observes no mass, so the
+    /// histogram's `_count` is deliberately below the counter's sum.
+    ///
+    /// The owner's call, and an asymmetry a reader would otherwise have to
+    /// infer from a graph that does not add up — ADR 0017's row says it in
+    /// words and this says it in numbers.
+    #[test]
+    fn a_program_is_counted_and_observes_no_answer_mass() {
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Noul, Some(0.998));
+        metrics.record_decision(Primitive::Point, None);
+        metrics.record_decision(Primitive::Number, None);
+        metrics.record_decision(Primitive::Box, None);
+
+        let text = metrics.render();
+        for (primitive, expected) in [("noul", "1"), ("number", "1"), ("point", "1"), ("box", "1")]
+        {
+            assert_eq!(
+                value(&text, "ignis_decisions_total", &format!("type=\"{primitive}\"")),
+                expected,
+                "every primitive is counted, whatever answered it"
             );
         }
+        assert_eq!(
+            value(&text, "ignis_decision_answer_mass_count", ""),
+            "1",
+            "and only the readout observed a mass: a run's answer is a run of sampled tokens, with no single position's distribution to be a share of"
+        );
+        assert_eq!(
+            value(&text, "ignis_decision_answer_mass_sum", ""),
+            "0.998",
+            "a constrained decode contributing 0 would put a false alarm in the bucket a real collapse lands in"
+        );
+    }
+
+    #[test]
+    fn a_mass_observation_lands_in_every_bucket_at_or_above_it() {
+        let metrics = Metrics::new();
+        // 0.998 sits *on* a boundary (`le` is inclusive), 0.9 on the second,
+        // and a collapse below the coarsest bound lands only above 0.5.
+        metrics.record_decision(Primitive::Noul, Some(0.9));
+        metrics.record_decision(Primitive::Noul, Some(0.998));
+        metrics.record_decision(Primitive::Noul, Some(0.03));
+
+        let text = metrics.render();
+        let at = |le: &str| {
+            value(&text, "ignis_decision_answer_mass_bucket", &format!("le=\"{le}\""))
+        };
+        assert_eq!(at("0.5"), "1", "the collapsed one, and only it");
+        assert_eq!(at("0.9"), "2");
+        assert_eq!(at("0.995"), "2");
+        assert_eq!(at("0.998"), "3", "a boundary is inclusive");
+        assert_eq!(at("1"), "3");
+        assert_eq!(at("+Inf"), "3");
+        assert_eq!(value(&text, "ignis_decision_answer_mass_count", ""), "3");
+        assert_eq!(value(&text, "ignis_decision_answer_mass_sum", ""), "1.928");
+    }
+
+    #[test]
+    fn a_mass_outside_the_unit_interval_is_visible_rather_than_clamped() {
+        // `le="1"` equalling `_count` is the exposition's own statement
+        // that every reading was a probability, and it is only worth
+        // exporting if it can be false. Clamping would make it true by
+        // construction; so would filing a NaN under 0, which would also
+        // report a collapse that did not happen.
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Choice, Some(0.998));
+        metrics.record_decision(Primitive::Choice, Some(1.5));
+        metrics.record_decision(Primitive::Choice, Some(-0.2));
+        metrics.record_decision(Primitive::Choice, Some(f64::NAN));
+
+        let text = metrics.render();
+        let at = |le: &str| {
+            value(&text, "ignis_decision_answer_mass_bucket", &format!("le=\"{le}\""))
+        };
+        assert_eq!(at("0.5"), "0", "nothing collapsed, whatever went wrong");
+        assert_eq!(at("1"), "1", "one reading was a probability");
+        assert_eq!(at("+Inf"), "4", "and three were not");
+        assert_eq!(value(&text, "ignis_decision_answer_mass_count", ""), "4");
+        // 0.998 + 1.5; the NaN and the negative are not numbers a sum can
+        // carry, and the bucket count is where they show.
+        assert_eq!(value(&text, "ignis_decision_answer_mass_sum", ""), "2.498");
+        assert_eq!(value(&text, "ignis_decisions_total", "type=\"choice\""), "4");
+    }
+
+    #[test]
+    fn confidence_is_never_exported() {
+        // Spec 05 states it as a rule rather than an omission: confidence is
+        // per-caller and per-domain, and a histogram over callers who each
+        // mean something different by it means nothing. Pinned, so the
+        // omission cannot be undone by somebody adding "the other number
+        // the endpoint already has".
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Score, Some(0.9));
+        let text = metrics.render();
+        assert!(!text.contains("confidence"), "{text}");
     }
 
     /// ADR 0017's fixed boundaries, in seconds, `+Inf` implied.
@@ -958,6 +1361,10 @@ mod tests {
             .collect()
     }
 
+    /// The amended contract's mass boundaries, `+Inf` implied.
+    const MASS_BOUNDS: [&str; 10] =
+        ["0.5", "0.9", "0.95", "0.98", "0.99", "0.995", "0.998", "0.999", "0.9995", "1"];
+
     #[test]
     fn the_histograms_use_exactly_the_adr_s_buckets_and_positive_infinity() {
         let text = Metrics::new().render();
@@ -971,6 +1378,14 @@ mod tests {
             assert_eq!(value(&text, &format!("{name}_sum"), ""), "0");
             assert_eq!(value(&text, &format!("{name}_count"), ""), "0");
         }
+        // The mass histogram exists only after a decision, so it is read off
+        // a projection that has seen one.
+        let metrics = Metrics::new();
+        metrics.record_decision(Primitive::Noul, Some(1.0));
+        let text = metrics.render();
+        let mut expected: Vec<String> = MASS_BOUNDS.iter().map(|b| (*b).to_owned()).collect();
+        expected.push("+Inf".to_owned());
+        assert_eq!(bucket_bounds(&text, "ignis_decision_answer_mass"), expected, "{text}");
     }
 
     #[test]

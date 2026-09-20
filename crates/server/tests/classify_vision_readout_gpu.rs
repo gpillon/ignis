@@ -271,7 +271,7 @@ fn typed_option_logits_are_readable_over_an_image() {
         // One embedding may be live at a time, so it is encoded, used and
         // dropped inside this iteration.
         let embedding = step::encode_media(&model, item.grid, &item.patches, &control)
-            .unwrap_or_else(|e| panic!("{}: encode: {e}", decision.canary));
+            .unwrap_or_else(|(_, e)| panic!("{}: encode: {e}", decision.canary));
 
         let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
         logits.fill(0.0);

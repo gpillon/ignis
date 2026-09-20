@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
+use crate::decision::{Readout, argmax, log_sum_exp};
 use crate::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, PrefillOutcome, NO_HOST_ROOM};
 use crate::types::{ComputeError, FinishReason, RequestId, SpecCounters, TokenId};
 
@@ -75,6 +76,19 @@ struct Inner {
     /// backend whose blobs are ordinary allocations — today's default, and
     /// what every scenario that is not about placement wants.
     arena: Option<MockHostArena>,
+    /// The draw a **constrained decode** request has made and not yet emitted (GitHub
+    /// #242), per request: the token the *next* decode round returns.
+    ///
+    /// This is the leaf's one-round lag, modelled on purpose. A mock that
+    /// emitted the set it was handed in the same call would let a scheduler
+    /// that constrained only its rounds pass every CPU test and read one
+    /// free token in the middle of its forced text on the card — which is
+    /// exactly the bug `permitted_decode_gpu.rs` caught, and exactly the
+    /// bug a mock exists to catch first (ADR 0006).
+    pending: HashMap<RequestId, crate::constrained::Draw>,
+    /// Constrained steps served so far, per request: what varies the mock's
+    /// pick from one step to the next.
+    drawn: HashMap<RequestId, u32>,
 }
 
 /// Which blob a span of [`MockHostArena`] holds: the three kinds the host
@@ -341,6 +355,14 @@ impl Compute for MockCompute {
             g.limits.insert(job.request, job.params.max_tokens);
             g.seeds.insert(job.request, job.params.seed);
         }
+        for job in jobs {
+            // GitHub #242: a prefill *draws*, and a run's first token is
+            // the one it draws. Held until a decode round asks for it.
+            if let Some(permitted) = &job.permitted {
+                let draw = Self::draw(self.seed, &mut g, job.request, permitted);
+                g.pending.insert(job.request, draw);
+            }
+        }
         g.prefill_batches.push(jobs.to_vec());
         Ok(jobs
             .iter()
@@ -358,6 +380,15 @@ impl Compute for MockCompute {
                 // declines the bet testable too.
                 checkpoint_captured: job.capture_checkpoint.is_some()
                     && !g.capture_refusals.remove(&job.request),
+                // GitHub #237 / ADR 0034: the `Compute` seam now carries a
+                // second kind of answer, and every CPU-only implementation
+                // of it has to produce one or the scheduler's tests stop
+                // covering the path (ADR 0006). A job that asked for no
+                // readout gets none, exactly as a real backend reports.
+                readout: job
+                    .readout
+                    .as_deref()
+                    .map(|answers| Self::readout(self.seed, job.request, answers)),
             })
             .collect())
     }
@@ -439,6 +470,21 @@ impl Compute for MockCompute {
         Ok(jobs
             .iter()
             .map(|job| {
+                // GitHub #242 — a constrained lane, which is a different round
+                // entirely: exactly one token, the one drawn a round ago,
+                // and no speculation, no EOS and no token cap (the schedule
+                // is the budget, and the scheduler owns it).
+                if let Some(emitted) = g.pending.remove(&job.request) {
+                    if let Some(permitted) = &job.permitted {
+                        let next = Self::draw(self.seed, &mut g, job.request, permitted);
+                        g.pending.insert(job.request, next);
+                    }
+                    *g.generated.entry(job.request).or_insert(0) += 1;
+                    return DecodeOutcome::constrained_run(
+                        vec![emitted.token],
+                        vec![emitted.probability],
+                    );
+                }
                 let round = {
                     let rounds = g.rounds.entry(job.request).or_insert(0);
                     *rounds += 1;
@@ -483,6 +529,7 @@ impl Compute for MockCompute {
                 DecodeOutcome {
                     tokens: run,
                     finish,
+                    probabilities: Vec::new(),
                     spec: (!g.run_lengths.is_empty())
                         .then(|| SpecCounters::round(length - 1, committed - 1)),
                 }
@@ -551,6 +598,77 @@ impl MockCompute {
         if let Some(arena) = self.inner.lock().unwrap().arena.as_mut() {
             arena.free(blob);
         }
+    }
+
+    /// How much of the mock's modelled distribution sits *outside* the
+    /// answer tokens, in nats. Small and nonzero on purpose: a readout
+    /// whose answer mass were exactly 1 would let a caller that forgot to
+    /// check the mass pass every CPU test and fail on the card, and the
+    /// real measurement is a median 99.8% held by the declared options
+    /// (`docs/findings/2026-09-19-typed-option-logit-readout.md`).
+    const OUTSIDE_THE_ANSWERS: f64 = 0.002;
+
+    /// The deterministic readout (GitHub #237): a pure function of (mock
+    /// seed, request id, answer token id, slot), shaped like a real one
+    /// rather than uniform — separated logits with one clear winner, an
+    /// answer mass just under 1, and an unrestricted argmax that *is* a
+    /// declared answer, which is what the served model does on every row
+    /// the finding scored.
+    fn readout(seed: u64, request: RequestId, answers: &[TokenId]) -> Readout {
+        let logits: Vec<f32> = answers
+            .iter()
+            .enumerate()
+            .map(|(slot, &id)| {
+                let mixed = Self::mix(seed, request, u64::from(id), slot as u32);
+                // -4 ..= +4 in thousandths: wide enough to separate slots,
+                // fine enough that two of one batch practically never tie.
+                (f64::from(mixed % 8_000) / 1000.0 - 4.0) as f32
+            })
+            .collect();
+        let answer_lse = log_sum_exp(&logits);
+        Readout {
+            full_log_sum_exp: if answer_lse.is_finite() {
+                answer_lse + Self::OUTSIDE_THE_ANSWERS
+            } else {
+                0.0
+            },
+            full_argmax: argmax(&logits).map_or(0, |slot| answers[slot]),
+            logits,
+        }
+    }
+
+    /// The mock's **constrained** draw (GitHub #242): a member of
+    /// `permitted`, picked deterministically, with a probability inside it.
+    ///
+    /// The probability is never 0 and never 1 for a set of more than one
+    /// token, for the reason [`MockCompute::OUTSIDE_THE_ANSWERS`] exists: a
+    /// mock that reported a perfect draw would let a caller that never looks
+    /// at the trace report zero uncertainty and pass, then meet a units
+    /// digit at 0.149 on the card
+    /// (`docs/findings/2026-09-19-constrained-digit-readout-points.md`). A
+    /// set of **one** does report exactly 1, which is not a courtesy but the
+    /// arithmetic: a softmax over one logit is 1, and a forced literal
+    /// therefore adds nothing to an answer's uncertainty.
+    fn draw(
+        seed: u64,
+        state: &mut Inner,
+        request: RequestId,
+        permitted: &[TokenId],
+    ) -> crate::constrained::Draw {
+        let step = {
+            let drawn = state.drawn.entry(request).or_insert(0);
+            *drawn += 1;
+            *drawn - 1
+        };
+        let request_seed = state.seeds.get(&request).copied().unwrap_or(0);
+        let mixed = Self::mix(seed, request, request_seed, step);
+        let token = permitted[mixed as usize % permitted.len()];
+        let probability = match permitted.len() {
+            1 => 1.0,
+            // 0.50 ..= 0.999, well clear of both ends.
+            _ => 0.5 + (mixed % 500) as f32 / 1000.0,
+        };
+        crate::constrained::Draw { token, probability }
     }
 
     /// The deterministic token mix: a pure function of (mock seed, request

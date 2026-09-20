@@ -8,10 +8,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ignis_core::vision::{MediaItem, Multimodal};
+use ignis_core::vision::{MEDIA_ENCODE_POOL_FULL, MediaItem, Multimodal};
 use ignis_core::{
     BlobIdentity, Compute, ComputeError, DecodeJob, DecodeOutcome, DecodeParams, FinishReason,
-    N_DECODE_LANES, PrefillJob, PrefillOutcome, RequestId, RetainedAt, SpecCounters, TokenId,
+    N_DECODE_LANES, PrefillJob, PrefillOutcome, Readout, RequestId, RetainedAt, SpecCounters,
+    TokenId,
 };
 
 #[cfg(feature = "cuda")]
@@ -164,15 +165,38 @@ pub struct DecodeLane<'a> {
     /// The committed run is cut at the first of these, inclusive: the
     /// model's EOS, or none for a lane that decodes past it.
     pub stop_ids: &'a [TokenId],
+    /// The ids this lane's **draw** is restricted to (GitHub #242), or
+    /// empty for an ordinary round.
+    ///
+    /// It constrains the token the lane draws *this* round, which the leaf
+    /// returns on the *next* one
+    /// ([`ignis_core::scheduler::DecodeJob::permitted`]). A constrained lane
+    /// commits exactly one token: the drafts a verify round would accept are
+    /// proposed by a second model that knows nothing of a set, so a round
+    /// with any constrained lane in it is run as a plain round.
+    pub permitted: &'a [TokenId],
 }
 
 /// One lane's committed run from a decode round (P5-06, GitHub #154).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent since GitHub #242: `drawn_probability` is an
+/// `f32`, and a run is compared for equality in tests and nowhere else.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaneRun {
     /// The committed tokens, in order.
     pub tokens: Vec<TokenId>,
     /// The round's speculative counters, when it was a verify round.
     pub spec: Option<SpecCounters>,
+    /// The probability of the token this round **drew** within its
+    /// [`DecodeLane::permitted`] set (GitHub #242), or `None` for an
+    /// unconstrained lane.
+    ///
+    /// It belongs to the token the *next* round returns, not to anything in
+    /// `tokens`. The leaf reports it here because by the time that token is
+    /// emitted the sequence has moved past the position it was drawn at, and
+    /// there is nothing left to recompute it from;
+    /// [`RuntimeCompute`] is what holds it for the one round in between.
+    pub drawn_probability: Option<f32>,
 }
 
 impl LaneRun {
@@ -181,6 +205,16 @@ impl LaneRun {
         Self {
             tokens: vec![token],
             spec: None,
+            drawn_probability: None,
+        }
+    }
+
+    /// One committed token, and the probability of the one this round drew
+    /// for the next (GitHub #242).
+    pub fn drawn(token: TokenId, probability: Option<f32>) -> Self {
+        Self {
+            drawn_probability: probability,
+            ..Self::token(token)
         }
     }
 }
@@ -245,6 +279,23 @@ pub trait StepLeaf: Send + Sync + 'static {
     fn release_model(&self, model: Self::Model);
     /// Read the leaf's current geometry and step counters.
     fn stats(&self, model: &Self::Model) -> Result<RuntimeStats, i32>;
+    /// Columns the loaded model's output head writes — the length a
+    /// [`StepLeaf::prefill`] logits buffer must have (GitHub #237).
+    ///
+    /// The leaf's own number, and it is **not** the 151,936 ADR 0034
+    /// quotes: that is Qwen2/Qwen3's vocabulary, and this artifact's runs to
+    /// 248,320 (its `<|image_pad|>` alone sits at id 248,056). So a readout
+    /// buffer is nearer 970 KB than the ADR's 607, and one sized from the
+    /// wrong number would be a short write into the caller's memory.
+    /// Required rather than defaulted for the same reason — every leaf
+    /// knows this, and a default would be a wrong answer waiting to be
+    /// believed.
+    ///
+    /// `model` is taken for symmetry with [`StepLeaf::stats`], not because
+    /// today's leaf reads it: ignis is specialized for one topology
+    /// (`CONTEXT.md`), so `CudaLeaf` answers from its `ModelConfig` and
+    /// ignores the handle.
+    fn vocab(&self, model: &Self::Model) -> u32;
     /// Allocate one sequence with its full context reservation.
     fn allocate_sequence(
         &self,
@@ -359,6 +410,17 @@ pub trait StepLeaf: Send + Sync + 'static {
         BlobIdentity::UNSET
     }
     /// Warm one sequence with a prefill span.
+    ///
+    /// `out_logits`, when `Some`, is filled with the span's **last**
+    /// position's full logits — the readout path (GitHub #237, ADR 0034).
+    /// It must be [`StepLeaf::vocab`] entries long. No token is sampled for
+    /// it and the sequence is left exactly as a `None` call would leave it:
+    /// a readout observes the prefill, it does not change it.
+    ///
+    /// `permitted`, when non-empty, restricts the draw this span makes
+    /// (GitHub #242) — the successor the first decode round returns — and
+    /// the call reports its probability within that set. Empty is an
+    /// ordinary prefill and reports 0.
     fn prefill(
         &self,
         model: &Self::Model,
@@ -366,7 +428,9 @@ pub trait StepLeaf: Send + Sync + 'static {
         tokens: &[TokenId],
         start_position: u32,
         params: DecodeParams,
-    ) -> Result<(), i32>;
+        permitted: &[TokenId],
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<f32, i32>;
     /// Encode one media item's patch rows into a device-resident embedding
     /// (the media encode step, GitHub #178). A leaf without vision refuses.
     fn encode_media(&self, _model: &Self::Model, _item: &MediaItem) -> Result<Self::Media, i32> {
@@ -377,6 +441,11 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// [`StepLeaf::prefill`] over a span of a multimodal prompt: rotated at
     /// the span's three-axis positions, its placeholder columns taking the
     /// embedding's columns. A leaf without vision refuses.
+    ///
+    /// `out_logits` is [`StepLeaf::prefill`]'s, and is here for the same
+    /// reason the text path has it: the evidence a decision is put to may
+    /// be an image, and a readout wired only to the text path would return
+    /// nothing at all for one rather than failing (GitHub #237).
     fn prefill_multimodal(
         &self,
         _model: &Self::Model,
@@ -384,8 +453,10 @@ pub trait StepLeaf: Send + Sync + 'static {
         _tokens: &[TokenId],
         _start_position: u32,
         _params: DecodeParams,
+        _permitted: &[TokenId],
         _span: MultimodalSpan<'_, Self::Media>,
-    ) -> Result<(), i32> {
+        _out_logits: Option<&mut [f32]>,
+    ) -> Result<f32, i32> {
         Err(-1)
     }
     /// Decode one round over a batch of warmed sequences, `lanes` parallel
@@ -484,10 +555,118 @@ struct LiveSequence<S> {
     generated: u32,
 }
 
-/// A request's live media embedding (GitHub #178): the item it encodes.
-struct LiveMedia<M> {
-    item: usize,
+/// What decides an encoder run's output, and so what two requests have to
+/// share to share its result (GitHub #243).
+///
+/// Deliberately *not* [`ignis_core::identity::MediaKey`], which also carries
+/// where the item sits in the prompt. Two siblings of a fan-out ask different
+/// questions about one picture; a question that comes before the image moves
+/// its placeholders. The encoder sees neither — it sees these bytes at this
+/// grid — so these two fields are the identity and the offset is not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MediaEmbeddingKey {
+    digest: [u8; 32],
+    grid: [u32; 3],
+}
+
+impl From<&MediaItem> for MediaEmbeddingKey {
+    fn from(item: &MediaItem) -> Self {
+        Self {
+            digest: item.content_digest,
+            grid: [item.grid.t, item.grid.h, item.grid.w],
+        }
+    }
+}
+
+/// One encoded item the cache holds (GitHub #243).
+struct CachedMedia<M> {
     handle: M,
+    /// Requests whose current prefill chunk covers this item. Zero is an
+    /// entry nobody is using *right now* — which is not an entry to drop,
+    /// it is the whole point: the next question about the same picture is
+    /// the one that finds it.
+    holders: usize,
+    /// The cache clock when the last holder let go, for LRU among unheld
+    /// entries. Meaningless while `holders > 0`.
+    released_at: u64,
+    /// The item's merged columns, for the resident-bytes fact (GitHub #216).
+    columns: u64,
+}
+
+/// The media embedding cache (GitHub #243): encoded items, kept past the
+/// request that encoded them.
+///
+/// The miss this closes is a fan-out — N questions over one image. It cannot
+/// be closed by reference counting alone, because the siblings never overlap:
+/// exactly one request holds multi-tick prefill progress at a time
+/// (`ignis_core::concrete`), and the embedding is given up at its item's last
+/// placeholder, before the sibling's first chunk runs. So an entry outliving
+/// its last holder *is* the mechanism, not a tuning knob on top of one.
+///
+/// Bounded by the leaf's pool and nothing here: this side never counts bytes
+/// or pages. It asks the leaf to encode, and a leaf that answers
+/// [`MEDIA_ENCODE_POOL_FULL`] gets an unheld entry released and the same
+/// question again ([`RuntimeCompute::encode_into`]). Policy here, bytes
+/// there.
+struct MediaCache<M> {
+    entries: HashMap<MediaEmbeddingKey, CachedMedia<M>>,
+    /// What each request is holding. At most one entry per request: a prefill
+    /// chunk covers at most one media item.
+    held: HashMap<RequestId, MediaEmbeddingKey>,
+    clock: u64,
+}
+
+impl<M> MediaCache<M> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            held: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    /// Entries a request is prefilling against right now.
+    fn live(&self) -> usize {
+        self.entries.values().filter(|e| e.holders > 0).count()
+    }
+
+    /// Take a hold on `key` for `request`, which must be in `entries`.
+    fn acquire(&mut self, request: RequestId, key: MediaEmbeddingKey) {
+        if self.held.get(&request) == Some(&key) {
+            return;
+        }
+        self.release(request);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.holders += 1;
+            self.held.insert(request, key);
+        }
+    }
+
+    /// Drop `request`'s hold, if it has one. The entry stays.
+    fn release(&mut self, request: RequestId) {
+        let Some(key) = self.held.remove(&request) else {
+            return;
+        };
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.holders = entry.holders.saturating_sub(1);
+            if entry.holders == 0 {
+                entry.released_at = self.clock;
+            }
+        }
+    }
+
+    /// Give up the least recently released unheld entry, or `None` when
+    /// every entry is held.
+    fn evict_lru(&mut self) -> Option<M> {
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.holders == 0)
+            .min_by_key(|(_, e)| e.released_at)
+            .map(|(key, _)| *key)?;
+        self.entries.remove(&victim).map(|e| e.handle)
+    }
 }
 
 /// A request evicted to the host tier (P4-07, GitHub #125): its snapshot
@@ -535,10 +714,24 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// as `prefixes` is. Non-consuming too: a prefix brought back onto the
     /// device keeps its blob, so giving it up again copies nothing.
     spilled_prefixes: Mutex<HashMap<(RequestId, u32), L::SnapshotBuf>>,
-    /// Media embeddings still needed by a request's next chunk (GitHub
-    /// #178): at most one per request, held from its item's first covered
-    /// chunk until its last placeholder is prefilled.
-    media: Mutex<HashMap<RequestId, LiveMedia<L::Media>>>,
+    /// Encoded media items (GitHub #178, cached across requests by GitHub
+    /// #243): held from an item's first covered chunk until the leaf's pool
+    /// needs the room, so the next question about the same picture does not
+    /// run the tower again.
+    media: Mutex<MediaCache<L::Media>>,
+    /// The probability of the token a **constrained decode** request has drawn and not
+    /// yet emitted (GitHub #242), per request.
+    ///
+    /// This is the one-round lag, held on this side of the `Compute` seam
+    /// because this is the only side that can hold it. The leaf draws a
+    /// token at the end of one call and returns it at the start of the
+    /// next, and its probability within the permitted set is computed from
+    /// at most 32 logits that exist only at the moment of the draw. By the
+    /// round that emits the token those logits are gone, so the number is
+    /// carried across here — one `f32` per program in flight — rather than
+    /// recomputed or reported a round early
+    /// ([`ignis_core::scheduler::DecodeJob::permitted`]).
+    drawn: Mutex<HashMap<RequestId, f32>>,
 }
 
 impl<L: StepLeaf> RuntimeCompute<L> {
@@ -554,54 +747,116 @@ impl<L: StepLeaf> RuntimeCompute<L> {
             evicted: Mutex::new(HashMap::new()),
             retained: Mutex::new(HashMap::new()),
             spilled_prefixes: Mutex::new(HashMap::new()),
-            media: Mutex::new(HashMap::new()),
+            media: Mutex::new(MediaCache::new()),
+            drawn: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Number of live media embeddings (the CPU-stub observation point for
-    /// their lifetime, GitHub #178).
+    /// Media embeddings a request is prefilling against right now (the
+    /// CPU-stub observation point for their lifetime, GitHub #178).
+    ///
+    /// Not the cache's size: since GitHub #243 an embedding outlives the
+    /// request that encoded it, and this counts holders, not residents. A
+    /// fan-out still brings it back to zero — see [`Self::cached_media`] for
+    /// what is left behind.
     pub fn live_media(&self) -> usize {
-        self.media.lock().unwrap().len()
+        self.media.lock().unwrap().live()
+    }
+
+    /// Encoded items the cache holds, held or not (GitHub #243).
+    pub fn cached_media(&self) -> usize {
+        self.media.lock().unwrap().entries.len()
+    }
+
+    /// The merged columns the cache's entries occupy (GitHub #243) — the
+    /// shape of what it costs, in the one unit both sides of the seam agree
+    /// on. The bytes are the leaf's: a column is `hidden x 2`.
+    pub fn cached_media_columns(&self) -> u64 {
+        self.media.lock().unwrap().entries.values().map(|e| e.columns).sum()
     }
 
     fn release_media_handle(&self, media: L::Media) {
         self.model.leaf.release_media(self.model.handle(), media);
     }
 
-    /// Release `request`'s live media embedding, if it holds one.
+    /// Drop `request`'s hold on its embedding, if it has one.
+    ///
+    /// The embedding stays cached (GitHub #243). A request finishing,
+    /// failing or being evicted is exactly the moment a sibling asking the
+    /// next question about the same picture is about to want it.
     fn release_media_of(&self, request: RequestId) {
-        let media = self.media.lock().unwrap().remove(&request);
-        if let Some(media) = media {
-            self.release_media_handle(media.handle);
+        self.media.lock().unwrap().release(request);
+    }
+
+    /// Encode `item` under `key`, making room by releasing unheld entries
+    /// until the leaf's pool takes it (GitHub #243).
+    ///
+    /// The eviction policy is here and the bytes are the leaf's: it answers
+    /// [`MEDIA_ENCODE_POOL_FULL`] and this decides what to give up. The loop
+    /// terminates because the load floors the pool at one envelope-wide item
+    /// and a chunk covers one item, so releasing every unheld entry leaves
+    /// room for the one item being prefilled right now. It cannot spin: each
+    /// turn removes an entry, and a turn with nothing left to remove returns
+    /// the refusal.
+    fn encode_into(
+        &self,
+        media: &mut MediaCache<L::Media>,
+        item: &MediaItem,
+        key: MediaEmbeddingKey,
+    ) -> Result<(), i32> {
+        loop {
+            match self.model.leaf.encode_media(self.model.handle(), item) {
+                Ok(handle) => {
+                    media.entries.insert(
+                        key,
+                        CachedMedia {
+                            handle,
+                            holders: 0,
+                            released_at: media.clock,
+                            columns: item.grid.vision_tokens(),
+                        },
+                    );
+                    return Ok(());
+                }
+                Err(MEDIA_ENCODE_POOL_FULL) => match media.evict_lru() {
+                    Some(handle) => self.release_media_handle(handle),
+                    None => return Err(MEDIA_ENCODE_POOL_FULL),
+                },
+                Err(code) => return Err(code),
+            }
         }
     }
 
     /// One chunk of a multimodal prompt (GitHub #178): encode the media item
-    /// the chunk covers unless its embedding is already live, prefill the
-    /// span at its three-axis positions with the item's columns, and release
-    /// the embedding once the chunk covered its last placeholder.
+    /// the chunk covers unless the cache already holds it, prefill the span
+    /// at its three-axis positions with the item's columns, and let the
+    /// embedding go once the chunk covered its last placeholder.
+    ///
+    /// "Let go" is a hold, not a free, since GitHub #243: the entry stays in
+    /// the cache for the next request that names the same picture, and only
+    /// the leaf's pool running out takes it away.
     ///
     /// Returns the microseconds the encode took (GitHub #192), 0 when this
-    /// chunk encoded nothing — the same clock read `ConcreteScheduler` takes
-    /// around `evict`, and taken unconditionally, so this path never varies
-    /// with what an operator turned on.
+    /// chunk encoded nothing — which is now the common case in a fan-out, and
+    /// exactly what acceptance 1 reads. The same clock read
+    /// `ConcreteScheduler` takes around `evict`, and taken unconditionally,
+    /// so this path never varies with what an operator turned on.
     fn prefill_multimodal_job(
         &self,
         sequence: &mut L::Sequence,
-        media: &mut HashMap<RequestId, LiveMedia<L::Media>>,
+        media: &mut MediaCache<L::Media>,
         job: &PrefillJob,
         multimodal: &Multimodal,
-    ) -> Result<u64, i32> {
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<(u64, f32), i32> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
         let mut encode_micros = 0;
+        let mut held = None;
         if let Some(chunk) = &chunk {
-            if media.get(&job.request).is_some_and(|live| live.item != chunk.item) {
-                let stale = media.remove(&job.request).expect("checked above");
-                self.release_media_handle(stale.handle);
-            }
-            if !media.contains_key(&job.request) {
-                let item = &multimodal.media[chunk.item];
+            let item = &multimodal.media[chunk.item];
+            let key = MediaEmbeddingKey::from(item);
+            if !media.entries.contains_key(&key) {
                 let _span = tracing::debug_span!(
                     "ignis.media.encode",
                     request_id = job.request,
@@ -610,35 +865,41 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 )
                 .entered();
                 let started = std::time::Instant::now();
-                let handle = self.model.leaf.encode_media(self.model.handle(), item)?;
+                // A hold this request already has is not in the way: the
+                // cache takes the new one only after dropping the old, and
+                // an eviction inside the encode may need the old one's room.
+                media.release(job.request);
+                self.encode_into(media, item, key)?;
                 encode_micros = started.elapsed().as_micros() as u64;
-                media.insert(job.request, LiveMedia { item: chunk.item, handle });
             }
+            media.acquire(job.request, key);
+            held = Some(key);
         }
         let positions = multimodal.span_positions(start as usize, len as usize);
         let span_media = chunk.as_ref().map(|chunk| SpanMedia {
-            embedding: &media[&job.request].handle,
+            embedding: &media.entries[&held.expect("a covered chunk took a hold")].handle,
             first_column: chunk.first_column,
             scatter_indices: &chunk.scatter_indices,
         });
-        self.model.leaf.prefill_multimodal(
+        let permitted = job.permitted.clone().unwrap_or_else(|| Vec::new().into());
+        let probability = self.model.leaf.prefill_multimodal(
             self.model.handle(),
             sequence,
             &job.tokens,
             start,
             job.params,
+            &permitted,
             MultimodalSpan {
                 positions: &positions,
                 rope_delta: multimodal.rope_delta,
                 media: span_media,
             },
+            out_logits,
         )?;
-        if chunk.is_some_and(|chunk| chunk.completes_item)
-            && let Some(done) = media.remove(&job.request)
-        {
-            self.release_media_handle(done.handle);
+        if chunk.is_some_and(|chunk| chunk.completes_item) {
+            media.release(job.request);
         }
-        Ok(encode_micros)
+        Ok((encode_micros, probability))
     }
 
     /// Number of live leaf sequences (the CPU-stub observation point).
@@ -722,17 +983,17 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             .and_then(|publish| prefixes.remove(&(job.request, publish.tokens)))
                     })
                     .collect();
-                // GitHub #178: the retry re-encodes whatever it needs.
-                let unencoded: Vec<_> = jobs
-                    .iter()
-                    .filter_map(|job| media.remove(&job.request))
-                    .collect();
+                // GitHub #178: every job in the batch gives its embedding
+                // back. GitHub #243: gives back its *hold* — the encode
+                // succeeded, the item has not changed, and the retry that
+                // follows finds it in the cache instead of running the tower
+                // a second time.
+                for job in jobs {
+                    media.release(job.request);
+                }
                 drop(media);
                 drop(prefixes);
                 drop(sequences);
-                for live in unencoded {
-                    self.release_media_handle(live.handle);
-                }
                 for sequence in released {
                     self.release_sequence(sequence.handle);
                 }
@@ -843,6 +1104,16 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // progress section carries the pending token the capturing
             // sequence had at its opener.
             if !job.tokens.is_empty() {
+                // GitHub #237: the full-vocabulary buffer, allocated only
+                // for a job that asked to read one out — every other job
+                // pays nothing, not an allocation and not a gather. It is
+                // one f32 per output-head column (248,320 of them on the
+                // 27B) and it dies at the end of this iteration: what
+                // crosses the `Compute` seam is the gather below.
+                let mut logits = job
+                    .readout
+                    .as_ref()
+                    .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -853,16 +1124,54 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.params,
+                            // GitHub #242: the set this chunk's own draw is
+                            // restricted to, borrowed and not cloned — every
+                            // chunk that is not a constrained run's last
+                            // passes an empty slice and allocates nothing.
+                            job.permitted.as_deref().unwrap_or(&[]),
+                            logits.as_deref_mut(),
                         )
-                        .map(|()| 0),
-                    Some(multimodal) => {
-                        self.prefill_multimodal_job(&mut sequence.handle, &mut media, job, multimodal)
-                    }
+                        .map(|probability| (0, probability)),
+                    Some(multimodal) => self.prefill_multimodal_job(
+                        &mut sequence.handle,
+                        &mut media,
+                        job,
+                        multimodal,
+                        logits.as_deref_mut(),
+                    ),
                 };
                 match warmed {
-                    Ok(encode_micros) => outcomes[index].encode_micros = encode_micros,
+                    Ok((encode_micros, probability)) => {
+                        outcomes[index].encode_micros = encode_micros;
+                        // The first token of a run's run was just drawn
+                        // here; the first decode round returns it, and this
+                        // is the only place its probability exists.
+                        if job.permitted.is_some() {
+                            self.drawn.lock().unwrap().insert(job.request, probability);
+                        }
+                    }
                     Err(code) => unwind!(RuntimeError::Leaf(code).into()),
                 }
+                if let (Some(answers), Some(logits)) = (&job.readout, &logits) {
+                    outcomes[index].readout = Some(Readout::gather(logits, answers));
+                }
+            } else if job.readout.is_some() {
+                // A chunk with nothing to prefill runs no forward pass, so
+                // there are no logits at this position to read — an exact
+                // repeat of a decision, whose reuse claim covered its whole
+                // prompt, is the way to get here (GitHub #238 trims such a
+                // claim by one token for exactly this reason). Failing
+                // loudly rather than returning `None`: a readout that
+                // silently did not happen is a decision answered by
+                // whatever the caller does with an absent answer.
+                // hotpath-lint-allow: failure-only path (the batch returns `Err` on the next line), reviewed exception (GitHub #237).
+                tracing::error!(
+                    name: "ignis.runtime.readout_without_tokens",
+                    request_id = job.request,
+                    start_position = job.start_position,
+                    "a readout job whose chunk carries no tokens runs no forward pass"
+                );
+                unwind!(RuntimeError::Leaf(ignis_core::scheduler::READOUT_WITHOUT_TOKENS).into());
             }
             if let Some(publish) = job.publish_prefix {
                 to_publish.push((job.request, publish));
@@ -1058,12 +1367,21 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // and at the EOS, so the sequence never commits past the text its
         // request emits.
         let eos = [self.eos];
+        // GitHub #242: cloned out of `batch` before the lanes borrow it,
+        // because the handles below take it mutably. An `Option<Arc>` clone
+        // is a refcount bump for a constrained lane and nothing at all for
+        // any other — an ordinary round allocates no more than it did before
+        // this ticket, which is the bar for anything on this path.
+        let permitted: Vec<Option<ignis_core::constrained::PermittedSet>> = batch
+            .iter()
+            .map(|(job, _)| job.permitted.clone())
+            .collect();
         let decoded = {
             let lanes: Vec<DecodeLane<'_>> = batch
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| active[*index])
-                .map(|(_, (job, sequence))| DecodeLane {
+                .map(|(index, (job, sequence))| DecodeLane {
                     params: job.params,
                     remaining_tokens: job
                         .params
@@ -1073,6 +1391,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         })
                         .max(1),
                     stop_ids: if job.params.ignore_eos { &[] } else { &eos },
+                    permitted: permitted[index].as_deref().unwrap_or(&[]),
                 })
                 .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
@@ -1114,12 +1433,42 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
         let mut decoded = decoded.into_iter();
         let mut released = Vec::new();
+        // GitHub #242: taken once for the whole round rather than per lane.
+        // The map is empty unless a constrained run is in flight, and this
+        // is the decode path — one uncontended lock per round is a cost an
+        // ordinary round can carry; eight of them would be a cost this
+        // ticket added to every request the engine serves.
+        let mut drawn_probabilities = self.drawn.lock().unwrap();
         for (index, (job, mut sequence)) in batch.into_iter().enumerate() {
             if !active[index] {
                 released.push(sequence);
                 continue;
             }
-            let LaneRun { mut tokens, spec } = decoded.next().expect("decoded result length was checked");
+            let LaneRun {
+                mut tokens,
+                spec,
+                drawn_probability,
+            } = decoded.next().expect("decoded result length was checked");
+            // GitHub #242 — the one-round lag, closed here. The round
+            // returns the token drawn *last* time, so its probability is the
+            // one held from then; what this round drew is held for the next.
+            // A lane that drew unconstrained leaves nothing behind, so the
+            // entry disappears on the round after a run's last set and
+            // never outlives the request.
+            let probabilities = match drawn_probabilities.is_empty() {
+                true => Vec::new(),
+                false => match drawn_probabilities.remove(&job.request) {
+                    Some(probability) => vec![probability],
+                    None => Vec::new(),
+                },
+            };
+            if let Some(probability) = drawn_probability {
+                drawn_probabilities.insert(job.request, probability);
+            }
+            debug_assert!(
+                probabilities.is_empty() || tokens.len() == 1,
+                "a constrained lane commits exactly one token, so there is one probability for it"
+            );
             let eos_at = (!job.params.ignore_eos)
                 .then(|| tokens.iter().position(|&token| token == self.eos))
                 .flatten();
@@ -1136,8 +1485,13 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     DecodeOutcome::run(tokens)
                 }
             };
-            outcomes[index] = Some(DecodeOutcome { spec, ..outcome });
+            outcomes[index] = Some(DecodeOutcome {
+                spec,
+                probabilities,
+                ..outcome
+            });
         }
+        drop(drawn_probabilities);
         drop(sequences);
         for sequence in released {
             self.release_sequence(sequence.handle);
@@ -1149,9 +1503,15 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
     }
 
     fn release(&self, request: RequestId) {
-        // GitHub #178: a request completed or cancelled mid-item releases
-        // the item's embedding with its sequence.
+        // GitHub #178: a request completed or cancelled mid-item lets its
+        // item's embedding go with its sequence. GitHub #243: lets its
+        // *hold* go — the picture it was asked about is very often the
+        // picture the next request is about.
         self.release_media_of(request);
+        // GitHub #242: and a constrained decode cancelled mid-run leaves a draw nobody
+        // will ever emit. One `f32`, but the id is never reused, so an entry
+        // left here would be leaked for the life of the process.
+        self.drawn.lock().unwrap().remove(&request);
         let sequence = self.sequences.lock().unwrap().remove(&request);
         if let Some(sequence) = sequence {
             self.release_sequence(sequence.handle);
@@ -1275,12 +1635,14 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 impl<L: StepLeaf> Drop for RuntimeCompute<L> {
     fn drop(&mut self) {
         let media = std::mem::take(
-            self.media
+            &mut self
+                .media
                 .get_mut()
-                .expect("RuntimeCompute is not dropped while its media lock is held"),
+                .expect("RuntimeCompute is not dropped while its media lock is held")
+                .entries,
         );
-        for (_, media) in media {
-            self.release_media_handle(media.handle);
+        for (_, entry) in media {
+            self.release_media_handle(entry.handle);
         }
         let sequences = std::mem::take(
             self.sequences

@@ -261,6 +261,14 @@ impl TemplateProvider for ArtifactTemplateProvider {
         })
     }
 
+    fn answer_alphabet(&self) -> ignis_core::decision::AnswerAlphabet {
+        ignis_core::decision::AnswerAlphabet::from_tokenizer(self.set.tokenizer())
+    }
+
+    fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
+        self.set.tokenizer().encode(text).ok()
+    }
+
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
         // `TokenId` is a `u32` alias, so the id slice is the tokenizer's
         // own input type.

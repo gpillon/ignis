@@ -3,9 +3,9 @@
 - Kind: experiment
 - Status: current
 - Observed: 2026-09-19
-- Last verified: 2026-09-19
+- Last verified: 2026-09-20 (through the served endpoint)
 - Scope: serving / constrained decode, multimodal grounding, decision endpoint primitives
-- Related: `crates/server/tests/classify_pointing_gpu.rs`, `slot_alphabet.rs`, `2026-09-19-typed-option-logit-readout.md`, GitHub #178 (multimodal prefill), #235
+- Related: `crates/server/tests/classify_pointing_gpu.rs`, `slot_alphabet.rs`, `crates/server/tests/decide_point_gpu.rs`, `2026-09-19-typed-option-logit-readout.md`, GitHub #178 (multimodal prefill), #235, #242
 - Superseded by: none
 
 ## Question
@@ -95,12 +95,84 @@ still plausible.
 button, on a button as small as 7.8% of the side, with a worst error of 2.1%
 of the side.
 
+**The place-weighted sum covers the true error on four of six axes.** With
+`sigma = sum((1 - p_k) * 10^place)` and the target rescaled onto the 0-999
+axis, `|reading - target| <= sigma` holds on four axes and fails on two:
+
+| Axis | sigma | true error | covered |
+|---|---|---|---|
+| large x | 1.32 | 1.27 | yes |
+| large y | 7.75 | 20.39 | **no** |
+| medium x | 4.37 | 1.19 | yes |
+| medium y | 5.00 | 4.20 | yes |
+| small x | 3.71 | 0.66 | yes |
+| small y | 4.60 | 7.69 | **no** |
+
+Both misses are on y, the axis whose *first* digit the model was least sure
+of. So the quantity is the model's **self-declared** uncertainty and is not
+a bound: it is worth reporting because it is the model's own statement of
+resolution, not because a caller can rely on the answer falling inside it.
+
 **The per-digit probability is a resolution readout.** It falls
 monotonically across each number: hundreds ~0.97–0.99, tens ~0.50–0.98, units
 ~0.15–0.57. The model is certain about the coarse position and admits it is
 guessing the last digit. That is not noise to be smoothed away — it is the
 model reporting that its spatial resolution is about 1 part in 100, and a
 caller can read it directly.
+
+## Reproduced through the served endpoint (2026-09-20, GitHub #242)
+
+The numbers above were taken by driving the kernel directly: the digits were
+picked host-side out of a full logits row and forced back in. What ships does
+none of that — the permitted set is masked into the logits on the device, the
+schedule lives on the request, and the answer comes back over HTTP from
+`POST /v1/decide` as `{"type": "point"}`. `decide_point_gpu.rs` runs the same
+three scenes through that whole stack:
+
+| Scene | Served (px) | Target (px) | Error | Inside button |
+|---|---|---|---|---|
+| large | (3149, 3424) | (3150, 3340) | 84 px (2.1%) | yes |
+| medium | (1279, 988) | (1280, 975) | 13 px (0.3%) | yes |
+| small | (3657, 611) | (3660, 645) | 34 px (0.8%) | yes |
+
+Same worst case (84 px on `large`), and every scene still inside its button
+— but the two runs are **not** the same reading, and one scene drifts more
+than rounding:
+
+| Scene | Direct (normalized) | Served (normalized) | Drift |
+|---|---|---|---|
+| large | x=767 y=835 | x=768 y=835 | 1 unit of x (4 px) |
+| medium | x=311 y=242 | x=312 y=241 | 1 unit each (~4 px) |
+| small | x=892 y=165 | x=892 y=149 | **16 units of y (66 px)** |
+
+`small`'s y is a changed **tens digit**, 6 to 4, and the direct run read that
+6 at p=0.665 — not a near-tie the two runs could be splitting. The point
+moves from 32 px below the button's centre to 34 px above it; the button is
+90 px tall, so acceptance 3 holds either way, and it holds by less than the
+drift.
+
+Two differences between the runs could produce it and this run does not
+separate them:
+
+- **KV format.** The served load is hq-e8-2b (ADR 0022's serving default);
+  `classify_pointing_gpu.rs` asks for `KvFormat::Bf16` by name.
+- **How the forced `{"x":` is rotated.** Here it is appended to the prompt
+  and takes continued MRoPE positions (`Multimodal::append_text`); there it
+  was forced through a *text* `prefill_program` call after the multimodal
+  one. Whichever is the better rotation, they are not the same one.
+
+The user turn is byte-identical between the two, so the prompt text is not a
+candidate. Listed rather than attributed: a cause nobody measured is a guess.
+
+The run also holds on a **drafter load** (`dflash2-7`), pixel for pixel. That
+matters: a speculative load runs every round as a verify round and the leaf
+refuses a constrained lane there, so `CudaLeaf::decode` routes a batch with
+any constrained lane through the plain path. This is the only test that
+exercises that claim on the card.
+
+The per-digit trace survives the crossing. The `uncertainty` reported on each
+axis is that axis's own place-weighted sum rescaled onto its side in pixels,
+checked in the test rather than asserted in prose.
 
 ## Implications
 
@@ -160,3 +232,9 @@ caller can read it directly.
   uncertain.
 - Whether a second constrained pass over a crop refines the last digit, which
   is where the resolution actually ends.
+- Rerun `decide_point_gpu.rs` on a BF16 load, which splits the two candidates
+  above for `small`'s 16-unit y drift: same rotation, different KV format.
+- The y axis is consistently the worse one — `point`'s two uncovered sigmas
+  are both y, and `box`'s edges are within 6 px on x and 30-80 px on y
+  (`2026-09-20-number-width-and-decide-e2e.md`). Three scenes is not enough
+  to call it a bias, and it is the same direction every time.

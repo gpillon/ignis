@@ -10,6 +10,11 @@ slots) and absorbs GitHub #204. Measurement and code analysis:
 classes. It is the future ADR that ADR 0017 required before KV usage and
 capacity could be exported, and it preserves that ADR's zero-work invariant.
 Built by GitHub #216 (the exposition) and #217 (the Playground's Monitor).
+**Amended 2026-09-20 by ADR 0035** (GitHub #243): the `media_embedding` line
+reserved one item's encoder output and now reserves the embedding *pool*
+(`--vision-embedding-pool-mib`, defaulting to one envelope-wide item, so the
+number it carries at the default is unchanged). The line's name, its place in
+the layout order and its refusal rule are untouched.
 Amended 2026-09-18 (#216, owner decision) where building it settled three
 readings this section had left to the source column — the retained slots'
 capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's
@@ -82,7 +87,7 @@ The load lays out, in order:
 
 1. the weights;
 2. the workspaces (the prefill scratch and the vision encoder share one
-   `max`, and the media embedding stays its own);
+   `max`, and the media embedding pool stays its own);
 3. the round and sampling buffers;
 4. every lane's state;
 5. the **retained slots**;

@@ -2,7 +2,13 @@
 
 ## Status
 
-Accepted (2026-09-20, owner). **Amends the *Per-lane sampling* invariant** in
+Accepted (2026-09-20, owner). **Corrected 2026-09-20 while implementing
+GitHub #237**: this ADR first sized the readout buffer at 151,936 × f32 ≈
+607 KB. That is Qwen2/Qwen3's vocabulary, not this artifact's — its
+`<|image_pad|>` alone sits at id 248,056, and `ModelConfig::qwen38_27b().vocab`
+is 248,320, so the buffer is ≈ 970 KB. An arithmetic correction only: it
+makes the case for keeping the gather below the seam stronger, not weaker,
+and no decision here turns on it. **Amends the *Per-lane sampling* invariant** in
 `CONTEXT.md`, which said the leaf "returns token ids and never ships logits to
 the host": that claim is now the decode path's, and this ADR names the two
 paths that sit beside it.
@@ -55,7 +61,7 @@ the box the model gives unprompted to within (0,9) on a 0–999 scale. The
 restriction reads the model rather than overruling it — the digit mass is 1.000
 at every position after the first.
 
-Doing that against today's leaf means a host round-trip per digit: 607 KB of
+Doing that against today's leaf means a host round-trip per digit: 970 KB of
 logits across PCIe and a synchronization, six times, on a lane that blocks its
 round meanwhile. That is what the experiment did, because an experiment is alone
 on the card. A service is not.
@@ -68,7 +74,7 @@ rather than excepted.
 - **A readout receives logits and draws no sample.** `StepLeaf::prefill` takes
   an optional logits buffer; the `Compute` seam carries the **answer tokens**
   in and the readout out. The gather happens inside `RuntimeCompute::prefill_step`
-  — the full-vocabulary buffer (151,936 × f32 ≈ 607 KB per decision) never
+  — the full-vocabulary buffer (248,320 × f32 ≈ 970 KB per decision) never
   crosses the seam, only the answer logits, the full-vocabulary log-sum-exp and
   the unrestricted argmax.
 - **A constrained decode restricts sampling, per lane, in the leaf.** The
@@ -93,7 +99,7 @@ rather than excepted.
 **Host-side constraint for the digits** — read the logits each round, pick on
 the host, force the token back. It needs no kernel change and it is exactly what
 the experiment did. Rejected: six host synchronizations per number on a lane
-that blocks its round, 607 KB each way, and it would contradict the invariant
+that blocks its round, 970 KB each way, and it would contradict the invariant
 three days after we sharpened it. A thing that is fine alone on a card and wrong
 under load is not a design.
 
@@ -124,10 +130,16 @@ model that would have written the sentence.
 - The sampling ABI gains a per-lane token set, which every future sampling
   change has to carry. That is the cost of not having the host in the loop.
 - `ignis_decoded_tokens_total` does not move for a readout, which is correct and
-  makes decisions invisible to the existing panels. The decision counters and
-  the **answer mass** histogram exist because of it: a silent collapse of answer
+  makes decisions invisible to the existing panels. `ignis_decisions_total`
+  (`type=noul|choice|score`) and the **answer mass** histogram
+  `ignis_decision_answer_mass` exist because of it: a silent collapse of answer
   mass in production means well-formed noise, and it is the only failure of this
-  endpoint that nothing else would show.
+  endpoint that nothing else would show. Both are counted per *question* and
+  both are absent from the exposition until a decision has been served; ADR
+  0017's contract table carries them, and the reasoning for the absence is
+  there (#241). `confidence` is deliberately not exported — it is per-caller
+  and per-domain, and an aggregate over callers with different thresholds means
+  nothing.
 - The endpoint can be reached by an unmodified Jev client, which is the reason
   to copy their wire shape rather than invent one. Their vocabulary (`noul`,
   `criteria`, `instructions`) therefore enters our glossary as imported, not

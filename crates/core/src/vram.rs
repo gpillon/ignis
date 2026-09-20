@@ -133,6 +133,11 @@ pub struct VramRequest<'a> {
     /// `--kv-pool-bytes`, when the operator named it: the pool's payload
     /// budget, as [`plan_kv_pool`] reads it. `None` gives the pool the rest.
     pub kv_pool_bytes: Option<u64>,
+    /// Whether the operator named `--vision-embedding-pool-mib` (GitHub
+    /// #243). Only so a refusal can name the knob they just set: telling
+    /// someone who asked for a large embedding pool to run "without
+    /// --vision" is the one remedy they did not mean.
+    pub embedding_pool_named: bool,
     /// The device bytes a KV pool of this many pages occupies: its planes
     /// and its block tables, as the leaf lays them out.
     pub kv_arena_bytes: &'a dyn Fn(u32) -> u64,
@@ -186,6 +191,7 @@ pub enum VramPlanError {
         needed_bytes: u64,
         max_context_tokens: u32,
         kv_pool_named: bool,
+        embedding_pool_named: bool,
     },
 }
 
@@ -207,6 +213,7 @@ impl std::fmt::Display for VramPlanError {
                 needed_bytes,
                 max_context_tokens,
                 kv_pool_named,
+                embedding_pool_named,
             } => {
                 write!(
                     f,
@@ -231,6 +238,9 @@ impl std::fmt::Display for VramPlanError {
                 }
                 if kv_pool_named {
                     f.write_str(", or name a smaller --kv-pool-bytes")?;
+                }
+                if embedding_pool_named {
+                    f.write_str(", or name a smaller --vision-embedding-pool-mib")?;
                 }
                 Ok(())
             }
@@ -292,6 +302,7 @@ pub fn plan_vram(request: &VramRequest<'_>) -> Result<VramPlan, VramPlanError> {
             needed_bytes,
             max_context_tokens: request.max_context_tokens,
             kv_pool_named: request.kv_pool_bytes.is_some(),
+            embedding_pool_named: request.embedding_pool_named,
         };
         if !request.mode.allows_oversubscription() {
             return Err(refusal);
@@ -391,6 +402,7 @@ mod tests {
             max_context_tokens: 262_144,
             retained_slots: SLOTS,
             kv_pool_bytes: None,
+            embedding_pool_named: false,
             kv_arena_bytes: &arena,
             can_page: true,
         }
@@ -571,6 +583,35 @@ mod tests {
         .expect_err("past the budget");
         let message = err.to_string();
         assert!(message.contains("--kv-pool-bytes"), "{message}");
+    }
+
+    #[test]
+    fn a_named_embedding_pool_past_the_budget_refuses_and_names_that_flag_too() {
+        // GitHub #243: the remedies an operator is offered have to include
+        // the one they just reached for. Telling someone who asked for a
+        // large embedding pool to run "without --vision" is the single
+        // remedy they did not mean.
+        let huge = || {
+            let mut l = lines();
+            l.media_embedding = 20 * GIB;
+            l
+        };
+        let message = plan_vram(&VramRequest {
+            lines: huge(),
+            embedding_pool_named: true,
+            ..request(DERIVED, 30 * GIB)
+        })
+        .expect_err("past the budget")
+        .to_string();
+        assert!(message.contains("--vision-embedding-pool-mib"), "{message}");
+
+        // And it stays quiet when the operator did not name one: the pool is
+        // then whatever the envelope implies, and shrinking it is not a knob
+        // they turned.
+        let quiet = plan_vram(&VramRequest { lines: huge(), ..request(DERIVED, 30 * GIB) })
+            .expect_err("past the budget")
+            .to_string();
+        assert!(!quiet.contains("--vision-embedding-pool-mib"), "{quiet}");
     }
 
     #[test]

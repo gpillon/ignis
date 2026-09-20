@@ -1110,6 +1110,7 @@ mod tests {
             preprocess_seconds: 0.25,
             cache_hits: 1,
             cache_misses: 1,
+            source_pixels: Some((64, 64)),
         };
         let events = capture_events(|| {
             telemetry.note_submit(1, 20, RequestClass::Agent);

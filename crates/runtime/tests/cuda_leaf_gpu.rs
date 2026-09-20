@@ -73,6 +73,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             checkpoint: None,
             capture_checkpoint: None,
             multimodal: None,
+            readout: None,
             request,
             tokens: prompt,
             context_tokens: 256,
@@ -83,7 +84,8 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             },
             shared_prefix: None,
             publish_prefix: None,
-        }])
+            permitted: None,
+}])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 
     let mut generated = Vec::new();
@@ -97,7 +99,8 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
                     ..DecodeParams::default()
                 },
                 remaining_tokens: (MAX_GENERATED - generated.len()) as u32,
-            }])
+                permitted: None,
+}])
             .unwrap_or_else(|e| panic!("decode_step: {e}"));
         let Some(DecodeOutcome { tokens, finish, .. }) = out.into_iter().next() else {
             break;

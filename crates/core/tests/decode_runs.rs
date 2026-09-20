@@ -28,6 +28,7 @@ fn submit(sched: &mut ConcreteScheduler, max_tokens: u32) -> RequestId {
     sched
         .submit(
             RequestInput {
+                decision: None,
                 multimodal: None,
                 opener_tokens: None,
                 user_turn_tokens: None,
@@ -38,6 +39,7 @@ fn submit(sched: &mut ConcreteScheduler, max_tokens: u32) -> RequestId {
                     max_tokens: Some(max_tokens),
                     ..DecodeParams::default()
                 },
+                constrained: None,
             },
             RequestClass::Interactive,
         )
@@ -74,6 +76,7 @@ fn done(events: &[SchedEvent], id: RequestId) -> (u32, FinishReason, Option<Spec
                 tokens,
                 reason,
                 spec,
+                ..
             } if *request == id => Some((*tokens, *reason, *spec)),
             _ => None,
         })
