@@ -651,11 +651,16 @@ fn two_questions_over_one_state_have_the_same_system_block() {
 
 #[test]
 fn an_image_state_stays_in_the_user_turn() {
-    // Spec 04's acceptance 2 is **not met**, and this is where it is
-    // refused rather than forgotten: `check_content_parts` turns media in a
-    // system or developer message into a 400 (GitHub #175), so an image
-    // `state` cannot go where the retained prefix is cut. A fan-out over an
-    // image re-encodes it per question.
+    // Spec 04's acceptance 2 is **not met**, and this is where that is
+    // recorded rather than forgotten: an image `state` does not go where
+    // the retained prefix is cut, so a fan-out over one re-encodes it per
+    // question.
+    //
+    // Not because it *cannot*. `check_content_parts` refuses media in a
+    // system message (GitHub #175) but never runs on the decide path, so
+    // what keeps the image in the user turn is a choice — see
+    // `decide::messages_for` for the two things that argue for it. This
+    // test pins the choice; it does not pretend to pin a law.
     let questions = prepared_value(json!({
         "state": "s",
         "questions": { "q": { "type": "choice", "instructions": "Which number?", "criteria": { "42": null, "47": null } } }
@@ -668,17 +673,18 @@ fn an_image_state_stays_in_the_user_turn() {
         ignis_server::decide::DIRECT_SYSTEM,
         "the system block carries the instruction and nothing else"
     );
-    assert!(
-        ignis_server::template::check_content_parts(&messages, true).is_ok(),
-        "and the messages this builds are ones the server will accept"
-    );
+    let ignis_server::template::MessageContent::Parts(parts) = &messages[1].content else {
+        panic!("the image rides in the user turn");
+    };
+    assert_eq!(parts[0].kind.as_deref(), Some("image_url"), "and leads it");
 
-    // The refusal that keeps it that way, stated as a fact rather than as a
-    // comment: the same image moved into the system message is a 400.
+    // What the rest of the server would say about the other arrangement,
+    // recorded so the choice is visible next to its cost: the chat and
+    // responses routes refuse exactly this.
     let mut moved = messages.clone();
     moved[0].content = messages[1].content.clone();
     let rejection = ignis_server::template::check_content_parts(&moved, true)
-        .expect_err("media in a system message is refused");
+        .expect_err("media in a system message is refused on the routes that check");
     assert_eq!(rejection.code, "invalid_media");
 }
 

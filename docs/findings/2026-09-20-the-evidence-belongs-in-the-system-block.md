@@ -1,6 +1,6 @@
 # The evidence belongs in the system block, not merely first
 
-- Kind: defect
+- Kind: discovery
 - Status: current
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
@@ -66,6 +66,21 @@ SemIf's 144 authored rows on the served 27B, on one load, in one run
 The two layouts give the same answer on 137 of 144 rows; of the seven they
 disagree on, the shipped layout is right on four more than it loses.
 
+## Finding
+
+**Observed.** A decision's sibling claims no reuse tier at all when the
+evidence sits in the user turn: the two facts above — no live publisher, no
+checkpoint — are `ConcreteScheduler`'s, and `retained_prefix_point` is
+`floor(system_block_tokens, KV_PAGE_TOKENS)` by inspection. The token counts
+in the table are measured by `decide_prompt_tail.rs` on the loaded artifact's
+own tokenizer and chat template. The A/B numbers are measured on the served
+27B over all 144 rows.
+
+**Inferred.** That the shipped layout is *better* rather than merely not
+worse is an inference from four net rows out of 144 and is not claimed as
+one. What the sweep establishes is the negative: moving the evidence between
+turns did not break the readout.
+
 ## Implications
 
 **The re-measurement the previous finding asked for is taken**, and it is of
@@ -88,17 +103,67 @@ reported by the test rather than left to be rediscovered. A fan-out is worth
 asking for when the state is a ticket, a transcript or a document, which is
 also the only case where the N x 16K prefill it prevents would have hurt.
 
-**Spec 04's acceptance 2 cannot be met as written.** `check_content_parts`
-refuses media in a system or developer message (#175), so an image `state`
-cannot go where the retained prefix is cut: a fan-out over an image
-re-encodes it per question. The refusal is pinned by a test
-(`decide_wire.rs::an_image_state_stays_in_the_user_turn`) so the gap is
-visible rather than assumed away. Lifting that refusal, or #235's
-one-request-N-suffix shape, are the two ways out and both are somebody's
-decision, not an implementation detail.
+**Spec 04's acceptance 2 is unmet, and not for the reason first given.** An
+image `state` stays in the user turn, so a fan-out over an image re-encodes
+it per question. The first version of this document said
+`check_content_parts` made that impossible; it does refuse media in a system
+message (#175) but it is called only from the chat and responses routes and
+never on the decide path, so it does not bind here. What actually stands in
+the way is two things and a choice:
+
+- an image in a system message would reverse, on this one route, a policy
+  the server enforces on every other, against a chat template nobody has
+  checked renders it at all;
+- and inside the block it would usually be excluded anyway —
+  `prefix_floor` walks the page floor back out of any media item it lands
+  inside (#193), so a retained prefix keeps an image only when a whole page
+  of something else follows it within the block. Image first, then the
+  instruction, is a third prompt layout, with its own measurement.
+
+So there is a route, and it is a design fork rather than an impossibility:
+this finding's earlier "cannot" was wrong. Taking it, or #235's
+one-request-N-suffix shape, is the owner's call.
 
 Worth carrying elsewhere: **"shared" and "reusable" are different
 properties.** Two prompts having a common prefix says nothing about whether
 the engine can claim it — that depends on which tier the publisher qualifies
 for and where that tier is cut. A reuse argument that reasons about text
 rather than about the cache is an argument about a saving nobody gets.
+
+## Limits and unknowns
+
+- **144 rows, one model, one sweep.** No confidence interval is computed and
+  the 0.934 -> 0.963 difference is 4 rows; a second sweep could move it back.
+  The mass and in-slot figures are the ones this rests on, and those are
+  flat.
+- **The rows are authored, English, and short** (median 135 prompt tokens).
+  Nothing here says how either layout behaves on the long states that are
+  the whole reason a fan-out exists — which is also the regime where the
+  reuse pays.
+- **The reuse itself is measured on `MockCompute`, not on the card.** That a
+  follower prefills 72 tokens instead of 456 is a scheduler-level fact
+  (`decide_http.rs::twenty_questions_over_one_state_prefill_it_once`); no GPU
+  run has yet timed a fan-out end to end, so the wall-clock saving is
+  inferred from the token count rather than observed.
+- **Nothing was measured for an image `state`**, which does not use this
+  layout.
+- **The fan-out's saving is conditional on the engine's configuration.** It
+  needs `--prompt-reuse` on and a free retained slot (`--retained-slots`
+  above 0); with either off the questions still answer and silently pay full
+  price. No test covers that degradation.
+- **A block boundary the tokenizer disagrees about disables it silently.**
+  `ArtifactTemplateProvider::system_block_tokens` returns `None` unless the
+  block's text tokenizes to an exact prefix of the whole prompt — correct,
+  and it means an unusual `state` could restore the N-fold prefill with
+  nothing reported. `decide_prompt_tail.rs` checks one state on the real
+  tokenizer; the CPU tests use a word-hash template that cannot disagree
+  with itself.
+
+## Follow-ups
+
+- Whether the image fan-out is worth either exit — lifting #175's refusal of
+  media in a system message, or GitHub #235's one-request-N-suffix shape — is
+  a design fork and the owner's call. Unfiled on purpose.
+- A GPU run that times a real N-question fan-out would turn the token-count
+  saving into a latency one. GitHub #241 owns the metrics that would report
+  it.

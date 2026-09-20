@@ -607,13 +607,25 @@ fn score_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOp
 /// N times. Spec 04 asked for "evidence first"; what it needed was "evidence
 /// in the block".
 ///
-/// **An image `state` cannot follow it.** `check_content_parts` refuses media
-/// in a system or developer message outright (GitHub #175), so the parts stay
-/// in the user turn — image first, then the decision's JSON without an
-/// `evidence` field, the shape `classify_vision_readout_gpu.rs` measured. A
-/// fan-out over an image therefore shares nothing and re-encodes it per
-/// question, which is spec 04's acceptance 2 unmet and reported rather than
-/// papered over.
+/// **An image `state` does not follow it, and spec 04's acceptance 2 is
+/// unmet.** The parts stay in the user turn — image first, then the
+/// decision's JSON without an `evidence` field, the shape
+/// `classify_vision_readout_gpu.rs` measured — so a fan-out over an image
+/// shares nothing and re-encodes it per question.
+///
+/// Why, precisely, because an earlier version of this comment got it wrong:
+/// `check_content_parts` does refuse media in a system message (GitHub
+/// #175), but it is called only from the chat and responses routes and
+/// **never on this path** (`api.rs::prepare_request` does not call it), so
+/// it is not what stops this. What stops it is that putting an image in a
+/// system message would be a policy this server enforces everywhere else,
+/// reversed here, on a render nobody has checked the real chat template
+/// does at all — and that even inside the block an image is normally
+/// excluded anyway, since `prefix_floor` walks the page floor back out of
+/// any media item it lands inside (GitHub #193). It would have to be the
+/// image *first* and then a whole page of text, which is a third prompt
+/// layout to measure. That is a design fork for #240's owner or GitHub
+/// #235, not something to decide in a prompt builder.
 pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMessage> {
     let options: Vec<JsonValue> = question
         .options
@@ -1003,20 +1015,52 @@ async fn serve(
     let mut questions = prepared.iter().zip(rendered);
     let mut answers = BTreeMap::new();
     if let Some((question, ready)) = questions.next() {
-        answers.insert(question.id.clone(), ask(server, question, ready, class).await);
+        // A first question the engine has no room for leaves the fan-out
+        // with no prefix to share, but it is still one question's failure
+        // and not the request's — the same slot an engine-full follower
+        // gets, and the same one the sequential loop before #240 gave it.
+        let answer = match ask(server, question, ready, class).await {
+            Attempt::Answered(answer) => answer,
+            Attempt::Full(_) => engine_full(),
+        };
+        answers.insert(question.id.clone(), answer);
     }
-    loop {
-        let wave: Vec<_> = questions.by_ref().take(FAN_OUT_WIDTH).collect();
-        if wave.is_empty() {
-            break;
-        }
-        let ids: Vec<String> = wave.iter().map(|(question, _)| question.id.clone()).collect();
+
+    // The followers, in waves, with whatever the engine turned away put
+    // back for the next one.
+    //
+    // A wave is `FAN_OUT_WIDTH` wide *because* the engine admits about that
+    // many, but it is not the only client: two of its lanes may already be
+    // somebody else's, and then two of this wave's questions come back
+    // `Full`. Answering those with an error would be a failure the
+    // one-at-a-time loop before #240 never produced, so they are re-queued
+    // instead — a wave that answers even one question makes room for them.
+    // A wave where *nothing* got in is an engine with no room at all, and
+    // that is reported rather than spun on.
+    let mut pending: std::collections::VecDeque<_> = questions.collect();
+    while !pending.is_empty() {
+        let wave: Vec<_> = (0..FAN_OUT_WIDTH.min(pending.len()))
+            .filter_map(|_| pending.pop_front())
+            .collect();
+        let asked: Vec<&PreparedQuestion> = wave.iter().map(|(question, _)| *question).collect();
         let run = wave
             .into_iter()
             .map(|(question, ready)| ask(server, question, ready, class))
             .collect();
-        for (id, answer) in ids.into_iter().zip(concurrently(run).await) {
-            answers.insert(id, answer);
+        let mut answered_one = false;
+        for (question, attempt) in asked.into_iter().zip(concurrently(run).await) {
+            match attempt {
+                Attempt::Answered(answer) => {
+                    answers.insert(question.id.clone(), answer);
+                    answered_one = true;
+                }
+                Attempt::Full(ready) => pending.push_back((question, ready)),
+            }
+        }
+        if !answered_one {
+            for (question, _) in pending.drain(..) {
+                answers.insert(question.id.clone(), engine_full());
+            }
         }
     }
     Ok(DecideResponse {
@@ -1126,39 +1170,72 @@ async fn ask(
     question: &PreparedQuestion,
     ready: Rendered,
     class: ignis_core::types::RequestClass,
-) -> Answer {
+) -> Attempt {
+    // Cloned because `submit_with_media` consumes what it takes and a
+    // `Full` has to be retriable: a prompt's worth of token ids beside a
+    // prefill is nothing.
     let submitted = server
         .engine
-        .submit_with_media(ready.input, class, ready.media)
+        .submit_with_media(ready.input.clone(), class, ready.media)
         .await;
     let (id, mut events) = match submitted {
         Ok(pair) => pair,
-        Err(error) => return failed("submit_failed", format!("{error:?}")),
+        // Not an answer. The engine is saying "not now", and a fan-out's
+        // own siblings are the likeliest reason.
+        Err(ignis_core::SubmitError::Full) => return Attempt::Full(ready),
+        Err(error) => return Attempt::Answered(failed("submit_failed", format!("{error:?}"))),
     };
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
-    match crate::engine::collect_readout(&mut events, server.request_timeout).await {
-        Ok(readout) => {
-            guard.completed();
-            answer_for(question, &readout)
-        }
-        Err(_) => failed(
-            "not_completed",
-            "the engine did not answer this question in time".to_owned(),
-        ),
-    }
+    Attempt::Answered(
+        match crate::engine::collect_readout(&mut events, server.request_timeout).await {
+            Ok(readout) => {
+                guard.completed();
+                answer_for(question, &readout)
+            }
+            Err(_) => failed(
+                "not_completed",
+                "the engine did not answer this question in time".to_owned(),
+            ),
+        },
+    )
+}
+
+/// What one attempt at a question produced: an answer, or the unsubmitted
+/// question back because the engine had no room for it.
+enum Attempt {
+    Answered(Answer),
+    Full(Rendered),
+}
+
+fn engine_full() -> Answer {
+    failed(
+        "engine_full",
+        "the engine could not admit this question (all lanes in use); retry".to_owned(),
+    )
 }
 
 /// How many follower questions are put to the engine at once (GitHub #240).
 ///
 /// Not a throughput knob — a **floor under the failure mode parallelism
-/// introduces**. The engine admits `max_in_flight` requests, which is
-/// `N_DECODE_LANES` in v1, and turns the rest away with `SubmitError::Full`:
-/// a 503 "retry" on `/v1/chat/completions`, and an error in that question's
-/// slot here. Twenty questions fired at once would answer eight and fail
-/// twelve, which is worse than answering them one at a time — so they go in
-/// waves, and an idle engine never refuses one.
+/// introduces**. The engine admits `SchedulerConfig::max_in_flight` requests
+/// and turns the rest away with `SubmitError::Full`: a 503 "retry" on
+/// `/v1/chat/completions`, and an error in that question's slot here.
+/// Twenty questions fired at once would answer eight and fail twelve, which
+/// is worse than answering them one at a time — so they go in waves, and an
+/// idle engine never refuses one.
+///
+/// **What it is tied to, and what it is not.** The number that matters is
+/// `max_in_flight`, which no server flag sets: `runtime.rs` builds its
+/// `SchedulerConfig` without it, so it is the default, and the default is
+/// `N_DECODE_LANES`. That is the whole justification for reading it from
+/// there — *not* that a decision occupies a decode lane, which it never does
+/// (`CONTEXT.md`: a decision takes only the single global prefill lane). The
+/// two numbers are equal today and mean different things; if `max_in_flight`
+/// ever becomes configurable from the server, or core-06 raises it as its
+/// doc promises, this has to be read from the engine instead of assumed.
+/// Being too small is a slower fan-out, being too large is a failed one.
 ///
 /// A fan-out sharing the engine with other clients can still meet a full
 /// engine, exactly as any single request can. That is the pre-existing
@@ -1166,9 +1243,19 @@ async fn ask(
 /// fan-out competing with *itself*.
 ///
 /// The cost is one `--request-timeout` per wave rather than per question:
-/// twenty questions bound at three timeouts (the sequenced first, then two
-/// waves), not twenty.
-pub const FAN_OUT_WIDTH: usize = ignis_core::N_DECODE_LANES;
+/// twenty questions bound at four timeouts — the sequenced first, then
+/// `ceil(19 / 8)` waves — instead of twenty. A wave also ends no sooner
+/// than its slowest question, so one question that times out holds the next
+/// wave for that long; a sliding window would not, and is not worth the
+/// machinery until a fan-out is wider than two waves.
+///
+/// The other cost is honest to state: a leaf error fails the whole prefill
+/// batch it was in (`MockCompute::fail_prefill`'s own contract), so one
+/// kernel fault now takes up to a wave's worth of questions down where
+/// one-at-a-time took one. Spec 04's "leaves the others' paid-for answers
+/// alone" holds for a fault in one question's own readout, which is the
+/// per-question failure it describes; a fault in the batch is not one.
+const FAN_OUT_WIDTH: usize = ignis_core::N_DECODE_LANES;
 
 /// Run every future to completion **at the same time**, in place, and
 /// collect their outputs in order.
@@ -1183,6 +1270,11 @@ pub const FAN_OUT_WIDTH: usize = ignis_core::N_DECODE_LANES;
 ///   precisely spec 04's warning: "twenty independent requests is exactly
 ///   the shape in which one forgets to cancel nineteen".
 /// - Awaiting them in sequence is what this replaces.
+///
+/// `futures_util::future::join_all` does have the right semantics and would
+/// be the answer if it were already here; it is not a dependency of this
+/// crate (`futures-core` is, and carries no combinators), and a dependency
+/// edge is a larger thing to add than the fifteen lines it saves.
 ///
 /// Held in a `Vec` and polled in place, the futures are owned by the
 /// handler's own future. A client that disconnects drops that, which drops

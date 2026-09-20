@@ -144,9 +144,17 @@ fn server_over(compute: Arc<dyn ignis_core::Compute>) -> Server {
 }
 
 fn scheduler_over(compute: Arc<dyn ignis_core::Compute>) -> ConcreteScheduler {
+    scheduler_admitting(compute, SchedulerConfig::default().max_in_flight)
+}
+
+fn scheduler_admitting(
+    compute: Arc<dyn ignis_core::Compute>,
+    max_in_flight: usize,
+) -> ConcreteScheduler {
     ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
+            max_in_flight,
             ..SchedulerConfig::default()
         },
         compute,
@@ -905,6 +913,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     // Nothing here sleeps (ADR 0006): the compute signals when a follower is
     // inside it, and reports every release on its way back out.
     use std::sync::mpsc::sync_channel;
+    const QUESTIONS: usize = 8;
 
     let (entered_tx, entered_rx) = sync_channel(0);
     let (go_tx, go_rx) = sync_channel(0);
@@ -922,7 +931,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
         .method("POST")
         .uri("/v1/decide")
         .header("content-type", "application/json")
-        .body(Body::from(fan_out(300, 8).into_bytes()))
+        .body(Body::from(fan_out(300, QUESTIONS).into_bytes()))
         .unwrap();
     let client = tokio::spawn(async move { app.oneshot(request).await });
 
@@ -939,10 +948,19 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     support::nudge().await;
     go_tx.send(()).expect("the held prefill is still waiting");
 
+    // Every one of the N requests releases — the ones that finished and the
+    // ones that were cancelled alike — so the collector stops when it has
+    // them all. The timeout is the failure path, not the exit: waiting it
+    // out on every green run would be the sleep ADR 0006 forbids.
     let releases = tokio::task::spawn_blocking(move || {
         let mut seen = std::collections::BTreeSet::new();
-        while let Ok(request) = released_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-            seen.insert(request);
+        while seen.len() < QUESTIONS {
+            match released_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(request) => {
+                    seen.insert(request);
+                }
+                Err(_) => break,
+            }
         }
         seen
     })
@@ -972,10 +990,27 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     // answering nobody, and a `CancelOnDrop` deleted from `ask` leaves every
     // line above green (verified by mutation). What only a cancelled
     // request has is a cancel issued for it.
-    let cancelled: std::collections::BTreeSet<u64> =
-        cancelled.lock().unwrap().iter().copied().collect();
+    //
+    // Waited for rather than read: a release and its request's cancel are
+    // two different journeys through the engine and the release wins the
+    // race about half the time.
     let followers: std::collections::BTreeSet<u64> =
         prefilled.iter().copied().filter(|&id| id >= 1).collect();
+    let wanted = followers.clone();
+    let cancelled = tokio::task::spawn_blocking(move || {
+        let mut seen = std::collections::BTreeSet::new();
+        while !wanted.is_subset(&seen) {
+            match cancelled.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(request) => {
+                    seen.insert(request);
+                }
+                Err(_) => break,
+            }
+        }
+        seen
+    })
+    .await
+    .expect("the cancel collector ran");
     assert!(
         followers.is_subset(&cancelled),
         "the handler's future dropping cancels every internal request still \
@@ -991,7 +1026,7 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
 struct RecordingScheduler {
     inner: ConcreteScheduler,
     submitted: Arc<std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>>,
-    cancelled: Arc<std::sync::Mutex<Vec<ignis_core::RequestId>>>,
+    cancelled: std::sync::mpsc::SyncSender<ignis_core::RequestId>,
 }
 
 impl ignis_core::Scheduler for RecordingScheduler {
@@ -1005,12 +1040,18 @@ impl ignis_core::Scheduler for RecordingScheduler {
     }
 
     fn cancel(&mut self, request: ignis_core::RequestId) -> bool {
-        // Recorded before delegating, and the return value is not the
+        // Reported before delegating, and the return value is not the
         // property under test: the engine calls this for a request that has
         // already finished too, and `cancel` answers `false`. What a
         // disconnected client owes its siblings is that the cancel was
         // *issued*.
-        self.cancelled.lock().unwrap().push(request);
+        //
+        // A channel rather than a list because a test has to be able to
+        // *wait* for this. The cancels are queued on the engine's command
+        // channel and processed by the model thread after the tick already
+        // in progress, so a test that reads a list right after the client
+        // goes away reads it before the engine has seen a thing.
+        let _ = self.cancelled.try_send(request);
         self.inner.cancel(request)
     }
 
@@ -1042,7 +1083,7 @@ impl ignis_core::Scheduler for RecordingScheduler {
 type Submitted = Arc<
     std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>,
 >;
-type Cancelled = Arc<std::sync::Mutex<Vec<ignis_core::RequestId>>>;
+type Cancelled = std::sync::mpsc::Receiver<ignis_core::RequestId>;
 
 fn recording() -> (axum::Router, Submitted) {
     let (app, submitted, _) = recording_over(Arc::new(MockCompute::new()));
@@ -1051,14 +1092,14 @@ fn recording() -> (axum::Router, Submitted) {
 
 fn recording_over(compute: Arc<dyn ignis_core::Compute>) -> (axum::Router, Submitted, Cancelled) {
     let submitted: Submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let cancelled: Cancelled = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (cancelled, cancels) = std::sync::mpsc::sync_channel(64);
     let scheduler = RecordingScheduler {
         inner: scheduler_over(compute),
         submitted: submitted.clone(),
-        cancelled: cancelled.clone(),
+        cancelled,
     };
     let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate));
-    (server.app(), submitted, cancelled)
+    (server.app(), submitted, cancels)
 }
 
 #[tokio::test]
@@ -1118,6 +1159,43 @@ async fn the_evidence_reaches_the_scheduler_inside_the_system_block() {
         assert!(
             block < input.tokens.len() as u32,
             "and stops before the question, which is this request's alone"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wave_wider_than_the_engine_is_retried_rather_than_failed() {
+    // A wave is sized for an engine nobody else is using. When somebody is,
+    // the engine answers `SubmitError::Full` — "not now" — and turning that
+    // into an error in a question's slot would be a failure the one question
+    // at a time loop before GitHub #240 never produced.
+    //
+    // An engine that admits two at a time stands in for a busy one: the
+    // wave of seven followers cannot fit, and every question must still be
+    // answered.
+    const QUESTIONS: usize = 8;
+    let compute = Arc::new(MockCompute::new());
+    let scheduler = scheduler_admitting(compute.clone() as Arc<dyn ignis_core::Compute>, 2);
+    let app = Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate)).app();
+
+    let (status, response) = decide(&app, &fan_out(300, QUESTIONS)).await;
+    assert_eq!(status, 200, "{response}");
+    let answers = response["answers"].as_object().expect("a map");
+    assert_eq!(answers.len(), QUESTIONS);
+    for (id, answer) in answers {
+        assert_eq!(
+            answer["type"], "noul",
+            "question {id} was answered rather than turned away: {answer}"
+        );
+    }
+    // And the retries did not cost the sharing: the state is still prefilled
+    // once, however many waves it took.
+    let totals = prefilled(&compute);
+    assert_eq!(totals.len(), QUESTIONS, "one request per question: {totals:?}");
+    for (request, tokens) in totals.iter().skip(1) {
+        assert!(
+            *tokens < 300,
+            "question {request} still claims the state: {tokens} tokens"
         );
     }
 }

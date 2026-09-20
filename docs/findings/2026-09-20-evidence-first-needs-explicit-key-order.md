@@ -1,12 +1,12 @@
 # "Evidence first" was never in the bytes
 
-- Kind: defect
+- Kind: discovery
 - Status: current
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / decisions, the `/v1/decide` prompt, shared-prefix reuse
-- Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, GitHub #239, #240
-- Superseded by: none (followed by `2026-09-20-the-evidence-belongs-in-the-system-block.md`, which takes the re-measurement this one leaves open and shows the byte order was not what the reuse turned on)
+- Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, `docs/findings/2026-09-20-the-evidence-belongs-in-the-system-block.md` (takes the re-measurement this one leaves open, and shows the byte order was not what the reuse turned on), GitHub #239, #240
+- Superseded by: none
 
 ## Question
 
