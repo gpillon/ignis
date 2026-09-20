@@ -363,7 +363,7 @@ fn an_exact_repeat_of_a_decision_still_prefills_a_token() {
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
 
-    let first = sched
+    sched
         .submit(decision(tokens(1, 40), None), RequestClass::Agent)
         .expect("admitted");
     run_to_idle(&mut sched);
@@ -394,7 +394,6 @@ fn an_exact_repeat_of_a_decision_still_prefills_a_token() {
         readout.is_some(),
         "so the repeat is answered, exactly as the first was"
     );
-    assert_ne!(first, second);
 }
 
 #[test]
@@ -402,6 +401,12 @@ fn a_decision_retains_nothing_for_a_later_request_to_claim() {
     // Its prompt ends at the opener, so a checkpoint captured there would
     // cover the whole prompt — and no decision may ever claim that far.
     // Retaining it would be state nothing can use.
+    //
+    // Nothing in the decision path enforces this: `Request::checkpoint_point`
+    // already refuses an opener that leaves no prompt token after it, which
+    // a decision's opener by definition does not. The test is here because
+    // that is an invariant two features hold by accident of arithmetic, and
+    // this is the side of it that would break silently.
     let compute = Arc::new(MockCompute::new());
     let mut sched = ConcreteScheduler::with_config(config(), compute);
     sched
@@ -454,4 +459,91 @@ fn decisions_over_one_evidence_share_its_prefix() {
         tail < head,
         "and skips the shared head it is entitled to: {tail} of {head}"
     );
+}
+
+#[test]
+fn an_exact_repeat_over_a_retained_evidence_prefix_still_prefills_a_token() {
+    // The trap with teeth. The test above cannot catch it: a 40-token
+    // decision with no system block retires its prefix the moment it
+    // finishes, so its repeat claims nothing whatever the code does, and
+    // every trim in the engine could be deleted with it still green.
+    //
+    // This is the shape that discriminates — a **retained** evidence prefix
+    // (so it outlives its publisher) over a prompt whose length is an exact
+    // multiple of the KV page (so the shareable head lands *on* the prompt
+    // rather than below it). Without the trim the repeat claims all 64
+    // tokens, prefills none, runs no forward pass and is answered by
+    // nothing; with it the head is published a page lower and the repeat
+    // re-runs the page that carries its answer.
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(config(), compute.clone());
+
+    let prompt = tokens(1, 64);
+    sched
+        .submit(decision_over_evidence(prompt.clone(), 64), RequestClass::Agent)
+        .expect("admitted");
+    run_to_idle(&mut sched);
+    let repeat = sched
+        .submit(decision_over_evidence(prompt, 64), RequestClass::Agent)
+        .expect("admitted");
+    let events = run_to_idle(&mut sched);
+
+    let widths: Vec<usize> = compute
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .filter(|job| job.request == repeat)
+        .map(|job| job.tokens.len())
+        .collect();
+    assert!(
+        widths.last().is_some_and(|&last| last > 0),
+        "the repeat's final chunk runs the model: {widths:?}"
+    );
+    let (_, reason, readout) = finish(&events, repeat);
+    assert!(readout.is_some(), "so it is answered");
+    assert_eq!(reason, FinishReason::Stop);
+}
+
+#[test]
+fn a_decision_that_cannot_be_read_out_ends_in_error_not_in_silence() {
+    // The one thing the termination must never do is report `Stop` with an
+    // empty answer: that is a decision answered by nothing, dressed as a
+    // decision answered. Unreachable through the real seam — the backend
+    // refuses such a job outright (`READOUT_WITHOUT_TOKENS`) — so the only
+    // way to see the guard is to build a backend that lies.
+    struct SwallowsTheReadout(Arc<MockCompute>);
+
+    impl Compute for SwallowsTheReadout {
+        fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+            let mut outcomes = self.0.prefill_step(jobs)?;
+            for outcome in &mut outcomes {
+                outcome.readout = None;
+            }
+            Ok(outcomes)
+        }
+
+        fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+            self.0.decode_step(jobs)
+        }
+
+        fn release(&self, request: RequestId) {
+            self.0.release(request);
+        }
+    }
+
+    let compute = Arc::new(SwallowsTheReadout(Arc::new(MockCompute::new())));
+    let mut sched = ConcreteScheduler::with_config(config(), compute);
+    let id = sched
+        .submit(decision(tokens(1, 40), None), RequestClass::Agent)
+        .expect("admitted");
+    let events = run_to_idle(&mut sched);
+
+    let (generated, reason, readout) = finish(&events, id);
+    assert_eq!(
+        reason,
+        FinishReason::Error,
+        "a decision with no answer could not be served, and ends saying so"
+    );
+    assert!(readout.is_none());
+    assert_eq!(generated, 0);
 }

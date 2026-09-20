@@ -134,18 +134,47 @@ impl RequestInput {
         self.decision.is_some()
     }
 
-    /// How many leading prompt tokens may be reused from retained state
-    /// (GitHub #238): all of them for an ordinary request, and one short of
-    /// the prompt for a **decision**.
+    /// How many leading prompt tokens this request may **match** retained
+    /// state over: all of them, or one short of the prompt for a request
+    /// that must be left something to prefill.
     ///
-    /// The trim is the empty-last-chunk trap, prevented rather than
-    /// repaired. A decision's rendered prompt *ends* at the generation
-    /// opener, so an exact repeat would match a prompt checkpoint covering
-    /// every token it has — and a chunk with nothing left to prefill runs no
-    /// forward pass, so there would be no logits at the last position to
-    /// read. Reusing one token less leaves exactly the one chunk the readout
-    /// needs, and costs a single token's prefill.
+    /// Two kinds of request must, for the same shape of reason. A
+    /// **multimodal** claimant learns its own rope delta only from a prefill
+    /// span (ADR 0029), and a **decision** (GitHub #238) reads its answer
+    /// off a forward pass — a chunk with nothing left to prefill runs none,
+    /// so there would be no logits at the last position to read. A
+    /// decision's rendered prompt *ends* at the generation opener, so an
+    /// exact repeat would otherwise match state covering every token it has:
+    /// the empty-last-chunk trap, prevented rather than repaired, at the
+    /// cost of one token's prefill.
+    ///
+    /// Not to be confused with [`RequestInput::publish_reach`], which
+    /// answers the other half of the same picture and does **not** have the
+    /// same membership.
     pub fn reuse_reach(&self) -> usize {
+        match self.is_decision() || self.multimodal.is_some() {
+            true => self.tokens.len().saturating_sub(1),
+            false => self.tokens.len(),
+        }
+    }
+
+    /// How many leading prompt tokens this request may **publish** as a
+    /// shared prefix: all of them, or one short of the prompt for a
+    /// **decision** (GitHub #238).
+    ///
+    /// The same arithmetic as [`RequestInput::reuse_reach`] over a
+    /// deliberately different set, which is why they are two functions. A
+    /// multimodal request publishes its whole head — it is a *claimant* that
+    /// needs a tail to prefill, not a publisher — and folding the two
+    /// together silently cut every multimodal prefix by a page.
+    ///
+    /// A decision is in this set because the two halves compose: what it
+    /// publishes must be something it can also claim, and it may claim only
+    /// `reuse_reach`. Publishing at its own prompt length would create an
+    /// entry no decision could ever match, and — through the capture that
+    /// rides a page-aligned publish — a prompt checkpoint covering the whole
+    /// prompt.
+    pub fn publish_reach(&self) -> usize {
         match self.is_decision() {
             true => self.tokens.len().saturating_sub(1),
             false => self.tokens.len(),
@@ -268,15 +297,15 @@ impl RequestClass {
     /// when it stated none — where every other route defaults to
     /// [`RequestClass::Interactive`].
     ///
-    /// The exception is not a claim that decisions matter less
-    /// (`CONTEXT.md`, **Lane tag**). A decision holds no residency for an
-    /// **eviction priority** to take — it prefills, reads and ends — so
-    /// `Interactive` would buy it a protection it cannot use and spend one a
-    /// conversation would. And it never takes a decode lane, only the single
-    /// global **prefill lane**, so a fan-out of twenty questions is twenty
-    /// prefills queued on it; under `Interactive` they would cut ahead of
-    /// every waiting conversation. A caller whose one decision really is
-    /// interactive says so with the tag, and is believed.
+    /// `CONTEXT.md`'s **Lane tag** entry carries why, and carries it once:
+    /// the short of it is that a decision has no residency an **eviction
+    /// priority** could take and no decode lane to protect, so
+    /// `Interactive` would spend a protection it cannot use on behalf of a
+    /// conversation that could.
+    ///
+    /// A tag that was *stated* but not understood still means
+    /// `Interactive` — that rule belongs to the tag, not to the route —
+    /// which is why this takes an `Option` rather than a sentinel string.
     pub fn for_decision(tag: Option<&str>) -> Self {
         tag.map_or(RequestClass::Agent, RequestClass::from_extension)
     }
