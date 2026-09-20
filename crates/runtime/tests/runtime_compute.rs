@@ -920,6 +920,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                     max_tokens: Some(1),
                     ..DecodeParams::default()
                 },
+                program: None,
             },
             RequestClass::Interactive,
         )
@@ -953,6 +954,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
+                program: None,
             },
             RequestClass::Interactive,
         )
@@ -997,7 +999,8 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
-    };
+        program: None,
+};
     scheduler
         .submit(input(vec![1, 2, 3, 4]), RequestClass::Interactive)
         .unwrap();
@@ -1054,7 +1057,8 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
-    };
+        program: None,
+};
     scheduler
         .submit(input(), RequestClass::Interactive)
         .unwrap();
@@ -1110,6 +1114,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
+        program: None,
     }
 }
 
@@ -1396,6 +1401,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
                         max_tokens: Some(8),
                         ..DecodeParams::default()
                     },
+                    program: None,
                 },
                 RequestClass::Agent,
             )
@@ -1740,6 +1746,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
+                program: None,
             },
             RequestClass::Agent,
         )

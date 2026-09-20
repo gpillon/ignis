@@ -436,7 +436,10 @@ async fn telemetry_task(
                     // travels to its caller on the response stream, not into
                     // the telemetry counters — a decision generates nothing,
                     // so there is nothing here for `on_done` to count.
+                    // GitHub #242: and a program's trace, for the same
+                    // reason — its tokens were already counted one by one.
                     readout: _,
+                    drawn: _,
                 } => telemetry.on_done(request, tokens, reason, spec),
                 SchedEvent::PrefillChunk {
                     request,
@@ -571,6 +574,7 @@ mod tests {
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
             decision: None,
+            program: None,
             multimodal: None,
             opener_tokens: None,
             user_turn_tokens: None,
@@ -708,6 +712,7 @@ mod tests {
                 },
                 SchedEvent::Done {
                     readout: None,
+                    drawn: None,
                     request: Self::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,
@@ -778,6 +783,7 @@ mod tests {
                 },
                 SchedEvent::Done {
                     readout: None,
+                    drawn: None,
                     request: ProtectedBatchScheduler::ID,
                     tokens: 1,
                     reason: FinishReason::Stop,

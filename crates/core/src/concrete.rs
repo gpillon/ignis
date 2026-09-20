@@ -291,9 +291,19 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 /// check and [`sequence_tokens`] both — wants the same answer, and a
 /// decision admitted on prompt + `max_tokens` would be refused for a budget
 /// it was never going to spend.
+///
+/// The schedule's length for a **program** (GitHub #242), for the mirror of
+/// that reason: it emits exactly one token per step and `max_tokens` is
+/// meaningless to it, so a program admitted on some other number would
+/// either reserve pages it cannot use or be cut off mid-number. The budget
+/// is also what ends it — `remaining_work` reaching 0 is the schedule being
+/// spent — which is why the two are one number and not two.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
     if input.is_decision() {
         return 0;
+    }
+    if let Some(program) = &input.program {
+        return u32::try_from(program.len()).unwrap_or(u32::MAX);
     }
     input.params.max_tokens.unwrap_or_else(|| {
         config
@@ -1710,6 +1720,22 @@ impl ConcreteScheduler {
         (request_id, tokens)
     }
 
+    /// Why a request whose generation budget is spent stopped.
+    ///
+    /// [`FinishReason::Length`] for every ordinary request: it had more to
+    /// say and the reservation cap cut it off, which is what `length` means
+    /// on the OpenAI surface. [`FinishReason::Stop`] for a **program**
+    /// (GitHub #242), because its budget *is* its schedule — a number that
+    /// has read its last digit is finished, not truncated, and reporting
+    /// `length` for it would tell a caller their answer may be incomplete
+    /// every single time.
+    fn budget_spent_reason(&self, idx: usize) -> FinishReason {
+        match self.requests[idx].input.is_program() {
+            true => FinishReason::Stop,
+            false => FinishReason::Length,
+        }
+    }
+
     /// Complete request `idx` (its lane and KV reservation are released).
     /// `reason` is why it stopped — carried into the emitted
     /// [`SchedEvent::Done`] for the server's `finish_reason` (GitHub #61).
@@ -1726,6 +1752,14 @@ impl ConcreteScheduler {
         // reaped, and an answer left behind on it would be a second copy of
         // the only thing this event exists to carry.
         let readout = self.requests[idx].readout.take();
+        // GitHub #242: a program's answer, moved out for the same reason —
+        // and `None` rather than an empty vector for a request that never
+        // had one, so a reader can tell "this was not a program" from "this
+        // program emitted nothing".
+        let drawn = match self.requests[idx].input.is_program() {
+            true => Some(std::mem::take(&mut self.requests[idx].drawn)),
+            false => None,
+        };
         let (request_id, tokens) = self.release_request(idx);
         events.push(SchedEvent::Done {
             request: request_id,
@@ -1733,6 +1767,7 @@ impl ConcreteScheduler {
             reason,
             spec,
             readout,
+            drawn,
         });
     }
 
@@ -1891,6 +1926,10 @@ impl ConcreteScheduler {
         let prefix_entry = r.prefix_entry;
         r.requeue(); // Evicted → Admitted, lane released (there is none).
         r.tokens = 0;
+        // GitHub #242: and the trace it built, since the re-prefill draws
+        // step 0 again — a program that kept it would answer with twice its
+        // own digits.
+        r.drawn.clear();
         let effective_max = generation_budget(&self.config, &r.input);
         r.remaining_work = effective_max as u64;
         r.backfill_class = BackfillClass::None;
@@ -2262,11 +2301,22 @@ impl ConcreteScheduler {
 impl Scheduler for ConcreteScheduler {
     fn submit(
         &mut self,
-        input: RequestInput,
+        mut input: RequestInput,
         class: RequestClass,
     ) -> Result<RequestId, SubmitError> {
         if input.model != self.config.model {
             return Err(SubmitError::UnknownModel(input.model));
+        }
+        // GitHub #242: a **program**'s budget is its schedule, and nothing
+        // else may cut it short. Dropped here, once, rather than checked at
+        // each of the places `max_tokens` is read: the backend enforces it
+        // too (`RuntimeCompute::decode_step` finishes a lane whose
+        // `generated` has reached it *before* the leaf runs, and cannot tell
+        // a program's last round from an ordinary one), so a request that
+        // carried one would return a number with fewer digits than the
+        // caller asked for — which is not a shorter answer but a wrong one.
+        if input.is_program() {
+            input.params.max_tokens = None;
         }
         if self.in_flight() >= self.config.max_in_flight {
             return Err(SubmitError::Full);
@@ -2957,7 +3007,17 @@ impl Scheduler for ConcreteScheduler {
                         .decision
                         .clone()
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
-                        permitted: None,
+                    // GitHub #242: and the program's first step, on the same
+                    // chunk and for a related reason — this prefill draws the
+                    // token the first decode round emits, so step 0's set
+                    // belongs here and nowhere else. `reuse_reach` is what
+                    // guarantees the chunk is not empty.
+                    permitted: r
+                        .input
+                        .program
+                        .as_ref()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32)
+                        .and_then(|program| program.step(0)),
                 }
             })
             .collect();
@@ -3356,7 +3416,8 @@ impl Scheduler for ConcreteScheduler {
             if self.requests[i].remaining_work == 0 {
                 // The reservation cap was reached (core-05): complete
                 // now, releasing the lane and the reservation.
-                self.mark_done(i, &mut events, FinishReason::Length);
+                let reason = self.budget_spent_reason(i);
+                self.mark_done(i, &mut events, reason);
             }
         }
         let to_decode: Vec<usize> = running
@@ -3371,7 +3432,15 @@ impl Scheduler for ConcreteScheduler {
                     lane: self.requests[i].lane.expect("running requests hold a lane"),
                     params: self.requests[i].input.params,
                     remaining_tokens: self.requests[i].remaining_work.min(u32::MAX as u64) as u32,
-                    permitted: None,
+                    // GitHub #242: the set for the draw this round makes,
+                    // which is the step *after* the one it emits — the
+                    // prefill drew step 0, so a request that has emitted `n`
+                    // tokens draws step `n + 1` here. The last round asks for
+                    // a step past the end and gets `None`: its draw is
+                    // discarded with the sequence.
+                    permitted: self.requests[i].input.program.as_ref().and_then(|program| {
+                        program.step(self.requests[i].tokens as usize + 1)
+                    }),
                 })
                 .collect();
             match self.compute.decode_step(&jobs) {
@@ -3413,6 +3482,16 @@ impl Scheduler for ConcreteScheduler {
                         // emitted one event per token, in order.
                         let mut run_truncated_by_budget = false;
                         for (n, &token) in tokens.iter().enumerate() {
+                            // GitHub #242: the probability this token held
+                            // inside its own step's set, which only the
+                            // backend could pair with it (the round that
+                            // drew it is not the round that returned it).
+                            // Absent on every unconstrained lane.
+                            if let Some(&probability) = probabilities.get(n) {
+                                self.requests[i]
+                                    .drawn
+                                    .push(crate::program::Draw { token, probability });
+                            }
                             self.requests[i].tokens += 1;
                             // Service-work decay (core-05): one quantum per
                             // generated token.
@@ -3457,7 +3536,8 @@ impl Scheduler for ConcreteScheduler {
                             // The request completes on its final reserved
                             // token.
                             _ if self.requests[i].remaining_work == 0 => {
-                                self.mark_done(i, &mut events, FinishReason::Length)
+                                let reason = self.budget_spent_reason(i);
+                                self.mark_done(i, &mut events, reason)
                             }
                             _ => {}
                         }

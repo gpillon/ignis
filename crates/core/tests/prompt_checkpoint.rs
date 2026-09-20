@@ -52,6 +52,7 @@ fn input(prompt: Vec<u32>, opener: Option<u32>, max: u32) -> RequestInput {
         opener_tokens: opener,
         user_turn_tokens: None,
         system_block_tokens: None,
+        program: None,
     }
 }
 

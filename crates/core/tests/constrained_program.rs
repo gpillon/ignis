@@ -214,3 +214,225 @@ fn a_program_refuses_a_step_the_leaf_could_not_honour() {
     assert_eq!(program.step(0).map(|set| set.len()), Some(MAX_PERMITTED_TOKENS));
     let _: Arc<[TokenId]> = program.step(0).expect("the set");
 }
+
+// ---------------------------------------------------------------------------
+// The scheduler's program (GitHub #242, layer 4)
+// ---------------------------------------------------------------------------
+//
+// One `ConcreteScheduler` over the mock above, which is the whole point of
+// modelling the lag there: the scheduler's cursor, its budget and its
+// stopping condition are testable without a GPU (ADR 0006).
+
+mod scheduler {
+    use std::sync::Arc;
+
+    use ignis_core::mock::MockCompute;
+    use ignis_core::program::Program;
+    use ignis_core::types::{
+        DecodeParams, RequestClass, RequestInput, SchedEvent, TokenId,
+    };
+    use ignis_core::{ConcreteScheduler, FinishReason, Scheduler, SchedulerConfig};
+
+    const MODEL: &str = "qwen3.8-27b";
+
+    /// A program over four disjoint steps, the last of which permits one
+    /// token — a forced literal.
+    fn steps() -> Vec<Vec<TokenId>> {
+        vec![
+            vec![10, 11, 12],
+            vec![20, 21, 22],
+            vec![30, 31, 32],
+            vec![40],
+        ]
+    }
+
+    fn program_request(steps: Vec<Vec<TokenId>>, max_tokens: Option<u32>) -> RequestInput {
+        RequestInput {
+            model: MODEL.into(),
+            tokens: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            params: DecodeParams {
+                max_tokens,
+                ..DecodeParams::default()
+            },
+            multimodal: None,
+            opener_tokens: None,
+            user_turn_tokens: None,
+            system_block_tokens: None,
+            decision: None,
+            program: Some(Arc::new(Program::new(steps).expect("a legal program"))),
+        }
+    }
+
+    fn run(input: RequestInput) -> (Vec<TokenId>, Option<Vec<ignis_core::program::Draw>>, FinishReason) {
+        let mut sched =
+            ConcreteScheduler::with_config(
+                SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+                Arc::new(MockCompute::new()),
+            );
+        sched.submit(input, RequestClass::Agent).expect("admitted");
+        let mut tokens = Vec::new();
+        let mut finished = None;
+        let mut ticks = 0;
+        while !sched.is_idle() {
+            for event in sched.advance() {
+                match event {
+                    SchedEvent::Token { token, .. } => tokens.push(token),
+                    SchedEvent::Done { reason, drawn, .. } => finished = Some((drawn, reason)),
+                    _ => {}
+                }
+            }
+            ticks += 1;
+            assert!(ticks < 200, "the engine never went idle");
+        }
+        let (drawn, reason) = finished.expect("the request completed");
+        (tokens, drawn, reason)
+    }
+
+    /// The cursor: one token per step, each from its own step's set, and the
+    /// trace beside it.
+    #[test]
+    fn a_program_emits_its_schedule_and_nothing_else() {
+        let steps = steps();
+        let (tokens, drawn, reason) = run(program_request(steps.clone(), None));
+        assert_eq!(tokens.len(), steps.len(), "one token per step, no more");
+        for (index, (token, step)) in tokens.iter().zip(&steps).enumerate() {
+            assert!(
+                step.contains(token),
+                "token {index} is {token}, which step {index} ({step:?}) does not permit — \
+                 the steps are disjoint, so this is the cursor being off by one"
+            );
+        }
+        assert_eq!(
+            reason,
+            FinishReason::Stop,
+            "a number that has read its last digit is finished, not truncated: \
+             `length` would tell every caller their answer may be incomplete"
+        );
+        let drawn = drawn.expect("a program's trace rides its completion");
+        assert_eq!(
+            drawn.iter().map(|draw| draw.token).collect::<Vec<_>>(),
+            tokens,
+            "the trace is the run, in order"
+        );
+        assert_eq!(
+            drawn.last().expect("four draws").probability,
+            1.0,
+            "and the forced literal at the end is certain by arithmetic"
+        );
+        for draw in &drawn[..3] {
+            assert!(
+                draw.probability > 0.0 && draw.probability < 1.0,
+                "while a real step reports a real confidence: {}",
+                draw.probability
+            );
+        }
+    }
+
+    /// `max_tokens` never reaches the backend at all.
+    ///
+    /// Not the same claim as the one below, and the one that matters on the
+    /// card: `RuntimeCompute` finishes a lane whose `generated` has reached
+    /// `max_tokens` *before* the leaf runs, and it cannot tell a program's
+    /// last round (which carries no set) from an ordinary one. A program
+    /// that carried a `max_tokens` of 1 would therefore return one digit
+    /// with `length` on a GPU and four with `stop` here, and only the mock
+    /// would agree with the doc comment.
+    #[test]
+    fn a_programs_jobs_carry_no_max_tokens_for_a_backend_to_enforce() {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+            compute.clone(),
+        );
+        sched
+            .submit(program_request(steps(), Some(1)), RequestClass::Agent)
+            .expect("admitted");
+        let mut ticks = 0;
+        while !sched.is_idle() {
+            sched.advance();
+            ticks += 1;
+            assert!(ticks < 200, "the engine never went idle");
+        }
+        let prefill_caps: Vec<_> = compute
+            .prefill_calls()
+            .iter()
+            .flatten()
+            .map(|job| job.params.max_tokens)
+            .collect();
+        let decode_caps: Vec<_> = compute
+            .decode_calls()
+            .iter()
+            .flatten()
+            .map(|job| job.params.max_tokens)
+            .collect();
+        assert!(!prefill_caps.is_empty() && !decode_caps.is_empty(), "the run happened");
+        assert!(
+            prefill_caps.iter().chain(&decode_caps).all(Option::is_none),
+            "a program's jobs carry no cap for any backend to cut it short with:              prefill {prefill_caps:?}, decode {decode_caps:?}"
+        );
+    }
+
+    /// `max_tokens` is not a program's budget, in either direction.
+    #[test]
+    fn max_tokens_neither_shortens_nor_lengthens_a_program() {
+        let steps = steps();
+        for max_tokens in [Some(1), Some(64), None] {
+            let (tokens, drawn, reason) = run(program_request(steps.clone(), max_tokens));
+            assert_eq!(
+                tokens.len(),
+                steps.len(),
+                "max_tokens = {max_tokens:?} must not change how many digits a \
+                 number has: a short number is not a short answer, it is a wrong one"
+            );
+            assert_eq!(reason, FinishReason::Stop);
+            assert_eq!(drawn.expect("a trace").len(), steps.len());
+        }
+    }
+
+    /// One step: the degenerate program, and the one the off-by-one is
+    /// easiest to get wrong on — the prefill draws the only token and the
+    /// single round carries no set at all.
+    #[test]
+    fn a_one_step_program_is_one_token() {
+        let (tokens, drawn, reason) = run(program_request(vec![vec![7, 8, 9]], None));
+        assert_eq!(tokens.len(), 1);
+        assert!([7, 8, 9].contains(&tokens[0]), "drawn by the prefill, from its set");
+        assert_eq!(reason, FinishReason::Stop);
+        assert_eq!(drawn.expect("a trace").len(), 1);
+    }
+
+    /// An ordinary request is untouched: no trace, and `Length` still means
+    /// `length`.
+    #[test]
+    fn an_ordinary_request_carries_no_trace_and_still_stops_on_length() {
+        let mut input = program_request(steps(), Some(3));
+        input.program = None;
+        let (tokens, drawn, reason) = run(input);
+        assert_eq!(tokens.len(), 3, "its max_tokens, as before");
+        assert_eq!(reason, FinishReason::Length);
+        assert!(
+            drawn.is_none(),
+            "and `None` rather than an empty trace: a reader can tell a request \
+             that was never a program from a program that emitted nothing"
+        );
+    }
+
+    /// The empty-last-chunk trap, for a program: its first token is drawn by
+    /// its prefill, so it must always be left something to prefill.
+    #[test]
+    fn a_program_is_always_left_a_token_to_prefill() {
+        let input = program_request(steps(), None);
+        assert_eq!(
+            input.reuse_reach(),
+            input.tokens.len() - 1,
+            "a program may match retained state over all but one of its prompt \
+             tokens — a chunk with nothing to prefill draws nothing, and the run \
+             would begin with whatever the claimed state left pending"
+        );
+        assert_eq!(
+            input.publish_reach(),
+            input.tokens.len() - 1,
+            "and publishes only what it could itself claim"
+        );
+    }
+}

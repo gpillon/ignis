@@ -159,6 +159,64 @@ impl Multimodal {
         self.positions.len() / 3
     }
 
+    /// Extend the prompt by `count` **text** tokens appended after it
+    /// (GitHub #242), continuing its MRoPE positions and recomputing
+    /// `rope_delta`. `false` when this prompt cannot be extended.
+    ///
+    /// A **program** forces a literal prefix — spec 06's `{"x":` — by
+    /// putting it in the prompt rather than spending a constrained round per
+    /// token on it. For a text prompt that is a `Vec::extend` and nothing
+    /// else; for a multimodal one the positions have to grow with the
+    /// tokens, or the leaf refuses the chunk outright (it checks
+    /// `positions.len() == 3 * tokens`). The measured test
+    /// (`classify_pointing_gpu.rs`) never met this: it forced its literal
+    /// through a *second, text* prefill call after the multimodal one, which
+    /// the server's chunker does not do.
+    ///
+    /// The rule is `assign_positions`' own, read off it rather than guessed:
+    /// a run of text tokens takes consecutive positions on all three axes,
+    /// continuing from where the run before it left off. The last token of a
+    /// rendered prompt is the generation opener, which is text, so its
+    /// position — identical on all three axes — is what the appended run
+    /// continues from. `rope_delta` is `maximum + 1 - length`, and both
+    /// terms move: the appended tokens may or may not raise the maximum
+    /// (after a wide image they do not), so it is recomputed rather than
+    /// left alone.
+    ///
+    /// Refuses when the prompt is empty or its last token is a media
+    /// placeholder — then the last position is a *grid* coordinate, the
+    /// three axes disagree, and continuing from any one of them would be a
+    /// guess. Nothing renders such a prompt today (a template always ends in
+    /// text), and a refusal is what an impossible prompt deserves rather
+    /// than positions nobody can check.
+    pub fn append_text(&mut self, count: usize) -> bool {
+        let tokens = self.prompt_tokens();
+        if tokens == 0 || count == 0 {
+            return tokens > 0;
+        }
+        let last = tokens - 1;
+        let axes: [i32; 3] = [
+            self.positions[last],
+            self.positions[tokens + last],
+            self.positions[2 * tokens + last],
+        ];
+        if axes[0] != axes[1] || axes[1] != axes[2] {
+            return false;
+        }
+        let maximum = self.rope_delta + tokens as i32;
+        let appended: Vec<i32> = (1..=count as i32).map(|step| axes[0] + step).collect();
+        let grown = tokens + count;
+        let mut positions = Vec::with_capacity(3 * grown);
+        for axis in 0..3 {
+            positions.extend_from_slice(&self.positions[axis * tokens..(axis + 1) * tokens]);
+            positions.extend_from_slice(&appended);
+        }
+        self.positions = positions;
+        self.rope_delta =
+            maximum.max(*appended.last().expect("count > 0")) + 1 - grown as i32;
+        true
+    }
+
     /// Axis-major `[3, len]` positions of the span `[start, start + len)`.
     pub fn span_positions(&self, start: usize, len: usize) -> Vec<i32> {
         let tokens = self.prompt_tokens();
@@ -335,6 +393,57 @@ mod tests {
     fn multimodal(tokens: usize, media: Vec<MediaItem>) -> Multimodal {
         let positions = (0..3).flat_map(|axis| (0..tokens).map(move |t| (axis * 1000 + t) as i32)).collect();
         Multimodal { positions, rope_delta: -3, media }
+    }
+
+    /// GitHub #242: appending a forced literal must produce exactly the
+    /// positions the processor would have produced had the literal been part
+    /// of the render.
+    ///
+    /// The oracle is `assign_positions` itself, run over the longer prompt —
+    /// not a restatement of its rule here. A prompt with an image in it is
+    /// where the two could disagree: after a wide image `current` and
+    /// `maximum` have parted company, and continuing from the wrong one
+    /// shifts every appended token.
+    #[test]
+    fn appended_text_takes_the_positions_the_processor_would_have_given_it() {
+        use ignis_artifact::vision::layout::{IMAGE, TEXT, assign_positions};
+
+        // A 4x6 merged grid: `maximum` runs ahead of `current` on the width
+        // axis, which is the case a naive `maximum + 1` gets wrong.
+        let grid = Grid { t: 1, h: 4 * 2, w: 6 * 2 };
+        let placeholders = 4 * 6;
+        let build = |tail: usize| {
+            let mut types = vec![TEXT; 3];
+            types.extend(std::iter::repeat_n(IMAGE, placeholders));
+            types.extend(std::iter::repeat_n(TEXT, tail));
+            let (positions, spans, rope_delta) =
+                assign_positions(&types, &[grid]).expect("a legal layout");
+            Multimodal {
+                positions,
+                rope_delta,
+                media: vec![MediaItem {
+                    grid,
+                    token_span: spans[0],
+                    patches: Vec::new(),
+                    content_digest: [0; 32],
+                }],
+            }
+        };
+
+        for appended in [1, 5, 9] {
+            let mut grown = build(2);
+            assert!(grown.append_text(appended), "a prompt ending in text extends");
+            assert_eq!(
+                grown,
+                build(2 + appended),
+                "appending {appended} token(s) must give the render's own positions"
+            );
+        }
+
+        // A prompt whose last token is a placeholder has no single position
+        // to continue from, and says so rather than guessing one.
+        let mut ends_in_media = build(0);
+        assert!(!ends_in_media.append_text(1));
     }
 
     #[test]
