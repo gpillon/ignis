@@ -86,9 +86,14 @@ extern "C" {
  * logits cross this ABI for it, which is the whole reason it is here and not
  * in the host (ADR 0034).
  *
- * Only `ignis_program_decode` reads it today; the single-sequence entry
- * points reject a nonzero count rather than ignoring it, because a
- * constraint silently dropped is a wrong answer that looks like a right one.
+ * `ignis_program_prefill` and `ignis_program_decode` both read it, and they
+ * have to: a decode round returns the successor the *previous* call made
+ * ready, so the first token of a constrained run is the one the prefill
+ * itself draws. A run of K constrained tokens is one prefill carrying the
+ * first set and K-1 rounds carrying the rest. The degenerate `ignis_prefill`
+ * / `ignis_decode` entry points reject a nonzero count rather than ignoring
+ * it, because a constraint silently dropped is a wrong answer that looks
+ * like a right one.
  *
  * P5-04 (GitHub #153) appends the verify round's per-lane inputs (ADR 0016:
  * a field append and a size bump, never a parameter). Both are read only by
@@ -183,6 +188,11 @@ struct ignis_prefill_options {
   const struct ignis_media_embedding *media;
   const int32_t *media_scatter_indices;
   uint32_t media_first_column;
+  /* P6-06 (GitHub #242): the drawn token's probability within this call's
+   * permitted set, or NULL. 0 when the call declared no set. One float, not
+   * a logits row -- the first digit of a constrained run is drawn here, and
+   * its confidence has to come back with it (ADR 0034). */
+  float *out_permitted_prob;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus

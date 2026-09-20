@@ -105,6 +105,11 @@ mod ffi {
         pub media: *const IgnisMediaEmbedding,
         pub media_scatter_indices: *const i32,
         pub media_first_column: u32,
+        /// P6-06 (GitHub #242): the span's own draw's probability within its
+        /// permitted set, or null. A constrained run's **first** token is
+        /// drawn here — a decode round returns the successor the previous
+        /// call made ready — so this is where its confidence comes back.
+        pub out_permitted_prob: *mut f32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -544,6 +549,7 @@ impl PrefillRoute {
             media: std::ptr::null(),
             media_scatter_indices: std::ptr::null(),
             media_first_column: 0,
+            out_permitted_prob: std::ptr::null_mut(),
         }
     }
 }
@@ -765,6 +771,150 @@ pub fn decode_program_batch_sampled(
         return Err(last_error());
     }
     Ok(tokens)
+}
+
+/// Prefill `token_ids` and draw the span's successor from `permitted`
+/// alone (P6-06, GitHub #242, ADR 0034), returning that draw's probability
+/// within the set.
+///
+/// **This is where a constrained run starts.** `ignis_program_decode`
+/// returns the successor the *previous* call made ready, so the first token
+/// of a K-token run is the one this prefill draws; the rounds after it carry
+/// the sets for tokens 2..K. A run that constrained only its decode rounds
+/// would commit one free token in the middle of its own forced text.
+///
+/// The successor itself is not returned here — it is the sequence's pending
+/// token, which the next round emits.
+pub fn prefill_program_permitted(
+    model: &Model,
+    pool: &SeqPool,
+    sequence: &mut Seq<'_>,
+    token_ids: &[i32],
+    start_position: u64,
+    sampling: SamplingParams,
+    permitted: &[i32],
+) -> Result<f32, String> {
+    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+        return Err(format!(
+            "prefill_program_permitted: {} ids, past the leaf's {} (a set is refused, never              truncated)",
+            permitted.len(),
+            ffi::MAX_PERMITTED_TOKENS
+        ));
+    }
+    let mut probability = 0f32;
+    let mut options = PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault);
+    options.out_permitted_prob = &mut probability;
+    let params = ffi::IgnisSamplingParams {
+        permitted_count: permitted.len() as u32,
+        permitted_ids: match permitted.is_empty() {
+            true => std::ptr::null(),
+            false => permitted.as_ptr(),
+        },
+        ..sampling.to_ffi()
+    };
+    let rc = unsafe {
+        ffi::ignis_program_prefill(
+            model.handle(),
+            pool.handle(),
+            sequence.handle(),
+            token_ids.as_ptr(),
+            token_ids.len() as u64,
+            start_position,
+            &params,
+            &options,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(probability)
+}
+
+/// One lane of a **constrained** decode round (P6-06, GitHub #242).
+pub struct PermittedLane<'a> {
+    /// The lane's sampling parameters, unchanged in meaning: the constraint
+    /// composes with them rather than replacing them.
+    pub sampling: SamplingParams,
+    /// The ids this lane may commit, or empty for an ordinary draw. At most
+    /// [`ffi::MAX_PERMITTED_TOKENS`]; the leaf refuses a larger set rather
+    /// than truncating it.
+    pub permitted: &'a [i32],
+}
+
+/// [`decode_program_batch_sampled`] with a **permitted token set** per lane
+/// (P6-06, GitHub #242, ADR 0034).
+///
+/// Returns each lane's committed token and, beside it, how much of that
+/// lane's permitted set the token held — the model's own confidence in what
+/// it just committed, computed on the device from at most 32 logits. A lane
+/// that declared no set commits as it always has and reports 0.
+///
+/// This is the only entry point that honours a set: the single-sequence
+/// paths and the verify round refuse one, because a constraint silently
+/// dropped is a wrong answer that looks like a right one.
+pub fn decode_program_batch_permitted(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[PermittedLane<'_>],
+) -> Result<(Vec<i32>, Vec<f32>), String> {
+    if lanes.len() != sequences.len() {
+        return Err(format!(
+            "decode_program_batch_permitted: {} lanes for {} sequences",
+            lanes.len(),
+            sequences.len()
+        ));
+    }
+    for (index, lane) in lanes.iter().enumerate() {
+        if lane.permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+            return Err(format!(
+                "decode_program_batch_permitted: lane {index} permits {} ids, past the leaf's {}                  (a set is refused, never truncated)",
+                lane.permitted.len(),
+                ffi::MAX_PERMITTED_TOKENS
+            ));
+        }
+    }
+    let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
+    // The id slices are the caller's and stay borrowed for the call, which
+    // is exactly the lifetime the ABI asks for.
+    let params: Vec<ffi::IgnisSamplingParams> = lanes
+        .iter()
+        .map(|lane| ffi::IgnisSamplingParams {
+            permitted_count: lane.permitted.len() as u32,
+            permitted_ids: match lane.permitted.is_empty() {
+                true => std::ptr::null(),
+                false => lane.permitted.as_ptr(),
+            },
+            ..lane.sampling.to_ffi()
+        })
+        .collect();
+    let mut tokens = vec![-1i32; handles.len()];
+    let mut probabilities = vec![0f32; handles.len()];
+    let options = ffi::IgnisDecodeOptions {
+        size: std::mem::size_of::<ffi::IgnisDecodeOptions>() as u32,
+        speculative_window: 0,
+        drafts: std::ptr::null(),
+        draft_counts: std::ptr::null(),
+        out_committed_counts: std::ptr::null_mut(),
+        out_extents: std::ptr::null_mut(),
+        out_permitted_probs: probabilities.as_mut_ptr(),
+    };
+    let rc = unsafe {
+        ffi::ignis_program_decode(
+            model.handle(),
+            pool.handle(),
+            handles.as_mut_ptr(),
+            handles.len() as u64,
+            params.as_ptr(),
+            tokens.as_mut_ptr(),
+            &options,
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok((tokens, probabilities))
 }
 
 /// One verify round over `sequences` at the load's draft `window` (P5-04,

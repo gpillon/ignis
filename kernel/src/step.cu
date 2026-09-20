@@ -112,12 +112,54 @@ ninfer::ops::SamplingConfig to_sampling_config(const ignis_sampling_params &abi,
 // error.
 int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       const ninfer::Tensor &logits, const ignis_sampling_params &sampling,
-                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id) {
-  if (!unconstrained(sampling)) {
-    set_error(
-        "ignis_program: a permitted token set is only honoured by "
-        "ignis_program_decode (GitHub #242)");
-    return -1;
+                      std::int32_t purpose, std::int32_t position, int32_t *out_token_id,
+                      float *out_permitted_prob) {
+  // GitHub #242: the prefill's own draw is the first token of a constrained
+  // run, so this path masks too -- staged through the decode buffers' lane
+  // 0, which no decode round is using while a prefill holds the stream.
+  const bool constrained = !unconstrained(sampling);
+  if (constrained) {
+    if (sampling.permitted_count > IGNIS_MAX_PERMITTED_TOKENS) {
+      set_error("ignis_program: permitted_count " + std::to_string(sampling.permitted_count) +
+                " exceeds IGNIS_MAX_PERMITTED_TOKENS (" +
+                std::to_string(IGNIS_MAX_PERMITTED_TOKENS) + ")");
+      return -1;
+    }
+    if (sampling.permitted_ids == nullptr) {
+      set_error("ignis_program: permitted_ids is null with a nonzero count");
+      return -1;
+    }
+    std::vector<std::int32_t> row(IGNIS_MAX_PERMITTED_TOKENS, -1);
+    const auto vocab = static_cast<std::int32_t>(model->vocab);
+    for (uint32_t k = 0; k < sampling.permitted_count; ++k) {
+      const int32_t id = sampling.permitted_ids[k];
+      if (id < 0 || id >= vocab) {
+        set_error("ignis_program: permitted id " + std::to_string(id) +
+                  " is outside the vocabulary");
+        return -1;
+      }
+      row[k] = id;
+    }
+    const std::int32_t count = static_cast<std::int32_t>(sampling.permitted_count);
+    cudaError_t staged =
+        cudaMemcpyAsync(model->sampling_decode_permitted->p, row.data(),
+                        row.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, model->stream);
+    if (staged == cudaSuccess) {
+      staged = cudaMemcpyAsync(model->sampling_decode_permitted_counts->p, &count, sizeof(count),
+                               cudaMemcpyHostToDevice, model->stream);
+    }
+    if (staged != cudaSuccess) {
+      set_error(std::string("ignis_program: cudaMemcpyAsync(permitted set) failed: ") +
+                cudaGetErrorString(staged));
+      return -1;
+    }
+    if (ignis_permit_mask(logits.data, vocab, 1,
+                          static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+                          static_cast<const int32_t *>(model->sampling_decode_permitted_counts->p),
+                          IGNIS_MAX_PERMITTED_TOKENS, model->stream) != 0) {
+      set_error("ignis_program: permitted-set mask launch failed");
+      return -1;
+    }
   }
   const ninfer::ops::SamplingConfig cfg =
       to_sampling_config(sampling, pool->token_counts_for(seq->slot));
@@ -147,6 +189,30 @@ int32_t sample_single(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program: sample() failed: ") + e.what());
     return -1;
+  }
+  // GitHub #242: the drawn token's share of its own set, while the logits
+  // are still here. Read from lane 0's staging, the same row the mask used.
+  if (constrained && out_permitted_prob != nullptr) {
+    if (ignis_permit_probability(
+            logits.data, static_cast<std::int32_t>(model->vocab), 1,
+            static_cast<const int32_t *>(model->sampling_decode_permitted->p),
+            static_cast<const int32_t *>(model->sampling_decode_permitted_counts->p),
+            IGNIS_MAX_PERMITTED_TOKENS,
+            static_cast<const int32_t *>(model->sampling_single_out->p),
+            static_cast<float *>(model->sampling_decode_permitted_probs->p),
+            model->stream) != 0) {
+      set_error("ignis_program: permitted-set probability launch failed");
+      return -1;
+    }
+    err = cudaMemcpyAsync(out_permitted_prob, model->sampling_decode_permitted_probs->p,
+                          sizeof(float), cudaMemcpyDeviceToHost, model->stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_program: cudaMemcpyAsync(permitted probability) failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+  } else if (out_permitted_prob != nullptr) {
+    *out_permitted_prob = 0.0f;
   }
   err = cudaMemcpyAsync(out_token_id, model->sampling_single_out->p, sizeof(*out_token_id),
                         cudaMemcpyDeviceToHost, model->stream);
@@ -274,7 +340,8 @@ bool validate_common(const ignis_model *model, const int32_t *token_ids, uint64_
 // after this call returns).
 int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                           int32_t token_id, const ignis_sampling_params &sampling,
-                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode) {
+                          int32_t *out_token_id, float *out_logits, LinearPolicyMode mode,
+                          float *permitted_prob_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->scratch->scope();
@@ -319,7 +386,8 @@ int32_t run_program_token(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
     ninfer::Tensor logits = model->scratch->alloc(ninfer::DType::BF16, {vocab, 1, 1, 1});
     ninfer::ops::linear(normalized, model->output_head, logits, model->stream);
     if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
-                      static_cast<std::int32_t>(seq->position), out_token_id) != 0) {
+                      static_cast<std::int32_t>(seq->position), out_token_id,
+                      permitted_prob_out) != 0) {
       return -1;
     }
 
@@ -740,7 +808,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           uint64_t dflash2_tap_from, bool compute_output,
                           const ignis_sampling_params &sampling, int32_t *out_token_id,
                           float *out_logits, LinearPolicyMode mode,
-                          const SpanMultimodal &multimodal) {
+                          const SpanMultimodal &multimodal, float *permitted_prob_out) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -921,7 +989,7 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       // here (the caller advances it only after this function returns 0).
       const auto last_position = static_cast<std::int32_t>(seq->position + T - 1);
       if (sample_single(model, pool, seq, logits, sampling, ninfer::ops::kSamplePurposePrefill,
-                        last_position, out_token_id) != 0) {
+                        last_position, out_token_id, permitted_prob_out) != 0) {
         return -1;
       }
       if (out_logits != nullptr) {
@@ -1013,7 +1081,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
 int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
-                                    LinearPolicyMode mode, const SpanMultimodal &multimodal) {
+                                    LinearPolicyMode mode, const SpanMultimodal &multimodal,
+                                    float *permitted_prob) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
@@ -1024,7 +1093,8 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     int32_t successor = -1;
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
-                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal) != 0) {
+                          is_last_chunk, sampling, &successor, slot_logits, mode, multimodal,
+                          is_last_chunk ? permitted_prob : nullptr) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1154,6 +1224,9 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   }
 
   const auto began = std::chrono::steady_clock::now();
+  // GitHub #242: where the span's own draw reports its restricted
+  // probability, when the caller asked and declared a set.
+  float *permitted_prob = (options != nullptr) ? options->out_permitted_prob : nullptr;
   int32_t rc = 0;
   if (route == IGNIS_PREFILL_ROUTE_PER_TOKEN) {
     // Test-only self-oracle route (ADR 0016): the per-token loop, one
@@ -1166,7 +1239,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
       // every earlier position stays argmax-only.
       float *slot_logits = (i + 1 == num_tokens) ? out_logits : nullptr;
       if (run_program_token(model, pool, seq, token_ids[i], *sampling, &successor, slot_logits,
-                            mode) != 0) {
+                            mode, (i + 1 == num_tokens) ? permitted_prob : nullptr) != 0) {
         rc = -1;
         break;
       }
@@ -1175,7 +1248,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     }
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
-                                     out_logits, mode, multimodal);
+                                     out_logits, mode, multimodal, permitted_prob);
   }
   if (rc != 0) {
     return rc;
