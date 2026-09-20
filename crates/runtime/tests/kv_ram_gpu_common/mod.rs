@@ -206,7 +206,7 @@ impl Loaded {
             opener_tokens: opener,
             user_turn_tokens: None,
             system_block_tokens: Some(block),
-            program: None,
+            constrained: None,
         }
     }
 }

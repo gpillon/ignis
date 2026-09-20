@@ -666,7 +666,7 @@ async fn a_numbers_uncertainty_is_its_own_trace_summed_by_place() {
         "and it is a real number: the mock draws at a real confidence, so a handler \
          that never read the trace could not pass by reporting zero"
     );
-    // A program generates, and says so.
+    // A constrained decode generates, and says so.
     assert_eq!(response["usage"]["output_tokens"], 3, "{response}");
 }
 
@@ -733,21 +733,22 @@ async fn a_point_on_a_non_square_image_is_in_that_images_pixels() {
     );
     assert!(
         jobs.iter().any(|job| job.permitted.is_some()),
-        "and the prefill drew the run's first digit, which is where a constrained          run starts"
+        "and the prefill drew the run's first digit, which is where a constrained run starts"
     );
 
-    // The same normalized pair would be two different points on a square
-    // image, which is exactly the mistake this prevents.
-    let (x, y) = (
-        answer["normalized"]["x"].as_u64().unwrap(),
-        answer["normalized"]["y"].as_u64().unwrap(),
+    // The two axes do not share a divisor. Asserted on a reading of this
+    // run's own, unconditionally: the earlier version only checked this
+    // inside `if x == y`, which the mock never satisfies — a branch that
+    // never runs, carrying an assertion that was backwards anyway (equal
+    // readings on a non-square image must give *different* pixels).
+    let reading = answer["normalized"]["x"].as_u64().expect("a reading").max(1);
+    let across = (reading as f64 / 999.0 * f64::from(WIDTH)).round() as i64;
+    let down = (reading as f64 / 999.0 * f64::from(HEIGHT)).round() as i64;
+    assert_ne!(
+        across, down,
+        "{reading} of 999 is {across} px across and {down} px down on a {WIDTH}x{HEIGHT} image; a caller handed one divisor would be right along x and wrong along y"
     );
-    if x == y {
-        assert_eq!(
-            answer["pixels"]["x"], answer["pixels"]["y"],
-            "equal readings on a non-square image can only agree in pixels by accident"
-        );
-    }
+
     assert_eq!(
         response["usage"]["output_tokens"], 11,
         "three digits, the forced separator, three digits — and no prefix, which \

@@ -132,7 +132,7 @@ impl Primitive {
     /// The three readouts do: their answer is a restricted softmax over
     /// declared option tokens, and the mass is how much of the real
     /// distribution those options held — the one silent failure the family
-    /// exists to show. The three **programs** do not: their answer is a run
+    /// exists to show. The three **constrained decodes** do not: their answer is a run
     /// of sampled tokens, each drawn from a permitted set, and there is no
     /// single position whose distribution the answer stands on. A number
     /// reported as mass 1 would be a lie, and one reported as 0 would put a
@@ -417,12 +417,12 @@ impl Metrics {
     /// over one `state` are twenty decisions, and the mass of each is a
     /// separate reading of the same failure.
     ///
-    /// `answer_mass` is `None` for a **program** (GitHub #242): a `number`,
+    /// `answer_mass` is `None` for a **constrained decode** (GitHub #242): a `number`,
     /// `point` or `box` is counted like any other decision and observes no
     /// mass, because it has none to observe
     /// ([`Primitive::has_answer_mass`]). The histogram is therefore
     /// deliberately **readout-only**, and its `_count` sits below the
-    /// counter's sum by exactly the number of programs served — stated in
+    /// counter's sum by exactly the number of constrained decodes served — stated in
     /// ADR 0017's row rather than left for a reader to infer from a graph
     /// that does not add up.
     pub fn record_decision(&self, primitive: Primitive, answer_mass: Option<f64>) {
@@ -1246,7 +1246,7 @@ mod tests {
         assert_eq!(value(&text, "ignis_generated_tokens_total", ""), "0");
     }
 
-    /// GitHub #242: a program is counted and observes no mass, so the
+    /// GitHub #242: a constrained decode is counted and observes no mass, so the
     /// histogram's `_count` is deliberately below the counter's sum.
     ///
     /// The owner's call, and an asymmetry a reader would otherwise have to
@@ -1272,12 +1272,12 @@ mod tests {
         assert_eq!(
             value(&text, "ignis_decision_answer_mass_count", ""),
             "1",
-            "and only the readout observed a mass: a program's answer is a run of              sampled tokens, with no single position's distribution to be a share of"
+            "and only the readout observed a mass: a run's answer is a run of sampled tokens, with no single position's distribution to be a share of"
         );
         assert_eq!(
             value(&text, "ignis_decision_answer_mass_sum", ""),
             "0.998",
-            "a program contributing 0 would put a false alarm in the bucket a real              collapse lands in"
+            "a constrained decode contributing 0 would put a false alarm in the bucket a real collapse lands in"
         );
     }
 

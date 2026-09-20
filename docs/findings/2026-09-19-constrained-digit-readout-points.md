@@ -95,6 +95,24 @@ still plausible.
 button, on a button as small as 7.8% of the side, with a worst error of 2.1%
 of the side.
 
+**The place-weighted sum covers the true error on four of six axes.** With
+`sigma = sum((1 - p_k) * 10^place)` and the target rescaled onto the 0-999
+axis, `|reading - target| <= sigma` holds on four axes and fails on two:
+
+| Axis | sigma | true error | covered |
+|---|---|---|---|
+| large x | 1.32 | 1.27 | yes |
+| large y | 7.75 | 20.39 | **no** |
+| medium x | 4.37 | 1.19 | yes |
+| medium y | 5.00 | 4.20 | yes |
+| small x | 3.71 | 0.66 | yes |
+| small y | 4.60 | 7.69 | **no** |
+
+Both misses are on y, the axis whose *first* digit the model was least sure
+of. So the quantity is the model's **self-declared** uncertainty and is not
+a bound: it is worth reporting because it is the model's own statement of
+resolution, not because a caller can rely on the answer falling inside it.
+
 **The per-digit probability is a resolution readout.** It falls
 monotonically across each number: hundreds ~0.97–0.99, tens ~0.50–0.98, units
 ~0.15–0.57. The model is certain about the coarse position and admits it is

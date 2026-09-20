@@ -85,7 +85,7 @@ fn input(tokens: &[u32], max_tokens: u32) -> RequestInput {
             max_tokens: Some(max_tokens),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
     }
 }
 

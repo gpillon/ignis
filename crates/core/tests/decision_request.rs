@@ -48,7 +48,7 @@ fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         user_turn_tokens: None,
         system_block_tokens: None,
         decision: Some(Arc::from(ANSWERS.to_vec())),
-        program: None,
+        constrained: None,
     }
 }
 

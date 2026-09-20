@@ -1,10 +1,10 @@
-//! The `Compute` seam under a **program** (GitHub #242, spec 06): the
+//! The `Compute` seam under a **constrained decode** (GitHub #242, spec 06): the
 //! permitted set per step, and the one-round lag that carries it.
 //!
 //! What is pinned here is the contract a backend has to honour, stated on
 //! [`DecodeJob::permitted`] and modelled by [`MockCompute`]:
 //!
-//! - a prefill **draws**, and a program's first token is the one it draws;
+//! - a prefill **draws**, and a run's first token is the one it draws;
 //! - a decode round **returns the token the previous call drew** and draws
 //!   the next one, so round `i` carries step `i`'s set and emits step
 //!   `i-1`'s token;
@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use ignis_core::mock::MockCompute;
-use ignis_core::program::{Draw, MAX_PERMITTED_TOKENS, Program};
+use ignis_core::constrained::{Draw, MAX_PERMITTED_TOKENS, Schedule};
 use ignis_core::scheduler::{Compute, DecodeJob, PrefillJob};
 use ignis_core::types::{DecodeParams, RequestId, TokenId};
 
@@ -28,8 +28,8 @@ const REQUEST: RequestId = 77;
 /// Three disjoint steps, then one of exactly one token — the shape a forced
 /// literal takes (spec 06's `,"y":` is a step per token, each permitting
 /// one).
-fn program() -> Program {
-    Program::new(vec![
+fn program() -> Schedule {
+    Schedule::new(vec![
         vec![10, 11, 12],
         vec![20, 21, 22],
         vec![30, 31, 32],
@@ -38,7 +38,7 @@ fn program() -> Program {
     .expect("four legal steps")
 }
 
-fn prefill_job(program: &Program) -> PrefillJob {
+fn prefill_job(program: &Schedule) -> PrefillJob {
     PrefillJob {
         request: REQUEST,
         tokens: vec![1, 2, 3],
@@ -55,7 +55,7 @@ fn prefill_job(program: &Program) -> PrefillJob {
     }
 }
 
-fn decode_job(permitted: Option<ignis_core::program::PermittedSet>) -> DecodeJob {
+fn decode_job(permitted: Option<ignis_core::constrained::PermittedSet>) -> DecodeJob {
     DecodeJob {
         request: REQUEST,
         lane: 0,
@@ -68,7 +68,7 @@ fn decode_job(permitted: Option<ignis_core::program::PermittedSet>) -> DecodeJob
 /// Run `program` through the mock the way a scheduler has to: one
 /// constrained prefill, then one round per step, each carrying the *next*
 /// step's set.
-fn run(compute: &MockCompute, program: &Program) -> Vec<Draw> {
+fn run(compute: &MockCompute, program: &Schedule) -> Vec<Draw> {
     compute
         .prefill_step(&[prefill_job(program)])
         .expect("the constrained prefill");
@@ -148,7 +148,7 @@ fn a_probability_is_the_tokens_own_and_a_forced_literal_is_certain() {
 
 #[test]
 fn an_unconstrained_lane_is_untouched_and_reports_no_probability() {
-    // The mock's ordinary path, unchanged: no program, no pending draw, and
+    // The mock's ordinary path, unchanged: no constrained decode, no pending draw, and
     // the round behaves exactly as every other test in this crate expects.
     let compute = MockCompute::new();
     compute
@@ -195,7 +195,7 @@ fn a_lane_beside_a_program_is_not_dragged_into_it() {
         .expect("a mixed round");
     assert!(
         program.steps()[0].contains(&outcomes[0].tokens[0]),
-        "the program lane kept its schedule"
+        "the constrained lane kept its schedule"
     );
     assert!(
         outcomes[1].probabilities.is_empty(),
@@ -206,11 +206,11 @@ fn a_lane_beside_a_program_is_not_dragged_into_it() {
 #[test]
 fn a_program_refuses_a_step_the_leaf_could_not_honour() {
     let too_wide: Vec<TokenId> = (0..=MAX_PERMITTED_TOKENS as TokenId).collect();
-    assert!(Program::new(vec![too_wide]).is_err());
-    assert!(Program::new(vec![Vec::new()]).is_err());
+    assert!(Schedule::new(vec![too_wide]).is_err());
+    assert!(Schedule::new(vec![Vec::new()]).is_err());
     // And a set at exactly the cap is legal: the refusal is `>`, not `>=`.
     let at_cap: Vec<TokenId> = (0..MAX_PERMITTED_TOKENS as TokenId).collect();
-    let program = Program::new(vec![at_cap]).expect("a set at the cap");
+    let program = Schedule::new(vec![at_cap]).expect("a set at the cap");
     assert_eq!(program.step(0).map(|set| set.len()), Some(MAX_PERMITTED_TOKENS));
     let _: Arc<[TokenId]> = program.step(0).expect("the set");
 }
@@ -227,7 +227,7 @@ mod scheduler {
     use std::sync::Arc;
 
     use ignis_core::mock::MockCompute;
-    use ignis_core::program::Program;
+    use ignis_core::constrained::Schedule;
     use ignis_core::types::{
         DecodeParams, RequestClass, RequestInput, SchedEvent, TokenId,
     };
@@ -235,7 +235,7 @@ mod scheduler {
 
     const MODEL: &str = "qwen3.8-27b";
 
-    /// A program over four disjoint steps, the last of which permits one
+    /// A constrained decode over four disjoint steps, the last of which permits one
     /// token — a forced literal.
     fn steps() -> Vec<Vec<TokenId>> {
         vec![
@@ -259,11 +259,11 @@ mod scheduler {
             user_turn_tokens: None,
             system_block_tokens: None,
             decision: None,
-            program: Some(Arc::new(Program::new(steps).expect("a legal program"))),
+            constrained: Some(Arc::new(Schedule::new(steps).expect("a legal program"))),
         }
     }
 
-    fn run(input: RequestInput) -> (Vec<TokenId>, Option<Vec<ignis_core::program::Draw>>, FinishReason) {
+    fn run(input: RequestInput) -> (Vec<TokenId>, Option<Vec<ignis_core::constrained::Draw>>, FinishReason) {
         let mut sched =
             ConcreteScheduler::with_config(
                 SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
@@ -308,7 +308,7 @@ mod scheduler {
             "a number that has read its last digit is finished, not truncated: \
              `length` would tell every caller their answer may be incomplete"
         );
-        let drawn = drawn.expect("a program's trace rides its completion");
+        let drawn = drawn.expect("a run's trace rides its completion");
         assert_eq!(
             drawn.iter().map(|draw| draw.token).collect::<Vec<_>>(),
             tokens,
@@ -332,13 +332,13 @@ mod scheduler {
     ///
     /// Not the same claim as the one below, and the one that matters on the
     /// card: `RuntimeCompute` finishes a lane whose `generated` has reached
-    /// `max_tokens` *before* the leaf runs, and it cannot tell a program's
-    /// last round (which carries no set) from an ordinary one. A program
+    /// `max_tokens` *before* the leaf runs, and it cannot tell a run's
+    /// last round (which carries no set) from an ordinary one. A constrained decode
     /// that carried a `max_tokens` of 1 would therefore return one digit
     /// with `length` on a GPU and four with `stop` here, and only the mock
     /// would agree with the doc comment.
     #[test]
-    fn a_programs_jobs_carry_no_max_tokens_for_a_backend_to_enforce() {
+    fn a_constrained_runs_jobs_carry_no_max_tokens_for_a_backend_to_enforce() {
         let compute = Arc::new(MockCompute::new());
         let mut sched = ConcreteScheduler::with_config(
             SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
@@ -368,11 +368,11 @@ mod scheduler {
         assert!(!prefill_caps.is_empty() && !decode_caps.is_empty(), "the run happened");
         assert!(
             prefill_caps.iter().chain(&decode_caps).all(Option::is_none),
-            "a program's jobs carry no cap for any backend to cut it short with:              prefill {prefill_caps:?}, decode {decode_caps:?}"
+            "a run's jobs carry no cap for any backend to cut it short with: prefill {prefill_caps:?}, decode {decode_caps:?}"
         );
     }
 
-    /// `max_tokens` is not a program's budget, in either direction.
+    /// `max_tokens` is not a run's budget, in either direction.
     #[test]
     fn max_tokens_neither_shortens_nor_lengthens_a_program() {
         let steps = steps();
@@ -406,18 +406,18 @@ mod scheduler {
     #[test]
     fn an_ordinary_request_carries_no_trace_and_still_stops_on_length() {
         let mut input = program_request(steps(), Some(3));
-        input.program = None;
+        input.constrained = None;
         let (tokens, drawn, reason) = run(input);
         assert_eq!(tokens.len(), 3, "its max_tokens, as before");
         assert_eq!(reason, FinishReason::Length);
         assert!(
             drawn.is_none(),
             "and `None` rather than an empty trace: a reader can tell a request \
-             that was never a program from a program that emitted nothing"
+             that was never a constrained decode from a constrained decode that emitted nothing"
         );
     }
 
-    /// The empty-last-chunk trap, for a program: its first token is drawn by
+    /// The empty-last-chunk trap, for a constrained decode: its first token is drawn by
     /// its prefill, so it must always be left something to prefill.
     #[test]
     fn a_program_is_always_left_a_token_to_prefill() {
@@ -425,7 +425,7 @@ mod scheduler {
         assert_eq!(
             input.reuse_reach(),
             input.tokens.len() - 1,
-            "a program may match retained state over all but one of its prompt \
+            "a constrained decode may match retained state over all but one of its prompt \
              tokens — a chunk with nothing to prefill draws nothing, and the run \
              would begin with whatever the claimed state left pending"
         );

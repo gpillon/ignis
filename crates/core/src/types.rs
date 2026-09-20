@@ -125,12 +125,12 @@ pub struct RequestInput {
     /// reservation is the prompt alone, and a decision is admitted on a
     /// prompt that fits however large a `max_tokens` came with it.
     pub decision: Option<std::sync::Arc<[TokenId]>>,
-    /// The **program** this request generates under (GitHub #242, ADR
+    /// The **constrained decode** this request generates under (GitHub #242, ADR
     /// 0034), or `None` for every request that generates freely.
     ///
     /// One permitted token set per token it will emit, in order
-    /// ([`crate::program::Program`]). It is the request's whole generation
-    /// budget and its whole stopping condition: a program ends when its
+    /// ([`crate::constrained::Schedule`]). It is the request's whole generation
+    /// budget and its whole stopping condition: a constrained decode ends when its
     /// schedule is exhausted, with [`FinishReason::Stop`], and **never on
     /// EOS** — a token drawn from a set of digits cannot be the EOS token,
     /// and [`DecodeParams::max_tokens`] is ignored, since a number with
@@ -138,10 +138,10 @@ pub struct RequestInput {
     /// wrong one.
     ///
     /// Never set together with [`RequestInput::decision`]: a decision reads
-    /// one position and generates nothing, a program generates from one.
+    /// one position and generates nothing, a constrained decode generates from one.
     /// They are the two halves of ADR 0034, and a request is one or the
     /// other.
-    pub program: Option<std::sync::Arc<crate::program::Program>>,
+    pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
 }
 
 impl RequestInput {
@@ -151,11 +151,11 @@ impl RequestInput {
         self.decision.is_some()
     }
 
-    /// Whether this request generates under a **program** (GitHub #242): it
-    /// emits exactly its schedule's length in tokens, each drawn from that
-    /// step's permitted set.
-    pub fn is_program(&self) -> bool {
-        self.program.is_some()
+    /// Whether this request is a **constrained decode** (GitHub #242,
+    /// `CONTEXT.md`): it emits exactly its schedule's length in tokens, each
+    /// drawn from that step's permitted set.
+    pub fn is_constrained(&self) -> bool {
+        self.constrained.is_some()
     }
 
     /// How many leading prompt tokens this request may **match** retained
@@ -170,7 +170,7 @@ impl RequestInput {
     /// empty-last-chunk trap, prevented rather than repaired, at the cost of
     /// one token's prefill.
     ///
-    /// A **program** (GitHub #242) is in the set for the same reason wearing
+    /// A **constrained decode** (GitHub #242) is in the set for the same reason wearing
     /// a different hat: its first token is *drawn by its prefill*, so a
     /// chunk with nothing to prefill draws nothing and the run would begin
     /// with whatever the claimed state left pending — a free token in the
@@ -190,7 +190,7 @@ impl RequestInput {
     /// answers the other half of the same picture and does **not** have the
     /// same membership.
     pub fn reuse_reach(&self) -> usize {
-        match self.is_decision() || self.is_program() || self.multimodal.is_some() {
+        match self.is_decision() || self.is_constrained() || self.multimodal.is_some() {
             true => self.tokens.len().saturating_sub(1),
             false => self.tokens.len(),
         }
@@ -213,7 +213,7 @@ impl RequestInput {
     /// rides a page-aligned publish — a prompt checkpoint covering the whole
     /// prompt.
     pub fn publish_reach(&self) -> usize {
-        match self.is_decision() || self.is_program() {
+        match self.is_decision() || self.is_constrained() {
             true => self.tokens.len().saturating_sub(1),
             false => self.tokens.len(),
         }
@@ -341,7 +341,7 @@ impl RequestClass {
     /// `Interactive` would spend a protection it cannot use on behalf of a
     /// conversation that could.
     ///
-    /// A **program** question (GitHub #242) takes this default too, and the
+    /// A **constrained decode** question (GitHub #242) takes this default too, and the
     /// reasoning above is not why. It *does* hold a decode lane, for as many
     /// rounds as its number has digits. It takes `Agent` because it arrives
     /// on the same route as its siblings — a fan-out of questions over one
@@ -536,23 +536,23 @@ pub enum SchedEvent {
         /// field its completion would carry nothing at all — which is why
         /// the readout rides the finish event rather than a second one.
         readout: Option<crate::decision::Readout>,
-        /// The **trace** a **program** finished with (GitHub #242, ADR
+        /// The **trace** a **constrained decode** finished with (GitHub #242, ADR
         /// 0034), and `None` for every other request: one
-        /// [`crate::program::Draw`] per emitted token, in order, each with
+        /// [`crate::constrained::Draw`] per emitted token, in order, each with
         /// its probability inside that step's permitted set.
         ///
         /// It rides the finish event beside the readout, and for the same
-        /// reason: a program's answer is the whole run — the digits *and*
+        /// reason: a run's answer is the whole run — the digits *and*
         /// the confidences that make it a reading rather than a guess — and
         /// there is no useful partial form of it. A per-token field on
         /// [`SchedEvent::Token`] would instead put a `None` on every token
         /// event this engine emits, forever, to carry a number that only
         /// means anything six at a time.
         ///
-        /// `Some` with fewer draws than the program has steps is a run the
+        /// `Some` with fewer draws than the constrained decode has steps is a run the
         /// engine cut short; the tokens are still the `SchedEvent::Token`s
         /// that preceded it, and this says how far it got.
-        drawn: Option<Vec<crate::program::Draw>>,
+        drawn: Option<Vec<crate::constrained::Draw>>,
     },
     /// A request was admitted onto a decode lane. `backfill` is the class
     /// the admission state machine admitted it under (ADR 0004): `None` for

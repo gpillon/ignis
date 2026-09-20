@@ -198,7 +198,7 @@ async fn point_at(app: &axum::Router, image: &[u8]) -> JsonValue {
     assert_eq!(status, 200, "the decide request was served: {response}");
     let answer = response["answers"]["where"].clone();
     assert_eq!(answer["type"], "point", "{response}");
-    // A program generates, and the usage says so: three digits, the forced
+    // A constrained decode generates, and the usage says so: three digits, the forced
     // separator, three more digits.
     assert!(
         response["usage"]["output_tokens"].as_u64().expect("a count") >= 6,

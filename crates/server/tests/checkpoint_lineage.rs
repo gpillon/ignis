@@ -113,7 +113,7 @@ fn request_input(rendered: RenderedPrompt) -> RequestInput {
         opener_tokens: rendered.opener_tokens,
         user_turn_tokens: rendered.user_turn_tokens,
         system_block_tokens: rendered.system_block_tokens,
-        program: None,
+        constrained: None,
     }
 }
 

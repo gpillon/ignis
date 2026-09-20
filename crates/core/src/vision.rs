@@ -163,7 +163,7 @@ impl Multimodal {
     /// (GitHub #242), continuing its MRoPE positions and recomputing
     /// `rope_delta`. `false` when this prompt cannot be extended.
     ///
-    /// A **program** forces a literal prefix — spec 06's `{"x":` — by
+    /// A **constrained decode** forces a literal prefix — spec 06's `{"x":` — by
     /// putting it in the prompt rather than spending a constrained round per
     /// token on it. For a text prompt that is a `Vec::extend` and nothing
     /// else; for a multimodal one the positions have to grow with the

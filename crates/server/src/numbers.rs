@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use ignis_core::program::{Draw, Program};
+use ignis_core::constrained::{Draw, Schedule};
 use ignis_core::types::TokenId;
 use serde::{Deserialize, Serialize};
 
@@ -125,7 +125,7 @@ fn spelled(digits: u32) -> &'static str {
     }
 }
 
-/// One axis of a program question: what the answer calls it, and which of
+/// One axis of a constrained question: what the answer calls it, and which of
 /// the run's draws are its digits.
 ///
 /// The range is needed because the run is not all digits: the literal
@@ -138,21 +138,21 @@ pub struct Axis {
     pub digits: Range<usize>,
 }
 
-/// Everything a program question needs beyond its prompt: the literal
+/// Everything a constrained question needs beyond its prompt: the literal
 /// prefilled after it, the schedule, and where each axis sits in the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// The opening literal, in tokens, appended to the rendered prompt.
     pub prefix: Vec<TokenId>,
     /// The schedule the request generates under.
-    pub program: Program,
+    pub schedule: Schedule,
     /// The axes, in prompt order.
     pub axes: Vec<Axis>,
     /// The ten digit tokens, indexed by the digit they spell.
     pub digit_tokens: [TokenId; 10],
 }
 
-/// Why a program's plan could not be built.
+/// Why a run's plan could not be built.
 ///
 /// Every one of these is a property of the *load*, not of the request, so
 /// the endpoint reports it as a refusal that names what the tokenizer could
@@ -239,8 +239,8 @@ pub fn plan(
         steps.extend(std::iter::repeat_n(alphabet.clone(), digits as usize));
         axes.push(Axis { name, digits: begin..steps.len() });
     }
-    let program = Program::new(steps).map_err(PlanError::Schedule)?;
-    Ok(Plan { prefix, program, axes, digit_tokens })
+    let schedule = Schedule::new(steps).map_err(PlanError::Schedule)?;
+    Ok(Plan { prefix, schedule, axes, digit_tokens })
 }
 
 /// One digit of an answer, and the model's own confidence in it.
@@ -264,6 +264,16 @@ pub struct Reading {
     /// 0.97-0.99, units at 0.15-0.57 — so the model is reporting its
     /// resolution, not its mood. And it would be uncomparable with the
     /// answer, when what a caller wants is "3145 ± 87 pixels".
+    ///
+    /// **It is the model's self-declared uncertainty, and it is not a
+    /// guarantee.** On the measured sample it covers the true error on
+    /// **four of six axes**: the two it misses are `large`'s y (sigma 7.8,
+    /// error 20.4) and `small`'s y (sigma 4.6, error 7.7), both on the axis
+    /// whose first digit the model was least sure of
+    /// (`docs/findings/2026-09-19-constrained-digit-readout-points.md`
+    /// carries the derivation). A caller treating it as a bound will be
+    /// wrong about one reading in three; a caller treating it as the
+    /// model's own statement of resolution will not.
     pub sigma: f64,
     pub digits: Vec<DigitDraw>,
 }
@@ -294,6 +304,18 @@ pub fn read(plan: &Plan, drawn: &[Draw]) -> Option<BTreeMap<String, Reading>> {
         readings.insert(axis.name.to_owned(), Reading { value, sigma, digits });
     }
     Some(readings)
+}
+
+impl Reading {
+    /// Rescale this reading onto an image `pixels` pixels wide (or tall) on
+    /// its own axis, returning the value and its uncertainty in pixels.
+    ///
+    /// A method rather than a free function taking the value and the sigma
+    /// apart: they are always this reading's two fields, and separating
+    /// them is how an x sigma ends up rescaled by a y side.
+    pub fn to_pixels(&self, digits: u32, pixels: u32) -> (i64, f64) {
+        to_pixels(self.value, self.sigma, digits, pixels)
+    }
 }
 
 /// Rescale a reading from the declared 0-`scale` axis onto an image `pixels`
@@ -350,13 +372,13 @@ mod tests {
             per_character("{\"x\":").unwrap(),
             "the opening literal is prompt, not schedule: it costs no round"
         );
-        assert_eq!(plan.program.len(), 3 + separator + 3);
+        assert_eq!(plan.schedule.len(), 3 + separator + 3);
         assert_eq!(plan.axes[0].digits, 0..3);
         assert_eq!(plan.axes[1].digits, 3 + separator..6 + separator);
-        for step in &plan.program.steps()[plan.axes[0].digits.clone()] {
+        for step in &plan.schedule.steps()[plan.axes[0].digits.clone()] {
             assert_eq!(step.len(), 10, "a digit step permits the ten digits");
         }
-        for step in &plan.program.steps()[3..3 + separator] {
+        for step in &plan.schedule.steps()[3..3 + separator] {
             assert_eq!(step.len(), 1, "a forced literal is a set of one");
         }
     }
@@ -392,7 +414,7 @@ mod tests {
         let plan = plan(POINT_LAYOUT, 2, &per_character).expect("a plan");
         let digit = |d: usize, p: f32| Draw { token: plan.digit_tokens[d], probability: p };
         let mut drawn = vec![digit(3, 1.0), digit(1, 1.0)];
-        for step in &plan.program.steps()[plan.axes[0].digits.end..plan.axes[1].digits.start] {
+        for step in &plan.schedule.steps()[plan.axes[0].digits.end..plan.axes[1].digits.start] {
             drawn.push(Draw { token: step[0], probability: 1.0 });
         }
         drawn.extend([digit(2, 1.0), digit(4, 0.5)]);

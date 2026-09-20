@@ -610,7 +610,7 @@ pub struct RuntimeCompute<L: StepLeaf> {
     /// #178): at most one per request, held from its item's first covered
     /// chunk until its last placeholder is prefilled.
     media: Mutex<HashMap<RequestId, LiveMedia<L::Media>>>,
-    /// The probability of the token a **program** request has drawn and not
+    /// The probability of the token a **constrained decode** request has drawn and not
     /// yet emitted (GitHub #242), per request.
     ///
     /// This is the one-round lag, held on this side of the `Compute` seam
@@ -942,9 +942,6 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .readout
                     .as_ref()
                     .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
-                // GitHub #242: the set this chunk's own draw is restricted
-                // to, empty on every chunk that is not a program's last.
-                let permitted = job.permitted.clone().unwrap_or_else(|| Vec::new().into());
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -955,7 +952,11 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                             &job.tokens,
                             job.start_position,
                             job.params,
-                            &permitted,
+                            // GitHub #242: the set this chunk's own draw is
+                            // restricted to, borrowed and not cloned — every
+                            // chunk that is not a constrained run's last
+                            // passes an empty slice and allocates nothing.
+                            job.permitted.as_deref().unwrap_or(&[]),
                             logits.as_deref_mut(),
                         )
                         .map(|probability| (0, probability)),
@@ -970,7 +971,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 match warmed {
                     Ok((encode_micros, probability)) => {
                         outcomes[index].encode_micros = encode_micros;
-                        // The first token of a program's run was just drawn
+                        // The first token of a run's run was just drawn
                         // here; the first decode round returns it, and this
                         // is the only place its probability exists.
                         if job.permitted.is_some() {
@@ -1195,11 +1196,13 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // request emits.
         let eos = [self.eos];
         // GitHub #242: cloned out of `batch` before the lanes borrow it,
-        // because the handles below take it mutably. Cloning an `Arc` per
-        // lane, not a set.
-        let permitted: Vec<ignis_core::program::PermittedSet> = batch
+        // because the handles below take it mutably. An `Option<Arc>` clone
+        // is a refcount bump for a constrained lane and nothing at all for
+        // any other — an ordinary round allocates no more than it did before
+        // this ticket, which is the bar for anything on this path.
+        let permitted: Vec<Option<ignis_core::constrained::PermittedSet>> = batch
             .iter()
-            .map(|(job, _)| job.permitted.clone().unwrap_or_else(|| Vec::new().into()))
+            .map(|(job, _)| job.permitted.clone())
             .collect();
         let decoded = {
             let lanes: Vec<DecodeLane<'_>> = batch
@@ -1216,7 +1219,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         })
                         .max(1),
                     stop_ids: if job.params.ignore_eos { &[] } else { &eos },
-                    permitted: &permitted[index],
+                    permitted: permitted[index].as_deref().unwrap_or(&[]),
                 })
                 .collect();
             let mut handles: Vec<&mut L::Sequence> = batch
@@ -1258,6 +1261,12 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
 
         let mut decoded = decoded.into_iter();
         let mut released = Vec::new();
+        // GitHub #242: taken once for the whole round rather than per lane.
+        // The map is empty unless a constrained run is in flight, and this
+        // is the decode path — one uncontended lock per round is a cost an
+        // ordinary round can carry; eight of them would be a cost this
+        // ticket added to every request the engine serves.
+        let mut drawn_probabilities = self.drawn.lock().unwrap();
         for (index, (job, mut sequence)) in batch.into_iter().enumerate() {
             if !active[index] {
                 released.push(sequence);
@@ -1272,18 +1281,21 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
             // returns the token drawn *last* time, so its probability is the
             // one held from then; what this round drew is held for the next.
             // A lane that drew unconstrained leaves nothing behind, so the
-            // entry disappears on the round after a program's last set and
+            // entry disappears on the round after a run's last set and
             // never outlives the request.
-            let probabilities = match self.drawn.lock().unwrap().remove(&job.request) {
-                Some(probability) => vec![probability],
-                None => Vec::new(),
+            let probabilities = match drawn_probabilities.is_empty() {
+                true => Vec::new(),
+                false => match drawn_probabilities.remove(&job.request) {
+                    Some(probability) => vec![probability],
+                    None => Vec::new(),
+                },
             };
             if let Some(probability) = drawn_probability {
-                self.drawn.lock().unwrap().insert(job.request, probability);
+                drawn_probabilities.insert(job.request, probability);
             }
             debug_assert!(
                 probabilities.is_empty() || tokens.len() == 1,
-                "a constrained lane commits exactly one token, so there is one                  probability for it"
+                "a constrained lane commits exactly one token, so there is one probability for it"
             );
             let eos_at = (!job.params.ignore_eos)
                 .then(|| tokens.iter().position(|&token| token == self.eos))
@@ -1307,6 +1319,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 ..outcome
             });
         }
+        drop(drawn_probabilities);
         drop(sequences);
         for sequence in released {
             self.release_sequence(sequence.handle);
@@ -1321,7 +1334,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
         // GitHub #178: a request completed or cancelled mid-item releases
         // the item's embedding with its sequence.
         self.release_media_of(request);
-        // GitHub #242: and a program cancelled mid-run leaves a draw nobody
+        // GitHub #242: and a constrained decode cancelled mid-run leaves a draw nobody
         // will ever emit. One `f32`, but the id is never reused, so an entry
         // left here would be leaked for the life of the process.
         self.drawn.lock().unwrap().remove(&request);

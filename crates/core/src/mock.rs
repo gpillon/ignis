@@ -76,7 +76,7 @@ struct Inner {
     /// backend whose blobs are ordinary allocations — today's default, and
     /// what every scenario that is not about placement wants.
     arena: Option<MockHostArena>,
-    /// The draw a **program** request has made and not yet emitted (GitHub
+    /// The draw a **constrained decode** request has made and not yet emitted (GitHub
     /// #242), per request: the token the *next* decode round returns.
     ///
     /// This is the leaf's one-round lag, modelled on purpose. A mock that
@@ -85,7 +85,7 @@ struct Inner {
     /// free token in the middle of its forced text on the card — which is
     /// exactly the bug `permitted_decode_gpu.rs` caught, and exactly the
     /// bug a mock exists to catch first (ADR 0006).
-    pending: HashMap<RequestId, crate::program::Draw>,
+    pending: HashMap<RequestId, crate::constrained::Draw>,
     /// Constrained steps served so far, per request: what varies the mock's
     /// pick from one step to the next.
     drawn: HashMap<RequestId, u32>,
@@ -356,7 +356,7 @@ impl Compute for MockCompute {
             g.seeds.insert(job.request, job.params.seed);
         }
         for job in jobs {
-            // GitHub #242: a prefill *draws*, and a program's first token is
+            // GitHub #242: a prefill *draws*, and a run's first token is
             // the one it draws. Held until a decode round asks for it.
             if let Some(permitted) = &job.permitted {
                 let draw = Self::draw(self.seed, &mut g, job.request, permitted);
@@ -470,7 +470,7 @@ impl Compute for MockCompute {
         Ok(jobs
             .iter()
             .map(|job| {
-                // GitHub #242 — a program lane, which is a different round
+                // GitHub #242 — a constrained lane, which is a different round
                 // entirely: exactly one token, the one drawn a round ago,
                 // and no speculation, no EOS and no token cap (the schedule
                 // is the budget, and the scheduler owns it).
@@ -654,7 +654,7 @@ impl MockCompute {
         state: &mut Inner,
         request: RequestId,
         permitted: &[TokenId],
-    ) -> crate::program::Draw {
+    ) -> crate::constrained::Draw {
         let step = {
             let drawn = state.drawn.entry(request).or_insert(0);
             *drawn += 1;
@@ -668,7 +668,7 @@ impl MockCompute {
             // 0.50 ..= 0.999, well clear of both ends.
             _ => 0.5 + (mixed % 500) as f32 / 1000.0,
         };
-        crate::program::Draw { token, probability }
+        crate::constrained::Draw { token, probability }
     }
 
     /// The deterministic token mix: a pure function of (mock seed, request

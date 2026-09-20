@@ -32,7 +32,7 @@ pub mod loader;
 pub mod media;
 pub mod metrics;
 pub mod playground;
-pub mod program;
+pub mod numbers;
 pub mod runtime;
 pub mod telemetry;
 pub mod template;

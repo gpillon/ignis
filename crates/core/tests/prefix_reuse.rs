@@ -38,7 +38,7 @@ fn input(model: &str, prompt: Vec<u32>, max: u32) -> RequestInput {
             max_tokens: Some(max),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
     }
 }
 

@@ -23,7 +23,7 @@ fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
             max_tokens,
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
     }
 }
 
@@ -100,7 +100,7 @@ fn token_stream_is_deterministic_and_seed_sensitive() {
                     model: "qwen3.8-27b".into(),
                     tokens: vec![1, 2],
                     params,
-                    program: None,
+                    constrained: None,
                 },
                 RequestClass::Agent,
             )
@@ -146,7 +146,7 @@ fn token_stream_depends_on_the_request_seed() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: mk(7),
-                program: None,
+                constrained: None,
             },
             RequestClass::Agent,
         )
@@ -162,7 +162,7 @@ fn token_stream_depends_on_the_request_seed() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: mk(8),
-                program: None,
+                constrained: None,
             },
             RequestClass::Agent,
         )

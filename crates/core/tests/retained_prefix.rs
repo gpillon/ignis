@@ -91,7 +91,7 @@ fn input(prompt: Vec<u32>, block: Option<u32>, opener: Option<u32>, max: u32) ->
         opener_tokens: opener,
         user_turn_tokens: None,
         system_block_tokens: block,
-        program: None,
+        constrained: None,
     }
 }
 
@@ -208,7 +208,7 @@ fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() 
     assert_eq!(
         sched.prefix_pinned_pages(),
         BLOCK / PAGE + 1,
-        "its block is still held — two whole pages, charged once — plus the one page          it chained over them for its own prompt checkpoint (#187)"
+        "its block is still held — two whole pages, charged once — plus the one page it chained over them for its own prompt checkpoint (#187)"
     );
 
     let second = sched.submit(subagent(900), RequestClass::Agent).unwrap();
@@ -241,7 +241,7 @@ fn a_second_subagent_arriving_after_the_first_finished_skips_the_system_block() 
     assert_eq!(
         sched.prefix_pinned_pages(),
         BLOCK / PAGE + 2,
-        "and the block is still one set of pages, not two — what grew is one chained          page per subagent, each holding that subagent's own checkpoint (#187)"
+        "and the block is still one set of pages, not two — what grew is one chained page per subagent, each holding that subagent's own checkpoint (#187)"
     );
 }
 

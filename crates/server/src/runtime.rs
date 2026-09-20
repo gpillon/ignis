@@ -799,7 +799,7 @@ mod tests {
             .submit(
                 RequestInput {
                     decision: None,
-                    program: None,
+                    constrained: None,
                     multimodal: None,
                     opener_tokens: None,
                     user_turn_tokens: None,

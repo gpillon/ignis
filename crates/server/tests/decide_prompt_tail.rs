@@ -185,7 +185,7 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
     // documented example is a single sentence.
     let floor = block / ignis_core::KV_PAGE_TOKENS * ignis_core::KV_PAGE_TOKENS;
     eprintln!(
-        "ignis decide: system block {block} tokens, retained prefix {floor}          (page {})",
+        "ignis decide: system block {block} tokens, retained prefix {floor} (page {})",
         ignis_core::KV_PAGE_TOKENS
     );
 
@@ -194,7 +194,7 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
     // the state is a ticket, a transcript or a document.
     let long = json!(format!(
         "{} ",
-        "The customer writes at length about a payout failure that has now          lasted three days, with invoice numbers, timestamps and an          increasingly short temper. "
+        "The customer writes at length about a payout failure that has now lasted three days, with invoice numbers, timestamps and an increasingly short temper. "
             .repeat(12)
     ));
     let messages = messages_for(&Evidence::read(&long), &prepared[0]);
@@ -206,16 +206,16 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
         .expect("a decision's prompt opens with a system block");
     let floor = block / ignis_core::KV_PAGE_TOKENS * ignis_core::KV_PAGE_TOKENS;
     eprintln!(
-        "ignis decide: a {}-token prompt over a real state retains {floor} of          a {block}-token block",
+        "ignis decide: a {}-token prompt over a real state retains {floor} of a {block}-token block",
         rendered.tokens.len()
     );
     assert!(
         floor > 0,
-        "a state of any size worth fanning out over reaches the first page          boundary: block {block}, floor {floor}"
+        "a state of any size worth fanning out over reaches the first page boundary: block {block}, floor {floor}"
     );
     assert!(
         (rendered.tokens.len() as u32) - floor < block,
-        "and what each sibling question re-prefills is its own tail, not the          state"
+        "and what each sibling question re-prefills is its own tail, not the state"
     );
 }
 

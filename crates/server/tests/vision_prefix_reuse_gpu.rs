@@ -98,7 +98,7 @@ fn request(provider: &ArtifactTemplateProvider, processor: &ignis_artifact::visi
         provider.prepare_multimodal(&messages, &options, &[], vec![media]).expect("prepare prompt");
     RequestInput {
         decision: None,
-        program: None,
+        constrained: None,
         model: MODEL.into(),
         tokens: rendered.tokens,
         params: DecodeParams { max_tokens: Some(MAX_TOKENS), ..DecodeParams::default() },

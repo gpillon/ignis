@@ -57,7 +57,7 @@ pub struct Request {
     /// that reports it. `None` on every request that is not a **decision**,
     /// and on a decision whose last chunk has not landed yet.
     pub readout: Option<crate::decision::Readout>,
-    /// The **trace** a **program** has built so far (GitHub #242): one draw
+    /// The **trace** a **constrained decode** has built so far (GitHub #242): one draw
     /// per token it has emitted, in order, each with the probability it held
     /// inside its own step's permitted set.
     ///
@@ -65,8 +65,8 @@ pub struct Request {
     /// the answer is the whole run: three digits and their confidences are a
     /// reading with a resolution, and any one of them alone is a digit. It
     /// leaves on [`crate::types::SchedEvent::Done`], beside the readout a
-    /// decision leaves on. Empty on every request that is not a program.
-    pub drawn: Vec<crate::program::Draw>,
+    /// decision leaves on. Empty on every request that is not a constrained decode.
+    pub drawn: Vec<crate::constrained::Draw>,
     /// The resources this request reserves while it holds a lane (core-05:
     /// the admission state machine's KV reservation, charged at deal and
     /// released at completion — the pool never over-allocates).
@@ -672,7 +672,7 @@ mod tests {
             class,
             RequestInput {
                 decision: None,
-                program: None,
+                constrained: None,
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),

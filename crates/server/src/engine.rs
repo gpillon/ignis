@@ -436,7 +436,7 @@ async fn telemetry_task(
                     // travels to its caller on the response stream, not into
                     // the telemetry counters — a decision generates nothing,
                     // so there is nothing here for `on_done` to count.
-                    // GitHub #242: and a program's trace, for the same
+                    // GitHub #242: and a run's trace, for the same
                     // reason — its tokens were already counted one by one.
                     readout: _,
                     drawn: _,
@@ -540,20 +540,20 @@ pub async fn collect_readout(
     }
 }
 
-/// Drain a **program** request's stream to its completion (GitHub #242) and
+/// Drain a **constrained decode** request's stream to its completion (GitHub #242) and
 /// return the trace it finished with: one draw per emitted token, in order.
 ///
 /// The mirror of [`collect_readout`], and a separate function for the same
-/// reason the two request kinds are separate: a program's `Done` carries no
-/// readout, so `collect_readout` would report every program as
+/// reason the two request kinds are separate: a run's `Done` carries no
+/// readout, so `collect_readout` would report every constrained decode as
 /// `NotCompleted`. The tokens themselves are in the `SchedEvent::Token`s
-/// that preceded it and are not collected here — a program's caller wants
+/// that preceded it and are not collected here — a run's caller wants
 /// the digits and their confidences, which the trace already pairs, and the
 /// token ids are the same numbers in the model's id space.
-pub async fn collect_program(
+pub async fn collect_draws(
     rx: &mut EventStream,
     timeout: Duration,
-) -> Result<Vec<ignis_core::program::Draw>, CollectError> {
+) -> Result<Vec<ignis_core::constrained::Draw>, CollectError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -600,7 +600,7 @@ mod tests {
     fn input(model: &str, tokens: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         RequestInput {
             decision: None,
-            program: None,
+            constrained: None,
             multimodal: None,
             opener_tokens: None,
             user_turn_tokens: None,

@@ -7,7 +7,7 @@
 //!
 //! GitHub #242 adds three that *do* generate — `number`, `point` and `box` —
 //! by restricting each step to a declared alphabet instead of reading one
-//! position ([`crate::program`]). They cost one prefill and a round per
+//! position ([`crate::numbers`]). They cost one prefill and a round per
 //! digit, they move `usage.output_tokens` and the throughput panels, and
 //! they are counted in `ignis_decisions_total` beside the readouts. What
 //! they do not have is an **answer mass**, which is why the histogram beside
@@ -213,8 +213,8 @@ pub struct Question {
     #[serde(default, alias = "options")]
     pub criteria: Option<Criteria>,
     /// Digits per axis for a `number`, `point` or `box` (GitHub #242);
-    /// [`crate::program::DEFAULT_DIGITS`] when absent, and refused outside
-    /// [`crate::program::DIGITS`].
+    /// [`crate::numbers::DEFAULT_DIGITS`] when absent, and refused outside
+    /// [`crate::numbers::DIGITS`].
     ///
     /// Refused rather than ignored on a readout question, like every other
     /// field this endpoint cannot honour: a caller who wrote `digits` on a
@@ -358,12 +358,12 @@ impl QuestionKind {
 
     /// The axis layout this primitive generates under, or `None` for a
     /// readout (GitHub #242).
-    fn layout(self) -> Option<crate::program::Layout> {
+    fn layout(self) -> Option<crate::numbers::Layout> {
         match self {
             Self::Noul | Self::Choice | Self::Score => None,
-            Self::Number => Some(crate::program::NUMBER_LAYOUT),
-            Self::Point => Some(crate::program::POINT_LAYOUT),
-            Self::Box => Some(crate::program::BOX_LAYOUT),
+            Self::Number => Some(crate::numbers::NUMBER_LAYOUT),
+            Self::Point => Some(crate::numbers::POINT_LAYOUT),
+            Self::Box => Some(crate::numbers::BOX_LAYOUT),
         }
     }
 
@@ -373,9 +373,32 @@ impl QuestionKind {
         matches!(self, Self::Point | Self::Box)
     }
 
-    /// Whether this primitive generates rather than reading one position.
-    pub fn is_program(self) -> bool {
+    /// Whether this primitive answers with a **constrained decode**
+    /// (`CONTEXT.md`) rather than a readout of one position.
+    pub fn is_constrained(self) -> bool {
         self.layout().is_some()
+    }
+
+    /// The system text a question of this primitive is put under:
+    /// [`DIRECT_SYSTEM`] for a readout, and the shape-declaring text of each
+    /// constrained one (GitHub #242, [`crate::numbers`]).
+    ///
+    /// A constrained decode's is not `DIRECT_SYSTEM` with a clause bolted
+    /// on. It has to declare the **scale**, which is what the finding
+    /// established its accuracy against, and `DIRECT_SYSTEM` says "choose
+    /// exactly one listed option" — which a number does not do.
+    ///
+    /// On the kind rather than beside the prompt builder: the builder reads
+    /// nothing else of the question to decide this, and a primitive added to
+    /// the wire should fail to compile until somebody writes its
+    /// instruction.
+    pub fn system_text(self, digits: u32) -> String {
+        match self {
+            Self::Number => crate::numbers::number_system(digits),
+            Self::Point => crate::numbers::point_system(digits),
+            Self::Box => crate::numbers::box_system(digits),
+            Self::Noul | Self::Choice | Self::Score => DIRECT_SYSTEM.to_owned(),
+        }
     }
 }
 
@@ -418,11 +441,11 @@ pub struct PreparedQuestion {
     pub options: Vec<PreparedOption>,
     /// The answer token per option, parallel to `options`.
     pub answers: Vec<AnswerToken>,
-    /// The schedule a **program** question generates under (GitHub #242),
+    /// The schedule a **constrained decode** question generates under (GitHub #242),
     /// and `None` for a readout. `options` and `answers` are then empty: a
     /// program names no options, it forces an alphabet.
-    pub plan: Option<std::sync::Arc<crate::program::Plan>>,
-    /// Digits per axis, for a program question.
+    pub plan: Option<std::sync::Arc<crate::numbers::Plan>>,
+    /// Digits per axis, for a constrained question.
     pub digits: u32,
 }
 
@@ -466,7 +489,7 @@ pub fn prepare(
         .collect()
 }
 
-/// The loaded tokenizer, as a program's plan needs it: text to token ids
+/// The loaded tokenizer, as a run's plan needs it: text to token ids
 /// (GitHub #242). [`crate::template::TemplateProvider::encode_literal`] is
 /// what supplies one.
 pub type Encoder<'a> = &'a dyn Fn(&str) -> Option<Vec<TokenId>>;
@@ -533,7 +556,7 @@ fn prepare_one(
     })
 }
 
-/// Validate and plan a **program** question (GitHub #242): a `number`,
+/// Validate and plan a **constrained decode** question (GitHub #242): a `number`,
 /// `point` or `box`.
 ///
 /// It declares no options — it forces the digit alphabet — so nothing here
@@ -542,7 +565,7 @@ fn prepare_one(
 fn prepare_program(
     id: &str,
     question: &Question,
-    layout: crate::program::Layout,
+    layout: crate::numbers::Layout,
     encode: Encoder<'_>,
 ) -> Result<PreparedQuestion, Refusal> {
     if question.criteria.is_some() {
@@ -554,18 +577,18 @@ fn prepare_program(
             ),
         ));
     }
-    let digits = question.digits.unwrap_or(crate::program::DEFAULT_DIGITS);
-    if !crate::program::DIGITS.contains(&digits) {
+    let digits = question.digits.unwrap_or(crate::numbers::DEFAULT_DIGITS);
+    if !crate::numbers::DIGITS.contains(&digits) {
         return Err(Refusal::new(
             "digits_out_of_range",
             format!(
-                "question {id:?} asks for {digits} digits; {}..={} is the range this endpoint                  serves — one digit is a choice between ten answers, and six is already far                  past the resolution the model reports for itself",
-                crate::program::DIGITS.start,
-                crate::program::DIGITS.end - 1
+                "question {id:?} asks for {digits} digits; {}..={} is the range this endpoint serves — one digit is a choice between ten answers, and six is already far past the resolution the model reports for itself",
+                crate::numbers::DIGITS.start,
+                crate::numbers::DIGITS.end - 1
             ),
         ));
     }
-    let plan = crate::program::plan(layout, digits, encode).map_err(|error| {
+    let plan = crate::numbers::plan(layout, digits, encode).map_err(|error| {
         // Every one of these is a property of the load, not of the request:
         // this tokenizer cannot spell a digit as one token, so this model
         // cannot answer a number at all.
@@ -774,10 +797,10 @@ fn score_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOp
 /// layout to measure. That is a design fork for #240's owner or GitHub
 /// #235, not something to decide in a prompt builder.
 pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMessage> {
-    // GitHub #242: a program's user turn is the instruction alone — it
+    // GitHub #242: a run's user turn is the instruction alone — it
     // declares no options, and the shape its answer must take lives in the
     // system text, which is the shape the finding measured.
-    let ask = match question.kind.is_program() {
+    let ask = match question.kind.is_constrained() {
         true => payload_text(&[("instruction", &question.instructions)]),
         false => {
             let options: Vec<JsonValue> = question
@@ -794,7 +817,7 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
             ])
         }
     };
-    let instruction = system_for(question);
+    let instruction = question.kind.system_text(question.digits);
     match state {
         Evidence::Json(value) => {
             // One blank line between the instruction and the evidence: the
@@ -824,23 +847,6 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
                 },
             ]
         }
-    }
-}
-
-/// The system text a question is put under: [`DIRECT_SYSTEM`] for a
-/// readout, and the shape-declaring text of each program primitive (GitHub
-/// #242, [`crate::program`]).
-///
-/// A program's is not `DIRECT_SYSTEM` with a clause bolted on. It has to
-/// declare the **scale**, which is what the finding established its accuracy
-/// against, and `DIRECT_SYSTEM` says "choose exactly one listed option" —
-/// which a number does not do.
-fn system_for(question: &PreparedQuestion) -> String {
-    match question.kind {
-        QuestionKind::Number => crate::program::number_system(question.digits),
-        QuestionKind::Point => crate::program::point_system(question.digits),
-        QuestionKind::Box => crate::program::box_system(question.digits),
-        _ => DIRECT_SYSTEM.to_owned(),
     }
 }
 
@@ -989,7 +995,7 @@ pub enum Answer {
     Number {
         number: u64,
         uncertainty: f64,
-        digits: Vec<crate::program::DigitDraw>,
+        digits: Vec<crate::numbers::DigitDraw>,
     },
     /// A position on the submitted image, in **its** pixels.
     ///
@@ -1001,7 +1007,7 @@ pub enum Answer {
         pixels: BTreeMap<String, i64>,
         normalized: BTreeMap<String, u64>,
         uncertainty: BTreeMap<String, f64>,
-        digits: BTreeMap<String, Vec<crate::program::DigitDraw>>,
+        digits: BTreeMap<String, Vec<crate::numbers::DigitDraw>>,
     },
     /// A bounding box on the submitted image: [`Answer::Point`]'s shape over
     /// `x0`, `y0`, `x1`, `y1`.
@@ -1010,7 +1016,7 @@ pub enum Answer {
         pixels: BTreeMap<String, i64>,
         normalized: BTreeMap<String, u64>,
         uncertainty: BTreeMap<String, f64>,
-        digits: BTreeMap<String, Vec<crate::program::DigitDraw>>,
+        digits: BTreeMap<String, Vec<crate::numbers::DigitDraw>>,
     },
     /// This question alone failed at *runtime*, after the GPU was already
     /// spent on its siblings (spec 04).
@@ -1025,7 +1031,7 @@ pub enum Answer {
     Error { code: String, message: String },
 }
 
-/// Shape a **program**'s finished run into `question`'s answer (GitHub
+/// Shape a **constrained decode**'s finished run into `question`'s answer (GitHub
 /// #242).
 ///
 /// `pixels` is the submitted image's `(width, height)`, needed by `point`
@@ -1036,31 +1042,31 @@ pub enum Answer {
 /// and a place-weighted sum over a partial number is a plausible-looking
 /// wrong answer rather than a missing one — the exact failure mode this
 /// endpoint exists to remove.
-pub fn program_answer_for(
+pub fn constrained_answer_for(
     question: &PreparedQuestion,
-    drawn: &[ignis_core::program::Draw],
+    drawn: &[ignis_core::constrained::Draw],
     pixels: Option<(u32, u32)>,
 ) -> Answer {
     let Some(plan) = &question.plan else {
         return failed("not_a_program", "this question generates nothing".to_owned());
     };
-    if drawn.len() != plan.program.len() {
+    if drawn.len() != plan.schedule.len() {
         return failed(
             "run_cut_short",
             format!(
-                "the engine committed {} of this question's {} forced tokens, so its answer                  would be a number with digits missing from the middle",
+                "the engine committed {} of this question's {} forced tokens, so its answer would be a number with digits missing from the middle",
                 drawn.len(),
-                plan.program.len()
+                plan.schedule.len()
             ),
         );
     }
-    let Some(readings) = crate::program::read(plan, drawn) else {
+    let Some(readings) = crate::numbers::read(plan, drawn) else {
         return failed(
             "run_off_alphabet",
             "a forced step committed a token outside its own permitted set".to_owned(),
         );
     };
-    let digits: BTreeMap<String, Vec<crate::program::DigitDraw>> = readings
+    let digits: BTreeMap<String, Vec<crate::numbers::DigitDraw>> = readings
         .iter()
         .map(|(axis, reading)| (axis.clone(), reading.digits.clone()))
         .collect();
@@ -1074,7 +1080,7 @@ pub fn program_answer_for(
     }
     debug_assert!(
         question.kind.is_spatial(),
-        "every program that is not a number answers on an image"
+        "every constrained decode that is not a number answers on an image"
     );
     // Spatial: the answer is in pixels of the image the caller submitted,
     // and each axis is scaled by its own side.
@@ -1089,8 +1095,7 @@ pub fn program_answer_for(
     let mut uncertainty = BTreeMap::new();
     for (axis, reading) in &readings {
         let side = if axis.starts_with('x') { width } else { height };
-        let (value, sigma) =
-            crate::program::to_pixels(reading.value, reading.sigma, question.digits, side);
+        let (value, sigma) = reading.to_pixels(question.digits, side);
         in_pixels.insert(axis.clone(), value);
         normalized.insert(axis.clone(), reading.value);
         uncertainty.insert(axis.clone(), sigma);
@@ -1127,8 +1132,8 @@ pub fn answer_for(question: &PreparedQuestion, readout: &Readout) -> Answer {
                 confidence: confidence_of(&probabilities),
             }
         }
-        // A program never reaches here: `ask` routes it to
-        // `program_answer_for`, which is the only function that has a run to
+        // A constrained decode never reaches here: `ask` routes it to
+        // `constrained_answer_for`, which is the only function that has a run to
         // shape. Answered rather than `unreachable!()` because this is the
         // request path and a wrong route is a bug to report, not a panic on
         // the model's thread.
@@ -1249,7 +1254,7 @@ async fn serve(
 ) -> Result<DecideResponse, Refusal> {
     let started = std::time::Instant::now();
     refuse_thinking(server, &request)?;
-    // The tokenizer, for any program question's forced alphabet (GitHub
+    // The tokenizer, for any constrained question's forced alphabet (GitHub
     // #242). A load with no real tokenizer answers `None` and the question
     // is refused, rather than forcing ids this server invented.
     let encode = |text: &str| server.template.encode_literal(text);
@@ -1380,21 +1385,21 @@ async fn serve(
             // position's logits and samples nothing, so
             // `ignis_decoded_tokens_total` does not move for it either.
             //
-            // A **program** does generate (GitHub #242), and this counts
+            // A **constrained decode** does generate (GitHub #242), and this counts
             // what it generated. Saying 0 for a `point` would be the one lie
             // this endpoint could tell that nothing downstream would catch —
-            // and the throughput panels, which a program *does* move, would
+            // and the throughput panels, which a constrained decode *does* move, would
             // disagree with the usage a caller was billed by.
             output_tokens,
         },
     })
 }
 
-/// The tokens this request's **programs** generated (GitHub #242): each
-/// answered program question's whole schedule, and nothing for a readout.
+/// The tokens this request's **constrained decodes** generated (GitHub #242): each
+/// answered constrained question's whole schedule, and nothing for a readout.
 ///
 /// The schedule's length rather than a count of emitted tokens, because they
-/// are the same number by construction — a program ends when its schedule is
+/// are the same number by construction — a constrained decode ends when its schedule is
 /// spent — and a question that did *not* end that way is an error in its
 /// slot, with nothing to bill for.
 fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) -> u32 {
@@ -1403,7 +1408,7 @@ fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) 
         .filter(|question| !matches!(answers.get(&question.id), None | Some(Answer::Error { .. })))
         .filter_map(|question| question.plan.as_ref())
         .fold(0u32, |total, plan| {
-            total.saturating_add(u32::try_from(plan.program.len()).unwrap_or(u32::MAX))
+            total.saturating_add(u32::try_from(plan.schedule.len()).unwrap_or(u32::MAX))
         })
 }
 
@@ -1552,7 +1557,7 @@ async fn render(
                 question.answers.iter().map(|answer| answer.id).collect::<Vec<_>>(),
             ));
         }
-        // GitHub #242: a program appends its opening literal to the prompt —
+        // GitHub #242: a constrained decode appends its opening literal to the prompt —
         // forced text the model appears to have written, costing prefill
         // rather than a decode round each — and carries the schedule for
         // everything after it.
@@ -1562,7 +1567,7 @@ async fn render(
                 return Err(Refusal::new(
                     "context_exceeded",
                     format!(
-                        "question {:?} renders {prompt_tokens} prompt tokens with its forced                          prefix, past this engine's {} context",
+                        "question {:?} renders {prompt_tokens} prompt tokens with its forced prefix, past this engine's {} context",
                         question.id,
                         server.engine.max_model_len()
                     ),
@@ -1579,13 +1584,13 @@ async fn render(
                     return Err(Refusal::new(
                         "prompt_not_extendable",
                         format!(
-                            "question {:?} renders a prompt ending inside an image, which                              leaves no position for its forced prefix to continue from",
+                            "question {:?} renders a prompt ending inside an image, which leaves no position for its forced prefix to continue from",
                             question.id
                         ),
                     ));
                 }
             }
-            input.program = Some(std::sync::Arc::new(plan.program.clone()));
+            input.constrained = Some(std::sync::Arc::new(plan.schedule.clone()));
         }
     }
     Ok(Rendered { input, model, prompt_tokens, media })
@@ -1620,13 +1625,13 @@ async fn ask(
     // The engine keeps working on a request whose caller has gone until it
     // is told otherwise, and a fan-out is twenty of them.
     let mut guard = crate::api::CancelOnDrop::new(server.engine.clone(), id);
-    // GitHub #242: a program's completion carries a trace, not a readout,
+    // GitHub #242: a run's completion carries a trace, not a readout,
     // so `collect_readout` would report every one of them as never
     // completed.
-    if question.kind.is_program() {
+    if question.kind.is_constrained() {
         let pixels = ready.media.and_then(|stats| stats.source_pixels);
         return Attempt::Answered(
-            match crate::engine::collect_program(&mut events, server.request_timeout).await {
+            match crate::engine::collect_draws(&mut events, server.request_timeout).await {
                 Ok(drawn) => {
                     guard.completed();
                     if let Some(metrics) = &server.metrics {
@@ -1636,7 +1641,7 @@ async fn ask(
                         // over one position (ADR 0017's row says so).
                         metrics.record_decision(question.kind.primitive(), None);
                     }
-                    program_answer_for(question, &drawn, pixels)
+                    constrained_answer_for(question, &drawn, pixels)
                 }
                 Err(_) => failed(
                     "not_completed",

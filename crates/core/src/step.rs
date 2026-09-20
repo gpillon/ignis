@@ -19,7 +19,7 @@ use crate::model_load::Model;
 use crate::seq::{Seq, SeqPool, ffi::IgnisSeq};
 use crate::vision::{Grid, VisionItemControl};
 
-mod ffi {
+pub(crate) mod ffi {
     use std::os::raw::c_char;
 
     use crate::model_load::ffi::IgnisModel;
@@ -792,6 +792,42 @@ pub fn decode_program_batch_sampled(
 /// call may ask for both — the readout observes the prefill and the
 /// constraint decides its draw — although nothing in the engine does: a
 /// decision reads a position and a program generates from one.
+/// The sampling parameters of a lane restricted to `permitted` (P6-06,
+/// GitHub #242), or the refusal a set the leaf cannot honour earns.
+///
+/// One function rather than the same six lines at each of the three entry
+/// points that take a set: the cap check, the null-vs-pointer rule and the
+/// count all have to agree with `ignis_step.h`, and three copies of a rule
+/// is three places for it to stop agreeing. `what` names the caller so the
+/// message still says which entry point refused.
+///
+/// The set is **refused, never truncated**: a constraint silently narrowed
+/// is a wrong answer that looks like a right one.
+fn permitted_params(
+    what: &str,
+    sampling: SamplingParams,
+    permitted: &[i32],
+) -> Result<ffi::IgnisSamplingParams, String> {
+    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
+        return Err(format!(
+            "{what}: {} ids, past the leaf's {} (a set is refused, never truncated)",
+            permitted.len(),
+            ffi::MAX_PERMITTED_TOKENS
+        ));
+    }
+    Ok(ffi::IgnisSamplingParams {
+        permitted_count: permitted.len() as u32,
+        // The ABI reads the pointer only when the count is nonzero, and a
+        // dangling one beside a zero count is the kind of thing that works
+        // until it does not.
+        permitted_ids: match permitted.is_empty() {
+            true => std::ptr::null(),
+            false => permitted.as_ptr(),
+        },
+        ..sampling.to_ffi()
+    })
+}
+
 pub fn prefill_program_permitted(
     model: &Model,
     pool: &SeqPool,
@@ -804,25 +840,18 @@ pub fn prefill_program_permitted(
 ) -> Result<f32, String> {
     if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
         return Err(format!(
-            "prefill_program_permitted: {} ids, past the leaf's {} (a set is refused, never              truncated)",
+            "prefill_program_permitted: {} ids, past the leaf's {} (a set is refused, never truncated)",
             permitted.len(),
             ffi::MAX_PERMITTED_TOKENS
         ));
     }
+    let params = permitted_params("prefill_program_permitted", sampling, permitted)?;
     let mut probability = 0f32;
     let mut options = PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault);
     options.out_permitted_prob = &mut probability;
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
-    };
-    let params = ffi::IgnisSamplingParams {
-        permitted_count: permitted.len() as u32,
-        permitted_ids: match permitted.is_empty() {
-            true => std::ptr::null(),
-            false => permitted.as_ptr(),
-        },
-        ..sampling.to_ffi()
     };
     let rc = unsafe {
         ffi::ignis_program_prefill(
@@ -878,29 +907,21 @@ pub fn decode_program_batch_permitted(
             sequences.len()
         ));
     }
-    for (index, lane) in lanes.iter().enumerate() {
-        if lane.permitted.len() > ffi::MAX_PERMITTED_TOKENS {
-            return Err(format!(
-                "decode_program_batch_permitted: lane {index} permits {} ids, past the leaf's {}                  (a set is refused, never truncated)",
-                lane.permitted.len(),
-                ffi::MAX_PERMITTED_TOKENS
-            ));
-        }
-    }
+
     let mut handles: Vec<*mut IgnisSeq> = sequences.iter_mut().map(|seq| seq.handle()).collect();
     // The id slices are the caller's and stay borrowed for the call, which
     // is exactly the lifetime the ABI asks for.
     let params: Vec<ffi::IgnisSamplingParams> = lanes
         .iter()
-        .map(|lane| ffi::IgnisSamplingParams {
-            permitted_count: lane.permitted.len() as u32,
-            permitted_ids: match lane.permitted.is_empty() {
-                true => std::ptr::null(),
-                false => lane.permitted.as_ptr(),
-            },
-            ..lane.sampling.to_ffi()
+        .enumerate()
+        .map(|(index, lane)| {
+            permitted_params(
+                &format!("decode_program_batch_permitted: lane {index}"),
+                lane.sampling,
+                lane.permitted,
+            )
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let mut tokens = vec![-1i32; handles.len()];
     let mut probabilities = vec![0f32; handles.len()];
     let options = ffi::IgnisDecodeOptions {
@@ -1205,13 +1226,7 @@ pub fn prefill_program_multimodal(
     span: MultimodalPrefill<'_>,
     out_logits: Option<&mut [f32]>,
 ) -> Result<f32, String> {
-    if permitted.len() > ffi::MAX_PERMITTED_TOKENS {
-        return Err(format!(
-            "prefill_program_multimodal: {} ids, past the leaf's {} (a set is refused, never truncated)",
-            permitted.len(),
-            ffi::MAX_PERMITTED_TOKENS
-        ));
-    }
+    let params = permitted_params("prefill_program_multimodal", sampling, permitted)?;
     if span.positions.len() != 3 * token_ids.len() {
         return Err(format!(
             "prefill_program_multimodal: {} positions for {} tokens",
@@ -1242,14 +1257,6 @@ pub fn prefill_program_multimodal(
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
-    };
-    let params = ffi::IgnisSamplingParams {
-        permitted_count: permitted.len() as u32,
-        permitted_ids: match permitted.is_empty() {
-            true => std::ptr::null(),
-            false => permitted.as_ptr(),
-        },
-        ..sampling.to_ffi()
     };
     let rc = unsafe {
         ffi::ignis_program_prefill(

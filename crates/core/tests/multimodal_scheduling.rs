@@ -44,7 +44,7 @@ fn multimodal_input(tokens: usize, media: Vec<MediaItem>, max: u32) -> RequestIn
         opener_tokens: None,
         user_turn_tokens: None,
         system_block_tokens: None,
-        program: None,
+        constrained: None,
     }
 }
 

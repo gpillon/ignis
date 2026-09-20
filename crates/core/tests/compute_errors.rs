@@ -64,7 +64,7 @@ fn failed_prefill_leaves_the_request_retryable() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
-                program: None,
+                constrained: None,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -141,7 +141,7 @@ fn a_prefill_that_keeps_failing_ends_its_request_with_an_error() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
-                program: None,
+                constrained: None,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -206,7 +206,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![1, 2],
                 params: Default::default(),
-                program: None,
+                constrained: None,
             },
             ignis_core::types::RequestClass::Agent,
         )
@@ -222,7 +222,7 @@ fn failed_decode_ends_the_request_and_releases_its_lane() {
                 model: "qwen3.8-27b".into(),
                 tokens: vec![3, 4],
                 params: Default::default(),
-                program: None,
+                constrained: None,
             },
             ignis_core::types::RequestClass::Agent,
         )

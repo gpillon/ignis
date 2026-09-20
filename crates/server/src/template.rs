@@ -443,9 +443,9 @@ pub trait TemplateProvider: Send + Sync {
     }
 
     /// Encode `text` as the loaded tokenizer does, with no chat template
-    /// around it (GitHub #242): the token ids a **program** forces.
+    /// around it (GitHub #242): the token ids a **constrained decode** forces.
     ///
-    /// A program's prompt ends in a literal the model is made to have
+    /// A run's prompt ends in a literal the model is made to have
     /// written — spec 06's `{"x":` — and its schedule restricts each
     /// following step to an alphabet of single tokens. Both are token ids,
     /// not text, and only a tokenizer can produce them. It is the same seam
@@ -458,7 +458,7 @@ pub trait TemplateProvider: Send + Sync {
     /// sixteen thousand when the evidence is a screenshot.
     ///
     /// `None` for a provider with no real tokenizer, which is the honest
-    /// answer: `/v1/decide` then refuses a program rather than forcing ids
+    /// answer: `/v1/decide` then refuses a constrained decode rather than forcing ids
     /// it invented.
     fn encode_literal(&self, text: &str) -> Option<Vec<TokenId>> {
         let _ = text;
@@ -730,7 +730,7 @@ mod tests {
         let p = SimpleTemplateProvider;
         assert!(p.apply_chat_template(&[], &opts(), no_tools()).expect("render").tokens.is_empty());
         assert!(p
-            .apply_chat_template(&[msg("user", "   ")], &opts(), no_tools()).expect("render").tokens
+            .apply_chat_template(&[msg("user", " ")], &opts(), no_tools()).expect("render").tokens
             .is_empty());
     }
 

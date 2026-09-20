@@ -38,7 +38,7 @@ fn input(max: u32) -> RequestInput {
             max_tokens: Some(max),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
     }
 }
 
@@ -286,7 +286,7 @@ fn a_burst_on_one_prefix_overflows_through_materialized_snapshots_without_repref
             max_tokens: Some(max),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
 };
 
     // Eight fillers share one 16-token prefix (a whole page): the first
@@ -400,7 +400,7 @@ fn a_request_holding_a_shared_prefix_is_evicted_with_its_prefix_materialized() {
             max_tokens: Some(max),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
 };
 
     // `main` publishes a one-page head; `sub` claims it and prefills only its
@@ -502,7 +502,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                         max_tokens: Some(20),
                         ..DecodeParams::default()
                     },
-                    program: None,
+                    constrained: None,
                 },
                 RequestClass::Interactive,
             )
@@ -526,7 +526,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     max_tokens: Some(8),
                     ..DecodeParams::default()
                 },
-                program: None,
+                constrained: None,
             },
             RequestClass::Interactive,
         )
@@ -548,7 +548,7 @@ fn eviction_prefers_agent_over_an_older_interactive_request() {
                     max_tokens: Some(8),
                     ..DecodeParams::default()
                 },
-                program: None,
+                constrained: None,
             },
             RequestClass::Agent,
         )

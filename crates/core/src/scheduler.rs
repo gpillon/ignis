@@ -149,19 +149,22 @@ pub struct PrefillJob {
     /// `logits[i]` is the logit of `readout[i]`.
     pub readout: Option<std::sync::Arc<[TokenId]>>,
     /// The **permitted token set** this chunk's own draw is restricted to
-    /// (GitHub #242, ADR 0034), if this is a **program** request's last
+    /// (GitHub #242, ADR 0034), if this is a **constrained decode** request's last
     /// chunk.
     ///
     /// Set for the same reason and on the same chunk as
     /// [`PrefillJob::readout`], and for one more: a prefill *draws the first
     /// token of the run that follows it*, which the first decode round then
-    /// returns ([`crate::program`]). A program that constrained only its
+    /// returns ([`crate::constrained`]). A constrained decode that constrained only its
     /// rounds would commit the prompt's own free successor as the first
     /// token of its forced text.
     ///
-    /// `None` on every other job, which pays nothing for it: the backend
-    /// masks no logits and the round takes whatever path it takes.
-    pub permitted: Option<crate::program::PermittedSet>,
+    /// `None` on every other job, and an ordinary job pays a borrow for it:
+    /// the backend reads it as an empty slice rather than building one
+    /// (`RuntimeCompute::prefill_step`), masks nothing, and takes whatever
+    /// path it would have taken. The measured claim is only that — no
+    /// allocation and no device work — not that the field is free to name.
+    pub permitted: Option<crate::constrained::PermittedSet>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -183,8 +186,8 @@ pub struct DecodeJob {
     /// #242) — whose token this lane returns **next** round, not this one.
     ///
     /// The lag is the leaf's, and the seam states it rather than hiding it
-    /// ([`crate::program`]): a round returns the token the previous call
-    /// drew. So a K-step program's round `i` carries step `i`'s set and
+    /// ([`crate::constrained`]): a round returns the token the previous call
+    /// drew. So a K-step run's round `i` carries step `i`'s set and
     /// returns step `i-1`'s token; its first round carries step 1 and
     /// returns the token [`PrefillJob::permitted`] drew; and its last round
     /// carries `None`, drawing a token nobody reads.
@@ -194,7 +197,7 @@ pub struct DecodeJob {
     /// implementation that reported this round's draw probability beside
     /// the previous round's token would be off by one step, which on a
     /// number is off by a factor of ten.
-    pub permitted: Option<crate::program::PermittedSet>,
+    pub permitted: Option<crate::constrained::PermittedSet>,
 }
 
 /// One job's result from a prefill step (GitHub #192): what the chunk cost
@@ -276,7 +279,7 @@ pub struct DecodeOutcome {
     /// The probability of each token in `tokens`, within the permitted set
     /// **that token** was drawn from (GitHub #242): parallel to `tokens`,
     /// and **empty** for every lane that drew unconstrained — which is every
-    /// lane the engine has apart from a program's.
+    /// lane the engine has apart from a run's.
     ///
     /// A backend fills this from the draw one round earlier than the one
     /// reporting it, because that is the round the token came from

@@ -47,7 +47,7 @@ pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
 pub mod prefix;
-pub mod program;
+pub mod constrained;
 pub mod request;
 pub mod retained_slot;
 pub mod rope_scaling;

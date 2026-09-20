@@ -1,4 +1,4 @@
-//! A **program**: a decision whose answer is *generated*, one constrained
+//! A **constrained decode**: a decision whose answer is *generated*, one constrained
 //! token at a time (GitHub #242, ADR 0034, spec 06).
 //!
 //! The readout primitives ([`crate::decision`]) read one position and name
@@ -26,7 +26,7 @@
 //! keeps it visible rather than hiding it — a backend that hid it would let
 //! a scheduler with exactly that bug pass on CPU.
 //!
-//! So a K-step program costs one constrained prefill and K rounds: round `i`
+//! So a K-step run costs one constrained prefill and K rounds: round `i`
 //! returns step `i-1`'s token and draws step `i`'s. The final round draws
 //! nothing anybody wants, and its token is discarded with the sequence.
 
@@ -45,27 +45,27 @@ use crate::types::TokenId;
 /// that a second caller walks past.
 pub const MAX_PERMITTED_TOKENS: usize = 32;
 
-/// The tokens one step of a program may draw from.
+/// The tokens one step of a constrained decode may draw from.
 ///
-/// An `Arc` because a program is cloned onto every job of the request that
+/// An `Arc` because a constrained decode is cloned onto every job of the request that
 /// carries it, and a step's set is the same handful of digit ids each time.
 pub type PermittedSet = Arc<[TokenId]>;
 
-/// The schedule of permitted sets a **program request** generates under:
+/// The schedule of permitted sets a **constrained request** generates under:
 /// one set per token it will emit, in order.
 ///
 /// Its length is the request's whole generation budget. There is no other
-/// stopping condition: a program ends when its schedule is exhausted and
+/// stopping condition: a constrained decode ends when its schedule is exhausted and
 /// **never on EOS**, because a token drawn from a set of digits cannot be
-/// the EOS token, and a program that could stop early would return a number
+/// the EOS token, and a constrained decode that could stop early would return a number
 /// with fewer digits than the caller asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Program {
+pub struct Schedule {
     steps: Vec<PermittedSet>,
 }
 
-impl Program {
-    /// Build a program from its steps, or refuse it.
+impl Schedule {
+    /// Build a constrained decode from its steps, or refuse it.
     ///
     /// A step is refused rather than truncated or widened, for the reason
     /// the leaf refuses one: a constraint silently dropped is a wrong answer
@@ -78,15 +78,15 @@ impl Program {
     /// uncertainty.
     pub fn new(steps: Vec<Vec<TokenId>>) -> Result<Self, String> {
         if steps.is_empty() {
-            return Err("a program must carry at least one step".to_owned());
+            return Err("a constrained decode must carry at least one step".to_owned());
         }
         for (index, step) in steps.iter().enumerate() {
             if step.is_empty() {
-                return Err(format!("program step {index} permits no token at all"));
+                return Err(format!("schedule step {index} permits no token at all"));
             }
             if step.len() > MAX_PERMITTED_TOKENS {
                 return Err(format!(
-                    "program step {index} permits {} tokens; {MAX_PERMITTED_TOKENS} is the leaf's cap, \
+                    "schedule step {index} permits {} tokens; {MAX_PERMITTED_TOKENS} is the leaf's cap, \
                      and a set past it is refused, never truncated",
                     step.len()
                 ));
@@ -97,12 +97,12 @@ impl Program {
         })
     }
 
-    /// How many tokens this program emits — its generation budget.
+    /// How many tokens this constrained decode emits — its generation budget.
     pub fn len(&self) -> usize {
         self.steps.len()
     }
 
-    /// Never true: [`Program::new`] refuses an empty schedule. Present
+    /// Never true: [`Schedule::new`] refuses an empty schedule. Present
     /// because `len` without it is a clippy lint and a reader's question.
     pub fn is_empty(&self) -> bool {
         self.steps.is_empty()
@@ -120,7 +120,7 @@ impl Program {
     }
 }
 
-/// One token a program drew, and how much of its own permitted set stood
+/// One token a constrained decode drew, and how much of its own permitted set stood
 /// behind it.
 ///
 /// The probability is the **restricted softmax** over that step's set alone,
@@ -143,26 +143,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_program_refuses_what_the_leaf_would_refuse() {
-        assert!(Program::new(Vec::new()).is_err(), "an empty schedule");
+    fn a_schedule_refuses_what_the_leaf_would_refuse() {
+        assert!(Schedule::new(Vec::new()).is_err(), "an empty schedule");
         assert!(
-            Program::new(vec![vec![1, 2], Vec::new()]).is_err(),
+            Schedule::new(vec![vec![1, 2], Vec::new()]).is_err(),
             "a step that permits nothing"
         );
         let too_wide: Vec<TokenId> = (0..=MAX_PERMITTED_TOKENS as TokenId).collect();
-        let refusal = Program::new(vec![too_wide]).expect_err("a step past the cap");
+        let refusal = Schedule::new(vec![too_wide]).expect_err("a step past the cap");
         assert!(
             refusal.contains("refused, never truncated"),
             "and says so rather than quietly cutting it: {refusal}"
         );
     }
 
+    /// The cap is written down three times — here, in `step.rs`'s FFI
+    /// block, and in `ignis_step.h` — and a restatement nobody checks is a
+    /// restatement that drifts. This ties the two Rust copies together; the
+    /// C copy is tied to `step.rs`'s by the size-prefixed struct the leaf
+    /// validates (ADR 0016).
+    ///
+    /// Drift here does not fail loudly: the wide side would build a set the
+    /// narrow side refuses, and the refusal would name a cap the caller
+    /// cannot see.
+    #[cfg(feature = "cuda")]
     #[test]
-    fn a_program_hands_out_its_steps_and_then_stops() {
-        let program = Program::new(vec![vec![1, 2], vec![3]]).expect("two steps");
-        assert_eq!(program.len(), 2);
-        assert_eq!(program.step(0).as_deref(), Some(&[1, 2][..]));
-        assert_eq!(program.step(1).as_deref(), Some(&[3][..]));
-        assert_eq!(program.step(2), None, "the last round draws nothing wanted");
+    fn the_cap_is_the_leafs_cap() {
+        assert_eq!(MAX_PERMITTED_TOKENS, crate::step::ffi::MAX_PERMITTED_TOKENS);
+    }
+
+    #[test]
+    fn a_schedule_hands_out_its_steps_and_then_stops() {
+        let schedule = Schedule::new(vec![vec![1, 2], vec![3]]).expect("two steps");
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule.step(0).as_deref(), Some(&[1, 2][..]));
+        assert_eq!(schedule.step(1).as_deref(), Some(&[3][..]));
+        assert_eq!(schedule.step(2), None, "the last round draws nothing wanted");
     }
 }

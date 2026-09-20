@@ -529,6 +529,29 @@ When output names a domain concept, use the term as defined here.
   a declared set of tokens. What a **readout** is to one position, this is to
   a run of them: the answer's shape is the caller's, so nothing has to parse
   what comes back. It is the only decision primitive that generates tokens.
+  The wire exposes it as `number`, `point` and `box` (GitHub #242): a number
+  read digit by digit, and two or four of those.
+- **Permitted set** — the vocabulary entries one step of a **constrained
+  decode** may draw from, at most 32 of them. The leaf drives every other
+  column of the logits row to `-1e30` before the vendored sampler runs, so
+  the constraint composes with temperature, top-k, seeds and penalties
+  instead of replacing them, and what comes back is a token id like any
+  other. A set the leaf cannot honour is **refused, never truncated**: a
+  constraint silently narrowed is a wrong answer that looks like a right one.
+- **Schedule** — one **permitted set** per token a **constrained decode**
+  will emit, in order. It is that request's whole generation budget and its
+  whole stopping condition: the run ends when the schedule is spent, with
+  `stop`, and never on EOS, because a token drawn from a set of digits cannot
+  be one. Not the request **scheduler's** anything — it schedules alphabets,
+  not requests. A set of cardinality one is how a literal is forced
+  mid-generation.
+- **Draw** — one token a **constrained decode** emitted, and its probability
+  *within that step's **permitted set*** — a restricted softmax over at most
+  32 logits, computed on the device and temperature-free on purpose: it is
+  the model's confidence in the token, not the chance the sampler happened to
+  pick it. A run's draws, in order, are its **trace**. The first token of a
+  run is drawn by its **prefill**, not by its first decode round, because a
+  round returns the token the previous call made ready.
 - **Answer mass** — how much of the whole next-token distribution the answer
   tokens hold, `exp(logsumexp(answer logits) - logsumexp(all logits))`. It is
   what says whether a restricted softmax is reading the model or renormalizing

@@ -61,7 +61,7 @@ fn alphabet() -> AnswerAlphabet {
     AnswerAlphabet::from_tokenizer(&WideTokenizer::new())
 }
 
-/// The literal encoder a **program** question's plan needs (GitHub #242):
+/// The literal encoder a **constrained decode** question's plan needs (GitHub #242):
 /// one token per character, so every digit is a single vocabulary entry and
 /// an arbitrary forced literal has an encoding.
 ///
@@ -455,7 +455,7 @@ fn a_malformed_question_refuses_the_whole_request() {
     let cases: Vec<(&str, JsonValue)> = vec![
         (
             "empty_instructions",
-            json!({ "bad": { "type": "noul", "instructions": "   " } }),
+            json!({ "bad": { "type": "noul", "instructions": " " } }),
         ),
         (
             "missing_criteria",
@@ -752,7 +752,7 @@ fn digits_outside_the_served_range_is_refused() {
 #[test]
 fn a_program_without_digits_takes_the_measured_width() {
     let prepared = prepare_one_wire(&program_body("point", "")).expect("a point");
-    assert_eq!(prepared[0].digits, ignis_server::program::DEFAULT_DIGITS);
+    assert_eq!(prepared[0].digits, ignis_server::numbers::DEFAULT_DIGITS);
     let plan = prepared[0].plan.as_ref().expect("a point carries a schedule");
     // Two axes of three digits, with the separator's tokens between them.
     assert_eq!(plan.axes.len(), 2);
@@ -770,19 +770,19 @@ fn a_field_the_primitive_cannot_honour_is_refused_not_ignored() {
     assert_eq!(on_a_readout.code, "digits_unsupported", "{}", on_a_readout.message);
 
     let on_a_program = prepare_one_wire(&program_body("number", r#","criteria":{"a":"b"}"#))
-        .expect_err("a program declares no options");
+        .expect_err("a constrained decode declares no options");
     assert_eq!(on_a_program.code, "criteria_unsupported", "{}", on_a_program.message);
 }
 
-/// The system text a program is put under declares the shape and the scale,
+/// The system text a constrained decode is put under declares the shape and the scale,
 /// and its user turn carries the instruction alone.
 #[test]
-fn a_programs_prompt_declares_its_shape_and_asks_the_instruction_alone() {
+fn a_constrained_questions_prompt_declares_its_shape_and_asks_the_instruction_alone() {
     let prepared = prepare_one_wire(&program_body("point", "")).expect("a point");
     let messages = messages_for(&Evidence::Json(json!("s")), &prepared[0]);
     let system = messages[0].content.text();
     assert!(
-        system.starts_with(&ignis_server::program::point_system(3)),
+        system.starts_with(&ignis_server::numbers::point_system(3)),
         "the measured point instruction leads the system block: {system}"
     );
     assert!(
@@ -794,7 +794,7 @@ fn a_programs_prompt_declares_its_shape_and_asks_the_instruction_alone() {
     assert_eq!(ask["instruction"], "where?");
     assert!(
         ask.get("options").is_none(),
-        "a program declares no options: the alphabet is forced, not listed"
+        "a constrained decode declares no options: the alphabet is forced, not listed"
     );
 }
 
@@ -815,11 +815,11 @@ fn each_primitive_forces_the_json_shape_its_prompt_declared() {
         let forced: usize = separators.iter().map(|s| ids(s).len()).sum();
         let axes = separators.len() + 1;
         assert_eq!(
-            plan.program.len(),
+            plan.schedule.len(),
             axes * 2 + forced,
             "{kind}: two digits per axis plus every separator, one step per token"
         );
-        for step in plan.program.steps() {
+        for step in plan.schedule.steps() {
             assert!(
                 step.len() == 10 || step.len() == 1,
                 "{kind}: a step is the ten digits or one forced token"

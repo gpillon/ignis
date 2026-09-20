@@ -600,7 +600,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
     let leaf = Arc::new(StubLeaf::with_tokens([11, 12, 13]));
     let model = Arc::new(Model::load(leaf.clone()).unwrap());
     let compute = RuntimeCompute::new(model, 99);
-    let digits: ignis_core::program::PermittedSet = vec![3, 4, 5].into();
+    let digits: ignis_core::constrained::PermittedSet = vec![3, 4, 5].into();
 
     // The prefill draws the run's first token under the first step's set.
     compute
@@ -615,7 +615,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
         "the set reached the leaf's prefill, which is where a constrained run starts"
     );
 
-    let round = |permitted: Option<ignis_core::program::PermittedSet>| {
+    let round = |permitted: Option<ignis_core::constrained::PermittedSet>| {
         compute
             .decode_step(&[DecodeJob {
                 request: 1,
@@ -648,7 +648,7 @@ fn the_adapter_holds_a_constrained_draw_for_the_round_that_emits_it() {
     assert_eq!(after.tokens, vec![13]);
     assert!(
         after.probabilities.is_empty(),
-        "a round after an unconstrained one reports nothing: the entry is          removed when it is used, not left for the next lane to pick up"
+        "a round after an unconstrained one reports nothing: the entry is removed when it is used, not left for the next lane to pick up"
     );
     assert_eq!(
         leaf.calls.lock().unwrap().decode_permitted,
@@ -920,7 +920,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_completes() {
                     max_tokens: Some(1),
                     ..DecodeParams::default()
                 },
-                program: None,
+                constrained: None,
             },
             RequestClass::Interactive,
         )
@@ -954,7 +954,7 @@ fn scheduler_passes_the_full_sequence_reservation_to_first_prefill() {
                 model: "stub".into(),
                 tokens: vec![1, 2, 3],
                 params: DecodeParams::default(),
-                program: None,
+                constrained: None,
             },
             RequestClass::Interactive,
         )
@@ -999,7 +999,7 @@ fn scheduler_passes_the_shared_prefix_boundary_to_prefill() {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
 };
     scheduler
         .submit(input(vec![1, 2, 3, 4]), RequestClass::Interactive)
@@ -1057,7 +1057,7 @@ fn a_full_prompt_match_is_allocated_against_the_prefix_and_never_prefilled() {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
 };
     scheduler
         .submit(input(), RequestClass::Interactive)
@@ -1114,7 +1114,7 @@ fn checkpoint_input(tokens: Vec<u32>, opener: Option<u32>) -> RequestInput {
             max_tokens: Some(3),
             ..DecodeParams::default()
         },
-        program: None,
+        constrained: None,
     }
 }
 
@@ -1401,7 +1401,7 @@ fn scheduler_releases_the_adapter_sequence_when_a_request_is_evicted() {
                         max_tokens: Some(8),
                         ..DecodeParams::default()
                     },
-                    program: None,
+                    constrained: None,
                 },
                 RequestClass::Agent,
             )
@@ -1746,7 +1746,7 @@ fn a_scheduled_multimodal_request_encodes_and_releases_every_item() {
                 opener_tokens: None,
                 user_turn_tokens: None,
                 system_block_tokens: None,
-                program: None,
+                constrained: None,
             },
             RequestClass::Agent,
         )
