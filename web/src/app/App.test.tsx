@@ -21,7 +21,10 @@ describe("App", () => {
   it("keeps the Decide tab mounted behind the chat, so a typed request survives a look elsewhere", () => {
     const html = renderToStaticMarkup(<App />);
     expect(html).toContain("Nothing is generated");
-    expect(html).toContain('aria-label="Decide"');
+    // Its three columns, each with its own scroll.
+    expect(html).toContain('aria-label="Decisions"');
+    expect(html).toContain('aria-label="Answers"');
+    expect(html).toContain('aria-label="Questions"');
   });
 
   it("offers the Decide tab from the start and the Monitor only once /ui/metrics has answered", () => {

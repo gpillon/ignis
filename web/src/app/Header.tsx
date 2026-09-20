@@ -32,11 +32,14 @@ export function Header({
   monitorAvailable?: boolean;
 }) {
   const chat = view === "chat";
+  // The chat and the bench both have two side columns that are drawers below
+  // `lg`; the Monitor has none.
+  const sided = view !== "monitor";
   return (
     <header className="z-20 shrink-0 bg-kiln text-[#eae8e4]">
       <div className="flex items-center gap-3 px-4 py-3 sm:gap-4 md:px-6">
-        {chat && (
-          <HeaderButton label="Sessions" onClick={() => onOpen("sessions")}>
+        {sided && (
+          <HeaderButton label={chat ? "Sessions" : "Decisions"} onClick={() => onOpen("sessions")}>
             <IconSessions />
           </HeaderButton>
         )}
@@ -61,8 +64,8 @@ export function Header({
             Lock
           </button>
         )}
-        {chat && (
-          <HeaderButton label="Settings" onClick={() => onOpen("settings")}>
+        {sided && (
+          <HeaderButton label={chat ? "Settings" : "Questions"} onClick={() => onOpen("settings")}>
             <IconSliders />
           </HeaderButton>
         )}

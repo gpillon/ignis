@@ -37,6 +37,23 @@ describe("Answers", () => {
     expect(html).toContain("department");
   });
 
+  it("sets the question in the ink and the headline figure in the ember, and rules one answer off from the next", () => {
+    const html = render([question("a", "noul"), question("b", "noul"), question("c", "noul")], {
+      a: { type: "noul", noul: 0.1 },
+      b: { type: "noul", noul: 0.2 },
+      c: { type: "noul", noul: 0.3 },
+    });
+    // The question is text and wears a text token; the ember is spent on the
+    // one figure the panel exists to report.
+    expect(html).toMatch(/<h3 class="[^"]*font-bold[^"]*text-ink[^"]*">/);
+    expect(html).toMatch(/<p class="[^"]*text-\[28px\][^"]*text-ember[^"]*">No<\/p>/);
+    // A rule between panels, and not above the first one.
+    const items = html.match(/<li class="[^"]*"><section>/g) ?? [];
+    expect(items).toHaveLength(3);
+    expect(items[0]).toBe('<li class=""><section>');
+    expect(items.slice(1).every((li) => li.includes("border-t"))).toBe(true);
+  });
+
   it("falls back to the answer name when a question asked nothing", () => {
     const html = render([{ ...question("bare", "noul"), instructions: jsonString("") }], { bare: { type: "noul", noul: 0.5 } });
     expect(html).toMatch(/<h3[^>]*>bare<\/h3>/);
@@ -52,13 +69,24 @@ describe("Answers", () => {
     expect(html).toContain("max-h-56");
     expect(html).toContain("Full size");
     expect(html).toContain("cursor-zoom-in");
+    // The picture and its figures read side by side, the picture centred in
+    // its half while the caption spans it.
+    expect(html).toContain("sm:grid-cols-2");
+    expect(html).toContain("mx-auto block w-fit");
+    // The caveat is about the figures as much as the drawing, so it runs under
+    // both columns rather than under the picture.
+    expect(html).toMatch(/<p class="[^"]*sm:col-span-2[^"]*">\s*The halo is the model/);
   });
 
-  it("leads with the cost and says a readout generated nothing", () => {
-    const html = render([question("a", "noul")], { a: { type: "noul", noul: 0.86 } });
+  it("closes with the cost, under the answers it paid for, and says a readout generated nothing", () => {
+    const html = render([{ ...question("a", "noul"), instructions: jsonString("Urgent?") }], { a: { type: "noul", noul: 0.86 } });
     expect(html).toContain("312");
     expect(html).toContain("84");
     expect(html).toContain("Nothing was generated");
+    // The receipt comes last: after the answer, and above the raw body.
+    expect(html.indexOf("Urgent?")).toBeLessThan(html.indexOf("prompt tokens"));
+    expect(html.indexOf("prompt tokens")).toBeLessThan(html.indexOf("answer mass"));
+    expect(html.indexOf("answer mass")).toBeLessThan(html.indexOf("Response body"));
   });
 
   it("says the generated tokens are real when a constrained decode was asked", () => {
@@ -66,17 +94,25 @@ describe("Answers", () => {
     expect(html).toContain("generates a digit per step");
   });
 
-  it("reads a noul as the probability of yes, with the caller's own descriptions", () => {
-    const html = render([question("a", "noul", { yes: "Time-sensitive", no: "Not urgent" })], { a: { type: "noul", noul: 0.862 } });
-    expect(html).toContain("0.862");
-    expect(html).toContain("Time-sensitive");
-    expect(html).toContain("Not urgent");
+  it("leads a noul with the option that won, in the caller's own words, and reads the confidence under it", () => {
+    const yes = render([question("a", "noul", { yes: "Time-sensitive", no: "Not urgent" })], { a: { type: "noul", noul: 0.862 } });
+    expect(yes).toContain(">Time-sensitive</p>");
+    expect(yes).not.toContain("Not urgent");
+    // `noul` carries no confidence of its own: the winner's own probability is
+    // it, and the raw p stays on the page beside it.
+    expect(yes).toContain("0.862");
+
+    const no = render([question("a", "noul", { yes: "Time-sensitive", no: "Not urgent" })], { a: { type: "noul", noul: 0.138 } });
+    expect(no).toContain(">Not urgent</p>");
+    // 1 - p for a no, and the raw p still says which way it was read.
+    expect(no).toContain("0.862");
+    expect(no).toContain("p(yes) = 0.138");
   });
 
   it("falls back to Yes and No when a noul declared no descriptions", () => {
     const html = render([question("a", "noul")], { a: { type: "noul", noul: 0.2 } });
-    expect(html).toContain("0.200");
-    expect(html).toContain("No");
+    expect(html).toContain(">No</p>");
+    expect(html).toContain("p(yes) = 0.200");
   });
 
   it("lists a choice in the order the request declared, not the order it came back", () => {
@@ -121,6 +157,14 @@ describe("Answers", () => {
     // 1.6 across three levels is 80% of the axis: past Frustrated, short of Very angry.
     expect(html).toContain("left:80%");
     expect(html).toContain("1.60");
+    // n + 1 ticks for n levels: a level is the band between two of them.
+    // Three levels, four ticks — at 0%, a third, two thirds, and the right
+    // edge, which is drawn from the edge because `left: 100%` never shows.
+    expect((html.match(/h-1\.5 w-px bg-line/g) ?? [])).toHaveLength(4);
+    expect(html).toContain("left:0%");
+    expect(html).toContain("left:33.33333333333333%");
+    expect(html).toContain("left:66.66666666666666%");
+    expect(html).toContain("right-0 h-1.5 w-px bg-line");
   });
 
   it("draws a score's levels on the probability's own scale, the same as a choice's rows", () => {
@@ -132,6 +176,21 @@ describe("Answers", () => {
     // bar grows to is on the element from the first paint.
     expect(html).toContain("--fill:60%");
     expect(html).toContain("--fill:40%");
+  });
+
+  it("says what a confidence means, and says a score's differently from a choice's", () => {
+    const choice = render([question("c", "choice", { options: [{ key: "a", description: "" }] })], {
+      c: { type: "choice", choice: "a", probabilities: { a: 1 }, confidence: 1 },
+    });
+    expect(choice).toContain("the winner&#x27;s own share");
+
+    const score = render([question("s", "score", { levels: ["Low", "High"] })], {
+      s: { type: "score", score: 0.5, legend: { "0": "Low", "1": "High" }, probabilities: { "0": 0.5, "1": 0.5 }, confidence: 0 },
+    });
+    // A score's is the spread, not the tallest bar — the one thing a
+    // winner's-share confidence would hide.
+    expect(score).toContain("how tightly the levels cluster");
+    expect(score).toContain("Not the tallest bar");
   });
 
   it("shows a number with its uncertainty and one column per place", () => {
@@ -157,6 +216,14 @@ describe("Answers", () => {
     expect(html).toContain('viewBox="0 0 400 200"');
     expect(html).toContain('cx="120"');
     expect(html).toContain('cy="64"');
+    // White over black and never a hue: the mark lands on a picture nobody
+    // chose for it. The strokes are in screen pixels, so the same crosshair is
+    // readable in the preview and at full size.
+    expect(html).toContain('stroke="#fff"');
+    expect(html).toContain('stroke="#000"');
+    expect(html).toContain('vector-effect="non-scaling-stroke"');
+    // Sized off the image's shorter side (200), with a gap at the answer's own pixel.
+    expect(html).toContain("M102,64H116 M124,64H138");
     // The figures are in the table too, so the drawing is never the only copy.
     expect(html).toContain(">120<");
     expect(html).toContain(">300<");
@@ -182,6 +249,10 @@ describe("Answers", () => {
     expect(html).toContain('height="100"');
     // The band is the nominal rect grown by each edge's own sigma.
     expect(html).toContain('width="106"');
+    // Four axes read two to a row, not as a column taller than the picture.
+    expect(html).toContain("grid grid-cols-2");
+    expect(html).toContain('stroke="#fff"');
+    expect(html).toContain('vector-effect="non-scaling-stroke"');
   });
 
   it("says a point has no image to draw on rather than drawing nowhere", () => {

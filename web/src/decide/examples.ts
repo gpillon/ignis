@@ -141,7 +141,9 @@ export const EXAMPLES: Example[] = [
       extras: [],
       questions: [
         question("hottest", "point", "Where is the brightest part of the flame?"),
-        question("mark", "box", "Draw a box around the whole flame."),
+        // The hexagon is the one hard-edged shape in the mark, so a box around
+        // it is an answer that can be looked at and agreed with.
+        question("hexagon", "box", "Draw a box around the hexagon."),
         question("on_dark", "noul", "Is this mark on a dark background?"),
       ],
     }),

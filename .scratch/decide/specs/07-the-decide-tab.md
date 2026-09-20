@@ -7,15 +7,22 @@ is **built, sent and read**. The endpoint exists (spec 03, spec 06) and is
 reachable only by `curl`; nothing in the Playground shows what a decision
 costs or what an answer looks like. This is that surface.
 
-It is not a chat. A decision is an *instrument reading*: point it at evidence,
-declare what to measure, get a distribution and an uncertainty back. The tab
-is shaped as a bench — the sample on the left, the readings on the right —
-and not as a message thread.
+It is not a chat, but it is worked the way the chat is worked: a list of
+sessions on the left, what came back in the middle, the controls on the right,
+three columns that scroll on their own. A decision is an *instrument reading* —
+point it at evidence, declare what to measure, get a distribution and an
+uncertainty back — so the bench that writes the request takes the edge and the
+answers take the middle.
 
 ## Scope
 
 - A new `View` value, `decide`, third in the header switch after `Playground`
   and before `Monitor`.
+- **Sessions**: several decisions worked on at once, listed on the left, each
+  with its own draft, its own evidence and its own answers.
+- **Three columns**, each with its own scroll: the decisions, the answers, the
+  bench. Below `lg` the two side columns are drawers, opened from the header's
+  own buttons like the chat's.
 - A **question builder**: add, reorder, edit and remove typed questions with
   no JSON typed at all — all six primitives (`noul`, `choice`, `score`,
   `number`, `point`, `box`).
@@ -69,6 +76,29 @@ and not as a message thread.
 - **Thinking is never sent.** Not a field the tab exposes, not a field it
   emits — spec 03 answers 422 for it, and there is nothing to gain by
   offering a control whose only outcome is a refusal.
+- **Sessions get their own module, not the chat's.** `sessions/sessions.ts`
+  carries messages, a figures log, attached files, tool runs and the moment a
+  conversation opened; a decision carries a draft, the evidence shapes set
+  aside, and one answered run. The two share `id` and a name, so a shared type
+  would be an abstraction over nothing — and a generic list over two types with
+  no common field is more code than either. What *is* taken is the mechanics,
+  spelled the same way in `decide/sessions.ts`: an untouched active session is
+  reused rather than piling up empties, removing the active one moves to
+  whichever took its place, removing the last leaves a fresh one.
+- **A decision's name is derived, not stored.** The chat names a session from
+  its first prompt, which is fixed the moment it is sent. A draft is edited,
+  sent, and edited again, so a name written once would describe a decision that
+  no longer exists: it is what the first question asks, else the evidence.
+- **The bench is on the right.** Same reason the chat puts the transcript in
+  the middle and its controls at the edges: the answers are what a reader came
+  for. It is wider than the chat's settings panel — a question is a paragraph
+  and a list of options, not a row of switches — and the `Decide` button is
+  pinned at its foot the way the composer is pinned under the transcript.
+- **A send belongs to its decision.** Each one carries its own in-flight flag
+  and its own abort, so a run in one session can be watched or stopped while
+  another is still going, and switching away does not cancel anything.
+- **A refused re-send keeps the answers already paid for.** The refusal is a
+  banner above them, not a replacement for them.
 - **The tab stays mounted.** Like the chat under it: it holds a whole typed
   request, and a glance at the Monitor is not a reason to lose it. Nothing in
   it fetches on mount, so an always-mounted view costs nothing.
@@ -128,6 +158,15 @@ pointer, which earns itself because the score genuinely lands *between* the
 levels the bars sit on. `--good`/`--warn`/`--fault` stay reserved for state
 (valid, unsent, refused).
 
+**A narrow control cannot wear `field`.** `ui/classes.ts`'s `field` carries
+`w-full`, and a second width utility beside it does not win: Tailwind emits its
+own utilities in its own order, so `` `${field} w-[7.5rem]` `` resolves to
+`width: 100%` however the class attribute is written. On a `shrink-0` flex item
+that width cannot be given back, and the row is wider than the column — which
+is what put a horizontal scrollbar on the bench. `fieldLook` is the same field
+with no width of its own, and `field` is now `w-full` plus it. Measured, not
+reasoned: the `<select>` was 396px in a 396px row where 120px was asked for.
+
 **Type.** Three roles, no fourth: figures and headings in the display face
 with `tabular-nums`, prose in the sans, JSON and digit traces in the mono.
 Option labels are sentence case, as written by whoever declared them — the
@@ -137,31 +176,43 @@ tab never upper-cases a label it was handed.
 stacked column below `lg` with the answers first once a run lands.
 
 ```
-+-------------------------------------------------------------------------+
-| ignis   Playground . Decide . Monitor                 qwen3-8b o ready  |
-+----------------------------------+--------------------------------------+
-| Evidence           text json img |  Answers        312 in . 0 out . 84ms|
-| +------------------------------+ |                                      |
-| | Help! My payouts have been   | |  is_urgent                      noul |
-| | failing for 3 days.          | |  ################........  0.86      |
-| +------------------------------+ |  Explicitly time-sensitive           |
-|                                  |                                      |
-| Questions              Build JSON|  department                   choice |
-| +------------------------------+ |  billing    #################  0.91 *|
-| | is_urgent   [noul   v]     x | |  technical  ##                0.07   |
-| | Does this convey urgency?    | |  sales      #                 0.02   |
-| | yes  Explicitly time-sensit. | |  confidence 0.91                     |
-| | no   No urgency expressed    | |                                      |
-| +------------------------------+ |  frustration                   score |
-| +------------------------------+ |  Calm  Frustrated  Very angry        |
-| | department  [choice v]     x | |  #     ######      ############      |
-| | ...                          | |  |----------+-------v-----|  1.6     |
-| +------------------------------+ |                                      |
-| + noul  choice  score  number .. |  > Raw response                      |
-|                                  |                                      |
-|                      [ Decide ]  |                                      |
-+----------------------------------+--------------------------------------+
++-------------------------------------------------------------------------------+
+| ignis   Playground . Decide . Monitor                     qwen3-8b o ready    |
++-------------+-----------------------------------+-----------------------------+
+| + New       | 312 in . 0 out . 84 ms            | Evidence      text json img |
+|             |                                   | +-------------------------+ |
+| Does this   | Does this convey urgency?         | | Help! My payouts have   | |
+| convey      |                 is_urgent   noul  | | been failing for 3 days | |
+| urgency?    | 0.862                             | +-------------------------+ |
+| 3 answers   | ################........          |                             |
+|             | Explicitly time-sensitive         | Questions  3    Build JSON  |
+| How many    |                                   | +-------------------------+ |
+| days?       | Which team should handle this?    | | [ choice v ]      ^ v # | |
+| 1 answer    |                 department choice | | One option from a set.. | |
+|             | billing                           | | +---------------------+ | |
+| New         | billing   #############  0.91 *   | | | Which team should   | | |
+| decision    | technical ##             0.07     | | | handle this?        | | |
+| Nothing     | sales     #              0.02     | | +---------------------+ | |
+| asked yet   | confidence 0.91                   | | Options, in the order.. | |
+|             |                                   | | billing | Payments,... | |
+|             | How frustrated is the customer?   | | Answer name [department]| |
+|             |               frustration  score  | +-------------------------+ |
+|             | Calm  Frustrated  Very angry      | + noul choice score number  |
+|             | #     ######      ###########     |                             |
+|             | |----------+-------v-----|  1.6   +-----------------------------+
+|             |                                   |        [ Decide ]           |
+|             | > Response body                   | 3 questions, one request.   |
++-------------+-----------------------------------+-----------------------------+
+   own scroll          own scroll                        own scroll
 ```
+
+**A mark on somebody else's picture is white over black.** A `point` and a
+`box` land on an image the tab did not choose, so the crosshair and the outline
+are drawn twice — a thick black stroke under a thin white one — and never in a
+hue: the ember is spent on the uncertainty halo, which is data. Both strokes
+carry `non-scaling-stroke`, so 2px is 2px on screen at either size; sized in
+image units instead, the same crosshair was a sub-pixel hairline in the
+preview and invisible.
 
 **The one orchestrated moment, and it is information.** When a run lands,
 every readout answer's bar grows from zero to its value *at the same time*,
@@ -216,9 +267,15 @@ sorted in declared order.
     than replacing them.
 12. Switching to the Playground and back leaves the draft, the JSON and the
     answers as they were.
-13. Loading an example and then switching evidence mode shows that example's
+13. A new decision opened on an untouched one reuses it; opened on a written
+    one goes to the top of the list, and removing the last leaves a fresh one.
+14. Switching decisions carries the draft, the evidence and the answers of the
+    one switched to, and the JSON view shows that decision's request.
+15. Each of the three columns scrolls without moving the other two, and the
+    page itself never scrolls.
+16. Loading an example and then switching evidence mode shows that example's
     own evidence, never the one before it.
-14. `npm run typecheck` and `npm test` pass in `web/`, and `cargo test` passes
+17. `npm run typecheck` and `npm test` pass in `web/`, and `cargo test` passes
     workspace-wide.
 
 ## References

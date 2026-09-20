@@ -4,8 +4,10 @@ import { DecideView } from "./DecideView.tsx";
 import { EvidenceEditor } from "./EvidenceEditor.tsx";
 import { EXAMPLES } from "./examples.ts";
 import { jsonString } from "./json.ts";
-import { EMPTY_SPARE, newQuestion, type Primitive, type Question, validate } from "./model.ts";
-import { QuestionCard } from "./QuestionCard.tsx";
+import { EMPTY_DRAFT, EMPTY_SPARE, newQuestion, type Primitive, type Question, validate } from "./model.ts";
+import { isClipped, QuestionCard } from "./QuestionCard.tsx";
+import { createDecision } from "./sessions.ts";
+import { Sessions } from "./Sessions.tsx";
 
 // The bench (GitHub #247): the opening screen, and one card per primitive.
 
@@ -22,7 +24,7 @@ const ask = (kind: Primitive, extra: Partial<Question> = {}): Question => ({
 
 describe("DecideView", () => {
   it("opens on what the endpoint does and every example it ships", () => {
-    const html = renderToStaticMarkup(<DecideView ready />);
+    const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
     expect(html).toContain("Nothing is generated");
     for (const example of EXAMPLES) {
       expect(html, example.id).toContain(example.name);
@@ -31,23 +33,23 @@ describe("DecideView", () => {
   });
 
   it("holds Decide back until there is something to decide", () => {
-    const html = renderToStaticMarkup(<DecideView ready />);
+    const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
     expect(html).toMatch(/<button[^>]*disabled[^>]*>Decide<\/button>/);
     expect(html).toContain("Add a question");
   });
 
   it("says it is waiting for the model rather than offering a button that cannot work", () => {
-    expect(renderToStaticMarkup(<DecideView ready={false} />)).toContain("Waiting for the model");
+    expect(renderToStaticMarkup(<DecideView ready={false} drawer={null} onDrawer={() => {}} />)).toContain("Waiting for the model");
   });
 
   it("offers every primitive as a starting point", () => {
-    const html = renderToStaticMarkup(<DecideView ready />);
+    const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
     for (const kind of ["noul", "choice", "score", "number", "point", "box"]) expect(html, kind).toContain(`>${kind}</button>`);
   });
 
   it("gives every form field an id or a name, as the browser asks", () => {
     const html =
-      renderToStaticMarkup(<DecideView ready />) +
+      renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />) +
       card(ask("noul")) +
       card(ask("choice", { options: [{ key: "a", description: "the a" }] })) +
       card(ask("score", { levels: ["Low", "High"] })) +
@@ -88,6 +90,30 @@ describe("QuestionCard", () => {
     expect(html.indexOf('value="zulu"')).toBeLessThan(html.indexOf('value="alpha"'));
   });
 
+  it("calls a field clipped only when it is really showing less than it holds", () => {
+    // The rule the folding row turns on. A pixel of rounding is not an
+    // overflow: a box whose content is one pixel over still reads as full.
+    expect(isClipped({ scrollWidth: 400, clientWidth: 200 })).toBe(true);
+    expect(isClipped({ scrollWidth: 200, clientWidth: 200 })).toBe(false);
+    expect(isClipped({ scrollWidth: 201, clientWidth: 200 })).toBe(false);
+    expect(isClipped({ scrollWidth: 202, clientWidth: 200 })).toBe(true);
+  });
+
+  it("folds an option's name and delete away while its description is being written", () => {
+    const html = card(ask("choice", { options: [{ key: "billing", description: "Payments" }] }));
+    // At rest both neighbours are there at their own width, and the width is
+    // on a wrapper rather than on the control: a second width utility beside
+    // the control's own would not win.
+    expect(html).toContain("mr-1.5 w-[7.5rem]");
+    expect(html).toContain("ml-1.5 w-7");
+    expect(html).toContain("transition-[width,margin]");
+    expect(html).toContain("motion-reduce:transition-none");
+    // And they are still real controls while folded, so the row stays
+    // reachable by keyboard.
+    expect(html).toContain('aria-label="Option 1 name"');
+    expect(html).toContain('aria-label="Remove option 1"');
+  });
+
   it("numbers a score's levels, since the answer is a weighted average of their positions", () => {
     const html = card(ask("score", { levels: ["Low", "Mid", "High"] }));
     expect(html).toContain("Levels, lowest first");
@@ -125,5 +151,30 @@ describe("EvidenceEditor", () => {
     const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} invalid="not JSON (line 1, column 2)" />);
     expect(html).toContain("not JSON (line 1, column 2)");
     expect(html).toContain("border-warn");
+  });
+});
+
+describe("Sessions", () => {
+  const list = {
+    decisions: [
+      { ...createDecision(2), draft: { ...EMPTY_DRAFT, questions: [ask("noul"), ask("choice")] } },
+      { ...createDecision(1), running: true },
+    ],
+    activeId: 2,
+  };
+
+  it("names each decision by what it asks and says how much is in it", () => {
+    const html = renderToStaticMarkup(<Sessions list={list} open onNew={() => {}} onSelect={() => {}} onRemove={() => {}} />);
+    expect(html).toContain("Decide.");
+    expect(html).toContain("2 questions");
+    // A decision with a send in flight says so, and cannot be deleted under it.
+    expect(html).toContain("Deciding");
+    expect(html).toMatch(/aria-label="Delete decision: New decision"[^>]*disabled/);
+  });
+
+  it("marks the active one and offers a new one", () => {
+    const html = renderToStaticMarkup(<Sessions list={list} open onNew={() => {}} onSelect={() => {}} onRemove={() => {}} />);
+    expect(html).toContain('aria-current="true"');
+    expect(html).toContain("New decision");
   });
 });

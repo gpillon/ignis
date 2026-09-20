@@ -3,7 +3,7 @@ import { forgetKey, useAuth } from "../api/auth.ts";
 import { useModel } from "../api/model.ts";
 import { Composer } from "../conversation/Composer.tsx";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
-import { DecideView } from "../decide/DecideView.tsx";
+import { DecideView, type Drawer as DecideDrawer } from "../decide/DecideView.tsx";
 import { type OpenAgent, Transcript } from "../conversation/Transcript.tsx";
 import { contextUsage } from "../metrics/context.ts";
 import { Readout } from "../metrics/Readout.tsx";
@@ -55,6 +55,9 @@ export function App() {
   const [memoryOpen, setMemoryOpen] = useState(false);
   const closeMemory = useCallback(() => setMemoryOpen(false), []);
   const [drawer, setDrawer] = useState<Drawer>(null);
+  // The bench has its own two drawers below `lg`; the header's buttons open
+  // whichever view is showing.
+  const [decideDrawer, setDecideDrawer] = useState<DecideDrawer>(null);
   const chat = useConversation({ model, settings, tools, parallel });
   const { active } = chat;
   const monitoring = view === "monitor" && monitorVisible;
@@ -116,7 +119,7 @@ export function App() {
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden">
-      <Header model={model} busy={chat.busy} onOpen={setDrawer} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : deciding ? "decide" : "chat"} onView={setView} monitorAvailable={monitorVisible} />
+      <Header model={model} busy={chat.busy} onOpen={(which) => (deciding ? setDecideDrawer(which) : setDrawer(which))} onForgetKey={auth.key ? forgetKey : undefined} onOpenMemory={() => setMemoryOpen(true)} view={monitoring ? "monitor" : deciding ? "decide" : "chat"} onView={setView} monitorAvailable={monitorVisible} />
 
       {monitoring && <Monitor />}
 
@@ -124,7 +127,7 @@ export function App() {
           holds a whole typed request, and a glance at the Monitor is not a
           reason to lose it. Nothing here fetches on mount. */}
       <div className={deciding ? "contents" : "hidden"}>
-        <DecideView ready={model.state === "ready"} />
+        <DecideView ready={model.state === "ready"} drawer={decideDrawer} onDrawer={setDecideDrawer} />
       </div>
 
       <div className={monitoring || deciding ? "hidden" : "contents"}>

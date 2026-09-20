@@ -15,16 +15,20 @@ export function Answers({ draft, run }: { draft: Draft; run: Run }) {
   const anyGenerated = run.response.usage.output_tokens > 0;
   return (
     <div className="flex min-w-0 flex-col gap-5">
-      <Cost run={run} anyGenerated={anyGenerated} />
-      <ol className="flex flex-col gap-5">
-        {draft.questions.map((question) => (
-          <li key={question.uid}>
+      <ol className="flex flex-col">
+        {draft.questions.map((question, index) => (
+          <li key={question.uid} className={index > 0 ? "mt-6 border-t border-line pt-6" : ""}>
             <AnswerPanel question={question} answer={run.response.answers[question.id]} draft={draft} />
           </li>
         ))}
       </ol>
-      <AnswerMassNote />
-      <Raw run={run} />
+      {/* The receipt, under what it paid for: what the request cost, what the
+          answers cannot say, and the bytes they came back as. */}
+      <footer className="flex flex-col gap-3 border-t border-line pt-4">
+        <Cost run={run} anyGenerated={anyGenerated} />
+        <AnswerMassNote />
+        <Raw run={run} />
+      </footer>
     </div>
   );
 }
@@ -33,7 +37,7 @@ export function Answers({ draft, run }: { draft: Draft; run: Run }) {
 function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
   const { input_tokens, output_tokens } = run.response.usage;
   return (
-    <div className="border-b border-line pb-3">
+    <div>
       <p className="flex flex-wrap items-baseline gap-x-4 gap-y-1 font-display text-[13px] tabular-nums text-ash">
         <span>
           <span className="text-ink">{input_tokens.toLocaleString()}</span> prompt tokens
@@ -46,7 +50,7 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
         </span>
         <span className="text-ash/80">{run.response.model}</span>
       </p>
-      <p className="mt-1.5 max-w-[68ch] text-[12px] leading-snug text-ash">
+      <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
           ? "A number, point or box generates a digit per step, so those tokens are real. The readouts beside them generated none."
           : "Nothing was generated: every answer was read from the logits of one position, out of a single prefill of the evidence."}
@@ -63,7 +67,7 @@ function AnswerPanel({ question, answer, draft }: { question: Question; answer: 
   return (
     <section>
       <header className="flex items-baseline justify-between gap-3">
-        <h3 className="min-w-0 font-display text-[17px] font-semibold leading-snug text-ink">{asked || question.id}</h3>
+        <h3 className="min-w-0 font-display text-[17px] font-bold leading-snug text-ink">{asked || question.id}</h3>
         <span className="flex shrink-0 items-baseline gap-2 font-display text-[11px] text-ash">
           <span className="font-mono" title="The key this answer came back under">
             {question.id}
@@ -87,7 +91,7 @@ function AnswerPanel({ question, answer, draft }: { question: Question; answer: 
 function Body({ question, answer, draft }: { question: Question; answer: Answer; draft: Draft }) {
   switch (answer.type) {
     case "noul":
-      return <NoulMark value={answer.noul} yes={question.yes.trim() || "Yes"} no={question.no.trim() || "No"} />;
+      return <NoulBody question={question} answer={answer} />;
     case "choice":
       return <ChoiceBody question={question} answer={answer} />;
     case "score":
@@ -102,13 +106,31 @@ function Body({ question, answer, draft }: { question: Question; answer: Answer;
   }
 }
 
+/**
+ * Jev's `noul` answer carries no confidence field, because the number *is*
+ * the confidence — so the winning option's own probability is what reads
+ * here, which is `p` for a yes and `1 - p` for a no. The raw `p` stays on the
+ * page beside it: the answer above is the reading, and this is the figure it
+ * was read from.
+ */
+function NoulBody({ question, answer }: { question: Question; answer: Extract<Answer, { type: "noul" }> }) {
+  const yes = question.yes.trim() || "Yes";
+  const no = question.no.trim() || "No";
+  return (
+    <div>
+      <NoulMark value={answer.noul} yes={yes} no={no} />
+      <Confidence value={Math.max(answer.noul, 1 - answer.noul)} note={`p(yes) = ${answer.noul.toFixed(3)}`} />
+    </div>
+  );
+}
+
 function ChoiceBody({ question, answer }: { question: Question; answer: Extract<Answer, { type: "choice" }> }) {
   const declared = question.options.map((option) => option.key);
   const extra = Object.keys(answer.probabilities).filter((key) => !declared.includes(key));
   const rows = [...declared, ...extra];
   return (
     <div>
-      <p className="font-display text-[28px] font-semibold leading-none text-ink">{answer.choice}</p>
+      <p className="font-display text-[28px] font-semibold leading-none text-ember">{answer.choice}</p>
       <ol className="mt-3 max-h-[19rem] overflow-y-auto pr-1">
         {rows.map((key) => (
           <DistributionRow
@@ -120,7 +142,11 @@ function ChoiceBody({ question, answer }: { question: Question; answer: Extract<
           />
         ))}
       </ol>
-      <Confidence value={answer.confidence} note="the winner's own probability" />
+      <Confidence
+        value={answer.confidence}
+        note="the winner's own share"
+        detail="A choice's confidence is the chosen option's own probability, nothing more."
+      />
     </div>
   );
 }
@@ -137,7 +163,15 @@ function ScoreBody({ question, answer }: { question: Question; answer: Extract<A
   return (
     <div>
       <ScoreMark score={answer.score} levels={levels} probabilities={levels.map((l) => l.probability)} />
-      <Confidence value={answer.confidence} note="1 − spread over half the level range, so two adjacent levels are confident" />
+      <Confidence
+        value={answer.confidence}
+        note="how tightly the levels cluster"
+        detail={
+          "Not the tallest bar: 1 − the spread of the distribution over half the level range. " +
+          "Mass on two neighbouring levels is a precise answer and stays confident; the same mass split " +
+          "between the two ends averages to a middle nobody voted for, and reads 0."
+        }
+      />
     </div>
   );
 }
@@ -145,14 +179,14 @@ function ScoreBody({ question, answer }: { question: Question; answer: Extract<A
 function NumberBody({ answer }: { answer: Extract<Answer, { type: "number" }> }) {
   return (
     <div>
-      <p className="font-display text-[34px] font-semibold leading-none tabular-nums text-ink">
+      <p className="font-display text-[34px] font-semibold leading-none tabular-nums text-ember">
         {answer.number.toLocaleString()}
         <span className="ml-2 align-baseline font-display text-[15px] font-medium text-ash">± {answer.uncertainty.toFixed(1)}</span>
       </p>
       <div className="mt-3">
         <DigitTrace digits={answer.digits} />
       </div>
-      <p className="mt-2 max-w-[68ch] text-[12px] leading-snug text-ash">
+      <p className="mt-2 text-[12px] leading-snug text-ash">
         One column per place: the digit it committed and how sure it was. The uncertainty is in units of the number, and it is the
         model's own reckoning — not a bound.
       </p>
@@ -160,72 +194,87 @@ function NumberBody({ answer }: { answer: Extract<Answer, { type: "number" }> })
   );
 }
 
+/**
+ * A point or a box: the picture and its figures side by side, because they are
+ * one answer read two ways — the drawing says where, the table says how
+ * precisely.
+ */
 function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point" | "box" }>; draft: Draft }) {
   const image = evidenceImage(draft.evidence);
   const axes = AXES[answer.type];
   return (
-    <div className="flex flex-col gap-3">
-      {image ? (
-        <ImageMark
-          image={image}
-          caption="The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound."
-        >
-          {(natural) => {
-            // A hairline on a 1,500-pixel image has to be drawn in that image's
-            // units, so strokes scale with its longest side.
-            const scale = Math.max(natural.width, natural.height) / 600;
-            return answer.type === "point" ? (
-              <PointGlyph
-                x={answer.pixels.x ?? 0}
-                y={answer.pixels.y ?? 0}
-                sigmaX={answer.uncertainty.x ?? 0}
-                sigmaY={answer.uncertainty.y ?? 0}
-                scale={scale}
-              />
-            ) : (
-              <BoxGlyph pixels={answer.pixels} sigma={answer.uncertainty} scale={scale} />
-            );
-          }}
-        </ImageMark>
-      ) : (
-        <p className="text-[13px] text-ash">The evidence image is no longer on this page, so there is nothing to draw on.</p>
-      )}
-      <table className="w-full text-[13px] tabular-nums">
-        <thead>
-          <tr className="font-display text-[11px] text-ash">
-            <th className="w-10 text-left font-medium">axis</th>
-            <th className="text-right font-medium">pixels</th>
-            <th className="text-right font-medium">± px</th>
-            <th className="text-right font-medium">on the 0–scale</th>
-          </tr>
-        </thead>
-        <tbody>
-          {axes.map((axis) => (
-            <tr key={axis} className="border-t border-line/60">
-              <td className="py-1 font-display text-ash">{axis}</td>
-              <td className="py-1 text-right text-ink">{answer.pixels[axis] ?? "—"}</td>
-              <td className="py-1 text-right text-ash">{(answer.uncertainty[axis] ?? 0).toFixed(1)}</td>
-              <td className="py-1 text-right text-ash">{answer.normalized[axis] ?? "—"}</td>
+    <div className="grid items-start gap-5 sm:grid-cols-2">
+      <div className="flex justify-center">
+        {image ? (
+          <ImageMark image={image}>
+            {(natural) =>
+              answer.type === "point" ? (
+                <PointGlyph
+                  x={answer.pixels.x ?? 0}
+                  y={answer.pixels.y ?? 0}
+                  sigmaX={answer.uncertainty.x ?? 0}
+                  sigmaY={answer.uncertainty.y ?? 0}
+                  span={Math.min(natural.width, natural.height)}
+                />
+              ) : (
+                <BoxGlyph pixels={answer.pixels} sigma={answer.uncertainty} />
+              )
+            }
+          </ImageMark>
+        ) : (
+          <p className="text-[13px] text-ash">The evidence image is no longer on this page, so there is nothing to draw on.</p>
+        )}
+      </div>
+
+      <div className="flex min-w-0 flex-col gap-3">
+        <table className="w-full text-[13px] tabular-nums">
+          <thead>
+            <tr className="font-display text-[11px] text-ash">
+              <th className="w-10 text-left font-medium">axis</th>
+              <th className="text-right font-medium">pixels</th>
+              <th className="text-right font-medium">± px</th>
+              <th className="text-right font-medium">on the 0–scale</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-      <details className="text-[12px] text-ash">
-        <summary className="cursor-pointer font-display text-ink">Digit trace per axis</summary>
-        <ol className="mt-2 flex flex-col gap-2">
-          {axes.map((axis, index) => (
-            <li key={axis} className="flex items-end gap-3">
-              <span className="w-6 font-display text-ash">{axis}</span>
-              <DigitTrace digits={answer.digits[axis] ?? []} offset={index * (answer.digits[axis]?.length ?? 0)} />
-            </li>
-          ))}
-        </ol>
-      </details>
+          </thead>
+          <tbody>
+            {axes.map((axis) => (
+              <tr key={axis} className="border-t border-line/60">
+                <td className="py-1 font-display text-ash">{axis}</td>
+                <td className="py-1 text-right text-ink">{answer.pixels[axis] ?? "—"}</td>
+                <td className="py-1 text-right text-ash">{(answer.uncertainty[axis] ?? 0).toFixed(1)}</td>
+                <td className="py-1 text-right text-ash">{answer.normalized[axis] ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <details className="text-[12px] text-ash">
+          <summary className="cursor-pointer font-display text-ink">Digit trace per axis</summary>
+          {/* Two to a row: a box has four axes, and a column of four traces is
+              taller than the picture they belong to. */}
+          <ol className="mt-2 grid grid-cols-2 gap-x-5 gap-y-3">
+            {axes.map((axis, index) => (
+              <li key={axis} className="flex items-end gap-3">
+                <span className="w-6 font-display text-ash">{axis}</span>
+                <DigitTrace digits={answer.digits[axis] ?? []} offset={index * (answer.digits[axis]?.length ?? 0)} />
+              </li>
+            ))}
+          </ol>
+        </details>
+      </div>
+
+      <p className="text-[12px] leading-snug text-ash sm:col-span-2">
+        The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound.
+      </p>
     </div>
   );
 }
 
-function Confidence({ value, note }: { value: number; note: string }) {
+/**
+ * The confidence row. `note` is what fits on the line; `detail` is what a
+ * reader who stops on it wants — the arithmetic, which is ours and not Jev's,
+ * so it has to be sayable somewhere.
+ */
+function Confidence({ value, note, detail }: { value: number; note: string; detail?: string }) {
   return (
     <div className="mt-3 flex items-center gap-3">
       <span className="font-display text-[11px] text-ash">confidence</span>
@@ -233,7 +282,7 @@ function Confidence({ value, note }: { value: number; note: string }) {
         <Bar value={value} dim />
       </span>
       <span className="font-display text-[13px] tabular-nums text-ink">{value.toFixed(3)}</span>
-      <span className="min-w-0 truncate text-[12px] text-ash" title={note}>
+      <span className="min-w-0 truncate text-[12px] text-ash" title={detail ?? note}>
         {note}
       </span>
     </div>
@@ -257,7 +306,7 @@ function Failed({ code, message }: { code: string; message: string }) {
   return (
     <div className="border-l-2 border-fault pl-3">
       <p className="font-display text-[13px] font-semibold text-fault">{code}</p>
-      <p className="mt-0.5 max-w-[68ch] text-[13px] leading-snug text-ash">{message}</p>
+      <p className="mt-0.5 text-[13px] leading-snug text-ash">{message}</p>
     </div>
   );
 }
@@ -272,7 +321,7 @@ function Failed({ code, message }: { code: string; message: string }) {
  */
 function AnswerMassNote() {
   return (
-    <p className="max-w-[68ch] border-t border-line pt-3 text-[12px] leading-snug text-ash">
+    <p className="text-[12px] leading-snug text-ash">
       These probabilities are shared out among the declared options alone, so they always add to 1. How much of the model's own
       distribution those options actually held — the answer mass — is not in the response; the Monitor charts it.
     </p>

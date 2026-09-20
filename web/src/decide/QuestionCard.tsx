@@ -1,4 +1,5 @@
-import { caption, field } from "../ui/classes.ts";
+import { useState } from "react";
+import { caption, field, fieldLook } from "../ui/classes.ts";
 import { IconClose, IconPlus, IconTrash } from "../ui/icons.tsx";
 import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
@@ -51,7 +52,7 @@ export function QuestionCard({
           onChange={(e) => set("kind", e.target.value as Primitive)}
           name={`${question.uid}-type`}
           aria-label="Question type"
-          className={`${field} w-[7.5rem] shrink-0 font-display text-[13px]`}
+          className={`${fieldLook} w-[7.5rem] shrink-0 font-display text-[13px]`}
         >
           {PRIMITIVES.map((kind) => (
             <option key={kind} value={kind}>
@@ -134,7 +135,7 @@ export function QuestionCard({
               onChange={(e) => set("digits", Number(e.target.value))}
               name={`${question.uid}-digits`}
               aria-label="Digits per number"
-              className={`${field} w-20 tabular-nums`}
+              className={`${fieldLook} w-20 tabular-nums`}
             />
           </Labelled>
           <p className="pb-2 text-[12px] leading-snug text-ash">
@@ -153,7 +154,7 @@ export function QuestionCard({
           name={`${question.uid}-id`}
           title="The key this question's answer comes back under"
           placeholder="answer_name"
-          className={`${field} min-w-0 flex-1 py-1 font-mono text-[12px]`}
+          className={`${fieldLook} min-w-0 flex-1 py-1 font-mono text-[12px]`}
         />
       </label>
 
@@ -170,51 +171,92 @@ export function QuestionCard({
   );
 }
 
-/** The options of a `choice`, in the order they will be sent. */
+/**
+ * The options of a `choice`, in the order they will be sent.
+ *
+ * A description is a sentence in a column with room for about six words, so
+ * when one is too long to read its neighbours fold away and it takes the whole
+ * row. They fold back the moment focus leaves.
+ *
+ * Only when it is **actually clipped**: a description that fits is left where
+ * it is, because moving a row that was already readable is motion for its own
+ * sake. And once folded it stays folded until focus leaves — re-checking would
+ * find the text fits *because* the row widened, fold it back, find it clipped
+ * again, and oscillate.
+ *
+ * The width rides on a wrapper rather than on the controls themselves: a
+ * second width utility on an element that already carries one does not win —
+ * Tailwind emits its own in its own order — so the collapsing box is a box of
+ * its own, and the control inside it keeps its size and is clipped.
+ *
+ * Everything stays reachable by keyboard: the name and the delete button are
+ * still in the tab order while folded, and focusing either unfolds the row
+ * again.
+ */
 function OptionList({ options, stem, onChange }: { options: Option[]; stem: string; onChange: (options: Option[]) => void }) {
+  const [writing, setWriting] = useState<number | null>(null);
   const replace = (index: number, option: Option) => onChange(options.map((o, i) => (i === index ? option : o)));
-  const move = (index: number, by: -1 | 1) => {
-    const next = [...options];
-    const [moved] = next.splice(index, 1);
-    next.splice(index + by, 0, moved);
-    onChange(next);
+  /** Widen this row if what it holds does not fit; never narrow it. */
+  const widenIfClipped = (index: number, field: HTMLInputElement) => {
+    if (isClipped(field)) setWriting(index);
   };
+  const fold = "shrink-0 overflow-hidden transition-[width,margin] duration-200 motion-reduce:transition-none";
   return (
     <div className="mt-2">
       <p className={caption}>Options, in the order the prompt lists them</p>
       <ol className="mt-1 flex flex-col gap-1">
-        {options.map((option, index) => (
-          <li key={index} className="flex items-center gap-1.5">
-            <input
-              value={option.key}
-              onChange={(e) => replace(index, { ...option, key: e.target.value })}
-              name={`${stem}-option-${index}-key`}
-              aria-label={`Option ${index + 1} name`}
-              placeholder="name"
-              className={`${field} w-[7.5rem] shrink-0 font-mono text-[13px]`}
-            />
-            <input
-              value={option.description}
-              onChange={(e) => replace(index, { ...option, description: e.target.value })}
-              name={`${stem}-option-${index}-description`}
-              aria-label={`Option ${index + 1} description`}
-              placeholder="what it means — blank lets the name speak for itself"
-              className={`${field} min-w-0 flex-1`}
-            />
-            <MoveButton label="Move up" disabled={index === 0} onClick={() => move(index, -1)}>
-              ↑
-            </MoveButton>
-            <MoveButton label="Move down" disabled={index === options.length - 1} onClick={() => move(index, 1)}>
-              ↓
-            </MoveButton>
-            <RemoveButton label={`Remove option ${index + 1}`} onClick={() => onChange(options.filter((_, i) => i !== index))} />
-          </li>
-        ))}
+        {options.map((option, index) => {
+          const wide = writing === index;
+          return (
+            <li key={index} className="flex items-center">
+              <span className={`${fold} ${wide ? "mr-0 w-0" : "mr-1.5 w-[7.5rem]"}`}>
+                <input
+                  value={option.key}
+                  onChange={(e) => replace(index, { ...option, key: e.target.value })}
+                  onFocus={() => setWriting(null)}
+                  name={`${stem}-option-${index}-key`}
+                  aria-label={`Option ${index + 1} name`}
+                  placeholder="name"
+                  className={`${fieldLook} w-[7.5rem] font-mono text-[13px]`}
+                />
+              </span>
+              <input
+                value={option.description}
+                onChange={(e) => {
+                  replace(index, { ...option, description: e.target.value });
+                  // The element already holds the new text, so this measures
+                  // the line as it now is: a row widens the moment its
+                  // description outgrows it.
+                  widenIfClipped(index, e.currentTarget);
+                }}
+                onFocus={(e) => widenIfClipped(index, e.currentTarget)}
+                onBlur={() => setWriting((current) => (current === index ? null : current))}
+                name={`${stem}-option-${index}-description`}
+                aria-label={`Option ${index + 1} description`}
+                placeholder="what it means — blank lets the name speak for itself"
+                className={`${fieldLook} min-w-0 flex-1`}
+              />
+              <span className={`${fold} ${wide ? "ml-0 w-0" : "ml-1.5 w-7"}`} onFocus={() => setWriting(null)}>
+                <RemoveButton label={`Remove option ${index + 1}`} onClick={() => onChange(options.filter((_, i) => i !== index))} />
+              </span>
+            </li>
+          );
+        })}
       </ol>
       <AddButton onClick={() => onChange([...options, emptyOption()])}>Add an option</AddButton>
     </div>
   );
 }
+
+/**
+ * Whether a field is showing less than it holds.
+ *
+ * A pixel of rounding is not an overflow: a box whose content is one pixel
+ * over reads as full, and treating that as clipped would widen rows nobody
+ * would call unreadable.
+ */
+export const isClipped = (field: { scrollWidth: number; clientWidth: number }): boolean =>
+  field.scrollWidth > field.clientWidth + 1;
 
 /** The levels of a `score`, low to high; the answer is a weighted average of their positions. */
 function LevelList({ levels, stem, onChange }: { levels: string[]; stem: string; onChange: (levels: string[]) => void }) {
@@ -231,7 +273,7 @@ function LevelList({ levels, stem, onChange }: { levels: string[]; stem: string;
               name={`${stem}-level-${index}`}
               aria-label={`Level ${index}`}
               placeholder="what this level means"
-              className={`${field} min-w-0 flex-1`}
+              className={`${fieldLook} min-w-0 flex-1`}
             />
             <RemoveButton label={`Remove level ${index}`} onClick={() => onChange(levels.filter((_, i) => i !== index))} />
           </li>
