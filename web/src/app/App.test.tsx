@@ -18,6 +18,12 @@ describe("App", () => {
     expect(html).toContain("Warming up");
   });
 
+  it("keeps the Decide tab mounted behind the chat, so a typed request survives a look elsewhere", () => {
+    const html = renderToStaticMarkup(<App />);
+    expect(html).toContain("Nothing is generated");
+    expect(html).toContain('aria-label="Decide"');
+  });
+
   it("offers the Decide tab from the start and the Monitor only once /ui/metrics has answered", () => {
     const html = renderToStaticMarkup(<App />);
     // The Decide tab talks to /v1/decide, so it never waits on the metrics

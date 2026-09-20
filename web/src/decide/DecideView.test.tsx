@@ -4,7 +4,7 @@ import { DecideView } from "./DecideView.tsx";
 import { EvidenceEditor } from "./EvidenceEditor.tsx";
 import { EXAMPLES } from "./examples.ts";
 import { jsonString } from "./json.ts";
-import { newQuestion, type Primitive, type Question, validate } from "./model.ts";
+import { EMPTY_SPARE, newQuestion, type Primitive, type Question, validate } from "./model.ts";
 import { QuestionCard } from "./QuestionCard.tsx";
 
 // The bench (GitHub #247): the opening screen, and one card per primitive.
@@ -52,9 +52,9 @@ describe("DecideView", () => {
       card(ask("choice", { options: [{ key: "a", description: "the a" }] })) +
       card(ask("score", { levels: ["Low", "High"] })) +
       card(ask("number")) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} onChange={() => {}} />) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} onChange={() => {}} />) +
-      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} onChange={() => {}} />);
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
+      renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);
     const fields = html.match(/<(input|textarea|select)\b[^>]*>/g) ?? [];
     expect(fields.length).toBeGreaterThan(10);
     for (const field of fields) expect(field).toMatch(/\s(id|name)="[^"]+"/);
@@ -103,13 +103,13 @@ describe("QuestionCard", () => {
 
 describe("EvidenceEditor", () => {
   it("offers the three shapes state accepts and says what each is for", () => {
-    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{}" }} onChange={() => {}} />);
+    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{}" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);
     for (const label of ["Text", "JSON", "Image"]) expect(html, label).toContain(`>${label}</button>`);
     expect(html).toContain("not as a quoted string");
   });
 
   it("shows the parse error it was handed", () => {
-    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{" }} onChange={() => {}} invalid="not JSON (line 1, column 2)" />);
+    const html = renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "{" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} invalid="not JSON (line 1, column 2)" />);
     expect(html).toContain("not JSON (line 1, column 2)");
     expect(html).toContain("border-warn");
   });

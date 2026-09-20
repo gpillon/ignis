@@ -69,6 +69,21 @@ and not as a message thread.
 - **Thinking is never sent.** Not a field the tab exposes, not a field it
   emits — spec 03 answers 422 for it, and there is nothing to gain by
   offering a control whose only outcome is a refusal.
+- **The tab stays mounted.** Like the chat under it: it holds a whole typed
+  request, and a glance at the Monitor is not a reason to lose it. Nothing in
+  it fetches on mount, so an always-mounted view costs nothing.
+- **The JSON view lists every fault, the question-bound ones included.** The
+  builder is what normally carries a fault next to the question it belongs to,
+  and the builder is not on screen — so a `Decide` button greying out with no
+  message anywhere would be the one way this tab could refuse silently.
+- **A blank description is omitted, not sent empty.** Absent is what the
+  server reads as "use the default"; an empty string is the one shape it
+  refuses. So `malformed_criteria` on a `noul` cannot arise from the builder,
+  and the field's placeholder shows the default it will fall back to.
+- **A spatial answer is bound to the *first* image.** `media.rs` records
+  `source_pixels` for `item == 0` only, because a `state` carrying several
+  images has no single frame for an answer to be in. The evidence editor says
+  which one, and the overlay draws on that one.
 - **A `point` or `box` needs an image.** The builder says so where the
   question is, before the send, rather than letting the per-question
   `state_carries_no_image` error come back.
@@ -80,7 +95,7 @@ and not as a message thread.
 | At least one question | `no_questions` |
 | Question ids non-blank and unique | `duplicate_question` |
 | `instructions` non-empty | `empty_instructions` |
-| `noul`: `true`/`false` descriptions non-empty when given | `malformed_criteria` |
+| `noul`: a blank description is omitted, so none is ever sent empty | `malformed_criteria`, which therefore cannot arise |
 | `choice`: at least one option, keys non-blank and unique | `no_options`, `unclean_option`, `duplicate_option` |
 | `choice`: at most 256 options | `too_many_options` |
 | `score`: at least 2 levels, each non-empty | `too_few_levels`, `malformed_criteria` |
@@ -97,6 +112,12 @@ The look is the Playground's: kiln band, ember accent, the 45 degree `.cut`,
 Chakra Petch for display and figures, Instrument Sans for prose, JetBrains
 Mono for JSON. No new palette — the tokens in `styles.css` carry both
 schemes already.
+
+**One scale for one quantity.** A `score`'s level bars and a `choice`'s option
+rows are both probabilities, so both are drawn on an absolute 0-1 scale.
+Normalizing the score to its own peak would make the winning level full height
+in every answer, and a reader comparing the two panels side by side would read
+two scales as one. A flat distribution should look flat.
 
 **Colour.** The distributions are one hue. Bar *length* encodes probability,
 so shading a bar by the same number would double-encode it and burn the only
@@ -193,7 +214,11 @@ sorted in declared order.
 10. A 422 renders the endpoint's own message; a 401 shows the key prompt.
 11. A per-question `Error` answer renders beside its siblings' answers rather
     than replacing them.
-12. `npm run typecheck` and `npm test` pass in `web/`, and `cargo test` passes
+12. Switching to the Playground and back leaves the draft, the JSON and the
+    answers as they were.
+13. Loading an example and then switching evidence mode shows that example's
+    own evidence, never the one before it.
+14. `npm run typecheck` and `npm test` pass in `web/`, and `cargo test` passes
     workspace-wide.
 
 ## References

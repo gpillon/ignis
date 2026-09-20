@@ -7,6 +7,7 @@ import { EXAMPLES, type Example } from "./examples.ts";
 import {
   type Draft,
   EMPTY_DRAFT,
+  EMPTY_SPARE,
   type Fault,
   freeId,
   newQuestion,
@@ -15,6 +16,7 @@ import {
   type Question,
   readRequest,
   requestBody,
+  type Spare,
   validate,
 } from "./model.ts";
 import { QuestionCard } from "./QuestionCard.tsx";
@@ -38,6 +40,10 @@ type Mode = "build" | "json";
 
 export function DecideView({ ready }: { ready: boolean }) {
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  // The evidence shapes not in use, kept beside the draft rather than inside
+  // the evidence editor: a replaced draft has no history, and a ref inside the
+  // editor would have carried the last example's text into the next one.
+  const [spare, setSpare] = useState<Spare>(EMPTY_SPARE);
   const [mode, setMode] = useState<Mode>("build");
   // While the JSON view is open its text is what the reader is editing; the
   // draft follows it on every parse that succeeds, and stands still on one
@@ -55,6 +61,7 @@ export function DecideView({ ready }: { ready: boolean }) {
 
   const replace = useCallback((next: Draft) => {
     setDraft(next);
+    setSpare(EMPTY_SPARE);
     setJson(requestBody(next));
     setJsonError(null);
   }, []);
@@ -117,6 +124,8 @@ export function DecideView({ ready }: { ready: boolean }) {
         <div className={state.at === "idle" ? "lg:order-1" : "order-2 lg:order-1"}>
           <Bench
             draft={draft}
+            spare={spare}
+            onSpare={setSpare}
             mode={mode}
             json={json}
             jsonError={jsonError}
@@ -158,6 +167,8 @@ export function DecideView({ ready }: { ready: boolean }) {
 
 function Bench({
   draft,
+  spare,
+  onSpare,
   mode,
   json,
   jsonError,
@@ -177,6 +188,8 @@ function Bench({
   onClear,
 }: {
   draft: Draft;
+  spare: Spare;
+  onSpare: (spare: Spare) => void;
   mode: Mode;
   json: string;
   jsonError: string | null;
@@ -197,7 +210,13 @@ function Bench({
 }) {
   return (
     <div className="flex flex-col gap-5">
-      <EvidenceEditor evidence={draft.evidence} onChange={(evidence) => onEdit({ ...draft, evidence })} invalid={jsonFault} />
+      <EvidenceEditor
+        evidence={draft.evidence}
+        spare={spare}
+        onChange={(evidence) => onEdit({ ...draft, evidence })}
+        onSpare={onSpare}
+        invalid={jsonFault}
+      />
 
       <section>
         <div className="flex items-center justify-between gap-3">
@@ -225,11 +244,11 @@ function Bench({
         {mode === "build" ? (
           <Builder draft={draft} faults={faults} onEdit={onEdit} onAdd={onAdd} />
         ) : (
-          <JsonEditor text={json} error={jsonError} onChange={onJson} />
+          <JsonEditor text={json} error={jsonError} faults={faults} onChange={onJson} />
         )}
       </section>
 
-      {loose.length > 0 && (
+      {mode === "build" && loose.length > 0 && (
         <ul className="flex flex-col gap-1">
           {loose.map((fault) => (
             <li key={fault.code} className="text-[13px] leading-snug text-warn">
@@ -319,7 +338,18 @@ function Builder({
   );
 }
 
-function JsonEditor({ text, error, onChange }: { text: string; error: string | null; onChange: (text: string) => void }) {
+function JsonEditor({
+  text,
+  error,
+  faults,
+  onChange,
+}: {
+  text: string;
+  error: string | null;
+  /** Every fault, not only the loose ones: the builder that shows the rest is not on screen. */
+  faults: Fault[];
+  onChange: (text: string) => void;
+}) {
   return (
     <div className="mt-2">
       <textarea
@@ -342,6 +372,15 @@ function JsonEditor({ text, error, onChange }: { text: string; error: string | n
           This is the body that will be sent. Option order is part of the prompt, so it is kept exactly as written here — even for keys
           that look like numbers.
         </p>
+      )}
+      {faults.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-1">
+          {faults.map((fault) => (
+            <li key={fault.code + fault.message} className="text-[12px] leading-snug text-warn">
+              {fault.message}
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );

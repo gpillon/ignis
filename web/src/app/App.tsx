@@ -120,7 +120,12 @@ export function App() {
 
       {monitoring && <Monitor />}
 
-      {deciding && <DecideView ready={model.state === "ready"} />}
+      {/* Mounted whichever view is showing, like the chat below it: the tab
+          holds a whole typed request, and a glance at the Monitor is not a
+          reason to lose it. Nothing here fetches on mount. */}
+      <div className={deciding ? "contents" : "hidden"}>
+        <DecideView ready={model.state === "ready"} />
+      </div>
 
       <div className={monitoring || deciding ? "hidden" : "contents"}>
         <div className="relative flex min-h-0 flex-1">

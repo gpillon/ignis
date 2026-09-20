@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";
 import { caption, field } from "../ui/classes.ts";
 import { IconClose, IconImage } from "../ui/icons.tsx";
-import type { Evidence, EvidenceMode } from "./model.ts";
+import { type Evidence, type EvidenceMode, restore, setAside, type Spare } from "./model.ts";
 
 // The evidence (GitHub #247): what every question in the request is asked
 // about, and what makes a fan-out cheap — it is prefilled once and the
@@ -16,40 +16,38 @@ import type { Evidence, EvidenceMode } from "./model.ts";
 const MODES: { mode: EvidenceMode; label: string; hint: string }[] = [
   { mode: "text", label: "Text", hint: "Prose: a message, a review, a transcript." },
   { mode: "json", label: "JSON", hint: "A record: it goes in as an object or an array, not as a quoted string." },
-  { mode: "image", label: "Image", hint: "A picture, with optional words. A point or a box answers in its pixels." },
+  {
+    mode: "image",
+    label: "Image",
+    // The server binds a spatial answer to the *first* image (`media.rs`,
+    // `source_pixels`), so several images have no single frame between them.
+    hint: "A picture, with optional words. A point or a box answers in the pixels of the first one.",
+  },
 ];
 
 export function EvidenceEditor({
   evidence,
+  spare,
   onChange,
+  onSpare,
   invalid,
 }: {
   evidence: Evidence;
+  /** What the modes not in use last held; the caller owns it, and clears it with the draft. */
+  spare: Spare;
   onChange: (evidence: Evidence) => void;
+  onSpare: (spare: Spare) => void;
   /** The parse error of a JSON evidence, when there is one. */
   invalid?: string;
 }) {
-  // What the other modes held, so switching back does not lose it.
-  const kept = useRef<{ text: string; json: string; images: PromptImage[]; words: string }>({
-    text: "",
-    json: "",
-    images: [],
-    words: "",
-  });
   const [imageError, setImageError] = useState<string | null>(null);
   const hint = MODES.find((m) => m.mode === evidence.mode)?.hint;
 
   function switchTo(mode: EvidenceMode) {
     if (mode === evidence.mode) return;
-    if (evidence.mode === "text") kept.current.text = evidence.text;
-    if (evidence.mode === "json") kept.current.json = evidence.text;
-    if (evidence.mode === "image") {
-      kept.current.images = evidence.images;
-      kept.current.words = evidence.text;
-    }
-    if (mode === "text") onChange({ mode, text: kept.current.text });
-    else if (mode === "json") onChange({ mode, text: kept.current.json });
-    else onChange({ mode, images: kept.current.images, text: kept.current.words });
+    const kept = setAside(spare, evidence);
+    onSpare(kept);
+    onChange(restore(kept, mode));
   }
 
   async function addFiles(files: File[]) {

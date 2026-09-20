@@ -3,6 +3,7 @@ import { jsonString, parseOrdered } from "./json.ts";
 import {
   type Draft,
   EMPTY_DRAFT,
+  EMPTY_SPARE,
   type Evidence,
   freeId,
   newQuestion,
@@ -10,6 +11,8 @@ import {
   type Question,
   readRequest,
   requestBody,
+  restore,
+  setAside,
   validate,
 } from "./model.ts";
 
@@ -257,6 +260,22 @@ describe("readRequest", () => {
       ok: false,
       message: expect.stringContaining("unknown type"),
     });
+  });
+});
+
+describe("setAside and restore", () => {
+    it("gives each mode back what it last held, and never what another mode held", () => {
+    let spare = setAside(EMPTY_SPARE, { mode: "text", text: "prose" });
+    spare = setAside(spare, { mode: "json", text: '{"a":1}' });
+    spare = setAside(spare, { mode: "image", images: [image], text: "the words" });
+    expect(restore(spare, "text")).toEqual({ mode: "text", text: "prose" });
+    expect(restore(spare, "json")).toEqual({ mode: "json", text: '{"a":1}' });
+    expect(restore(spare, "image")).toEqual({ mode: "image", images: [image], text: "the words" });
+  });
+
+  it("starts each mode empty, so a freshly replaced draft carries no history", () => {
+    expect(restore(EMPTY_SPARE, "text")).toEqual({ mode: "text", text: "" });
+    expect(restore(EMPTY_SPARE, "image")).toEqual({ mode: "image", images: [], text: "" });
   });
 });
 

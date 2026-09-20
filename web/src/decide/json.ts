@@ -208,7 +208,7 @@ export function writeOrdered(node: JsonNode, indent = 2): string {
   return write(node, 0);
 }
 
-/** The node as a plain JavaScript value — for display, where order no longer matters. */
+/** The node as a plain JavaScript value: the parser's readable inverse, for a reader that does not care about order. */
 export function plain(node: JsonNode): unknown {
   switch (node.kind) {
     case "object":
@@ -220,15 +220,6 @@ export function plain(node: JsonNode): unknown {
   }
 }
 
-/** A plain value as a node. Object keys keep the order `Object.entries` reports. */
-export function fromPlain(value: unknown): JsonNode {
-  if (value === null || value === undefined) return jsonNull;
-  if (typeof value === "string") return { kind: "string", value };
-  if (typeof value === "number") return { kind: "number", value: Number.isFinite(value) ? value : 0 };
-  if (typeof value === "boolean") return { kind: "boolean", value };
-  if (Array.isArray(value)) return { kind: "array", items: value.map(fromPlain) };
-  return { kind: "object", entries: Object.entries(value).map(([key, v]) => ({ key, value: fromPlain(v) })) };
-}
 
 /** Whether the node says nothing at all — `instructions_are_empty` in `decide.rs`. */
 export function saysNothing(node: JsonNode): boolean {
@@ -251,12 +242,3 @@ export function asText(node: JsonNode): string {
   return node.kind === "string" ? node.value : writeOrdered(node, 0);
 }
 
-/** The first key that appears more than once, if any. */
-export function duplicateKey(entries: JsonEntry[]): string | null {
-  const seen = new Set<string>();
-  for (const entry of entries) {
-    if (seen.has(entry.key)) return entry.key;
-    seen.add(entry.key);
-  }
-  return null;
-}

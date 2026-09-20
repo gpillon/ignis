@@ -12,15 +12,13 @@
 import type { PromptImage } from "../conversation/images.ts";
 import {
   asText,
-  duplicateKey,
-  fromPlain,
   type JsonEntry,
   type JsonNode,
   jsonArray,
+  jsonNull,
   jsonObject,
   jsonString,
   parseOrdered,
-  plain,
   saysNothing,
   writeOrdered,
 } from "./json.ts";
@@ -39,12 +37,9 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
   box: "A rectangle on the image, in its own pixels.",
 };
 
-/** The primitives answered by reading one position: no tokens generated. */
-export const READOUTS: Primitive[] = ["noul", "choice", "score"];
-/** The primitives that generate a digit per step, and so cost a round each. */
+/** The primitives that generate a digit per step, and so cost a round each; the rest read one position. */
 export const CONSTRAINED: Primitive[] = ["number", "point", "box"];
 
-export const isReadout = (kind: Primitive) => READOUTS.includes(kind);
 export const isConstrained = (kind: Primitive) => CONSTRAINED.includes(kind);
 /** `point` and `box` answer in pixels of the submitted image, so they need one. */
 export const isSpatial = (kind: Primitive) => kind === "point" || kind === "box";
@@ -102,6 +97,29 @@ export type Evidence =
   | { mode: "image"; images: PromptImage[]; text: string };
 
 export type EvidenceMode = Evidence["mode"];
+
+/**
+ * What the evidence shapes *not* in use last held, so switching mode and back
+ * is not a loss. Never sent, and reset whenever the whole draft is replaced —
+ * a freshly loaded example has no history of its own.
+ */
+export type Spare = { text: string; json: string; images: PromptImage[]; words: string };
+
+export const EMPTY_SPARE: Spare = { text: "", json: "", images: [], words: "" };
+
+/** `evidence` moved aside, so the mode it is leaving can be returned to. */
+export function setAside(spare: Spare, evidence: Evidence): Spare {
+  if (evidence.mode === "text") return { ...spare, text: evidence.text };
+  if (evidence.mode === "json") return { ...spare, json: evidence.text };
+  return { ...spare, images: evidence.images, words: evidence.text };
+}
+
+/** The evidence a mode is returned to, out of what was set aside. */
+export function restore(spare: Spare, mode: EvidenceMode): Evidence {
+  if (mode === "text") return { mode, text: spare.text };
+  if (mode === "json") return { mode, text: spare.json };
+  return { mode, images: spare.images, text: spare.words };
+}
 
 /** The whole request under construction. */
 export type Draft = {
@@ -344,7 +362,7 @@ function criteriaNode(question: Question): JsonNode | null {
           key: option.key,
           // `null` is Jev's own "this option needs no extra detail", and the
           // key becomes its own description.
-          value: option.description.trim() === "" ? { kind: "null" as const } : jsonString(option.description),
+          value: option.description.trim() === "" ? jsonNull : jsonString(option.description),
         })),
       );
     case "score":
@@ -468,12 +486,3 @@ function applyCriteria(question: Question, criteria: JsonNode) {
   }));
 }
 
-/** The duplicate keys a pasted body carries, which the builder would otherwise hide. */
-export function duplicateQuestionKey(text: string): string | null {
-  const parsed = parseOrdered(text);
-  if (!parsed.ok || parsed.node.kind !== "object") return null;
-  const questions = parsed.node.entries.find((e) => e.key === "questions")?.value;
-  return questions?.kind === "object" ? duplicateKey(questions.entries) : null;
-}
-
-export { asText, plain, fromPlain, writeOrdered };

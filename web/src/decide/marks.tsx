@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useState } from "react";
 import type { PromptImage } from "../conversation/images.ts";
 import type { DigitDraw } from "./request.ts";
 
@@ -10,6 +10,14 @@ import type { DigitDraw } from "./request.ts";
 // probability, so shading a bar by the same number would spend the only free
 // channel on information the mark already carries; the winner is marked by its
 // label, not by a second colour.
+
+/**
+ * The value a mark grows to, carried as a custom property so it is on the
+ * element from the first paint — the animation is then "0% until grown", and
+ * what the mark *means* is readable in the DOM whether it has grown or not.
+ */
+const fill = (share: number, extra: CSSProperties = {}): CSSProperties =>
+  ({ "--fill": `${Math.max(0, Math.min(1, share)) * 100}%`, ...extra }) as CSSProperties;
 
 /** True one frame after mount, which is what lets a width transition run. */
 function useGrown(): boolean {
@@ -24,12 +32,11 @@ function useGrown(): boolean {
 /** One probability, as a track and a fill. The number itself is the caller's to print. */
 export function Bar({ value, dim = false }: { value: number; dim?: boolean }) {
   const grown = useGrown();
-  const width = `${Math.max(0, Math.min(1, value)) * 100}%`;
   return (
     <span className="relative block h-2 w-full bg-line/70" aria-hidden>
       <span
         className="bar-grow bar-end absolute inset-y-0 left-0 bg-ember"
-        style={{ width: grown ? width : "0%", opacity: dim ? 0.55 : 1 }}
+        style={fill(value, { width: grown ? "var(--fill)" : "0%", opacity: dim ? 0.55 : 1 })}
       />
     </span>
   );
@@ -109,10 +116,10 @@ export function ScoreMark({
       <div className="mt-3 flex h-16 items-end gap-1" aria-hidden>
         {levels.map((level) => (
           <span key={level.index} className="flex min-w-0 flex-1 flex-col justify-end">
-            <span
-              className="bar-grow w-full bg-ember"
-              style={{ height: grown ? `${(level.probability / peak) * 100}%` : "0%", opacity: 0.85 }}
-            />
+            {/* On the probability's own 0-1 scale, not normalized to the
+                peak: a choice's bars beside it read the same way, and a flat
+                distribution should look flat. */}
+            <span className="bar-grow w-full bg-ember" style={fill(level.probability, { height: grown ? "var(--fill)" : "0%", opacity: 0.85 })} />
           </span>
         ))}
       </div>

@@ -96,6 +96,17 @@ describe("Answers", () => {
     expect(html).toContain("1.60");
   });
 
+  it("draws a score's levels on the probability's own scale, the same as a choice's rows", () => {
+    const html = render([question("s", "score", { levels: ["Low", "High"] })], {
+      s: { type: "score", score: 0.4, legend: { "0": "Low", "1": "High" }, probabilities: { "0": 0.6, "1": 0.4 }, confidence: 0.6 },
+    });
+    // Absolute, not normalized to the peak: normalizing would have made the
+    // winning level 100% tall and unreadable beside a choice panel. The value a
+    // bar grows to is on the element from the first paint.
+    expect(html).toContain("--fill:60%");
+    expect(html).toContain("--fill:40%");
+  });
+
   it("shows a number with its uncertainty and one column per place", () => {
     const digits = [
       { digit: 3, probability: 0.98 },

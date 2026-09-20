@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { asText, duplicateKey, fromPlain, parseOrdered, plain, saysNothing, writeOrdered } from "./json.ts";
+import { asText, parseOrdered, plain, saysNothing, writeOrdered } from "./json.ts";
 
 const parse = (text: string) => {
   const read = parseOrdered(text);
@@ -19,7 +19,6 @@ describe("parseOrdered", () => {
   it("keeps duplicate keys rather than merging them, so a duplicate can be reported", () => {
     const node = parse('{"a":1,"a":2}');
     expect(node.kind === "object" && node.entries.map((e) => e.key)).toEqual(["a", "a"]);
-    expect(duplicateKey(node.kind === "object" ? node.entries : [])).toBe("a");
   });
 
   it("reads the scalars, nesting and escapes", () => {
@@ -62,15 +61,6 @@ describe("writeOrdered", () => {
   });
 });
 
-describe("fromPlain", () => {
-  it("turns a plain value into a node and back", () => {
-    expect(plain(fromPlain({ a: [1, "x", null, false] }))).toEqual({ a: [1, "x", null, false] });
-  });
-
-  it("reads undefined as null, since a request field is either written or absent", () => {
-    expect(plain(fromPlain(undefined))).toBe(null);
-  });
-});
 
 describe("saysNothing", () => {
   it("is true for the shapes decide.rs calls empty instructions", () => {
