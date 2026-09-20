@@ -580,15 +580,40 @@ fn score_options(id: &str, criteria: Option<&Criteria>) -> Result<Vec<PreparedOp
 
 /// The messages one prepared question is asked as.
 ///
-/// SemIf's `direct_messages`: the system instruction, plus one user message
-/// carrying `{evidence, criterion, options: [{letter, description}]}` as
-/// JSON with the evidence first.
+/// SemIf's `direct_messages` with one departure, which GitHub #240 forced:
+/// the evidence rides in the **system message**, not at the head of the
+/// user payload. The system message is `DIRECT_SYSTEM` followed by
+/// `{"evidence": …}`; the user message carries
+/// `{criterion, options: [{letter, description}]}`.
 ///
-/// When `state` is content parts the evidence is the parts themselves — the
-/// image first, then the decision's JSON without an `evidence` field, which
-/// is the shape `classify_vision_readout_gpu.rs` measured. Either way the
-/// evidence leads, so one `state` across many questions is one shared token
-/// prefix.
+/// **Why the system block and not just "first".** A fan-out of N questions
+/// over one `state` is only cheap if the state is prefilled once, and the
+/// tier that can do that is decided by *where* the shared text sits, not by
+/// its being shared:
+///
+/// - A **live shared prefix** needs a publisher that is still running when
+///   the claimant arrives. A decision terminates in the same tick its
+///   prefill does (GitHub #238), so it is never a live publisher for a
+///   sibling — the very property that makes it cheap denies it this tier.
+/// - A **prompt checkpoint** is refused outright for a decision
+///   (`ConcreteScheduler`'s capture point, GitHub #238).
+/// - A **retained prefix** outlives its publisher, which is exactly what a
+///   sequenced first question needs. It is cut at
+///   `Request::retained_prefix_point` — the page floor of
+///   `system_block_tokens` — and nothing outside the system block is ever
+///   part of it.
+///
+/// So evidence in the user turn can be first, shared, and still re-prefilled
+/// N times. Spec 04 asked for "evidence first"; what it needed was "evidence
+/// in the block".
+///
+/// **An image `state` cannot follow it.** `check_content_parts` refuses media
+/// in a system or developer message outright (GitHub #175), so the parts stay
+/// in the user turn — image first, then the decision's JSON without an
+/// `evidence` field, the shape `classify_vision_readout_gpu.rs` measured. A
+/// fan-out over an image therefore shares nothing and re-encodes it per
+/// question, which is spec 04's acceptance 2 unmet and reported rather than
+/// papered over.
 pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMessage> {
     let options: Vec<JsonValue> = question
         .options
@@ -598,29 +623,30 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
             json!({ "letter": answer.label, "description": option.description })
         })
         .collect();
-    let system = ChatMessage::text("system", DIRECT_SYSTEM);
+    let ask = payload_text(&[
+        ("criterion", &question.instructions),
+        ("options", &JsonValue::Array(options)),
+    ]);
     match state {
         Evidence::Json(value) => {
-            let payload = payload_text(&[
-                ("evidence", value),
-                ("criterion", &question.instructions),
-                ("options", &JsonValue::Array(options)),
-            ]);
-            vec![system, ChatMessage::text("user", payload)]
+            // One blank line between the instruction and the evidence: the
+            // instruction is the same bytes for every question over every
+            // state, so a reader — and a retained prefix — meets it first.
+            let system = format!("{DIRECT_SYSTEM}\n\n{}", payload_text(&[("evidence", value)]));
+            vec![
+                ChatMessage::text("system", system),
+                ChatMessage::text("user", ask),
+            ]
         }
         Evidence::Parts(parts) => {
-            let payload = payload_text(&[
-                ("criterion", &question.instructions),
-                ("options", &JsonValue::Array(options)),
-            ]);
             let mut content = parts.clone();
             content.push(ContentPart {
                 kind: Some("text".to_owned()),
-                text: Some(payload),
+                text: Some(ask),
                 url: None,
             });
             vec![
-                system,
+                ChatMessage::text("system", DIRECT_SYSTEM),
                 ChatMessage {
                     role: "user".to_owned(),
                     content: MessageContent::Parts(content),
@@ -636,17 +662,22 @@ pub fn messages_for(state: &Evidence, question: &PreparedQuestion) -> Vec<ChatMe
 /// Serialize `fields` as a JSON object **in the order given**.
 ///
 /// Built by hand rather than with `json!` because `serde_json::Map` sorts
-/// its keys in this build, and the order of these three is load-bearing.
-/// `{"criterion": ...}` sorts before `{"evidence": ...}`, so a `json!`
-/// payload puts the *question* in front of the evidence — and then two
-/// questions over one `state` share nothing but the nine characters of
-/// `{"criterion`, which is the opposite of what one shared evidence is
-/// supposed to buy (spec 04's fan-out, and the reuse the finding argues
-/// for).
+/// its keys in this build, so `json!` emits an order nobody wrote and
+/// nobody can read off the call site.
 ///
-/// See `docs/findings/2026-09-20-evidence-first-needs-explicit-key-order.md`:
-/// the measured prompts had this same sorting, so "evidence first" was a
-/// description of the intent and not of the bytes.
+/// The sorting used to be load-bearing here: with the evidence in the user
+/// payload, `{"criterion"` sorted in front of `{"evidence"`, and two
+/// questions over one `state` shared nine characters instead of the whole
+/// state (`docs/findings/2026-09-20-evidence-first-needs-explicit-key-order.md`
+/// — the measured prompts had that sorting, so "evidence first" described
+/// the intent and not the bytes). GitHub #240 moved the evidence into the
+/// system block, where the reuse actually lives, and the two keys left
+/// happen to sort into the order they are written in.
+///
+/// Kept, and kept explicit, because "happens to sort right" is not a
+/// property anyone should have to re-derive: the next field added here
+/// would silently reorder a prompt that has been measured. The order in
+/// the call site is the order the model sees.
 fn payload_text(fields: &[(&str, &JsonValue)]) -> String {
     let mut out = String::from("{");
     for (index, (name, value)) in fields.iter().enumerate() {
@@ -951,18 +982,42 @@ async fn serve(
         rendered.push(render(server, &evidence, question, model.clone()).await?);
     }
 
-    // One question at a time, each under its own `--request-timeout`
-    // (GitHub #95). So a request of N questions may take N times that
-    // timeout, which is worth knowing: the timeout bounds a *decision*, not
-    // this request. GitHub #240 makes the followers parallel, at which
-    // point the two bounds converge.
+    let input_tokens = rendered
+        .iter()
+        .fold(0u32, |total, ready| total.saturating_add(ready.prompt_tokens));
+    let resolved = rendered.first().map(|ready| ready.model.clone());
+
+    // The fan-out (GitHub #240). **One question goes first, alone**, and the
+    // rest go together once it is answered.
+    //
+    // The sequencing is not politeness, it is the whole saving. Handed N
+    // questions at once the scheduler sees N requests with no published
+    // prefix between them, and every one of them prefills the whole state —
+    // for an image, N x 16K tokens. The first question prefills it once and
+    // leaves a **retained prefix** behind (`messages_for` says why it is
+    // retained and not shared); the followers claim it and prefill only
+    // their own tail.
+    //
+    // After that there is nothing left to serialize, so the followers run
+    // together, [`FAN_OUT_WIDTH`] of them at a time.
+    let mut questions = prepared.iter().zip(rendered);
     let mut answers = BTreeMap::new();
-    let mut input_tokens = 0u32;
-    let mut resolved = None;
-    for (question, ready) in prepared.iter().zip(rendered) {
-        input_tokens = input_tokens.saturating_add(ready.prompt_tokens);
-        resolved = Some(ready.model.clone());
+    if let Some((question, ready)) = questions.next() {
         answers.insert(question.id.clone(), ask(server, question, ready, class).await);
+    }
+    loop {
+        let wave: Vec<_> = questions.by_ref().take(FAN_OUT_WIDTH).collect();
+        if wave.is_empty() {
+            break;
+        }
+        let ids: Vec<String> = wave.iter().map(|(question, _)| question.id.clone()).collect();
+        let run = wave
+            .into_iter()
+            .map(|(question, ready)| ask(server, question, ready, class))
+            .collect();
+        for (id, answer) in ids.into_iter().zip(concurrently(run).await) {
+            answers.insert(id, answer);
+        }
     }
     Ok(DecideResponse {
         // The model that *performed* the evaluation, which is the one the
@@ -1093,6 +1148,68 @@ async fn ask(
             "the engine did not answer this question in time".to_owned(),
         ),
     }
+}
+
+/// How many follower questions are put to the engine at once (GitHub #240).
+///
+/// Not a throughput knob — a **floor under the failure mode parallelism
+/// introduces**. The engine admits `max_in_flight` requests, which is
+/// `N_DECODE_LANES` in v1, and turns the rest away with `SubmitError::Full`:
+/// a 503 "retry" on `/v1/chat/completions`, and an error in that question's
+/// slot here. Twenty questions fired at once would answer eight and fail
+/// twelve, which is worse than answering them one at a time — so they go in
+/// waves, and an idle engine never refuses one.
+///
+/// A fan-out sharing the engine with other clients can still meet a full
+/// engine, exactly as any single request can. That is the pre-existing
+/// behaviour and not something waves promise to fix; what they fix is a
+/// fan-out competing with *itself*.
+///
+/// The cost is one `--request-timeout` per wave rather than per question:
+/// twenty questions bound at three timeouts (the sequenced first, then two
+/// waves), not twenty.
+pub const FAN_OUT_WIDTH: usize = ignis_core::N_DECODE_LANES;
+
+/// Run every future to completion **at the same time**, in place, and
+/// collect their outputs in order.
+///
+/// Fifteen lines rather than a `futures-util` dependency, but that is not
+/// the reason it is hand-written. The two obvious tools are both wrong
+/// here:
+///
+/// - `tokio::spawn` / `JoinSet` need `'static` futures, and these borrow
+///   the server and the prepared question. That alone settles it, and the
+///   shape it would force — detaching the work from the handler — is
+///   precisely spec 04's warning: "twenty independent requests is exactly
+///   the shape in which one forgets to cancel nineteen".
+/// - Awaiting them in sequence is what this replaces.
+///
+/// Held in a `Vec` and polled in place, the futures are owned by the
+/// handler's own future. A client that disconnects drops that, which drops
+/// these, which drops each `CancelOnDrop` — nineteen cancelled engine
+/// requests, with nobody having to remember them.
+async fn concurrently<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+    let mut done: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(move |cx| {
+        let mut waiting = false;
+        for (slot, future) in done.iter_mut().zip(futures.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(output) => *slot = Some(output),
+                std::task::Poll::Pending => waiting = true,
+            }
+        }
+        if waiting {
+            return std::task::Poll::Pending;
+        }
+        // Every slot was filled above, and the future is never polled again
+        // after it returns `Ready`.
+        std::task::Poll::Ready(done.iter_mut().filter_map(Option::take).collect())
+    })
+    .await
 }
 
 fn failed(code: &str, message: String) -> Answer {

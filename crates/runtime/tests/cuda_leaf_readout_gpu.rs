@@ -71,12 +71,15 @@ fn a_readout_crosses_the_real_compute_seam() {
     let labels: Vec<&str> = answers.iter().map(|a| a.label.as_str()).collect();
     assert_eq!(labels, vec!["A", "B", "C"], "the first three answer tokens");
 
-    // The decision, evidence first — the order `decide::payload_text` emits.
-    let payload = format!(
-        r#"{{"evidence":"Help! My payouts have been failing for 3 days.","criterion":"Which team should handle this?","options":[{{"letter":"A","description":"Payments, invoicing, refunds"}},{{"letter":"B","description":"Bugs, outages, integrations"}},{{"letter":"C","description":"Pricing, upgrades, new accounts"}}]}}"#
-    );
+    // The decision in the layout `/v1/decide` sends since GitHub #240: the
+    // evidence rides in the **system block**, where a sibling question's
+    // retained prefix can reach it, and the user turn carries only the
+    // question. `decide::messages_for` says why it is the block and not
+    // merely first.
+    let evidence = r#"{"evidence":"Help! My payouts have been failing for 3 days."}"#;
+    let payload = r#"{"criterion":"Which team should handle this?","options":[{"letter":"A","description":"Payments, invoicing, refunds"},{"letter":"B","description":"Bugs, outages, integrations"},{"letter":"C","description":"Pricing, upgrades, new accounts"}]}"#;
     let rendered = format!(
-        "<|im_start|>system\n{DIRECT_SYSTEM}<|im_end|>\n<|im_start|>user\n{payload}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "<|im_start|>system\n{DIRECT_SYSTEM}\n\n{evidence}<|im_end|>\n<|im_start|>user\n{payload}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
     let prompt = frontend
         .tokenizer()

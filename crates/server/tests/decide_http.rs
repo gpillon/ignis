@@ -69,7 +69,23 @@ impl LabelTokenizer for WideTokenizer {
 /// provider gets from the loaded artifact's tokenizer. Without one
 /// `/v1/decide` refuses every request, which is the right behaviour for a
 /// load that cannot name answers and the wrong fixture for testing one.
+///
+/// It also reports a **system block** the placeholder does not (GitHub
+/// #240). The placeholder renders no chat markers at all, so it has no
+/// structure to report and nothing it produces is ever reused — which
+/// makes it unable to show the one thing a fan-out is for. Here the block
+/// is exactly the first message when it is the system one, which is what
+/// the real template's block is too: the instruction and, since #240, the
+/// evidence.
 struct DecidingTemplate;
+
+/// How many of `messages`' tokens the leading system message accounts for,
+/// under [`SimpleTemplateProvider`]'s one-token-per-word rendering.
+fn system_block_of(messages: &[ChatMessage]) -> Option<u32> {
+    let first = messages.first().filter(|m| m.role == "system")?;
+    let words = first.content.text().split_whitespace().count() as u32;
+    (words > 0).then_some(words)
+}
 
 impl TemplateProvider for DecidingTemplate {
     fn apply_chat_template(
@@ -78,7 +94,9 @@ impl TemplateProvider for DecidingTemplate {
         options: &ThinkingOptions,
         tools: &[JsonValue],
     ) -> Result<RenderedPrompt, TemplateRejection> {
-        SimpleTemplateProvider.apply_chat_template(messages, options, tools)
+        let mut rendered = SimpleTemplateProvider.apply_chat_template(messages, options, tools)?;
+        rendered.system_block_tokens = system_block_of(messages);
+        Ok(rendered)
     }
 
     fn answer_alphabet(&self) -> AnswerAlphabet {
@@ -93,7 +111,10 @@ impl TemplateProvider for DecidingTemplate {
         media: Vec<ignis_artifact::vision::PreparedMedia>,
     ) -> Result<(RenderedPrompt, ignis_core::vision::Multimodal), ignis_server::template::ContentRejection>
     {
-        SimpleTemplateProvider.prepare_multimodal(messages, options, tools, media)
+        let (mut rendered, multimodal) =
+            SimpleTemplateProvider.prepare_multimodal(messages, options, tools, media)?;
+        rendered.system_block_tokens = system_block_of(messages);
+        Ok((rendered, multimodal))
     }
 
     fn render_tokens(&self, tokens: &[TokenId]) -> String {
@@ -114,14 +135,22 @@ fn app(compute: Arc<MockCompute>) -> axum::Router {
 }
 
 fn server(compute: Arc<MockCompute>) -> Server {
-    let scheduler = ConcreteScheduler::with_config(
+    server_over(compute)
+}
+
+/// [`server`] over any compute, for the fan-out tests' decorators.
+fn server_over(compute: Arc<dyn ignis_core::Compute>) -> Server {
+    Server::new(Engine::new(Box::new(scheduler_over(compute))), Box::new(DecidingTemplate))
+}
+
+fn scheduler_over(compute: Arc<dyn ignis_core::Compute>) -> ConcreteScheduler {
+    ConcreteScheduler::with_config(
         SchedulerConfig {
             model: MODEL.into(),
             ..SchedulerConfig::default()
         },
         compute,
-    );
-    Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate))
+    )
 }
 
 /// POST raw JSON text — never a `serde_json::Value`, whose object is sorted
@@ -515,25 +544,22 @@ async fn an_image_state_is_rendered_into_the_prompt() {
     assert!(vision_tokens > 0, "the image has a token run of its own");
 
     // The run is really *in* the prompt, not merely attached to it: the
-    // same decision without the image is shorter by exactly the image.
-    let prompt_tokens: usize = jobs.iter().map(|job| job.tokens.len()).sum();
-    let text_only = Arc::new(MockCompute::new());
-    let (_, _) = decide(
-        &app(text_only.clone()),
-        r#"{"state":"","questions":{"which":{"type":"choice","instructions":"Which number?","criteria":{"42":null,"47":null}}}}"#,
-    )
-    .await;
-    let without: usize = text_only
-        .prefill_calls()
-        .into_iter()
-        .flatten()
-        .map(|job| job.tokens.len())
-        .sum();
+    // prompt carries exactly that many `<|image_pad|>` ids.
+    //
+    // Counted in the prompt rather than measured against the same decision
+    // without an image, which is what this used to do: since GitHub #240 a
+    // text `state` rides in the system message and an image `state` cannot
+    // (`check_content_parts` refuses media there), so the two prompts differ
+    // by the evidence as well as by the image and their lengths no longer
+    // subtract.
+    let pads = jobs
+        .iter()
+        .flat_map(|job| job.tokens.iter())
+        .filter(|&&token| token == ignis_artifact::vision::IMAGE_PAD_ID)
+        .count();
     assert_eq!(
-        prompt_tokens - without,
-        vision_tokens,
-        "the image's {vision_tokens} placeholders are what the prompt grew by \
-         ({prompt_tokens} with it, {without} without)"
+        pads, vision_tokens,
+        "the image's {vision_tokens} placeholders are in the prompt"
     );
     assert_eq!(response["usage"]["output_tokens"], 0);
 }
@@ -651,4 +677,413 @@ async fn criteria_of_the_wrong_shape_refuses_in_its_own_vocabulary() {
         message.contains("mood") && message.contains("criteria"),
         "the refusal names the question and the field: {message}"
     );
+}
+
+// ── the fan-out: one state, N questions (GitHub #240, spec 04) ───────────
+
+/// A body of `questions` questions over one `state` of `state_words`
+/// distinct words.
+///
+/// The words are distinct so the evidence cannot be confused with anything
+/// else in the prompt under [`SimpleTemplateProvider`]'s one-token-per-word
+/// rendering, and the instructions differ per question so the questions are
+/// not accidentally one prompt repeated.
+fn fan_out(state_words: usize, questions: usize) -> String {
+    let state = (0..state_words)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let asked = (0..questions)
+        .map(|i| format!(r#""q{i}":{{"type":"noul","instructions":"Is q{i} urgent?"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"state":"{state}","model":"{MODEL}","questions":{{{asked}}}}}"#)
+}
+
+/// Every request id the compute was asked to prefill, and how many tokens
+/// of it — summed over the chunks a prompt was cut into.
+fn prefilled(compute: &MockCompute) -> std::collections::BTreeMap<u64, u32> {
+    let mut totals = std::collections::BTreeMap::new();
+    for job in compute.prefill_calls().into_iter().flatten() {
+        *totals.entry(job.request).or_insert(0u32) += job.tokens.len() as u32;
+    }
+    totals
+}
+
+#[tokio::test]
+async fn twenty_questions_over_one_state_prefill_it_once() {
+    // Spec 04's acceptance 1, on the prefill token count rather than on wall
+    // time. The mechanism is a **retained prefix** over the system block
+    // (`decide::messages_for`): the first question pays for the state, the
+    // other nineteen claim it and prefill only their own tail.
+    const STATE: usize = 300;
+    const QUESTIONS: usize = 20;
+    let compute = Arc::new(MockCompute::new());
+    let (status, response) = decide(&app(compute.clone()), &fan_out(STATE, QUESTIONS)).await;
+
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"].as_object().expect("a map").len(), QUESTIONS);
+
+    let totals = prefilled(&compute);
+    assert_eq!(totals.len(), QUESTIONS, "one request per question: {totals:?}");
+    let first = *totals.values().next().expect("a first question");
+    assert!(
+        first > STATE as u32,
+        "the first question prefills the whole state: {first} tokens"
+    );
+    for (request, tokens) in totals.iter().skip(1) {
+        assert!(
+            *tokens < STATE as u32,
+            "question {request} prefilled {tokens} tokens — it cannot have \
+             claimed the state and still run that many"
+        );
+    }
+    let total: u32 = totals.values().sum();
+    assert!(
+        total < first + QUESTIONS as u32 * 32,
+        "the state is paid for once, not twenty times: {total} tokens over \
+         {QUESTIONS} questions, the first of them {first}"
+    );
+}
+
+#[tokio::test]
+async fn the_followers_of_a_fan_out_are_in_the_engine_together() {
+    // The other half of the sequencing rule. The first question runs alone
+    // so there is a prefix to claim; after that there is nothing left to
+    // serialize, and answering the rest one at a time would cost N
+    // `--request-timeout`s for no gain.
+    //
+    // Served in sequence only ever one request exists at a time, so a
+    // prefill batch carrying two of them is proof the followers overlap.
+    let compute = Arc::new(MockCompute::new());
+    let (status, _) = decide(&app(compute.clone()), &fan_out(300, 8)).await;
+    assert_eq!(status, 200);
+
+    let batched = compute
+        .prefill_calls()
+        .into_iter()
+        .map(|call| {
+            call.iter()
+                .map(|job| job.request)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        batched > 1,
+        "the followers reached the scheduler together — the widest prefill \
+         batch held {batched} requests"
+    );
+}
+
+/// Answers `victim`'s prefill with no readout, the way a leaf that ran the
+/// forward pass but produced nothing usable would.
+///
+/// A per-question runtime failure has to be *per question*: the mock's own
+/// `fail_prefill` fails the whole batch the way a leaf error does, and the
+/// followers share a batch, so it would take all of them down together and
+/// prove nothing about isolation. Dropping one job's readout leaves its
+/// siblings' outcomes untouched, and a decision with no readout is exactly
+/// what the scheduler finishes with `FinishReason::Error` (GitHub #238).
+struct DropReadout {
+    inner: MockCompute,
+    victim: ignis_core::RequestId,
+}
+
+impl ignis_core::Compute for DropReadout {
+    fn prefill_step(
+        &self,
+        jobs: &[ignis_core::PrefillJob],
+    ) -> Result<Vec<ignis_core::PrefillOutcome>, ignis_core::ComputeError> {
+        let mut outcomes = self.inner.prefill_step(jobs)?;
+        for (job, outcome) in jobs.iter().zip(outcomes.iter_mut()) {
+            if job.request == self.victim {
+                outcome.readout = None;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn decode_step(
+        &self,
+        jobs: &[ignis_core::DecodeJob],
+    ) -> Result<Vec<ignis_core::DecodeOutcome>, ignis_core::ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+
+    fn release(&self, request: ignis_core::RequestId) {
+        self.inner.release(request);
+    }
+}
+
+#[tokio::test]
+async fn one_question_failing_at_runtime_still_answers_the_others() {
+    // Spec 04's acceptance 4. Everything a *caller* can get wrong is refused
+    // before the first submit (`serve`); this is the other kind of failure —
+    // the engine dropping one question after the others have been paid for.
+    const QUESTIONS: usize = 8;
+    // A follower, not the sequenced first question: the first one failing
+    // would be indistinguishable from a fan-out that never started.
+    let compute = Arc::new(DropReadout {
+        inner: MockCompute::new(),
+        victim: 3,
+    });
+    let app = server_over(compute.clone() as Arc<dyn ignis_core::Compute>).app();
+    let (status, response) = decide(&app, &fan_out(300, QUESTIONS)).await;
+
+    assert_eq!(status, 200, "one question's runtime failure is not the request's");
+    let answers = response["answers"].as_object().expect("a map");
+    assert_eq!(answers.len(), QUESTIONS, "every question keeps its slot");
+    let failed: Vec<&String> = answers
+        .iter()
+        .filter(|(_, answer)| answer["type"] == "error")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(failed.len(), 1, "exactly one slot carries the failure: {response}");
+    for (id, answer) in answers {
+        if failed.contains(&id) {
+            assert!(answer["message"].is_string(), "the error says what happened: {answer}");
+            continue;
+        }
+        assert_eq!(answer["type"], "noul", "question {id} keeps its paid-for answer");
+        assert!(answer["noul"].is_number(), "{answer}");
+    }
+}
+
+/// Holds the first `prefill_step` that carries a **follower**, and reports
+/// every request the engine releases.
+///
+/// Gating `prefill_step` rather than `decode_step` (`GatedCompute`) is the
+/// whole point: a decision never decodes, so the existing gate can never
+/// hold one. Holding on a job whose request id is not the first one is what
+/// makes "mid-fan-out" a fact rather than a hope — the followers are in the
+/// engine at the instant the client goes away.
+struct HoldFollower {
+    inner: MockCompute,
+    entered: std::sync::mpsc::SyncSender<()>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    held: std::sync::atomic::AtomicBool,
+    released: std::sync::mpsc::SyncSender<ignis_core::RequestId>,
+}
+
+impl ignis_core::Compute for HoldFollower {
+    fn prefill_step(
+        &self,
+        jobs: &[ignis_core::PrefillJob],
+    ) -> Result<Vec<ignis_core::PrefillOutcome>, ignis_core::ComputeError> {
+        let follower = jobs.iter().any(|job| job.request > 1);
+        if follower && !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.entered.send(());
+            let _ = self.go.lock().unwrap().recv();
+        }
+        self.inner.prefill_step(jobs)
+    }
+
+    fn decode_step(
+        &self,
+        jobs: &[ignis_core::DecodeJob],
+    ) -> Result<Vec<ignis_core::DecodeOutcome>, ignis_core::ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+
+    fn release(&self, request: ignis_core::RequestId) {
+        self.inner.release(request);
+        let _ = self.released.send(request);
+    }
+}
+
+#[tokio::test]
+async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
+    // Spec 04's acceptance 3. The fan-out is a unit of cancellation even
+    // though it is not a unit of scheduling: the engine keeps working on a
+    // request whose caller has gone until it is told otherwise, and twenty
+    // of them is exactly the shape in which nineteen are forgotten.
+    //
+    // Nothing here sleeps (ADR 0006): the compute signals when a follower is
+    // inside it, and reports every release on its way back out.
+    use std::sync::mpsc::sync_channel;
+
+    let (entered_tx, entered_rx) = sync_channel(0);
+    let (go_tx, go_rx) = sync_channel(0);
+    let (released_tx, released_rx) = sync_channel(64);
+    let compute = Arc::new(HoldFollower {
+        inner: MockCompute::new(),
+        entered: entered_tx,
+        go: std::sync::Mutex::new(go_rx),
+        held: std::sync::atomic::AtomicBool::new(false),
+        released: released_tx,
+    });
+    let app = server_over(compute.clone() as Arc<dyn ignis_core::Compute>).app();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/decide")
+        .header("content-type", "application/json")
+        .body(Body::from(fan_out(300, 8).into_bytes()))
+        .unwrap();
+    let client = tokio::spawn(async move { app.oneshot(request).await });
+
+    // Blocking, but off the runtime's thread — the handler has to keep being
+    // polled to submit the followers this waits for.
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("the waiter ran")
+        .expect("a follower reached the compute");
+
+    // The client goes away. Dropping the handler's future drops every
+    // in-flight `ask`, and each of those drops its `CancelOnDrop`.
+    client.abort();
+    support::nudge().await;
+    go_tx.send(()).expect("the held prefill is still waiting");
+
+    let releases = tokio::task::spawn_blocking(move || {
+        let mut seen = std::collections::BTreeSet::new();
+        while let Ok(request) =
+            released_rx.recv_timeout(std::time::Duration::from_secs(10))
+        {
+            seen.insert(request);
+        }
+        seen
+    })
+    .await
+    .expect("the collector ran");
+
+    assert!(
+        releases.len() > 1,
+        "the sequenced first question and at least one follower were \
+         released: {releases:?}"
+    );
+    let prefilled: std::collections::BTreeSet<u64> = compute
+        .inner
+        .prefill_calls()
+        .into_iter()
+        .flatten()
+        .map(|job| job.request)
+        .collect();
+    assert!(
+        prefilled.is_subset(&releases),
+        "every request the engine started is released, none left running: \
+         started {prefilled:?}, released {releases:?}"
+    );
+}
+
+/// A [`Scheduler`] that records what the server submitted, and otherwise is
+/// the real one.
+///
+/// The class a request carries reaches no response field and no metric, so
+/// this is the seam it *can* be read at — the same one the engine drives.
+struct RecordingScheduler {
+    inner: ConcreteScheduler,
+    submitted: Arc<std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>>,
+}
+
+impl ignis_core::Scheduler for RecordingScheduler {
+    fn submit(
+        &mut self,
+        input: ignis_core::types::RequestInput,
+        class: ignis_core::types::RequestClass,
+    ) -> Result<ignis_core::RequestId, ignis_core::SubmitError> {
+        self.submitted.lock().unwrap().push((input.clone(), class));
+        self.inner.submit(input, class)
+    }
+
+    fn cancel(&mut self, request: ignis_core::RequestId) -> bool {
+        self.inner.cancel(request)
+    }
+
+    fn advance(&mut self) -> Vec<ignis_core::SchedEvent> {
+        self.inner.advance()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.inner.is_idle()
+    }
+
+    fn model_id(&self) -> &str {
+        ignis_core::Scheduler::model_id(&self.inner)
+    }
+
+    fn max_sequence_tokens(&self) -> u32 {
+        ignis_core::Scheduler::max_sequence_tokens(&self.inner)
+    }
+
+    fn mode(&self) -> ignis_core::types::EngineMode {
+        ignis_core::Scheduler::mode(&self.inner)
+    }
+
+    fn occupancy(&self) -> ignis_core::scheduler::Occupancy {
+        ignis_core::Scheduler::occupancy(&self.inner)
+    }
+}
+
+fn recording() -> (axum::Router, Arc<std::sync::Mutex<Vec<(ignis_core::types::RequestInput, ignis_core::types::RequestClass)>>>) {
+    let submitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scheduler = RecordingScheduler {
+        inner: scheduler_over(Arc::new(MockCompute::new())),
+        submitted: submitted.clone(),
+    };
+    let server = Server::new(Engine::new(Box::new(scheduler)), Box::new(DecidingTemplate));
+    (server.app(), submitted)
+}
+
+#[tokio::test]
+async fn every_question_in_a_fan_out_carries_the_parents_class() {
+    // Spec 04's acceptance 5. The class is read once, off the parent's Lane
+    // tag, and handed to every internal request — a fan-out is twenty
+    // requests but one caller, and nineteen of them silently defaulting to
+    // Agent would be a lane the caller never asked for.
+    use ignis_core::types::RequestClass;
+
+    let (app, submitted) = recording();
+    let (status, _) = decide(&app, &fan_out(300, 5)).await;
+    assert_eq!(status, 200);
+    let classes: Vec<RequestClass> = submitted.lock().unwrap().iter().map(|(_, c)| *c).collect();
+    assert_eq!(classes.len(), 5);
+    assert!(
+        classes.iter().all(|class| *class == RequestClass::Agent),
+        "a decision defaults to Agent, every one of them: {classes:?}"
+    );
+
+    let (app, submitted) = recording();
+    let body = fan_out(300, 5).replace(
+        &format!(r#""model":"{MODEL}""#),
+        &format!(r#""model":"{MODEL}@interactive""#),
+    );
+    let (status, _) = decide(&app, &body).await;
+    assert_eq!(status, 200);
+    let classes: Vec<RequestClass> = submitted.lock().unwrap().iter().map(|(_, c)| *c).collect();
+    assert_eq!(classes.len(), 5);
+    assert!(
+        classes.iter().all(|class| *class == RequestClass::Interactive),
+        "and the caller's own Lane tag reaches all of them: {classes:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_evidence_reaches_the_scheduler_inside_the_system_block() {
+    // The mechanism, asserted where it is decided rather than inferred from
+    // a token count. A retained prefix is cut at the page floor of
+    // `system_block_tokens` (`Request::retained_prefix_point`) and nothing
+    // outside the block is ever part of one — so evidence that is merely
+    // *first* is re-prefilled per question however shared it looks.
+    const STATE: usize = 300;
+    let (app, submitted) = recording();
+    let (status, _) = decide(&app, &fan_out(STATE, 3)).await;
+    assert_eq!(status, 200);
+
+    for (input, _) in submitted.lock().unwrap().iter() {
+        let block = input
+            .system_block_tokens
+            .expect("a decision's prompt opens with a system block");
+        assert!(
+            block > STATE as u32,
+            "the block holds the instruction and the whole {STATE}-token \
+             state, not just the instruction: {block}"
+        );
+        assert!(
+            block < input.tokens.len() as u32,
+            "and stops before the question, which is this request's alone"
+        );
+    }
 }

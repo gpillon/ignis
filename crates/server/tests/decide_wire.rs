@@ -587,22 +587,99 @@ fn image_evidence_leads_the_prompt_and_drops_the_evidence_field() {
 }
 
 #[test]
-fn text_evidence_leads_the_payload() {
+fn text_evidence_rides_in_the_system_block() {
+    // GitHub #240. The evidence used to lead the user payload, which made it
+    // *first* without making it *shared*: the only tier a decision's sibling
+    // can claim is a retained prefix, and a retained prefix is cut inside the
+    // system block and nowhere else (`decide::messages_for` says why).
     let questions = prepared(JEV_CHOICE);
     let messages = messages_for(
         &Evidence::read(&json!("Help! My payouts have been failing for 3 days.")),
         &questions[0],
     );
-    let text = messages[1].content.text();
-    let payload: JsonValue = serde_json::from_str(&text).expect("the payload is JSON");
-    assert_eq!(payload["evidence"], "Help! My payouts have been failing for 3 days.");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+
+    let system = messages[0].content.text();
+    assert!(
+        system.starts_with(ignis_server::decide::DIRECT_SYSTEM),
+        "the instruction leads, so it is the same bytes for every state: {system}"
+    );
+    let evidence: JsonValue = serde_json::from_str(
+        system.strip_prefix(ignis_server::decide::DIRECT_SYSTEM).unwrap().trim(),
+    )
+    .expect("the evidence is the block's JSON tail");
+    assert_eq!(evidence["evidence"], "Help! My payouts have been failing for 3 days.");
+
+    // And the question is the user turn, which is this request's alone.
+    let payload: JsonValue =
+        serde_json::from_str(&messages[1].content.text()).expect("the payload is JSON");
+    assert!(payload.get("evidence").is_none(), "not repeated: {payload}");
     assert_eq!(payload["criterion"], "Which team should handle this?");
     assert_eq!(payload["options"][1]["letter"], "B");
     assert_eq!(payload["options"][1]["description"], "Bugs, outages, integrations");
-    assert!(
-        text.find("evidence").unwrap() < text.find("criterion").unwrap(),
-        "evidence first, which is what makes one state a shared prefix"
+}
+
+#[test]
+fn two_questions_over_one_state_have_the_same_system_block() {
+    // The property the fan-out rests on, at the seam that decides it: what
+    // two questions share has to be a whole *prefix*, byte for byte, or the
+    // page floor of the block is a page of two different prompts.
+    let body = r#"{
+      "state": "Help! My payouts have been failing for 3 days.",
+      "questions": {
+        "is_urgent": { "type": "noul", "instructions": "Urgent?" },
+        "department": { "type": "choice", "instructions": "Which team?", "criteria": { "billing": null, "technical": null } }
+      }
+    }"#;
+    let questions = prepared(body);
+    let evidence = Evidence::read(&json!("Help! My payouts have been failing for 3 days."));
+    let first = messages_for(&evidence, &questions[0]);
+    let second = messages_for(&evidence, &questions[1]);
+
+    assert_eq!(
+        first[0].content.text(),
+        second[0].content.text(),
+        "one state is one system block"
     );
+    assert_ne!(
+        first[1].content.text(),
+        second[1].content.text(),
+        "and the questions are still two different prompts"
+    );
+}
+
+#[test]
+fn an_image_state_stays_in_the_user_turn() {
+    // Spec 04's acceptance 2 is **not met**, and this is where it is
+    // refused rather than forgotten: `check_content_parts` turns media in a
+    // system or developer message into a 400 (GitHub #175), so an image
+    // `state` cannot go where the retained prefix is cut. A fan-out over an
+    // image re-encodes it per question.
+    let questions = prepared_value(json!({
+        "state": "s",
+        "questions": { "q": { "type": "choice", "instructions": "Which number?", "criteria": { "42": null, "47": null } } }
+    }));
+    let state = json!([{ "type": "image_url", "image_url": { "url": "https://example.test/a.png" } }]);
+    let messages = messages_for(&Evidence::read(&state), &questions[0]);
+
+    assert_eq!(
+        messages[0].content.text(),
+        ignis_server::decide::DIRECT_SYSTEM,
+        "the system block carries the instruction and nothing else"
+    );
+    assert!(
+        ignis_server::template::check_content_parts(&messages, true).is_ok(),
+        "and the messages this builds are ones the server will accept"
+    );
+
+    // The refusal that keeps it that way, stated as a fact rather than as a
+    // comment: the same image moved into the system message is a 400.
+    let mut moved = messages.clone();
+    moved[0].content = messages[1].content.clone();
+    let rejection = ignis_server::template::check_content_parts(&moved, true)
+        .expect_err("media in a system message is refused");
+    assert_eq!(rejection.code, "invalid_media");
 }
 
 #[test]

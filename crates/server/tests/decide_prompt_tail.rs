@@ -23,6 +23,13 @@
 //!    does per row and `AnswerAlphabet` deliberately does not
 //!    (GitHub #237) — it is a property of the rendered prompt, not of the
 //!    tokenizer alone.
+//! 3. The **evidence is inside the system block**, and how much of it
+//!    survives the page floor (GitHub #240). A fan-out of N questions over
+//!    one `state` shares that state only through a retained prefix, and a
+//!    retained prefix is cut at `floor(system_block_tokens, KV_PAGE_TOKENS)`
+//!    — so a state shorter than what is left of a page is shared in full on
+//!    paper and not at all in practice. Only the real tokenizer can say
+//!    which, and this is the only test that has one.
 //!
 //! Machine-local: skips when the artifact is absent (`docs/agents/testing.md`
 //! — this is CPU-only and nowhere near the forward pass, so a skip is green).
@@ -33,6 +40,7 @@ use ignis_artifact::{FrontendSet, Reader};
 use ignis_core::decision::AnswerAlphabet;
 use ignis_server::artifact_template::ArtifactTemplateProvider;
 use ignis_server::decide::{Evidence, messages_for, prepare};
+use serde_json::json;
 use ignis_server::template::TemplateProvider;
 use ignis_server::thinking::ThinkingOptions;
 
@@ -151,6 +159,61 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
     eprintln!(
         "ignis decide: the answer boundary holds for all {} labels",
         prepared[0].answers.len()
+    );
+
+    // 3. The evidence is in the system block — the only place a sibling
+    //    question can claim it from.
+    let block = rendered
+        .system_block_tokens
+        .expect("a decision's prompt opens with a system block");
+    let head = tokenizer
+        .decode(&rendered.tokens[..block as usize])
+        .unwrap_or_else(|e| panic!("decode the block: {e}"));
+    assert!(
+        head.contains("payouts have been failing"),
+        "the state is inside the system block, not merely first: {head:?}"
+    );
+    assert!(
+        !head.contains("Which team should handle this?"),
+        "and the question is not, or two questions would share nothing: {head:?}"
+    );
+
+    // How much of it a retained prefix actually keeps. Reported, not
+    // asserted: the floor is a property of the state's length, and Jev's own
+    // documented example is a single sentence.
+    let floor = block / ignis_core::KV_PAGE_TOKENS * ignis_core::KV_PAGE_TOKENS;
+    eprintln!(
+        "ignis decide: system block {block} tokens, retained prefix {floor}          (page {})",
+        ignis_core::KV_PAGE_TOKENS
+    );
+
+    // The same decision over a state worth sharing. The sentence above is
+    // Jev's documentation, not its workload — a fan-out is asked for when
+    // the state is a ticket, a transcript or a document.
+    let long = json!(format!(
+        "{} ",
+        "The customer writes at length about a payout failure that has now          lasted three days, with invoice numbers, timestamps and an          increasingly short temper. "
+            .repeat(12)
+    ));
+    let messages = messages_for(&Evidence::read(&long), &prepared[0]);
+    let rendered = provider
+        .apply_chat_template(&messages, &thinking, &[])
+        .unwrap_or_else(|e| panic!("template: {}", e.message));
+    let block = rendered
+        .system_block_tokens
+        .expect("a decision's prompt opens with a system block");
+    let floor = block / ignis_core::KV_PAGE_TOKENS * ignis_core::KV_PAGE_TOKENS;
+    eprintln!(
+        "ignis decide: a {}-token prompt over a real state retains {floor} of          a {block}-token block",
+        rendered.tokens.len()
+    );
+    assert!(
+        floor > 0,
+        "a state of any size worth fanning out over reaches the first page          boundary: block {block}, floor {floor}"
+    );
+    assert!(
+        (rendered.tokens.len() as u32) - floor < block,
+        "and what each sibling question re-prefills is its own tail, not the          state"
     );
 }
 
