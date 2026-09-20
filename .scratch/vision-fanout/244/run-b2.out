@@ -1,0 +1,21 @@
+ready
+large 768 887 ms
+large 1024 1019 ms
+large 1536 1525 ms
+large 2048 2374 ms
+large 3072 5388 ms
+large 4096 10943 ms
+medium 768 823 ms
+medium 1024 1013 ms
+medium 1536 1551 ms
+medium 2048 2387 ms
+medium 3072 5390 ms
+medium 4096 10950 ms
+small 768 820 ms
+small 1024 1021 ms
+small 1536 1535 ms
+small 2048 2381 ms
+small 3072 5415 ms
+small 4096 10993 ms
+oversize done
+ALLDONE

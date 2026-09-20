@@ -1,0 +1,9 @@
+=== ignis ===
+  ignis run 1: 6387 ms
+  ignis run 2: 2300 ms
+  ignis run 3: 2257 ms
+=== ninfer ===
+  ninfer run 1: 6205 ms
+  ninfer run 2: 60 ms
+  ninfer run 3: 67 ms
+ALLDONE

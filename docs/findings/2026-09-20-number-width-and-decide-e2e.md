@@ -195,6 +195,11 @@ readout baseline.
   tower at this width: GitHub #181's closeout measured the vision part at
   21 ms against a reference's 63 ms, on an image three orders of magnitude
   smaller. Whether 4.17 s is the roofline or an unexamined path is unknown.
+  *(Answered: it is the roofline —
+  [`2026-09-21-vision-tower-cost-at-width.md`](2026-09-21-vision-tower-cost-at-width.md).
+  The fan-out measurements above were taken before GitHub #243 landed; the
+  tower now runs once per image, see
+  [`2026-09-20-shared-vision-embedding-fan-out.md`](2026-09-20-shared-vision-embedding-fan-out.md).)*
 
 ## Limits and unknowns
 
