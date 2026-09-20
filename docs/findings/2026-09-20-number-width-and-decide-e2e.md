@@ -82,6 +82,19 @@ Same questions, same server, varying only how many and what the evidence is.
 
 Input tokens, image: 16,506 / 32,968 / 65,977 — exactly 1x, 2x, 4x.
 
+Where an image question's 6.9 s actually goes, from `ignis.request.admitted`
+on a 4096x4096 screenshot (16,384 vision tokens):
+
+| stage | time | cached across questions? |
+|---|---|---|
+| media preprocess (PNG decode, resize, pack) | 0.17 s first, **0.00 s** after | yes — the media cache |
+| **vision encode** (the tower, 16,384 columns) | **4.17 s** | **no — paid per question** |
+| attention prefill, 16,506 tokens | ~2.4 s | no |
+
+The same 18,800 tokens as **plain text** prefill in 2.99 s (6,283 tok/s), which
+is what pins the third row by difference and says the first two are the
+image's own cost.
+
 For comparison on the same load: a 33-token chat prompt generating 88 tokens
 takes 0.672 s (~131 tok/s with dflash2-7), and the same 4096² image in a
 free-form chat completion is 16,413 prompt tokens in 7.14 s.
@@ -134,12 +147,23 @@ edges land within 6 px on x and 30–80 px on y of the ground truth — the same
 y-bias `point` shows. Still three synthetic scenes; still not a claim about
 bounding boxes in general.
 
-**An image `state` shares nothing across a fan-out, and the cost is exactly
-linear.** 6.9 s and 16.5 K tokens per question, every question. A text state
-rides the system block and is prefilled once: eight questions cost 0.36 s
-against 0.13 s for one, a marginal 33 ms each. This is GitHub #240's unmet
-acceptance 2 measured rather than reasoned about — the ratio between the two
-rows is 200x per question.
+**An image `state` shares nothing across a fan-out, and most of what it
+does not share is the *encode*, not the prefill.** 6.9 s per question, every
+question, of which **4.17 s is the vision tower re-encoding the same
+picture** and ~2.4 s is the attention prefill. The CPU half — decoding the
+PNG and packing its patches — *is* cached and costs 0.17 s once, so the media
+cache is working; what has no cache at any tier is the device-resident
+embedding, which `RuntimeCompute` keys by request and releases when the
+request's last placeholder is prefilled.
+
+That reframes GitHub #240's unmet acceptance 2. The fix everyone reaches for
+is sharing the prompt, and sharing the prompt would recover the 2.4 s. The
+larger 4.17 s is a second, independent miss: N questions over one image
+encode it N times, and nothing in the prefix machinery would change that.
+
+A text state rides the system block and is prefilled once: eight questions
+cost 0.36 s against 0.13 s for one, a marginal 33 ms each. The ratio between
+the two evidence kinds is 200x per question.
 
 **The readout-only histogram reads correctly in the wild.** 46 decisions
 counted, 27 masses observed, difference 19 = the `number` + `point` + `box`
@@ -160,6 +184,17 @@ readout baseline.
   per question a caller is better served asking one question with a richer
   `criterion` than four cheap ones. Whatever #235 concludes about shared
   prefixes applies here with a 200x lever.
+- **The vision embedding wants a cache of its own**, and it is the bigger
+  half. The prepared patches are already cached by content digest
+  (`media.cache_hits` is 1 on every follower); the embedding they encode to
+  is not, so the tower runs again per question over bytes it has already
+  seen. Whether a device-resident embedding can be shared between two live
+  requests is a question for whoever owns the media path — it is not the
+  prefix machinery's, and a shared-prefix fix would leave it untouched.
+- 16,384 columns in 4.17 s is ~3,900 columns/s. Nobody has profiled the
+  tower at this width: GitHub #181's closeout measured the vision part at
+  21 ms against a reference's 63 ms, on an image three orders of magnitude
+  smaller. Whether 4.17 s is the roofline or an unexamined path is unknown.
 
 ## Limits and unknowns
 
