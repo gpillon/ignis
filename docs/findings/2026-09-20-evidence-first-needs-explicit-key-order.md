@@ -5,15 +5,20 @@
 - Observed: 2026-09-20
 - Last verified: 2026-09-20
 - Scope: serving / decisions, the `/v1/decide` prompt, shared-prefix reuse
-- Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, GitHub #239, #240, ADR 0034
+- Related: `docs/findings/2026-09-19-typed-option-logit-readout.md`, `crates/server/tests/classify_readout_gpu.rs`, `classify_option_ceiling_gpu.rs`, `classify_vision_readout_gpu.rs`, `crates/server/src/decide.rs`, GitHub #239, #240
 - Superseded by: none
 
 ## Question
 
-ADR 0034 and the readout finding both rest on one sentence: *"Evidence-first
-costs nothing and keeps reuse possible. Jev's shape is one `state` and many
-questions; with the evidence at the head of the payload that is one shared
-token prefix and N short suffixes."*
+The readout finding rests on one sentence: *"Evidence-first costs nothing and
+keeps reuse possible. Jev's shape is one `state` and many questions; with the
+evidence at the head of the payload that is one shared token prefix and N
+short suffixes."*
+
+(ADR 0034 does **not** say this — it is the finding's implication alone. An
+earlier draft of this document, and the commit message that shipped it,
+attributed it to the ADR as well; they were wrong, and the ADR's own text is
+silent about prompt layout.)
 
 Spec 04's whole fan-out design is that sentence made mechanical — twenty
 questions over one `state` prefill the state once. While implementing #239 a
@@ -69,10 +74,10 @@ implication drawn from the source rather than from the output.
 Two consequences, and they point in opposite directions.
 
 **For reuse, this is a real defect.** Every claim about one `state` becoming a
-shared token prefix — ADR 0034's "evidence-first costs nothing and keeps reuse
-possible", spec 04's acceptance 1 ("twenty questions over one text `state`
-prefill the state once") and acceptance 2 (an image encoded once) — was false
-of the prompt as it was actually being built. A fan-out over the sorted
+shared token prefix — the readout finding's "evidence-first costs nothing and
+keeps reuse possible", spec 04's acceptance 1 ("twenty questions over one text
+`state` prefill the state once") and acceptance 2 (an image encoded once) —
+was false of the prompt as it was actually being built. A fan-out over the sorted
 payload would have re-prefilled the whole evidence per question and
 re-encoded the image per question.
 
@@ -87,19 +92,33 @@ well-formed — but "no reason to expect" is not a measurement.
 
 ## Implications
 
-- `crates/server/src/decide.rs` builds the payload with `payload_text`, which
-  emits the keys in the order given rather than through `serde_json::Map`.
-  The order is load-bearing, so it is now stated in code rather than implied
-  by the order of a literal.
-- **The GPU tests still sort.** They were left alone: they are the record of
-  what was measured, and rewriting them would silently restate history. A
-  re-run of `classify_readout_gpu.rs` against the evidence-first payload is
-  the measurement that would close the gap between the shipped prompt and the
+**What is fixed, and what is not.** The defect is fixed in the only place
+that serves traffic: `crates/server/src/decide.rs` builds the payload with
+`payload_text`, which emits the keys in the order given rather than through
+`serde_json::Map`. The order is load-bearing, so it is now stated in code
+rather than implied by the order of a literal, and
+`decide_wire.rs::text_evidence_leads_the_payload` fails if that stops being
+true (verified by mutation).
+
+Three things are deliberately *not* fixed:
+
+- **The GPU tests still sort.** They are the record of what was measured, and
+  rewriting them would silently restate history. A re-run of
+  `classify_readout_gpu.rs` against the evidence-first payload is the
+  measurement that would close the gap between the shipped prompt and the
   published accuracy, and it is not done here.
+- **No re-measurement has been taken**, so the accuracy numbers still
+  describe the old prompt.
+- **The claim still stands in the readout finding's own Implications**, with
+  a pointer to this document beside it rather than a rewrite. Erasing it
+  would erase that the claim was made and believed, which is the part worth
+  keeping.
+
+Two things worth carrying elsewhere:
+
 - Enabling `serde_json/preserve_order` workspace-wide would have fixed this
   invisibly and reordered the keys of every other JSON the server emits. The
   explicit builder is three lines and changes nothing else.
-- The general shape is worth remembering: a `json!` literal reads like an
-  ordered document and is not one. Anywhere key order carries meaning — a
-  prompt, a cache key, a signature — the order has to be asserted by a test,
-  because the source will keep looking right.
+- A `json!` literal reads like an ordered document and is not one. Anywhere
+  key order carries meaning — a prompt, a cache key, a signature — the order
+  has to be asserted by a test, because the source will keep looking right.

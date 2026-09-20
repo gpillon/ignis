@@ -189,7 +189,13 @@ pixels.
   the figure.)
 - **Evidence-first costs nothing and keeps reuse possible.** Jev's shape is one
   `state` and many questions; with the evidence at the head of the payload that
-  is one shared token prefix and N short suffixes. It does **not** follow that
+  is one shared token prefix and N short suffixes. (**The prompts measured
+  here did not have that layout**: `json!` sorts its keys in this workspace,
+  so every row above was served `{"criterion": …, "evidence": …}` and two
+  questions over one `state` shared nine characters. The claim is about the
+  design, and `/v1/decide` implements it; the numbers on this page were taken
+  criterion-first. See
+  `2026-09-20-evidence-first-needs-explicit-key-order.md`.) It does **not** follow that
   prefix reuse pays here. A traversal on ignis is ~19 ms fixed
   (`2026-09-18-prompt-reuse-tax-on-short-ttft.md`), and splitting a 132-token
   prompt into prefix plus suffix is two traversals where one cost 36.5 ms —
