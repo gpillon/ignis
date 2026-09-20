@@ -201,7 +201,7 @@ slots; no percentage is exported.
 included, because a zero is a reading. A decision's are not exported until a
 decision has been served, and that is this ADR's other rule — *only
 authoritative values are exported* — applied to a route most loads never
-call: four permanently-zero series and an eleven-bucket histogram on every
+call: three permanently-zero series and an eleven-bucket histogram on every
 scrape of every server would be clutter that says nothing about the server
 it is scraped from. Prometheus handles a series that appears mid-window the
 way it handles a new target. Once the family exists, **all three `type`

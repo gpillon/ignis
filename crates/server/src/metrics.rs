@@ -116,7 +116,10 @@ impl Primitive {
     /// Every primitive, in the order their series are rendered.
     pub const ALL: [Primitive; 3] = [Self::Noul, Self::Choice, Self::Score];
 
-    fn label(self) -> &'static str {
+    /// The label value this primitive is exported under — and the word the
+    /// request log calls it by, so the two are the same string by
+    /// construction rather than by coincidence.
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Noul => "noul",
             Self::Choice => "choice",
@@ -693,7 +696,7 @@ impl Metrics {
         // (GitHub #241). ADR 0017 exports zeros for everything else; this
         // follows its other rule instead — "only authoritative values are
         // exported" — because a load that serves no decisions is the normal
-        // one, and four permanently-zero series plus an eleven-bucket
+        // one, and three permanently-zero series plus an eleven-bucket
         // histogram on every scrape of every server would be clutter that
         // says nothing. A `rate()` over a series that appears mid-window is
         // handled by Prometheus the same way a new target is.
@@ -1106,13 +1109,21 @@ mod tests {
         // ADR 0030: every memory series is bytes, pages or slots, so a
         // reader always has both terms and never a ratio that hides which
         // of them moved.
-        let text = Metrics::new().render();
-        for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
-            let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
-            assert!(
-                !name.contains("_pct") && !name.contains("percent") && !name.contains("_ratio"),
-                "{name} is a percentage"
-            );
+        //
+        // Both shapes of exposition, because the decision family is absent
+        // from a fresh one (GitHub #241) and it is the one series here that
+        // *is* a ratio — answer mass has no second term, which is the ADR's
+        // own distinction and worth having under a test.
+        let served = Metrics::new();
+        served.record_decision(Primitive::Score, 0.996);
+        for text in [Metrics::new().render(), served.render()] {
+            for line in text.lines().filter(|l| l.starts_with("# HELP ignis_")) {
+                let name = line.split_whitespace().nth(2).expect("# HELP <name> <help>");
+                assert!(
+                    !name.contains("_pct") && !name.contains("percent") && !name.contains("_ratio"),
+                    "{name} is a percentage"
+                );
+            }
         }
     }
 

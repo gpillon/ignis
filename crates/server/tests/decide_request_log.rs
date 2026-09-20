@@ -150,6 +150,9 @@ async fn a_served_decision_is_one_line_with_its_question_count_and_types() {
     assert_eq!(line["errors"], 0);
     // Declared order, deduplicated — one of seven strings, never unbounded.
     assert_eq!(line["types"], "noul,choice,score");
+    // The same spelling the `ignis.request.*` events use, and a decision
+    // defaults to `Agent` where every other route defaults to `Interactive`.
+    assert_eq!(line["class"], "agent");
     // A readout generates nothing, and the line says so rather than leaving
     // a reader to infer it from a missing field.
     assert_eq!(line["output_tokens"], 0);
@@ -182,6 +185,25 @@ async fn the_same_primitive_twice_is_named_once() {
     assert_eq!(logged.len(), 1);
     assert_eq!(logged[0]["questions"], 3, "three questions");
     assert_eq!(logged[0]["types"], "noul", "of one primitive");
+}
+
+#[tokio::test]
+async fn the_callers_lane_tag_reaches_the_line() {
+    // A decision defaults to `Agent`, and a caller who says otherwise is
+    // believed (GitHub #120). The log has to say which, or a reader cannot
+    // tell a fan-out of subagent work from a person waiting on it.
+    let sink = Arc::new(MemorySink::new());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(ignis_logging::JsonLayer::new(sink.clone())),
+    );
+    let body = r#"{"state":"s","model":"test-model@interactive",
+                   "questions":{"q":{"type":"noul","instructions":"Urgent?"}}}"#;
+
+    let (status, response) = decide(&app(), body).await;
+    assert_eq!(status, 200, "{response}");
+    let logged = decisions(&sink);
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0]["class"], "interactive");
 }
 
 #[tokio::test]

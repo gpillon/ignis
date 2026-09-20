@@ -1080,7 +1080,7 @@ async fn serve(
             }
         }
     }
-    log_decision(&prepared, &answers, input_tokens, started);
+    log_decision(&prepared, &answers, class, input_tokens, started);
     Ok(DecideResponse {
         // The model that *performed* the evaluation, which is the one the
         // engine resolved — not the string the caller sent.
@@ -1105,22 +1105,25 @@ async fn serve(
 /// decision of twenty questions", and the fan-out is what a caller asked
 /// for. This is that reading, and the only one emitted from the endpoint.
 ///
-/// `types` is the distinct primitives in declared order, so it is one of
-/// seven strings and never unbounded — the log is not a metric, but a field
+/// `types` is the distinct primitives in declared order, spelled by
+/// [`crate::metrics::Primitive::label`] so a log field and a metric label
+/// value that mean the same thing *are* the same string. It is one of seven
+/// values and never unbounded: the log is not a metric, but a field
 /// somebody will eventually group by should be groupable.
 fn log_decision(
     prepared: &[PreparedQuestion],
     answers: &BTreeMap<String, Answer>,
+    class: ignis_core::types::RequestClass,
     input_tokens: u32,
     started: std::time::Instant,
 ) {
     let mut types: Vec<&str> = Vec::with_capacity(3);
     for question in prepared {
-        let label = match question.kind {
-            QuestionKind::Noul => "noul",
-            QuestionKind::Choice => "choice",
-            QuestionKind::Score => "score",
-        };
+        // The projection's own word for the primitive, borrowed rather than
+        // spelled again here: a log field and a label value that are
+        // supposed to be the same string should not be two `match`es that
+        // happen to agree.
+        let label = question.kind.primitive().label();
         if !types.contains(&label) {
             types.push(label);
         }
@@ -1133,6 +1136,11 @@ fn log_decision(
         name: "ignis.decision.done",
         questions = prepared.len(),
         types = types.join(","),
+        // The same spelling the `ignis.request.*` events give it, since a
+        // decision defaults to `Agent` where every other route defaults to
+        // `Interactive` (`CONTEXT.md`, *Lane tag*) and a reader comparing
+        // the two should not have to know that.
+        class = class.as_extension_str(),
         answered = prepared.len() - errors,
         errors,
         input_tokens,
