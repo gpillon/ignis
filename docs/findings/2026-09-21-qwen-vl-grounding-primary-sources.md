@@ -28,8 +28,9 @@ and it serves two product questions that pull in different directions:
   fused kernel never materializes it. Is C5 plausible there, and what would it
   buy?
 - **TAIL.** The chain is exact or catastrophic. It lands inside the button on
-  218 of 240 scenes, with a median error of 0.8 units of 999. The other 22 are
-  gross failures, and the failures are small targets. The literature's remedy
+  218 of 240 scenes (synthetic 1024 px scenes, run in the PyTorch vehicle),
+  with a median error of 0.8 units of 999. The other 22 are gross failures,
+  and the failures are small targets. The literature's remedy
   for small targets is test-time zoom: crop around a first estimate and ground
   again. That is also the natural pass 2 of the two-pass box. Does it fix our
   tail, and what does it cost on this engine?
@@ -77,7 +78,7 @@ Seven sub-questions. The tag after each says which product question it serves:
 - set-of-mark hurts open-weight models;
 - MRoPE is interleaved.
 
-### 0. The served model, from its own files [Qwen3.8]
+### 0. The served model, from its own files (Q4) [Qwen3.8]
 
 These are primary sources for the architecture. They replace the MindStudio
 citation in the first pass.
@@ -130,7 +131,7 @@ and AndroidWorld 81.9. Thinking is on by default.
 **Tokenizer.** `<|object_ref_start|>`, `<|object_ref_end|>`, `<|box_start|>`,
 `<|box_end|>`, `<|quad_start|>` and `<|quad_end|>` are special tokens 248047-248052.
 
-### 1. Where grounding attention lives, by layer (COST)
+### 1. Where grounding attention lives, by layer (Q1, COST)
 
 | model | LLM layers | layers named | depth | chosen by | used for | source |
 |---|---|---|---|---|---|---|
@@ -208,7 +209,7 @@ directions:
   layers). If that holds for a VLM, the retrieval-shaped heads are concentrated
   in exactly the layers that can be read.
 
-### 2. What the one-pass readouts actually are (COST)
+### 2. What the one-pass readouts actually are (Q5, COST)
 
 **TAG** [other: MiniCPM-Llama3-V 2.5, 8.5B; arXiv 2412.10840]
 
@@ -249,6 +250,11 @@ LiteTrain (Table 5; Qwen2-VL frozen, only the head and special tokens trained):
 | 2B-LiteTrain + Verifier | 19M | 34.0 | 79.2 | 82.3 |
 | 7B-LiteTrain | 103M | 22.9 | 73.5 | 74.9 |
 | 7B-LiteTrain + Verifier | 103M | 35.8 | 81.3 | 83.8 |
+
+Resolution: the paper states only the 28 px patch. The released
+GUI-Actor-7B-Qwen2.5-VL `preprocessor_config.json` has `max_pixels: 5720064`,
+and `eval/screenSpot_pro.py` resizes screenshots to `3200*1800` pixels by
+default.
 
 - **Full training** (Table 1) gets further: Qwen2-VL-7B base 40.7 on
   ScreenSpot-Pro (44.2 with the verifier), Qwen2.5-VL-3B 42.2 (45.9), and
@@ -300,7 +306,7 @@ coordinate output on ScreenSpot and halve it on ScreenSpot-Pro** [Qwen2.5-VL
 3B]. Every attention-style readout above is patch-granular, and each one
 reports its weakest numbers on the smallest targets.
 
-### 3. Test-time zoom for small targets (TAIL, and pass 2 of the box)
+### 3. Test-time zoom for small targets (Q2, TAIL, and pass 2 of the box)
 
 ScreenSpot-Pro (SS-Pro) text / icon / average, before and after, each within
 its own paper. The same backbone's single-pass SS-Pro score differs between
@@ -362,7 +368,8 @@ examples in ScreenSpot-Pro have this issue". Its crop is 1920×1080.
 
 Computed for this finding, CPU only, from the per-scene rows of the
 native-format A/B run (`.scratch/latent-probe/results/format-ab.json`, `ours`
-arm). Coordinates were rescaled from 0-999 to the 1024 px side, and each crop
+arm). The script is `.scratch/lit/tail-containment.py`, run from the worktree
+root. Coordinates were rescaled from 0-999 to the 1024 px side, and each crop
 was clamped to the image.
 
 - **The failures are not near misses.** None of the 22 lands within 2% of the
@@ -391,7 +398,7 @@ Crops that do not depend on the wrong answer's y:
 The failing buttons measure a median 13.5% × 3.6% of the side. At 1024 px that
 is **4.3 × 1.1 merged tokens**.
 
-### 4. How the family trains and emits grounding (both)
+### 4. How the family trains and emits grounding (Q3, both)
 
 **[Qwen2-VL]** §2.2.1 of arXiv 2409.12191:
 
@@ -472,7 +479,7 @@ CountBench 97.8, with no ScreenSpot row.
 
 **[Qwen3.8]** The card has no grounding row at all (§0).
 
-### 5. Qwen3.8 against Qwen3-VL: DeepStack (COST)
+### 5. Qwen3.8 against Qwen3-VL: DeepStack (Q4, COST)
 
 **[Qwen3-VL]** §2.2: "we select features from three distinct levels of the
 vision encoder. Subsequently, dedicated vision–language merger modules project
@@ -507,7 +514,7 @@ Qwen3-VL needs every layer because DeepStack spreads the cues over depth
 therefore has no mechanism here. The single-layer Qwen2.5-VL readouts of §1 are
 the closer analogue.
 
-### 6. Resolution for GUI grounding (TAIL)
+### 6. Resolution for GUI grounding (Q6, TAIL)
 
 - **[other: benchmark]** ScreenSpot-Pro: "targets in ScreenSpot-Pro occupy
   0.07% of the screenshot area on average, a significant reduction compared to
@@ -533,7 +540,7 @@ the closer analogue.
   button covers about 0.49% of the image area. That sits between ScreenSpot's
   2.01% and ScreenSpot-Pro's 0.07%.
 
-### 7. Probing hidden states for position (context)
+### 7. Probing hidden states for position (Q7, context)
 
 - [Qwen2.5-VL] 7B, 2606.31257: 5-fold logistic probes on the decision token's
   residual, for binary within-axis relations.
@@ -657,8 +664,7 @@ pixels.
 (inferred; unmeasured here):
 
 - **Tiles.** The 2×2 quadrants contain the whole button on 17 of 22. That is
-  ZoomClick's pre-zoom, RankGround's tiles and UI-AGILE's sub-images, at the
-  cost of several passes.
+  the shape of ZoomClick's 2×2 pre-zoom, at the cost of several passes.
 - **A column at the answer's x.** 15 of 22 at half width, because x is usually
   right.
 - **The attention map.** Two papers report that the attention lands on the
@@ -763,6 +769,13 @@ number for the served generation at all.
 1024 px scenes, from one run. They are geometry, not accuracy: whether the model
 then finds the button inside a crop that contains it is exactly what is
 unmeasured.
+
+**The tail itself was measured only at 1024 px, in the PyTorch vehicle.** There
+the median failing button is 1.1 merged tokens tall. At the engine's default
+4096 px the same button would be about 4.6 tokens tall. The width finding has
+only three scenes at that size, all inside. Whether the 22 survive at 2048 or
+4096 px is unmeasured, so part of the TAIL question may be the vehicle's
+resolution rather than the model's.
 
 **Some sources were not read, or were read only in part:**
 
