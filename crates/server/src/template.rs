@@ -168,14 +168,14 @@ impl utoipa::PartialSchema for ContentPart {
                 ObjectBuilder::new()
                     .schema_type(SchemaType::Type(Type::String))
                     .description(Some(
-                        "A `data:` URI carrying base64 bytes, or an `http(s)` URL the                          server fetches.",
+                        "A `data:` URI carrying base64 bytes, or an `http(s)` URL the server fetches.",
                     )),
             )
             .required("url");
         ObjectBuilder::new()
             .schema_type(SchemaType::Type(Type::Object))
             .description(Some(
-                "One OpenAI content part. A `text` part carries `text`; an `image_url`                  part carries an `image_url` object with a `url` (accepted only by a                  server started with `--vision`, else a 400 naming the part).",
+                "One OpenAI content part. A `text` part carries `text`; an `image_url` part carries an `image_url` object with a `url` (accepted only by a server started with `--vision`, else a 400 naming the part).",
             ))
             .property(
                 "type",
