@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { asText } from "./json.ts";
 import { Bar, BoxGlyph, DigitTrace, DistributionRow, ImageMark, NoulMark, PointGlyph, ScoreMark } from "./marks.tsx";
-import { type Draft, evidenceImage, type Question } from "./model.ts";
+import { type Draft, evidenceImage, MAX_DIGITS, type Question } from "./model.ts";
 import { type Answer, AXES, levelOrder, type Run } from "./request.ts";
 
 // What came back (GitHub #247), read in the order the request declared.
@@ -52,7 +52,7 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
       </p>
       <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
-          ? "A number, point or box generates a digit per step, so those tokens are real. The readouts beside them generated none."
+          ? "A number, point or box generates a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none."
           : "Nothing was generated: every answer was read from the logits of one position, out of a single prefill of the evidence."}
       </p>
     </div>
@@ -98,6 +98,8 @@ function Body({ question, answer, draft }: { question: Question; answer: Answer;
       return <ScoreBody question={question} answer={answer} />;
     case "number":
       return <NumberBody answer={answer} />;
+    case "scalar":
+      return <ScalarBody question={question} answer={answer} />;
     case "point":
     case "box":
       return <SpatialBody answer={answer} draft={draft} />;
@@ -192,6 +194,60 @@ function NumberBody({ answer }: { answer: Extract<Answer, { type: "number" }> })
       </p>
     </div>
   );
+}
+
+/**
+ * A `scalar`: what the model wrote, what that parses to, and what the run
+ * cost.
+ *
+ * Both spellings are on the page because they are not the same fact — `3` and
+ * `3.0` are one number written two ways, and a caller checking a reading
+ * against its trace wants the one that produced it.
+ *
+ * The rounds are here rather than only in the receipt below: a scalar's whole
+ * argument is that it spends what its answer needs, and that is invisible
+ * unless the field it did *not* have to fill is named beside it.
+ */
+function ScalarBody({ question, answer }: { question: Question; answer: Extract<Answer, { type: "scalar" }> }) {
+  // The characters it wrote plus the brace that closed the object — which is
+  // exactly what `usage.output_tokens` billed for this question.
+  const rounds = [...answer.text].length + 1;
+  const ceiling = question.ceiling ?? MAX_DIGITS;
+  return (
+    <div>
+      <p className="font-display text-[34px] font-semibold leading-none tabular-nums text-ember">
+        {answer.text}
+        <span className="ml-2 align-baseline font-display text-[15px] font-medium text-ash">± {sigma(answer.uncertainty)}</span>
+      </p>
+      <p className="mt-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 font-display text-[12px] tabular-nums text-ash">
+        <span title="The f64 the spelling above parsed to. `3` and `3.0` are the same number and not the same answer.">
+          reads as <span className="text-ink">{String(answer.value)}</span>
+        </span>
+        <span title="The characters it wrote, plus the brace that closed the object.">
+          <span className="text-ink">{rounds}</span> round{rounds === 1 ? "" : "s"}, where a number {ceiling} wide spends {ceiling}
+        </span>
+      </p>
+      <div className="mt-3">
+        <DigitTrace digits={answer.digits} />
+      </div>
+      <p className="mt-2 text-[12px] leading-snug text-ash">
+        One column per digit, and how sure it was of it. The decimal point, the sign and the closing brace were steps of the run
+        too, but they hold no place — a trace shorter than the spelling is right. The uncertainty is in units of the value, each
+        digit weighted by the place the point put it, and it is the model's own reckoning — not a bound.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * A sigma in the value's own units, which for a scalar is a small number: a
+ * fixed decimal place would print every one of them as `0.0`, and a
+ * percentage would be a different quantity altogether.
+ */
+function sigma(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (value === 0) return "0";
+  return Math.abs(value) >= 1 ? value.toFixed(1) : String(Number(value.toPrecision(2)));
 }
 
 /**

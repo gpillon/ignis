@@ -29,6 +29,11 @@ const options = (pairs: [string, string][]): Option[] => pairs.map(([key, descri
 
 const PAYOUTS = "Help! My payouts have been failing for 3 days. I've emailed twice and nobody has replied. If this isn't fixed by Friday I'm moving to another provider.";
 
+// A decimal and a negative in the same sentence, because those are the half of
+// a quantity `number` cannot spell at all.
+const BATCH =
+  "Our batch job processed 47 invoices today and rejected 128 of them. The average run took 2.5 hours and the account balance moved by -0.75 EUR.";
+
 const ORDER = `{
   "order": "A-4471",
   "placed": "2026-09-14",
@@ -129,6 +134,26 @@ export const EXAMPLES: Example[] = [
       questions: [
         question("days_failing", "number", "For how many days have the payouts been failing?", { digits: 2 }),
         question("emails_sent", "number", "How many emails has the customer sent?", { digits: 1 }),
+      ],
+    }),
+  },
+  {
+    id: "scale",
+    name: "Ask without a width",
+    shows: "A scalar closes its own object, so it answers 2.5 and -0.75 — and nobody had to guess the magnitude.",
+    build: async () => ({
+      evidence: { mode: "text", text: BATCH },
+      extras: [],
+      questions: [
+        // No ceiling on either: that is the acceptance, not an omission. The
+        // run ends when the number is complete, so it costs what it wrote.
+        question("average_hours", "scalar", "How many hours did the average run take?"),
+        // "in EUR" is load-bearing: the sign is the model's judgement, and
+        // asking by how much something *moved* invites the magnitude alone.
+        question("balance_move", "scalar", "By how much did the account balance move, in EUR?"),
+        // Beside them, the same evidence read into a declared field: the
+        // receipt is where the two spends can be compared.
+        question("invoices", "number", "How many invoices were processed?", { digits: 3 }),
       ],
     }),
   },

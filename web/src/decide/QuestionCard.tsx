@@ -5,7 +5,7 @@ import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
   emptyOption,
   type Fault,
-  isConstrained,
+  hasFixedWidth,
   MAX_DIGITS,
   MIN_DIGITS,
   type Option,
@@ -124,7 +124,7 @@ export function QuestionCard({
 
       {question.kind === "score" && <LevelList levels={question.levels} stem={question.uid} onChange={(levels) => set("levels", levels)} />}
 
-      {isConstrained(question.kind) && (
+      {hasFixedWidth(question.kind) && (
         <div className="mt-2 flex items-end gap-3">
           <Labelled label="Digits per number">
             <input
@@ -142,6 +142,32 @@ export function QuestionCard({
             {question.kind === "number"
               ? `Up to ${"9".repeat(Math.max(1, Math.min(MAX_DIGITS, question.digits)))}.`
               : `The prompt declares a 0–${"9".repeat(Math.max(1, Math.min(MAX_DIGITS, question.digits)))} scale on each axis.`}
+          </p>
+        </div>
+      )}
+
+      {/* A scalar's field is a **ceiling**, so blank is its default and blank
+          is a legal request: the run closes itself when the number is
+          complete, and the caller who does not know the magnitude is the one
+          this primitive exists for. */}
+      {question.kind === "scalar" && (
+        <div className="mt-2 flex items-end gap-3">
+          <Labelled label="Digits at most">
+            <input
+              type="number"
+              min={MIN_DIGITS}
+              max={MAX_DIGITS}
+              value={question.ceiling ?? ""}
+              onChange={(e) => set("ceiling", e.target.value.trim() === "" ? null : Number(e.target.value))}
+              name={`${question.uid}-ceiling`}
+              aria-label="Digits at most"
+              placeholder="any"
+              className={`${fieldLook} w-20 tabular-nums`}
+            />
+          </Labelled>
+          <p className="pb-2 text-[12px] leading-snug text-ash">
+            A ceiling, not a width — the answer ends as soon as the number is complete, and may have a decimal part or a sign.
+            Leave it empty when you do not know the magnitude; {MAX_DIGITS} digits is the widest served either way.
           </p>
         </div>
       )}

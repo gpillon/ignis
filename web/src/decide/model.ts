@@ -23,8 +23,8 @@ import {
   writeOrdered,
 } from "./json.ts";
 
-/** The six primitives `decide.rs` serves. */
-export const PRIMITIVES = ["noul", "choice", "score", "number", "point", "box"] as const;
+/** The seven primitives `decide.rs` serves. */
+export const PRIMITIVES = ["noul", "choice", "score", "number", "scalar", "point", "box"] as const;
 export type Primitive = (typeof PRIMITIVES)[number];
 
 /** What each primitive answers with, in the tab's own words. */
@@ -32,15 +32,24 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
   noul: "Yes or no, as the probability of yes.",
   choice: "One option from a set you declare, with the distribution over all of them.",
   score: "A value across ordered levels — the weighted average, so it can land between two.",
-  number: "A whole number, generated one digit at a time.",
+  number: "A whole number, generated one digit at a time into a field you declare.",
+  scalar: "A number that ends when it is complete — it may be fractional or negative, and you need not say how wide.",
   point: "A position on the image, in its own pixels.",
   box: "A rectangle on the image, in its own pixels.",
 };
 
-/** The primitives that generate a digit per step, and so cost a round each; the rest read one position. */
-export const CONSTRAINED: Primitive[] = ["number", "point", "box"];
+/** The primitives that generate a token per step, and so cost a round each; the rest read one position. */
+export const CONSTRAINED: Primitive[] = ["number", "scalar", "point", "box"];
 
 export const isConstrained = (kind: Primitive) => CONSTRAINED.includes(kind);
+/**
+ * The generated primitives whose `digits` is a **width**: a field for a
+ * `number`, an axis scale for a `point` or a `box`. A `scalar`'s `digits` is
+ * a ceiling it may close early out of, which is a different field on the
+ * question and a different refusal, so it is not one of these.
+ */
+export const FIXED_WIDTH: Primitive[] = ["number", "point", "box"];
+export const hasFixedWidth = (kind: Primitive) => FIXED_WIDTH.includes(kind);
 /** `point` and `box` answer in pixels of the submitted image, so they need one. */
 export const isSpatial = (kind: Primitive) => kind === "point" || kind === "box";
 
@@ -84,8 +93,15 @@ export type Question = {
   options: Option[];
   /** `score`, in level order. */
   levels: string[];
-  /** `number`, `point`, `box`. */
+  /** `number`, `point`, `box`: the width of the field, or the scale of the axes. */
   digits: number;
+  /**
+   * `scalar`: at most this many digits, and `null` for "however many it
+   * takes". A ceiling and not a width — the run closes itself as soon as the
+   * number is complete — so blank is the honest default for the caller this
+   * primitive exists for, who does not know the magnitude.
+   */
+  ceiling: number | null;
   /** Fields the JSON editor carried that the builder does not edit; re-emitted as they were. */
   extras: JsonEntry[];
 };
@@ -143,6 +159,7 @@ export function newQuestion(kind: Primitive, id: string): Question {
     options: kind === "choice" ? [emptyOption(), emptyOption()] : [],
     levels: kind === "score" ? ["", "", ""] : [],
     digits: DEFAULT_DIGITS,
+    ceiling: null,
     extras: [],
   };
 }
@@ -224,7 +241,8 @@ export function validate(draft: Draft): Fault[] {
 
     if (question.kind === "choice") faults.push(...choiceFaults(question, name));
     if (question.kind === "score") faults.push(...scoreFaults(question, name));
-    if (isConstrained(question.kind)) faults.push(...digitFaults(question, name));
+    if (hasFixedWidth(question.kind)) faults.push(...digitFaults(question, name));
+    if (question.kind === "scalar") faults.push(...ceilingFaults(question, name));
     if (isSpatial(question.kind) && !hasImage(draft.evidence)) {
       faults.push({
         code: "state_carries_no_image",
@@ -280,6 +298,24 @@ function digitFaults(question: Question, name: string): Fault[] {
     {
       code: "digits_out_of_range",
       message: `${name} asks for ${question.digits} digits; ${MIN_DIGITS} to ${MAX_DIGITS} is the range served.`,
+      uid: question.uid,
+    },
+  ];
+}
+
+/**
+ * A `scalar`'s ceiling, which is allowed to be absent — that is the whole
+ * point of the primitive. When it is there it is the same range `number`
+ * serves, and `decide.rs` refuses the rest under the same code.
+ */
+function ceilingFaults(question: Question, name: string): Fault[] {
+  const { ceiling } = question;
+  if (ceiling === null) return [];
+  if (Number.isInteger(ceiling) && ceiling >= MIN_DIGITS && ceiling <= MAX_DIGITS) return [];
+  return [
+    {
+      code: "digits_out_of_range",
+      message: `${name} allows at most ${ceiling} digits; ${MIN_DIGITS} to ${MAX_DIGITS} is the range served — and for a scalar this is a ceiling, not a width, so leave it empty when you do not know the magnitude.`,
       uid: question.uid,
     },
   ];
@@ -341,7 +377,13 @@ function questionNode(question: Question): JsonNode {
   ];
   const criteria = criteriaNode(question);
   if (criteria) entries.push({ key: "criteria", value: criteria });
-  if (isConstrained(question.kind)) entries.push({ key: "digits", value: { kind: "number", value: question.digits } });
+  if (hasFixedWidth(question.kind)) entries.push({ key: "digits", value: { kind: "number", value: question.digits } });
+  // A scalar's ceiling is omitted when it has none: absent is what the server
+  // reads as "the widest run you serve", and there is no value to write that
+  // says it.
+  if (question.kind === "scalar" && question.ceiling !== null) {
+    entries.push({ key: "digits", value: { kind: "number", value: question.ceiling } });
+  }
   return jsonObject([...entries, ...question.extras]);
 }
 
@@ -454,7 +496,12 @@ function readQuestion(id: string, node: JsonNode): ReadQuestion {
   const instructions = at("instructions") ?? at("question");
   if (instructions) question.instructions = instructions;
   const digits = at("digits");
-  if (digits?.kind === "number") question.digits = digits.value;
+  // The same wire field lands on a different question field for a scalar,
+  // because there it is a ceiling and not a width.
+  if (digits?.kind === "number") {
+    if (kind === "scalar") question.ceiling = digits.value;
+    else question.digits = digits.value;
+  }
   const criteria = at("criteria") ?? at("options");
   if (criteria) applyCriteria(question, criteria);
   // Anything else the caller wrote stays on the question and goes back out as
