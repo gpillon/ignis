@@ -72,5 +72,5 @@ lives in those buffers; the hot path never updates graph nodes.
 - **Non-goals (v1):** per-batch-size graph variants, per-step node updates,
   and lazy re-capture. If a later perf gate shows the single-geometry graph
   underperforms, that is a later decision — re-gated per ADR 0005 / 0007.
-- The B2 spec (`kernel-abi/specs/09-cuda-graph-replay.md`) implements this
+- The B2 spec (`docs/specs/kernel-abi/09-cuda-graph-replay.md`) implements this
   model and references this ADR.

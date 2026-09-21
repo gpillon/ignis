@@ -20,6 +20,7 @@ lives in it, and it is never an issue tracker.
 | Status (open / closed / in-progress) | GitHub Issue | Native close, CI triggers, external visibility |
 | Blocking relationships | GitHub Issue body (`**Blocked by:** #X`) + native blocking from UI | Single authoritative source for dependencies |
 | Owner / milestone / labels | GitHub Issue | Tracker metadata |
+| Feature-level spec (the whole feature in one document) | `docs/specs/<feature>/spec.md` | What the tickets below it decompose |
 | Implementation spec (seam, acceptance criteria, ADR refs) | `docs/specs/<feature>/NN-name.md` | Rich formatting, versioned with code, readable offline |
 | Cross-cutting open items (span 2+ crates or external blockers) | `docs/PENDING.md` | No single GitHub issue owns them |
 

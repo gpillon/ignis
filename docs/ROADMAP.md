@@ -10,11 +10,11 @@ when its gate is recorded green on a free RTX 5090 (ADR 0006).
 
 | Phase | Gate | Master ticket | Spec |
 |---|---|---|---|
-| 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `runtime/specs/01-device-resident-forward.md` |
-| 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `runtime/specs/02-real-prefill.md` |
-| 3 — serving loop: chunk-level prefill/decode interleaving, batched decode rounds, per-width CUDA graphs, sampling, request log | G3: three cells live/live (ADR 0015) — C=1 ≥ 99% of the live reference, C=4 aggregate ≥ 99%, p95 inter-token latency under a cold 32K prefill within the live envelope; plus the K-agnostic anti-serialization property | #64 | `runtime/specs/03-serving-loop.md` |
-| 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | `runtime/specs/04-reference-feature-floor.md` |
-| 5 — speculative decoding: the verify round + ReplaySSM fold, then the DFlash2 drafter (MTP deferred) | G5: ≥ 99% of the reference's DFlash2-7 committed tok/s @24K/98K/196K, live/live, pooled over two launches, run once at phase end; greedy spec-on == spec-off as the correctness floor | #66 | `runtime/specs/05-speculative-decoding.md` |
+| 1 — device-resident correct forward, batch 1, bf16 KV | G1: coherent greedy canary completions; per-layer f64 reference within bf16 tolerance; ≥95% teacher-forced next-token agreement with the reference engine over the first 32 positions per canary (ADR 0014; free-running comparison is diagnostic only); EOS; reproducible | #36 | `docs/specs/runtime/01-device-resident-forward.md` |
+| 2 — real prefill (chunked, W4A4, tensor-core attention, GDN chunked) | G2: median TTFT @8K/32K ≤ 1.5× the reference's, measured **live/live** in one session on cold-prefix samples (ADR 0015); the teacher-forced canary floor and a chunked-vs-per-token self-oracle stay green | #63 | `docs/specs/runtime/02-real-prefill.md` |
+| 3 — serving loop: chunk-level prefill/decode interleaving, batched decode rounds, per-width CUDA graphs, sampling, request log | G3: three cells live/live (ADR 0015) — C=1 ≥ 99% of the live reference, C=4 aggregate ≥ 99%, p95 inter-token latency under a cold 32K prefill within the live envelope; plus the K-agnostic anti-serialization property | #64 | `docs/specs/runtime/03-serving-loop.md` |
+| 4 — reference feature floor: hq-e8-2b KV, device prefix reuse, KV-RAM tier, tagged lanes | G4: bench-03 99% gate on the recorded "1 main + N subagents" trace | #65 (absorbs #20/#24) | `docs/specs/runtime/04-reference-feature-floor.md` |
+| 5 — speculative decoding: the verify round + ReplaySSM fold, then the DFlash2 drafter (MTP deferred) | G5: ≥ 99% of the reference's DFlash2-7 committed tok/s @24K/98K/196K, live/live, pooled over two launches, run once at phase end; greedy spec-on == spec-off as the correctness floor | #66 | `docs/specs/runtime/05-speculative-decoding.md` |
 | 6 — beyond the reference (north star) | per-item gates | — | concurrent prefill / prefill-decode overlap, PDL + fusion, lazy graphs, hot reload, own artifact recipe |
 
 ## Phase 1 decomposition (G1, master #36)
@@ -57,7 +57,7 @@ Critical path: #42 → #45/#46 → #47/#48/#49 → #57/#58 → #59 → #61 → #
 
 ## Phase 2 decomposition (G2, master #63)
 
-Tracer bullets from `runtime/specs/02-real-prefill.md`. The ops this phase
+Tracer bullets from `docs/specs/runtime/02-real-prefill.md`. The ops this phase
 needs are already vendored and compiled (G1); what is missing is a program
 that hands them more than one token, and an instrument that measures the
 result.
@@ -98,7 +98,7 @@ unused slack.
 
 ## Phase 3 decomposition (G3, master #64)
 
-Tracer bullets from `runtime/specs/03-serving-loop.md`, cut in the grilling
+Tracer bullets from `docs/specs/runtime/03-serving-loop.md`, cut in the grilling
 session of 2026-09-09. That session also introduced **ADR 0018**
 (scheduler-driven chunk-level prefill/decode interleaving on the single model
 stream; true GPU overlap explicitly excluded) and recorded ten deferred
