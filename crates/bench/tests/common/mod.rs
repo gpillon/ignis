@@ -87,6 +87,12 @@ struct Inner {
     /// The prefill this mock holds a request for before its first token
     /// (ms) — [`PREFILL`] unless a test raised it.
     prefill_ms: std::sync::atomic::AtomicU64,
+    /// The gap between this mock's tokens (ms) — [`TOKEN`] unless a test
+    /// changed it. A test that measures a *window* bounded by a decode
+    /// stream needs to be able to widen it: the token cap ([`MAX_TOKENS`])
+    /// is fixed, so the pacing is the only way to make a lane outlive a
+    /// series of other requests by a margin rather than by luck.
+    token_ms: std::sync::atomic::AtomicU64,
     /// Every prompt the mock has been sent, in arrival order (so a test
     /// can prove the samples were distinct on the wire).
     prompts: Mutex<Vec<String>>,
@@ -110,6 +116,7 @@ impl MockState {
                 next_id: std::sync::atomic::AtomicU64::new(0),
                 cached_prompt_tokens: std::sync::atomic::AtomicI64::new(-1),
                 prefill_ms: std::sync::atomic::AtomicU64::new(PREFILL.as_millis() as u64),
+                token_ms: std::sync::atomic::AtomicU64::new(TOKEN.as_millis() as u64),
                 completed: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
                 images: Mutex::new(Vec::new()),
@@ -150,6 +157,17 @@ impl MockState {
     /// The prefill the mock currently holds a request for.
     pub fn prefill(&self) -> Duration {
         Duration::from_millis(self.inner.prefill_ms.load(Ordering::Relaxed))
+    }
+
+    /// Pace every following request's tokens `interval` apart, on both the
+    /// streaming and the non-streaming path.
+    pub fn set_token_interval(&self, interval: Duration) {
+        self.inner.token_ms.store(interval.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The gap the mock currently leaves between tokens.
+    pub fn token_interval(&self) -> Duration {
+        Duration::from_millis(self.inner.token_ms.load(Ordering::Relaxed))
     }
 
     /// The number of requests currently in flight.
@@ -372,6 +390,7 @@ async fn completions(
     let id = format!("mock-cmpl-{}", state.inner.next_id.fetch_add(1, Ordering::Relaxed));
     let created = now_secs();
     let prefill = state.prefill();
+    let token = state.token_interval();
     if req.stream {
         // The SSE response: the 200 and its headers go out immediately (as
         // a real engine's do), then the stream holds the connection open
@@ -385,12 +404,12 @@ async fn completions(
             .is_some_and(|o| o.include_usage)
             .then_some((prompt_tokens, cached));
         let events = paced_chunks(&id, &model, created, n, usage, thinking);
-        Sse::new(PacedSse::new(state.inner.clone(), n, guard, events, prefill)).into_response()
+        Sse::new(PacedSse::new(state.inner.clone(), n, guard, events, prefill, token)).into_response()
     } else {
         // Non-streaming: hold the request in flight for the "generation"
         // time (prefill + per-token decode), then the single JSON body.
         let guard = InFlightGuard::enter(state.inner.clone());
-        tokio::time::sleep(generation_time(prefill, n)).await;
+        tokio::time::sleep(generation_time(prefill, token, n)).await;
         state.inner.completed.lock().unwrap().push(n);
         drop(guard);
         Json(completion_json(&id, &model, created, &req, n, thinking)).into_response()
@@ -613,8 +632,8 @@ fn paced_chunks(
 
 /// The "generation" time of a non-streaming request (prefill + per-token
 /// decode), matching the paced SSE schedule.
-fn generation_time(prefill: Duration, n: u32) -> Duration {
-    prefill + TOKEN * n
+fn generation_time(prefill: Duration, token: Duration, n: u32) -> Duration {
+    prefill + token * n
 }
 
 /// The Unix epoch seconds (the server's `created` / `created_at` fields).
@@ -661,7 +680,7 @@ impl Drop for InFlightGuard {
 // ── the paced SSE stream ──────────────────────────────────────────────────
 
 /// The paced SSE stream: waits out the prefill, then emits the pre-built
-/// events at [`TOKEN`] cadence. The wait lives here rather than in the
+/// events at the state's token cadence ([`TOKEN`] unless a test changed it). The wait lives here rather than in the
 /// handler so the response's headers reach the client first, the way a real
 /// engine's do while it is still prefilling (GitHub #138).
 /// The in-flight guard is released when the stream ends (a normal end or a
@@ -670,6 +689,9 @@ struct PacedSse {
     inner: Arc<Inner>,
     n: u32,
     events: VecDeque<Event>,
+    /// Read once, when the stream is built, so one response is paced by one
+    /// cadence even if a test changes it mid-flight.
+    token: Duration,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
     guard: Option<InFlightGuard>,
 }
@@ -681,11 +703,13 @@ impl PacedSse {
         guard: InFlightGuard,
         events: VecDeque<Event>,
         prefill: Duration,
+        token: Duration,
     ) -> Self {
         Self {
             inner,
             n,
             events,
+            token,
             // The prefill is the first delay the stream waits out, before
             // its first event — the client measures it as ttft.
             delay: Some(Box::pin(tokio::time::sleep(prefill))),
@@ -714,7 +738,7 @@ impl Stream for PacedSse {
         }
         let event = me.events.pop_front().expect("non-empty");
         if !me.events.is_empty() {
-            me.delay = Some(Box::pin(tokio::time::sleep(TOKEN)));
+            me.delay = Some(Box::pin(tokio::time::sleep(me.token)));
         }
         Poll::Ready(Some(Ok(event)))
     }

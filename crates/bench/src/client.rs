@@ -1138,15 +1138,27 @@ mod tests {
 
     #[test]
     fn results_are_sorted_by_id_and_tok_s_is_computed() {
+        // Keyed by id, not `MockEndpoint`'s canned queue: the queue is
+        // consumed by whichever worker calls `complete` first, and with
+        // `max_concurrency: 4` and `time_scale: 0.0` all three requests are
+        // in flight at once, so which one gets the "main" outcome is a race.
+        // It resolved the same way on Windows for long enough to look
+        // deterministic and came out the other way the first time this suite
+        // ran on Linux (tok_s 70.0 — main had been handed s1's outcome).
+        // This test is about tok_s, so it pins the mapping instead.
+        struct ById;
+        impl Endpoint for ById {
+            fn complete(&self, req: &Request) -> Result<Outcome, String> {
+                // "main": 512 tokens, ttft 200 ms, total 6200 ms -> 511
+                // decode tokens / 6.0 s ~= 85.2 tok/s.
+                Ok(match req.id.as_str() {
+                    "main" => outcome(200.0, 6200.0, 512),
+                    _ => outcome(100.0, 1000.0, 64),
+                })
+            }
+        }
         let trace = Trace::from_jsonl(&trace_jsonl()).expect("valid trace");
-        // Give the "main" request a known ttft/total so its tok_s is
-        // deterministic: 512 tokens, ttft 200 ms, total 6200 ms -> 511
-        // decode tokens / 6.0 s ~= 85.2 tok/s.
-        let ep = Arc::new(MockEndpoint::new(vec![
-            outcome(200.0, 6200.0, 512), // main
-            outcome(100.0, 1000.0, 64),  // s1
-            outcome(100.0, 1000.0, 64),  // s2
-        ]));
+        let ep = Arc::new(ById);
         let cfg = ReplayConfig {
             max_concurrency: 4,
             time_scale: 0.0,

@@ -54,6 +54,27 @@ fn config(session: &str, label: &str) -> G3Config {
     }
 }
 
+/// A mock engine paced slowly enough that the ITL cell's measurement window
+/// spans the prefiller series by a margin rather than by luck.
+///
+/// The window is bounded above by the decode lanes, and the mock caps a
+/// request at 32 tokens, so the *only* way to widen it is the token cadence.
+/// At the mock's default 2 ms a lane decodes for 64 ms while three
+/// sequential prefill requests cost 3 x (20 ms prefill + 4 tokens + the HTTP
+/// round trip) — more than the window on any host, and it passed on Windows
+/// only because the round trip happened to be small enough there. The first
+/// run of this suite on Linux covered 1 prefiller of 3, two short of what a
+/// pooled percentile needs.
+///
+/// At 8 ms the lane decodes for 256 ms against a series of ~72 ms per
+/// prefiller: the two the gate requires are covered with 1.8x of room, and
+/// in practice all three are.
+fn engine() -> MockEngine {
+    let engine = MockEngine::start();
+    engine.state.set_token_interval(std::time::Duration::from_millis(8));
+    engine
+}
+
 fn measure(engine: &MockEngine, cfg: &G3Config) -> Record {
     let ep = HttpEndpoint::new(engine.url());
     g3::measure(&ep, &WordTemplate, engine.state.model().to_string(), engine.url().to_string(), cfg)
@@ -61,7 +82,7 @@ fn measure(engine: &MockEngine, cfg: &G3Config) -> Record {
 
 #[test]
 fn a_record_measures_all_three_cells_cold_over_real_http() {
-    let engine = MockEngine::start();
+    let engine = engine();
     let record = measure(&engine, &config("S-cold", "ignis"));
 
     assert!(record.c1.all_cold(), "bad: {:?}", record.c1.bad_samples());
@@ -104,7 +125,7 @@ fn a_record_measures_all_three_cells_cold_over_real_http() {
 
 #[test]
 fn a_prefix_cache_hit_voids_the_throughput_samples_and_the_prefillers() {
-    let engine = MockEngine::start();
+    let engine = engine();
     engine.state.set_cached_prompt_tokens(Some(4));
     let record = measure(&engine, &config("S-hot", "ignis"));
 
@@ -119,8 +140,8 @@ fn a_prefix_cache_hit_voids_the_throughput_samples_and_the_prefillers() {
 
 #[test]
 fn two_live_records_produce_a_g3_verdict() {
-    let ours_engine = MockEngine::start();
-    let reference_engine = MockEngine::start();
+    let ours_engine = engine();
+    let reference_engine = engine();
     let session = "S-live";
     let ours = measure(&ours_engine, &config(session, "ignis"));
     let reference = measure(&reference_engine, &config(session, "reference"));
@@ -136,8 +157,8 @@ fn two_live_records_produce_a_g3_verdict() {
 
 #[test]
 fn a_contaminated_record_is_refused_a_verdict_rather_than_failing_one() {
-    let ours_engine = MockEngine::start();
-    let reference_engine = MockEngine::start();
+    let ours_engine = engine();
+    let reference_engine = engine();
     let session = "S-contaminated";
     let ours = measure(&ours_engine, &config(session, "ignis"));
     reference_engine.state.set_cached_prompt_tokens(Some(4));
@@ -152,7 +173,7 @@ fn a_contaminated_record_is_refused_a_verdict_rather_than_failing_one() {
 
 #[test]
 fn a_record_round_trips_through_json() {
-    let engine = MockEngine::start();
+    let engine = engine();
     let record = measure(&engine, &config("S-json", "ignis"));
     let json = record.to_json().expect("serialize");
     assert_eq!(Record::from_json(&json).expect("parse"), record);
@@ -166,7 +187,7 @@ fn the_decode_lanes_run_concurrently_with_the_sequential_prefillers() {
     // 2 alone would just prove the lanes overlap *each other* — the peak
     // must reach 3 (both lanes + at least one prefiller) to prove the
     // property this cell exists to exercise.
-    let engine = MockEngine::start();
+    let engine = engine();
     let _record = measure(&engine, &config("S-concurrency", "ignis"));
     assert!(
         engine.state.peak_in_flight() >= 3,
