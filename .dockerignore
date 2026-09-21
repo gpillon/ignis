@@ -18,6 +18,17 @@ web/dist/
 web/.vitest/
 node_modules/
 
+# What CI writes back into the repo root from this same Containerfile. The
+# release job exports the `artifacts` stage to `out/linux` and then packages
+# it as `ignis-v<version>-<triple>/`, both inside the build context -- so
+# without these the image build that follows sees a different `COPY . .` than
+# the artifacts build did, misses the cache on it, and recompiles the whole
+# workspace a second time (measured: 429s of a 610s step).
+out/
+ignis-v*/
+ignis-v*.tar.gz*
+ignis-v*.zip*
+
 # Logs (ignis-server.log alone is ~270 MB) and profiler captures, which embed
 # the profiled process's environment.
 *.log

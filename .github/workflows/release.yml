@@ -233,6 +233,12 @@ jobs:
       # Same context, same build args, same `build` stage -- everything up to
       # the final COPY is already in this builder's local cache, so this step
       # costs the runtime layers and nothing else.
+      #
+      # "Same context" is load-bearing and was not free: the step above
+      # writes its export into `out/linux`, which is *inside* the context, so
+      # until `.dockerignore` excluded it this build saw a different
+      # `COPY . .`, missed the cache on it, and recompiled the whole
+      # workspace — 429 s of a 610 s step on the first run of this pipeline.
       - name: Build the container image
         uses: docker/build-push-action@v6
         env:
