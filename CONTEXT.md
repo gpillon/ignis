@@ -541,10 +541,15 @@ When output names a domain concept, use the term as defined here.
   read, and that token belongs to another label.
 - **Constrained decode** — a decode whose sampling is restricted, per lane, to
   a declared set of tokens. What a **readout** is to one position, this is to
-  a run of them: the answer's shape is the caller's, so nothing has to parse
-  what comes back. It is the only decision primitive that generates tokens.
-  The wire exposes it as `number`, `point` and `box` (GitHub #242): a number
-  read digit by digit, and two or four of those.
+  a run of them: the answer's shape is the caller's, so no parser has to
+  survive a shape the model chose. Where the shape has a choice in it —
+  `scalar`'s optional decimal point — the *reader* refuses what the schedule
+  could not forbid, which is a parse of a known alphabet and not of free
+  text. These are the decision primitives that generate tokens.
+  The wire exposes it as `number`, `point` and `box` (GitHub #242) — a number
+  read digit by digit into a field of fixed width, and two or four of those —
+  and as `scalar` (GitHub #255), which adds the closing brace to the alphabet
+  so the number chooses its own width and may carry a decimal point.
 - **Permitted set** — the vocabulary entries one step of a **constrained
   decode** may draw from, at most 32 of them. The leaf drives every other
   column of the logits row to `-1e30` before the vendored sampler runs, so
@@ -553,12 +558,26 @@ When output names a domain concept, use the term as defined here.
   other. A set the leaf cannot honour is **refused, never truncated**: a
   constraint silently narrowed is a wrong answer that looks like a right one.
 - **Schedule** — one **permitted set** per token a **constrained decode**
-  will emit, in order. It is that request's whole generation budget and its
-  whole stopping condition: the run ends when the schedule is spent, with
-  `stop`, and never on EOS, because a token drawn from a set of digits cannot
-  be one. Not the request **scheduler's** anything — it schedules alphabets,
-  not requests. A set of cardinality one is how a literal is forced
-  mid-generation.
+  may emit, in order. It is that request's whole generation budget, and its
+  whole stopping condition **unless it names a terminator**: the run ends
+  when the schedule is spent, with `stop`, and never on EOS, because a token
+  drawn from a set of digits cannot be one. Not the request **scheduler's**
+  anything — it schedules alphabets, not requests. A set of cardinality one
+  is how a literal is forced mid-generation.
+- **Terminator** — a token a **schedule** names, permitted by its steps like
+  any other, that ends the run when it is drawn. Not EOS by another name,
+  and the difference is whose decision it is: EOS is the model saying it has
+  nothing more to say, while a terminator closes the *shape the caller
+  asked for*. `scalar` puts `}` there, so a number that is complete closes
+  its own object instead of filling a field, and its `digits` is a maximum.
+  A short run is then not automatically a fault, which is the one thing a
+  reader must get right: ended on the terminator (complete), stopped without
+  one with steps left (the engine cut it off), or spent the whole schedule
+  without one — which, when the schedule has room for every structural
+  token, means the run wrote past its own ceiling. Told apart by the **last
+  token** and never by the length. A schedule bounds **tokens** and not digits, since
+  a step cannot tell a digit from a decimal point, so what the schedule
+  cannot forbid the reader refuses.
 - **Draw** — one token a **constrained decode** emitted, and its probability
   *within that step's **permitted set*** — a restricted softmax over at most
   32 logits, computed on the device and temperature-free on purpose: it is

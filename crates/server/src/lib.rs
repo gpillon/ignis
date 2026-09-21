@@ -35,6 +35,7 @@ pub mod playground;
 pub mod numbers;
 pub mod openapi;
 pub mod runtime;
+pub mod scalar;
 pub mod telemetry;
 pub mod template;
 pub mod thinking;

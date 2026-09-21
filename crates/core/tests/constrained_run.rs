@@ -436,3 +436,118 @@ mod scheduler {
         );
     }
 }
+
+// ── a schedule that can end early (GitHub #255, spec 10) ─────────────────
+
+mod terminator {
+    use std::sync::Arc;
+
+    use ignis_core::constrained::Schedule;
+    use ignis_core::mock::MockCompute;
+    use ignis_core::types::{DecodeParams, RequestClass, RequestInput, SchedEvent, TokenId};
+    use ignis_core::{ConcreteScheduler, FinishReason, Scheduler, SchedulerConfig};
+
+    const MODEL: &str = "qwen3.8-27b";
+    /// The token that closes the shape. `scalar` uses `}`; here it only has
+    /// to be a token no other step permits, so a run that ended on anything
+    /// else is visible.
+    const END: TokenId = 92;
+
+    fn request(schedule: Schedule) -> RequestInput {
+        RequestInput {
+            model: MODEL.into(),
+            tokens: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            params: DecodeParams::default(),
+            multimodal: None,
+            opener_tokens: None,
+            user_turn_tokens: None,
+            system_block_tokens: None,
+            decision: None,
+            constrained: Some(Arc::new(schedule)),
+        }
+    }
+
+    fn run(input: RequestInput) -> (Vec<TokenId>, usize, FinishReason) {
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig { model: MODEL.into(), ..SchedulerConfig::default() },
+            Arc::new(MockCompute::new()),
+        );
+        sched.submit(input, RequestClass::Agent).expect("admitted");
+        let mut tokens = Vec::new();
+        let mut finished = None;
+        let mut ticks = 0;
+        while !sched.is_idle() {
+            for event in sched.advance() {
+                match event {
+                    SchedEvent::Token { token, .. } => tokens.push(token),
+                    SchedEvent::Done { reason, drawn, .. } => {
+                        finished = Some((drawn.map(|d| d.len()).unwrap_or(0), reason))
+                    }
+                    _ => {}
+                }
+            }
+            ticks += 1;
+            assert!(ticks < 200, "the engine never went idle");
+        }
+        let (drawn, reason) = finished.expect("the request completed");
+        (tokens, drawn, reason)
+    }
+
+    /// A step of exactly one token is how this is made deterministic: the
+    /// mock draws from the set it is handed, so a set of `[END]` alone must
+    /// produce `END` whatever the seed. Chasing a seed that happened to
+    /// terminate would be a test about the mock's arithmetic.
+    #[test]
+    fn a_run_ends_on_its_terminator_with_steps_left_over() {
+        let schedule = Schedule::new(vec![vec![10, 11, 12], vec![END], vec![30], vec![40]])
+            .expect("four legal steps")
+            .ending_on(END)
+            .expect("the terminator is permitted somewhere");
+        let (tokens, drawn, reason) = run(request(schedule));
+
+        assert_eq!(tokens.len(), 2, "one digit and the token that closed it: {tokens:?}");
+        assert_eq!(tokens[1], END);
+        assert_eq!(
+            drawn, 2,
+            "the terminator is a token the run generated, so it is in the trace and in \
+             usage.output_tokens"
+        );
+        assert_eq!(reason, FinishReason::Stop);
+    }
+
+    /// Without the terminator the very same steps run to the end — so the
+    /// early stop is the schedule's property and not the mock's.
+    #[test]
+    fn the_same_steps_without_a_terminator_run_to_the_cap() {
+        let schedule = Schedule::new(vec![vec![10, 11, 12], vec![END], vec![30], vec![40]])
+            .expect("four legal steps");
+        let (tokens, drawn, _) = run(request(schedule));
+        assert_eq!(tokens.len(), 4, "{tokens:?}");
+        assert_eq!(drawn, 4);
+    }
+
+    /// A terminator no step permits could never be drawn, so a caller who
+    /// wrote one believes their run can stop early and is wrong about it.
+    #[test]
+    fn a_terminator_outside_every_step_is_refused() {
+        let error = Schedule::new(vec![vec![10, 11], vec![20, 21]])
+            .expect("two legal steps")
+            .ending_on(99)
+            .expect_err("no step permits 99");
+        assert!(error.contains("never be drawn"), "{error}");
+    }
+
+    /// The token stays permitted where the caller put it: a terminator is an
+    /// addition to an alphabet, not a replacement for the schedule.
+    #[test]
+    fn a_terminator_is_just_a_permitted_token_that_also_ends_the_run() {
+        let schedule = Schedule::new(vec![vec![10, 11], vec![20, END]])
+            .expect("two legal steps")
+            .ending_on(END)
+            .expect("permitted at step 1");
+        assert_eq!(schedule.terminator(), Some(END));
+        assert!(schedule.ends_on(END));
+        assert!(!schedule.ends_on(20));
+        assert!(schedule.step(1).expect("a step").contains(&20), "20 is still drawable");
+    }
+}

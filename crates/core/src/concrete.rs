@@ -293,11 +293,16 @@ fn lands_on(start: u32, take: u32, point: u32) -> bool {
 /// it was never going to spend.
 ///
 /// The schedule's length for a **constrained decode** (GitHub #242), for the mirror of
-/// that reason: it emits exactly one token per step and `max_tokens` is
+/// that reason: it emits at most one token per step and `max_tokens` is
 /// meaningless to it, so a constrained decode admitted on some other number would
-/// either reserve pages it cannot use or be cut off mid-number. The budget
-/// is also what ends it — `remaining_work` reaching 0 is the schedule being
-/// spent — which is why the two are one number and not two.
+/// either reserve pages it cannot use or be cut off mid-number.
+///
+/// It is the budget and, for a schedule with no terminator, also what ends
+/// the run — `remaining_work` reaching 0 is the schedule being spent — which
+/// is why the two are one number and not two. A schedule that names a
+/// terminator (GitHub #255) may stop before it; this still reserves the
+/// whole length, because the reservation is made at submit and which round
+/// closes the shape is not known then.
 fn generation_budget(config: &SchedulerConfig, input: &RequestInput) -> u32 {
     if input.is_decision() {
         return 0;
@@ -3481,6 +3486,12 @@ impl Scheduler for ConcreteScheduler {
                         // P5-06 (GitHub #154): the round committed a run,
                         // emitted one event per token, in order.
                         let mut run_truncated_by_budget = false;
+                        // GitHub #255: a schedule may name a token that ends
+                        // its run. Checked here, where the tokens the round
+                        // committed are read, because that is the only place
+                        // that sees *which* token was drawn — the budget
+                        // below sees only how many.
+                        let mut terminated = false;
                         for (n, &token) in tokens.iter().enumerate() {
                             // GitHub #242: the probability this token held
                             // inside its own step's set, which only the
@@ -3498,6 +3509,19 @@ impl Scheduler for ConcreteScheduler {
                             self.requests[i].remaining_work =
                                 self.requests[i].remaining_work.saturating_sub(1);
                             events.push(SchedEvent::Token { request: request_id, token });
+                            // The terminator is emitted like any other token
+                            // — it was generated, and `output_tokens` that
+                            // hid it would under-report the round this run
+                            // actually cost — and then the run is over.
+                            if self.requests[i]
+                                .input
+                                .constrained
+                                .as_ref()
+                                .is_some_and(|schedule| schedule.ends_on(token))
+                            {
+                                terminated = true;
+                                break;
+                            }
                             // The reservation cap: nothing past the final
                             // reserved token is emitted, whatever the
                             // backend committed.
@@ -3527,6 +3551,12 @@ impl Scheduler for ConcreteScheduler {
                             self.requests[i].checkpoint(new_pos);
                         }
                         match finish {
+                            // The run closed its own shape: the schedule may
+                            // have steps left and none of them will be
+                            // asked for.
+                            _ if terminated => {
+                                self.mark_done(i, &mut events, FinishReason::Stop)
+                            }
                             // Finished (EOS or the backend's own `max_tokens`
                             // enforcement) after the whole run: Done, lane
                             // released.
