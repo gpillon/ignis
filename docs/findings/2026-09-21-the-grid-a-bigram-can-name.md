@@ -115,21 +115,24 @@ has to hold rather than a range it can count. 81 cells against 324 is the
 price of not knowing which of those two the model handles — and that is a
 measurement nobody has taken.
 
-**Single letters have no holes, and that is where the resolution is.** 26 of
-26 admitted means a **strip** readout — "which of the 26 equal vertical
-strips contains the target" — is nameable with a trivially compositional
-legend and no rectangle problem at all. One strip is 3.8% of the side as an
-argmax, and the readout returns the whole 26-way distribution, so a centroid
-over adjacent strips is not bounded by 3.8%. The price is that x and y are
-then **two positions rather than one**, which is a different design and a
-different experiment.
+**Single letters have no holes, and that is where a nameable grid actually
+is.** 26 of 26 admitted means a **strip** readout — "which of the 26 equal
+vertical strips contains the target" — is nameable with a trivially
+compositional legend and no rectangle problem at all.
 
-**The failure pattern is a property of BPE merge frequency, not of this
-grid.** The clean rows are the letters that begin common English words and
-the refused ones are the rare pairs, which is why the holes concentrate in
-`J`, `Q`, `V`, `W`, `X`, `Y`, `Z`. Any future compositional naming over this
-tokenizer will hit the same wall, and it is worth checking with this test
-rather than assuming — one artifact swap moves every number above.
+It is not, on its own, an accurate one: a strip is 3.8% of the side and half
+of it is 1.9%, against `small`'s 1.1% half-height, so **a strip argmax does
+not clear acceptance 3 either** — by a factor of 1.7 rather than 5, which is
+a smaller gap and the same kind. What the strip buys over the cell is that
+the readout returns the whole 26-way distribution over an **ordered** axis,
+so a centroid is not bounded by 3.8%, and that two strip counts of coprime
+width can be multiplied. Both of those are unmeasured. The price of either
+is that x and y are then **two positions rather than one**, which is a
+different design and a different experiment.
+
+**Any future compositional naming over this tokenizer hits the same wall**,
+and it is worth checking with this test rather than assuming — one artifact
+swap moves every number above.
 
 ## Implications
 
@@ -137,12 +140,21 @@ rather than assuming — one artifact swap moves every number above.
   `docs/specs/decide/11-point-in-one-pass.md`) is **not viable as a point
   answer**. It stays viable as the *coarse* pass of a two-pass box, where
   11% of the side is plenty to seed a scaffold.
-- The lead candidate becomes the **two-position strip readout**: x from one
-  26-way distribution, y from another, decoded by centroid. It needs the
-  multi-position readout head, and it needs the study's E2 to establish that
-  a second readout conditioned on a placeholder first answer is not damaged —
-  "which vertical strip" and "which horizontal strip" are self-contained
-  questions, which is exactly the cross-axis case E2 exists to test.
+- What replaces it is a **per-axis strip readout at two positions**, in one
+  of two forms, and the arithmetic picks between them: a single 26-strip read
+  per axis does not clear acceptance 3 on its argmax and rests on an
+  unmeasured centroid, while two coprime strip counts per axis (11 and 13,
+  multiplied as densities) resolve to 0.7% of the side and clear it on the
+  argmax alone. Either needs the multi-position readout head, and either
+  needs the study's E2 to establish that a second readout conditioned on a
+  placeholder first answer is not damaged — "which vertical strip" and "which
+  horizontal strip" are self-contained questions, which is exactly the
+  cross-axis case E2 exists to test.
+- The hole map *looks* like BPE merge frequency: the clean rows are letters
+  that begin common English words and the refused ones are the rare pairs,
+  which would explain the concentration in `J`, `Q`, `V`, `W`, `X`, `Y`,
+  `Z`. The merge table was not inspected, so this is listed rather than
+  attributed - a cause nobody measured is a guess.
 - Nothing here says the model can *read* any grid. This is a property of the
   tokenizer alone: it bounds what could work, and bounds nothing else.
 

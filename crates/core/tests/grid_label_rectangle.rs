@@ -179,6 +179,36 @@ fn the_largest_grid_a_bigram_can_name() {
     let full_rows = (0..LETTERS).filter(|&r| labels.contains(letter(r).to_string().as_str())).count();
     eprintln!("single uppercase letters admitted: {full_rows} of {LETTERS}");
 
+    // While the tokenizer is open: **count** the rounds a point and a box
+    // actually cost today, rather than estimating them. The schedule is the
+    // literals after the first (one step per token, spec 06) plus `digits`
+    // per axis, and the run costs one round more than its schedule because
+    // a decode round returns the token the previous call drew
+    // (`constrained.rs`, the one-round lag).
+    let encode = |text: &str| set.tokenizer().encode(text).map(|ids| ids.len());
+    for (name, literals) in [
+        ("point", &[r#"{"x":"#, r#","y":"#][..]),
+        (
+            "box",
+            &[r#"{"x0":"#, r#","y0":"#, r#","x1":"#, r#","y1":"#][..],
+        ),
+    ] {
+        let digits = 3usize;
+        let prefix = encode(literals[0]).expect("prefix encodes");
+        let forced: usize = literals[1..]
+            .iter()
+            .map(|l| encode(l).expect("literal encodes"))
+            .sum();
+        let steps = forced + digits * literals.len();
+        eprintln!(
+            "{name} at {digits} digits: prefix {prefix} prompt tokens, \
+             schedule {steps} steps ({forced} forced literal + {} digit), \
+             {} decode rounds",
+            digits * literals.len(),
+            steps + 1
+        );
+    }
+
     // Not an assertion about the model: an assertion that the alphabet was
     // actually read. A zero here means the tokenizer was not consulted.
     assert!(alphabet.len() > 100, "alphabet came back empty: {}", alphabet.len());

@@ -18,8 +18,12 @@ GitHub: (unfiled)
 ## The ask
 
 `point` should cost **one forward pass** and `box` **two**. Today they cost
-one prefill plus a run of decode rounds: about ten for a point, about
-twenty-five for a box (spec 06, `crates/server/src/numbers.rs`).
+one prefill plus a run of decode rounds: **10 for a point and 25 for a box**
+at three digits per axis (spec 06, `crates/server/src/numbers.rs`). Counted
+through the loaded tokenizer in `crates/core/tests/grid_label_rectangle.rs`
+rather than estimated: a point's schedule is 6 digit steps and 3 forced
+literal ones, and a run costs one round more than its schedule because of
+the leaf's one-round lag (`constrained.rs`).
 
 ## What "one forward pass" has to mean
 
@@ -108,6 +112,70 @@ one**, not a chain, and it buys it into a context that now contains nine
 wrong answers. Worth exactly one experiment (E5), and only if the first digit
 turns out to be where the error is.
 
+## The bar every candidate is measured against
+
+Acceptance 3 of spec 06: **inside the button on all three scenes.** On the
+committed fixture the hardest is `small`, 320 x 90 px on a 4096 px side -
+7.8% wide and **2.2% tall**, so half its height is 1.1% of the side.
+
+A readout over a grid of width W answers with a cell centre, which can sit
+half a cell from the truth. So an **argmax alone clears the bar only when
+W/2 < 1.1%**, i.e. W < 2.2%. That one line disposes of more of this list than
+any argument in it, and it is applied to every candidate below rather than to
+the ones that happen to fail it.
+
+| candidate | W | W/2 | argmax clears the bar? |
+|---|---|---|---|
+| C1, contiguous bigram grid | 11.1% | 5.6% | no, by a factor of 5 |
+| C1, free bigram grid | 5.6% | 2.8% | no, by a factor of 2.5 |
+| C1b, 26 strips per axis | 3.8% | 1.9% | **no**, by a factor of 1.7 |
+| C4, 11 x 13 coprime strips | 0.7% | 0.35% | **yes**, with room |
+| C3 / today's digit chain | - | - | yes (measured, 2.1% worst case) |
+
+So **C4 leads on arithmetic** and C1b does not. What C1b has instead is
+plausibility - one declared strip index is the simplest thing the model could
+be asked - so it is the **control** that says whether any strip readout works
+at all, and the coarse pass for a two-pass box. If E1 shows the model cannot
+read a single strip index, C4 dies with it and nothing in the sidestep column
+survives.
+
+The centroid is the one thing that could move C1b across the line, and it is
+**unmeasured**. It is named as a bet with a falsifier (E1), not leaned on:
+refusing to build C1 on a factor-of-five centroid and then building C1b on a
+factor-of-1.7 one would be the same mistake at a discount.
+
+## The bar every candidate is measured against
+
+Acceptance 3 of spec 06: **inside the button on all three scenes.** On the
+committed fixture the hardest is `small`, 320 x 90 px on a 4096 px side -
+7.8% wide and **2.2% tall**, so half its height is 1.1% of the side.
+
+A readout over a grid of width W answers with a cell centre, which can sit
+half a cell from the truth. So an **argmax alone clears the bar only when
+W/2 < 1.1%**, i.e. W < 2.2%. That one line disposes of more of this list than
+any argument in it, and it is applied to every candidate below rather than to
+the ones that happen to fail it.
+
+| candidate | W | W/2 | argmax clears the bar? |
+|---|---|---|---|
+| C1, contiguous bigram grid | 11.1% | 5.6% | no, by a factor of 5 |
+| C1, free bigram grid | 5.6% | 2.8% | no, by a factor of 2.5 |
+| C1b, 26 strips per axis | 3.8% | 1.9% | **no**, by a factor of 1.7 |
+| C4, 11 x 13 coprime strips | 0.7% | 0.35% | **yes**, with room |
+| C3 / today's digit chain | - | - | yes (measured, 2.1% worst case) |
+
+So **C4 leads on arithmetic** and C1b does not. What C1b has instead is
+plausibility - one declared strip index is the simplest thing the model could
+be asked - so it is the **control** that says whether any strip readout works
+at all, and the coarse pass for a two-pass box. If E1 shows the model cannot
+read a single strip index, C4 dies with it and nothing in the sidestep column
+survives.
+
+The centroid is the one thing that could move C1b across the line, and it is
+**unmeasured**. It is named as a bet with a falsifier (E1), not leaned on:
+refusing to build C1 on a factor-of-five centroid and then building C1b on a
+factor-of-1.7 one would be the same mistake at a discount.
+
 ## The candidates
 
 ### C1 - the compositional grid readout: one position, one symbol, no chain
@@ -132,9 +200,9 @@ directions.** Only four rows are clean across all 26 columns. So
 | largest **contiguous** square | 9 x 9 | **11.11%** of the side |
 | largest free (non-contiguous) | 18 x 18 | **5.56%** of the side |
 
-against the digit chain's measured 2.1% worst case. `small`'s button is 2.2%
-of the side tall, so an argmax cell **misses it by construction** at either
-width. A centroid would have to close a factor of five, which is not a bet to
+Against the bar above: half a cell is 5.6% (contiguous) or 2.8% (free) against
+`small`'s 1.1% half-height, so an argmax cell clears acceptance 3 only by
+luck. A centroid would have to close a factor of five, which is not a bet to
 build a primitive on.
 
 What survives:
@@ -147,9 +215,10 @@ What survives:
 
 ### C1b - the strip readout: two positions, two self-contained questions
 
-The lead candidate after E0. Instead of one label naming a cell, **one label
-per axis naming a strip**: "which of the 26 equal vertical strips contains
-the target", and the same horizontally. Single letters have no rectangle
+What E0 promoted — and the **control** the rest of the sidestep column rests
+on, not the winner: the bar above puts C4 ahead of it on arithmetic. Instead
+of one label naming a cell, **one label per axis naming a strip**: "which of
+the 26 equal vertical strips contains the target", and the same horizontally. Single letters have no rectangle
 problem, and the legend is a range.
 
 Why this is not C3 in disguise: the two questions are **self-contained**.
@@ -158,15 +227,21 @@ where `x`'s tens digit is meaningless without its hundreds digit. So this is
 still the *sidestep* posture — there is no chain, only two independent reads
 that happen to sit at two positions.
 
-- One prefill, zero decode rounds. It needs the **multi-position readout
-  head** (E4), which is the only C++ in this study, and E2's answer about
-  whether a second read conditioned on a placeholder first answer is damaged.
-- An argmax strip is 3.8% of the side — still coarser than 2.1%. **The
-  centroid is the whole proposition**: a 26-way distribution over ordered
-  strips is not bounded by its cell width, and adjacent-strip mass is
-  genuinely spatial information. Spec 08 found the mean worse than the
-  argmax, but that was an **ordinal legend** over values, not a spatial axis;
-  the result does not transfer and has to be taken again.
+- One prefill, zero decode rounds. The x read sits at the prompt's last
+  position and costs nothing new - that is the position the chunk's head
+  already computes. The y read sits at a second position, so **the design
+  needs the multi-position head (E4) unconditionally**. E2 does not decide
+  whether E4 is needed, only whether it is worth writing, by saying how far a
+  second read conditioned on a placeholder first answer is damaged.
+- An argmax strip is 3.8%, half of it 1.9%, against a 1.1% half-height: **it
+  does not clear the bar either**, by a factor of 1.7. So C1b's honest claim
+  is a *coarse* point - good enough to seed pass 2 of a box, not good enough
+  to be the point. A point-in-one-pass at the fixture's accuracy rests
+  entirely on the **centroid**: a 26-way distribution over ordered strips is
+  not bounded by its cell width, and adjacent-strip mass is genuinely spatial
+  information. That is a bet, and E1 is its falsifier. Spec 08 found the mean
+  worse than the argmax, but that was an **ordinal legend** over values, not
+  a spatial axis; the result does not transfer and has to be taken again.
 - It also composes with C4 for free: a second strip count per axis is a third
   and fourth read, not a new mechanism.
 
@@ -308,8 +383,13 @@ first is for.
 readout, no new code. Two questions in one experiment, because they share a
 prefill: the 9 x 9 bigram cell (C1 as a coarse pass) and the 26-strip single
 letter on **one** axis (C1b's x read, at the last position, where it needs no
-multi-position head). Report the argmax, the centroid, the answer mass and
-whether each lands inside the button. If the model cannot map a visual
+multi-position head). Report the argmax, the centroid, the answer mass,
+whether each lands inside the button - and, decisively, **whether
+`Readout.full_argmax` is a declared strip letter at all**. That is the typed
+option finding's own acceptance ("winner in the declared set at 100% of
+rows") and it is one field already gathered: if the unrestricted winner is a
+digit or a brace, the strip readout is renormalized noise and no centroid
+rescues it. If the model cannot map a visual
 position onto a declared strip index, C1b and C4 both die here and the study
 collapses to C3.
 
