@@ -238,8 +238,10 @@ How C5 goes into the engine, and what it must not skip:
   170, guard 203 of 240 (BF16; hq alike). The chain drifts down ~11/999 at
   the median, x untouched, and the guard — built for a wrong-element tail —
   keeps a drifted chain because it stays under d = 60. Not the codec, not
-  prefill chunking; model or engine is open. Until it is closed, the 4096 px
-  answer is not "the chain with the guard".
+  prefill chunking, and **not the engine**: the PyTorch reference drifts the
+  same, scene for scene (paired median difference 0). It is the model at
+  its largest grid, so the 4096 px answer is not "the chain with the
+  guard" — the head, or a smaller grid for `point`, is the owner's call.
 
 The rest of what was left before C5:
 

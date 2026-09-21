@@ -1,4 +1,4 @@
-# The codec costs the head its read; at 4096 px the chain drifts down
+# The codec costs the head its read; at 4096 px the model's chain drifts down
 
 - Kind: experiment
 - Status: current
@@ -9,7 +9,8 @@
   `crates/server/tests/attn_tap_hq_consumed_gpu.rs`,
   `kernel/include/ignis_attn_tap.h`, `crates/core/src/attn_tap.rs`,
   `.scratch/latent-probe/results/engine/` and `engine-runs4.log`,
-  `engine-runs5.log` (raw, on disk),
+  `engine-runs5.log`, `vehicle4096.py` and `results/vehicle4096.json`
+  (raw, on disk),
   `2026-09-21-the-head-points-in-the-engine.md` (the arms this completes),
   `2026-09-12-hq-attention-route-agreement.md`, ADR 0030 (VRAM plan)
 - Superseded by: none
@@ -138,10 +139,34 @@ Excluded, each by a measurement or a line-by-line check:
   (transformers 5.17, `bilinear`, `align_corners=True` for this model) are
   the same taps and weights in the same arithmetic order.
 
-What is left is the model itself at its largest grid, or a numeric
-difference in the engine's 4096 px path past these checks (the vision tower
-at 65,536 patches, the LLM at 16.5K positions). Only a reference run tells
-them apart; it is not in this finding.
+### The reference drifts too: it is the model
+
+What those checks leave is the model itself at its largest grid, or a
+numeric difference in the engine's 4096 px path (the vision tower at 65,536
+patches, the LLM at 16.5K positions). The PyTorch vehicle tells them apart:
+BF16 source weights quantized NF4 with the vision tower left alone, the
+reference implementation, and at 1024 px a chain that agreed with the
+engine's inside predicate on 240 of 240. It had run out of memory at
+4096 px because the LLM's SDPA got a mask and materialized
+[heads, 16.5K, 16.5K]; `vehicle4096.py` computes that attention in blocks
+of 1024 queries with an explicit causal mask — the same arithmetic, not all
+rows at once — and leaves the tower's unmasked attention whole. Served
+render, checked byte for byte against the engine dump's first render; the
+processor's grid asserted at 256 x 256 patches and the prompt at the
+engine's 16,506 tokens.
+
+On the first 20 scenes of C4096 (BF16 engine arm):
+
+- inside: **vehicle 11, engine 12**, the predicate agreeing on 19 of 20; the
+  same 4 scenes are wrong-element in both.
+- on the 16 near misses, the median y error is **+9.3 in the vehicle** and
+  +14.6 in the engine, x −0.8 and −1.8; the vehicle lands below the target
+  on 15 of 16. **The paired engine − vehicle difference in y has median 0**
+  (mean +1.5, range −9 to +16): the two drift by the same amount, scene by
+  scene, and the medians differ only because medians do not subtract.
+
+The drift is the model's, at its largest grid. The engine's chain is
+faithful to it.
 
 ## Finding
 
@@ -168,7 +193,9 @@ them apart; it is not in this finding.
 - **At 4096 px the chain, not the head, is the problem** — and it is the
   shipped `point` at the endpoint's default size. It drifts down by ~11/999
   at the median, more in the lower half of the image; the head does not.
-  The guard as designed does not correct a drift, only a wrong element.
+  **The drift is the model's, not the engine's**: the reference drifts the
+  same, scene for scene. The guard as designed does not correct a drift,
+  only a wrong element.
 
 ## Implications
 
@@ -177,22 +204,24 @@ them apart; it is not in this finding.
 - **At 4096 px the head alone is the better point** on this set (238 against
   the chain's 170). Whether the product answer at 4096 is the head, the
   chain with a drift-aware guard, or a chain run at a smaller grid is a
-  decision that waits on the drift's cause.
-- **The chain's 4096 px drift is a correctness question for the shipped
-  primitive**, independent of the head. If the model does it, it is a
-  property of the model at its largest grid, and `/v1/decide` should know
-  it (a smaller grid for `point`, or the head); if the engine does it, it is
-  a bug in the 4096 px path.
+  product decision, and it no longer waits on anything: there is no engine
+  bug to fix first.
+- **The chain's 4096 px drift is a property of the model at its largest
+  grid**, and `/v1/decide` `point` inherits it at the default size: 170-175
+  of 240 inside at 4096 px against 211 at 1024 px on scenes from the same
+  generator (different seeds, so not paired). The levers are the head, or a
+  smaller grid for `point`; neither is measured here as a product.
 - **d = 60/999 was chosen on a 32 x 32 grid** and on a failure mode (wrong
   element) that is not the one at 4096 px. A second guard is designed on
   sets A, B, C and C4096 and measured once, on a new set.
 
 ## Limits and unknowns
 
-- **The drift's cause is open**: model at its largest grid, or the engine's
-  4096 px path past the processor. A reference run at 4096 px (the PyTorch
-  vehicle with attention computed in query blocks, or the reference server)
-  decides it.
+- **The reference is 20 scenes in NF4**, not the served NVFP4: its points
+  sit a median 6/999 from the engine's at 4096 px (3 at 1024 px). Enough to
+  tell "the model drifts" from "the engine drifts" — the paired difference
+  is centred on 0 — not to price the drift to the unit. The reference
+  server (ninfer) was not run.
 - **Synthetic scenes from one generator family**, two seeds, two sizes.
 - **The exact-copy design is measured by proxy**: "keys before the codec" is
   those keys scored on the host, not a copy in the engine.
