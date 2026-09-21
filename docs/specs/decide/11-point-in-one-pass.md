@@ -115,12 +115,44 @@ turns out to be where the error is.
 ## A different question, asked next door
 
 Every candidate below takes the coordinate out of the **vocabulary**. [Spec
-12](12-the-coordinate-in-the-latent.md) asks whether it can be taken out of
-the **hidden state** instead, and its first experiment is a go/no-go for this
-document too: if that position latent does not hold the coordinate, no
-reading of that position holds it either, and the arithmetic below is arguing
-about how finely to quantize something that is not there. Read that
-discriminator before spending a GPU hour on E1.
+12](12-the-coordinate-in-the-latent.md) asked whether it can be taken out of
+the **hidden state** instead, and its first experiment was a go/no-go for
+this document too.
+
+**It fired, and it fired negative** (2026-09-21,
+`docs/findings/2026-09-21-the-point-is-assembled-as-it-is-written.md`). At
+the position a one-pass point would read, the latent holds the digit it is
+about to emit and little more: a cross-validated probe lands inside the
+button on 97 of 240 scenes, 111 with an RBF kernel, where the chain lands
+218. And a fitted probe is strictly stronger than a fixed readout into the
+vocabulary, so **that ceiling bounds every one-position reading of that
+position** — C1, C1b and C4 below included. The arithmetic about strip
+widths was about quantizing something that is not there.
+
+What that leaves standing is named in *What survives E-P1* below. The
+candidates are kept as written: they were argued before the measurement and
+the measurement is what a study is for.
+
+## What survives E-P1
+
+Three things, and the order has changed:
+
+1. **A box in two passes** — untouched, and now the interesting half of this
+   document. Its second pass forces the first pass's digits, which is
+   precisely the conditioning the probe result says the model needs; and its
+   certificate is unaffected by anything measured.
+2. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
+   later positions know progressively more, which is C3's own premise read
+   from the other side. E2 is still the experiment that prices it.
+3. **A shorter chain.** Not in the original list, and it comes out of the
+   measurement: a probe at `y1` is 187/240 after five rounds where the chain
+   is 218 after nine. Fewer rounds at a known cost in acceptance is a
+   product decision nobody has been offered.
+
+What is gone is the *sidestep* column — the hope that one position could be
+asked for the whole coordinate. The bar below is kept because it is how that
+column was ranked, and because a reader who wants to know why C1 was dropped
+before E-P1 ever ran should find the arithmetic that dropped it.
 
 ## The bar every candidate is measured against
 

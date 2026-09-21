@@ -1,14 +1,57 @@
 # 12 - the coordinate in the latent
 
-> **STUDY, NOT A SPEC**, and an **addition to [spec 11](11-point-in-one-pass.md)**
-> rather than a replacement for it. Spec 11 asks how to get a point out of the
-> **vocabulary** in one pass and answers it with arithmetic that stands on its
-> own. This asks a different question — whether the coordinate can be taken out
-> of the **hidden state** instead, before the vocabulary projection throws most
-> of it away — and it is the more ambitious of the two. Nothing here is
-> measured. The go/no-go is one experiment and it is named below.
+> **STUDY, AND THE GO/NO-GO HAS FIRED — NEGATIVE.** E-P0 and E-P1 ran on
+> 2026-09-21 and the answer is reading **(b)**: at the position a one-pass
+> point would read, the latent holds the digit it is about to emit and
+> little more. A cross-validated probe lands inside the button on 97 of 240
+> scenes (111 non-linear) where the chain lands 218, and the learning curve
+> is flat. The finding is
+> `docs/findings/2026-09-21-the-point-is-assembled-as-it-is-written.md`, and
+> **§ The result** below carries what it changes.
+>
+> The rest of this document is kept as written, because a study whose
+> prediction was checked is worth more than one quietly edited to agree with
+> the outcome. It asks whether the coordinate can be taken out of the
+> **hidden state** rather than the vocabulary — spec 11's question — and it
+> is the more ambitious of the two.
 
 GitHub: (unfiled)
+
+## The result
+
+Measured 2026-09-21, raw material in `.scratch/latent-probe/`. Full finding:
+`docs/findings/2026-09-21-the-point-is-assembled-as-it-is-written.md`.
+
+**Reading (b).** At `x0` the latent recovers x to 20.9 units against a
+leading-digit baseline of 25.0, and y to 148 against a chance of 204. On the
+predicate that matters — inside the button — the best probe is 97/240
+linear and 111/240 with an RBF kernel, where the chain itself is 218/240.
+
+**It closes more than the probe.** A readout is a *fixed* linear map into
+the vocabulary; a probe is the best *estimable* linear map into the answer.
+The probe is the stronger instrument, so its ceiling bounds every
+one-position reading of `x0` — which takes spec 11's C1, C1b and C4 with it.
+
+**What survived the checks that could have made it an artefact.** The
+permuted control sits exactly at the predict-the-mean baseline, so nothing
+leaks. The learning curve is flat from n=120, so the ceiling is the latent
+and not the sample. An RBF kernel buys 97 to 111 and four concatenated
+layers make it *worse* (65), so it is not the probe's linearity either.
+
+**Three things worth keeping from it.** The best site is L47, not the final
+residual (2.58% against 6.54%) — so a probe would need a tap, not the 10 KB
+crossing costed below, and that crossing is no longer worth its ADR 0034
+amendment. Mean absolute error is the wrong statistic: the best probe beats
+the chain on it (2.58% against 2.75%) while landing inside less than half as
+often. And the residual at a position is about its own next token, not the
+run so far — at `y1`, with x fully written and in the context, the probe
+recovers x *worse* than at `x0`.
+
+**What is still open.** A probe at `y1` is 187/240 after five rounds where
+the chain is 218 after nine: a **shorter** chain is real even though no
+chain is not. And the two-pass box is untouched — its second pass forces the
+first pass's digits, which is exactly the conditioning this result says the
+model needs.
 
 ## The ask
 
