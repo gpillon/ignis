@@ -235,6 +235,7 @@ own next token, not the run so far.
 
 ## Limits and unknowns
 
+- **Measured on the vehicle's render, not the served one**: an xhigh reasoning-effort instruction at the head of the system block, thinking open (`<think>\n` before the forced `{"x":`) and the instruction as plain text, where `/v1/decide` closes thinking and sends `{"instruction":…}`. The full note is in `2026-09-21-one-attention-head-points.md`, Limits.
 - **1024 px, not 4096.** The digit traces of the original pointing finding
   are at 16,384 vision columns; these are at 1,024. E-P0 shows the chain
   behaves the same way at this size on the three fixture scenes, but a

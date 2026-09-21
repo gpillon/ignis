@@ -216,8 +216,16 @@ How C5 goes into the engine, and what it must not skip:
 - **The query sits inside the answer's scaffold.** At the instruction's own
   tokens the chosen head does not transfer across instructions (136-143 of
   240); after the forced `{"x":` it does.
-- **First measure under the engine's quantized KV.** Everything above is the
-  PyTorch vehicle: NF4 weights, BF16 attention, 1024 px, synthetic scenes.
+- **Measured in the engine** (`docs/findings/2026-09-21-the-head-points-in-the-engine.md`),
+  through a test-only tap on the query and key rows the GQA layer hands its
+  attention op. The head's pre-registered criterion passes on all four
+  vehicle-render arms (BF16 and hq, both sets); the guard's fails on two of
+  four by one and two scenes, because it sits on its threshold — it takes the
+  chain from about 90% to about 99% in every arm. Cross-validation picks
+  L39.h10 on every fold of all six arms, and it points on the 4096 px fixture
+  under both renders. **Still unmeasured: production itself** — the served
+  render under hq-e8-2b with the codec applied to L39's own keys — which is
+  the next pre-registered run, on a new scene set, before any second guard.
 
 The rest of what was left before C5:
 

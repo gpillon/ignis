@@ -217,6 +217,8 @@ model is not picking a different element because it was asked in an
 unfamiliar shape; it is missing small targets, and it misses them the same
 way in its own dialect.
 
+Both arms used the vehicle's render — thinking open, instruction as plain text — not the served one (`2026-09-21-one-attention-head-points.md`, Limits). That the two formats agree holds on that render.
+
 This is a real negative for the cheapest idea in this finding, and it is
 worth its own sentence: **the output shape is not load-bearing here.**
 ADR 0034's rule that a reworded instruction is an unmeasured one stands as a

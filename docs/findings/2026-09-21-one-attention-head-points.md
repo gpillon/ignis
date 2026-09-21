@@ -210,15 +210,16 @@ flagged a contested alignment in #254, flagging a different failure.
 
 ## Limits and unknowns
 
+- **The vehicle rendered a prompt the product does not send.** Every vehicle run called the processor's `apply_chat_template(..., add_generation_prompt=True)` without `enable_thinking`, and this model's template (`chat_template.jinja`, the `add_generation_prompt` branch) then renders `<|im_start|>assistant\n<think>\n` — so the forced `{"x":` sat **inside an open think block** — and the same undefined `enable_thinking` makes the template default `reasoning_effort` to `xhigh` and **prepend a reasoning instruction to the system block**: "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.", then `point_system(3)`. Three differences, not one. `/v1/decide` forces thinking off (`decide.rs`), which renders `<think>\n\n</think>\n\n` before the answer, and it sends the instruction as a JSON payload, `{"instruction":"click the blue button"}`, where the vehicle sent the plain text. The chain is indifferent to both — E-P0 put the vehicle's x within 2 units of the engine's, which used the served render — but nothing here was measured on the served render, and a head's attention is exactly the kind of thing a different prefix can move. Found by the parallel session on this branch while writing the engine harness; the engine run measures both renders.
 - **1024 px, synthetic scenes, 480 of them from one generator family.** Flat
   chrome, one instruction shape ("click the ... button"), one target per
   screen. The head was chosen and tested on synthetic data; a real screenshot
   corpus is where it has to hold next, and where the small-target limit will
   matter most.
-- **The PyTorch vehicle, not the engine.** NF4 weights in transformers, not
-  ignis's NVFP4 kernels; BF16 attention, not hq-e8-2b keys. Whether the same
-  head points under the engine's quantized KV is the first thing to measure
-  there.
+- **The PyTorch vehicle, not the engine** — since measured there
+  (`2026-09-21-the-head-points-in-the-engine.md`): the head holds (236 and 232
+  under BF16, CV picks L39.h10 on every fold), the chain is scene for scene
+  the same, and the guard lands at about 237 rather than this vehicle's 239.
 - **One head was chosen by 240 labelled scenes.** "Calibrated once" means
   someone has to do it, per artifact, with labelled data.
 - **16 of 64 layers have attention.** L39.h10 is one head among 384; nothing

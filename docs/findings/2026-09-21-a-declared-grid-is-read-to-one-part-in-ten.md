@@ -142,6 +142,7 @@ that works.
 
 ## Limits and unknowns
 
+- **Measured on the vehicle's render, not the served one**: an xhigh reasoning-effort instruction at the head of the system block, thinking open (`<think>\n` before the forced `{"x":`) and the instruction as plain text, where `/v1/decide` closes thinking and sends `{"instruction":…}`. The full note is in `2026-09-21-one-attention-head-points.md`, Limits.
 - **Nothing was drawn on the image.** This is the model computing a strip
   index from a declared rule, which is the thing it is measured to be bad at
   elsewhere (`number_system`'s own note: asked for a total it had to
