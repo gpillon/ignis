@@ -5,7 +5,9 @@ import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
   emptyOption,
   type Fault,
+  DEFAULT_CEILING,
   hasFixedWidth,
+  MAX_CEILING,
   MAX_DIGITS,
   MIN_DIGITS,
   type Option,
@@ -125,7 +127,7 @@ export function QuestionCard({
       {question.kind === "score" && <LevelList levels={question.levels} stem={question.uid} onChange={(levels) => set("levels", levels)} />}
 
       {hasFixedWidth(question.kind) && (
-        <DigitField label="Digits per number" value={question.digits} name={`${question.uid}-digits`} onChange={(digits) => set("digits", digits ?? 0)}>
+        <DigitField label="Digits per number" value={question.digits} max={MAX_DIGITS} name={`${question.uid}-digits`} onChange={(digits) => set("digits", digits ?? 0)}>
           {question.kind === "number"
             ? `Up to ${nines(question.digits)}.`
             : `The prompt declares a 0–${nines(question.digits)} scale on each axis.`}
@@ -137,9 +139,17 @@ export function QuestionCard({
           complete, and the caller who does not know the magnitude is the one
           this primitive exists for. */}
       {question.kind === "scalar" && (
-        <DigitField label="Digits at most" value={question.ceiling} name={`${question.uid}-ceiling`} placeholder="any" onChange={(ceiling) => set("ceiling", ceiling)}>
+        <DigitField
+          label="Digits at most"
+          value={question.ceiling}
+          max={MAX_CEILING}
+          name={`${question.uid}-ceiling`}
+          placeholder={String(DEFAULT_CEILING)}
+          onChange={(ceiling) => set("ceiling", ceiling)}
+        >
           A ceiling, not a width — the answer ends as soon as the number is complete, and may have a decimal part or a sign. Leave
-          it empty when you do not know the magnitude; {MAX_DIGITS} digits is the widest served either way.
+          it empty when you do not know the magnitude and it asks for {DEFAULT_CEILING}; {MAX_CEILING} is the most you can ask for,
+          which is where an f64 stops.
         </DigitField>
       )}
 
@@ -291,6 +301,7 @@ function LevelList({ levels, stem, onChange }: { levels: string[]; stem: string;
 function DigitField({
   label,
   value,
+  max,
   name,
   placeholder,
   onChange,
@@ -298,6 +309,8 @@ function DigitField({
 }: {
   label: string;
   value: number | null;
+  /** A width stops at `MAX_DIGITS`; a ceiling reaches further, and says so. */
+  max: number;
   name: string;
   placeholder?: string;
   onChange: (value: number | null) => void;
@@ -309,7 +322,7 @@ function DigitField({
         <input
           type="number"
           min={MIN_DIGITS}
-          max={MAX_DIGITS}
+          max={max}
           value={value ?? ""}
           onChange={(e) => onChange(e.target.value.trim() === "" ? null : Number(e.target.value))}
           name={name}

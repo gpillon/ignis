@@ -49,15 +49,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::numbers::{DigitDraw, PlanError};
 
-/// The most digits a scalar may emit, and the default when the caller names
-/// none.
+/// The ceilings a scalar question may declare, inclusive at both ends.
 ///
-/// A **maximum**, not a width — that is the whole point of the primitive —
-/// so the default is the ceiling rather than a guess at the magnitude. At
-/// six digits the worst case a run can spell is `-123456.`… no: a sign, six
-/// digits, a point and the brace, which is nine rounds. The common case is
-/// two. `number` at the same six spends six every time.
-pub const MAX_DIGITS: u32 = 6;
+/// Wider than [`crate::numbers::DIGITS`], and it can be, because the two
+/// numbers are not the same kind of number. A `number`'s `digits` is a field
+/// the model must **fill**, so every digit of it is a decode round spent
+/// whatever the answer is, and widening it widens the run. A scalar's is a
+/// ceiling the run may close early out of, so widening it costs a caller who
+/// does not reach it exactly nothing — only the schedule, which is a list and
+/// not a spend.
+///
+/// Fifteen is where `f64` stops. Every 15-significant-digit decimal
+/// round-trips through an `f64` exactly and the sixteenth does not, so a
+/// wider ceiling would permit a run whose spelling `value` could not carry —
+/// and `text` and `value` disagreeing is the one thing this answer's two
+/// fields exist to rule out.
+pub const DIGITS: std::ops::Range<u32> = 1..16;
+
+/// The ceiling when the caller declares none.
+///
+/// **Not the maximum.** A caller who writes nothing is not asking for the
+/// widest run this endpoint can serve; they are saying they do not know the
+/// magnitude, and eight digits covers the quantities that turn up in evidence
+/// — a count, a duration, an amount of money — while keeping the schedule at
+/// eleven steps. A caller who needs the other seven says so, and is refused
+/// past fifteen.
+pub const DEFAULT_DIGITS: u32 = 8;
 
 /// The tokens a run may spend beyond its digits: the sign, the decimal
 /// point, and the brace that closes the object.
@@ -486,6 +503,32 @@ mod tests {
     fn a_token_from_no_step_is_named_as_such() {
         let plan = plan(6, &per_character).expect("a plan");
         assert_eq!(read(&plan, &[draw('x', 1.0), draw('}', 1.0)]), Err(ReadError::OffAlphabet));
+    }
+
+    /// The widest ceiling served, spelled out. Fifteen digits is where the
+    /// range stops because it is where an `f64` stops carrying a decimal
+    /// exactly, so the spelling and the value have to still agree at the
+    /// edge — which is the whole reason the answer carries both.
+    #[test]
+    fn the_widest_ceiling_reads_every_digit_it_allows() {
+        let widest = DIGITS.end - 1;
+        let plan = plan(widest, &per_character).expect("a plan");
+        let drawn: Vec<Draw> = "123456789012345}".chars().map(|c| draw(c, 1.0)).collect();
+        let reading = read(&plan, &drawn).expect("a number");
+        assert_eq!(reading.text, "123456789012345");
+        assert_eq!(reading.value, 123_456_789_012_345.0);
+        assert_eq!(reading.digits.len(), widest as usize);
+        assert_eq!(reading.value.to_string(), reading.text, "the value spells itself back");
+    }
+
+    /// The default is what a caller who says nothing gets, and it is
+    /// deliberately not the maximum: saying nothing is "I do not know the
+    /// magnitude", not "give me every digit you serve".
+    #[test]
+    fn the_default_ceiling_leaves_room_above_it() {
+        assert!(DIGITS.contains(&DEFAULT_DIGITS));
+        assert!(DEFAULT_DIGITS > DIGITS.start, "a one-digit default would refuse most evidence");
+        assert!(DEFAULT_DIGITS < DIGITS.end - 1, "a caller who needs more must have somewhere to go");
     }
 
     #[test]

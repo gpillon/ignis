@@ -193,7 +193,7 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
       // Here `digits` is a ceiling and absent asks for the widest run, so the
       // mock picks its own width under it — that is the whole behaviour the
       // tab is being built against.
-      const ceiling = Math.max(1, Math.min(6, Number(text(entry(question, "digits"))) || 6));
+      const ceiling = Math.max(1, Math.min(15, Number(text(entry(question, "digits"))) || 8));
       const width = 1 + Math.floor(hashed(seed, 313) * ceiling);
       const trace = digitsFor(seed, width);
       // Some of them fractional and fewer of them negative, so the decimal and

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { asText } from "./json.ts";
 import { Bar, BoxGlyph, DigitTrace, DistributionRow, ImageMark, NoulMark, PointGlyph, ScoreMark } from "./marks.tsx";
-import { type Draft, evidenceImage, MAX_DIGITS, type Question } from "./model.ts";
+import { DEFAULT_CEILING, type Draft, evidenceImage, type Question } from "./model.ts";
 import { type Answer, AXES, levelOrder, type Run } from "./request.ts";
 
 // What came back (GitHub #247), read in the order the request declared.
@@ -215,7 +215,7 @@ function ScalarBody({ question, answer }: { question: Question; answer: Extract<
   // reported — and it holds because the alphabet is one token per character,
   // which `scalar.rs` verifies against the loaded tokenizer at load.
   const rounds = [...answer.text].length + 1;
-  const ceiling = question.ceiling ?? MAX_DIGITS;
+  const ceiling = question.ceiling ?? DEFAULT_CEILING;
   return (
     <div>
       <p className="font-display text-[34px] font-semibold leading-none tabular-nums text-ember">
@@ -226,8 +226,8 @@ function ScalarBody({ question, answer }: { question: Question; answer: Extract<
         <span title="The f64 the spelling above parsed to. `3` and `3.0` are the same number and not the same answer.">
           reads as <span className="text-ink">{String(answer.value)}</span>
         </span>
-        <span title="The characters it wrote, plus the brace that closed the object.">
-          <span className="text-ink">{rounds}</span> round{rounds === 1 ? "" : "s"}, where a number {ceiling} wide spends {ceiling}
+        <span title="The characters it wrote, plus the brace that closed the object. A number spends its whole field whatever the answer is.">
+          <span className="text-ink">{rounds}</span> round{rounds === 1 ? "" : "s"}, under a ceiling of {ceiling} digits
         </span>
       </p>
       <div className="mt-3">

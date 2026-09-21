@@ -18,6 +18,31 @@ answers a whole number in a declared field; `point` and `box` are untouched,
 because there the width is the **scale** and not a field — a coordinate on a
 0-999 axis is three digits by definition, and those numbers are measured.
 
+## How wide a ceiling may be
+
+A `number`'s `digits` and a `scalar`'s are not the same quantity and do not
+share a bound. A width is a field the model must **fill**, so every digit of
+it is a decode round spent whatever the answer is, and `number` is held to
+1..=6 because that is what was measured. A ceiling is a bound the run may
+close early out of, so raising it costs a caller who does not reach it
+nothing at all — only the schedule, which is a list and not a spend.
+
+| | range | when the caller says nothing |
+|---|---|---|
+| `number`, `point`, `box` | 1..=6 | 3, the measured width |
+| `scalar` | 1..=15 | **8** |
+
+Fifteen is where `f64` stops: every 15-significant-digit decimal round-trips
+through an `f64` exactly and the sixteenth does not, so a wider ceiling would
+permit a run whose spelling `value` could not carry — and `text` and `value`
+disagreeing is the one thing those two fields exist to rule out.
+
+Eight is **not** the maximum, deliberately. A caller who writes nothing is not
+asking for the widest run served; they are saying they do not know the
+magnitude, and eight digits covers the quantities that turn up in evidence — a
+count, a duration, an amount of money — while keeping the schedule at eleven
+steps. A caller who needs the other seven says so.
+
 ## The schedule
 
 The prefix `{"value":` is prompt, as it is for `number`. Then:
@@ -111,6 +136,10 @@ nothing: the first two are structure and the third is the end.
 3. A run the engine cut short is still an error.
 4. `{"value":3}` answers `3` in **two** rounds where `number` at six digits
    spends six.
+4b. A question that names no `digits` is prepared at the default ceiling, not
+   at the maximum, and every ceiling between `number`'s ceiling and this
+   primitive's is legal — a width a field refuses is a bound a run may simply
+   not reach.
 5. `3.5` and `-0.25` round-trip: `value`, `text` and the per-digit trace
    agree, and `uncertainty` weights `5` in `3.5` at 0.1 and not at 1.
 6. `..`, `3.`, `-` alone, and an empty run are each a 422-shaped

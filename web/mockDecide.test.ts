@@ -79,7 +79,9 @@ describe("mockDecide", () => {
     const { body } = send({ state: "s", questions: { s: { type: "scalar", instructions: "How much?" } } });
     const answer = body.answers.s as { type: string; digits: unknown[] };
     expect(answer.type).toBe("scalar");
-    expect(answer.digits.length).toBeLessThanOrEqual(6);
+    // Nothing declared asks for the server's default ceiling, which is 8 and
+    // not the 15 it would serve on request.
+    expect(answer.digits.length).toBeLessThanOrEqual(8);
   });
 
   it("refuses a point when the state carried no image, on that question alone", () => {

@@ -1,7 +1,7 @@
 # Pending / revisit ledger (ignis)
 
 Cross-cutting items that are intentionally deferred or blocked on an external
-dependency. Per-ticket details live in `.scratch/<feature>/specs/`; status and
+dependency. Per-ticket details live in `docs/specs/<feature>/`; status and
 blocking live on GitHub (AGENTS.md). This ledger records *capabilities that do
 not work yet*, never tickets that closed.
 

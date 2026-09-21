@@ -186,12 +186,14 @@ describe("validate", () => {
 
   it("accepts a scalar with no ceiling, and names one outside the range", () => {
     expect(codes(draft([question("a", "scalar", "How many hours?")]))).toEqual([]);
-    for (const ceiling of [0, 7, 2.5]) {
+    for (const ceiling of [0, 16, 2.5]) {
       expect(codes(draft([question("a", "scalar", "How many hours?", { ceiling })])), String(ceiling)).toEqual([
         "digits_out_of_range",
       ]);
     }
-    for (const ceiling of [1, 3, 6]) {
+    // Widths a `number` refuses are legal ceilings: a field must be filled
+    // and a ceiling need not.
+    for (const ceiling of [1, 3, 6, 8, 15]) {
       expect(codes(draft([question("a", "scalar", "How many hours?", { ceiling })])), String(ceiling)).toEqual([]);
     }
   });

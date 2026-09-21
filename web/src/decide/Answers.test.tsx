@@ -241,7 +241,7 @@ describe("Answers", () => {
     );
     // `-0.75` is six tokens: five characters and the closing brace.
     expect(html).toContain(">6</span> rounds");
-    expect(html).toContain("a number 6 wide spends 6");
+    expect(html).toContain("under a ceiling of 6 digits");
     // The sign and the point were steps of the run and hold no place, so the
     // trace is three columns against a five-character spelling — right, not
     // a gap.
@@ -252,7 +252,9 @@ describe("Answers", () => {
   it("reads a scalar with no ceiling against the widest field the endpoint serves", () => {
     const html = render([question("s", "scalar")], { s: { type: "scalar", value: 3, text: "3", uncertainty: 0, digits: [] } }, undefined, 2);
     expect(html).toContain(">2</span> rounds");
-    expect(html).toContain("a number 6 wide spends 6");
+    // Nothing was declared, so the panel reads against the ceiling the server
+    // applies when the caller says nothing — which is not its maximum.
+    expect(html).toContain("under a ceiling of 8 digits");
   });
 
   it("renders a scalar's own per-answer errors as errors, not as a blank card", () => {

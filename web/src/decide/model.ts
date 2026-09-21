@@ -58,6 +58,15 @@ export const MIN_DIGITS = 1;
 export const MAX_DIGITS = 6;
 /** `numbers::DEFAULT_DIGITS`. */
 export const DEFAULT_DIGITS = 3;
+/**
+ * `scalar::DIGITS`, inclusive, and wider than a field's on purpose: a width
+ * must be filled and a ceiling need not, so raising it costs a caller who
+ * does not reach it nothing. Fifteen is where an `f64` stops carrying a
+ * decimal exactly.
+ */
+export const MAX_CEILING = 15;
+/** `scalar::DEFAULT_DIGITS`: what an empty ceiling asks for, which is not the maximum. */
+export const DEFAULT_CEILING = 8;
 
 /** One `choice` option: the key the answer comes back under, and what the prompt says it means. */
 export type Option = {
@@ -92,10 +101,11 @@ export type Question = {
   /** `number`, `point`, `box`: the width of the field, or the scale of the axes. */
   digits: number;
   /**
-   * `scalar`: at most this many digits, and `null` for "however many it
-   * takes". A ceiling and not a width — the run closes itself as soon as the
-   * number is complete — so blank is the honest default for the caller this
-   * primitive exists for, who does not know the magnitude.
+   * `scalar`: at most this many digits, and `null` for the server's own
+   * default of `DEFAULT_CEILING`. A ceiling and not a width — the run closes
+   * itself as soon as the number is complete — so blank is the honest default
+   * for the caller this primitive exists for, who does not know the
+   * magnitude.
    */
   ceiling: number | null;
   /** Fields the JSON editor carried that the builder does not edit; re-emitted as they were. */
@@ -304,16 +314,17 @@ function digitFaults(question: Question, name: string): Fault[] {
 
 /**
  * A `scalar`'s ceiling, which is allowed to be absent — that is the whole
- * point of the primitive. When it is there it is the same range `number`
- * serves, and `decide.rs` refuses the rest under the same code.
+ * point of the primitive — and which reaches further than a `number`'s width,
+ * because a ceiling need not be filled. `decide.rs` refuses the rest under
+ * the same code as a width.
  */
 function ceilingFaults(question: Question, name: string): Fault[] {
   const { ceiling } = question;
-  if (ceiling === null || inDigitRange(ceiling)) return [];
+  if (ceiling === null || (Number.isInteger(ceiling) && ceiling >= MIN_DIGITS && ceiling <= MAX_CEILING)) return [];
   return [
     {
       code: "digits_out_of_range",
-      message: `${name} allows at most ${ceiling} digits; ${MIN_DIGITS} to ${MAX_DIGITS} is the range served.`,
+      message: `${name} allows at most ${ceiling} digits; ${MIN_DIGITS} to ${MAX_CEILING} is the range a scalar serves.`,
       uid: question.uid,
     },
   ];
