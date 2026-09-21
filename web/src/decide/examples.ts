@@ -4,8 +4,8 @@
 //
 // Three of them are Jev's own documented requests over Jev's own state, so a
 // reader who knows that API recognises the tab immediately; the rest show what
-// this server adds — a JSON evidence, a generated number, and a position on an
-// image.
+// this server adds — a JSON evidence, a generated number, a number that decides
+// its own width, and a position on an image.
 
 import flame from "../brand/flame.webp";
 import { imageFromFile, type PromptImage } from "../conversation/images.ts";

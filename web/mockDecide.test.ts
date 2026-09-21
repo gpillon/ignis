@@ -67,7 +67,10 @@ describe("mockDecide", () => {
     expect(answer.value).toBe(Number(answer.text));
     // The trace is the digits alone: the point and the sign were steps of the
     // run and hold no place.
-    expect(answer.digits.length).toBe(answer.text.replace(/[-.]/g, "").length);
+    // The trace and the spelling are the same digits in the same order: a
+    // column the text does not carry is the one fault this card exists to
+    // show, so the mock must never manufacture one.
+    expect(answer.text.replace(/[-.]/g, "")).toBe(answer.digits.map((d) => d.digit).join(""));
     expect(answer.digits.length).toBeLessThanOrEqual(4);
     expect(body.usage.output_tokens).toBe(answer.text.length + 1);
   });

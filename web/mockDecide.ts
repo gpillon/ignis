@@ -200,11 +200,13 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
       // the sign are both reachable without the card.
       const fraction = width > 1 && hashed(seed, 419) < 0.45 ? 1 : 0;
       const sign = hashed(seed, 523) < 0.25 ? "-" : "";
+      // A model writes `0.5` and never `07`: a leading zero only stands before
+      // the point. Corrected on the **trace** and not on the spelling, because
+      // the card shows both and a digit the text does not carry reads there as
+      // the fault it would be.
+      if (width - fraction > 1 && trace[0].digit === 0) trace[0] = { ...trace[0], digit: 1 };
       const spelled = trace.map((d) => d.digit).join("");
-      // A model writes `0.5` and never `07`: a leading zero only stands
-      // before the point.
-      const whole = spelled.slice(0, width - fraction).replace(/^0(?=.)/, "1");
-      const written = `${sign}${whole}${fraction ? `.${spelled.slice(width - fraction)}` : ""}`;
+      const written = `${sign}${spelled.slice(0, width - fraction)}${fraction ? `.${spelled.slice(width - fraction)}` : ""}`;
       // What it wrote, plus the brace that closed the object.
       generated += [...written].length + 1;
       answers[id] = {
