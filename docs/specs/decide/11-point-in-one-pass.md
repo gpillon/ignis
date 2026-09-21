@@ -164,23 +164,37 @@ and the measurement is what a study is for.
 **The sidestep column is closed.** Both halves of it were measured and both
 failed: the latent at that position holds about one digit (E-P1), and a
 declared grid is read to one part in ten however finely it is declared (E1).
-C1, C1b and C4 are done. What is left:
+C1, C1b and C4 are done.
+
+**And then the literature was read**, which should have happened first
+(`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`). It
+renames the target — a one-pass point is *coordinate-free grounding* — and
+names a mechanism none of the candidates below used. What is left:
 
 1. **A box in two passes** — untouched, and now the interesting half of this
    document. Its second pass forces the first pass's digits, which is
    precisely the conditioning the probe result says the model needs; and its
    certificate is unaffected by anything measured.
-2. **C2, set-of-mark** — the one candidate neither experiment touched,
-   because it does not ask the model to *compute* a grid index: the label is
-   drawn where the model is already looking. It is now the only unmeasured
-   way to a one-pass point, and its costs are unchanged (a rasterizer in the
-   media path, and it breaks the two-pass reuse).
-3. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
+2. **C5, attention as the answer** — new, and it outranks everything else
+   here. The published one-pass grounding methods read the **attention from
+   the instruction's tokens to the image tokens**, not the residual: TAG
+   does it tuning-free, GUI-Actor trains a small head on it and answers in a
+   single pass. Free to try in the PyTorch vehicle, where the 240 scenes and
+   the harness already are. The engine-side blocker is specific and
+   unmeasured by anyone: **16 of 64 layers have an attention matrix**, and a
+   fused kernel never materializes it.
+   (`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`.)
+3. **C2, set-of-mark** — demoted. It was the last unmeasured candidate, and
+   the literature says it is the one that *fails* to transfer: it lifts
+   GPT-4V and generally **decreases** open-weight models, apparently because
+   reading marks is an OCR task. Still untested here; no longer the obvious
+   next thing.
+4. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
    later positions know progressively more, which is C3's own premise read
    from the other side. E2 is still the experiment that prices it, and E1
    could not answer it — a placeholder moved `y` by 2.58 strips, but `y` was
    3 strips wrong to begin with.
-4. **A shorter chain.** Not in the original list, and it comes out of the
+5. **A shorter chain.** Not in the original list, and it comes out of the
    measurement: a probe at `y1` is 187/240 after five rounds where the chain
    is 218 after nine. Fewer rounds at a known cost in acceptance is a
    product decision nobody has been offered.

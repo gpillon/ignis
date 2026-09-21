@@ -235,16 +235,31 @@ tokens, one per 32 px, **0.78% of the side**, with a centroid finer than that
 and a genuine 2-D covariance as the uncertainty. The cost is one GEMV of
 16,384 x 5120, which is nothing beside the 27B forward it rides on.
 
+> **The first of these three was wrong, and it was the load-bearing one**
+> (`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`).
+> The published methods — GUI-Actor, TAG — do not probe the image tokens'
+> own states at all. They read **attention from the instruction's tokens to
+> the image tokens**: late query, early keys, so causality is satisfied by
+> construction and there is nothing to reorder. The paragraph below blocked
+> the one mechanism the literature says works, on an objection that only
+> applies to the direction it happened to imagine. It is kept because the
+> correction is the point.
+>
+> What does stand in the way on this engine is narrower and was not named
+> here: **16 of the 64 layers have an attention matrix and 48 do not**, and
+> a fused kernel never materializes the one they do.
+
 Three things stand between it and a measurement, and they are why it is
 second:
 
-1. **Causal ordering.** Today the render is system -> user[Image, Text]
-   (`classify_pointing_gpu.rs`). So the image tokens *do* see the system's
-   pointing instruction, but **not the specific target** — "click the blue
-   button" comes after them, and no image token can attend to it. A heatmap
-   over those states can encode "what is here", not "am I the one". Moving
-   the instruction before the image is possible (the parts are ordered by the
-   caller) but it is a different prompt and therefore unmeasured text.
+1. **Causal ordering.** *(Wrong — see the note above.)* Today the render is
+   system -> user[Image, Text] (`classify_pointing_gpu.rs`). So the image
+   tokens *do* see the system's pointing instruction, but **not the specific
+   target** — "click the blue button" comes after them, and no image token
+   can attend to it. A heatmap over those states can encode "what is here",
+   not "am I the one". Moving the instruction before the image is possible
+   (the parts are ordered by the caller) but it is a different prompt and
+   therefore unmeasured text.
 2. **Probe site.** Last-layer image-token states are frequently degenerate in
    VLMs. The live site is likely mid-stack — which is a **tap**, not a reuse
    of `final_residual`, and a much bigger kernel change. The ngram study's
