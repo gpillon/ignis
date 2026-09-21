@@ -112,37 +112,15 @@ one**, not a chain, and it buys it into a context that now contains nine
 wrong answers. Worth exactly one experiment (E5), and only if the first digit
 turns out to be where the error is.
 
-## The bar every candidate is measured against
+## A different question, asked next door
 
-Acceptance 3 of spec 06: **inside the button on all three scenes.** On the
-committed fixture the hardest is `small`, 320 x 90 px on a 4096 px side -
-7.8% wide and **2.2% tall**, so half its height is 1.1% of the side.
-
-A readout over a grid of width W answers with a cell centre, which can sit
-half a cell from the truth. So an **argmax alone clears the bar only when
-W/2 < 1.1%**, i.e. W < 2.2%. That one line disposes of more of this list than
-any argument in it, and it is applied to every candidate below rather than to
-the ones that happen to fail it.
-
-| candidate | W | W/2 | argmax clears the bar? |
-|---|---|---|---|
-| C1, contiguous bigram grid | 11.1% | 5.6% | no, by a factor of 5 |
-| C1, free bigram grid | 5.6% | 2.8% | no, by a factor of 2.5 |
-| C1b, 26 strips per axis | 3.8% | 1.9% | **no**, by a factor of 1.7 |
-| C4, 11 x 13 coprime strips | 0.7% | 0.35% | **yes**, with room |
-| C3 / today's digit chain | - | - | yes (measured, 2.1% worst case) |
-
-So **C4 leads on arithmetic** and C1b does not. What C1b has instead is
-plausibility - one declared strip index is the simplest thing the model could
-be asked - so it is the **control** that says whether any strip readout works
-at all, and the coarse pass for a two-pass box. If E1 shows the model cannot
-read a single strip index, C4 dies with it and nothing in the sidestep column
-survives.
-
-The centroid is the one thing that could move C1b across the line, and it is
-**unmeasured**. It is named as a bet with a falsifier (E1), not leaned on:
-refusing to build C1 on a factor-of-five centroid and then building C1b on a
-factor-of-1.7 one would be the same mistake at a discount.
+Every candidate below takes the coordinate out of the **vocabulary**. [Spec
+12](12-the-coordinate-in-the-latent.md) asks whether it can be taken out of
+the **hidden state** instead, and its first experiment is a go/no-go for this
+document too: if that position latent does not hold the coordinate, no
+reading of that position holds it either, and the arithmetic below is arguing
+about how finely to quantize something that is not there. Read that
+discriminator before spending a GPU hour on E1.
 
 ## The bar every candidate is measured against
 
