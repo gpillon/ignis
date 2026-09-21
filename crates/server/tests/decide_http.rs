@@ -1687,15 +1687,24 @@ const SCALAR: &str = r#"{
 /// (acceptance 1, 2 and 4).
 ///
 /// The mock's draw is arbitrary but deterministic, so the seed decides
-/// whether a given run closes its object early or spends its schedule. Both
-/// happen across a handful of seeds, and **both are covered here on
-/// purpose**: a test pinned to one seed would pass just as well if the
-/// terminator never fired, and the accounting invariant — you are charged
-/// for the tokens that were generated — has to hold either way.
+/// whether a given run answers or is refused, and both happen across a
+/// handful of seeds. A test pinned to one seed would pass just as well if
+/// the terminator never fired.
+///
+/// **What this cannot check, and where it is checked instead.**
+/// `usage.output_tokens` is rebuilt by `generated` from the answer's own
+/// spelling, so asserting `written + 1` here restates that formula rather
+/// than verifying it. The independent check would be the engine's own token
+/// count, and `ignis_decoded_tokens_total` is not it: `Telemetry::on_token`
+/// returns early for a request the consumer never registered, which is every
+/// request on this endpoint, so that counter reads 0 for a `number` and a
+/// `point` too. What does pin the engine's side is
+/// `constrained_run.rs::terminator`, which counts the `SchedEvent::Token`s a
+/// terminated run emits.
 #[tokio::test]
 async fn a_scalar_is_billed_for_the_run_it_wrote_and_not_for_its_ceiling() {
     let mut terminated = 0;
-    let mut at_cap = 0;
+    let mut refused = 0;
     for seed in 0..12u64 {
         let compute = Arc::new(MockCompute::with_seed(seed));
         let (status, body) = decide(&app(compute), SCALAR).await;
@@ -1708,31 +1717,41 @@ async fn a_scalar_is_billed_for_the_run_it_wrote_and_not_for_its_ceiling() {
             Some("scalar") => {
                 let text = answer["text"].as_str().expect("the spelling");
                 let written = text.chars().count() as u64;
-                if written < 3 {
-                    assert_eq!(
-                        billed,
-                        written + 1,
-                        "seed {seed}: the brace that closed the run is a token too: {body}"
-                    );
-                    terminated += 1;
-                } else {
-                    assert_eq!(billed, written, "seed {seed}: at the cap, nothing closed it");
-                    at_cap += 1;
-                }
+                assert_eq!(
+                    billed,
+                    written + 1,
+                    "seed {seed}: the brace that closed the run is a token too: {body}"
+                );
+                terminated += 1;
                 assert!(answer["value"].is_number(), "seed {seed}: {body}");
             }
-            // The schedule permits runs that are not numbers — `3.` and a
-            // bare sign among them — and those are refused by name rather
-            // than reported as some number.
-            Some("error") => assert_eq!(
-                answer["code"], "malformed_scalar",
-                "seed {seed}: the only fault a mock can produce here: {body}"
-            ),
+            // The schedule permits runs a number cannot be made of — `3.`
+            // and a bare sign — and runs with more digits than the question
+            // allowed, because a step cannot tell a digit from a point.
+            // Both are refused **by name** rather than reported as some
+            // number, which is the property under test; the mock draws
+            // arbitrarily, so which of the two it produces is not.
+            Some("error") => {
+                let code = answer["code"].as_str().unwrap_or_default();
+                assert!(
+                    matches!(code, "malformed_scalar" | "too_many_digits"),
+                    "seed {seed}: a fault the reader does not name: {body}"
+                );
+                refused += 1;
+                assert_eq!(
+                    billed, 0,
+                    "seed {seed}: a question that did not answer bills nothing, however many                      rounds the engine spent on it: {body}"
+                );
+            }
             other => panic!("seed {seed}: unexpected answer {other:?}: {body}"),
         }
     }
     assert!(terminated > 0, "no seed closed its own object; the terminator never fired");
-    assert!(at_cap > 0, "no seed reached the cap; the ceiling is untested");
+    // The mock draws arbitrarily, so with the digit ceiling enforced it
+    // produces a refusal far more often than a run that fills the schedule
+    // without closing. The at-the-cap row of the table is pinned in
+    // `scalar.rs`'s own tests, where the run can be written out by hand.
+    assert!(refused > 0, "no seed produced a run the reader had to refuse");
 }
 
 /// A scalar is counted under its own primitive and observes no answer mass:

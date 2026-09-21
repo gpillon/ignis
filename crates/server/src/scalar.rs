@@ -27,15 +27,21 @@
 //! the shape of a right one, which is the reason `run_cut_short` exists one
 //! module over.
 //!
-//! # Three ways a run ends and only one is an error
+//! # Three ways a run ends and only one of them answers
 //!
 //! The signal is the **last token**, never the length:
 //!
 //! | run | reading |
 //! |---|---|
 //! | ends with `}` | terminated — the number is what precedes it |
-//! | schedule spent, no `}` | at the cap — `digits` digits, a valid answer |
-//! | ends without `}`, short | the engine cut it off, an error |
+//! | no `}`, schedule unspent | the engine cut it off, an error |
+//! | no `}`, schedule spent | more digits than were asked for, an error |
+//!
+//! The third row is a consequence of the schedule leaving room for every
+//! structural token: a well-formed answer can **always** close itself, so a
+//! run that spent the whole schedule instead wrote at least one digit past
+//! its ceiling. "At the cap" is not a valid outcome here the way it is for
+//! [`crate::numbers`], whose field has no terminator to miss.
 
 use ignis_core::constrained::{Draw, Schedule};
 use ignis_core::types::TokenId;
@@ -47,10 +53,20 @@ use crate::numbers::{DigitDraw, PlanError};
 /// none.
 ///
 /// A **maximum**, not a width — that is the whole point of the primitive —
-/// so the default is the ceiling rather than a guess at the magnitude. Six
-/// digits with a point and a sign is nine rounds in the worst case and two
-/// in the common one, which is cheaper than `number`'s three.
+/// so the default is the ceiling rather than a guess at the magnitude. At
+/// six digits the worst case a run can spell is `-123456.`… no: a sign, six
+/// digits, a point and the brace, which is nine rounds. The common case is
+/// two. `number` at the same six spends six every time.
 pub const MAX_DIGITS: u32 = 6;
+
+/// The tokens a run may spend beyond its digits: the sign, the decimal
+/// point, and the brace that closes the object.
+///
+/// The schedule is a **token** bound and not a digit bound, because
+/// `Schedule::step` is a function of the index alone and cannot tell a digit
+/// from a point. Which is why [`read`] counts the digits itself — the same
+/// division of labour "at most one decimal point" needs.
+const STRUCTURAL_TOKENS: usize = 3;
 
 /// The literal prefilled after the prompt: the answer's opening, which
 /// costs prompt tokens instead of a decode round each.
@@ -94,6 +110,9 @@ pub struct Plan {
     point: TokenId,
     sign: TokenId,
     terminator: TokenId,
+    /// The most digits the prompt asked for, which the schedule cannot
+    /// enforce and [`read`] therefore does.
+    max_digits: usize,
 }
 
 /// Build the plan for a scalar of at most `digits` digits.
@@ -124,6 +143,7 @@ pub fn plan(
     let sign = one(SIGN)?;
     let terminator = one(TERMINATOR)?;
     let prefix = encode(PREFIX).ok_or_else(|| PlanError::Unencodable(PREFIX.to_owned()))?;
+    let max_digits = digits as usize;
 
     // Step 0 opens the number: a digit, or the sign before one. Neither the
     // point nor the terminator belongs there — `{"value":.5}` and
@@ -136,13 +156,15 @@ pub fn plan(
     rest.push(terminator);
 
     let mut steps = vec![opening];
-    // `digits` digits, plus room for the point and the sign, so a caller who
-    // asks for six digits can actually spell `-12.3456`.
-    steps.resize(digits as usize + 2, rest);
+    // Room for the digits *and* the structure, so a caller who asks for six
+    // digits can spell `-12.3456` and still draw the brace that closes it.
+    // With one token less, a full-width negative decimal could never
+    // terminate and would always land at the cap.
+    steps.resize(digits as usize + STRUCTURAL_TOKENS, rest);
     let schedule = Schedule::new(steps)
         .and_then(|schedule| schedule.ending_on(terminator))
         .map_err(PlanError::Schedule)?;
-    Ok(Plan { prefix, schedule, digit_tokens, point, sign, terminator })
+    Ok(Plan { prefix, schedule, digit_tokens, point, sign, terminator, max_digits })
 }
 
 /// One scalar read out of a finished run.
@@ -181,6 +203,13 @@ pub enum ReadError {
     /// The tokens are not a number: two points, a trailing point, a sign
     /// with nothing after it, or nothing at all.
     Malformed(String),
+    /// More digits than the question asked for.
+    ///
+    /// Its own variant rather than a [`ReadError::Malformed`] because the
+    /// run *is* a number — it is the wrong number, longer than the ceiling
+    /// the prompt declared, and a caller reading "not a number" would look
+    /// for the fault in the wrong place.
+    TooManyDigits { wrote: usize, asked: usize },
 }
 
 impl std::fmt::Display for ReadError {
@@ -197,15 +226,25 @@ impl std::fmt::Display for ReadError {
             Self::Malformed(text) => {
                 write!(f, "the run spells {text:?}, which is not a number")
             }
+            Self::TooManyDigits { wrote, asked } => write!(
+                f,
+                "the run spells {wrote} digits where the question allowed {asked}: a schedule bounds tokens and cannot tell a digit from a point, so the count is checked when the run is read"
+            ),
         }
     }
 }
 
 /// Read a finished run as a scalar.
 ///
-/// `at_cap` says whether the run spent its whole schedule — the second row
-/// of the module's table. Without it a short run and a complete one are the
-/// same length of digits and only the caller knows which happened.
+/// Which of the module's three outcomes this was is read off the run
+/// itself: the terminator if it is there, otherwise the schedule's length
+/// against the run's. Nothing else has to be passed in.
+///
+/// This is also where the **digit count** the prompt asked for is enforced.
+/// The schedule bounds *tokens*, since a step cannot tell a digit from a
+/// point, so a run may legally spell more digits than were asked for — and
+/// a `digits: 1` question answering `123` would be the endpoint agreeing
+/// with itself about a ceiling neither half meant.
 pub fn read(plan: &Plan, drawn: &[Draw]) -> Result<Reading, ReadError> {
     let mut text = String::with_capacity(drawn.len());
     let mut digits = Vec::with_capacity(drawn.len());
@@ -234,6 +273,9 @@ pub fn read(plan: &Plan, drawn: &[Draw]) -> Result<Reading, ReadError> {
     // Row three of the table: no terminator and the schedule not spent.
     if !terminated && drawn.len() < plan.schedule.len() {
         return Err(ReadError::CutShort);
+    }
+    if digits.len() > plan.max_digits {
+        return Err(ReadError::TooManyDigits { wrote: digits.len(), asked: plan.max_digits });
     }
     // `f64::from_str` is not the well-formedness check it looks like: it
     // accepts `3.` and would report a trailing point as the number 3,
@@ -360,11 +402,18 @@ mod tests {
         let plan = plan(6, &per_character).expect("a plan");
         let reading = read(
             &plan,
-            &[draw('-', 0.9), draw('0', 1.0), draw('.', 1.0), draw('2', 0.8), draw('}', 1.0)],
+            &[
+                draw('-', 0.9),
+                draw('0', 1.0),
+                draw('.', 1.0),
+                draw('2', 0.8),
+                draw('5', 1.0),
+                draw('}', 1.0),
+            ],
         )
         .expect("a number");
-        assert_eq!(reading.value, -0.2);
-        assert_eq!(reading.text, "-0.2");
+        assert_eq!(reading.value, -0.25);
+        assert_eq!(reading.text, "-0.25");
         // The sign is not a digit and carries no place, so only the `2`'s
         // doubt counts, at a tenth.
         // A probability is an `f32`, so 0.8 is 0.800000011920929 and a
@@ -372,15 +421,45 @@ mod tests {
         assert!((reading.uncertainty - 0.02).abs() < 1e-6, "{}", reading.uncertainty);
     }
 
+    /// A well-formed answer can always close itself, because the schedule
+    /// leaves room for the sign, the point *and* the brace. So a run that
+    /// closed early with its schedule unspent is the ordinary case and not
+    /// a short one.
     #[test]
-    fn a_run_that_spends_its_schedule_without_closing_is_a_number_at_the_cap() {
+    fn a_closed_run_with_steps_to_spare_is_the_ordinary_case() {
+        let plan = plan(2, &per_character).expect("a plan");
+        let drawn: Vec<Draw> = "-1.5}".chars().map(|c| draw(c, 1.0)).collect();
+        assert!(drawn.len() <= plan.schedule.len(), "the widest well-formed run still fits");
+        let reading = read(&plan, &drawn).expect("a closed run");
+        assert_eq!(reading.value, -1.5);
+        assert_eq!(reading.digits.len(), 2, "the sign, the point and the brace are not digits");
+    }
+
+    /// The other side of that: spending the whole schedule without closing
+    /// means at least one digit past the ceiling, so the third row of the
+    /// module's table is always an error and never an answer.
+    #[test]
+    fn spending_the_whole_schedule_without_closing_is_always_too_many_digits() {
+        let plan = plan(2, &per_character).expect("a plan");
+        let drawn: Vec<Draw> = "-1.55".chars().map(|c| draw(c, 1.0)).collect();
+        assert_eq!(drawn.len(), plan.schedule.len(), "it spent every step");
+        match read(&plan, &drawn) {
+            Err(ReadError::TooManyDigits { wrote: 3, asked: 2 }) => {}
+            other => panic!("a two-digit question wrote three: {other:?}"),
+        }
+    }
+
+    /// The schedule bounds tokens and cannot tell a digit from a point, so
+    /// a run may spell more digits than the prompt asked for. The reader is
+    /// what makes `digits` mean anything.
+    #[test]
+    fn more_digits_than_the_question_allowed_is_refused() {
         let plan = plan(1, &per_character).expect("a plan");
-        // Three steps for one digit: the digit, and room for a point and a
-        // brace the model did not use.
-        let drawn: Vec<Draw> = "123".chars().map(|c| draw(c, 1.0)).collect();
-        assert_eq!(drawn.len(), plan.schedule.len());
-        let reading = read(&plan, &drawn).expect("at the cap is not an error");
-        assert_eq!(reading.value, 123.0);
+        let drawn: Vec<Draw> = "123}".chars().map(|c| draw(c, 1.0)).collect();
+        match read(&plan, &drawn) {
+            Err(ReadError::TooManyDigits { wrote: 3, asked: 1 }) => {}
+            other => panic!("a one-digit question answered 123: {other:?}"),
+        }
     }
 
     #[test]

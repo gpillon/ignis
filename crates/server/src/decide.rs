@@ -1388,6 +1388,11 @@ pub fn constrained_answer_for(
             Err(error @ crate::scalar::ReadError::Malformed(_)) => {
                 failed("malformed_scalar", error.to_string())
             }
+            // Its own code: the run *is* a number, and a caller told it was
+            // malformed would look for the fault in the wrong place.
+            Err(error @ crate::scalar::ReadError::TooManyDigits { .. }) => {
+                failed("too_many_digits", error.to_string())
+            }
         };
     }
     let Some(plan) = &question.plan else {
@@ -1783,11 +1788,14 @@ fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) 
         .iter()
         .filter_map(|question| match answers.get(&question.id) {
             None | Some(Answer::Error { .. }) => None,
-            Some(Answer::Scalar { text, .. }) => {
+            // No fallback when the plan is missing: that state cannot
+            // happen — a scalar answer comes from a scalar plan — and a
+            // fallback would make it bill like an at-cap run instead of
+            // being visible.
+            Some(Answer::Scalar { text, .. }) => question.scalar.as_ref().map(|plan| {
                 let written = text.chars().count();
-                let cap = question.scalar.as_ref().map_or(written, |plan| plan.schedule.len());
-                Some(written + usize::from(written < cap))
-            }
+                written + usize::from(written < plan.schedule.len())
+            }),
             _ => question.plan.as_ref().map(|plan| plan.schedule.len()),
         })
         .fold(0u32, |total, tokens| {

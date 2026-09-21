@@ -43,7 +43,10 @@ at the first digit, after which every later digit follows at p ≈ 1.
 2. `point_system(3)` and `box_system` are byte-identical to before.
 3. On the GPU, over four truths of one, two and three digits, **every width
    that can hold the value reads it exactly** — 21 of 21, against 11 of 21
-   before the clause.
+   before the clause. Only the after-walk is committed: the probe overwrites
+   its own output and the before-run's file was gone by the time the fix was
+   confirmed, so the 11/21 half lives in the finding's table and not in
+   `.scratch/`.
 4. A width narrower than the value truncates. That is the only thing a
    narrower field can do and it is not a fault to fix.
 5. `uncertainty` does not count the padding. A leading zero on a `number` is

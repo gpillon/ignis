@@ -56,8 +56,11 @@ use serde::{Deserialize, Serialize};
 /// rendered one way or the other, and nothing named which.
 ///
 /// [`number_system`] names it now, and the ambiguity goes with it: 11 of 21
-/// widths correct before that sentence, 21 of 21 after, with the padding
-/// zeros going from contested (p = 0.48-0.91) to certain (0.92-1.00). The
+/// widths correct before that sentence, 21 of 21 after. The padding zeros
+/// grow more certain with it but not uniformly so — ten of them are still
+/// under 0.95 in the committed walk, the lowest at 0.514 — and that is not
+/// the signal anyway, because what the clause settles is *which end* gets
+/// padded and not how sure the model is of a zero. The
 /// old tell — a first digit falling to 0.65-0.71 — was a symptom of the
 /// alignment being contested and not of the width being wrong, which is why
 /// it never fired on the `300` that started this
@@ -189,16 +192,8 @@ pub struct Plan {
     pub axes: Vec<Axis>,
     /// The ten digit tokens, indexed by the digit they spell.
     pub digit_tokens: [TokenId; 10],
-    /// Whether this plan's prompt told the model to **pad on the left**
-    /// (GitHub #254), and so whether a leading zero is padding or a digit.
-    ///
-    /// True for a `number`, whose width is a field: `number_system` asks for
-    /// the value right-aligned, so an opening zero is one the model was told
-    /// to write and its uncertainty is not the answer's. False for a `point`
-    /// and a `box`, whose width is the **scale**: `x` of 031 is a coordinate
-    /// in the first hundred, the hundreds zero is a choice the model made,
-    /// and dropping its uncertainty would hide exactly the digit the
-    /// pointing finding reports both of its misses on.
+    /// Copied from [`Layout::left_padded`], which is where the rule and its
+    /// reasoning live.
     pub left_padded: bool,
 }
 
@@ -456,6 +451,20 @@ mod tests {
     /// `crates/server/tests/classify_pointing_gpu.rs` rather than retyped.
     const MEASURED: &str = "You are given a screenshot and an instruction. Answer with the position on the screen the instruction refers to. Use a 0-999 scale on each axis, where x=0 is the left edge, x=999 the right edge, y=0 the top edge and y=999 the bottom edge. Reply with only a JSON object of the form {\"x\":NNN,\"y\":NNN}, three digits each.";
 
+    /// GitHub #254 changed `number_system` and nothing else. `point_system`
+    /// has the test above; this is `box_system`'s, so that a later edit to
+    /// one of the three texts cannot quietly reach a second.
+    #[test]
+    fn the_spatial_prompts_declare_a_scale_and_never_an_alignment() {
+        for text in [point_system(DEFAULT_DIGITS), box_system(DEFAULT_DIGITS)] {
+            assert!(text.contains("0-999 scale on each axis"), "{text}");
+            assert!(
+                !text.contains("padded on the left"),
+                "a coordinate fills its field, so the clause #254 added to `number` would be                  an instruction about a case that cannot arise: {text}"
+            );
+        }
+    }
+
     #[test]
     fn the_measured_prompt_is_the_prompt_that_ships() {
         assert_eq!(
@@ -550,7 +559,7 @@ mod tests {
         assert_eq!(reading.value, 3);
         assert!(
             reading.sigma < 0.01,
-            "the hundreds zero is padding the model was told to write, and counting it              reported 3 ± 2.2 on an answer nothing was unsure of: {}",
+            "the hundreds zero is padding the model was told to write, and counting it              reported 3 +- 2.2 on an answer nothing was unsure of: {}",
             reading.sigma
         );
         // The trace still carries them: a reader wants to see the padding,

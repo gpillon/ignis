@@ -25,7 +25,19 @@ The prefix `{"value":` is prompt, as it is for `number`. Then:
 | step | permitted |
 |---|---|
 | 0 | the ten digits, and `-` |
-| 1 .. K-1 | the ten digits, `.`, and `}` |
+| 1 .. K+2 | the ten digits, `.`, and `}` |
+
+The schedule is `K + 3` steps, not `K`, because it bounds **tokens** and the
+answer spends three of them on structure: a sign, a point, and the brace. One
+step fewer and `-12.3456` could never draw its terminator and would always
+land at the cap.
+
+That bound is not the digit count, and a step cannot tell a digit from a
+point, so a `digits: 1` question could legally spell `123`. **The reader
+enforces the count the prompt asked for** — the same division of labour the
+decimal point needs, and the refusal is its own code (`too_many_digits`)
+rather than `malformed_scalar`, because the run *is* a number and a caller
+told otherwise would look for the fault in the wrong place.
 
 `}` = 92, `.` = 13, `-` = 12 in the served 27B's tokenizer, each one token, and
 no `.5`, `-3` or `0.` exists to compete with them — verified at load, never
@@ -39,7 +51,7 @@ run. Refused and never repaired — a scalar read off a malformed run is a
 wrong answer wearing the shape of a right one, which is the same reason
 `run_cut_short` exists.
 
-## Three ways a run ends, and only one of them is an error
+## Three ways a run ends, and only one of them answers
 
 The signal is the **last token**, not the length. This table is the whole
 contract:
@@ -47,11 +59,17 @@ contract:
 | run | reading |
 |---|---|
 | ends with `}` | **terminated** — the number is what precedes it |
-| schedule exhausted, no `}` | **at the cap** — K digits exactly, a valid answer |
-| ends without `}`, shorter than K | **truncated** — the engine cut it off, an error |
+| no `}`, schedule unspent | **truncated** — the engine cut it off, an error |
+| no `}`, schedule spent | **past the ceiling** — `too_many_digits`, an error |
 
-Today's `run_cut_short` fires on the second row as well, because length is all
-it has. It must not.
+The third row follows from the schedule leaving room for every structural
+token: a well-formed answer can always close itself, so a run that spent the
+whole schedule instead wrote at least one digit past its ceiling. "At the cap"
+is a valid outcome for `number`, whose field has no terminator to miss, and
+not for this.
+
+Today's `run_cut_short` fires on length alone and would claim both of the
+last two rows. It must name them apart.
 
 ## The prompt
 
@@ -87,8 +105,9 @@ nothing: the first two are structure and the third is the end.
 1. A schedule whose step permits a terminator ends the run when that token is
    drawn, with `FinishReason::Stop`, and the token is counted in
    `usage.output_tokens` — it was generated.
-2. A run that reaches the cap without a terminator is a **valid** answer of K
-   digits, not `run_cut_short`.
+2. A run that spells more digits than the question allowed is
+   `too_many_digits` — never a number, and never `run_cut_short`. A run that
+   closed itself with steps to spare is the ordinary case, not a short one.
 3. A run the engine cut short is still an error.
 4. `{"value":3}` answers `3` in **two** rounds where `number` at six digits
    spends six.

@@ -81,11 +81,18 @@ consequence of that one gap rather than of anything about numbers.
 **The cost is that a short run stops being self-evidently a fault.** Until
 now, a run shorter than its schedule was an engine that cut it off, and the
 refusal protecting against a place-weighted sum over half a number was simply
-a length check. With a terminator there are three outcomes and only one is an
-error, told apart by the **last token** and never by the length: ended on the
-terminator (complete), spent its schedule without one (at the cap, complete),
-or stopped without one and short (cut off). A reader that kept the length
-check would refuse every correct short answer.
+a length check. With a terminator there are three outcomes and only one of them
+answers, told apart by the **last token** and never by the length: ended on
+the terminator (complete), stopped without one with steps left (cut off), or
+spent the whole schedule without one. A reader that kept the length check
+would refuse every correct short answer.
+
+The third outcome is worth stating because it is not the obvious one. The
+schedule leaves room for the sign, the point *and* the brace, so a well-formed
+answer can always close itself — which means a run that spent every step
+instead wrote at least one digit past the ceiling the prompt declared. "At the
+cap" is a valid answer for `number`, whose field has no terminator to miss,
+and is always an error here.
 
 **A static schedule cannot spell every rule it needs.** `Schedule::step` is a
 function of the index alone, so "at most one decimal point" is not
@@ -124,10 +131,9 @@ the permitted set independent of what was drawn.
 - The terminator was measured on `scalar` alone. Whether letting `number`
   end early would be better than its fixed field is untested, and would
   change a primitive whose numbers exist.
-- Nothing has measured a scalar whose answer genuinely needs all six digits,
-  where the run reaches the cap and the brace is never drawn. The path is
-  tested on CPU and is the second row of the table, but no live row has
-  exercised it.
+- Nothing has measured a scalar whose answer genuinely needs all six digits.
+  The schedule can spell it and close it, and the CPU tests cover the shape,
+  but no live row has written one.
 
 ## Follow-ups
 

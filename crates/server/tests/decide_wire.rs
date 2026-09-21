@@ -1015,12 +1015,15 @@ fn only_a_run_the_engine_cut_short_is_an_error() {
     let ids = |text: &str| encoder(text).expect("encodable")[0];
     let draw = |text: &str| ignis_core::constrained::Draw { token: ids(text), probability: 1.0 };
 
-    // Spent its schedule without closing: a number at the cap, not a fault.
-    let at_cap = [draw("1"), draw("2"), draw("3")];
-    assert!(
-        matches!(constrained_answer_for(&prepared[0], &at_cap, None), Answer::Scalar { .. }),
-        "a run that reached its ceiling answered"
-    );
+    // Spent its schedule without closing. A well-formed answer could have
+    // closed itself — the schedule has room for the sign, the point and the
+    // brace — so this one wrote past its ceiling, and it is named as that
+    // rather than as a number or as a cut-off run.
+    let over = [draw("1"), draw("2"), draw("3"), draw("4")];
+    let Answer::Error { code, .. } = constrained_answer_for(&prepared[0], &over, None) else {
+        panic!("a one-digit question cannot answer 1234");
+    };
+    assert_eq!(code, "too_many_digits");
 
     // Stopped without closing and short: the engine cut it off.
     let Answer::Error { code, .. } = constrained_answer_for(&prepared[0], &[draw("1")], None)
