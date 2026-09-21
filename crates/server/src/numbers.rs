@@ -39,23 +39,33 @@ use serde::{Deserialize, Serialize};
 /// The ceiling is not physics; it is the point past which the extra rounds
 /// buy nothing but a longer-looking number.
 ///
-/// **The width is part of the question, not formatting.** On a bare
-/// [`number`](number_system) the model writes its answer left-aligned and
-/// fills the leftover step with a zero, so a width of exactly *one* more
-/// than the value's own digits multiplies the answer by ten: 7 comes back
-/// 70, 42 comes back 420, 230 comes back 2300. Two or more past it and the
-/// model pads on the left instead and the answer is right again; below it,
-/// the number is truncated, which is the only thing a narrower field could
-/// do. Measured on a live server in
-/// `docs/findings/2026-09-20-number-width-and-decide-e2e.md`, along with the
-/// tell: the **first** digit's probability drops to 0.65-0.71 in the broken
-/// case against 0.94-1.00 when the width fits.
+/// **The width is a field, and any field that holds the value works**
+/// (GitHub #254). A narrower one truncates, which is the only thing a
+/// narrower field could do; there is nothing else to steer around.
 ///
-/// So a caller who knows the magnitude states it exactly, and one who does
-/// not leaves at least two digits of headroom — never exactly one. A
-/// declared `min`/`max` would make this a consequence of the range rather
-/// than a caller's guess; spec 06 leaves that open until somebody measures
-/// whether the model obeys a range other than 0-999.
+/// This used to say something else, and the something else was wrong. It
+/// read that the model left-aligns, so a width of exactly one more than the
+/// value's own digits multiplies the answer by ten while two or more pads on
+/// the left and is safe again. Measured across four truths at all six
+/// widths, that rule fails on every one of them: 47 is right at four digits
+/// and comes back 4700 at five, 3 comes back 300 at three. What the model
+/// was doing was **choosing** an alignment, at the first digit, because
+/// [`number_system`] declared a width and said nothing about which end to
+/// pad. The schedule forces exactly K digits and carries no way to say the
+/// number is finished, so a value narrower than its field can only be
+/// rendered one way or the other, and nothing named which.
+///
+/// [`number_system`] names it now, and the ambiguity goes with it: 11 of 21
+/// widths correct before that sentence, 21 of 21 after, with the padding
+/// zeros going from contested (p = 0.48-0.91) to certain (0.92-1.00). The
+/// old tell — a first digit falling to 0.65-0.71 — was a symptom of the
+/// alignment being contested and not of the width being wrong, which is why
+/// it never fired on the `300` that started this
+/// (`docs/findings/2026-09-21-the-number-prompt-declares-an-alignment.md`).
+///
+/// A declared `min`/`max` would make the width a consequence of the range
+/// rather than a caller's guess; spec 06 leaves that open until somebody
+/// measures whether the model obeys a range other than 0-999.
 pub const DIGITS: Range<u32> = 1..7;
 
 /// Digits per axis when the caller names none: the measured width.
@@ -109,6 +119,11 @@ pub fn box_system(digits: u32) -> String {
 
 /// The system text a **number** question is put under.
 ///
+/// **The alignment clause is load-bearing, not tidiness** (GitHub #254).
+/// Without it the model picks an end to pad at the first digit and is wrong
+/// on half the widths that could hold the answer; with it, every width that
+/// fits is right. [`DIGITS`] has what that replaced.
+///
 /// **The weakest of the three, and for a sharper reason than `box`:**
 /// `point`'s accuracy rests on 0-999 being the scale this model already
 /// thinks in — the pointing finding establishes that from a free probe with
@@ -116,11 +131,9 @@ pub fn box_system(digits: u32) -> String {
 /// model's own only by coincidence, and whether it *obeys* a declared range
 /// is an open follow-up in that same finding.
 ///
-/// What has been measured is the failure mode, and it is in [`DIGITS`]: the
-/// width has to match the value or clear it by two, because the model
-/// left-aligns. Its arithmetic is also not to be leaned on — asked for a
-/// total it has to compute, it answered 172 for 230.50 — though it said so,
-/// with a first digit at p=0.63 and a sigma of 46.7. The mechanism is
+/// Its arithmetic is also not to be leaned on — asked for a total it has to
+/// compute, it answered 172 for 230.50 — though it said so, with a first
+/// digit at p=0.63 and a sigma of 46.7. The mechanism is
 /// exposed plainly because it is the primitive the other two are made of;
 /// `point`'s numbers are `point`'s and do not transfer.
 pub fn number_system(digits: u32) -> String {
@@ -128,7 +141,7 @@ pub fn number_system(digits: u32) -> String {
     format!(
         "Apply the supplied instruction to the supplied evidence and answer with a single whole \
          number from 0 to {max}. Reply with only a JSON object of the form {{\"value\":{}}}, {} \
-         digits.",
+         digits, right-aligned and padded on the left with zeros.",
         "N".repeat(digits as usize),
         spelled(digits)
     )
@@ -381,6 +394,23 @@ mod tests {
              width; at three digits it must change nothing, or this endpoint's \
              accuracy figures are about a prompt it does not send"
         );
+    }
+
+    /// The alignment clause is the fix for GitHub #254 and it is the whole
+    /// fix: there is no code path that pads, only a prompt that says which
+    /// end to pad. So it is pinned the way `point_system`'s text is pinned,
+    /// at every width, because a reword that dropped it would put the
+    /// endpoint back to answering 300 for a truth of 3 with nothing failing.
+    #[test]
+    fn every_width_tells_the_model_which_end_to_pad() {
+        for digits in DIGITS {
+            let text = number_system(digits);
+            assert!(
+                text.contains("right-aligned and padded on the left with zeros"),
+                "{digits} digits: {text}"
+            );
+            assert!(text.contains(&format!("0 to {}", scale(digits))), "{text}");
+        }
     }
 
     /// A stand-in tokenizer: one token per character, ids offset so a digit

@@ -9,6 +9,13 @@
   `2026-09-19-typed-option-logit-readout.md`, `crates/server/src/numbers.rs`,
   GitHub #240 (fan-out), #242 (number/point/box)
 - Superseded by: none
+- **Corrected 2026-09-21 (#254)**: the width rule below — that a width two or
+  more past the value's own makes the model pad on the left and is safe — does
+  not hold. Walked at every width on four truths, 47 comes back 4700 at five
+  digits and 3 comes back 300 at three. The cause was an alignment the prompt
+  never named, and `number_system` names it now; see
+  [the number prompt declares an alignment](2026-09-21-the-number-prompt-declares-an-alignment.md).
+  Everything else here stands.
 
 ## Question
 
