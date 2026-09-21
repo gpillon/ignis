@@ -357,7 +357,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Ordered<T> {
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/decide` — Jev's `POST /v1/systemone` body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct DecideRequest {
     /// The content to evaluate: a string, a JSON object or array, **or**
     /// OpenAI content parts, so the evidence may be an image. The content
@@ -366,12 +366,18 @@ pub struct DecideRequest {
     ///
     /// [`OrderedValue`] and not `JsonValue`, because an object's key order is
     /// part of what the model reads and `serde_json::Map` would sort it away.
+    /// That order is a real property of this endpoint and one JSON Schema
+    /// cannot express: the document can say "any JSON", not "read in the
+    /// order you wrote it".
+    #[schema(value_type = serde_json::Value)]
     pub state: OrderedValue,
     /// The model to route to; the loaded model when absent or blank.
     #[serde(default)]
     pub model: Option<String>,
     /// The typed questions, keyed by ids the caller chooses. Answers come
-    /// back under the same ids.
+    /// back under the same ids, and the questions are asked in the order
+    /// they were written (which the schema below cannot state).
+    #[schema(value_type = std::collections::BTreeMap<String, Question>)]
     pub questions: Ordered<Question>,
     /// The thinking controls, in every shape this server documents them
     /// (GitHub #68): the top-level field, the effort level that implies
@@ -397,19 +403,24 @@ pub struct DecideRequest {
 /// `instructions` and `criteria` are Jev's field names. `question` and
 /// `options` are what we would have called them, and are accepted as
 /// aliases for exactly that reason — they are not a second shape.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct Question {
     /// `noul`, `choice` or `score`.
     #[serde(rename = "type")]
     pub kind: QuestionKind,
     /// What the model should decide. A string, object or array — anything
     /// but a string is serialized into the prompt as JSON, in the order it
-    /// was written ([`OrderedValue`]).
+    /// was written ([`OrderedValue`]). Also accepted as `question`.
     #[serde(alias = "question")]
+    #[schema(value_type = serde_json::Value)]
     pub instructions: OrderedValue,
     /// The type's own options: absent for a bare `noul`, a map for a
-    /// `choice`, an ordered array for a `score`.
+    /// `choice`, an ordered array for a `score`. A `choice`'s map is read in
+    /// declared order — a different option order is a different prompt — and
+    /// that, too, is outside what a schema can say. Also accepted as
+    /// `options`.
     #[serde(default, alias = "options")]
+    #[schema(value_type = Option<serde_json::Value>)]
     pub criteria: Option<Criteria>,
     /// Digits per axis for a `number`, `point` or `box` (GitHub #242);
     /// [`crate::numbers::DEFAULT_DIGITS`] when absent, and refused outside
@@ -518,7 +529,7 @@ impl<'de> Deserialize<'de> for Criteria {
 
 /// The six primitives: Jev's three, which read one position, and the three
 /// that **generate** one digit at a time (GitHub #242).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionKind {
     /// A yes/no question, answered with the probability of yes.
@@ -1158,7 +1169,7 @@ impl Evidence {
 // ---------------------------------------------------------------------------
 
 /// The response body.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct DecideResponse {
     /// The model that performed the evaluation.
     pub model: String,
@@ -1171,14 +1182,14 @@ pub struct DecideResponse {
 }
 
 /// The prompt's cost, and the absence of any other.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
 
 /// One question's answer, or the error that stands in its place.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
     /// A yes/no answer: the probability of the true option, 0 (no) to 1
@@ -1434,6 +1445,30 @@ pub fn score_confidence(probabilities: &[f64]) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/decide`, and `POST /v1/systemone` under its Jev name.
+#[utoipa::path(
+    post,
+    path = "/v1/decide",
+    tag = "decide",
+    operation_id = "decide",
+    summary = "A typed decision, read rather than generated",
+    description = "Evaluates `state` against typed `questions` and answers each one from the model's own readout at a single position (ADR 0034): the decision is read out of the forward pass, not generated, so `usage.output_tokens` is 0 for the readout kinds.
+
+Six primitives. `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them), `score` (a probability-weighted value across ordered levels, which can land between them), and -- generated a digit at a time under a constrained decode -- `number`, `point` and `box`, the last two in the submitted image's own pixels.
+
+Every fault a caller can commit refuses the whole request with a 422 before the first submit: a caller never pays a prefill for nineteen good questions and a refusal on the twentieth. Only an engine fault lands per-answer, as an `error` answer beside its siblings.
+
+Thinking is refused rather than ignored: a decision's prompt ends exactly where its answer is read, and a thinking prompt would put an open reasoning block at that position.
+
+`POST /v1/systemone` is the same handler under Jev's name.",
+    request_body = DecideRequest,
+    responses(
+        (status = 200, description = "One answer per question, under the ids the caller chose.", body = DecideResponse),
+        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = crate::api::ApiError),
+        (status = 422, description = "The body does not parse, or a question is malformed, or the request asked for something this endpoint cannot honour (thinking, an unnameable option, an image on a text-only load). Nothing reached the engine.",
+            body = crate::api::ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = crate::api::ApiError),
+    ),
+)]
 pub async fn decide(
     axum::extract::State(server): axum::extract::State<std::sync::Arc<crate::Server>>,
     body: Result<axum::Json<DecideRequest>, axum::extract::rejection::JsonRejection>,

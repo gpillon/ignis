@@ -1,6 +1,6 @@
 # 01 — The `/v1` surface documents itself: OpenAPI + Swagger UI
 
-GitHub: (master issue, filed by `/to-tickets`)
+GitHub: #250
 
 ## Problem Statement
 
@@ -105,14 +105,25 @@ actually serves:
 
 ## Implementation Decisions
 
-**Generator.** `utoipa` 5 for the derives, `utoipa-axum` 0.2 for the
-router bindings, `utoipa-swagger-ui` 9 for the page. All three carry
-`axum` 0.8, the version already in the workspace. `utoipa-swagger-ui` is
-taken with `features = ["axum", "vendored"]`: the `vendored` feature pulls
-the Swagger UI distribution from `utoipa-swagger-ui-vendored` on crates.io
-instead of downloading a zip in its build script, which is what keeps the
-container build (ADR 0032) offline and reproducible. Cost: roughly 2–3 MB
-of binary, paid once.
+**Generator.** `utoipa` 5 for the derives and `utoipa-axum` 0.2 for the
+router bindings; both carry `axum` 0.8, the version already in the
+workspace, and both are pure Rust.
+
+**Departure, found while implementing:** the page does *not* come from
+`utoipa-swagger-ui`. That crate embeds Swagger UI through `rust-embed`,
+whose proc macro pulls `walkdir → winapi-util → windows-sys 0.59`, and
+`windows-sys` 0.59 builds its raw-dylib imports with `dlltool` — which the
+`x86_64-pc-windows-gnu` **host** toolchain of this project's dev machine
+cannot run (`rust-mingw` ships `dlltool.exe` without the binutils it
+calls). It is a host dependency, so the MSVC target pin in
+`.cargo/config.toml` does not avoid it: `cargo check -p ignis-server`
+fails outright, with or without the crate's `vendored` feature. Instead
+the two files that matter (`swagger-ui-bundle.js`, `swagger-ui.css`, plus
+the licence and notices) are vendored under
+`crates/server/assets/swagger-ui` and `include_bytes!`-ed, with the page's
+HTML written in `openapi.rs`. Same result — no network at build, none at
+runtime — for the same binary size (~1.8 MB), and it builds with any
+toolchain. See that directory's `IGNIS-VENDOR.md` and ADR 0036.
 
 **The seam.** One seam, in `crates/server/src/api.rs`: the `/v1` routes
 are built through `utoipa_axum::router::OpenApiRouter` with the `routes!()`
@@ -173,8 +184,7 @@ themselves. No `--docs` / `--no-docs` knob until someone asks for one;
 compile-time document; no handler body changes, and no per-request work is
 added.
 
-**ADR.** One short ADR records the two decisions that outlive this
-change: the generated document is the machine-readable contract of the
+**ADR.** ADR 0036 records the decisions that outlive this change: the generated document is the machine-readable contract of the
 `/v1` surface (with `docs/design/ignis-v1.md` §2 staying the narrative),
 and the reference is served without a key even on a keyed server — a
 carve-out from ADR 0028's "an exposed server must not publish its load",
@@ -247,13 +257,14 @@ alone.
 
 ## Further Notes
 
-- Swagger UI is mounted at `/v1/docs` rather than at `/v1` itself on
-  purpose: `SwaggerUi::new("/v1")` would register a catch-all
-  `/v1/{*tail}` for its assets alongside the real `/v1/...` routes. The
-  redirect gives the same "navigate to `/v1`" behaviour with no catch-all
-  next to the inference routes.
-- `utoipa-swagger-ui` 9 has a `cache` feature that writes into the user's
-  dirs at build time. It is not taken.
+- The page is mounted at `/v1/docs` rather than at `/v1` itself on
+  purpose: serving it at `/v1` would put its assets on a catch-all
+  alongside the real `/v1/...` routes. The redirect gives the same
+  "navigate to `/v1`" behaviour with no catch-all next to the inference
+  routes. The assets are looked up by exact name, so no request path
+  reaches outside the table.
+- Updating Swagger UI is a manual `npm pack swagger-ui-dist@<version>`
+  copy, written down in the vendored directory's `IGNIS-VENDOR.md`.
 - The version in the document comes from `CARGO_PKG_VERSION`, so it
   follows the four-file version bump already in the release routine.
 - Repo formatting rule stands: the diff is attributes and new files, and

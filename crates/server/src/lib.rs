@@ -33,6 +33,7 @@ pub mod media;
 pub mod metrics;
 pub mod playground;
 pub mod numbers;
+pub mod openapi;
 pub mod runtime;
 pub mod telemetry;
 pub mod template;

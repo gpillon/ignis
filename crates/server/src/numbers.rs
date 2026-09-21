@@ -270,7 +270,7 @@ pub fn plan(
 }
 
 /// One digit of an answer, and the model's own confidence in it.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DigitDraw {
     pub digit: u32,
     pub probability: f64,

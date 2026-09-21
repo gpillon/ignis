@@ -437,6 +437,9 @@ a one-line readiness note (`model <id> on http://<bind>`) when ready.
 | `/v1/models` | GET | The loaded model. |
 | `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming. |
 | `/v1/responses` | POST | The OpenAI responses API (non-streaming; `stream: true` → 400). |
+| `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
+| `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN. Open even when `--api-key` is set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |
+| `/v1/openapi.json` | GET | The OpenAPI 3.1 document, generated from the handlers themselves. Monitoring is not in it (ADR 0017). |
 | `/ui/` | GET | The Playground page — only with `--ui`. |
 | `/ui/metrics` | GET | Prometheus text format 0.0.4 for the Playground — only with `--ui` and `--metrics` (ADR 0017). Needs the API key when one is set, like `/v1`. |
 

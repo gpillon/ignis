@@ -26,12 +26,15 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{options, post};
 use axum::{Json, Router};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tower_http::trace::{MakeSpan, TraceLayer};
+use utoipa::{OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use ignis_core::{
     DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent, SubmitError,
@@ -78,26 +81,10 @@ pub const TEXT_REQUEST_BODY_LIMIT: usize = 16 << 20;
 /// emitted from inside the span (including this handler's own tail) gets
 /// the request's real `trace_id` (`ignis_logging::trace_context`).
 pub fn router(state: Arc<Server>) -> Router {
-    let mut router = Router::new()
-        .route("/v1/models", get(list_models).options(cors_preflight))
-        .route(
-            "/v1/chat/completions",
-            post(chat_completions).options(cors_preflight),
-        )
-        .route("/v1/responses", post(responses_api).options(cors_preflight))
-        // GitHub #239 — the decision endpoint, and the Jev name for it so an
-        // unmodified Jev client reaches this server by changing the URL.
-        // Inside the key layer below, like every other `/v1` route.
-        .route(
-            "/v1/decide",
-            post(crate::decide::decide).options(cors_preflight),
-        )
-        .route(
-            "/v1/systemone",
-            post(crate::decide::decide).options(cors_preflight),
-        )
-        // Only the `/v1` routes above: the Playground's static pages stay
-        // reachable without a key.
+    let (v1, document) = v1_parts();
+    let mut router = v1
+        // Only the `/v1` routes above: the Playground's static pages, and
+        // the API reference merged below, stay reachable without a key.
         .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key));
     // The body cap, enforced before JSON parsing: wider with `--vision`,
     // which takes images inline as base64 data URIs (GitHub #179), than for
@@ -126,10 +113,61 @@ pub fn router(state: Arc<Server>) -> Router {
                 .route_layer(middleware::from_fn_with_state(state.clone(), require_api_key)),
         );
     }
+    // The API reference (GitHub #251): `GET /v1` redirects to the Swagger
+    // UI page at `/v1/docs/`, and the document it reads sits at
+    // `/v1/openapi.json`. Merged *after* the key layer above, so a browser
+    // pointed at `/v1` on a keyed server reaches the page rather than a
+    // bare 401 it has no way to answer. Always served: the reference is
+    // part of the `/v1` surface, not of the opt-in Playground.
+    router = router.merge(crate::openapi::router(document));
     router
         .layer(middleware::from_fn(cors_headers))
         .layer(TraceLayer::new_for_http().make_span_with(RootSpanMaker))
         .with_state(state)
+}
+
+/// The `/v1` handler routes and the document they generated, built in the
+/// one place (GitHub #251).
+///
+/// This is the seam that keeps the reference honest: `routes!` registers a
+/// handler *and* its `#[utoipa::path]` entry in the same call, so a route
+/// cannot exist without its documentation entry, nor an entry without its
+/// route. `crates/server/tests/openapi_http.rs` asserts the resulting path
+/// set, which is what fails when a new route is added by `.route()` alone.
+///
+/// `OPTIONS` is attached per path rather than through `routes!`: a CORS
+/// preflight is a browser mechanism, not an operation a client calls, and
+/// documenting it would put five meaningless entries in the document.
+fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
+    OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
+        .routes(routes!(list_models))
+        .routes(routes!(chat_completions))
+        .routes(routes!(responses_api))
+        // GitHub #239 — the decision endpoint, and the Jev name for it so an
+        // unmodified Jev client reaches this server by changing the URL.
+        // The alias is a `route`, not a `routes!`: it is the same handler
+        // under a second name, and OpenAPI has no notion of an alias, so
+        // listing it would duplicate every schema reference under it. The
+        // `/v1/decide` description names it instead.
+        .routes(routes!(crate::decide::decide))
+        .route(
+            "/v1/systemone",
+            post(crate::decide::decide).options(cors_preflight),
+        )
+        .route("/v1/models", options(cors_preflight))
+        .route("/v1/chat/completions", options(cors_preflight))
+        .route("/v1/responses", options(cors_preflight))
+        .route("/v1/decide", options(cors_preflight))
+        .split_for_parts()
+}
+
+/// The OpenAPI document this build serves at `/v1/openapi.json`.
+///
+/// Public so the document's own assertions (the path set, the absence of
+/// any monitoring path) can be made against the document itself rather
+/// than through HTTP.
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    v1_parts().1
 }
 
 /// The HTTP-ingress root span's shape: `request_id` is declared `Empty` —
@@ -401,7 +439,7 @@ fn resolve_model_and_class(
 /// The sampling fields accepted by chat completions. Values stay as JSON at
 /// the wire boundary so type, integer-width, and narrowing failures all use
 /// the same OpenAI-shaped sampling error instead of Axum's generic rejection.
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, ToSchema)]
 struct SamplingRequestFields {
     temperature: Option<JsonValue>,
     top_p: Option<JsonValue>,
@@ -876,6 +914,18 @@ fn now() -> u64 {
 // ── GET /v1/models ────────────────────────────────────────────────────────
 
 /// `GET /v1/models` — the loaded model (v1: a single model).
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "models",
+    operation_id = "list_models",
+    summary = "The loaded model",
+    description = "One entry: the model this server loaded, with the context a single request may spend (`max_model_len`, prompt plus completion). A server serves one model.",
+    responses(
+        (status = 200, description = "The loaded model.", body = ModelList),
+        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+    ),
+)]
 async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
     let id = server.engine.model_id();
     Json(ModelList {
@@ -890,14 +940,14 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
 }
 
 /// The models list envelope.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ModelList {
     object: &'static str,
     data: Vec<ModelInfo>,
 }
 
 /// One model entry.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ModelInfo {
     id: String,
     object: &'static str,
@@ -911,7 +961,7 @@ struct ModelInfo {
 
 /// A chat-completions request (OpenAI wire shape; unknown fields are
 /// ignored — serde's default).
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ChatCompletionsRequest {
     model: Option<String>,
     /// The conversation (role + content messages). Must be non-empty.
@@ -952,7 +1002,7 @@ struct ChatCompletionsRequest {
     class: Option<JsonValue>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct StreamOptions {
     #[serde(default)]
     include_usage: bool,
@@ -964,6 +1014,31 @@ struct StreamOptions {
 /// carries its generated tokens) and the handler either collects them into
 /// the single-response JSON (non-streaming) or wraps the stream in the
 /// `chat.completion.chunk` SSE shape (streaming).
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "chat",
+    operation_id = "chat_completions",
+    summary = "A chat completion, streaming or not",
+    description = "The OpenAI chat-completions contract, plus what ignis adds to it: `top_k`, `ignore_eos`, the thinking controls (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs`), and the `class` lane tag the scheduler admits under.
+
+`stream: false` answers one JSON body. `stream: true` answers `text/event-stream`: one `data:` line per chunk in the `chat.completion.chunk` shape, a final chunk carrying `finish_reason` and an empty `delta`, then a literal `data: [DONE]` line. With `stream_options.include_usage: true` a usage-only chunk (empty `choices`) precedes it.
+
+Tool calls come back whole -- one complete `tool_calls` delta per call, never a half-written fragment -- because they are parsed out of a closed block in the generated text.",
+    request_body = ChatCompletionsRequest,
+    responses(
+        (status = 200, description = "The completion. `application/json` when `stream` is false or absent; `text/event-stream` when it is true.", content(
+            (ChatCompletion = "application/json"),
+            (Chunk = "text/event-stream"),
+        )),
+        (status = 400, description = "The request is malformed: an empty `messages`, an unknown role, a sampling parameter out of range, a tool definition this template cannot take.", body = ApiError),
+        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "The request named a model this server has not loaded.", body = ApiError),
+        (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = ApiError),
+        (status = 504, description = "The engine did not finish the request within `--request-timeout`.", body = ApiError),
+    ),
+)]
 async fn chat_completions(
     State(server): State<Arc<Server>>,
     Json(req): Json<ChatCompletionsRequest>,
@@ -1089,7 +1164,7 @@ async fn chat_completions(
 }
 
 /// The non-streaming completion response (OpenAI wire shape).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ChatCompletion {
     id: String,
     object: &'static str,
@@ -1099,14 +1174,14 @@ struct ChatCompletion {
     usage: Usage,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct CompletionChoice {
     index: u8,
     message: AssistantMessage,
     finish_reason: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct AssistantMessage {
     role: &'static str,
     /// The model's thinking trace (GitHub #68) — omitted entirely (not
@@ -1123,14 +1198,14 @@ struct AssistantMessage {
 }
 
 /// One tool call, non-streaming wire shape (OpenAI: `message.tool_calls[]`).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ToolCallOut {
     id: String,
     r#type: &'static str,
     function: FunctionOut,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct FunctionOut {
     name: String,
     /// A JSON-encoded object, e.g. `{"path":"a.txt"}` (never a
@@ -1155,7 +1230,7 @@ impl From<ScannedToolCall> for ToolCallOut {
 
 /// The usage figures (the prompt's templated-token count + the generated
 /// tokens).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -1164,7 +1239,7 @@ struct Usage {
 
 /// One SSE chunk (the `chat.completion.chunk` shape): a token delta or the
 /// final `finish_reason` chunk (an empty `delta`).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct Chunk {
     id: String,
     object: &'static str,
@@ -1175,7 +1250,7 @@ struct Chunk {
     usage: Option<Usage>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ChunkChoice {
     index: u8,
     delta: Delta,
@@ -1184,7 +1259,7 @@ struct ChunkChoice {
 
 /// The token delta. An empty `content`, absent `reasoning_content` and
 /// absent `tool_calls` serialize to `{}` (OpenAI's final chunk shape).
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, ToSchema)]
 struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
@@ -1203,7 +1278,7 @@ struct Delta {
 /// `index` — the field a real agent client's reassembly buffer groups on,
 /// stable across chunks and never reused by two different calls (GitHub
 /// #121 acceptance criterion 2).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ToolCallDelta {
     index: usize,
     id: String,
@@ -1520,7 +1595,7 @@ impl Stream for ChunkStream {
 
 /// A responses-API request (OpenAI wire shape). `input` is a plain string
 /// (a single user turn) or a list of messages.
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct ResponsesRequest {
     input: ResponsesInput,
     model: Option<String>,
@@ -1544,7 +1619,7 @@ struct ResponsesRequest {
 }
 
 /// The responses API's `input` (a string or a message list).
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(untagged)]
 enum ResponsesInput {
     /// A plain string — treated as a single user turn.
@@ -1559,6 +1634,26 @@ enum ResponsesInput {
 /// completion (the same submit / event-stream path); the response is the
 /// responses API's `output`-message shape with the generated text in an
 /// `output_text` content part.
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    tag = "responses",
+    operation_id = "responses",
+    summary = "A response, the responses-API shape",
+    description = "The same engine path as a chat completion, under the responses API's names: `input` (a string or a message list) instead of `messages`, `max_output_tokens` instead of `max_tokens`, and an `output` of messages carrying `output_text` content parts.
+
+Non-streaming in v1: `stream: true` is refused with a 400 rather than answered partially.",
+    request_body = ResponsesRequest,
+    responses(
+        (status = 200, description = "The response.", body = Responses),
+        (status = 400, description = "The request is malformed, or asked for `stream: true`, which this endpoint does not serve in v1.", body = ApiError),
+        (status = 401, description = "The server was started with `--api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "The request named a model this server has not loaded.", body = ApiError),
+        (status = 413, description = "The prompt is longer than this server's `--max-context`.", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted.", body = ApiError),
+        (status = 504, description = "The engine did not finish the request within `--request-timeout`.", body = ApiError),
+    ),
+)]
 async fn responses_api(
     State(server): State<Arc<Server>>,
     Json(req): Json<ResponsesRequest>,
@@ -1671,7 +1766,7 @@ async fn responses_api(
 }
 
 /// The non-streaming responses response (the OpenAI responses API shape).
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct Responses {
     id: String,
     object: &'static str,
@@ -1682,7 +1777,7 @@ struct Responses {
     usage: ResponsesUsage,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ResponseMessage {
     r#type: &'static str,
     id: String,
@@ -1691,14 +1786,17 @@ struct ResponseMessage {
     content: Vec<ResponseContent>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ResponseContent {
     r#type: &'static str,
     text: String,
+    /// Always empty: this server annotates nothing (the field is the
+    /// responses API's, kept so the shape matches).
+    #[schema(value_type = Vec<Object>)]
     annotations: Vec<()>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ResponsesUsage {
     input_tokens: u32,
     output_tokens: u32,
@@ -1707,14 +1805,15 @@ struct ResponsesUsage {
 
 // ── the error envelope ───────────────────────────────────────────────────
 
-/// The OpenAI error body (`{"error": {...}}`).
-#[derive(Serialize)]
-struct ApiError {
+/// The OpenAI error body (`{"error": {...}}`). Every failure on this
+/// surface answers in this shape, `/v1/decide` included.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ApiError {
     error: ErrorBody,
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ErrorBody {
     message: String,
     r#type: String,
     code: String,

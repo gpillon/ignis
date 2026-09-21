@@ -33,7 +33,7 @@ use crate::thinking::{ThinkingCapabilities, ThinkingOptions};
 /// (GitHub #175). The parts are parsed permissively so a malformed or
 /// unknown part reaches [`check_content_parts`] and is refused with a 400
 /// naming it, rather than failing deserialization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ChatMessage {
     /// The message role (`system`, `user`, `assistant`, `tool`, …).
     pub role: String,
@@ -74,7 +74,7 @@ impl ChatMessage {
 }
 
 /// A message's `content`: the plain string, or OpenAI content parts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// The plain-string form.
@@ -149,6 +149,52 @@ impl From<ContentPart> for JsonValue {
             object.insert("type".to_owned(), JsonValue::String(kind));
         }
         JsonValue::Object(object)
+    }
+}
+
+/// The wire shape of a content part, which is not this type's fields:
+/// `#[serde(from = "JsonValue", into = "JsonValue")]` above flattens
+/// `{"type":"image_url","image_url":{"url":...}}` into `kind` + `url` on
+/// the way in and rebuilds it on the way out. A derived schema would
+/// publish the parsed shape and mislead every reader of the document, so
+/// the wire one is stated here.
+impl utoipa::PartialSchema for ContentPart {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ObjectBuilder, SchemaType, Type};
+        let url_object = ObjectBuilder::new()
+            .schema_type(SchemaType::Type(Type::Object))
+            .property(
+                "url",
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .description(Some(
+                        "A `data:` URI carrying base64 bytes, or an `http(s)` URL the                          server fetches.",
+                    )),
+            )
+            .required("url");
+        ObjectBuilder::new()
+            .schema_type(SchemaType::Type(Type::Object))
+            .description(Some(
+                "One OpenAI content part. A `text` part carries `text`; an `image_url`                  part carries an `image_url` object with a `url` (accepted only by a                  server started with `--vision`, else a 400 naming the part).",
+            ))
+            .property(
+                "type",
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .description(Some("`text` or `image_url`.")),
+            )
+            .property(
+                "text",
+                ObjectBuilder::new().schema_type(SchemaType::Type(Type::String)),
+            )
+            .property("image_url", url_object)
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for ContentPart {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ContentPart")
     }
 }
 
@@ -309,7 +355,7 @@ pub fn check_content_parts(messages: &[ChatMessage], vision: bool) -> Result<(),
 /// here (the only tool type this protocol defines), so it is accepted and
 /// ignored the same way `tool_call_id` is on a `role: "tool"` message —
 /// there is nothing to branch on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ToolCallIn {
     /// The call's id (OpenAI `id`), when the client sends one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -320,7 +366,7 @@ pub struct ToolCallIn {
 
 /// A tool call's function half: name + arguments (a JSON-encoded string on
 /// the wire, matching #121's own response shape).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FunctionIn {
     /// The function name.
     pub name: String,
