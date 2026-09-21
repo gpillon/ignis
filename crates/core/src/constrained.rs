@@ -121,7 +121,7 @@ impl Schedule {
     pub fn ending_on(mut self, terminator: TokenId) -> Result<Self, String> {
         if !self.steps.iter().any(|step| step.contains(&terminator)) {
             return Err(format!(
-                "token {terminator} would end this run, but no step permits it,                  so it can never be drawn"
+                "token {terminator} would end this run, but no step permits it, so it can never be drawn"
             ));
         }
         self.terminator = Some(terminator);
