@@ -38,15 +38,11 @@ export const PRIMITIVE_BLURB: Record<Primitive, string> = {
   box: "A rectangle on the image, in its own pixels.",
 };
 
-/** The primitives that generate a token per step, and so cost a round each; the rest read one position. */
-export const CONSTRAINED: Primitive[] = ["number", "scalar", "point", "box"];
-
-export const isConstrained = (kind: Primitive) => CONSTRAINED.includes(kind);
 /**
- * The generated primitives whose `digits` is a **width**: a field for a
- * `number`, an axis scale for a `point` or a `box`. A `scalar`'s `digits` is
- * a ceiling it may close early out of, which is a different field on the
- * question and a different refusal, so it is not one of these.
+ * The primitives whose `digits` is a **width**: a field for a `number`, an
+ * axis scale for a `point` or a `box`. A `scalar` generates as they do, but
+ * its `digits` is a ceiling it may close early out of — a different field on
+ * the question and a different refusal — so it is not one of these.
  */
 export const FIXED_WIDTH: Primitive[] = ["number", "point", "box"];
 export const hasFixedWidth = (kind: Primitive) => FIXED_WIDTH.includes(kind);
@@ -292,8 +288,11 @@ function scoreFaults(question: Question, name: string): Fault[] {
   return faults;
 }
 
+/** The widths `numbers::DIGITS` serves, which a scalar's ceiling shares. */
+const inDigitRange = (digits: number) => Number.isInteger(digits) && digits >= MIN_DIGITS && digits <= MAX_DIGITS;
+
 function digitFaults(question: Question, name: string): Fault[] {
-  if (Number.isInteger(question.digits) && question.digits >= MIN_DIGITS && question.digits <= MAX_DIGITS) return [];
+  if (inDigitRange(question.digits)) return [];
   return [
     {
       code: "digits_out_of_range",
@@ -310,12 +309,11 @@ function digitFaults(question: Question, name: string): Fault[] {
  */
 function ceilingFaults(question: Question, name: string): Fault[] {
   const { ceiling } = question;
-  if (ceiling === null) return [];
-  if (Number.isInteger(ceiling) && ceiling >= MIN_DIGITS && ceiling <= MAX_DIGITS) return [];
+  if (ceiling === null || inDigitRange(ceiling)) return [];
   return [
     {
       code: "digits_out_of_range",
-      message: `${name} allows at most ${ceiling} digits; ${MIN_DIGITS} to ${MAX_DIGITS} is the range served — and for a scalar this is a ceiling, not a width, so leave it empty when you do not know the magnitude.`,
+      message: `${name} allows at most ${ceiling} digits; ${MIN_DIGITS} to ${MAX_DIGITS} is the range served.`,
       uid: question.uid,
     },
   ];

@@ -209,8 +209,11 @@ function NumberBody({ answer }: { answer: Extract<Answer, { type: "number" }> })
  * unless the field it did *not* have to fill is named beside it.
  */
 function ScalarBody({ question, answer }: { question: Question; answer: Extract<Answer, { type: "scalar" }> }) {
-  // The characters it wrote plus the brace that closed the object — which is
-  // exactly what `usage.output_tokens` billed for this question.
+  // What the run spent, read off the spelling: one token per character, plus
+  // the brace that closed the object. The response bills the whole request in
+  // one figure and never per question, so this is derived rather than
+  // reported — and it holds because the alphabet is one token per character,
+  // which `scalar.rs` verifies against the loaded tokenizer at load.
   const rounds = [...answer.text].length + 1;
   const ceiling = question.ceiling ?? MAX_DIGITS;
   return (

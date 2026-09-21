@@ -60,6 +60,25 @@ describe("mockDecide", () => {
     expect(body.usage.output_tokens).toBe(4);
   });
 
+  it("lets a scalar choose its own width under the ceiling, and bills the brace that closed it", () => {
+    const { body } = send({ state: "s", questions: { s: { type: "scalar", instructions: "How many hours?", digits: 4 } } });
+    const answer = body.answers.s as { type: string; value: number; text: string; uncertainty: number; digits: { digit: number }[] };
+    expect(answer.type).toBe("scalar");
+    expect(answer.value).toBe(Number(answer.text));
+    // The trace is the digits alone: the point and the sign were steps of the
+    // run and hold no place.
+    expect(answer.digits.length).toBe(answer.text.replace(/[-.]/g, "").length);
+    expect(answer.digits.length).toBeLessThanOrEqual(4);
+    expect(body.usage.output_tokens).toBe(answer.text.length + 1);
+  });
+
+  it("answers a scalar with no ceiling at all, which is the request this primitive exists for", () => {
+    const { body } = send({ state: "s", questions: { s: { type: "scalar", instructions: "How much?" } } });
+    const answer = body.answers.s as { type: string; digits: unknown[] };
+    expect(answer.type).toBe("scalar");
+    expect(answer.digits.length).toBeLessThanOrEqual(6);
+  });
+
   it("refuses a point when the state carried no image, on that question alone", () => {
     const { body } = send({
       state: "just words",

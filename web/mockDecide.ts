@@ -57,9 +57,17 @@ function digitsFor(seed: string, count: number): Digit[] {
 }
 
 const valueOf = (digits: Digit[]): number => Number(digits.map((d) => d.digit).join(""));
-/** `sigma = sum((1 - p_k) * 10^place)`, as `numbers.rs` computes it. */
-const sigmaOf = (digits: Digit[]): number =>
-  digits.reduce((sum, d, i) => sum + (1 - d.probability) * 10 ** (digits.length - 1 - i), 0);
+/**
+ * `sigma = sum((1 - p_k) * 10^place)`, as `numbers.rs` computes it, where
+ * `fraction` is how many of the trailing digits fell after a decimal point.
+ *
+ * A `number` has no point and passes zero; a `scalar` cannot know a digit's
+ * place until the point has been seen, which is why `scalar.rs` parses the
+ * run before it weights it.
+ */
+const sigmaAt = (digits: Digit[], fraction: number): number =>
+  digits.reduce((sum, d, i) => sum + (1 - d.probability) * 10 ** (digits.length - fraction - 1 - i), 0);
+const sigmaOf = (digits: Digit[]): number => sigmaAt(digits, 0);
 
 /** A JPEG's pixel size, read off its SOF marker, so a point lands where it says it does. */
 function jpegSize(dataUri: string): { width: number; height: number } | null {
@@ -181,6 +189,33 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
       answers[id] = { type: "number", number: valueOf(trace), uncertainty: Number(sigmaOf(trace).toFixed(4)), digits: trace };
       continue;
     }
+    if (kind === "scalar") {
+      // Here `digits` is a ceiling and absent asks for the widest run, so the
+      // mock picks its own width under it — that is the whole behaviour the
+      // tab is being built against.
+      const ceiling = Math.max(1, Math.min(6, Number(text(entry(question, "digits"))) || 6));
+      const width = 1 + Math.floor(hashed(seed, 313) * ceiling);
+      const trace = digitsFor(seed, width);
+      // Some of them fractional and fewer of them negative, so the decimal and
+      // the sign are both reachable without the card.
+      const fraction = width > 1 && hashed(seed, 419) < 0.45 ? 1 : 0;
+      const sign = hashed(seed, 523) < 0.25 ? "-" : "";
+      const spelled = trace.map((d) => d.digit).join("");
+      // A model writes `0.5` and never `07`: a leading zero only stands
+      // before the point.
+      const whole = spelled.slice(0, width - fraction).replace(/^0(?=.)/, "1");
+      const written = `${sign}${whole}${fraction ? `.${spelled.slice(width - fraction)}` : ""}`;
+      // What it wrote, plus the brace that closed the object.
+      generated += [...written].length + 1;
+      answers[id] = {
+        type: "scalar",
+        value: Number(written),
+        text: written,
+        uncertainty: Number(sigmaAt(trace, fraction).toFixed(6)),
+        digits: trace,
+      };
+      continue;
+    }
     if (kind === "point" || kind === "box") {
       if (!image) {
         answers[id] = { type: "error", code: "state_carries_no_image", message: "a point is a position on an image, and this `state` carried none" };
@@ -216,8 +251,8 @@ export function mockDecide(raw: string): { status: number; body: unknown } {
     body: {
       model: "mock-model",
       answers,
-      // A readout generates nothing, so this stays 0 unless a number, point or
-      // box was asked for — the same honesty the real endpoint keeps.
+      // A readout generates nothing, so this stays 0 unless a number, scalar,
+      // point or box was asked for — the same honesty the real endpoint keeps.
       usage: { input_tokens: Math.ceil(raw.length / 3.6), output_tokens: generated },
     },
   };
