@@ -135,6 +135,10 @@ on a new set with its threshold fixed first.
 
 ## Limits and unknowns
 
+- *Measured since*, in `2026-09-22-the-codec-costs-the-head-its-read.md`:
+  the codec on L39's own keys costs the head 20 scenes of 240 at 1024 px
+  and fails set C's pre-registered floors; at 4096 px it costs 3, and there
+  the chain drifts down. The bullet below is kept as written.
 - **The hq rows leave out the armed layer's own quantization**: its scores
   use pre-codec keys. That is likely the kinder side of the codec but not a
   proven bound — noise on the keys can move a region either way. The route-agreement finding puts the codec's attention

@@ -104,6 +104,10 @@
 //! an unmeasured regime would turn a guess into a guarantee.
 //!
 //! `IGNIS_POINT_KV=bf16|hq|hq-precodec` (default bf16),
+//! `IGNIS_POINT_CHUNK=<tokens>` (default 1024, the serving default; a
+//! multiple of 128 — at 4096 px the image crosses ~16 prefill chunks, and
+//! a wider chunk is how a chunk-boundary effect is told from the model's
+//! own; a non-default width is appended to the dump's name),
 //! `IGNIS_POINT_LAYERS=all|head` (default: all GQA layers at 1024 px and
 //! below, only the head's layer above — at 4096 px sixteen layers of keys
 //! are ~0.5 GB of host memory per scene and the head is already fixed),
@@ -148,7 +152,24 @@ const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer
 /// Sized for the fixture's 4096x4096 images (~16.5K prompt tokens); the
 /// 1024 px sets need ~1.2K.
 const MAX_CONTEXT: u32 = 20_480;
-const PREFILL_CHUNK: u32 = 1024;
+/// The serving default (`DEFAULT_PREFILL_CHUNK`); `IGNIS_POINT_CHUNK`
+/// overrides it for the chunk-boundary control.
+const DEFAULT_PREFILL_CHUNK: u32 = 1024;
+
+fn prefill_chunk() -> u32 {
+    match std::env::var("IGNIS_POINT_CHUNK") {
+        Err(_) => DEFAULT_PREFILL_CHUNK,
+        Ok(v) => {
+            let chunk: u32 = v.parse().unwrap_or_else(|e| panic!("IGNIS_POINT_CHUNK={v}: {e}"));
+            assert!(
+                chunk > 0 && chunk % 128 == 0,
+                "IGNIS_POINT_CHUNK={chunk}: a nonzero multiple of 128"
+            );
+            chunk
+        }
+    }
+}
+
 const DIGITS: usize = 3;
 const SCALE: f64 = 999.0;
 
@@ -540,6 +561,7 @@ fn one_attention_head_points_in_the_engine() {
     let render = Render::from_env();
     let kv_mode = KvMode::from_env();
     let kv_format = kv_mode.format();
+    let chunk = prefill_chunk();
     let (dir, generated) = match std::env::var("IGNIS_POINT_SCENES") {
         Ok(dir) => (PathBuf::from(dir), true),
         Err(_) => (fixture_dir(), false),
@@ -615,7 +637,7 @@ fn one_attention_head_points_in_the_engine() {
         &reader,
         &artifact,
         &handles,
-        PREFILL_CHUNK,
+        chunk,
         MAX_CONTEXT,
         kv_format,
         None,
@@ -755,7 +777,7 @@ fn one_attention_head_points_in_the_engine() {
         // The chunk the query sits in: the hq route's fresh/side/codec rule is
         // relative to its start.
         let query_chunk_start =
-            chunk_start_of(&prompt, tokens.len() as u32, PREFILL_CHUNK, query as u32) as usize;
+            chunk_start_of(&prompt, tokens.len() as u32, chunk, query as u32) as usize;
 
         // ── one armed prefill ────────────────────────────────────────────
         let run = || {
@@ -766,7 +788,7 @@ fn one_attention_head_points_in_the_engine() {
                 &tokens,
                 &prompt,
                 &embedding,
-                PREFILL_CHUNK,
+                chunk,
                 &mut logits,
             )
         };
@@ -964,13 +986,17 @@ fn one_attention_head_points_in_the_engine() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("ignis-attention-head-point"));
     std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
-    let stem = format!("{set_name}-{}-{}", render.name(), kv_mode.name());
+    let stem = match chunk {
+        DEFAULT_PREFILL_CHUNK => format!("{set_name}-{}-{}", render.name(), kv_mode.name()),
+        _ => format!("{set_name}-{}-{}-chunk{chunk}", render.name(), kv_mode.name()),
+    };
     let (gh, gw) = grid.expect("at least one scene");
     let meta = serde_json::json!({
         "set": set_name,
         "render": render.name(),
         "kv": kv_mode.name(),
         "kv_format": kv_format.as_str(),
+        "prefill_chunk": chunk,
         "seed": manifest.seed,
         "side": manifest.side,
         "grid": [gh, gw],

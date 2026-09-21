@@ -223,9 +223,23 @@ How C5 goes into the engine, and what it must not skip:
   four by one and two scenes, because it sits on its threshold — it takes the
   chain from about 90% to about 99% in every arm. Cross-validation picks
   L39.h10 on every fold of all six arms, and it points on the 4096 px fixture
-  under both renders. **Still unmeasured: production itself** — the served
-  render under hq-e8-2b with the codec applied to L39's own keys — which is
-  the next pre-registered run, on a new scene set, before any second guard.
+  under both renders.
+- **Production, measured** (`docs/findings/2026-09-22-the-codec-costs-the-head-its-read.md`):
+  served render, hq-e8-2b, the keys attention actually reads, a new set C.
+  **The pre-registered criterion fails** — head 212, guard 222 of 240 —
+  and the whole loss is the codec on L39's own keys: with them exact the
+  head is 232, BF16's number. In ignis every hq key attention reads is a
+  codec decode (the residual window is never wired), and the window would
+  not help anyway: the image is older than it. So **the head reads an exact
+  copy of its one KV head** over the image span, taken where the tap reads
+  (after `qk_norm_rope`, before the append): 8 MB per sequence at 4096 px, a
+  per-slot reserve in the VRAM plan.
+- **At 4096 px the chain is the weak point, not the head**: head 238, chain
+  170, guard 203 of 240 (BF16; hq alike). The chain drifts down ~11/999 at
+  the median, x untouched, and the guard — built for a wrong-element tail —
+  keeps a drifted chain because it stays under d = 60. Not the codec, not
+  prefill chunking; model or engine is open. Until it is closed, the 4096 px
+  answer is not "the chain with the guard".
 
 The rest of what was left before C5:
 
