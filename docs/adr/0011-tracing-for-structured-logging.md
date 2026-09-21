@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted (2026-09-07, grilling session on `.scratch/Ignis Structured Logging
-Specification.md`). The interval-counter boundary below is superseded by ADR
+Accepted (2026-09-07, grilling session on `docs/specs/logging/spec.md`).
+The interval-counter boundary below is superseded by ADR
 0025: the counters are now the DEBUG event `ignis.scheduler.interval`, and
 the `IGNIS_TELEMETRY`/`--telemetry` sink is gone.
 
@@ -70,7 +70,7 @@ already depends on) to get the HTTP root span for free.
   `crates/server/src/telemetry.rs` module (design doc §5: the scheduler
   interval-counter and request-lifecycle JSONL stream, wired to
   `IGNIS_TELEMETRY`/`--telemetry` in #77) — a different, pre-existing concern.
-  See the Context note below and `.scratch/logging-roadmap.md` for how the
+  See the Context note below and `docs/specs/logging/roadmap.md` for how the
   two relate.
 - Any future switch away from `tracing` would touch every call site in the
   codebase — this is a hard-to-reverse choice, which is why it's recorded

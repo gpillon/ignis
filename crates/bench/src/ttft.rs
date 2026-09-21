@@ -2,7 +2,7 @@
 //! at an **exact prompt length**, on **cold prefixes**, against any
 //! OpenAI-compatible endpoint.
 //!
-//! Spec: `.scratch/runtime/specs/02-real-prefill.md`; ADR 0015 (G2 is
+//! Spec: `docs/specs/runtime/02-real-prefill.md`; ADR 0015 (G2 is
 //! judged live/live on cold-prefix samples). The verdict half lives in
 //! [`crate::g2`].
 //!

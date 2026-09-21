@@ -10,10 +10,12 @@ relationships, labels, and closure. Each GitHub issue body is short
 (1-3 lines of context) and links to the implementation spec.
 
 Implementation specs (acceptance criteria, seam description, ADR references)
-live under `.scratch/<feature>/specs/` in this repo. These are **specs, not
+live under `docs/specs/<feature>/` in this repo. These are **specs, not
 issues** — they do not track status or blocking (that is GitHub's job).
-`.scratch/` is also used for temporary artifacts, experiments, and workflow
-output, but **never for issue tracking**.
+
+`.scratch/` is **not tracked by git**: it is the scratchpad for temporary
+artifacts, experiments, raw logs and workflow output, local to each clone.
+Nothing durable lives there, and it is never an issue tracker.
 
 See `docs/agents/issue-tracker.md` for the full convention.
 

@@ -36,7 +36,7 @@ and include the other evidence in the document.
 | Content | Authoritative location |
 |---|---|
 | Work status and work to be done | GitHub issue |
-| Acceptance criteria and implementation spec | `.scratch/<feature>/specs/` |
+| Acceptance criteria and implementation spec | `docs/specs/<feature>/` |
 | Architectural decision | `docs/adr/` |
 | Domain term or concept | root `CONTEXT.md` |
 | Temporary material, raw logs, and experiment output | `.scratch/` |

@@ -50,7 +50,7 @@ SYSTEM_MESSAGE_POLICY ?= merge
 DEVELOPER_MESSAGE_POLICY ?= inplace
 
 # The GPU engine configuration (CUDA=1 only; the CPU mock gets none of it).
-# Defaults are the G5 gate legs (.scratch/runtime/specs/05, the g5-run driver):
+# Defaults are the G5 gate legs (docs/specs/runtime/05, the g5-run driver):
 # the full 262144-token envelope, hq-e8-2b KV, DFlash2 speculation with a
 # 7-token draft window. Empty = leave the flag off (the server's default);
 # SPEC= turns speculation off.

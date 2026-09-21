@@ -9,7 +9,7 @@
 //! - the model topology config (`compute::ModelConfig`) the forward pass
 //!   will be parameterized by, once the vendored compute adapter lands
 //!   (GitHub #39 deleted the superseded flat-C-ABI forward; the
-//!   replacement is tracked at `.scratch/ROADMAP.md`, P1-24 / #60)
+//!   replacement is tracked at `docs/ROADMAP.md`, P1-24 / #60)
 //! - the model-load step ABI call (`model_load`, feature `cuda`, GitHub
 //!   #53 / ADR 0009): builds the bound-tensor + topology descriptors the
 //!   kernel leaf's `ignis_model_load` consumes

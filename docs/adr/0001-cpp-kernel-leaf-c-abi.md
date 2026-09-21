@@ -33,7 +33,7 @@ flat C ABI (explicit pointers + sizes, no shared state).
 > device-resident: opaque handles, integer codes, and no host activation
 > pointers crossing the boundary. The per-operator, host-pointer reading of
 > this decision produced a forward pass that could not work at any speed;
-> see `.scratch/REVIEW-2026-09-05.md` §2-§3.
+> see `docs/REVIEW-2026-09-05.md` §2-§3.
 
 ## Consequences
 

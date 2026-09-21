@@ -1,3 +1,0 @@
-request deadline: 1800 s per request (IGNIS_BENCH_REQUEST_TIMEOUT=0 removes it)
-engine http://127.0.0.1:8000: qwen3.8-27b
-replaying 157 requests (143 continue an earlier turn) as `gate-214`

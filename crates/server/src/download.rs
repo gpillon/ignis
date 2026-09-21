@@ -1,5 +1,5 @@
 //! Fetching the model when it is not on disk (GitHub #234, spec
-//! `.scratch/model-download/specs/01-model-download.md`).
+//! `docs/specs/model-download/01-model-download.md`).
 //!
 //! A server started with no `.ninfer` artifact used to fall back to the
 //! placeholder template and `MockCompute` without a word about where the real

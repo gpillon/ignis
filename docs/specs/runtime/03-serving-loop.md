@@ -1,0 +1,458 @@
+# runtime 03 — serving loop: chunk-level interleaving, batched decode rounds, per-width graphs, sampling (gate G3)
+
+GitHub: #64 (phase 3 master; blocked by #63, gate G2 — closed 2026-09-09)
+
+Source: `docs/REVIEW-2026-09-05.md` §6 (Phase 3), `docs/ROADMAP.md`
+(the G3 row and the phase 3–5 candidate decomposition), and the grilling
+session of 2026-09-09 that turned them into this spec. Builds directly on
+`docs/specs/runtime/02-real-prefill.md` (G2).
+
+ADRs respected: 0005 (performance-first above a sane-output floor), 0006
+(exclusive GPU testing), 0007 (performance gates, correctness self-checked),
+0009 (step-level device-resident ABI), 0010 (vendored reference kernels),
+0011 (tracing for structured logging), 0012 (`request.id` as trace id), 0014
+(teacher-forced canary floor), 0015 (live/live gate on cold samples), 0016
+(extensible options structs at the step ABI), 0017 (Prometheus metrics).
+ADR introduced by this work: **0018** (chunk-level prefill/decode
+interleaving, scheduler-driven, single stream).
+
+Reference: ninfer at the manifest's pinned commit
+(`kernel/vendor/manifest.json`).
+
+## Problem Statement
+
+G2 made prefill real; decode is still what G1 left. Three gaps sit between
+that and a serving loop.
+
+**The loop stops the world for a prefill.** `ConcreteScheduler::advance()`
+runs a prefill phase to completion and then a decode phase, on one thread,
+and a prefill call returns only when the whole span is done. At the measured
+G2 numbers — a 1,024-token chunk costs ~110 ms (94–119 ms across runs), a
+32K span is 32 of them, a reference decode step is 13.2 ms — a 32K prompt
+inserts a ~3,820 ms gap into every decoding lane's token stream. The
+glossary already promised otherwise: `CONTEXT.md` said decoding on other
+lanes continues while the prefill lane runs, and it did not.
+
+**Decode is eager and greedy.** `ignis_program_decode` walks its batch one
+sequence at a time, `IgnisSamplingParams` has a single field (`greedy`), and
+`DecodeParams` carries only `temperature` and `seed`. No CUDA graph exists
+anywhere in the leaf or the runtime: ADR 0008's staging-buffer model was
+superseded by ADR 0009 and explicitly deferred the decode graph to this
+phase. The gate asks for ≥ 99% of the reference's C=1 rate, where the whole
+margin is 0.13 ms on a 13.2 ms step.
+
+**The scheduler's capacity numbers are not the GPU's.** `KvPool` counts
+abstract pages, admission's capacity math does not use real bytes, and the
+C=4 cell is the first time admission must queue or refuse on capacity that
+exists. A gate measured against invented accounting measures a policy that
+will not ship.
+
+There is also a measurement gap, the same one G2 had: no reference number
+exists for C=4 or for inter-token latency under a concurrent prefill, and
+`ignis-bench` cannot measure either.
+
+## Solution
+
+The scheduler drives the prefill chunk loop. `advance()` performs at most
+one prefill chunk and one decode round, so a decode-ready lane never waits
+longer than one chunk for its turn. Nothing runs concurrently on the GPU:
+prefill and decode take turns on the one model stream. This is
+**prefill/decode interleaving**, and it is deliberately not **true
+prefill/decode overlap**, which stays a north-star item (ADR 0018).
+
+It needs no ABI change. Rust passes a span one chunk wide, the leaf's own
+loop runs a single iteration, and the serving chunk width is a Rust-side
+number bounded above by the width the program scratch was reserved for at
+model load. The leaf keeps its internal loop for long spans: the GPU tests
+and the per-token self-oracle use it.
+
+Because a request now lives in `Prefilling` for tens of ticks, that state
+becomes durable and carries **prefill progress**. Resuming is the absence of
+anything special: the next chunk gets scheduled. Cancel is abort, not
+suspend — the in-flight chunk finishes, then the sequence is released. Each
+completed chunk boundary is recorded as a GDN resumable boundary, which is
+correct because the leaf advances the sequence's persistent conv slot and
+GDN recurrent slot in place and moves `seq->position` only after the chunk's
+synchronization returns.
+
+Decode becomes a real batched round: one call over every decode-ready lane,
+sampled device-side in the leaf with per-sequence parameters and
+per-sequence RNG state, replayed from a CUDA graph captured per **exact**
+batch width 1..8. Widths are never padded: GDN slot traffic is per sequence
+(144 MiB each), so padding width 1 up to width 8 moves 1.15 GB instead of
+144 MB and spends several times the C=1 gate's entire margin. The graph's
+staging buffers are a reservation separate from the prefill scratch, because
+a prefill chunk landing between two replays would otherwise clobber the
+fixed addresses a graph rereads.
+
+The gate is measured, not asserted, on the same live/live rule as G2
+(ADR 0015). `ignis-bench` gains the three G3 cells, measured over HTTP/SSE
+against either engine — the reference emits none of ignis's internal events,
+so the request log is observability and diagnosis, never the comparative
+oracle.
+
+## User Stories
+
+1. As the engine owner, I want a long prompt's prefill to cost the decoding lanes one chunk of latency instead of the whole span, so that a subagent starting up does not stall every session already running.
+2. As the engine owner, I want the scheduler to drive the chunk loop, so that the decision of when to decode lives above the step boundary where scheduling belongs.
+3. As the engine owner, I want the leaf to keep its own loop over a long span, so that the per-token self-oracle and the GPU tests keep working unchanged.
+4. As the engine owner, I want interleaving to require no ABI change, so that this phase spends its ABI budget on sampling alone.
+5. As the engine owner, I want a serving prefill chunk width bounded by the width reserved at load, so that narrowing under load is free and widening is refused rather than silently corrupting scratch.
+6. As the engine owner, I want the serving chunk width chosen from the gate measurement rather than argued in advance, so that the one dial that moves p95 is set by evidence.
+7. As the engine owner, I want no adaptive chunk-width policy in this phase, so that the loop stays explainable while its constants are still unmeasured.
+8. As the engine owner, I want one decode round per prefill chunk as the initial policy, so that there is a baseline to move rather than a tuned constant nobody can justify.
+9. As the engine owner, I want the gate's functional property stated independently of that ratio, so that improving it does not fail the gate.
+10. As the engine owner, I want exactly one request at a time holding device-resident prefill progress, so that VRAM no tier can yet reclaim is not multiplied across half-prefilled sequences.
+11. As the engine owner, I want `Prefilling` to be a durable state carrying how far the prompt is prefilled, so that admission can see a half-prefilled request instead of a momentary one.
+12. As the engine owner, I want resuming a prefill to need no suspend/resume primitive, so that the loop does not carry machinery for a case this phase does not have.
+13. As the engine owner, I want cancel to finish the in-flight chunk and then abort the sequence, releasing its KV pages, GDN slot and conv taps, so that cancellation is a definite point rather than a race with the GPU.
+14. As the engine owner, I want each completed chunk boundary recorded as a GDN resumable boundary, so that the old "mid-prefill is never resumable" rule stops being wrong now that mid-chunk and mid-prefill are different positions.
+15. As the engine owner, I want the boundary bookkeeping to stop being a per-token vector scanned linearly, so that the resumability check is not O(context) on the hot path.
+16. As the engine owner, I want a sequence that has not finished prefilling to be impossible to decode, so that a scheduling bug is a refused call rather than corrupted output.
+17. As the engine owner, I want one decode call spanning every decode-ready lane, so that eight lanes stream the model's weights once rather than eight times.
+18. As the engine owner, I want sampling to happen device-side in the leaf, so that no logits cross the ABI and ADR 0009's device-resident step is preserved.
+19. As the engine owner, I want temperature, top-p, top-k, presence penalty, frequency penalty and seed supported, so that the engine serves the parameters coding clients actually send.
+20. As the engine owner, I want the sampling parameters passed as an array parallel to the sequences, so that lanes with different settings still share one decode round.
+21. As the engine owner, I want RNG state carried per sequence, so that what a request generates depends on its own seed and never on which lanes shared its round.
+22. As the engine owner, I want presence and frequency penalties backed by per-sequence count state on the device, so that a penalty is a property of the request rather than of the batch.
+23. As the engine owner, I want that new per-sequence state added to the sequence handle's inventory, so that G4's snapshot checklist is complete when it is written.
+24. As the engine owner, I want the sampling ABI extended through the size-prefixed options struct, so that ADR 0016's mechanism is used rather than a second ABI break.
+25. As the engine owner, I want `top_k` documented as an ignis extension, so that the OpenAI-compatible surface stays honest about what is standard.
+26. As the engine owner, I want a parameter the engine does not support to be refused rather than silently ignored, so that a client's settings are never quietly dropped.
+27. As the engine owner, I want a decode CUDA graph captured for every exact batch width 1..8, so that no round pays for lanes it does not have.
+28. As the engine owner, I want batch widths never padded up to a captured width, so that the C=1 cell is not spending its gate margin on GDN traffic for absent sequences.
+29. As the engine owner, I want the graph's staging buffers reserved separately from the prefill scratch, so that an interleaved chunk cannot clobber what a replay rereads.
+30. As the engine owner, I want those staging buffers sized once for the widest batch and shared across the widths, so that eight graphs cost graph nodes rather than eight buffer sets.
+31. As the engine owner, I want an eager fallback for any width without a graph, so that a capture failure degrades performance instead of refusing service.
+32. As the engine owner, I want `KvPool` pages to be the device pages the leaf actually built, so that admission counts the resource that runs out.
+33. As the engine owner, I want admission's capacity math in real bytes, so that a request is refused when the GPU is full and not before or after.
+34. As the engine owner, I want the scheduler's capacity view and the leaf's pool checked against each other, so that a disagreement is a test failure rather than a load-time surprise.
+35. As the engine owner, I want the request log to be the canonical `ignis.request.*` events emitted as JSONL, so that logs and gate diagnosis read the same stream.
+36. As the engine owner, I want no third parallel telemetry stream, so that what the logs say and what the gate measures cannot drift apart.
+37. As the engine owner, I want per-phase fields covering chunks consumed, prefilled tokens and per-lane inter-token latency, so that a failing cell is attributable without another run.
+38. As the engine owner, I want interval counters to stay in Prometheus, so that metrics-shaped data does not leak into the event stream (ADR 0017).
+39. As the engine owner, I want the gate measured live/live in one session against the reference, so that a committed record can never decide it (ADR 0015).
+40. As the engine owner, I want the bench to measure TTFT and inter-token latency from the HTTP/SSE side, so that the same instrument works against an engine that emits none of ignis's internal events.
+41. As the engine owner, I want the C=1 cell expressed as a percentage of the live reference, so that the historical 75–76 tok/s is a note and not the oracle.
+42. As the engine owner, I want each cell's fixture stated as reserved `context_tokens`, so that a fixture is sized against what `ignis_seq_alloc` actually takes from the pool.
+43. As the engine owner, I want the ITL cell to repeat its cold prefill ten times, so that the percentile it reports has a distribution behind it.
+44. As the engine owner, I want those ten prefillers to be sequential, each released before the next is allocated, so that the cell measures one active prefill and not a concurrency this phase does not have.
+45. As the engine owner, I want the four decode lanes held open for as much of the series as the engine will keep them, and never restarted mid-cell, so that their inter-token latency is sampled continuously rather than stitched together across requests (the lanes are asked to outlive the whole series; how much of it they actually cover is story 53's concern).
+46. As the engine owner, I want p50, p95, p99 and max all recorded even though p95 decides, so that a later reader can see the shape and not only the verdict.
+47. As the engine owner, I want each generation cap derived from the measured window, so that reserved pages are not wasted on tokens no cell will generate.
+48. As the engine owner, I want the gate to state that N=8 at long context is unreachable with BF16 KV, so that nobody reads G3's concurrency as a promise G4 has not yet delivered.
+49. As the engine owner, I want the teacher-forced canary floor and the chunked-vs-per-token self-oracle re-run on this phase's tree, so that the serving loop is proven not to have changed the forward pass.
+50. As the engine owner, I want any correctness regression found at G3 filed as its own ticket, so that no gap is waived to make a gate pass.
+51. As a coding-agent user, I want my tokens to keep arriving while another agent's session starts up, so that one long prompt does not freeze the others.
+52. As a coding-agent user, I want my sampling settings honoured regardless of who else is being served in the same round, so that reproducibility is mine and not the batch's.
+53. As the engine owner, I want the ITL cell to pool only the stretch of the series in which every decode lane was alive, and to report how much of the series that was, so that a lane the engine ends early costs me distribution rather than the whole leg (GitHub #139).
+
+## Implementation Decisions
+
+**Scope boundary.** This phase makes the *serving loop* real. It does not
+pack several requests' prefill into one traversal, does not run prefill and
+decode concurrently on the GPU, does not hold more than one active prefill,
+does not snapshot or restore a sequence, and does not change the KV format.
+
+**Interleaving (ADR 0018).** One `advance()` performs at most one prefill
+chunk and at most one decode round. The scheduler passes
+`ignis_program_prefill` a span one serving-chunk wide; the leaf's internal
+loop runs one iteration and returns after its single synchronization. The
+serving chunk width is a scheduler-side value constrained to be at most the
+width the program scratch was reserved for at model load (P2-01); its G3
+default is that load width. No adaptive policy.
+
+**K, the decode rounds per chunk, is policy and not invariant.** K=1 is the
+shipped default. The gate's functional property is stated K-agnostically:
+while a prefill is active, no decode-ready lane waits more than one prefill
+chunk between two of its decode opportunities. Raising K must not fail the
+gate. K does not move p95 over any affordable range: per cycle a lane sees
+`K-1` short gaps and exactly one crossing a chunk, so the long gaps are the
+top `1/K` of the distribution and p95 stays among them until `K >= 20`, a
+240% TTFT inflation.
+
+**One active prefill.** Exactly one request at a time holds device-resident
+prefill progress and consumes chunks; the rest queue. Multi-prefill chunk
+interleaving buys fairness for a short prompt queued behind a long one,
+never throughput, and is deferred to G4 with burst scheduling and packed
+prefill.
+
+**Prefill progress and cancel.** `Prefilling` carries the position reached.
+No suspend/resume primitive is built: this phase has no case that needs one,
+and priority preemption of a prefill is G4. Cancel finishes the in-flight
+chunk, then aborts the sequence and releases its KV pages, GDN slot and conv
+taps.
+
+**Chunk boundaries are GDN resumable boundaries.** The loop calls
+`GdnState::checkpoint(position)`, not `advance(position)`, at each completed
+chunk. `GdnState`'s boundary set stops being a per-token `Vec<usize>`
+scanned with `contains()`.
+
+**Sampling.** Device-side in the leaf; the ABI keeps returning token ids.
+`ignis_sampling_params` is extended through ADR 0016's size-prefixed struct
+with temperature, top-p, top-k, presence penalty, frequency penalty and
+seed, and `ignis_program_decode` takes an array of them parallel to its
+sequences. RNG state and penalty count state are per sequence and live in
+the sequence handle, which makes them new sections on G4's snapshot
+checklist. Parameters are staged in device buffers at stable addresses, so a
+captured graph reads them by replay.
+
+**Decode graphs.** Captured per exact width 1..8 at startup, eager fallback
+for any width without one. Staging buffers reserved separately from the
+prefill scratch, sized for width 8, shared across the widths.
+
+**Core rewiring.** `KvPool` pages become the device pages the leaf built;
+admission's capacity math uses real bytes; scheduler and leaf capacity views
+are cross-checked. GDN state needs no wiring: it is already device-resident
+and consistent, and the boundary recording belongs to the interleaving
+ticket.
+
+**Request log.** The canonical `ignis.request.*` events (ADR 0011, 0012)
+emitted as JSONL, extended with the phase fields this loop creates. No third
+stream. Interval counters stay in Prometheus (ADR 0017).
+
+## Gate G3
+
+Three cells, all live/live in one measurement session against the reference
+in the owner's production profile (ADR 0015), all measured over HTTP/SSE.
+Fixtures are stated as reserved `context_tokens`, because `ignis_seq_alloc`
+reserves, materializes and zeroes pages for the full prompt-plus-cap
+entitlement at allocation.
+
+**Each engine's server process is launched at least twice within the session
+(ADR 0021, GitHub #116).** One process launch's C=1/C=4/ITL numbers can sit
+5-17% away from a second launch of the exact same binary on the exact same
+GPU, moments apart -- confirmed live, and not explained by code, by slow
+drift over a launch's life, by heat or clock carryover from whichever
+process ran just before, or by the GPU's own sustained clock (identical
+between a fast and a slow launch during genuine compute activity). A gate
+computed from one launch per engine can therefore be deciding which process
+each engine happened to draw that session, not which engine is faster. The
+verdict is taken from the cell statistic pooled across every launch, not
+from one launch arbitrarily picked, and a run that reports only one launch
+per engine is not a valid G3 reading.
+
+| cell | fixture | reserved `context_tokens` | pool 65,536 | verdict |
+|---|---|---|---|---|
+| C=1 | prompt 8,192, cap 256 | 8,448 | headroom 57,088 | at least 99% of the live reference's tok/s (historically ~75–76) |
+| C=4 | 4 × (prompt 8,192, cap 256) | 33,792 | headroom 31,744 | aggregate at least 99% of the live reference's aggregate |
+| ITL | 4 × (prompt 4,096, safety cap 4,032) with a prefiller at prompt 32,768, cap 64 | 65,344 peak | headroom 192 | p95 within the live reference's envelope |
+
+The ITL cell runs **ten sequential cold prefillers**: each 32,768-token
+prefiller is allocated, prefilled, and released before the next is
+allocated, every prompt cold and distinct under ADR 0015's rule, while the
+four decode lanes are held open beside it. The lanes' inter-token intervals
+are sampled across the measurement window -- the stretch in which all four
+were alive, which is the whole series when the engine keeps them that long
+and less when it does not (see below); p50, p95, p99 and max are all
+recorded and p95 decides. The original 512-token estimate was falsified by
+the live reference: lanes exhausted it after 15-19 seconds while the ten
+prefillers lasted about 62 seconds. The instrument cancels every lane once
+the final prefill window closes. To keep the measurement lanes alive until
+that boundary, their prompt ends with an explicit request for at least 4,032
+output tokens (the corpus window is shortened so the post-template prompt
+remains exactly 4,096 tokens), and the measurement request suppresses the
+artifact's EOS ids. Normal serving keeps its existing EOS behavior.
+
+Cancellation is the intended terminator but not a guaranteed one: an
+endpoint that honors neither ignis `ignore_eos` nor `logit_bias` still stops
+at its own EOS, and a fast enough engine reaches the safety cap first. The
+measurement does not depend on which of the three ends a lane. What it
+depends on is that every pooled interval comes from a stretch of the series
+that had all four lanes alive.
+
+**The cell measures the window its lanes shared, and says how much of the
+series that covered (#139).** The **measurement window** opens at the last
+lane's first token and closes at the first lane's end; only prefillers whose
+request-start -> first-token window closes inside it are pooled against, and
+only intervals lying inside it are pooled at all. A lane the harness
+cancelled was generating up to that moment, so its end is the cancellation,
+not its last observed token; only a lane the *engine* ended -- on its own
+EOS, on the cap -- ends where its last token arrived.
+
+The earlier rule refused any lane that ended before the final prefill window
+closed. That refused legs for reasons carrying no information about either
+engine: the reference honors neither suppression knob, so its lanes stop at
+their own EOS wherever the content puts it, and the cap arm of the same race
+tightens as an engine gets *faster* -- against ignis, precisely as ignis
+approaches what this gate exists to measure. The three refused reference legs
+of #139 covered 6, 7 and 8 of their 10 prefill windows, and the p95 they
+already carried sat within 0.7% of the leg that was accepted.
+
+What the shortened window costs is distribution, not validity, so the record
+carries the window and its coverage and the gate refuses only below
+`ITL_MIN_COVERED_PREFILLERS` (2) -- a percentile over one prefill window is
+an anecdote, which is what the ten prefillers of story 43 exist to prevent. A
+leg covering fewer than all ten is warned about by name, on both the record
+and the verdict, and a verdict whose two sides pooled different amounts of
+the series says so rather than correcting for it. A run in which a leg's
+lanes end on the cap is still a run whose cap is load-bearing rather than
+spare. The evidence behind this rule -- the three refused reference legs
+recomputed against the shared span, and the reference's handling of both
+suppression knobs read off its own source -- is
+[ITL lane terminator race](../../findings/2026-09-13-itl-lane-terminator-race.md).
+
+**The safety cap is 4,032, the largest the pool admits (#114).** #104's
+first estimate of 512 was falsified above; 3,072 replaced it and was itself
+load-bearing on #110's reference leg, whose lanes cleared the final prefill
+window by only 3.4 to 7.0 seconds out of a 101-second run. A reference some
+7% faster would have exhausted the cap before the window closed and had its
+lane refused, failing the cell for a fixture reason rather than an engine
+one. The arithmetic, redone: admission reserves the full
+`ceil((prompt + token budget) / 64)` pages up front and never over-allocates
+mid-generation (`ignis_core::admission::AdmissionResources`), and the pool
+is 65,536 tokens, so 1,024 pages, at the server's default 40,960-token
+`--max-context` (the 4 GiB `ignis_runtime::auto_kv_pool_bytes` default under
+BF16 KV; P4-04 / GitHub #122 replaced the former `kv_pool_tokens_for` token
+target with that byte budget, leaving this figure unchanged). Peak concurrent
+demand is the four lanes plus the single in-flight prefiller:
+
+| holder | reservation | pages |
+|---|---|---:|
+| decode lane | `ceil((4,096 + 4,032) / 64)` | 127 |
+| four of them | | 508 |
+| prefiller | `ceil((32,768 + 64) / 64)` | 513 |
+| peak | | **1,021 of 1,024** |
+
+One more page per lane — a cap of 4,096 — needs 1,025 and would have a lane
+refused. The three spare pages are not what protects the sequential
+prefiller invariant, and never were: two overlapping prefillers need 1,026
+pages at any cap, so that invariant rests on the harness sending the next
+prefiller only after the previous request returned. Raising the cap further
+means raising the pool, which is a change to the engine's shape rather than
+to the fixture, and the fixture must not be the reason the engine's shape
+moves.
+
+**Each lane's finish reason is recorded (#114).** The record carries, per
+lane, whether the measurement boundary closed it, the engine stopped on its
+own EOS, the safety cap ended it, or the stream ended for a reason the
+instrument does not model. A leg whose lanes end on the cap is warned about
+by name in the rendered record, because before this a reader could only
+notice it by seeing a token count that happened to equal the cap.
+
+**ITL p95 fails at 1.106, and the cause is this phase's own decode round
+(GitHub #110, blocked by #111).** The live/live re-run on a valid fixture
+measured 1.106 against a 1.10 ceiling. Splitting a lane's intervals by
+whether a prefill chunk was in flight decomposes that number exactly:
+
+| term | ignis | reference | ratio |
+|---|---:|---:|---|
+| prefill chunk, 1,024 tokens at 32K context | 116.3 ms | 141.2 ms | 0.82 |
+| decode round, B=4 | 70.2 ms | 17.3 ms | 4.06 |
+| blocked ITL interval, the sum | 186.5 ms | 158.5 ms | 1.18 |
+
+ignis's prefill is **faster**. The whole gap is the decode round, which at
+four lanes costs 4.8x its own single-lane round because requirement 17 above
+is not implemented: the width-W path replays W sequential per-lane model
+traversals and batches only the sampling (#111). Bringing the round to the
+reference's order puts the blocked interval near 136 ms against 158 ms.
+
+**Requirement 17 landed on 2026-09-10 (#111, ADR 0020).** A decode round is
+now one batch-wide traversal of the model at every exact width 1..8: the
+lanes are the batch's rows at one token each, every per-sequence input is
+read from device staging indexed by row, and the same traversal serves the
+captured graph and the eager fallback. The leaf reports it — a round's
+dispatch count is the layer count at every width, where it was the layer
+count times the width. The numbers in the table above are the pre-#111
+baseline; the re-measurement below is what replaced them.
+
+**Re-measured live/live, ADR 0021 launch-pooled, same day: ITL p95 passes
+(GitHub #110, closed).** `.scratch/g3-gate-110-113-rerun/README.md`, session
+`g3-110-113-20260910`, two independent launches per engine. Pooled mean ITL
+p95 ratio **0.960** (per-launch-pairing range 0.913-1.012, all under the
+1.10 ceiling). The decode round in isolation (the free-standing interval
+between prefill windows) moved from **70.2 ms / 4.06x the reference** to
+**18.6 ms / 1.067x the reference** — the B=4 traversal cost that used to
+dominate the cell is now within launch-to-launch noise (this same session
+measured up to 18.8% launch spread on the reference's own C=4). C=1's
+pooled ratio (0.992) sits right at its 0.99 floor and splits pass/fail by
+which reference launch it is paired against; it is not this requirement's
+cell and is left as an open observation, not a regression claim.
+
+**#113 (lockstep `advance`, one decode round per prefill chunk) closed as
+not needed for now, same re-measurement.** C=4 aggregate is now ignis 43.35
+tok/s pooled mean against the reference's 11.05 — 3.9x, not the 99%-of-
+reference bar the issue asked for. The reasoning that deferred it ("a round
+costs 70 ms against the reference's 17 ms; better asked once a round is
+cheap") no longer holds now that a round costs 18.6 ms: the policy is not
+visibly leaving throughput on the table at this shape. Reopen if a future
+gate shape shows a live gap C=4 does not already cover.
+
+This is not a KV-precision gap. The `BF16` / `hq-e8-2b` inequality ADR 0015
+records would act on prefill, and ignis wins prefill while carrying it. An
+earlier reading of these records deferred the p95 to phase 4 on that basis;
+it assumed the decode round was small on both sides, which is true of the
+reference and false of ignis.
+
+C=1 and C=4 pass. The separate lockstep gap, `advance()` running 1.056
+decode rounds per prefill chunk against the reference's 1.44, is #113 and is
+secondary to #111.
+
+Alongside the three cells, two non-negotiables: the functional
+anti-serialization property above, proven by a CPU test rather than inferred
+from a permissive envelope; and the G2 correctness checks (teacher-forced
+canary floor, chunked-vs-per-token self-oracle) still green on this phase's
+tree.
+
+**Recorded inequality.** N=8 at long context is not reachable with BF16 KV.
+At this geometry a sequence-token costs 64 KiB (16 GQA layers × 4 KV heads ×
+256 × K+V × 2 bytes), so the 65,536-token pool is ~4 GiB and eight lanes at
+full context would be ~20 GiB next to ~19 GB of weights. N=8 in BF16 exists
+at short contexts; G4's hq-e8-2b makes it practical at long ones. Nothing in
+G3 should be read as a promise otherwise.
+
+## Testing Decisions
+
+- The interleaving property is a CPU test against `MockCompute`: with a
+  prefill active and decode-ready lanes present, the recorded call sequence
+  must never place two prefill chunks between two decode rounds.
+- Prefill progress, cancel-as-abort and the one-active-prefill rule are CPU
+  tests on the scheduler seam.
+- Rust-driven chunking is checked against leaf-driven chunking: the same
+  prompt as one long span and as a sequence of chunk-wide spans must leave
+  the same state and predict the same next token. The per-token route is a
+  third, independent oracle and is retained for this phase.
+- Sampling is tested in the leaf's own test binary at real geometry, plus a
+  determinism test: the same seed on the same request produces the same
+  tokens regardless of which other lanes shared its rounds.
+- Graph replay is tested against the eager path at every width 1..8, and the
+  staging-buffer separation is tested by running an interleaved prefill
+  chunk between two replays and requiring identical output.
+- Capacity accounting is tested by driving admission to refusal and
+  comparing its view against the leaf's reported pool.
+- The bench cells are CPU-testable end to end against a stub endpoint; only
+  the gate run itself needs the GPU (ADR 0006).
+
+## Out of Scope
+
+- Packed prefill: several requests' prefill tokens in one traversal. Its
+  phase is decided after #92 reports.
+- True prefill/decode overlap on separate streams (roadmap phase 6).
+- More than one active prefill, multi-prefill chunk interleaving, and
+  priority preemption of a prefill (G4).
+- Snapshot and restore of a sequence, and eviction of a half-prefilled one:
+  the KV-RAM host tier is G4. This phase only establishes that a chunk
+  boundary is a valid capture point for the state that exists.
+- hq-e8-2b KV, device prefix reuse, tagged lanes (G4).
+- MTP, DFlash2, ReplaySSM (G5). Vision.
+- Deleting the per-token prefill route: retained here, reconsidered after G3.
+- Adaptive chunk-width policy, and any kernel work of our own.
+
+## Further Notes
+
+- The gate clause as #64 originally worded it ("within the reference
+  envelope") was satisfiable by building nothing, because the reference does
+  not overlap prefill and decode at all. That is why the phase carries a
+  functional property alongside the measured one.
+- The p95 floor is the chunk time plus a decode round and nothing else.
+  Chunk width is the only dial that moves it, which is why the serving width
+  knob exists and why K does not.
+- `ignis_seq_alloc` materializes and zeroes the whole reservation at
+  allocation, so the 32,768-token prefiller zeroes ~2 GiB inside its own
+  TTFT. Expected, and not a defect to chase when reading that number.
+- Work splits into eight tracer-bullet tickets: the interleaving loop, the
+  capacity rewiring, leaf sampling, the HTTP sampling surface, decode
+  graphs, the request log, the measurement instrument, and the gate run.
+  Four of them start in parallel; the critical path is leaf sampling into
+  graphs into the gate, because a graph captured before sampling would have
+  to be captured again.

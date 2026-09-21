@@ -5,7 +5,7 @@ ADRs in `docs/adr/` carry the decisions that are hard to reverse.
 
 > **Status note (2026-09-05).** The goals, the architecture *shape* and the
 > acceptance philosophy below still hold. What changed after the project
-> review (`.scratch/REVIEW-2026-09-05.md`): the engine has never produced a
+> review (`docs/REVIEW-2026-09-05.md`): the engine has never produced a
 > real completion, the ABI moved from the operator level to the **step** level
 > with the forward pass in the leaf (ADR 0009), ops are **vendored verbatim**
 > under a manifest (ADR 0010), and the "one expanded v1 release" milestone
@@ -81,7 +81,7 @@ Kernel leaf (C++/CUDA static library, CMake + nvcc, SM120a)
 Replaces the original "one expanded v1 release" table (2026-09-05, after the
 project review). Every phase ends in a **GPU-measured gate**; no phase is done
 on CPU tests. Tickets and blocking live on GitHub; the decomposition lives in
-`.scratch/ROADMAP.md`.
+`docs/ROADMAP.md`.
 
 | Phase | Gate | Scope |
 |---|---|---|

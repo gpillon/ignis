@@ -6,7 +6,7 @@ Accepted (2026-09-09, grilling session for GitHub #64 / G3). Builds on ADR
 0009 (step-level device-resident ABI) and ADR 0016 (extensible per-call
 options). Does not amend either.
 
-Sources: `.scratch/ROADMAP.md` phase 3, `.scratch/REVIEW-2026-09-05.md` §6.
+Sources: `docs/ROADMAP.md` phase 3, `docs/REVIEW-2026-09-05.md` §6.
 
 ## Context
 

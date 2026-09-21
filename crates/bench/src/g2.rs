@@ -1,7 +1,7 @@
 //! The **G2 gate check** (P2-05, GitHub #87): two TTFT records in, one
 //! verdict out.
 //!
-//! Spec: `.scratch/runtime/specs/02-real-prefill.md`; ADR 0015. G2 asks one
+//! Spec: `docs/specs/runtime/02-real-prefill.md`; ADR 0015. G2 asks one
 //! question per cell — is ignis's median time to first token within
 //! [`RATIO_THRESHOLD`] of the reference's? — and the answer is only
 //! meaningful if the two numbers were produced **live/live**: the same

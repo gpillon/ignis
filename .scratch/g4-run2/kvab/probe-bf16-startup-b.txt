@@ -1,7 +1,0 @@
-[2026-09-13 19:58:04.992] [info] ninfer-serve: loading model...
-[2026-09-13 19:58:05.144] [info] ninfer-serve: load        weights                      0.00%           0 B /      16.03 GiB     0.000 s
-[2026-09-13 19:58:10.827] [info] ninfer-serve: load        weights                    100.00%     16.03 GiB /      16.03 GiB     5.682 s
-[2026-09-13 19:58:12.721] [info] ninfer-serve: model loaded in 7.72657 s
-[2026-09-13 19:58:12.722] [info] ninfer-serve: KV capacity explicit resolved=65536 tokens pages=1024/5120 runtime=6.58 GiB free-after-weights=14.24 GiB free-after-startup=6.63 GiB headroom=0.00 MiB slack=7.66 GiB graphs=5.11 MiB/96.00 MiB kv-ram=off
-[2026-09-13 19:58:12.723] [info] ninfer-serve: warming up...
-[2026-09-13 19:58:12.818] [info] ninfer-serve: listening on http://127.0.0.1:8080 (model id: qwen3.8-27b-nvfp4full-hq-e8-2b-262k, auth: disabled)

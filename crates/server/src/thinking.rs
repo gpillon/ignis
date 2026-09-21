@@ -4,7 +4,7 @@
 //! capabilities, and the resolved value ([`ThinkingOptions`]) that crosses
 //! the template seam.
 //!
-//! Mirrors the reference field-for-field (`.scratch/server/specs/04-enable-thinking.md`):
+//! Mirrors the reference field-for-field (`docs/specs/server/04-enable-thinking.md`):
 //! `enable_thinking` accepted at the top level and under
 //! `chat_template_kwargs`, `null` treated as unset, a same-value duplicate
 //! accepted, a conflicting duplicate rejected, `reasoning_effort` resolved

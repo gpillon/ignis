@@ -1,5 +1,5 @@
 # Linux hooks. Same contract as mk/os/windows.mk (documented at the top of
-# that file). GitHub #167, spec .scratch/make/specs/01-linux-hooks.md.
+# that file). GitHub #167, spec docs/specs/make/01-linux-hooks.md.
 #
 # Implemented here: the kernel leaf build and its op tests (kernel/build.sh),
 # and the GPU status/guard pair (mk/linux/gpu.sh). Those are what a CUDA=1

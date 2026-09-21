@@ -5,7 +5,7 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: bench / G3 ITL cell, EOS suppression, reference engine capabilities
-- Related: [#139](https://github.com/gpillon/ignis/issues/139), [#146](https://github.com/gpillon/ignis/issues/146), [#114](https://github.com/gpillon/ignis/issues/114), [ADR 0015](../adr/0015-g2-live-live-cold-prefix-gate.md), [ADR 0021](../adr/0021-live-live-launch-pooling.md), [spec 03 serving loop](../../.scratch/runtime/specs/03-serving-loop.md), [CONTEXT.md glossary](../../CONTEXT.md)
+- Related: [#139](https://github.com/gpillon/ignis/issues/139), [#146](https://github.com/gpillon/ignis/issues/146), [#114](https://github.com/gpillon/ignis/issues/114), [ADR 0015](../adr/0015-g2-live-live-cold-prefix-gate.md), [ADR 0021](../adr/0021-live-live-launch-pooling.md), [spec 03 serving loop](../specs/runtime/03-serving-loop.md), [CONTEXT.md glossary](../../CONTEXT.md)
 - Superseded by: none
 
 ## Question

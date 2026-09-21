@@ -30,7 +30,7 @@ into a prefill chunk plus a decode round:
 ignis's prefill is 21% faster; the whole ITL p95 gap is the round. At B=4 it
 costs 4.81x its own B=1 round while the reference pays 1.07x, which is the
 signature of streaming the model's weights once per lane. Requirement 17 of
-`.scratch/runtime/specs/03-serving-loop.md` asked for the opposite: "one
+`docs/specs/runtime/03-serving-loop.md` asked for the opposite: "one
 decode call spanning every decode-ready lane, so that eight lanes stream the
 model's weights once rather than eight times."
 

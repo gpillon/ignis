@@ -228,7 +228,7 @@ pub struct SchedulerConfig {
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// The serving prefill chunk width's default, in tokens (ADR 0018): the
-/// measured 1,024-token chunk from the G2 gate run (`.scratch/ROADMAP.md`).
+/// measured 1,024-token chunk from the G2 gate run (`docs/ROADMAP.md`).
 /// P3-01 is CPU-only (driven through the `Compute` seam with `MockCompute`),
 /// so this is the value CPU tests and this config's [`Default`] use; wiring
 /// a real `--features cuda` load's actual reserved width through

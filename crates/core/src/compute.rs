@@ -11,7 +11,7 @@
 //! `Weights`/`HeadWeight`/`Nvfp4Weight` host formats, the CUDA-graph
 //! plumbing, and the `CudaCompute` production backend) was deleted by
 //! GitHub #39 (ADR 0010): the vendored op-by-op replacement lands under the
-//! Phase 1 decomposition (`.scratch/ROADMAP.md`), starting with the
+//! Phase 1 decomposition (`docs/ROADMAP.md`), starting with the
 //! [`crate::scheduler::Compute`] adapter at P1-24 (#60). Until then, the
 //! engine drives [`crate::mock::MockCompute`] (ADR 0006).
 

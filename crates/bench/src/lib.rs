@@ -10,7 +10,7 @@
 //! running server; the real HTTP endpoint (`client::HttpEndpoint`, a
 //! `reqwest` blocking client) drives the running `ignis-server`
 //! (`POST /v1/chat/completions` — streaming + non-streaming — and
-//! `GET /v1/models`) (see `.scratch/bench/specs/01-trace-replay.md`).
+//! `GET /v1/models`) (see `docs/specs/bench/01-trace-replay.md`).
 //!
 //! The capture proxy (`record`) is the recording side (spec 03): a
 //! transparent OpenAI endpoint in front of a target engine that records a

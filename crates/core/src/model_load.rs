@@ -14,7 +14,7 @@
 //! NVFP4 weight's descriptor (GitHub #58): the reference's NVFP4 `Weight`
 //! validation requires a finite, positive divisor regardless of compute
 //! policy, even though the W4A4 path that multiplies by it is still G2
-//! (`.scratch/runtime/specs/01-device-resident-forward.md`).
+//! (`docs/specs/runtime/01-device-resident-forward.md`).
 
 #![cfg(feature = "cuda")]
 

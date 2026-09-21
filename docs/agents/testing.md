@@ -19,7 +19,7 @@ until the test suite is green.
   forward pass (the kernel leaf, the step ABI, the program), a test that
   self-skips on a busy GPU or on a kernel error proves nothing; that pattern
   is what let a broken forward stay green for two tickets
-  (`.scratch/REVIEW-2026-09-05.md` §4.1). Those tests belong to the explicit
+  (`docs/REVIEW-2026-09-05.md` §4.1). Those tests belong to the explicit
   **GPU profile** (below), which requires the GPU free and *fails* on any
   kernel error, busy GPU, or missing fixture. The default `cargo test` stays
   CPU-only (GitHub #38).
@@ -398,7 +398,7 @@ The reference's DFlash2 round passes its proposal positions for both the cache
 and the rotation and carries no rope delta in its decode ingress at all, while
 its ordinary decode batch and its MTP round both add the sequence's — so on the
 reference a multimodal sequence's verify columns and its decode rounds
-disagree. The spec (`.scratch/vision/specs/01-image-input.md`, §Compute seam)
+disagree. The spec (`docs/specs/vision/01-image-input.md`, §Compute seam)
 asks for `rope_position = position + rope_delta` on *every* decode and verify
 round, and ignis follows the spec. Expect a live/live comparison against the
 reference with `--vision --spec dflash2` to show the reference's own

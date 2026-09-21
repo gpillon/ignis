@@ -11,7 +11,7 @@ the default is not. **A declared departure from the reference** — see
 
 Sources: owner decision 2026-09-20 on GitHub #243; the split measured in
 `docs/findings/2026-09-20-number-width-and-decide-e2e.md`; spec
-`.scratch/vision-fanout/specs/01-share-the-vision-embedding.md`.
+`docs/specs/vision-fanout/01-share-the-vision-embedding.md`.
 
 ## Context
 

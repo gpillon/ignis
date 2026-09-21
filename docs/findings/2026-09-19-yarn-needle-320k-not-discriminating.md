@@ -6,7 +6,7 @@
 - Last verified: 2026-09-19
 - Scope: serving / RoPE scaling, long-context evaluation method
 - Related: [#227](https://github.com/gpillon/ignis/issues/227) (YaRN as a load
-  option), `.scratch/rope-scaling/specs/01-yarn.md`
+  option), `docs/specs/rope-scaling/01-yarn.md`
 - Superseded by: none
 
 **Hardware:** RTX 5090, exclusive card (ADR 0006).

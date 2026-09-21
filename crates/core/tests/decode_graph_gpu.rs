@@ -87,7 +87,7 @@ fn greedy_for(_prompt: usize) -> SamplingParams {
 /// One lane's own sampling settings: a distinct seed, temperature, top-k
 /// and penalties per prompt (GitHub #115).
 ///
-/// Requirement 21 of `.scratch/runtime/specs/03-serving-loop.md` is that
+/// Requirement 21 of `docs/specs/runtime/03-serving-loop.md` is that
 /// what a request generates depends on its own seed and never on which
 /// lanes shared its round. A greedy round cannot exercise that at all --
 /// argmax reads neither the RNG nor the penalty counts -- so a row-order

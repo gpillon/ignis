@@ -4,7 +4,7 @@
 //! the needle-retrieval correctness floor. The verdict half lives in
 //! [`crate::g4_gate`].
 //!
-//! Spec: `.scratch/runtime/specs/04-reference-feature-floor.md` ("Gate G4");
+//! Spec: `docs/specs/runtime/04-reference-feature-floor.md` ("Gate G4");
 //! ADR 0015 (live/live), ADR 0021 (launch pooling). Before this ticket,
 //! `crates/bench/src/gate.rs` / `report.rs` compared two in-memory [`Run`]s
 //! with no session or trace identity at all — exactly the "record one

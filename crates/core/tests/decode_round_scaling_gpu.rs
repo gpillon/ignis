@@ -5,7 +5,7 @@
 //! batch-wide traversal of the model rather than B traversals. #111 measured
 //! ignis at **4.81x** its own B=1 round while the live reference paid 1.07x,
 //! which is the signature of streaming the weights once per lane; requirement
-//! 17 of `.scratch/runtime/specs/03-serving-loop.md` asks for the reference's
+//! 17 of `docs/specs/runtime/03-serving-loop.md` asks for the reference's
 //! shape. A round that traverses the model once adds only the per-lane
 //! attention, recurrence and sampling work as the width grows, so the ratio
 //! sits near one and nowhere near the width.

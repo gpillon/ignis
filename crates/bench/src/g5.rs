@@ -3,9 +3,9 @@
 //! (concurrency 1) instead of a new instrument. The verdict half lives in
 //! [`crate::g5_gate`].
 //!
-//! Spec: `.scratch/runtime/specs/05-speculative-decoding.md` — not written
+//! Spec: `docs/specs/runtime/05-speculative-decoding.md` — not written
 //! yet (#66: "to write when G4 lands"); this module is built from #66's and
-//! #151's own acceptance criteria plus `.scratch/REVIEW-2026-09-05.md` §6
+//! #151's own acceptance criteria plus `docs/REVIEW-2026-09-05.md` §6
 //! Phase 5's depth table. ADR 0007 (performance gate, not parity), ADR 0015
 //! (live/live, cold samples), ADR 0021 (pooled launches).
 //!
@@ -45,7 +45,7 @@ use crate::time::{unix_now, utc_timestamp};
 use crate::ttft::{load_corpus, PromptTemplate};
 
 /// The three prompt depths spec 05's Gate G5 table measures
-/// (`.scratch/REVIEW-2026-09-05.md` §6 Phase 5: "24K / 98K / 196K"), each
+/// (`docs/REVIEW-2026-09-05.md` §6 Phase 5: "24K / 98K / 196K"), each
 /// `X * 1024` post-template tokens.
 pub const DEPTH_24K: u32 = 24 * 1024;
 pub const DEPTH_98K: u32 = 98 * 1024;
