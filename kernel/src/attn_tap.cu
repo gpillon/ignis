@@ -44,6 +44,9 @@ struct Tap {
   std::uint16_t *k_out = nullptr;
   std::vector<std::int64_t> rows_written;         // [slot]
   std::vector<std::uint8_t> seen;                 // [slot * n_queries + query]
+  std::uint16_t *kc_out = nullptr;                // consumed keys, or null
+  std::vector<std::int64_t> consumed_rows;        // [slot]
+  std::vector<std::int64_t> consumed_start;       // [slot], -1 = none
 };
 
 Tap g_tap;
@@ -109,11 +112,32 @@ extern "C" int32_t ignis_attn_tap_arm(const int32_t *gqa_ordinals, int32_t n_lay
   g_tap.k_out = k_out;
   g_tap.rows_written.assign(static_cast<std::size_t>(n_layers), 0);
   g_tap.seen.assign(static_cast<std::size_t>(n_layers) * static_cast<std::size_t>(n_queries), 0);
+  g_tap.kc_out = nullptr;
+  g_tap.consumed_rows.assign(static_cast<std::size_t>(n_layers), 0);
+  g_tap.consumed_start.assign(static_cast<std::size_t>(n_layers), -1);
   g_tap.armed.store(true, std::memory_order_release);
   return 0;
 }
 
-extern "C" int32_t ignis_attn_tap_disarm(int64_t *rows_written, int32_t *queries_seen) {
+extern "C" int32_t ignis_attn_tap_arm_consumed(uint16_t *kc_out) {
+  if (kc_out == nullptr) {
+    set_error("ignis_attn_tap_arm_consumed: null argument");
+    return -1;
+  }
+  if (!g_tap.armed.load(std::memory_order_acquire)) {
+    set_error("ignis_attn_tap_arm_consumed: arm the tap first");
+    return -1;
+  }
+  if (g_tap.queries.empty()) {
+    set_error("ignis_attn_tap_arm_consumed: the arm names no query position");
+    return -1;
+  }
+  g_tap.kc_out = kc_out;
+  return 0;
+}
+
+extern "C" int32_t ignis_attn_tap_disarm(int64_t *rows_written, int32_t *queries_seen,
+                                         int64_t *consumed_rows, int64_t *consumed_chunk_start) {
   const bool was_armed = g_tap.armed.exchange(false, std::memory_order_acq_rel);
   if (!was_armed) {
     set_error("ignis_attn_tap_disarm: the tap was not armed");
@@ -136,8 +160,19 @@ extern "C" int32_t ignis_attn_tap_disarm(int64_t *rows_written, int32_t *queries
       queries_seen[q] = all;
     }
   }
+  if (consumed_rows != nullptr) {
+    for (std::int32_t i = 0; i < g_tap.n_layers; ++i) {
+      consumed_rows[i] = g_tap.consumed_rows[static_cast<std::size_t>(i)];
+    }
+  }
+  if (consumed_chunk_start != nullptr) {
+    for (std::int32_t i = 0; i < g_tap.n_layers; ++i) {
+      consumed_chunk_start[i] = g_tap.consumed_start[static_cast<std::size_t>(i)];
+    }
+  }
   g_tap.q_out = nullptr;
   g_tap.k_out = nullptr;
+  g_tap.kc_out = nullptr;
   return 0;
 }
 
@@ -216,5 +251,63 @@ int32_t ignis_attn_tap_record(uint32_t gqa_ordinal, int64_t start_position, int3
     return -1;
   }
   g_tap.rows_written[static_cast<std::size_t>(slot)] += tokens;
+  return 0;
+}
+
+int32_t ignis_attn_tap_record_consumed(uint32_t gqa_ordinal, int64_t start_position,
+                                       int32_t tokens, bool hq_prompt, const void *workspace,
+                                       int64_t span, cudaStream_t stream) {
+  if (!g_tap.armed.load(std::memory_order_acquire) || g_tap.kc_out == nullptr) {
+    return 0;
+  }
+  if (gqa_ordinal >= static_cast<uint32_t>(kIgnisGqaLayerCount)) {
+    return 0;
+  }
+  const std::int32_t slot = g_tap.slot_of[gqa_ordinal];
+  if (slot < 0) {
+    return 0;
+  }
+  const std::int64_t end = start_position + tokens;
+  const std::int64_t query = g_tap.queries.front();
+  if (query < start_position || query >= end) {
+    return 0;  // not the chunk whose attention the query row belongs to
+  }
+  // Only the hq prompt route materializes a scratch plane, and only a single
+  // band of it holds the whole history after the call.
+  if (!hq_prompt || workspace == nullptr || span < end) {
+    return 0;
+  }
+  if (end > g_tap.max_positions) {
+    set_error("ignis_attn_tap_record_consumed: " + std::to_string(end) +
+              " consumed rows exceed the armed max_positions " +
+              std::to_string(g_tap.max_positions));
+    return -1;
+  }
+  // scratch_k is [kv_head][span][256]; the capture is [position][kv_head][256].
+  const auto *base = static_cast<const std::uint16_t *>(workspace);
+  for (std::int32_t head = 0; head < kKvHeads; ++head) {
+    std::uint16_t *dst = g_tap.kc_out +
+                         (static_cast<std::int64_t>(slot) * g_tap.max_positions * kKvHeads + head) *
+                             kHeadDim;
+    const std::uint16_t *src = base + static_cast<std::int64_t>(head) * span * kHeadDim;
+    const cudaError_t err = cudaMemcpy2DAsync(
+        dst, static_cast<std::size_t>(kKRow) * sizeof(std::uint16_t), src,
+        static_cast<std::size_t>(kHeadDim) * sizeof(std::uint16_t),
+        static_cast<std::size_t>(kHeadDim) * sizeof(std::uint16_t),
+        static_cast<std::size_t>(end), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+      set_error(std::string("ignis_attn_tap_record_consumed: cudaMemcpy2DAsync failed: ") +
+                cudaGetErrorString(err));
+      return -1;
+    }
+  }
+  const cudaError_t err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) {
+    set_error(std::string("ignis_attn_tap_record_consumed: cudaStreamSynchronize failed: ") +
+              cudaGetErrorString(err));
+    return -1;
+  }
+  g_tap.consumed_rows[static_cast<std::size_t>(slot)] = end;
+  g_tap.consumed_start[static_cast<std::size_t>(slot)] = start_position;
   return 0;
 }

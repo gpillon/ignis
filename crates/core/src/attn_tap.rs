@@ -16,8 +16,13 @@
 //!
 //! **The keys are the ones before the KV cache.** Under a BF16 pool they are
 //! exactly what attention reads; under hq-e8-2b they are what the codec was
-//! given, not what it decodes. A number taken through this tap under hq says
-//! so.
+//! given, not what it decodes. [`with_attn_tap_hq`] adds the other half: the
+//! keys the hq prompt attention actually consumed, in the codec's rotated
+//! frame, scored with [`AttnTapCapture::consumed_scores`]. The vendored route
+//! *can* keep the current chunk, the 32 sink keys and the 512-key ring exact
+//! ([`hq_source`] is its rule), but only with residual side planes on the
+//! cache view, which ignis never supplies: in this engine every consumed key
+//! is the codec's decode, and `attn_tap_hq_consumed_gpu.rs` holds it to that.
 
 use std::ffi::{CStr, c_char};
 
@@ -43,7 +48,13 @@ mod ffi {
             q_out: *mut u16,
             k_out: *mut u16,
         ) -> i32;
-        pub fn ignis_attn_tap_disarm(rows_written: *mut i64, queries_seen: *mut i32) -> i32;
+        pub fn ignis_attn_tap_arm_consumed(kc_out: *mut u16) -> i32;
+        pub fn ignis_attn_tap_disarm(
+            rows_written: *mut i64,
+            queries_seen: *mut i32,
+            consumed_rows: *mut i64,
+            consumed_chunk_start: *mut i64,
+        ) -> i32;
         pub fn ignis_attn_tap_last_error() -> *const c_char;
     }
 }
@@ -70,6 +81,15 @@ pub struct AttnTapCapture {
     pub rows_written: Vec<i64>,
     /// Per query position: 1 when every armed layer saw it, else 0.
     pub queries_seen: Vec<i32>,
+    /// The keys hq-e8-2b attention consumed for the first query's chunk,
+    /// `[layer][max_positions][KV_HEADS][HEAD_DIM]` BF16, **rotated frame**;
+    /// empty unless taken through [`with_attn_tap_hq`].
+    pub kc: Vec<u16>,
+    /// Consumed rows each armed layer copied (0 = not captured).
+    pub consumed_rows: Vec<i64>,
+    /// Where each armed layer's captured chunk began (-1 = not captured):
+    /// the `chunk_start` [`hq_source`] needs.
+    pub consumed_chunk_start: Vec<i64>,
 }
 
 impl AttnTapCapture {
@@ -84,6 +104,52 @@ impl AttnTapCapture {
     pub fn key(&self, layer: usize, position: usize, kv_head: usize) -> &[u16] {
         let at = ((layer * self.max_positions as usize + position) * KV_HEADS + kv_head) * HEAD_DIM;
         &self.k[at..at + HEAD_DIM]
+    }
+
+    /// The consumed (rotated-frame) key row of `kv_head` at `position` in
+    /// armed layer `layer`.
+    pub fn consumed_key(&self, layer: usize, position: usize, kv_head: usize) -> &[u16] {
+        let at = ((layer * self.max_positions as usize + position) * KV_HEADS + kv_head) * HEAD_DIM;
+        &self.kc[at..at + HEAD_DIM]
+    }
+
+    /// The same logits as [`Self::scores`], but against the keys hq
+    /// attention consumed: the query is rotated into the codec's frame, which
+    /// is orthonormal, so the dot product is the one the kernel formed.
+    pub fn consumed_scores(
+        &self,
+        layer: usize,
+        query: usize,
+        q_head: usize,
+        positions: &[usize],
+    ) -> Vec<f32> {
+        let kv_head = q_head / (Q_HEADS / KV_HEADS);
+        let q: Vec<f32> = self.query(layer, query, q_head).iter().map(|&b| bf16_to_f32(b)).collect();
+        let rq = hq_rotate(&q);
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        positions
+            .iter()
+            .map(|&p| {
+                let k = self.consumed_key(layer, p, kv_head);
+                rq.iter().zip(k).map(|(a, &b)| a * bf16_to_f32(b)).sum::<f32>() * scale
+            })
+            .collect()
+    }
+
+    /// `|R k - kc| / |R k|` for one row: how far the consumed key is from the
+    /// rotation of the key the layer produced. About one BF16 rounding for
+    /// the exact sources, the codec's error for the rest.
+    pub fn consumed_key_rel_err(&self, layer: usize, position: usize, kv_head: usize) -> f32 {
+        let k: Vec<f32> = self.key(layer, position, kv_head).iter().map(|&b| bf16_to_f32(b)).collect();
+        let rk = hq_rotate(&k);
+        let kc = self.consumed_key(layer, position, kv_head);
+        let (mut num, mut den) = (0.0f32, 0.0f32);
+        for (a, &b) in rk.iter().zip(kc) {
+            let d = a - bf16_to_f32(b);
+            num += d * d;
+            den += a * a;
+        }
+        (num / den.max(f32::MIN_POSITIVE)).sqrt()
     }
 
     /// `q . k / sqrt(HEAD_DIM)` for one head of one armed layer, from query
@@ -113,6 +179,28 @@ pub fn with_attn_tap<T>(
     max_positions: i64,
     f: impl FnOnce() -> T,
 ) -> Result<(T, AttnTapCapture), String> {
+    armed(ordinals, query_positions, max_positions, false, f)
+}
+
+/// [`with_attn_tap`], plus the keys hq-e8-2b attention consumed for the
+/// chunk holding `query_positions[0]` ([`AttnTapCapture::kc`]). On a cache or
+/// route that does not materialize them, `consumed_rows` comes back 0.
+pub fn with_attn_tap_hq<T>(
+    ordinals: &[i32],
+    query_positions: &[i64],
+    max_positions: i64,
+    f: impl FnOnce() -> T,
+) -> Result<(T, AttnTapCapture), String> {
+    armed(ordinals, query_positions, max_positions, true, f)
+}
+
+fn armed<T>(
+    ordinals: &[i32],
+    query_positions: &[i64],
+    max_positions: i64,
+    consumed: bool,
+    f: impl FnOnce() -> T,
+) -> Result<(T, AttnTapCapture), String> {
     let n_layers = ordinals.len();
     let n_queries = query_positions.len();
     let mut q = vec![0u16; n_layers * n_queries * Q_HEADS * HEAD_DIM];
@@ -131,17 +219,40 @@ pub fn with_attn_tap<T>(
     if rc != 0 {
         return Err(last_error());
     }
+    let mut kc = if consumed { vec![0u16; k.len()] } else { Vec::new() };
+    if consumed {
+        let rc = unsafe { ffi::ignis_attn_tap_arm_consumed(kc.as_mut_ptr()) };
+        if rc != 0 {
+            let err = last_error();
+            unsafe {
+                ffi::ignis_attn_tap_disarm(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            return Err(err);
+        }
+    }
 
     struct Disarm {
         rows_written: Vec<i64>,
         queries_seen: Vec<i32>,
+        consumed_rows: Vec<i64>,
+        consumed_start: Vec<i64>,
         done: bool,
     }
     impl Drop for Disarm {
         fn drop(&mut self) {
             if !self.done {
                 unsafe {
-                    ffi::ignis_attn_tap_disarm(std::ptr::null_mut(), std::ptr::null_mut());
+                    ffi::ignis_attn_tap_disarm(
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
                 }
             }
         }
@@ -149,11 +260,18 @@ pub fn with_attn_tap<T>(
     let mut guard = Disarm {
         rows_written: vec![0; n_layers],
         queries_seen: vec![0; n_queries],
+        consumed_rows: vec![0; n_layers],
+        consumed_start: vec![-1; n_layers],
         done: false,
     };
     let value = f();
     let rc = unsafe {
-        ffi::ignis_attn_tap_disarm(guard.rows_written.as_mut_ptr(), guard.queries_seen.as_mut_ptr())
+        ffi::ignis_attn_tap_disarm(
+            guard.rows_written.as_mut_ptr(),
+            guard.queries_seen.as_mut_ptr(),
+            guard.consumed_rows.as_mut_ptr(),
+            guard.consumed_start.as_mut_ptr(),
+        )
     };
     guard.done = true;
     if rc != 0 {
@@ -169,8 +287,75 @@ pub fn with_attn_tap<T>(
             k,
             rows_written: std::mem::take(&mut guard.rows_written),
             queries_seen: std::mem::take(&mut guard.queries_seen),
+            kc,
+            consumed_rows: std::mem::take(&mut guard.consumed_rows),
+            consumed_chunk_start: std::mem::take(&mut guard.consumed_start),
         },
     ))
+}
+
+/// Where hq-e8-2b prompt attention takes a key from, for a query chunk that
+/// starts at `chunk_start` — the rule of `gqa_attention_prefill_hq_scratch_kernel`
+/// with the residual window wired and every ring slot valid (a fresh sequence
+/// prefilled in order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HqSource {
+    /// The chunk being prefilled: staged exact.
+    Fresh,
+    /// One of the 32 sink keys or the 512 before the chunk: exact, from the
+    /// residual side planes.
+    Side,
+    /// Everything else: decoded by the codec.
+    Codec,
+}
+
+/// Sink keys the hq residual window keeps exact (`kGqaHqSinkKeys`).
+pub const HQ_SINK_KEYS: usize = 32;
+/// Recent keys the hq residual ring keeps exact (`kGqaHqRecentKeys`).
+pub const HQ_RECENT_KEYS: usize = 512;
+
+/// [`HqSource`] of the key at `position` for a query chunk starting at `chunk_start`.
+pub fn hq_source(position: usize, chunk_start: usize) -> HqSource {
+    if position >= chunk_start {
+        HqSource::Fresh
+    } else if position < HQ_SINK_KEYS || position + HQ_RECENT_KEYS >= chunk_start {
+        HqSource::Side
+    } else {
+        HqSource::Codec
+    }
+}
+
+/// The engine-wide sign of coordinate `d` (`hq_engine_sign`,
+/// kernel/vendor/src/ops/kernel/hq_codec.cuh), bit for bit.
+pub fn hq_engine_sign(d: u32) -> f32 {
+    let mut x = 0x005E_ED01u32 ^ d.wrapping_mul(0x9E37_79B9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    if x & 1 == 1 { 1.0 } else { -1.0 }
+}
+
+/// The codec's rotation, `R = H * diag(signs) / 16`: signs, then a natural-order
+/// Walsh-Hadamard transform over 256 coordinates, then `1 / sqrt(256)` — the
+/// `hq_fwht256_sign` + `hq_store_rotated_row_warp` pair. Orthonormal, so
+/// `R q . R k == q . k`.
+pub fn hq_rotate(v: &[f32]) -> Vec<f32> {
+    assert_eq!(v.len(), HEAD_DIM, "hq_rotate: a row is {HEAD_DIM} coordinates");
+    let mut x: Vec<f32> = v.iter().enumerate().map(|(d, &a)| a * hq_engine_sign(d as u32)).collect();
+    let mut len = 1;
+    while len < HEAD_DIM {
+        for base in (0..HEAD_DIM).step_by(2 * len) {
+            for i in base..base + len {
+                let (a, b) = (x[i], x[i + len]);
+                x[i] = a + b;
+                x[i + len] = a - b;
+            }
+        }
+        len <<= 1;
+    }
+    let inv = 1.0 / (HEAD_DIM as f32).sqrt();
+    x.iter_mut().for_each(|a| *a *= inv);
+    x
 }
 
 /// A BF16 bit pattern as f32 (exact: BF16 is f32's top half).
@@ -208,6 +393,9 @@ mod tests {
             k: vec![0; 3 * KV_HEADS * HEAD_DIM],
             rows_written: vec![3],
             queries_seen: vec![1],
+            kc: Vec::new(),
+            consumed_rows: vec![0],
+            consumed_chunk_start: vec![-1],
         };
         let one = 0x3f80u16;
         cap.q[10 * HEAD_DIM] = one; // head 10, dim 0 = 1
@@ -218,5 +406,42 @@ mod tests {
         let s = cap.scores(0, 0, 10, &[0, 1, 2]);
         let scale = 1.0 / 16.0;
         assert_eq!(s, vec![1.0 * scale, 2.0 * scale, 3.0 * scale]);
+    }
+
+    #[test]
+    fn the_hq_rotation_is_orthonormal() {
+        // Two unlike rows: norms and the dot product survive the rotation,
+        // which is the whole reason a rotated query can score rotated keys.
+        let a: Vec<f32> = (0..HEAD_DIM).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.25).collect();
+        let b: Vec<f32> = (0..HEAD_DIM).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.5).collect();
+        let (ra, rb) = (hq_rotate(&a), hq_rotate(&b));
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        assert!((dot(&a, &a) - dot(&ra, &ra)).abs() < 1e-3 * dot(&a, &a));
+        assert!((dot(&a, &b) - dot(&ra, &rb)).abs() < 1e-3 * dot(&a, &a).max(dot(&b, &b)));
+        // and it is a rotation, not the identity
+        assert!(a.iter().zip(&ra).any(|(x, y)| (x - y).abs() > 1e-3));
+    }
+
+    #[test]
+    fn the_engine_signs_are_a_balanced_deterministic_diagonal() {
+        let signs: Vec<f32> = (0..HEAD_DIM as u32).map(hq_engine_sign).collect();
+        assert!(signs.iter().all(|&s| s == 1.0 || s == -1.0));
+        let plus = signs.iter().filter(|&&s| s == 1.0).count();
+        assert!((96..=160).contains(&plus), "{plus} of 256 positive");
+        assert_eq!(signs, (0..HEAD_DIM as u32).map(hq_engine_sign).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn hq_sources_follow_the_kernel_rule() {
+        // A query chunk starting at 1024: ring = [512, 1024), sinks = [0, 32).
+        assert_eq!(hq_source(0, 1024), HqSource::Side);
+        assert_eq!(hq_source(31, 1024), HqSource::Side);
+        assert_eq!(hq_source(32, 1024), HqSource::Codec);
+        assert_eq!(hq_source(511, 1024), HqSource::Codec);
+        assert_eq!(hq_source(512, 1024), HqSource::Side);
+        assert_eq!(hq_source(1023, 1024), HqSource::Side);
+        assert_eq!(hq_source(1024, 1024), HqSource::Fresh);
+        // A single-chunk prompt has no codec keys at all.
+        assert_eq!(hq_source(100, 0), HqSource::Fresh);
     }
 }

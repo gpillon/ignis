@@ -18,12 +18,23 @@
  *
  * **The keys are the ones before the cache, not the ones in it.** Under a
  * BF16 KV pool they are identical to what attention reads. Under hq-e8-2b
- * the attention kernel reads the codec's decode of them instead; this tap
- * does not see that. So an hq run through this tap measures everything the
- * codec did to the hidden states of *earlier* layers, and not what it does
- * to the armed layer's own scores. The difference is the codec's route
- * error (docs/findings/2026-09-12-hq-attention-route-agreement.md), and it
- * is stated wherever a number from this tap is reported.
+ * the attention kernel reads something else, from three sources: the current
+ * chunk's rows exact, the first 32 keys (the sinks) and the 512 before the
+ * chunk (the recent ring) exact from the residual side planes, and everything
+ * else decoded by the codec.
+ * `ignis_attn_tap_arm_consumed` adds that: after the attention op of the
+ * chunk holding the first query position, it copies the hq prompt route's
+ * own scratch planes -- every key the op consumed, in the codec's rotated
+ * frame -- so a host can score the head on the keys it really attended to.
+ * The rotated frame is orthonormal (R = H * diag(signs) / 16), so a query
+ * rotated the same way gives the same dot products.
+ *
+ * **In ignis the exact sources are off.** They exist only when the cache view
+ * carries the residual side planes, and `ignis_kv_batch_layer_view` never
+ * fills `residual_k` / `residual_v` / `ring_valid` -- so under hq-e8-2b every
+ * key attention reads, the current chunk's included, is the codec's decode.
+ * Measured, not assumed: crates/server/tests/attn_tap_hq_consumed_gpu.rs
+ * finds every row at the codec's own error and fails if one comes back exact.
  *
  * Positions are **cache positions** (the sequence index `run_gqa_layer`
  * appends at, `seq->gqa_positions`), not rotary positions. A multimodal
@@ -73,12 +84,38 @@ int32_t ignis_attn_tap_arm(const int32_t *gqa_ordinals, int32_t n_layers,
                            const int64_t *query_positions, int32_t n_queries,
                            int64_t max_positions, uint16_t *q_out, uint16_t *k_out);
 
+/* Also capture the keys the hq-e8-2b prompt attention consumed, for the
+ * chunk that holds `query_positions[0]` of the current arm. Call after
+ * `ignis_attn_tap_arm`, before the prefill.
+ *
+ * `kc_out`: caller-allocated, the same shape as `k_out`
+ * (`n_layers * max_positions * 4 * 256` uint16_t, [layer][position][kv_head]
+ * [dim]), receiving rows [0, visible) of the op's `scratch_k` plane in the
+ * codec's **rotated** frame. Nothing is written for a layer whose query chunk
+ * is not an hq prompt-route call (a BF16 or INT8 cache, a small-T width, or a
+ * history wider than one scratch band); `consumed_rows` reports 0 for it.
+ *
+ * The plane is found where the vendored op puts it: the first allocation of
+ * the attention workspace `run_gqa_layer` hands it
+ * (kernel/vendor/src/ops/wrapper/gqa_attention.cpp, the A1 prompt route),
+ * laid out [kv_head][span][256] as `gqa_attention_prefill_hq_scratch_kernel`
+ * writes it. A caller that relies on this should check it: rows of the
+ * current chunk are exact by construction, so the codec's rotation of the
+ * captured pre-cache keys must reproduce them. */
+int32_t ignis_attn_tap_arm_consumed(uint16_t *kc_out);
+
 /* Disarm, and report what was captured: for each armed layer, how many key
  * rows were written (`rows_written[n_layers]`, may be null), and for each
  * requested query position, whether its row was seen in *every* armed layer
  * (`queries_seen[n_queries]`, 0/1, may be null). A query position the
- * prefill never reached reads 0 there, which is the caller's to refuse. */
-int32_t ignis_attn_tap_disarm(int64_t *rows_written, int32_t *queries_seen);
+ * prefill never reached reads 0 there, which is the caller's to refuse.
+ * `consumed_rows[n_layers]` (may be null) is how many consumed-key rows each
+ * armed layer copied: 0 when the consumed capture was not armed or did not
+ * apply. `consumed_chunk_start[n_layers]` (may be null) is the cache position
+ * the captured chunk began at -- what decides which keys were exact and which
+ * the codec decoded -- or -1 with no capture. */
+int32_t ignis_attn_tap_disarm(int64_t *rows_written, int32_t *queries_seen,
+                              int64_t *consumed_rows, int64_t *consumed_chunk_start);
 
 const char *ignis_attn_tap_last_error(void);
 
@@ -92,6 +129,14 @@ const char *ignis_attn_tap_last_error(void);
 int32_t ignis_attn_tap_record(uint32_t gqa_ordinal, int64_t start_position, int32_t tokens,
                               const void *rotated_query, const void *rotated_key,
                               cudaStream_t stream);
+
+/* The hook `run_gqa_layer` calls after the attention op. `hq_prompt` is
+ * whether the op just ran the hq-e8-2b prompt route; `workspace` the base of
+ * the attention workspace it was handed; `span` the scratch plane's row
+ * count per KV head. Returns 0 when there is nothing to capture. */
+int32_t ignis_attn_tap_record_consumed(uint32_t gqa_ordinal, int64_t start_position,
+                                       int32_t tokens, bool hq_prompt, const void *workspace,
+                                       int64_t span, cudaStream_t stream);
 #endif
 
 #endif /* IGNIS_ATTN_TAP_H */

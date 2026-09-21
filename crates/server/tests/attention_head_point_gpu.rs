@@ -15,9 +15,44 @@
 //! `kernel/include/ignis_attn_tap.h`) captures the rotated query and key
 //! rows `run_gqa_layer` hands to the attention op, and the host forms
 //! `q . k / 16` for every (GQA layer, query head) over the image positions.
-//! Under hq-e8-2b the keys are the ones *given to* the codec, not the ones
-//! decoded from it — the header says so, and every hq number from here
-//! inherits that.
+//!
+//! **Under hq-e8-2b there are two readings, and only one is what attention
+//! computes.** The hq prompt route materializes the visible history into
+//! rotated-frame BF16 scratch planes and attends over those. The vendored
+//! kernel *can* fill them from three sources — the current chunk exact, the
+//! first 32 and the 512 rows before the chunk exact from a residual window,
+//! everything older decoded (`gqa_attention_prefill_hq.cuh`) — but the
+//! residual window is a feature a caller opts into by handing the KV view
+//! `residual_k`/`residual_v`/`ring_valid` (`core/paged_kv_cache.h`: "empty
+//! tensors mean the feature is off"), and **ignis hands it none**. So the
+//! launcher's `has_fresh` is false, no side row ever fires, and **every key
+//! this engine's hq attention reads is decoded by the codec** — measured on
+//! the first 4096 px capture, where the rows the three-source rule would
+//! have kept exact came back at the codec's own median 0.370 and max 0.762.
+//!
+//! - `IGNIS_POINT_KV=hq` scores against those scratch planes — the keys
+//!   attention *consumed*, captured after the op returns (`with_attn_tap_hq`).
+//!   The rotation is orthonormal, so rotating the query instead of
+//!   un-rotating the keys leaves `q . k` unchanged. This is the hq number.
+//! - `IGNIS_POINT_KV=hq-precodec` scores against the keys *given to* the
+//!   codec, which is what this test measured under hq before the consumed
+//!   capture existed (commit 94b9224's hq rows). Kept so those numbers can
+//!   be reproduced; it is not what attention reads.
+//!
+//! The consumed capture verifies itself, and a run that fails the check is
+//! not a measurement. Every prompt row on the armed head's KV head is
+//! compared with the rotated pre-codec key: **no row may be exact** (relative
+//! L2 under [`EXACT_ROW_REL_ERR`]) — one would mean the residual window has
+//! been switched on, the three-source rule now applies, and this test's
+//! expectation is out of date — and the rows' median must sit in the codec's
+//! own band, [`CODEC_ROW_MIN_MEDIAN`] to [`CODEC_ROW_MAX_MEDIAN`], which a
+//! mis-offset or mis-rotated capture (uncorrelated, ~1.4) cannot. The JSON
+//! also carries what the three-source rule *would* have kept exact, so the
+//! day the window is wired the difference is already on record.
+//!
+//! **Geometry.** With every key decoded, the codec fraction is 100% at every
+//! image size, so a 1024 px hq number is not flattered by exact rows the
+//! 4096 px prompt would lack. Set C4096 still exists for the resolution.
 //!
 //! **Two renders, because the vehicle did not measure the served prompt.**
 //! The vehicle rendered with `enable_thinking` undefined, which in this
@@ -46,6 +81,20 @@
 //! hq-e8-2b. Whether cross-validation still picks L39.h10 in the engine is
 //! reported by the scorer that reads this test's dump, not asserted here.
 //!
+//! **Pre-registered for set C** (2026-09-22, before any run on it, agreed
+//! between the same two sessions): set C is 240 new varied scenes at 1024 px
+//! (`scenes.py --varied --seed 20260923`), measured with the **served**
+//! render and **consumed hq** keys — the production configuration at this
+//! size. L39.h10 at least [`CRITERION_C_HEAD`] of 240, the guard at
+//! [`GUARD_DISTANCE`] (unchanged, not re-tuned) at least
+//! [`CRITERION_C_GUARD`]. These are **"not broken" floors, not "as good as
+//! before"**: the worst hq arm observed (230 head, 235 guard, keys before
+//! the codec) minus the same slack as the first criterion, because the
+//! codec on the armed layer may cost something and nobody has measured how
+//! much. Set C4096 (`--side 4096 --seed 20260924`, 240 scenes, same render
+//! and KV) is **reported and not evaluated**: it is the regime production
+//! serves, and nothing about it was known when these floors were written.
+//!
 //! **Scenes.** `IGNIS_POINT_SCENES=<dir with manifest.json>` runs a generated
 //! set (`.scratch/latent-probe/scenes` or `scenes-varied`, 1024 px, per-scene
 //! `instruction` and `kind` in the varied one). Without it, the committed
@@ -54,11 +103,16 @@
 //! measured inside on all three) and only *prints* L39.h10, because asserting
 //! an unmeasured regime would turn a guess into a guarantee.
 //!
-//! `IGNIS_POINT_KV=bf16|hq` (default bf16), `IGNIS_POINT_LIMIT=<n>` for a
-//! smoke run (the criterion is asserted only on a full 240), and
+//! `IGNIS_POINT_KV=bf16|hq|hq-precodec` (default bf16),
+//! `IGNIS_POINT_LAYERS=all|head` (default: all GQA layers at 1024 px and
+//! below, only the head's layer above — at 4096 px sixteen layers of keys
+//! are ~0.5 GB of host memory per scene and the head is already fixed),
+//! `IGNIS_POINT_LIMIT=<n>` for a smoke run (a criterion is asserted only on
+//! a full 240), and
 //! `IGNIS_POINT_OUT=<dir>` for the dump (default: the OS temp dir). The dump
-//! is `<set>-<render>-<kv>.bin` — every head's scores as little-endian f16,
-//! `[scene][GQA layer 0..16][query head 0..24][image position]` — and a
+//! is `<set>-<render>-<kv>.bin` — every armed head's scores as
+//! little-endian f16, `[scene][armed GQA layer][query head 0..24][image
+//! position]` — and a
 //! `.json` beside it with everything a scorer needs, including the full
 //! rendered text of the first scene so it can be compared byte for byte with
 //! the vehicle's own render.
@@ -76,7 +130,7 @@ use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
     ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
 };
-use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap};
+use ignis_core::attn_tap::{GQA_LAYERS, HqSource, Q_HEADS, hq_source, with_attn_tap, with_attn_tap_hq};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
@@ -113,11 +167,38 @@ const REGION_THRESHOLD: f64 = 0.5;
 /// 0-999 units of the side, is taken to have picked the wrong element.
 const GUARD_DISTANCE: f64 = 60.0;
 
-/// Pre-registered, vehicle render only (module docs).
+/// The generated sets, named by the seed their manifest records — so a
+/// criterion is tied to the exact scenes it was written for, not to a
+/// property another set could share (`varied` is true of B and C alike).
+const SEED_A: u64 = 20_260_921;
+const SEED_B: u64 = 20_260_922;
+const SEED_C: u64 = 20_260_923;
+const SEED_C4096: u64 = 20_260_924;
+
+/// Pre-registered 2026-09-21: sets A and B, vehicle render, BF16 keys and
+/// the keys given to the hq codec (module docs).
 const CRITERION_SCENES: usize = 240;
 const CRITERION_A: usize = 230;
 const CRITERION_B: usize = 227;
 const CRITERION_GUARD: usize = 237;
+
+/// Pre-registered 2026-09-22, before any run on set C: served render,
+/// consumed hq keys, 1024 px. "Not broken" floors (module docs).
+const CRITERION_C_HEAD: usize = 224;
+const CRITERION_C_GUARD: usize = 233;
+
+/// Under this relative L2 against the rotated pre-codec key a row was read
+/// exact, i.e. not through the codec; this engine reads none that way. The
+/// same bound as `attn_tap_hq_consumed_gpu.rs`: exact rows sit near 0.004,
+/// the codec's lowest row on a 4096 px prompt at 0.333, so 0.1 is far from
+/// both.
+const EXACT_ROW_REL_ERR: f64 = 0.1;
+/// The codec's own per-row error band on real rows: median ~0.37, max
+/// ~0.77 (`docs/findings/2026-09-12-hq-attention-route-agreement.md`). A
+/// median below the floor was not quantized; above the ceiling the capture
+/// is not aligned with the keys it claims to be (uncorrelated rows sit ~1.4).
+const CODEC_ROW_MIN_MEDIAN: f64 = 0.2;
+const CODEC_ROW_MAX_MEDIAN: f64 = 0.6;
 
 const DEFAULT_INSTRUCTION: &str = "click the blue button";
 
@@ -130,6 +211,8 @@ const SERVED_TAIL: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 #[derive(Deserialize)]
 struct Manifest {
     side: u32,
+    #[serde(default)]
+    seed: Option<u64>,
     scenes: Vec<Scene>,
 }
 
@@ -226,12 +309,63 @@ impl Render {
     }
 }
 
-fn kv_from_env() -> KvFormat {
-    match std::env::var("IGNIS_POINT_KV").as_deref() {
-        Err(_) | Ok("bf16") => KvFormat::Bf16,
-        Ok("hq") => KvFormat::HqE8_2b,
-        Ok(other) => panic!("IGNIS_POINT_KV must be bf16 or hq, not {other:?}"),
+/// Which keys the scores are formed against (module docs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KvMode {
+    Bf16,
+    /// hq-e8-2b, the keys attention consumed: fresh, side and decoded rows.
+    HqConsumed,
+    /// hq-e8-2b, the keys given to the codec (the pre-consumed-capture hq).
+    HqPrecodec,
+}
+
+impl KvMode {
+    fn from_env() -> Self {
+        match std::env::var("IGNIS_POINT_KV").as_deref() {
+            Err(_) | Ok("bf16") => Self::Bf16,
+            Ok("hq") => Self::HqConsumed,
+            Ok("hq-precodec") => Self::HqPrecodec,
+            Ok(other) => panic!("IGNIS_POINT_KV must be bf16, hq or hq-precodec, not {other:?}"),
+        }
     }
+
+    fn format(self) -> KvFormat {
+        match self {
+            Self::Bf16 => KvFormat::Bf16,
+            Self::HqConsumed | Self::HqPrecodec => KvFormat::HqE8_2b,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::HqConsumed => "hq",
+            Self::HqPrecodec => "hq-precodec",
+        }
+    }
+}
+
+/// The start of the prefill chunk holding `position`, cut exactly as
+/// `support::vision_canary::prefill_prompt` cuts it (`cap_chunk`, then the
+/// chunk width). The hq route's fresh/side/codec rule is relative to it.
+fn chunk_start_of(prompt: &Multimodal, total: u32, chunk: u32, position: u32) -> u32 {
+    let mut start = 0u32;
+    while start < total {
+        let len = prompt.cap_chunk(start, chunk.min(total - start));
+        if position < start + len {
+            return start;
+        }
+        start += len;
+    }
+    panic!("position {position} is past the prompt's {total} tokens")
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    Some(values[values.len() / 2])
 }
 
 fn fixture_dir() -> PathBuf {
@@ -404,7 +538,8 @@ fn f32_to_f16(value: f32) -> u16 {
 #[ignore = "GPU profile only, with --features attn-tap"]
 fn one_attention_head_points_in_the_engine() {
     let render = Render::from_env();
-    let kv_format = kv_from_env();
+    let kv_mode = KvMode::from_env();
+    let kv_format = kv_mode.format();
     let (dir, generated) = match std::env::var("IGNIS_POINT_SCENES") {
         Ok(dir) => (PathBuf::from(dir), true),
         Err(_) => (fixture_dir(), false),
@@ -501,7 +636,23 @@ fn one_attention_head_points_in_the_engine() {
     .unwrap_or_else(|e| panic!("seq pool create: {e}"));
     let vocab = ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = vec![0f32; vocab];
-    let ordinals: Vec<i32> = (0..GQA_LAYERS as i32).collect();
+    let head_only = match std::env::var("IGNIS_POINT_LAYERS").as_deref() {
+        Err(_) => manifest.side > 1024,
+        Ok("all") => false,
+        Ok("head") => true,
+        Ok(other) => panic!("IGNIS_POINT_LAYERS must be all or head, not {other:?}"),
+    };
+    let ordinals: Vec<i32> = if head_only {
+        vec![HEAD_ORDINAL as i32]
+    } else {
+        (0..GQA_LAYERS as i32).collect()
+    };
+    // Where the head's layer sits among the armed ones: the capture indexes
+    // by that, not by ordinal.
+    let head_layer = ordinals
+        .iter()
+        .position(|&o| o as usize == HEAD_ORDINAL)
+        .expect("the head's layer is always armed");
     let side = f64::from(manifest.side);
 
     eprintln!(
@@ -509,7 +660,7 @@ fn one_attention_head_points_in_the_engine() {
         scenes.len(),
         if varied { ", varied" } else { "" },
         render.name(),
-        kv_format.as_str(),
+        kv_mode.name(),
         4 * HEAD_ORDINAL + 3,
         HEAD_Q
     );
@@ -520,6 +671,9 @@ fn one_attention_head_points_in_the_engine() {
     let mut grid: Option<(usize, usize)> = None;
     let mut first_render: Option<String> = None;
     let (mut head_hits, mut chain_hits, mut guard_hits) = (0usize, 0usize, 0usize);
+    // Consumed-capture self-check failures, collected so the dump is written
+    // before any of them fails the run.
+    let mut verify_failures: Vec<String> = Vec::new();
 
     for scene in &scenes {
         let bytes = std::fs::read(dir.join(&scene.image))
@@ -598,8 +752,13 @@ fn one_attention_head_points_in_the_engine() {
         let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
         logits.fill(0.0);
 
+        // The chunk the query sits in: the hq route's fresh/side/codec rule is
+        // relative to its start.
+        let query_chunk_start =
+            chunk_start_of(&prompt, tokens.len() as u32, PREFILL_CHUNK, query as u32) as usize;
+
         // ── one armed prefill ────────────────────────────────────────────
-        let (prefilled, capture) = with_attn_tap(&ordinals, &[query as i64], max_positions, || {
+        let run = || {
             prefill_prompt(
                 &model,
                 &pool,
@@ -610,7 +769,13 @@ fn one_attention_head_points_in_the_engine() {
                 PREFILL_CHUNK,
                 &mut logits,
             )
-        })
+        };
+        let (prefilled, capture) = match kv_mode {
+            KvMode::HqConsumed => with_attn_tap_hq(&ordinals, &[query as i64], max_positions, run),
+            KvMode::Bf16 | KvMode::HqPrecodec => {
+                with_attn_tap(&ordinals, &[query as i64], max_positions, run)
+            }
+        }
         .unwrap_or_else(|e| panic!("{}: attention tap: {e}", scene.id));
         prefilled.unwrap_or_else(|e| panic!("{}: prefill: {e}", scene.id));
         assert_eq!(capture.queries_seen, vec![1], "{}: the query row was not captured", scene.id);
@@ -622,20 +787,103 @@ fn one_attention_head_points_in_the_engine() {
             capture.rows_written
         );
 
-        // ── every head's scores, into the dump ───────────────────────────
+        // ── the consumed capture checks itself before it is used ─────────
+        let mut hq_stats = serde_json::Value::Null;
+        if kv_mode == KvMode::HqConsumed {
+            let consumed = capture.consumed_rows[head_layer] as usize;
+            if consumed != tokens.len() {
+                verify_failures.push(format!(
+                    "{}: the head's layer consumed {consumed} rows, expected {} (not captured?)",
+                    scene.id,
+                    tokens.len()
+                ));
+            }
+            // The chunk the capture came from, as the kernel reports it, and as
+            // this test computes it from the prompt's own chunking: two sources
+            // for the boundary the whole fresh/side/codec rule hangs on.
+            let captured_start = capture.consumed_chunk_start[head_layer];
+            if captured_start != query_chunk_start as i64 {
+                verify_failures.push(format!(
+                    "{}: the capture's chunk starts at {captured_start}, the prompt's chunking \
+                     puts the query's chunk at {query_chunk_start}",
+                    scene.id
+                ));
+            }
+            let query_chunk_start = captured_start.max(0) as usize;
+            // Every row of the prompt on the head's own KV head, classified by
+            // the kernel's rule and compared with the rotated pre-codec key.
+            let kv_head = HEAD_Q / (Q_HEADS / 4);
+            let (mut fresh, mut side, mut codec) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut image_codec_rule, mut image_codec_measured) = (0usize, 0usize);
+            for position in 0..tokens.len() {
+                let err = f64::from(capture.consumed_key_rel_err(head_layer, position, kv_head));
+                let source = hq_source(position, query_chunk_start);
+                match source {
+                    HqSource::Fresh => fresh.push(err),
+                    HqSource::Side => side.push(err),
+                    HqSource::Codec => codec.push(err),
+                }
+                if (begin..begin + count).contains(&position) {
+                    image_codec_rule += usize::from(matches!(source, HqSource::Codec));
+                    image_codec_measured += usize::from(err >= EXACT_ROW_REL_ERR);
+                }
+            }
+            // This engine wires no residual window, so every row is decoded:
+            // an exact one means that changed.
+            let mut all: Vec<f64> = fresh.iter().chain(&side).chain(&codec).copied().collect();
+            let exact = all.iter().filter(|&&e| e < EXACT_ROW_REL_ERR).count();
+            if exact > 0 {
+                verify_failures.push(format!(
+                    "{}: {exact} of {} rows were read exact — the hq residual window is on in this \
+                     build, the kernel's three-source rule applies, and this harness's expectation \
+                     (every key decoded) is out of date",
+                    scene.id,
+                    all.len()
+                ));
+            }
+            let all_median = median(&mut all).unwrap_or(f64::NAN);
+            if !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&all_median) {
+                verify_failures.push(format!(
+                    "{}: the captured keys sit at median rel L2 {all_median:.4} from the rotated \
+                     pre-codec keys, outside the codec's band [{CODEC_ROW_MIN_MEDIAN}, \
+                     {CODEC_ROW_MAX_MEDIAN}] — the capture is not the keys attention consumed",
+                    scene.id
+                ));
+            }
+            hq_stats = serde_json::json!({
+                "query_chunk_start": query_chunk_start,
+                // What the three-source rule would put through the codec if
+                // the residual window were wired, beside what was measured.
+                "codec_fraction_if_window_on": image_codec_rule as f64 / count as f64,
+                "codec_fraction_measured": image_codec_measured as f64 / count as f64,
+                "rows": {"fresh": fresh.len(), "side": side.len(), "codec": codec.len()},
+                "median_rel_err_all": all_median,
+                "median_rel_err_by_rule_class": {
+                    "fresh": median(&mut fresh),
+                    "side": median(&mut side),
+                    "codec": median(&mut codec),
+                },
+            });
+        }
+
+        // ── every armed head's scores, into the dump ─────────────────────
         let mut head_scores: Vec<f32> = Vec::new();
-        for layer in 0..GQA_LAYERS {
+        for layer in 0..ordinals.len() {
             for q_head in 0..Q_HEADS {
-                let scores = capture.scores(layer, 0, q_head, &image_positions);
+                let scores = match kv_mode {
+                    KvMode::HqConsumed => capture.consumed_scores(layer, 0, q_head, &image_positions),
+                    KvMode::Bf16 | KvMode::HqPrecodec => capture.scores(layer, 0, q_head, &image_positions),
+                };
                 assert!(
                     scores.iter().all(|s| s.is_finite()),
-                    "{}: non-finite score at ordinal {layer} head {q_head}",
-                    scene.id
+                    "{}: non-finite score at ordinal {} head {q_head}",
+                    scene.id,
+                    ordinals[layer]
                 );
                 for &s in &scores {
                     dump.extend_from_slice(&f32_to_f16(s).to_le_bytes());
                 }
-                if layer == HEAD_ORDINAL && q_head == HEAD_Q {
+                if layer == head_layer && q_head == HEAD_Q {
                     head_scores = scores;
                 }
             }
@@ -707,6 +955,7 @@ fn one_attention_head_points_in_the_engine() {
             "chain_inside": chain_in,
             "guard_distance": distance,
             "guard_inside": guard_in,
+            "hq": hq_stats,
         }));
     }
 
@@ -715,21 +964,28 @@ fn one_attention_head_points_in_the_engine() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("ignis-attention-head-point"));
     std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
-    let stem = format!("{set_name}-{}-{}", render.name(), kv_format.as_str());
+    let stem = format!("{set_name}-{}-{}", render.name(), kv_mode.name());
     let (gh, gw) = grid.expect("at least one scene");
     let meta = serde_json::json!({
         "set": set_name,
         "render": render.name(),
-        "kv": kv_format.as_str(),
+        "kv": kv_mode.name(),
+        "kv_format": kv_format.as_str(),
+        "seed": manifest.seed,
         "side": manifest.side,
         "grid": [gh, gw],
         "n_image": n_image,
         "layers": ordinals.iter().map(|o| 4 * o + 3).collect::<Vec<_>>(),
         "q_heads": Q_HEADS,
         "dtype": "f16-le",
-        "shape": [rows.len(), GQA_LAYERS, Q_HEADS, n_image],
+        "shape": [rows.len(), ordinals.len(), Q_HEADS, n_image],
         "scores": "q . k / 16 over the image positions, before softmax",
-        "hq_keys_note": "under hq-e8-2b the keys are those given to the codec, not decoded from it",
+        "keys": match kv_mode {
+            KvMode::Bf16 => "the BF16 keys attention reads",
+            KvMode::HqConsumed => "the rotated-frame scratch rows the hq route consumed (query rotated to match)",
+            KvMode::HqPrecodec => "the keys given to the hq codec, NOT what attention reads",
+        },
+        "verify_failures": verify_failures,
         "head": {"ordinal": HEAD_ORDINAL, "layer": 4 * HEAD_ORDINAL + 3, "q_head": HEAD_Q},
         "region_threshold": REGION_THRESHOLD,
         "guard_distance": GUARD_DISTANCE,
@@ -749,10 +1005,19 @@ fn one_attention_head_points_in_the_engine() {
         "attention head point: {set_name} {} {}: head L{}.h{} {head_hits}/{n}, chain {chain_hits}/{n}, \
          guard {guard_hits}/{n}; dump {}",
         render.name(),
-        kv_format.as_str(),
+        kv_mode.name(),
         4 * HEAD_ORDINAL + 3,
         HEAD_Q,
         out_dir.join(&stem).display()
+    );
+
+    // A consumed capture that failed its own check is not a measurement,
+    // whatever it scored — asserted before any criterion, after the dump.
+    assert!(
+        verify_failures.is_empty(),
+        "the consumed-hq capture failed its self-check on {} scene(s):\n{}",
+        verify_failures.len(),
+        verify_failures.join("\n")
     );
 
     // ── what is asserted, and where ──────────────────────────────────────
@@ -768,19 +1033,40 @@ fn one_attention_head_points_in_the_engine() {
         }
         return;
     }
-    if render == Render::Vehicle && n == CRITERION_SCENES {
-        let floor = if varied { CRITERION_B } else { CRITERION_A };
+    if n != CRITERION_SCENES {
+        return;
+    }
+    // Each criterion names its set by seed, its render and its keys: the
+    // arms it was written for, and no other.
+    let criterion = match (manifest.seed, render, kv_mode) {
+        (Some(SEED_A), Render::Vehicle, KvMode::Bf16 | KvMode::HqPrecodec) => {
+            Some(("A (2026-09-21)", CRITERION_A, CRITERION_GUARD))
+        }
+        (Some(SEED_B), Render::Vehicle, KvMode::Bf16 | KvMode::HqPrecodec) => {
+            Some(("B (2026-09-21)", CRITERION_B, CRITERION_GUARD))
+        }
+        (Some(SEED_C), Render::Served, KvMode::HqConsumed) if manifest.side == 1024 => {
+            Some(("C (2026-09-22)", CRITERION_C_HEAD, CRITERION_C_GUARD))
+        }
+        // Set C4096 is the production regime and was written down as
+        // reported, not evaluated; so is every arm not named above.
+        (Some(SEED_C4096), _, _) => None,
+        _ => None,
+    };
+    if let Some((name, head_floor, guard_floor)) = criterion {
         assert!(
-            head_hits >= floor,
-            "pre-registered criterion: L39.h10 must land inside on at least {floor}/{n} of {set_name} \
-             ({} KV); it did on {head_hits}",
-            kv_format.as_str()
+            head_hits >= head_floor,
+            "pre-registered criterion {name}: L39.h10 must land inside on at least {head_floor}/{n} \
+             ({} render, {} keys); it did on {head_hits}",
+            render.name(),
+            kv_mode.name()
         );
         assert!(
-            guard_hits >= CRITERION_GUARD,
-            "pre-registered criterion: the guard at d={GUARD_DISTANCE} must land inside on at least \
-             {CRITERION_GUARD}/{n} of {set_name} ({} KV); it did on {guard_hits}",
-            kv_format.as_str()
+            guard_hits >= guard_floor,
+            "pre-registered criterion {name}: the guard at d={GUARD_DISTANCE} must land inside on at \
+             least {guard_floor}/{n} ({} render, {} keys); it did on {guard_hits}",
+            render.name(),
+            kv_mode.name()
         );
     }
 }

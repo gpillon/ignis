@@ -228,6 +228,23 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         gate.view({kHeadDim, kQHeads, tokens, 1}), attention_scale, batch_cache, envelope,
         attention_workspace, attention_heads, stream);
 
+    // Test-only: the keys the hq prompt route actually consumed
+    // (kernel/include/ignis_attn_tap.h). The route is asked of the same
+    // resolver the workspace was sized by, never inferred from a width.
+    if (ignis_attn_tap_record_consumed(
+            gqa_layer, start_position, tokens,
+            batch_cache.dtype == ninfer::DType::U8 &&
+                ninfer::ops::detail::gqa_attention_resolve_route(kQHeads, tokens, 1,
+                                                                 batch_cache.dtype, envelope) ==
+                    ninfer::ops::detail::GqaAttentionRoute::Prompt,
+            attention_workspace_storage.data,
+            static_cast<std::int64_t>(std::min<std::uint32_t>(
+                envelope.max_visible_keys, ninfer::ops::kGqaHqPromptScratchBandKeys)),
+            stream) != 0) {
+      set_error(std::string("ignis_gqa_layer: ") + ignis_attn_tap_last_error());
+      return -1;
+    }
+
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
     error = cudaMemcpyAsync(out_residual, in_residual,
                             static_cast<std::size_t>(hidden) * tokens * sizeof(uint16_t),
