@@ -151,6 +151,37 @@ scenes where it points at a different button. An off-distribution prompt is a
 plausible contributor to exactly that kind of failure, and it costs one
 prompt string to test.
 
+## Measured afterwards: the format is not the tail
+
+The one cheap implication above was tested the same day, because it cost a
+prompt string and the harness was warm. Same 240 scenes, same schedule
+shape, same predicate; only the system text and the forced literals change,
+from `{"x":` / `,"y":` to the trained `[{"point_2d": [` / `, `.
+
+| arm | inside | median err x / y | mean x / y | gross failures |
+|---|---|---|---|---|
+| ours (`point_system`) | 218 / 240 | 0.8 / 0.6 | 21.6 / 33.4 | 22 |
+| native (`point_2d`) | 218 / 240 | 0.7 / 0.5 | 21.6 / 35.4 | 22 |
+
+**They are the same answer.** The two formats agree on the inside predicate
+on **240 of 240** scenes — the native arm rescues none of the 22 that ours
+misses and loses none that ours has — and on those 22 failures they land a
+median of **(0, 1) units of 999** apart, within 50 units of each other on 19
+of them. On the 218 successes they disagree by (0, 0).
+
+**So the catastrophic tail is perception, not serialization.** It tracks
+target size instead: the failed scenes have a median button 13.5% of the
+side wide and 3.6% tall, against 17.7% and 4.7% for the ones that work. The
+model is not picking a different element because it was asked in an
+unfamiliar shape; it is missing small targets, and it misses them the same
+way in its own dialect.
+
+This is a real negative for the cheapest idea in this finding, and it is
+worth its own sentence: **the output shape is not load-bearing here.**
+ADR 0034's rule that a reworded instruction is an unmeasured one stands as a
+rule about not *assuming* — it was measured, between these two shapes, on
+this task, and it did not matter.
+
 ## Implications
 
 - **Spec 11's C2 (set-of-mark) should be demoted, not promoted.** It was the
@@ -161,8 +192,11 @@ prompt string to test.
   needs an experiment in the PyTorch vehicle before any kernel work — the
   harness and the 240 scenes exist, and `output_attentions=True` on the GQA
   layers is free there.
-- **Run the format A/B first.** It is one string, it uses the existing
-  harness, and it targets the chain's actual failure mode.
+- **The format A/B is done and came back null** (above). The tail is not the
+  prompt shape, so what is left of the tail is a target-size problem — and
+  the width walk already has a lever for that
+  (`2026-09-21-vision-tower-cost-at-width.md`: `box` was *most* accurate at
+  2048 px, not at 4096).
 - **The `<|box_start|>` / `<|object_ref_start|>` route stays untested**, as
   the pointing finding already noted. The trained JSON shape is now the more
   promising of the two.
