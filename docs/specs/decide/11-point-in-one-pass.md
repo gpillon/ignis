@@ -124,35 +124,44 @@ this document too.
 the position a one-pass point would read, the latent holds the digit it is
 about to emit and little more: a cross-validated probe lands inside the
 button on 97 of 240 scenes, 111 with an RBF kernel, where the chain lands
-218. And a fitted probe is strictly stronger than a fixed readout into the
-vocabulary, so **that ceiling bounds every one-position reading of that
-position** — C1, C1b and C4 below included. The arithmetic about strip
-widths was about quantizing something that is not there.
+218.
 
-What that leaves standing is named in *What survives E-P1* below. The
-candidates are kept as written: they were argued before the measurement and
-the measurement is what a study is for.
+**What that bound covers is the digit prompt, and only it.** A fitted probe
+is stronger than any fixed readout of *the same residual*, so C3's first
+read is bounded. C1b and C4 declare **strips** rather than digits, so at
+that position the model is about to emit something else and the residual is
+a different vector — which is the finding's own rule about what a residual
+holds. So **E1 below is open**, and it is the experiment that decides the
+sidestep column rather than a corollary of one that is already run. What the
+probe does hand it is a prior: about ten buckets of resolution were measured
+at one position, so C4's 11 and 13 strips sit right at it and C1b's 26 is a
+stretch beyond it.
+
+The candidates are kept as written: they were argued before the measurement
+and the measurement is what a study is for.
 
 ## What survives E-P1
 
-Three things, and the order has changed:
+Four things, and the order has changed:
 
 1. **A box in two passes** — untouched, and now the interesting half of this
    document. Its second pass forces the first pass's digits, which is
    precisely the conditioning the probe result says the model needs; and its
    certificate is unaffected by anything measured.
-2. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
+2. **C1b and C4**, unbounded by E-P1 and waiting on E1, with a prior of
+   about ten buckets of resolution at one position.
+3. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
    later positions know progressively more, which is C3's own premise read
    from the other side. E2 is still the experiment that prices it.
-3. **A shorter chain.** Not in the original list, and it comes out of the
+4. **A shorter chain.** Not in the original list, and it comes out of the
    measurement: a probe at `y1` is 187/240 after five rounds where the chain
    is 218 after nine. Fewer rounds at a known cost in acceptance is a
    product decision nobody has been offered.
 
-What is gone is the *sidestep* column — the hope that one position could be
-asked for the whole coordinate. The bar below is kept because it is how that
-column was ranked, and because a reader who wants to know why C1 was dropped
-before E-P1 ever ran should find the arithmetic that dropped it.
+What E-P1 did settle is that **the latent is not a shortcut around the
+chain**, and that the bar below has to be scored as a predicate: the chain's
+median error is 0.8 units of 999 and its mean is 21.6, so a mean comparison
+between it and anything else is meaningless.
 
 ## The bar every candidate is measured against
 
@@ -388,7 +397,8 @@ Finding: `docs/findings/2026-09-21-the-grid-a-bigram-can-name.md`. It killed
 C1 as a point answer and promoted C1b, which is what an experiment ordered
 first is for.
 
-**E1 - can the model read a declared grid at all?** The existing harness
+**E1 - can the model read a declared grid at all?** *(the decisive one for
+the sidestep column; E-P1 did not close it — see above)* The existing harness
 (`classify_pointing_gpu.rs`: three scenes, `out_logits` already wired), one
 readout, no new code. Two questions in one experiment, because they share a
 prefill: the 9 x 9 bigram cell (C1 as a coarse pass) and the 26-strip single

@@ -27,10 +27,18 @@ leading-digit baseline of 25.0, and y to 148 against a chance of 204. On the
 predicate that matters — inside the button — the best probe is 97/240
 linear and 111/240 with an RBF kernel, where the chain itself is 218/240.
 
-**It closes more than the probe.** A readout is a *fixed* linear map into
-the vocabulary; a probe is the best *estimable* linear map into the answer.
-The probe is the stronger instrument, so its ceiling bounds every
-one-position reading of `x0` — which takes spec 11's C1, C1b and C4 with it.
+**What it closes, and what it does not.** A readout is a *fixed* linear map
+into the vocabulary; a probe is the best *estimable* linear map into the
+answer. The probe is the stronger instrument, so its ceiling bounds every
+one-position reading of the `x0` residual **under the digit prompt**.
+
+It does **not** bound spec 11's C1b and C4, and an earlier draft of this
+section said it did. Those declare *strips*, not digits, so the position is
+about to emit something else and its residual is a different vector — which
+is this finding's own rule about what a residual holds. What the result
+gives them is a prior: ten buckets of resolution at one position, so C4's 11
+and 13 sit at it and C1b's 26 is a stretch. Spec 11's E1 is therefore
+**open**, not closed.
 
 **What survived the checks that could have made it an artefact.** The
 permuted control sits exactly at the predict-the-mean baseline, so nothing
@@ -156,6 +164,13 @@ about how finely to quantize something that is not there.
 This is why E-P1 runs before anything else in either study.
 
 ## Fit it to the chain, not to the truth
+
+> **What happened instead.** The generated scenes have a ground truth by
+> construction — the harness places the button — so truth was free after all
+> and became the headline target. The chain stayed the *discriminator's*
+> target, which is where the argument below actually bites: the
+> leading-digit baseline is about reproducing the chain's own spelling. The
+> reasoning below is why the fallback existed, not what was done.
 
 The probe's target is **the chain's own output**, not the button's true
 centre. Three reasons, and they are not a compromise:
