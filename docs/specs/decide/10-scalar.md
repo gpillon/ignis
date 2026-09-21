@@ -129,9 +129,9 @@ nothing: the first two are structure and the third is the end.
 - Spec 06 (`number`, `point`, `box`), whose fixed field this relaxes.
 - Finding: `docs/findings/2026-09-21-the-number-prompt-declares-an-alignment.md`
   — why a fixed field has two ends, and the measurement that closed it.
-- `docs/findings/2026-09-21-scalar-readout-legend-width.md` measured a
-  *different* `scalar`: a readout over a legend of cells, on branch
-  `scalar-readout`. That branch is superseded by this one and the name is
-  reused deliberately. Its measurement stands on its own — a grid's accuracy
-  is bounded by the legend's width — and is the reason this primitive
-  generates rather than reads.
+- [Spec 08](08-scalar-readout.md) and
+  `docs/findings/2026-09-21-scalar-readout-legend-width.md` are a *different*
+  `scalar`: a readout over a legend of cells, built and measured and then
+  left unimplemented. The name is reused deliberately. That measurement
+  stands on its own — a grid's accuracy is bounded by its legend's width —
+  and is the reason this primitive generates rather than reads.
