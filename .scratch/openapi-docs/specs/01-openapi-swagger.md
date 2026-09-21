@@ -263,8 +263,12 @@ alone.
   "navigate to `/v1`" behaviour with no catch-all next to the inference
   routes. The assets are looked up by exact name, so no request path
   reaches outside the table.
-- Updating Swagger UI is a manual `npm pack swagger-ui-dist@<version>`
-  copy, written down in the vendored directory's `IGNIS-VENDOR.md`.
+- Updating Swagger UI is an npm bump plus one make target: the version is
+  pinned in `web/package.json` (`swagger-ui-dist`, exact),
+  `make swagger-ui-sync` copies that pin's files into the assets directory,
+  and `make swagger-ui-check` — inside `make ci` — fails when the vendored
+  copy and the pin disagree. The vendored directory is a copy, never a
+  fork; hand-editing a file there fails the same check.
 - The version in the document comes from `CARGO_PKG_VERSION`, so it
   follows the four-file version bump already in the release routine.
 - Repo formatting rule stands: the diff is attributes and new files, and

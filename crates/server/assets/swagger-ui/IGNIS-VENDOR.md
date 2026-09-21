@@ -27,14 +27,19 @@ platform.
 
 ## Updating
 
+The version lives where every other frontend dependency's does —
+`web/package.json` (`swagger-ui-dist`, pinned exactly). The files here are a
+copy of what that pin installs:
+
 ```sh
-npm pack swagger-ui-dist@<version>
-tar xzf swagger-ui-dist-<version>.tgz
-cp package/swagger-ui.css package/swagger-ui-bundle.js \
-   package/swagger-ui-bundle.js.LICENSE.txt package/LICENSE package/NOTICE \
-   crates/server/assets/swagger-ui/
+npm --prefix web install --save-dev --save-exact swagger-ui-dist@<version>
+make swagger-ui-sync     # copies the files here and rewrites the line above
+make ci                  # swagger-ui-check fails if the two ever disagree
 ```
 
-Then bump the version at the top of this file and run
-`cargo test -p ignis-server --test openapi_http`, which loads the page and
-its assets through the router.
+`make swagger-ui-check` runs inside `make ci`, comparing every file here
+against `web/node_modules/swagger-ui-dist`, so a bump that was not synced —
+or a hand-edited file here — fails the gate instead of shipping. The page
+that drives these files is `crates/server/src/openapi.rs`'s `PAGE_HTML`, so
+a new Swagger UI major is worth a look at
+`http://127.0.0.1:8000/v1` before committing.

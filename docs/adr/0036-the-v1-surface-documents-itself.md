@@ -76,7 +76,12 @@ contract. Neither is regenerated from the other.
   stated in prose: that a JSON evidence reaches the model in the order its
   keys were written, and that a `choice`'s options are read in declared
   order. The schemas for those fields are free-form JSON.
-- The binary grows by the vendored distribution (~1.8 MB). Updating Swagger
-  UI is a manual `npm pack` copy, recorded in `IGNIS-VENDOR.md`.
+- The binary grows by the vendored distribution (~1.8 MB). The *version* is
+  not vendored: `swagger-ui-dist` is pinned in `web/package.json` like every
+  other frontend dependency, `make swagger-ui-sync` copies that pin's files
+  into the assets directory, and `make swagger-ui-check` — inside `make ci` —
+  fails when the copy and the pin disagree. A bump is therefore an npm bump
+  plus one make target, and a forgotten sync fails the gate rather than
+  shipping.
 - An operator on an air-gapped machine gets the same page as everyone else:
   nothing on it is fetched from a CDN.
