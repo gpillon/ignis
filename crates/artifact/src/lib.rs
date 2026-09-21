@@ -771,6 +771,7 @@ mod direct_io {
 #[cfg(unix)]
 mod direct_io {
     use libc::{close, open, pread, O_CLOEXEC, O_DIRECT, O_RDONLY};
+    use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
     pub struct DirectFile {
@@ -779,9 +780,16 @@ mod direct_io {
 
     impl DirectFile {
         pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
-            let bytes = path.as_os_str().as_bytes();
-            let ptr = bytes.as_ptr() as *const libc::c_char;
-            let fd = unsafe { open(ptr, O_RDONLY | O_CLOEXEC | O_DIRECT) };
+            // Through a `CString`, not the `OsStr`'s own bytes: `open` reads
+            // until a NUL and a path slice carries none, so handing it the
+            // slice's pointer reads past the end and asks the kernel for
+            // whatever followed it in memory. It surfaced as an ENOENT on a
+            // file that was right there -- every `Reader::open` on Linux,
+            // including eleven of `ignis-artifact`'s own unit tests, which is
+            // what the CI test job found the first time it ran.
+            let path = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let fd = unsafe { open(path.as_ptr(), O_RDONLY | O_CLOEXEC | O_DIRECT) };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
