@@ -3,8 +3,8 @@
 > **STUDY, AND THREE OF ITS EXPERIMENTS HAVE RUN.** It lays out what "one
 > forward pass" can and cannot mean on this engine and orders the
 > experiments that decide between the candidates. E0, E1 and spec 12's E-P1
-> then ran, on 2026-09-21, and between them they **close the one-pass
-> point**:
+> then ran, on 2026-09-21, and between them they close the one-pass point
+> **through the vocabulary and through the residual**:
 >
 > - E0 — the largest grid a compositional label can name is 9 x 9
 >   (`2026-09-21-the-grid-a-bigram-can-name.md`);
@@ -13,10 +13,16 @@
 > - E1 — a declared grid is read to one part in ten at every width
 >   (`2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`).
 >
-> What survives is in *What survives* below: the **two-pass box**, **C2**
-> (set-of-mark, the one candidate nothing measured), **C3** with E2 still to
-> price it, and a **shorter chain**. The candidates are kept as argued, and
-> the branch tree is still kept as killed by argument alone: a study whose
+> **And then C5 was measured, and it is the answer**
+> (`2026-09-21-one-attention-head-points.md`): the attention of one head,
+> L39.h10, read in the same prefill at the position after `{"x":`, lands
+> inside the button more often than the ten-round chain — 236 and 233 of 240
+> against 218 and 213 — in one pass, coarser. And as a guard on the chain it
+> gives 239 of 240 on both scene sets at the chain's precision. What
+> survives, below, is now a design rather than a ranking.
+>
+> The candidates are kept as argued, and the branch tree is still kept as
+> killed by argument alone: a study whose
 > predictions were checked is worth more than one edited to agree with the
 > outcome. The repo's rule is that the ADR is a consequence of the finding
 > and not a gate before it (`docs/findings/README.md`).
@@ -167,34 +173,65 @@ declared grid is read to one part in ten however finely it is declared (E1).
 C1, C1b and C4 are done.
 
 **And then the literature was read**, which should have happened first
-(`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`). It
-renames the target — a one-pass point is *coordinate-free grounding* — and
-names a mechanism none of the candidates below used. What is left:
+(`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`,
+corrected by `2026-09-21-qwen-vl-grounding-primary-sources.md`). It renames
+the target — a one-pass point is *coordinate-free grounding* — and names a
+signal none of the candidates below used: attention from a position to the
+image tokens.
 
-1. **A box in two passes** — untouched, and now the interesting half of this
-   document. Its second pass forces the first pass's digits, which is
-   precisely the conditioning the probe result says the model needs; and its
-   certificate is unaffected by anything measured.
-2. **C5, attention as the answer** — new, and it outranks everything else
-   here. The published one-pass grounding methods read the **attention from
-   the instruction's tokens to the image tokens**, not the residual: TAG
-   does it tuning-free, GUI-Actor trains a small head on it and answers in a
-   single pass. Free to try in the PyTorch vehicle, where the 240 scenes and
-   the harness already are. The engine-side blocker is specific and
-   unmeasured by anyone: **16 of 64 layers have an attention matrix**, and a
-   fused kernel never materializes it.
-   (`docs/findings/2026-09-21-what-the-literature-says-about-pointing.md`.)
-3. **C2, set-of-mark** — demoted. It was the last unmeasured candidate, and
+**C5 then ran, and it is the answer to the ask**
+(`docs/findings/2026-09-21-one-attention-head-points.md`). What is left, in
+the order it should be built:
+
+1. **C5 as a guard on today's chain — no extra round.** The map of one head,
+   L39.h10, comes out of the prefill the chain already starts from, at the
+   position after `{"x":`. Keep the chain's point unless it is more than
+   60/999 from the head's region centre, else return the centre: **239 of 240
+   on both scene sets at the chain's precision**, against 218 and 213 for the
+   chain alone, with the threshold chosen on one set and held on the other.
+   It removes the chain's wrong-element tail and costs one GEMV.
+2. **C5 alone, as a one-pass `point`.** 236 and 233 of 240 — more often inside
+   than the chain — with nothing decoded, at a median of about 20/999 against
+   0.8. A coarse primitive, and a real one: this is the owner's one-pass point,
+   and the caller has to be told what it trades.
+3. **The box, in two passes, with C5 as pass 1.** The box does *not* come out
+   of the map (region IoU ~0.3), so for `box` the head says *where* and the
+   chain still writes the numbers. See *A box in two passes* below for why
+   the head, and not the certificate, is what catches the tail.
+
+How C5 goes into the engine, and what it must not skip:
+
+- **One query row of one head in one layer** — L39's q for head 10 at the
+  `last` position, captured during the prefill — against the image keys
+  already in the paged cache: `q . K_img^T`, 1,024 image keys at 1024 px,
+  16,384 at 4096. Per-map normalization makes the full-row softmax
+  denominator irrelevant, so the logits over the image keys are enough. Under
+  hq-e8-2b the keys need the attention kernel's own dequantization; under
+  BF16 it is trivial. Two numbers cross the `Compute` seam.
+- **The head is a calibrated constant of the artifact**, in the answer
+  alphabet's position: chosen against one load, refused against another, with
+  a test that fails when the artifact changes and the head has not been
+  recalibrated. It was chosen with labels; label-free selection stays under
+  100 of 240.
+- **The query sits inside the answer's scaffold.** At the instruction's own
+  tokens the chosen head does not transfer across instructions (136-143 of
+  240); after the forced `{"x":` it does.
+- **First measure under the engine's quantized KV.** Everything above is the
+  PyTorch vehicle: NF4 weights, BF16 attention, 1024 px, synthetic scenes.
+
+The rest of what was left before C5:
+
+4. **C2, set-of-mark** — demoted. It was the last unmeasured candidate, and
    the literature says it is the one that *fails* to transfer: it lifts
    GPT-4V and generally **decreases** open-weight models, apparently because
    reading marks is an OCR task. Still untested here; no longer the obvious
    next thing.
-4. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
+5. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
    later positions know progressively more, which is C3's own premise read
    from the other side. E2 is still the experiment that prices it, and E1
    could not answer it — a placeholder moved `y` by 2.58 strips, but `y` was
    3 strips wrong to begin with.
-5. **A shorter chain.** Not in the original list, and it comes out of the
+6. **A shorter chain.** Not in the original list, and it comes out of the
    measurement: a probe at `y1` is 187/240 after five rounds where the chain
    is 218 after nine. Fewer rounds at a known cost in acceptance is a
    product decision nobody has been offered.
@@ -392,6 +429,20 @@ way no single pass can:
   withheld. This is Jacobi iteration with a fixpoint test, and the fixpoint
   test is the part worth having: it turns "probably right" into "provably the
   same answer the chain would have given".
+
+**What the certificate does not prove** (added 2026-09-21, after C5). The
+fixpoint test proves that pass 2 reproduces the chain — and the chain's
+failures are **wrong-element** errors that the model reproduces faithfully
+(`2026-09-21-one-attention-head-points.md`: every miss more than 2% of the
+side off, on a different element). So a certified box can be certified on the
+wrong button. What catches that is not the certificate but **C5**: the
+attention head's region, which comes from the same prefill and is right on
+all 22 of the chain's misses on one set and 26 of 27 on the other. Pass 1 of
+the box should therefore be C5's *where*, and pass 2 the chain's numbers,
+checked against it. And an answer-centred zoom, if one is ever added, has to
+be seeded by C5 too: a crop around the chain's answer contains the target on
+only 3 of its 22 misses at half the side
+(`2026-09-21-qwen-vl-grounding-primary-sources.md`).
 
 Two constraints on that shape, both sharp:
 

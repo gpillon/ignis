@@ -61,6 +61,17 @@ chain is not. And the two-pass box is untouched — its second pass forces the
 first pass's digits, which is exactly the conditioning this result says the
 model needs.
 
+**What answered the question instead** (2026-09-21,
+`docs/findings/2026-09-21-one-attention-head-points.md`). The coordinate is
+not in the residual at that position, and it *is* in the attention there:
+one head, L39.h10, read at the same position in the same prefill, lands
+inside the button on 236 and 233 of 240 scenes against the chain's 218 and
+213. The residual holds what the position is about to emit; the attention
+holds where it is looking. Spec 12 probed the first. The heatmap section
+below guessed at the second, aimed it at the image tokens' own states rather
+than at the attention onto them, and blocked it with an objection pointed
+the wrong way — both corrected in place.
+
 ## The ask
 
 The pointing finding establishes that this model answers coordinates on a
