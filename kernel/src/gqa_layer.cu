@@ -4,6 +4,7 @@
 // context: input norm -> fused Q/K/gate/V projection -> q/k norm + RoPE ->
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
+#include "ignis_attn_tap.h"
 #include "ignis_gqa_layer.h"
 
 #include "ignis_gqa_workspace.h"
@@ -125,6 +126,14 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
     ninfer::ops::qk_norm_rope(query_heads, key_heads, q_norm, k_norm, model->rms_norm_eps,
                               rotation_positions, rope, rotated_query_heads, rotated_key_heads,
                               stream);
+
+    // Test-only attention-input tap (kernel/include/ignis_attn_tap.h): one
+    // flag load when disarmed, which is the only way production ever runs.
+    if (ignis_attn_tap_record(gqa_layer, start_position, tokens, rotated_query.data,
+                              rotated_key.data, stream) != 0) {
+      set_error(std::string("ignis_gqa_layer: ") + ignis_attn_tap_last_error());
+      return -1;
+    }
 
     // P2-04 (GitHub #86): the fused append-and-attend entry point (A1)
     // replaces the two-pass A2 (gqa_kv_append) + A3 (gqa_attention_cached)

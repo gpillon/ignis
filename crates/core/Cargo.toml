@@ -37,3 +37,11 @@ cuda = ["ignis-artifact/cuda"]
 # prompt ever changes -- never enabled in a production build (no
 # production Cargo.toml in this workspace turns it on).
 kv-capture = []
+# Test-only attention-input tap (kernel/include/ignis_attn_tap.h, not part of
+# the public flat C ABI): gates `attn_tap`, which arms a process-wide capture
+# of the rotated query and key rows a GQA layer hands its attention op, so a
+# GPU test can score one head's attention onto the image tokens on the host
+# (docs/findings/2026-09-21-one-attention-head-points.md). Never enabled in a
+# production build; the only production-side trace is the disarmed flag
+# check in `run_gqa_layer`.
+attn-tap = []

@@ -1,0 +1,786 @@
+//! Does one attention head point, in the engine?
+//!
+//! `docs/findings/2026-09-21-one-attention-head-points.md` found, in a
+//! PyTorch vehicle, that one head — **L39.h10**, GQA ordinal 9, query head 10
+//! — read at the position after the forced `{"x":` lands inside the target
+//! button on 236 and 233 of 240 scenes, against the ten-round digit chain's
+//! 218 and 213, and that as a guard on the chain it gives 239 of 240. That
+//! vehicle is not this engine: its weights were bitsandbytes NF4 where these
+//! are NVFP4, its KV was BF16 where serving is hq-e8-2b, and its images were
+//! 1024 px where the endpoint takes up to 4096. This measures the same head
+//! here.
+//!
+//! **How the attention is read.** The fused attention kernels never
+//! materialize weights, so the test-only tap (`ignis_core::attn_tap`,
+//! `kernel/include/ignis_attn_tap.h`) captures the rotated query and key
+//! rows `run_gqa_layer` hands to the attention op, and the host forms
+//! `q . k / 16` for every (GQA layer, query head) over the image positions.
+//! Under hq-e8-2b the keys are the ones *given to* the codec, not the ones
+//! decoded from it — the header says so, and every hq number from here
+//! inherits that.
+//!
+//! **Two renders, because the vehicle did not measure the served prompt.**
+//! The vehicle rendered with `enable_thinking` undefined, which in this
+//! artifact's template means three things `/v1/decide` never sends: a
+//! "Reasoning effort is set to xhigh …" paragraph at the head of the system
+//! block, a think block left *open* before the forced `{"x":`, and the
+//! instruction as plain text instead of `{"instruction":…}`.
+//!
+//! - `IGNIS_POINT_RENDER=vehicle` (default) reproduces that render —
+//!   `enable_thinking: true`, `reasoning_effort` left to the template's own
+//!   default — and asserts both ends of it. It is the only arm that isolates
+//!   weights and KV from the prompt, so **the pre-registered criterion is
+//!   asserted here and only here**.
+//! - `IGNIS_POINT_RENDER=served` renders what `/v1/decide` sends —
+//!   `enable_thinking: false`, `{"instruction":…}` built by the endpoint's
+//!   own `OrderedValue` — and asserts that too. It is a new measurement,
+//!   reported and not held to a criterion nobody pre-registered for it.
+//!
+//! **Pre-registered** before the first engine run (2026-09-21, agreed between
+//! the two sessions that wrote this and the tap), vehicle render, 1024 px,
+//! the same 480 scenes, L39.h10 read by TAG's region rule:
+//! set A (target always blue) at least [`CRITERION_A`] of 240, set B (colour
+//! and label instructions) at least [`CRITERION_B`] of 240 — within about six
+//! of the vehicle — and the guard at [`GUARD_DISTANCE`] at least
+//! [`CRITERION_GUARD`] on both. Same criterion under BF16 KV first, then
+//! hq-e8-2b. Whether cross-validation still picks L39.h10 in the engine is
+//! reported by the scorer that reads this test's dump, not asserted here.
+//!
+//! **Scenes.** `IGNIS_POINT_SCENES=<dir with manifest.json>` runs a generated
+//! set (`.scratch/latent-probe/scenes` or `scenes-varied`, 1024 px, per-scene
+//! `instruction` and `kind` in the varied one). Without it, the committed
+//! three-scene fixture at **4096 px**, where C5 has never been measured: there
+//! the test asserts structure and the chain (which `decide_point_gpu.rs`
+//! measured inside on all three) and only *prints* L39.h10, because asserting
+//! an unmeasured regime would turn a guess into a guarantee.
+//!
+//! `IGNIS_POINT_KV=bf16|hq` (default bf16), `IGNIS_POINT_LIMIT=<n>` for a
+//! smoke run (the criterion is asserted only on a full 240), and
+//! `IGNIS_POINT_OUT=<dir>` for the dump (default: the OS temp dir). The dump
+//! is `<set>-<render>-<kv>.bin` — every head's scores as little-endian f16,
+//! `[scene][GQA layer 0..16][query head 0..24][image position]` — and a
+//! `.json` beside it with everything a scorer needs, including the full
+//! rendered text of the first scene so it can be compared byte for byte with
+//! the vehicle's own render.
+//!
+//! Explicit GPU profile (ADR 0006, GitHub #38), and the `attn-tap` feature.
+
+#![cfg(all(feature = "cuda", feature = "attn-tap"))]
+
+#[path = "support/mod.rs"]
+mod support;
+
+use std::path::{Path, PathBuf};
+
+use ignis_artifact::{
+    ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
+    ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
+};
+use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap};
+use ignis_core::compute::ModelConfig;
+use ignis_core::gpu_profile;
+use ignis_core::model_load::load_qwen38_27b_with_options;
+use ignis_core::seq::{SeqPool, SeqPoolBudget};
+use ignis_core::step;
+use ignis_core::vision::{Multimodal, vision_item_control};
+use ignis_core::{KvFormat, RopeScaling, Vision};
+use ignis_server::decide::OrderedValue;
+use ignis_server::numbers::point_system;
+use serde::Deserialize;
+
+use support::vision_canary::prefill_prompt;
+
+const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
+/// Sized for the fixture's 4096x4096 images (~16.5K prompt tokens); the
+/// 1024 px sets need ~1.2K.
+const MAX_CONTEXT: u32 = 20_480;
+const PREFILL_CHUNK: u32 = 1024;
+const DIGITS: usize = 3;
+const SCALE: f64 = 999.0;
+
+/// `<|image_pad|>` in this artifact's tokenizer (ADR 0034's own correction
+/// names it at 248,056). Checked against every position of the media item's
+/// span, so the span and the token ids are two sources for one fact.
+const IMAGE_PAD: u32 = 248_056;
+
+/// The head under test: backbone layer 39 is GQA ordinal 9 (`4 * 9 + 3`).
+const HEAD_ORDINAL: usize = 9;
+const HEAD_Q: usize = 10;
+
+/// TAG's region rule, as the vehicle's scorer applies it.
+const REGION_THRESHOLD: f64 = 0.5;
+/// The guard: a chain point farther than this from the head's point, in
+/// 0-999 units of the side, is taken to have picked the wrong element.
+const GUARD_DISTANCE: f64 = 60.0;
+
+/// Pre-registered, vehicle render only (module docs).
+const CRITERION_SCENES: usize = 240;
+const CRITERION_A: usize = 230;
+const CRITERION_B: usize = 227;
+const CRITERION_GUARD: usize = 237;
+
+const DEFAULT_INSTRUCTION: &str = "click the blue button";
+
+/// The head of the system block the vehicle's render carries and
+/// `/v1/decide` never does (the template's `reasoning_effort` default).
+const XHIGH_HEAD: &str = "<|im_start|>system\nReasoning effort is set to xhigh.";
+const VEHICLE_TAIL: &str = "<|im_start|>assistant\n<think>\n";
+const SERVED_TAIL: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+#[derive(Deserialize)]
+struct Manifest {
+    side: u32,
+    scenes: Vec<Scene>,
+}
+
+#[derive(Deserialize)]
+struct Scene {
+    id: String,
+    image: String,
+    /// The target's box and centre, in pixels of the scene's own side. The
+    /// generated sets keep the fixture's `blue_*` names even when the target
+    /// is another colour.
+    blue_box: [i64; 4],
+    blue_centre: [i64; 2],
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Render {
+    Vehicle,
+    Served,
+}
+
+impl Render {
+    fn from_env() -> Self {
+        match std::env::var("IGNIS_POINT_RENDER").as_deref() {
+            Err(_) | Ok("vehicle") => Self::Vehicle,
+            Ok("served") => Self::Served,
+            Ok(other) => panic!("IGNIS_POINT_RENDER must be vehicle or served, not {other:?}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Vehicle => "vehicle",
+            Self::Served => "served",
+        }
+    }
+
+    /// A fresh value per call: the options are consumed by the render and by
+    /// the prompt preparation, and both must see the same ones.
+    fn options(self) -> ChatRenderOptions {
+        match self {
+            // `reasoning_effort` left `None` on purpose: that is the
+            // template's own default, which is what the vehicle got by not
+            // passing it at all.
+            Self::Vehicle => ChatRenderOptions { enable_thinking: true, ..Default::default() },
+            Self::Served => ChatRenderOptions { enable_thinking: false, ..Default::default() },
+        }
+    }
+
+    fn user_text(self, instruction: &str) -> String {
+        match self {
+            Self::Vehicle => instruction.to_owned(),
+            // The endpoint's own serializer, so the bytes are the endpoint's.
+            Self::Served => format!(
+                "{{\"instruction\":{}}}",
+                OrderedValue::String(instruction.to_owned()).to_text()
+            ),
+        }
+    }
+
+    /// Both ends of the render, asserted — a render this test did not intend
+    /// would otherwise be measured as if it were one of the two.
+    fn check(self, rendered: &str, scene: &str) {
+        match self {
+            Self::Vehicle => {
+                assert!(
+                    rendered.starts_with(XHIGH_HEAD),
+                    "{scene}: the vehicle render must open with the template's xhigh reasoning \
+                     paragraph; it opens with {:?}",
+                    &rendered[..rendered.len().min(120)]
+                );
+                assert!(
+                    rendered.ends_with(VEHICLE_TAIL),
+                    "{scene}: the vehicle render must end with an open think block; it ends with {:?}",
+                    &rendered[rendered.len().saturating_sub(60)..]
+                );
+            }
+            Self::Served => {
+                assert!(
+                    !rendered.contains("Reasoning effort"),
+                    "{scene}: the served render must carry no reasoning paragraph"
+                );
+                assert!(
+                    rendered.ends_with(SERVED_TAIL),
+                    "{scene}: the served render must end with a closed, empty think block; it ends \
+                     with {:?}",
+                    &rendered[rendered.len().saturating_sub(60)..]
+                );
+            }
+        }
+    }
+}
+
+fn kv_from_env() -> KvFormat {
+    match std::env::var("IGNIS_POINT_KV").as_deref() {
+        Err(_) | Ok("bf16") => KvFormat::Bf16,
+        Ok("hq") => KvFormat::HqE8_2b,
+        Ok(other) => panic!("IGNIS_POINT_KV must be bf16 or hq, not {other:?}"),
+    }
+}
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("pointing")
+}
+
+fn messages_with(system: &str, text: String) -> [ChatMessage; 2] {
+    [
+        ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(system.to_owned()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        },
+        ChatMessage {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Image { url: None },
+                ContentPart::Text(text),
+            ]),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        },
+    ]
+}
+
+fn logsumexp(values: impl Iterator<Item = f32> + Clone) -> f64 {
+    let maximum = values
+        .clone()
+        .fold(f64::NEG_INFINITY, |acc, v| acc.max(f64::from(v)));
+    if !maximum.is_finite() {
+        return maximum;
+    }
+    maximum + values.map(|v| (f64::from(v) - maximum).exp()).sum::<f64>().ln()
+}
+
+/// One constrained step, as `classify_pointing_gpu.rs` takes it: the winning
+/// slot and its probability within the slots.
+fn constrained_pick(logits: &[f32], slots: &[u32]) -> (usize, f64) {
+    let restricted: Vec<f32> = slots.iter().map(|&slot| logits[slot as usize]).collect();
+    let total = logsumexp(restricted.iter().copied());
+    let (index, _) = restricted
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| if v > best.1 { (i, v) } else { best });
+    (index, (f64::from(restricted[index]) - total).exp())
+}
+
+/// TAG's region rule over one head's map, exactly as the vehicle's scorer
+/// (`.scratch/latent-probe/c5_score.py::region_tag`) applies it: min-max
+/// normalize, keep cells at or above the threshold, take the 4-connected
+/// region with the highest mean, and return its weighted centre in pixels.
+///
+/// The map is `exp(s - max s)` over the image positions. The vehicle's maps
+/// were softmax weights over the whole row restricted to the image columns,
+/// which differ from these by one positive factor — and min-max
+/// normalization removes it, so the point is the same.
+fn region_point(scores: &[f32], gh: usize, gw: usize, side: f64) -> (f64, f64) {
+    let top = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let weights: Vec<f64> = scores.iter().map(|&s| f64::from(s - top).exp()).collect();
+    let centre = |k: usize| -> (f64, f64) {
+        (
+            ((k % gw) as f64 + 0.5) * side / gw as f64,
+            ((k / gw) as f64 + 0.5) * side / gh as f64,
+        )
+    };
+    let lo = weights.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if hi <= lo {
+        let k = weights
+            .iter()
+            .enumerate()
+            .fold((0, f64::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+            .0;
+        return centre(k);
+    }
+    let r: Vec<f64> = weights.iter().map(|&w| (w - lo) / (hi - lo)).collect();
+    let on: Vec<bool> = r.iter().map(|&v| v >= REGION_THRESHOLD).collect();
+    let mut seen = vec![false; r.len()];
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    for start in 0..r.len() {
+        if !on[start] || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![start];
+        let mut component = Vec::new();
+        while let Some(k) = stack.pop() {
+            component.push(k);
+            let (row, col) = (k / gw, k % gw);
+            let mut visit = |row: usize, col: usize| {
+                let n = row * gw + col;
+                if on[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            };
+            if row + 1 < gh {
+                visit(row + 1, col);
+            }
+            if row > 0 {
+                visit(row - 1, col);
+            }
+            if col + 1 < gw {
+                visit(row, col + 1);
+            }
+            if col > 0 {
+                visit(row, col - 1);
+            }
+        }
+        let mean = component.iter().map(|&k| r[k]).sum::<f64>() / component.len() as f64;
+        // Strictly greater, so the first region found wins a tie — the
+        // vehicle's scorer does the same.
+        if best.as_ref().is_none_or(|(m, _)| mean > *m) {
+            best = Some((mean, component));
+        }
+    }
+    let (_, component) = best.expect("the maximum cell is always on");
+    let total: f64 = component.iter().map(|&k| r[k]).sum();
+    let (mut x, mut y) = (0.0, 0.0);
+    for &k in &component {
+        let (cx, cy) = centre(k);
+        x += cx * r[k] / total;
+        y += cy * r[k] / total;
+    }
+    (x, y)
+}
+
+fn inside(point: (f64, f64), b: [i64; 4]) -> bool {
+    b[0] as f64 <= point.0 && point.0 <= b[2] as f64 && b[1] as f64 <= point.1 && point.1 <= b[3] as f64
+}
+
+/// f32 to IEEE half, round to nearest even. Written out rather than taking a
+/// dependency for one conversion; attention logits sit well inside the
+/// normal range, and the edges are handled anyway.
+fn f32_to_f16(value: f32) -> u16 {
+    let x = value.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let exp = ((x >> 23) & 0xff) as i32;
+    let mant = x & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | (if mant != 0 { 0x0200 } else { 0 });
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let rounded = if rem > halfway || (rem == halfway && half & 1 == 1) { half + 1 } else { half };
+        return sign | rounded as u16;
+    }
+    let half = ((e as u32) << 10) | (mant >> 13);
+    let rem = mant & 0x1fff;
+    let rounded = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) { half + 1 } else { half };
+    sign | rounded as u16
+}
+
+#[test]
+#[ignore = "GPU profile only, with --features attn-tap"]
+fn one_attention_head_points_in_the_engine() {
+    let render = Render::from_env();
+    let kv_format = kv_from_env();
+    let (dir, generated) = match std::env::var("IGNIS_POINT_SCENES") {
+        Ok(dir) => (PathBuf::from(dir), true),
+        Err(_) => (fixture_dir(), false),
+    };
+    let Ok(manifest_text) = std::fs::read_to_string(dir.join("manifest.json")) else {
+        if gpu_profile::skip_or_fail(&format!("no scene manifest in {}", dir.display())) {
+            return;
+        }
+        unreachable!("skip_or_fail panics under the profile");
+    };
+    let manifest: Manifest =
+        serde_json::from_str(&manifest_text).unwrap_or_else(|e| panic!("parse the manifest: {e}"));
+    let limit = std::env::var("IGNIS_POINT_LIMIT")
+        .ok()
+        .map(|v| v.parse::<usize>().unwrap_or_else(|e| panic!("IGNIS_POINT_LIMIT: {e}")));
+    let scenes: Vec<&Scene> = manifest
+        .scenes
+        .iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    let set_name = if generated {
+        dir.file_name().and_then(|n| n.to_str()).unwrap_or("scenes").to_owned()
+    } else {
+        "fixture".to_owned()
+    };
+    let varied = scenes.iter().any(|s| s.kind.is_some());
+
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("the real artifact is absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {ARTIFACT}: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let processor = frontend
+        .vision_processor()
+        .unwrap_or_else(|e| panic!("vision processor: {e}"));
+    let tokenizer = frontend.tokenizer();
+    let encode = |text: &str| -> Vec<u32> {
+        tokenizer.encode(text).unwrap_or_else(|e| panic!("encode {text:?}: {e}"))
+    };
+    let digit_slots: Vec<u32> = (0..10)
+        .map(|digit| {
+            let ids = encode(&digit.to_string());
+            assert_eq!(ids.len(), 1, "digit {digit} must be one token");
+            ids[0]
+        })
+        .collect();
+    let x_prefix = encode("{\"x\":");
+    let y_literal: Vec<i32> = encode(",\"y\":").into_iter().map(|t| t as i32).collect();
+    let system = point_system(DIGITS as u32);
+
+    let (plan, handles) = bind_model_scope_27b_with(&reader, ModelScope { draft: None, vision: true })
+        .unwrap_or_else(|e| panic!("bind with vision: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(d) => d,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA device unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(a) => a,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + vision: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let model = load_qwen38_27b_with_options(
+        &reader,
+        &artifact,
+        &handles,
+        PREFILL_CHUNK,
+        MAX_CONTEXT,
+        kv_format,
+        None,
+        Some(Vision::default()),
+        RopeScaling::NONE,
+    )
+    .unwrap_or_else(|e| panic!("ignis_model_load with vision: {e}"));
+    let pool = SeqPool::create(
+        &ModelConfig::qwen38_27b(),
+        &SeqPoolBudget {
+            kv_format,
+            kv_page_group_count: MAX_CONTEXT / 64,
+            max_context_tokens: MAX_CONTEXT,
+            slot_count: 1,
+            retained_slot_count: 0,
+        },
+    )
+    .unwrap_or_else(|e| panic!("seq pool create: {e}"));
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let mut logits = vec![0f32; vocab];
+    let ordinals: Vec<i32> = (0..GQA_LAYERS as i32).collect();
+    let side = f64::from(manifest.side);
+
+    eprintln!(
+        "attention head point: set {set_name} ({} scenes{}), render {}, KV {}, head L{}.h{}",
+        scenes.len(),
+        if varied { ", varied" } else { "" },
+        render.name(),
+        kv_format.as_str(),
+        4 * HEAD_ORDINAL + 3,
+        HEAD_Q
+    );
+
+    let mut dump: Vec<u8> = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut n_image: Option<usize> = None;
+    let mut grid: Option<(usize, usize)> = None;
+    let mut first_render: Option<String> = None;
+    let (mut head_hits, mut chain_hits, mut guard_hits) = (0usize, 0usize, 0usize);
+
+    for scene in &scenes {
+        let bytes = std::fs::read(dir.join(&scene.image))
+            .unwrap_or_else(|e| panic!("{}: read image: {e}", scene.id));
+        let instruction = scene.instruction.as_deref().unwrap_or(DEFAULT_INSTRUCTION);
+        let messages = messages_with(&system, render.user_text(instruction));
+
+        // ── the render, checked at both ends ─────────────────────────────
+        let rendered = frontend
+            .chat_template()
+            .render_with_thinking_and_tools(&messages, render.options(), None)
+            .unwrap_or_else(|e| panic!("{}: render: {e}", scene.id));
+        render.check(&rendered, &scene.id);
+        if first_render.is_none() {
+            first_render = Some(rendered.clone());
+        }
+
+        let prepared = frontend
+            .prepare_prompt(&processor, &messages, &[&bytes], render.options(), None)
+            .unwrap_or_else(|e| panic!("{}: prepare: {e}", scene.id));
+        let (token_ids, mut prompt) = Multimodal::from_prepared(prepared);
+
+        // ── the image span, from two sources ─────────────────────────────
+        assert_eq!(prompt.media.len(), 1, "{}: one image", scene.id);
+        let (begin, count, item_grid) = {
+            let item = &prompt.media[0];
+            (item.token_span.begin as usize, item.token_span.count as usize, item.grid)
+        };
+        assert_eq!(item_grid.t, 1, "{}: a still image has one temporal patch", scene.id);
+        let (gh, gw) = (item_grid.h as usize / 2, item_grid.w as usize / 2);
+        assert_eq!(count, gh * gw, "{}: span {count} != merged grid {gh}x{gw}", scene.id);
+        assert!(
+            token_ids[begin..begin + count].iter().all(|&t| t == IMAGE_PAD),
+            "{}: the media span holds a token that is not <|image_pad|>",
+            scene.id
+        );
+        match (n_image, grid) {
+            (None, None) => {
+                n_image = Some(count);
+                grid = Some((gh, gw));
+            }
+            (Some(n), Some(g)) => assert!(
+                n == count && g == (gh, gw),
+                "{}: every scene of a dump must share one grid ({g:?}, {n}); this one is ({gh}, {gw})",
+                scene.id
+            ),
+            _ => unreachable!(),
+        }
+        let image_positions: Vec<usize> = (begin..begin + count).collect();
+
+        // Encoded before the prompt is extended: the embedding borrows only
+        // the model, and `append_text` needs the prompt mutably.
+        let control = vision_item_control(item_grid);
+        let embedding = step::encode_media(&model, item_grid, &prompt.media[0].patches, &control)
+            .unwrap_or_else(|(_, e)| panic!("{}: encode: {e}", scene.id));
+
+        // ── the forced prefix, appended the way the served path does ─────
+        assert!(
+            prompt.append_text(x_prefix.len()),
+            "{}: the prompt cannot be extended by the forced prefix",
+            scene.id
+        );
+        let mut tokens: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+        tokens.extend(x_prefix.iter().map(|&t| t as i32));
+        assert!(
+            tokens.len() + DIGITS * 2 + 16 < MAX_CONTEXT as usize,
+            "{}: {} prompt tokens do not fit",
+            scene.id,
+            tokens.len()
+        );
+        // The query row is the last prompt position: the one after `{"x":`,
+        // where the chain reads x's first digit and a one-pass point reads.
+        let query = tokens.len() - 1;
+        let max_positions = tokens.len() as i64 + 8;
+
+        let mut sequence = pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("seq alloc: {e}"));
+        logits.fill(0.0);
+
+        // ── one armed prefill ────────────────────────────────────────────
+        let (prefilled, capture) = with_attn_tap(&ordinals, &[query as i64], max_positions, || {
+            prefill_prompt(
+                &model,
+                &pool,
+                &mut sequence,
+                &tokens,
+                &prompt,
+                &embedding,
+                PREFILL_CHUNK,
+                &mut logits,
+            )
+        })
+        .unwrap_or_else(|e| panic!("{}: attention tap: {e}", scene.id));
+        prefilled.unwrap_or_else(|e| panic!("{}: prefill: {e}", scene.id));
+        assert_eq!(capture.queries_seen, vec![1], "{}: the query row was not captured", scene.id);
+        assert!(
+            capture.rows_written.iter().all(|&r| r == tokens.len() as i64),
+            "{}: every armed layer must write one key row per prompt position ({}), wrote {:?}",
+            scene.id,
+            tokens.len(),
+            capture.rows_written
+        );
+
+        // ── every head's scores, into the dump ───────────────────────────
+        let mut head_scores: Vec<f32> = Vec::new();
+        for layer in 0..GQA_LAYERS {
+            for q_head in 0..Q_HEADS {
+                let scores = capture.scores(layer, 0, q_head, &image_positions);
+                assert!(
+                    scores.iter().all(|s| s.is_finite()),
+                    "{}: non-finite score at ordinal {layer} head {q_head}",
+                    scene.id
+                );
+                for &s in &scores {
+                    dump.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+                }
+                if layer == HEAD_ORDINAL && q_head == HEAD_Q {
+                    head_scores = scores;
+                }
+            }
+        }
+        drop(capture);
+        let head_point = region_point(&head_scores, gh, gw, side);
+
+        // ── the chain, continuing from the same prefill ──────────────────
+        let mut position = tokens.len() as u64;
+        let read_digits = |sequence: &mut _, position: &mut u64, logits: &mut Vec<f32>| {
+            let mut value = 0i64;
+            let mut first_p = 0.0;
+            for place in 0..DIGITS {
+                let (digit, probability) = constrained_pick(logits, &digit_slots);
+                if place == 0 {
+                    first_p = probability;
+                }
+                value = value * 10 + digit as i64;
+                let token = [digit_slots[digit] as i32];
+                step::prefill_program(&model, &pool, sequence, &token, *position, Some(logits.as_mut_slice()))
+                    .unwrap_or_else(|e| panic!("{}: digit {place}: {e}", scene.id));
+                *position += 1;
+            }
+            (value, first_p)
+        };
+        let (x, x_p) = read_digits(&mut sequence, &mut position, &mut logits);
+        step::prefill_program(&model, &pool, &mut sequence, &y_literal, position, Some(logits.as_mut_slice()))
+            .unwrap_or_else(|e| panic!("{}: force ,\"y\": {e}", scene.id));
+        position += y_literal.len() as u64;
+        let (y, y_p) = read_digits(&mut sequence, &mut position, &mut logits);
+        drop(sequence);
+        drop(embedding);
+
+        let chain_point = (x as f64 / SCALE * side, y as f64 / SCALE * side);
+        let distance = ((chain_point.0 - head_point.0).powi(2) + (chain_point.1 - head_point.1).powi(2))
+            .sqrt()
+            / side
+            * SCALE;
+        let guarded = if distance <= GUARD_DISTANCE { chain_point } else { head_point };
+        let (head_in, chain_in, guard_in) = (
+            inside(head_point, scene.blue_box),
+            inside(chain_point, scene.blue_box),
+            inside(guarded, scene.blue_box),
+        );
+        head_hits += usize::from(head_in);
+        chain_hits += usize::from(chain_in);
+        guard_hits += usize::from(guard_in);
+        eprintln!(
+            "  {} {:>7}: head ({:.0},{:.0}) {}  chain ({x},{y}) p1 {x_p:.3}/{y_p:.3} {}  d {distance:.0} guard {}",
+            scene.id,
+            scene.kind.as_deref().unwrap_or("-"),
+            head_point.0,
+            head_point.1,
+            if head_in { "in " } else { "OUT" },
+            if chain_in { "in " } else { "OUT" },
+            if guard_in { "in" } else { "OUT" },
+        );
+        rows.push(serde_json::json!({
+            "id": scene.id,
+            "kind": scene.kind,
+            "instruction": instruction,
+            "box": scene.blue_box,
+            "centre": scene.blue_centre,
+            "prompt_tokens": tokens.len(),
+            "chain": [x, y],
+            "first_digit_p": [x_p, y_p],
+            "head_point": [head_point.0, head_point.1],
+            "head_inside": head_in,
+            "chain_inside": chain_in,
+            "guard_distance": distance,
+            "guard_inside": guard_in,
+        }));
+    }
+
+    // ── the dump, written before anything is asserted ────────────────────
+    let out_dir = std::env::var("IGNIS_POINT_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("ignis-attention-head-point"));
+    std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("create {}: {e}", out_dir.display()));
+    let stem = format!("{set_name}-{}-{}", render.name(), kv_format.as_str());
+    let (gh, gw) = grid.expect("at least one scene");
+    let meta = serde_json::json!({
+        "set": set_name,
+        "render": render.name(),
+        "kv": kv_format.as_str(),
+        "side": manifest.side,
+        "grid": [gh, gw],
+        "n_image": n_image,
+        "layers": ordinals.iter().map(|o| 4 * o + 3).collect::<Vec<_>>(),
+        "q_heads": Q_HEADS,
+        "dtype": "f16-le",
+        "shape": [rows.len(), GQA_LAYERS, Q_HEADS, n_image],
+        "scores": "q . k / 16 over the image positions, before softmax",
+        "hq_keys_note": "under hq-e8-2b the keys are those given to the codec, not decoded from it",
+        "head": {"ordinal": HEAD_ORDINAL, "layer": 4 * HEAD_ORDINAL + 3, "q_head": HEAD_Q},
+        "region_threshold": REGION_THRESHOLD,
+        "guard_distance": GUARD_DISTANCE,
+        "first_render": first_render,
+        "rows": rows,
+    });
+    std::fs::write(out_dir.join(format!("{stem}.bin")), &dump)
+        .unwrap_or_else(|e| panic!("write the dump: {e}"));
+    std::fs::write(
+        out_dir.join(format!("{stem}.json")),
+        serde_json::to_string_pretty(&meta).expect("serialize"),
+    )
+    .unwrap_or_else(|e| panic!("write the dump's metadata: {e}"));
+
+    let n = scenes.len();
+    eprintln!(
+        "attention head point: {set_name} {} {}: head L{}.h{} {head_hits}/{n}, chain {chain_hits}/{n}, \
+         guard {guard_hits}/{n}; dump {}",
+        render.name(),
+        kv_format.as_str(),
+        4 * HEAD_ORDINAL + 3,
+        HEAD_Q,
+        out_dir.join(&stem).display()
+    );
+
+    // ── what is asserted, and where ──────────────────────────────────────
+    if !generated {
+        // The committed fixture at 4096 px. The head is not measured at this
+        // size, so it is printed above and not held to anything. The chain is
+        // measured inside on all three by `decide_point_gpu.rs` -- through the
+        // endpoint, so on the *served* render only; the vehicle render at
+        // 4096 in the engine is unmeasured, and asserting it would be the
+        // same mistake as asserting the head.
+        if render == Render::Served {
+            assert_eq!(chain_hits, n, "the chain must land inside on every fixture scene");
+        }
+        return;
+    }
+    if render == Render::Vehicle && n == CRITERION_SCENES {
+        let floor = if varied { CRITERION_B } else { CRITERION_A };
+        assert!(
+            head_hits >= floor,
+            "pre-registered criterion: L39.h10 must land inside on at least {floor}/{n} of {set_name} \
+             ({} KV); it did on {head_hits}",
+            kv_format.as_str()
+        );
+        assert!(
+            guard_hits >= CRITERION_GUARD,
+            "pre-registered criterion: the guard at d={GUARD_DISTANCE} must land inside on at least \
+             {CRITERION_GUARD}/{n} of {set_name} ({} KV); it did on {guard_hits}",
+            kv_format.as_str()
+        );
+    }
+}

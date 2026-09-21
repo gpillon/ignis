@@ -52,3 +52,6 @@ ignis-bench = { path = "../bench" }
 # GPU-backed model instead of the deterministic `MockCompute` (ADR 0006);
 # off, or without an artifact, it stays on `MockCompute` (CPU-only).
 cuda = ["ignis-core/cuda", "ignis-artifact/cuda", "ignis-runtime/cuda"]
+# Test-only: forwards `ignis-core`'s attention-input tap for
+# `tests/attention_head_point_gpu.rs`. Never enabled in a production build.
+attn-tap = ["ignis-core/attn-tap"]

@@ -29,6 +29,10 @@
 //! reuse) are implemented on top of this contract.
 
 pub mod admission;
+// Test-only: the attention-input tap, reachable only with both the kernel
+// linked (`cuda`) and the non-default `attn-tap` feature on.
+#[cfg(all(feature = "cuda", feature = "attn-tap"))]
+pub mod attn_tap;
 pub mod checkpoint;
 pub mod compute;
 pub mod concrete;
