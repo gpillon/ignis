@@ -1,17 +1,25 @@
 # 11 - a point in one pass, a box in two
 
-> **STUDY, NOT A SPEC.** Nothing here is decided. It lays out what "one
-> forward pass" can and cannot mean on this engine, kills two candidates —
-> one by argument, one by measurement — and orders the experiments that would
-> decide between the rest. The repo's rule is that the ADR is a consequence of
-> the finding and not a gate before it (`docs/findings/README.md`); this
-> document exists so that the experiments are the right ones, not so that the
-> design is settled before them.
+> **STUDY, AND THREE OF ITS EXPERIMENTS HAVE RUN.** It lays out what "one
+> forward pass" can and cannot mean on this engine and orders the
+> experiments that decide between the candidates. E0, E1 and spec 12's E-P1
+> then ran, on 2026-09-21, and between them they **close the one-pass
+> point**:
 >
-> **One of them has run.** E0 is measured and has its own finding
-> (`docs/findings/2026-09-21-the-grid-a-bigram-can-name.md`); it changed the
-> ranking below, which is the only reason to run an experiment before a
-> design. Everything else here is still argument.
+> - E0 — the largest grid a compositional label can name is 9 x 9
+>   (`2026-09-21-the-grid-a-bigram-can-name.md`);
+> - E-P1 — the latent at that position holds about one digit
+>   (`2026-09-21-the-point-is-assembled-as-it-is-written.md`);
+> - E1 — a declared grid is read to one part in ten at every width
+>   (`2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`).
+>
+> What survives is in *What survives* below: the **two-pass box**, **C2**
+> (set-of-mark, the one candidate nothing measured), **C3** with E2 still to
+> price it, and a **shorter chain**. The candidates are kept as argued, and
+> the branch tree is still kept as killed by argument alone: a study whose
+> predictions were checked is worth more than one edited to agree with the
+> outcome. The repo's rule is that the ADR is a consequence of the finding
+> and not a gate before it (`docs/findings/README.md`).
 
 GitHub: (unfiled)
 
@@ -126,42 +134,62 @@ about to emit and little more: a cross-validated probe lands inside the
 button on 97 of 240 scenes, 111 with an RBF kernel, where the chain lands
 218.
 
-**What that bound covers is the digit prompt, and only it.** A fitted probe
-is stronger than any fixed readout of *the same residual*, so C3's first
-read is bounded. C1b and C4 declare **strips** rather than digits, so at
-that position the model is about to emit something else and the residual is
-a different vector — which is the finding's own rule about what a residual
-holds. So **E1 below is open**, and it is the experiment that decides the
-sidestep column rather than a corollary of one that is already run. What the
-probe does hand it is a prior: about ten buckets of resolution were measured
-at one position, so C4's 11 and 13 strips sit right at it and C1b's 26 is a
-stretch beyond it.
+**That bound covers the digit prompt, and only it.** A fitted probe is
+stronger than any fixed readout of *the same residual*, so C3's first read
+is bounded. C1b and C4 declare **strips** rather than digits, so at that
+position the model is about to emit something else and the residual is a
+different vector — which is the finding's own rule about what a residual
+holds. So E1 was still open, with a prior rather than a verdict: about ten
+buckets of resolution at one position, so C4's 11 and 13 strips sat right at
+it and C1b's 26 was a stretch beyond it.
+
+**E1 then ran, and it closes the column** (2026-09-21,
+`docs/findings/2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`).
+Asked which of N strips holds the target, the model answers with a declared
+letter on 240 of 240 scenes and is wrong by 9-15% of the axis at **every**
+width: 1 strip of 11, 2 of 13, 4 of 26. Declaring a finer grid divides the
+error with it. Inside the button: 39, 34 and 11 of 240 against the chain's
+218. And the grid was never the constraint — at 26 strips a *perfect* reader
+would clear acceptance 3 on 223 of 240, better than the chain, and the model
+clears it on 11.
+
+So the arithmetic below priced the wrong thing. It asked how finely to
+quantize an axis; what fails is the reading, at any quantization.
 
 The candidates are kept as written: they were argued before the measurement
 and the measurement is what a study is for.
 
-## What survives E-P1
+## What survives
 
-Four things, and the order has changed:
+**The sidestep column is closed.** Both halves of it were measured and both
+failed: the latent at that position holds about one digit (E-P1), and a
+declared grid is read to one part in ten however finely it is declared (E1).
+C1, C1b and C4 are done. What is left:
 
 1. **A box in two passes** — untouched, and now the interesting half of this
    document. Its second pass forces the first pass's digits, which is
    precisely the conditioning the probe result says the model needs; and its
    certificate is unaffected by anything measured.
-2. **C1b and C4**, unbounded by E-P1 and waiting on E1, with a prior of
-   about ten buckets of resolution at one position.
+2. **C2, set-of-mark** — the one candidate neither experiment touched,
+   because it does not ask the model to *compute* a grid index: the label is
+   drawn where the model is already looking. It is now the only unmeasured
+   way to a one-pass point, and its costs are unchanged (a rasterizer in the
+   media path, and it breaks the two-pass reuse).
 3. **C3, the placeholder scaffold**, and E2 with it. E-P1 says the chain's
    later positions know progressively more, which is C3's own premise read
-   from the other side. E2 is still the experiment that prices it.
+   from the other side. E2 is still the experiment that prices it, and E1
+   could not answer it — a placeholder moved `y` by 2.58 strips, but `y` was
+   3 strips wrong to begin with.
 4. **A shorter chain.** Not in the original list, and it comes out of the
    measurement: a probe at `y1` is 187/240 after five rounds where the chain
    is 218 after nine. Fewer rounds at a known cost in acceptance is a
    product decision nobody has been offered.
 
-What E-P1 did settle is that **the latent is not a shortcut around the
-chain**, and that the bar below has to be scored as a predicate: the chain's
-median error is 0.8 units of 999 and its mean is 21.6, so a mean comparison
-between it and anything else is meaningless.
+Two things the pair of experiments settled beyond their own question. **The
+latent is not a shortcut around the chain.** And **the bar below has to be
+scored as a predicate**: the chain's median error is 0.8 units of 999 and
+its mean is 21.6, so a mean comparison between it and anything else is
+meaningless — which is exactly the mistake the bar's own table invites.
 
 ## The bar every candidate is measured against
 
@@ -397,8 +425,10 @@ Finding: `docs/findings/2026-09-21-the-grid-a-bigram-can-name.md`. It killed
 C1 as a point answer and promoted C1b, which is what an experiment ordered
 first is for.
 
-**E1 - can the model read a declared grid at all?** *(the decisive one for
-the sidestep column; E-P1 did not close it — see above)* The existing harness
+**E1 - can the model read a declared grid at all? DONE, 2026-09-21: no.**
+9-15% of the axis at every width, 39/240 at best against the chain's 218.
+`docs/findings/2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`.
+What it was: The existing harness
 (`classify_pointing_gpu.rs`: three scenes, `out_logits` already wired), one
 readout, no new code. Two questions in one experiment, because they share a
 prefill: the 9 x 9 bigram cell (C1 as a coarse pass) and the 26-strip single
