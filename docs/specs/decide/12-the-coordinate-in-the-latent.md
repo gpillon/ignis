@@ -81,12 +81,28 @@ each step.
 token, and the falling confidence is the model genuinely making up the rest.
 
 **A linear probe on `n` at `x1` separates them, and that is the whole go/no-go.**
-Fit `n -> (x, y)` and compare against the chain on held-out scenes:
+Fit `n -> (x, y)` and compare against the chain on held-out scenes.
+
+The threshold is not a taste: **reading (b) predicts a specific number.** If
+the latent holds only the digit that position is about to emit, the best any
+probe can do is the centre of that digit's bucket, and the residual is the
+rest of the number — about 25 units on a 0-999 scale, **2.5% of the side**.
+That is the baseline to beat, and it is computed from the chain's own
+outputs rather than assumed, because the chain's coordinates are not uniform
+over the axis.
 
 | probe error vs the chain | reading | consequence |
 |---|---|---|
-| under ~1.5% of the side | **(a)** | a one-pass point is real; build it |
-| over ~4% | **(b)** | **no** one-pass point exists at this position, by any method — not the probe, not a strip readout, not a grid |
+| well under the leading-digit baseline (~1% of the side) | **(a)** | a one-pass point is real; build it |
+| **at** the leading-digit baseline (~2.5%) | **(b)** | the latent holds the digit it is about to emit and nothing more |
+| at the predict-the-mean baseline | neither | the probe found nothing; check the pipeline before believing it |
+
+An error *at* the baseline is the decisive negative, and it is a much
+sharper test than "over 4%": it says the probe recovered exactly the
+information the digit projection already exposes, and not one unit more.
+
+Under (b), **no one-pass point exists at this position by any method** — not
+the probe, not a strip readout, not a grid.
 
 Note what (b) would mean for [spec 11](11-point-in-one-pass.md): it is not a
 verdict on the probe, it is a verdict on the *position*. Every sidestep
