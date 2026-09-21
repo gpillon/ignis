@@ -41,6 +41,16 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json"] }
 futures-core = "0.3"
+# The OpenAPI surface (GitHub #251, ADR 0036): the document is generated
+# from the handler annotations, and `utoipa-axum` registers a route and its
+# path entry in the same call, so the two cannot drift. Both are pure Rust.
+# The Swagger UI page is *not* `utoipa-swagger-ui`: its `rust-embed` pulls
+# `windows-sys` 0.59 into the **host** graph, whose raw-dylib imports need a
+# `dlltool` the windows-gnu host toolchain cannot run -- and a host
+# dependency is not covered by the MSVC target pin in `.cargo/config.toml`.
+# The distribution is vendored instead (`crates/server/assets/swagger-ui`).
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.2"
 tower = { version = "0.5", features = ["util"] }
 # The HTTP-ingress root span (GitHub #81, ADR 0012): `TraceLayer` on the
 # `axum` router, not a hand-rolled span-per-request middleware.

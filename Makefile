@@ -362,6 +362,24 @@ web-build: $(WEB_INDEX) ## Build web/dist, only when web sources changed
 # $(call vite,<env assignments>,<vite args>)
 vite = cd web && $1 exec node node_modules/vite/bin/vite.js $2
 
+# The Swagger UI the API reference serves (ADR 0036) is vendored under
+# crates/server/assets, but its *version* lives where every other frontend
+# dependency's does: web/package.json. Bump it there, run
+# `make swagger-ui-sync`, commit the copied files. `swagger-ui-check` (in
+# `make ci`) fails when the two disagree, so a bump cannot be forgotten
+# half-done.
+SWAGGER_SRC := web/node_modules/swagger-ui-dist
+SWAGGER_DST := crates/server/assets/swagger-ui
+SWAGGER_FILES := swagger-ui-bundle.js swagger-ui.css   swagger-ui-bundle.js.LICENSE.txt LICENSE NOTICE
+
+.PHONY: swagger-ui-sync
+swagger-ui-sync: $(WEB_DEPS) ## Re-vendor Swagger UI from web/node_modules (after bumping it in web/package.json)
+	@v=$$(node -p "require('./$(SWAGGER_SRC)/package.json').version"); 	for f in $(SWAGGER_FILES); do cp "$(SWAGGER_SRC)/$$f" "$(SWAGGER_DST)/$$f" || exit 1; done; 	sed -i "s/^\`swagger-ui-dist\` \*\*.*\*\*, from npm/\`swagger-ui-dist\` **$$v**, from npm/" "$(SWAGGER_DST)/IGNIS-VENDOR.md"; 	echo "vendored swagger-ui-dist $$v -- commit $(SWAGGER_DST) and rebuild the server"
+
+.PHONY: swagger-ui-check
+swagger-ui-check: $(WEB_DEPS) ## Fail when the vendored Swagger UI is not the version web/package.json pins
+	@for f in $(SWAGGER_FILES); do 	  cmp -s "$(SWAGGER_SRC)/$$f" "$(SWAGGER_DST)/$$f" || { 	    echo "error: vendored Swagger UI differs from web/package.json's pin ($$f)"; 	    echo "  fix: make swagger-ui-sync, then commit $(SWAGGER_DST)"; 	    exit 1; }; 	done
+
 .PHONY: web-dev
 web-dev: $(WEB_DEPS) ## Vite with hot reload, proxying /v1 to the server on BIND
 	$(call vite,IGNIS_URL=$(SERVER_URL))
@@ -430,7 +448,7 @@ clippy: ## cargo clippy, every target of every crate
 test-all: test typecheck-web test-web ## Everything CPU-side: cargo test + web typecheck + vitest
 
 .PHONY: ci
-ci: version-check check test-all ## What a CI job would run (no GPU)
+ci: version-check swagger-ui-check check test-all ## What a CI job would run (no GPU)
 
 # ---------------------------------------------------------------------------
 ##@ Release

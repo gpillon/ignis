@@ -15,6 +15,8 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures-core = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
 arc-swap = { workspace = true }
 tracing = { workspace = true }
 tower-http = { workspace = true }
