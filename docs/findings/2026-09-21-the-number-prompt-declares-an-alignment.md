@@ -105,6 +105,24 @@ tell it reports — a first digit at 0.65-0.71 — is real but is a symptom of t
 alignment being contested, not of the width being wrong: the 300 that started
 this had a first digit at 0.998.
 
+### The padding is not uncertainty
+
+Fixing the rendering broke the number beside it. `sigma` is
+`sum((1 - p_k) * 10^place)` over every digit, and the padding zeros land at
+the *highest* places — so `3` in a three-digit field reported **2.23**, worse
+than the 1.76 the same question reported while answering 300, and it grew with
+the width the caller chose. A zero the model was told to write carries no
+information about the answer, so the sum now starts at the first non-zero
+digit.
+
+That scoping is not free, and it is the reason `Layout` grew a flag. On a
+`point` the width is the **scale**, not a field: an `x` of 031 is a coordinate
+in the first hundred, the hundreds zero is a choice, and 0.4 of doubt there is
+worth 40 on a 0-999 axis — the single number that says the reading might be a
+third of the screen out. Both of the pointing finding's misses are on the axis
+whose first digit the model was least sure of, so dropping that term would
+have hidden exactly the case the sigma exists for.
+
 ## Implications
 
 - `digits` becomes what a caller assumes it is: a field that holds the answer.
@@ -116,6 +134,9 @@ this had a first digit at 0.998.
 - The clause is prompt-only: there is no padding code to regress, so it is
   pinned by a test at every width. A reword that dropped it would restore the
   bug silently.
+- `uncertainty` on a `number` now means what it meant before the clause: the
+  model's own resolution on the digits it chose. It no longer grows with a
+  field the caller happened to make wide.
 - It weakens the case for a `scalar` readout ([#252](https://github.com/gpillon/ignis/issues/252)),
   whose pitch was partly that it has no width trap. Neither does `number` now,
   and `number` is the more accurate of the two.

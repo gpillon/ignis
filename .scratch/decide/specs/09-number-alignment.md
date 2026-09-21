@@ -46,6 +46,14 @@ at the first digit, after which every later digit follows at p ≈ 1.
    before the clause.
 4. A width narrower than the value truncates. That is the only thing a
    narrower field can do and it is not a fault to fix.
+5. `uncertainty` does not count the padding. A leading zero on a `number` is
+   a zero the prompt asked for, so a certain answer in a wide field reports a
+   small sigma and not a large one — before this, `3` in a three-digit field
+   reported 2.23.
+6. A leading zero on a `point` or a `box` **does** count: there the width is
+   the scale, an `x` of 031 is a coordinate in the first hundred, and that
+   digit's doubt is worth 100 on a 0-999 axis. `decide_point_gpu.rs` still
+   passes unchanged.
 
 ## References
 

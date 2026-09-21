@@ -189,6 +189,17 @@ pub struct Plan {
     pub axes: Vec<Axis>,
     /// The ten digit tokens, indexed by the digit they spell.
     pub digit_tokens: [TokenId; 10],
+    /// Whether this plan's prompt told the model to **pad on the left**
+    /// (GitHub #254), and so whether a leading zero is padding or a digit.
+    ///
+    /// True for a `number`, whose width is a field: `number_system` asks for
+    /// the value right-aligned, so an opening zero is one the model was told
+    /// to write and its uncertainty is not the answer's. False for a `point`
+    /// and a `box`, whose width is the **scale**: `x` of 031 is a coordinate
+    /// in the first hundred, the hundreds zero is a choice the model made,
+    /// and dropping its uncertainty would hide exactly the digit the
+    /// pointing finding reports both of its misses on.
+    pub left_padded: bool,
 }
 
 /// Why a run's plan could not be built.
@@ -221,20 +232,44 @@ impl std::fmt::Display for PlanError {
     }
 }
 
-/// The axis names and their literals, in prompt order.
+/// The shape one constrained primitive forces: its axes, and whether its
+/// prompt asked the model to pad on the left.
 ///
-/// The first element's literal is the **prefix**, which goes in the prompt;
-/// every other one is forced mid-generation, a step of one per token.
-pub type Layout = &'static [(&'static str, &'static str)];
+/// The flag lives here rather than beside the caller because it is a
+/// property of the **prompt this layout goes with**, and the two are
+/// written a dozen lines apart: whoever changes `number_system`'s alignment
+/// clause is looking straight at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// The axis names and their literals, in prompt order. The first
+    /// element's literal is the **prefix**, which goes in the prompt; every
+    /// other one is forced mid-generation, a step of one per token.
+    pub axes: &'static [(&'static str, &'static str)],
+    /// Whether this primitive's system text tells the model to write its
+    /// value right-aligned, padded on the left with zeros (GitHub #254) —
+    /// and so whether a leading zero is padding or a digit.
+    ///
+    /// True for a `number`, whose `digits` is a **field**. False for a
+    /// `point` and a `box`, whose `digits` is the **scale**: `x` of 031 is a
+    /// coordinate in the first hundred, that zero is a choice, and treating
+    /// it as padding would drop the uncertainty of exactly the digit the
+    /// pointing finding reports both of its misses on.
+    pub left_padded: bool,
+}
 
-pub const NUMBER_LAYOUT: Layout = &[("value", "{\"value\":")];
-pub const POINT_LAYOUT: Layout = &[("x", "{\"x\":"), ("y", ",\"y\":")];
-pub const BOX_LAYOUT: Layout = &[
-    ("x0", "{\"x0\":"),
-    ("y0", ",\"y0\":"),
-    ("x1", ",\"x1\":"),
-    ("y1", ",\"y1\":"),
-];
+pub const NUMBER_LAYOUT: Layout =
+    Layout { axes: &[("value", "{\"value\":")], left_padded: true };
+pub const POINT_LAYOUT: Layout =
+    Layout { axes: &[("x", "{\"x\":"), ("y", ",\"y\":")], left_padded: false };
+pub const BOX_LAYOUT: Layout = Layout {
+    axes: &[
+        ("x0", "{\"x0\":"),
+        ("y0", ",\"y0\":"),
+        ("x1", ",\"x1\":"),
+        ("y1", ",\"y1\":"),
+    ],
+    left_padded: false,
+};
 
 /// Build a plan; `encode` is the loaded tokenizer, spelling literals the way
 /// the model reads them.
@@ -262,8 +297,8 @@ pub fn plan(
     }
     let mut prefix = Vec::new();
     let mut steps: Vec<Vec<TokenId>> = Vec::new();
-    let mut axes = Vec::with_capacity(layout.len());
-    for (index, (name, literal)) in layout.iter().enumerate() {
+    let mut axes = Vec::with_capacity(layout.axes.len());
+    for (index, (name, literal)) in layout.axes.iter().enumerate() {
         let ids = encode(literal).ok_or_else(|| PlanError::Unencodable((*literal).to_owned()))?;
         match index {
             // The opening literal is prompt, not schedule: it costs a few
@@ -279,7 +314,7 @@ pub fn plan(
         axes.push(Axis { name, digits: begin..steps.len() });
     }
     let schedule = Schedule::new(steps).map_err(PlanError::Schedule)?;
-    Ok(Plan { prefix, schedule, axes, digit_tokens })
+    Ok(Plan { prefix, schedule, axes, digit_tokens, left_padded: layout.left_padded })
 }
 
 /// One digit of an answer, and the model's own confidence in it.
@@ -294,8 +329,16 @@ pub struct DigitDraw {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub value: u64,
-    /// `sigma = sum((1 - p_k) * 10^place)` — in units of the **value**, not
-    /// a 0-1 score.
+    /// `sigma = sum((1 - p_k) * 10^place)` over the digits **from the first
+    /// non-zero one onward** — in units of the **value**, not a 0-1 score.
+    ///
+    /// The leading zeros are excluded because since GitHub #254 they are
+    /// padding: `number_system` asks for the value right-aligned, so a field
+    /// wider than the answer opens with zeros the model is filling rather
+    /// than choosing, and they occupy the highest places. Counting them let
+    /// a certain answer look uncertain — `3` in a three-digit field reported
+    /// 2.23 — and the wider the caller's field, the worse it got, which is
+    /// the opposite of what a resolution reading should do.
     ///
     /// A score would be the wrong shape twice over. It would throw away
     /// *which* digit is uncertain, when that is the whole signal: the
@@ -330,6 +373,32 @@ pub fn read(plan: &Plan, drawn: &[Draw]) -> Option<BTreeMap<String, Reading>> {
         let mut sigma = 0f64;
         let width = axis.digits.len();
         let mut digits = Vec::with_capacity(width);
+        // On a left-padded plan a **leading zero is padding, not a digit**
+        // (GitHub #254). `number_system` asks for the value right-aligned,
+        // so a field wider than the answer opens with zeros the model is
+        // merely filling, and they sit at the *highest* places — weighting
+        // their uncertainty would let the widest place in the field dominate
+        // a reading that does not use it. Measured: `3` in a three-digit
+        // field came back with its hundreds zero at p = 0.978, and
+        // 0.022 x 100 alone is a sigma of 2.2 on an answer the model is
+        // certain of. Trailing zeros are never skipped — the zeros in 100
+        // are the number — and neither is anything on a `point` or a `box`,
+        // where the width is the scale and an opening zero is a choice.
+        let significant = match plan.left_padded {
+            false => 0,
+            true => axis
+            .digits
+            .clone()
+            .position(|index| {
+                drawn
+                    .get(index)
+                    .and_then(|draw| plan.digit_tokens.iter().position(|&id| id == draw.token))
+                    .is_none_or(|digit| digit != 0)
+            })
+            // Every digit is a zero, so the answer is 0 and the last place
+            // is the one that says it.
+            .unwrap_or(width - 1),
+        };
         for (place, index) in axis.digits.clone().enumerate() {
             let draw = drawn.get(index)?;
             let digit = plan.digit_tokens.iter().position(|&id| id == draw.token)? as u32;
@@ -337,7 +406,9 @@ pub fn read(plan: &Plan, drawn: &[Draw]) -> Option<BTreeMap<String, Reading>> {
             // loop is worth `10^(width - 1)`.
             let weight = 10f64.powi((width - 1 - place) as i32);
             value = value * 10 + u64::from(digit);
-            sigma += (1.0 - f64::from(draw.probability)) * weight;
+            if place >= significant {
+                sigma += (1.0 - f64::from(draw.probability)) * weight;
+            }
             digits.push(DigitDraw { digit, probability: f64::from(draw.probability) });
         }
         readings.insert(axis.name.to_owned(), Reading { value, sigma, digits });
@@ -460,6 +531,80 @@ mod tests {
         );
         assert_eq!(reading.digits.len(), 3);
         assert_eq!(reading.digits[0].digit, 7);
+    }
+
+    /// GitHub #254: padding is not a digit, and the widest field must not
+    /// be the most uncertain answer.
+    #[test]
+    fn the_zeros_a_right_aligned_value_is_padded_with_carry_no_uncertainty() {
+        let plan = plan(NUMBER_LAYOUT, 3, &per_character).expect("a plan");
+        let draw = |digit: usize, probability: f32| Draw {
+            token: plan.digit_tokens[digit],
+            probability,
+        };
+        // `3` right-aligned in a three-digit field, with the hundreds zero
+        // at the probability a live server actually reported for it.
+        let readings = read(&plan, &[draw(0, 0.978), draw(0, 0.999), draw(3, 1.0)])
+            .expect("every draw is a digit");
+        let reading = &readings["value"];
+        assert_eq!(reading.value, 3);
+        assert!(
+            reading.sigma < 0.01,
+            "the hundreds zero is padding the model was told to write, and counting it              reported 3 ± 2.2 on an answer nothing was unsure of: {}",
+            reading.sigma
+        );
+        // The trace still carries them: a reader wants to see the padding,
+        // it is only the arithmetic that must not.
+        assert_eq!(reading.digits.len(), 3);
+        assert_eq!(reading.digits[0].digit, 0);
+
+        // A zero *inside* the number is the number. 100 is uncertain in its
+        // tens and units exactly as much as its draws say.
+        let readings = read(&plan, &[draw(1, 0.9), draw(0, 0.8), draw(0, 0.5)])
+            .expect("every draw is a digit");
+        let reading = &readings["value"];
+        assert_eq!(reading.value, 100);
+        let expected = 0.1 * 100.0 + 0.2 * 10.0 + 0.5;
+        // A probability is an `f32`, so `1 - 0.9` weighted by a hundred is
+        // 10.000002 and not 10 — the same tolerance the place-weighting test
+        // above uses, for the same reason.
+        assert!((reading.sigma - expected).abs() < 1e-3, "{} vs {expected}", reading.sigma);
+
+        // All zeros: the answer is 0, and the units place is the one that
+        // says so.
+        let readings = read(&plan, &[draw(0, 0.9), draw(0, 0.9), draw(0, 0.6)])
+            .expect("every draw is a digit");
+        let reading = &readings["value"];
+        assert_eq!(reading.value, 0);
+        assert!((reading.sigma - 0.4).abs() < 1e-3, "{}", reading.sigma);
+    }
+
+    /// The other half of GitHub #254: a `point`'s width is the **scale**,
+    /// not a field, so its leading zero is a coordinate in the first
+    /// hundred and its uncertainty is the reading's.
+    #[test]
+    fn a_leading_zero_on_a_point_is_a_digit_and_keeps_its_uncertainty() {
+        let plan = plan(POINT_LAYOUT, 3, &per_character).expect("a plan");
+        assert!(!plan.left_padded, "point_system asks for a scale, not a padded field");
+        let digit = |d: usize, p: f32| Draw { token: plan.digit_tokens[d], probability: p };
+        let literal = |token: TokenId| Draw { token, probability: 1.0 };
+        let separator: Vec<Draw> = per_character(",\"y\":")
+            .expect("the literal")
+            .into_iter()
+            .map(literal)
+            .collect();
+        // x = 031, with the hundreds digit a contested zero — the model
+        // half thinking the point is past a third of the way across.
+        let mut drawn = vec![digit(0, 0.6), digit(3, 0.99), digit(1, 0.9)];
+        drawn.extend(separator);
+        drawn.extend([digit(5, 1.0), digit(0, 1.0), digit(0, 1.0)]);
+        let readings = read(&plan, &drawn).expect("every digit draw is a digit");
+        assert_eq!(readings["x"].value, 31);
+        assert!(
+            readings["x"].sigma > 39.0,
+            "0.4 of doubt at the hundreds place is 40 on a 0-999 scale, and it is the              one number that says the reading might be a third of the screen out: {}",
+            readings["x"].sigma
+        );
     }
 
     #[test]
