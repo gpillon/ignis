@@ -1,4 +1,4 @@
-//! GitHub #190 (ADR 0029, spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md`
+//! GitHub #190 (ADR 0029, spec `docs/specs/kv-reuse/01-cross-request-reuse.md`
 //! §"Retained state in KV-RAM") — retained state the device gives up is
 //! **spilled** to KV-RAM instead of lost, and comes back from there.
 //!

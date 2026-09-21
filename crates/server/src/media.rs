@@ -1,4 +1,4 @@
-//! Media acquisition (GitHub #179, spec `.scratch/vision/specs/01-image-input.md`
+//! Media acquisition (GitHub #179, spec `docs/specs/vision/01-image-input.md`
 //! §Wire contract): every `image_url` part of a chat request becomes a
 //! [`PreparedMedia`] — its bytes acquired from a base64 `data:` URI or an
 //! HTTP(S) URL, decoded, resized and packed — before the request is admitted

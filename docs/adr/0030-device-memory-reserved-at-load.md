@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-09-17). Spec: `.scratch/vram-budget/specs/01-vram-budget.md`.
+Accepted (2026-09-17). Spec: `docs/specs/vram-budget/01-vram-budget.md`.
 Clarifies ADR 0029 (its device pool of retained images is physical: retained
 slots) and absorbs GitHub #204. Measurement and code analysis:
 `.scratch/vram-analysis/REPORT.md`. Amended 2026-09-18 (owner request):

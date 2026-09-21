@@ -30,7 +30,7 @@ use ignis_core::step::{prefill_program_with_route, PrefillRoute};
 use ignis_bench::oracle::{G1_AGREEMENT_FLOOR, meets_g1_floor, score_teacher_forced};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
-/// The spec's own example (`.scratch/runtime/specs/02-real-prefill.md`):
+/// The spec's own example (`docs/specs/runtime/02-real-prefill.md`):
 /// "An 8K prompt warms its sequence in eight [1,024-token] traversals."
 const SPAN_TOKENS: usize = 8192;
 const PREFILL_CHUNK: u32 = 1024;

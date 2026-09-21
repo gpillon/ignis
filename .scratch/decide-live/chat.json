@@ -1,2 +1,0 @@
-{"model":"qwen3.8-27b","enable_thinking":false,"max_tokens":200,"stream":false,
- "messages":[{"role":"user","content":"In three sentences, explain why a constrained decode is more reliable than parsing a model's free-form JSON."}]}

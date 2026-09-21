@@ -1,4 +1,4 @@
-//! Media acquisition (GitHub #179, spec `.scratch/vision/specs/01-image-input.md`
+//! Media acquisition (GitHub #179, spec `docs/specs/vision/01-image-input.md`
 //! §Wire contract): the `MediaAcquirer` seam the chat handler calls before
 //! admission, driven on the CPU against a local image server and the real
 //! vision processor (ADR 0006: no GPU, no network beyond loopback).

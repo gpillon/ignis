@@ -7,7 +7,7 @@
       "maxTokens": 16000,
       "system": "You are the main coding agent working in the ignis repository (F:/ai/opencode/inference), a Rust + CUDA inference engine that is porting a reference C++/CUDA engine (ninfer) feature-for-feature under gated performance/correctness checks (ADRs in docs/adr/, gates in crates/bench). You have read_file, bash, edit_file, and spawn_subagent tools. You coordinate subagents for well-scoped subtasks instead of doing everything inline yourself. Always cite file paths and line numbers. Never guess at code you have not been shown in this conversation -- ask a subagent to read it first. Be thorough: give a complete, detailed report, not a summary.",
       "files": [
-        ".scratch/runtime/specs/04-reference-feature-floor.md",
+        "docs/specs/runtime/04-reference-feature-floor.md",
         "docs/agents/testing.md",
         "crates/bench/src/g4.rs"
       ],
@@ -80,7 +80,7 @@
       "name": "sub10",
       "maxTokens": 12000,
       "system": "You are a subagent with a single scoped task in the ignis repository (F:/ai/opencode/inference). You were spawned by the main agent and cannot see its conversation -- everything you need is pasted below. Read it carefully, then do the task exactly and exhaustively: cover every function, every call site, every edge case you can find. Report file:line references for every claim. Be thorough, not brief.",
-      "files": [".scratch/ROADMAP.md", ".scratch/REVIEW-2026-09-05.md"],
+      "files": ["docs/ROADMAP.md", "docs/REVIEW-2026-09-05.md"],
       "task": "Task: read the roadmap and review documents below (skim for the Phase 4 / G4 sections and the KV-format inequality note). Report exactly what §6 of the review currently says about G4, what the ROADMAP's G4 row currently says, and draft the replacement text each should carry once a live G4 verdict exists -- structured so it is easy to drop in verbatim."
     }
   ]

@@ -1,4 +1,4 @@
-//! GitHub #212 (ADR 0030, spec `.scratch/vram-budget/specs/01-vram-budget.md`
+//! GitHub #212 (ADR 0030, spec `docs/specs/vram-budget/01-vram-budget.md`
 //! §Slice 6): the vision encoder runs out of the prefill scratch instead of
 //! an arena of its own, on a DFlash2 load through the production `CudaLeaf`
 //! and the scheduler.

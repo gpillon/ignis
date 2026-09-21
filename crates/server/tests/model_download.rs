@@ -1,5 +1,5 @@
 //! The model transfer (GitHub #234, spec
-//! `.scratch/model-download/specs/01-model-download.md` AC3-AC5), driven
+//! `docs/specs/model-download/01-model-download.md` AC3-AC5), driven
 //! against a local `axum` server: no network, no GPU, no 19 GB.
 //!
 //! What is pinned here is what protects the operator from a file that is not

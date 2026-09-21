@@ -5,7 +5,7 @@
 - Observed: 2026-09-13
 - Last verified: 2026-09-13
 - Scope: bench / G4 per-class cell, trace replay, SSE reader
-- Related: [#147](https://github.com/gpillon/ignis/issues/147), [#137](https://github.com/gpillon/ignis/issues/137), [#128](https://github.com/gpillon/ignis/issues/128), [spec 04](../../.scratch/runtime/specs/04-reference-feature-floor.md)
+- Related: [#147](https://github.com/gpillon/ignis/issues/147), [#137](https://github.com/gpillon/ignis/issues/137), [#128](https://github.com/gpillon/ignis/issues/128), [spec 04](../specs/runtime/04-reference-feature-floor.md)
 - Superseded by: none
 
 ## Question

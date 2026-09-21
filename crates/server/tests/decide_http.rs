@@ -1025,11 +1025,49 @@ async fn the_followers_of_a_fan_out_are_in_the_engine_together() {
     //
     // Served in sequence only ever one request exists at a time, so a
     // prefill batch carrying two of them is proof the followers overlap.
-    let compute = Arc::new(MockCompute::new());
-    let (status, _) = decide(&app(compute.clone()), &fan_out(300, 8)).await;
+    //
+    // The batch is made wide on purpose rather than hoped for. `MockCompute`
+    // answers instantly, so on a loaded runner the scheduler can drain the
+    // followers one at a time as the handler submits them and every batch is
+    // one request wide -- which is what this assertion read on a GitHub
+    // Windows runner (`the widest prefill batch held 1 requests`) on a commit
+    // that passed twice on the development machine. It proved the runner was
+    // slow, not that the server serialized anything.
+    //
+    // So the compute holds the first batch that carries a follower until the
+    // harness says go. While it is held the handler keeps being polled and
+    // submits the rest, and the batch the scheduler forms when it comes back
+    // out is all of them. A server that really did serialize its followers
+    // would have nothing queued behind the held one and still fail.
+    use std::sync::mpsc::sync_channel;
+    let (entered_tx, entered_rx) = sync_channel(0);
+    let (go_tx, go_rx) = sync_channel(0);
+    let (released_tx, _released_rx) = sync_channel(64);
+    let compute = Arc::new(HoldFollower {
+        inner: MockCompute::new(),
+        entered: entered_tx,
+        go: std::sync::Mutex::new(go_rx),
+        held: std::sync::atomic::AtomicBool::new(false),
+        released: released_tx,
+    });
+    let app = server_over(compute.clone() as Arc<dyn ignis_core::Compute>).app();
+    let body = fan_out(300, 8);
+    let client = tokio::spawn(async move { decide(&app, &body).await });
+
+    // Blocking, but off the runtime's thread -- the handler has to keep being
+    // polled to submit the followers this waits for.
+    tokio::task::spawn_blocking(move || entered_rx.recv())
+        .await
+        .expect("the waiter ran")
+        .expect("a follower reached the compute");
+    support::nudge().await;
+    go_tx.send(()).expect("the held prefill is still waiting");
+
+    let (status, _) = client.await.expect("the request ran");
     assert_eq!(status, 200);
 
     let batched = compute
+        .inner
         .prefill_calls()
         .into_iter()
         .map(|call| {

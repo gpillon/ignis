@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-09-16) — GitHub #183 (absorbs #168). Spec:
-`.scratch/kv-reuse/specs/01-cross-request-reuse.md`. Builds on ADR 0024
+`docs/specs/kv-reuse/01-cross-request-reuse.md`. Builds on ADR 0024
 (sequence state transfer) and ADR 0023 (eviction priority), and amends both.
 Clarified by ADR 0030 (2026-09-17): the device pool of retained images below
 is physical — **retained slots** reserved at load, holding every shared

@@ -658,7 +658,7 @@ When output names a domain concept, use the term as defined here.
 
 - **Gate** — a milestone acceptance measured **on the GPU**, never on CPU
   tests. G1 correctness floor, G2 prefill, G3 decode + serving loop, G4 the
-  reference feature floor, G5 speculative decoding (`.scratch/ROADMAP.md`).
+  reference feature floor, G5 speculative decoding (`docs/ROADMAP.md`).
 - **GPU profile** — the explicit test profile for GPU work: it requires the
   5090 free and **fails**, never skips, when the GPU is busy or a kernel
   errors. A skip is not green for compute work. *Free* means **one process on

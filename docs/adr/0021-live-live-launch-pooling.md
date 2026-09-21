@@ -96,7 +96,7 @@ pair.
 - A gate run that reports only one launch pair per engine is not a valid
   reading of this method from here on — the same way ADR 0015 already
   refuses a verdict computed from records that do not share a session id.
-- `.scratch/runtime/specs/03-serving-loop.md`'s G3 procedure states the
+- `docs/specs/runtime/03-serving-loop.md`'s G3 procedure states the
   two-launch requirement for its three cells.
 - The mechanism behind the per-launch band is not resolved by this ADR and
   is not ignis's own defect: both trees produced both bands, and the GPU's

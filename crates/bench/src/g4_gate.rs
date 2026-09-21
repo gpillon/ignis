@@ -1,7 +1,7 @@
 //! The **G4 gate check** (P4-01, GitHub #117): at least two launches per
 //! engine in, one pooled verdict out.
 //!
-//! Spec: `.scratch/runtime/specs/04-reference-feature-floor.md` ("Gate G4");
+//! Spec: `docs/specs/runtime/04-reference-feature-floor.md` ("Gate G4");
 //! ADR 0015 (live/live), ADR 0021 (launch pooling). Mirrors
 //! [`crate::g2`] / [`crate::g3_gate`]'s refusal discipline exactly — a
 //! verdict is only computed when every launch of both engines agrees on the

@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-`.scratch/runtime/specs/04-reference-feature-floor.md`. Applies ADR 0009
+`docs/specs/runtime/04-reference-feature-floor.md`. Applies ADR 0009
 (step-level device-resident ABI) to the two features that move sequence state.
 
 ## Context
@@ -19,7 +19,7 @@ conv taps, a position and last token, and since #99 a penalty-count row. The
 G3 session established that all of these are consistent together at a completed
 chunk boundary, and recorded a caveat with it: a *new* state section does not
 inherit that snapshot-point permission and must re-earn it
-(`.scratch/DEFERRED-DECISIONS.md` item 5).
+(`docs/DEFERRED-DECISIONS.md` item 5).
 
 Two questions followed. First, how much of that structure crosses the C ABI.
 Exposing a section table to Rust would let the host tier compute layouts, and

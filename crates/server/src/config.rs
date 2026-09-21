@@ -1,6 +1,6 @@
 //! `ignis-server` CLI flags mirroring the existing env-var config surface
 //! one-to-one, plus `--help`/`-h` and `--version`/`-V` (GitHub #77,
-//! `.scratch/spec-cli-config.md`).
+//! `docs/specs/server/06-cli-config.md`).
 //!
 //! [`resolve`] is the one seam for this feature: pure (no `std::env`, no
 //! filesystem, no process exit), so precedence and validation are covered by

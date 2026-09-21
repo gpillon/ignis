@@ -6,9 +6,11 @@ kernel/build-b/
 kernel/build-c/
 kernel/build-119/
 
-# the Playground frontend (web/, ADR 0026): dependencies and build output
+# the Playground frontend (web/, ADR 0026): dependencies, build output and
+# the vitest reporter's JSON run record
 node_modules/
 dist/
+.vitest/
 
 # logs
 *.log
@@ -24,13 +26,13 @@ __pycache__/
 .claude/
 .codex/
 
-# local server pid
-.scratch/runtime/ignis-server.pid
-
-# per-machine Makefile overrides (template: local.mk.example), and the
-# server's pid file + logs from `make start` / `make run-ui`
+# per-machine Makefile overrides (template: local.mk.example)
 local.mk
-.scratch/serve/
+
+# the scratchpad: temporary artifacts, experiments, raw logs, workflow output
+# and the server pid/logs from `make start`. Local to each clone; durable
+# material belongs in docs/ (see docs/agents/issue-tracker.md).
+.scratch/
 
 # local artifact store (junction/symlink to the .ninfer artifact dir, never committed)
 models/

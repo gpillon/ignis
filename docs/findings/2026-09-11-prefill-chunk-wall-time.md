@@ -5,7 +5,7 @@
 - Observed: 2026-09-11
 - Last verified: 2026-09-11
 - Scope: kernel / prefill chunking (`kernel/src/step.cu`), GPU profiling
-- Related: [#92](https://github.com/gpillon/ignis/issues/92) (acceptance criterion 1), [ADR 0005](../adr/0005-performance-first-principle.md), [ADR 0006](../adr/0006-exclusive-gpu-testing.md), [ADR 0016](../adr/0016-step-abi-extensible-options.md), [#84](https://github.com/gpillon/ignis/issues/84), [#86](https://github.com/gpillon/ignis/issues/86), [#88](https://github.com/gpillon/ignis/issues/88), [#110](https://github.com/gpillon/ignis/issues/110), [#65](https://github.com/gpillon/ignis/issues/65), [#13](https://github.com/gpillon/ignis/issues/13), `.scratch/DEFERRED-DECISIONS.md` item 1, `.scratch/issue-92/DECOMPOSITION.md`
+- Related: [#92](https://github.com/gpillon/ignis/issues/92) (acceptance criterion 1), [ADR 0005](../adr/0005-performance-first-principle.md), [ADR 0006](../adr/0006-exclusive-gpu-testing.md), [ADR 0016](../adr/0016-step-abi-extensible-options.md), [#84](https://github.com/gpillon/ignis/issues/84), [#86](https://github.com/gpillon/ignis/issues/86), [#88](https://github.com/gpillon/ignis/issues/88), [#110](https://github.com/gpillon/ignis/issues/110), [#65](https://github.com/gpillon/ignis/issues/65), [#13](https://github.com/gpillon/ignis/issues/13), `docs/DEFERRED-DECISIONS.md` item 1, `.scratch/issue-92/DECOMPOSITION.md`
 - Superseded by: none
 
 **Hardware:** RTX 5090 (GB202, 170 SMs, 32,607 MiB), free card, ADR 0006 profile.
@@ -27,7 +27,7 @@ GDN/GQA entry points without moving that number at all.
 
 Two decisions were waiting on the answer:
 
-- **P4 / #65**, via `.scratch/DEFERRED-DECISIONS.md` item 1: packed prefill's
+- **P4 / #65**, via `docs/DEFERRED-DECISIONS.md` item 1: packed prefill's
   phase was left explicitly dependent on what #92 reported.
 - **#110**, where a chunk=512 run showed a *worse* ITL p95 tail than
   chunk=1024, read at the time as evidence of a fixed per-boundary cost.
@@ -371,7 +371,7 @@ at load, P2-01/#83), not the KV pool, which is a flat ~1.2 GiB in every row.
   compute, 9 % launch/dispatch, 0.5 % the forced synchronization**.
 - **The P4 / #65 input is settled:** the cost is **not** dominated by
   sync/dispatch.
-- **`.scratch/DEFERRED-DECISIONS.md` item 1 needs restating rather than
+- **`docs/DEFERRED-DECISIONS.md` item 1 needs restating rather than
   confirming.** Its stated reason (a dominant sync/dispatch cost to amortize
   across N) is not there. Its conclusion survives on a different and
   conditional footing: below ~1,024 tokens per traversal the model is

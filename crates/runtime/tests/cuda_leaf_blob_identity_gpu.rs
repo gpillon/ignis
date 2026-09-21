@@ -1,5 +1,5 @@
 //! GPU coverage for the blob compatibility identity against a real load
-//! (GitHub #189, ADR 0029; spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md`
+//! (GitHub #189, ADR 0029; spec `docs/specs/kv-reuse/01-cross-request-reuse.md`
 //! §"Identity and the Tier 2 seam").
 //!
 //! `ignis-core`'s CPU tests prove the *rule*: an identity accepts only itself,

@@ -1,1 +1,0 @@
-{"choices":[{"finish_reason":"length","index":0,"message":{"content":"Based","role":"assistant"}}],"created":1789942595,"id":"chatcmpl-e4de0e0f22b982b1","model":"qwen3.8-27b","object":"chat.completion","usage":{"completion_tokens":1,"prompt_tokens":16404,"total_tokens":16405}}

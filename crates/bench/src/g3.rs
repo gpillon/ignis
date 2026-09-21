@@ -1,7 +1,7 @@
 //! The G3 measurement instrument (P3-07, GitHub #100): C=1 / C=4 / ITL,
 //! measured over HTTP/SSE against any OpenAI-compatible endpoint.
 //!
-//! Spec: `.scratch/runtime/specs/03-serving-loop.md`; ADR 0015 (live/live
+//! Spec: `docs/specs/runtime/03-serving-loop.md`; ADR 0015 (live/live
 //! gate, cold samples). The verdict half lives in [`crate::g3_gate`].
 //!
 //! Reuses [`crate::ttft`]'s prompt generator and cold-prefix rule verbatim

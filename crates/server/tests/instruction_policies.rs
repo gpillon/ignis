@@ -1,5 +1,5 @@
 //! Instruction-message policies on the **real frontend** (GitHub #209, spec
-//! `.scratch/vram-budget/specs/01-vram-budget.md` §Slice 2).
+//! `docs/specs/vram-budget/01-vram-budget.md` §Slice 2).
 //!
 //! The policies themselves are pinned on message lists in
 //! `crates/server/src/instruction.rs`. What only the artifact's own template

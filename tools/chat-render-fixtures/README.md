@@ -6,7 +6,7 @@ small set of conversations, so `crates/artifact/tests/chat_render.rs` can hold
 ignis's minijinja render of the same messages to it byte for byte.
 
 The cases exist for the rendering prerequisite of cross-request state reuse
-(spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md` §Rendering
+(spec `docs/specs/kv-reuse/01-cross-request-reuse.md` §Rendering
 prerequisites, ADR 0029): a resent tool call must render its parameters in the
 order the model emitted them. `tool_call_key_order` and
 `tool_call_reversed_keys` carry the same five keys in opposite orders, so no

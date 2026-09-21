@@ -8,7 +8,7 @@
 - Related: [GitHub #135](https://github.com/gpillon/ignis/issues/135),
   [ADR 0006](../adr/0006-exclusive-gpu-testing.md),
   [testing](../agents/testing.md),
-  spec `.scratch/gpu-profile-speed/specs/01-gpu-profile-speed.md`
+  spec `docs/specs/gpu-profile-speed/01-gpu-profile-speed.md`
 - Superseded by: none
 
 ## Question

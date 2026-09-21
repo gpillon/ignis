@@ -5,7 +5,7 @@
 - Observed: 2026-09-18
 - Last verified: 2026-09-18
 - Scope: serving / device memory reservation, KV-RAM pinned arena, retained slots, WDDM paging
-- Related: https://github.com/gpillon/ignis/issues/214, https://github.com/gpillon/ignis/issues/207, [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), [ADR 0029](../adr/0029-cross-request-state-reuse.md), [spec](../../.scratch/vram-budget/specs/01-vram-budget.md), [run record](../../.scratch/vram-budget/gate-214/FINDINGS.md), https://github.com/gpillon/ignis/issues/218, https://github.com/gpillon/ignis/issues/219
+- Related: https://github.com/gpillon/ignis/issues/214, https://github.com/gpillon/ignis/issues/207, [ADR 0030](../adr/0030-device-memory-reserved-at-load.md), [ADR 0029](../adr/0029-cross-request-state-reuse.md), [spec](../specs/vram-budget/01-vram-budget.md), [run record](../../.scratch/vram-budget/gate-214/FINDINGS.md), https://github.com/gpillon/ignis/issues/218, https://github.com/gpillon/ignis/issues/219
 - Superseded by: none
 
 ## Question

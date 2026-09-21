@@ -1,5 +1,5 @@
 //! Prompt checkpoints — the device tier of cross-request state reuse
-//! (GitHub #186, ADR 0029; spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md`
+//! (GitHub #186, ADR 0029; spec `docs/specs/kv-reuse/01-cross-request-reuse.md`
 //! §"Prompt checkpoint on the device").
 //!
 //! A **prompt checkpoint** is the whole-sequence state of a request at its

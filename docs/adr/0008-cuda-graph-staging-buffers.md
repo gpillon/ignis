@@ -2,7 +2,7 @@
 
 ## Status
 
-Superseded (2026-09-05) by ADR 0009 (step-level device-resident C ABI) — see `.scratch/runtime/specs/01-device-resident-forward.md`, GitHub #36. The staging-buffer graph model captured a non-model toy sequence; decode graphs will capture the batched decode round over per-slot state views (G3). Originally accepted 2026-09-04. The decode graph this ADR anticipated landed as ADR 0019 (P3-05, GitHub #102): it keeps this ADR's persistent-staging-buffer principle but resolves round composition through device-resident slot indices rather than the fixed representative geometry this ADR assumed.
+Superseded (2026-09-05) by ADR 0009 (step-level device-resident C ABI) — see `docs/specs/runtime/01-device-resident-forward.md`, GitHub #36. The staging-buffer graph model captured a non-model toy sequence; decode graphs will capture the batched decode round over per-slot state views (G3). Originally accepted 2026-09-04. The decode graph this ADR anticipated landed as ADR 0019 (P3-05, GitHub #102): it keeps this ADR's persistent-staging-buffer principle but resolves round composition through device-resident slot indices rather than the fixed representative geometry this ADR assumed.
 
 ## Context
 
@@ -72,5 +72,5 @@ lives in those buffers; the hot path never updates graph nodes.
 - **Non-goals (v1):** per-batch-size graph variants, per-step node updates,
   and lazy re-capture. If a later perf gate shows the single-geometry graph
   underperforms, that is a later decision — re-gated per ADR 0005 / 0007.
-- The B2 spec (`kernel-abi/specs/09-cuda-graph-replay.md`) implements this
+- The B2 spec (`docs/specs/kernel-abi/09-cuda-graph-replay.md`) implements this
   model and references this ADR.

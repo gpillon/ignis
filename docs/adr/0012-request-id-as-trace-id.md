@@ -2,8 +2,7 @@
 
 ## Status
 
-Accepted (2026-09-07, grilling session on `.scratch/Ignis Structured Logging
-Specification.md`).
+Accepted (2026-09-07, grilling session on `docs/specs/logging/spec.md`).
 
 ## Context
 

@@ -5,7 +5,7 @@
 - Observed: 2026-09-11
 - Last verified: 2026-09-11
 - Scope: kernel / paged KV cache, scheduler capacity
-- Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [spec 04](../../.scratch/runtime/specs/04-reference-feature-floor.md), [#65](https://github.com/gpillon/ignis/issues/65), [#112](https://github.com/gpillon/ignis/issues/112)
+- Related: [ADR 0022](../adr/0022-two-kv-formats-bf16-as-oracle.md), [spec 04](../specs/runtime/04-reference-feature-floor.md), [#65](https://github.com/gpillon/ignis/issues/65), [#112](https://github.com/gpillon/ignis/issues/112)
 - Superseded by: none
 
 ## Question
@@ -33,7 +33,7 @@ Model geometry from `CONTEXT.md`: 16 GQA layers, 4 KV heads of 256, K and V
 both stored.
 
 BF16 per sequence-token: `16 × 4 × 256 × 2 roles × 2 bytes = 65,536`. This
-matches the figure already recorded in `.scratch/DEFERRED-DECISIONS.md` item 6
+matches the figure already recorded in `docs/DEFERRED-DECISIONS.md` item 6
 and in the G3 verdict.
 
 hq-e8-2b per sequence-token: `16 × 4 × 2 roles × (64 + 8) = 9,216`.

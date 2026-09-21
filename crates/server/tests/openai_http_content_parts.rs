@@ -1,5 +1,5 @@
 //! OpenAI content parts on chat messages (GitHub #175, spec
-//! `.scratch/vision/specs/01-image-input.md` §Wire contract): end-to-end
+//! `docs/specs/vision/01-image-input.md` §Wire contract): end-to-end
 //! tests over the real axum router against a mock-compute engine (CPU-only,
 //! ADR 0006).
 //!

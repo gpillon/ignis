@@ -1,7 +1,7 @@
 //! The **G3 gate check** (P3-07, GitHub #100): two G3 records in, one
 //! verdict out.
 //!
-//! Spec: `.scratch/runtime/specs/03-serving-loop.md`; ADR 0015. Mirrors
+//! Spec: `docs/specs/runtime/03-serving-loop.md`; ADR 0015. Mirrors
 //! [`crate::g2`]'s shape and its live/live discipline exactly: a verdict is
 //! only computed from two records sharing a session, with every cold-prefix
 //! obligation satisfied on both sides — otherwise [`check`] returns a

@@ -7,7 +7,7 @@ specifically its claim that chunked prefill would be "a leaf change, not an
 ABI change". The step-level, device-resident, opaque-handled design of ADR
 0009 is unchanged.
 
-Sources: `.scratch/runtime/specs/02-real-prefill.md` (GitHub #63).
+Sources: `docs/specs/runtime/02-real-prefill.md` (GitHub #63).
 
 ## Context
 

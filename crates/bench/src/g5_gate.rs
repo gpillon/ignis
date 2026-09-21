@@ -1,7 +1,7 @@
 //! The **G5 gate check** (P5-07, GitHub #151): at least two launches per
 //! engine in, one pooled ratio out — per depth.
 //!
-//! Spec: `.scratch/runtime/specs/05-speculative-decoding.md` (not written
+//! Spec: `docs/specs/runtime/05-speculative-decoding.md` (not written
 //! yet; see [`crate::g5`]'s doc comment). ADR 0015 (live/live), ADR 0021
 //! (launch pooling). #151: "a `g5-gate` reuses `g4-gate`'s per-cell pooling
 //! rule across launches and reports one ratio per depth against 0.99" — this

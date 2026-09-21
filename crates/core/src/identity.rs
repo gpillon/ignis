@@ -1,5 +1,5 @@
 //! What a retained blob is, and what a retained entry is *called*
-//! (GitHub #189, ADR 0029; spec `.scratch/kv-reuse/specs/01-cross-request-reuse.md`
+//! (GitHub #189, ADR 0029; spec `docs/specs/kv-reuse/01-cross-request-reuse.md`
 //! §"Identity and the Tier 2 seam").
 //!
 //! Two independent things live here, and keeping them apart is the point:

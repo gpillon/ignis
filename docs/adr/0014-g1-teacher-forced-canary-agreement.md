@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-09-07, GitHub #76). **Clarifies ADR 0007** and corrects the G1
-acceptance wording in `.scratch/runtime/specs/01-device-resident-forward.md`,
+acceptance wording in `docs/specs/runtime/01-device-resident-forward.md`,
 which had drifted into a parity requirement ADR 0007 explicitly rejects.
 
 Sources: GitHub #72 (root cause), GitHub #76 (this decision), the measurement

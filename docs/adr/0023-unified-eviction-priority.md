@@ -3,7 +3,7 @@
 ## Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-`.scratch/runtime/specs/04-reference-feature-floor.md`. Extends ADR 0004 (the
+`docs/specs/runtime/04-reference-feature-floor.md`. Extends ADR 0004 (the
 full admission state machine in v1) to the tier below the GPU.
 
 ## Context

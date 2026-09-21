@@ -7,8 +7,8 @@ granularity, not the two-language split. **Supersedes ADR 0008.**
 **Amended by ADR 0016** (2026-09-07): per-call options structs, and the
 correction to this ADR's "not an ABI change" wording below.
 
-Sources: `.scratch/REVIEW-2026-09-05.md` §2, §3, §5.3, §6 (the review that
-found the defect); `.scratch/runtime/specs/01-device-resident-forward.md`
+Sources: `docs/REVIEW-2026-09-05.md` §2, §3, §5.3, §6 (the review that
+found the defect); `docs/specs/runtime/01-device-resident-forward.md`
 (GitHub #36, the spec that implements this ADR).
 
 ## Context

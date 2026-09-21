@@ -7,7 +7,7 @@
 - Scope: serving / vision encode (`kernel/src/vision_encode.cu`,
   `crates/core/src/vision.rs`, `crates/server/src/media.rs`)
 - Related: [GitHub #244](https://github.com/gpillon/ignis/issues/244),
-  `.scratch/vision-fanout/specs/02-the-towers-cost-at-width.md`,
+  `docs/specs/vision-fanout/02-the-towers-cost-at-width.md`,
   [`2026-09-20-number-width-and-decide-e2e.md`](2026-09-20-number-width-and-decide-e2e.md),
   [`2026-09-20-shared-vision-embedding-fan-out.md`](2026-09-20-shared-vision-embedding-fan-out.md),
   [GitHub #243](https://github.com/gpillon/ignis/issues/243),
@@ -230,7 +230,7 @@ had already paid the encode.
 
 ## Implications
 
-- `.scratch/vision-fanout/specs/02` closes on branch 1: the price of a
+- `docs/specs/vision-fanout/02` closes on branch 1: the price of a
   16,384-column image is the price of the scheme. Nothing in the encode is
   worth optimising; the whole of it is at the card's rate with 0.1% idle.
 - The engineering lever that remains is not making the tower faster but

@@ -22,7 +22,7 @@
  * is the act that re-earns the snapshot-point permission.** The G3 session
  * established that the sections below are mutually consistent at a completed
  * chunk boundary and recorded the caveat that a *new* section does not
- * inherit that permission (`.scratch/DEFERRED-DECISIONS.md` item 5). A new
+ * inherit that permission (`docs/DEFERRED-DECISIONS.md` item 5). A new
  * section must therefore come with its own answer to "at which points is
  * this consistent with the others?", and must bump
  * `kIgnisSeqSnapshotFormatVersion` so blobs written before it are refused

@@ -6,7 +6,7 @@
 //! condition is a **hard failure**: a busy GPU, a missing artifact, or a
 //! kernel error must never hide behind "skip" — that pattern is what let a
 //! broken forward pass stay green for two tickets
-//! (`.scratch/REVIEW-2026-09-05.md` §4.1).
+//! (`docs/REVIEW-2026-09-05.md` §4.1).
 //!
 //! Turning the profile on takes **two** things, not one: `IGNIS_GPU_PROFILE=1`
 //! *and* a recent preflight pass. ADR 0006 asks for a preflight check in the
