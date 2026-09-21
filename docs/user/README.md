@@ -485,16 +485,16 @@ other Ignis GPU work), skippable with `GPU_CHECK=0`.
 
 ## Cutting a release
 
-The version lives in four files: the two the release workflow compares
-(`Cargo.toml` and `web/package.json`, because the Playground ships inside the
-binary) and the two lockfiles it does not look at, which the next build would
-rewrite.
+The version lives in four files: `Cargo.toml` and `web/package.json` (the
+Playground ships inside the binary) and the two lockfiles, which the next
+build would rewrite. The release workflow runs the same `mk/version.sh check`
+`make version-check` does, so all four have to agree there too.
 
 ```
 make version                     # what each of the four declares
 make version-bump T=patch        # or minor, major
 make version-bump V=1.2.3-rc.1   # or an exact version: x.y.z, -prerelease optional
-make version-check               # the workflow's comparison + the lockfiles, before you tag
+make version-check               # all four files agree, before you tag
 ```
 
 `version-bump` edits and stops there: the commit and the tag are printed, not
@@ -512,7 +512,13 @@ and the commits that name no issue, and prints Markdown for the version-bump
 commit and the GitHub release body. It is a draft: the headings are sorted by
 what the range can prove, not by what matters most.
 
-`.github/workflows/release.yml` builds the GPU engine for both hosts on every
-push to `main` or a `ci/**` branch and publishes nothing. A `v*` tag — which
-must match `workspace.package.version`, or the job refuses it — turns the same
-run into a GitHub Release and pushes the container image.
+`.github/workflows/release.yml` runs the CPU-only test suite on Linux and
+Windows, and only then builds the GPU engine for both hosts — on every push to
+`main` or a `ci/**` branch, publishing nothing. A `v*` tag — which must match
+`workspace.package.version`, or the job refuses it — turns the same run into a
+GitHub Release and pushes the container image. The image is built by the same
+job as the Linux tarball, out of the same compile, so the two can never carry
+different binaries (ADR 0032).
+
+CI cannot run the GPU profile: no runner has an NVIDIA card. Correctness on
+the card stays on the development machine (`docs/agents/testing.md`).

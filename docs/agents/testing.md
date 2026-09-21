@@ -7,7 +7,11 @@ until the test suite is green.
 ## The gate
 
 - `cargo test` from the workspace root — all five crates
-  (`artifact`, `core`, `server`, `bench`, `vendor`).
+  (`artifact`, `core`, `server`, `bench`, `vendor`). CI runs exactly this on
+  Linux and on Windows, and the release builds do not start until both legs
+  are green (`.github/workflows/release.yml`, ADR 0032). That is possible
+  only because the default suite is CPU-only; everything below about the GPU
+  profile stays on the machine with the 5090.
 - Machine-local smoke tests skip gracefully when their fixture is
   absent (e.g. `crates/artifact/tests/real_artifact.rs` needs the
   artifact in `F:\ai\q38`). A skip counts as green; a failure does not.

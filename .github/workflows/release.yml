@@ -1,18 +1,25 @@
-# Build ignis for Windows and Linux (x86_64, CUDA/SM120a) and, on a v* tag,
-# publish both as a GitHub Release.
+# Build ignis for Windows and Linux (x86_64, CUDA/SM120a), build the
+# linux/amd64 container image, and, on a v* tag, publish all three.
 #
-# A push to main or to a ci/** branch runs the same two builds and publishes
-# nothing: that is the dry run for a release, so a tag is only ever cut on a
-# pipeline already known to be green.
+# A push to main or to a ci/** branch runs the same tests and builds and
+# publishes nothing: that is the dry run for a release, so a tag is only ever
+# cut on a pipeline already known to be green.
 #
-# The container image is NOT built here -- image.yml owns it, so a failure on
-# either side never holds the other back. The release waits for both binary
-# builds and for neither the image nor anything else.
+# Nothing builds before the tests pass. The `test` job runs the CPU-only
+# suite on both hosts -- `cargo test` never touches the GPU on its own
+# (docs/agents/testing.md), which is exactly what makes it runnable on a
+# runner with no card in it. The GPU profile stays on the machine with the
+# 5090.
+#
+# The Linux tarball and the container image are one job and one compile (ADR
+# 0032, revised): the Containerfile's `artifacts` stage holds exactly the
+# binaries its `runtime` stage runs, and a second build step in the same job
+# hits the builder's own cache rather than compiling the kernel twice.
 #
 # Both halves build the real GPU engine (`--features cuda`). No runner has an
 # NVIDIA GPU, so nothing here is *run* -- the kernel leaf is compiled for
 # SM120a and linked against the toolkit's driver stubs (crates/artifact/
-# build.rs). Tests stay on the machine with the 5090 (docs/agents/testing.md).
+# build.rs).
 
 name: release
 
@@ -44,19 +51,21 @@ jobs:
       is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v4
+
+      # The version lives in four files, not two, and `mk/version.sh` is the
+      # one place that knows which -- the same check `make version-check`
+      # runs. It is bash, so it runs here unchanged.
+      - name: Every release file declares the same version
+        shell: bash
+        run: bash mk/version.sh check
+
       - id: resolve
         shell: bash
         run: |
           set -euo pipefail
           cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
             | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
-          web_version=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' web/package.json | head -1)
-          echo "Cargo.toml       $cargo_version"
-          echo "web/package.json $web_version"
-          if [ "$cargo_version" != "$web_version" ]; then
-            echo "::error::workspace version ($cargo_version) and web/package.json ($web_version) disagree"
-            exit 1
-          fi
+          echo "Cargo.toml $cargo_version"
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             tag_version="${GITHUB_REF#refs/tags/v}"
             if [ "$tag_version" != "$cargo_version" ]; then
@@ -68,15 +77,90 @@ jobs:
             echo "version=${cargo_version}+$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
-  # Linux: built through the Containerfile's `artifacts` stage, which holds
-  # exactly the binaries the runtime image runs -- so the tarball and the
+  # The CPU-only gate, on both hosts, before anything is built. This is
+  # `make test-all` without the Makefile: the workspace suite, plus the
+  # Playground's typecheck and vitest run.
+  #
+  # No `--features cuda` anywhere here. The default build is pure Rust (the
+  # ADR 0006 CPU mock), so no runner needs a CUDA toolkit to run the suite,
+  # and every GPU-touching Rust test is `#[ignore]`d behind the GPU profile.
+  #
+  # fail-fast off: when one host breaks, the other host's result is the
+  # information that says whether it is the change or the platform.
+  #
+  # The target is spelled out per host because `.cargo/config.toml` pins
+  # `build.target` to the MSVC triple for every host -- cargo has no host
+  # condition for it (ADR 0032, GitHub #226). A bare `cargo test` on Linux
+  # therefore asks for a Windows target that is not installed and dies in the
+  # first dependency with `can't find crate for 'core'`. Everything else that
+  # builds on Linux (the Makefile, the Containerfile) overrides it the same
+  # way.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            host: linux
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            host: windows
+            target: x86_64-pc-windows-msvc
+    name: test (${{ matrix.host }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-cpu
+
+      # `web/dist` is deliberately not built first: `crates/server/build.rs`
+      # embeds it only when it exists and the server serves its build-me page
+      # when it does not, so the suite is green either way (the assertion in
+      # crates/server/src/playground.rs covers both states). The Playground's
+      # own tests are below.
+      - name: cargo test (CPU only)
+        shell: bash
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      # The Playground's logic is pure TypeScript with no host in it, so one
+      # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
+      # cheaper runner.
+      - uses: actions/setup-node@v4
+        if: matrix.host == 'linux'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Playground typecheck and unit tests
+        if: matrix.host == 'linux'
+        working-directory: web
+        run: |
+          npm ci
+          npm run typecheck
+          npm run test
+
+  # Linux binaries and the container image, from one Containerfile and one
+  # compile (ADR 0032, revised 2026-09-21). The `artifacts` stage holds
+  # exactly the binaries the `runtime` image runs, so the tarball and the
   # published image can never carry different builds, and the CUDA toolkit
-  # comes from the base image rather than an install step. image.yml shares
-  # the build cache through the same scope, so whichever job gets there second
-  # mostly reuses it.
+  # comes from the base image rather than an install step.
+  #
+  # The two build steps share the builder this job set up, so the second one
+  # is layer hits: the kernel is compiled once per push, which is what the
+  # separate image workflow needed a shared remote cache scope to approximate.
   linux:
-    needs: version
+    needs: [version, test]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +183,23 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
       - name: Build the Linux binaries
         uses: docker/build-push-action@v6
         env:
@@ -114,14 +215,48 @@ jobs:
           # A SLSA attestation belongs on an image, not loose in a tarball:
           # left on, buildx drops a provenance.json next to the binaries.
           provenance: false
-          # An explicit scope, shared with image.yml: the default is per
-          # workflow, which would compile the same kernel twice per push.
+          # An explicit scope. The default is per workflow, which would now be
+          # enough on its own, but a named scope survives a workflow rename
+          # and keeps the cache addressable from a `ci/**` dry run.
+          #
+          # Read only: the image step below exports the same `build` stage,
+          # and a `mode=max` export of it twice per run is several GB written
+          # twice against a repo cache capped at 10. All this step adds on top
+          # of what that one exports is the `artifacts` COPY, which is three
+          # files out of a layer already in the cache.
           cache-from: type=gha,scope=linux-cuda
-          cache-to: type=gha,mode=max,scope=linux-cuda
           # 4 cores, 16 GB: nvcc on the W4A4/TMA units needs more than 2 GB
           # each, so the width is capped below the core count.
           build-args: |
             KERNEL_BUILD_JOBS=3
+
+      # Same context, same build args, same `build` stage -- everything up to
+      # the final COPY is already in this builder's local cache, so this step
+      # costs the runtime layers and nothing else.
+      - name: Build the container image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: ./Containerfile
+          target: runtime
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=linux-cuda
+          cache-to: type=gha,mode=max,scope=linux-cuda
+          build-args: |
+            KERNEL_BUILD_JOBS=3
+
+      - name: Image published
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Package
         shell: bash
@@ -141,7 +276,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    needs: version
+    needs: [version, test]
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -318,9 +453,7 @@ jobs:
           path: ignis-v*-x86_64-pc-windows-msvc.zip*
           if-no-files-found: error
 
-  # Both hosts, or no release. The image is deliberately not a dependency:
-  # it publishes on its own in image.yml, and a registry hiccup there must not
-  # withhold the binaries.
+  # Both hosts, or no release.
   release:
     needs: [version, linux, windows]
     if: startsWith(github.ref, 'refs/tags/v')
@@ -367,9 +500,9 @@ jobs:
 
             (`docker`: `--gpus all` in place of `--device`.) The image carries
             the CUDA runtime but no driver — the host's NVIDIA driver is
-            injected by the container runtime. It is published by its own
-            workflow, so check the `image` run if the tag above is not there
-            yet.
+            injected by the container runtime. It is built from the same
+            compile as the Linux tarball below, so the two always carry the
+            same binaries.
 
             ### Binaries
 

@@ -1,8 +1,11 @@
-# ADR 0032 — the Linux release is the container build, and the image ships on its own
+# ADR 0032 — the Linux release is the container build, and it is one pipeline
 
 ## Status
 
-Accepted (2026-09-19, owner decision — GitHub #225).
+Accepted (2026-09-19, owner decision — GitHub #225). **Revised (2026-09-21,
+owner decision)**: the two-workflow split below is withdrawn — one workflow,
+one Linux job, and a CPU-only test gate in front of every build. The core
+decision (the Linux binaries *are* the container build) is unchanged.
 
 ## Context
 
@@ -32,19 +35,34 @@ inside `nvidia/cuda:<v>-devel`; its `artifacts` stage holds exactly what the
 image therefore cannot carry different binaries, and no CI job installs a CUDA
 toolkit of its own — the base image is the toolchain.
 
-**Two workflows, not one.** `release.yml` builds the Windows and Linux
-binaries and cuts the GitHub Release; `image.yml` builds and publishes the
-image. They share one buildx cache scope (`linux-cuda`), so the kernel is
-compiled once per push rather than once per workflow, but they fail
-independently: a registry outage never withholds a release, and a broken
-Windows build never withholds the image.
+**One workflow, and the image is the same job as the Linux tarball**
+(revised 2026-09-21; originally two workflows, `release.yml` and
+`image.yml`). Both come out of the same `build` stage, so building them in
+two jobs — let alone two workflows — bought nothing but a shared remote cache
+scope to keep the kernel from being compiled twice. In one job the builder's
+own local cache does that: the `artifacts` build compiles, the `runtime`
+build that follows it is layer hits.
+
+The price is the coupling the split was there to avoid: a GHCR push failure
+now fails the `linux` job, and therefore withholds the Release. Accepted on
+the owner's call — the registry push is the last step of a job whose
+expensive half has already succeeded, and a re-run costs a cached build.
+
+**Nothing is built before the tests pass** (2026-09-21). A `test` job runs
+the CPU-only suite on both hosts — `cargo test --workspace` plus the
+Playground's typecheck and vitest run — and `linux` and `windows` need it.
+`cargo test` never touches the GPU on its own (GitHub #38,
+`docs/agents/testing.md`), which is what makes it runnable on a runner with
+no card: the default build is pure Rust and needs no CUDA toolkit. The GPU
+profile is not and cannot be part of CI; correctness on the card stays on the
+development machine.
 
 **The Release waits for both hosts, and for nothing else.** `release` needs
-`linux` and `windows`; the image is deliberately not a dependency.
+`linux` and `windows`.
 
 **A tag is only cut on a pipeline already green.** Every push to `main` or a
-`ci/**` branch runs both workflows and publishes nothing — that is the dry
-run. A `v*` tag publishes, and its version must equal
+`ci/**` branch runs the tests and both builds and publishes nothing — that is
+the dry run. A `v*` tag publishes, and its version must equal
 `workspace.package.version` (and `web/package.json`'s), or the run fails
 before building anything. A tag's run is never cancelled by the concurrency
 group.
@@ -67,11 +85,17 @@ own.
   directly, as the Windows job does — rejected: a second toolchain to keep in
   step with the image's, several GB of install per job, and two Linux builds
   per push that can disagree.
-- **One workflow with the image as a third job** — rejected on the owner's
-  call: the image is not part of the Release's contract, and coupling their
-  failures means one flaky registry push hides a good release.
-- **Make the image a dependency of the Release** — rejected for the same
-  reason, in the other direction.
+- **One workflow with the image as a third job** — rejected in 2026-09-19 on
+  the owner's call (the image is not part of the Release's contract, and
+  coupling their failures means one flaky registry push hides a good
+  release), then **adopted in 2026-09-21** in a stronger form: not a third
+  job, but the same job, because the two builds share every layer that costs
+  anything. The failure coupling is real and accepted above.
+- **Make the image a dependency of the Release** — still rejected: `release`
+  needs `linux` and `windows`, and nothing else.
+- **Gate the builds on the GPU profile too** — impossible: no runner has an
+  NVIDIA GPU. CI runs the CPU-only suite, which is the whole of what a
+  runner can honestly answer for.
 - **Ship a CPU-mock image** (no `--features cuda`), which would build anywhere
   — rejected: an inference engine that cannot infer is not a release.
 - **`cudart_static` on Linux** so the tarball needs no CUDA runtime —
@@ -91,7 +115,9 @@ own.
 - `.cargo/config.toml` still pins the MSVC target for every host — cargo has
   no host condition for `build.target` — so everything that builds on Linux
   passes `--target` explicitly. A bare `cargo` command there needs
-  `CARGO_BUILD_TARGET`. GitHub #226.
+  `CARGO_BUILD_TARGET`. GitHub #226. The `test` job is the newest thing that
+  has to say so: without `--target x86_64-unknown-linux-gnu` its Linux leg
+  dies in the first dependency with `can't find crate for 'core'`.
 - The image is SM120a-only, like every ignis build. It will not run on another
   card.
 - `make` on Linux covers the kernel and GPU hooks; background server control
