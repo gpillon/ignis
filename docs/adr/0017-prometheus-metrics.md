@@ -11,7 +11,9 @@ fact. Amended again 2026-09-15 (#89, owner decision): `GET /metrics` moves to
 its own listener (`--metrics-bind`, no API key, never exposed), and the
 Playground reads the same exposition at `/ui/metrics` on the API listener,
 under the API key when one is set. This replaces "on the existing listener".
-Clarified 2026-09-15 (#90): a submission longer than the per-sequence context
+Amended 2026-09-21 (#255): `type="scalar"` joins `ignis_decisions_total`'s
+label set. It is a **generated** answer, so like `number`, `point` and `box`
+it observes no answer mass. Clarified 2026-09-15 (#90): a submission longer than the per-sequence context
 (`ContextExceeded`, #166, which postdates the table) counts under
 `reason="oversized"` — like a request larger than the KV pool, it can never
 fit — so the reason set stays the three below. The latency histograms' "submission"
@@ -205,7 +207,7 @@ The initial stable metric contract is:
 | `ignis_decoded_tokens_total` | counter | none | Tokens generated so far, counted as each one is emitted |
 | `ignis_request_ttft_seconds` | histogram | none | Submission-to-first-token latency |
 | `ignis_request_duration_seconds` | histogram | none | Submission-to-completion latency |
-| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
+| `ignis_decisions_total` | counter | `type=noul\|choice\|score\|scalar\|number\|point\|box` | Questions answered, by typed primitive (#241, #242, ADR 0034). **Absent until the first one** — see below |
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's

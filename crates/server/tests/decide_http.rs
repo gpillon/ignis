@@ -1673,3 +1673,91 @@ async fn a_server_without_metrics_serves_decisions_just_the_same() {
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["answers"]["department"]["type"], "choice");
 }
+
+// ── the scalar (GitHub #255, spec 10) ────────────────────────────────────
+
+const SCALAR: &str = r#"{
+  "state": "The batch ran for 3 days.",
+  "questions": {
+    "days": { "type": "scalar", "instructions": "How many days did the batch run?", "digits": 1 }
+  }
+}"#;
+
+/// A scalar is billed for what it wrote, not for the ceiling it was allowed
+/// (acceptance 1, 2 and 4).
+///
+/// The mock's draw is arbitrary but deterministic, so the seed decides
+/// whether a given run closes its object early or spends its schedule. Both
+/// happen across a handful of seeds, and **both are covered here on
+/// purpose**: a test pinned to one seed would pass just as well if the
+/// terminator never fired, and the accounting invariant — you are charged
+/// for the tokens that were generated — has to hold either way.
+#[tokio::test]
+async fn a_scalar_is_billed_for_the_run_it_wrote_and_not_for_its_ceiling() {
+    let mut terminated = 0;
+    let mut at_cap = 0;
+    for seed in 0..12u64 {
+        let compute = Arc::new(MockCompute::with_seed(seed));
+        let (status, body) = decide(&app(compute), SCALAR).await;
+        assert_eq!(status, 200, "seed {seed}: {body}");
+        let answer = &body["answers"]["days"];
+        let billed = body["usage"]["output_tokens"].as_u64().expect("a count");
+        // `digits: 1` leaves room for one digit, a point and the brace.
+        assert!(billed <= 3, "seed {seed}: billed past the ceiling: {body}");
+        match answer["type"].as_str() {
+            Some("scalar") => {
+                let text = answer["text"].as_str().expect("the spelling");
+                let written = text.chars().count() as u64;
+                if written < 3 {
+                    assert_eq!(
+                        billed,
+                        written + 1,
+                        "seed {seed}: the brace that closed the run is a token too: {body}"
+                    );
+                    terminated += 1;
+                } else {
+                    assert_eq!(billed, written, "seed {seed}: at the cap, nothing closed it");
+                    at_cap += 1;
+                }
+                assert!(answer["value"].is_number(), "seed {seed}: {body}");
+            }
+            // The schedule permits runs that are not numbers — `3.` and a
+            // bare sign among them — and those are refused by name rather
+            // than reported as some number.
+            Some("error") => assert_eq!(
+                answer["code"], "malformed_scalar",
+                "seed {seed}: the only fault a mock can produce here: {body}"
+            ),
+            other => panic!("seed {seed}: unexpected answer {other:?}: {body}"),
+        }
+    }
+    assert!(terminated > 0, "no seed closed its own object; the terminator never fired");
+    assert!(at_cap > 0, "no seed reached the cap; the ceiling is untested");
+}
+
+/// A scalar is counted under its own primitive and observes no answer mass:
+/// it generates its answer rather than reading one position (ADR 0017).
+#[tokio::test]
+async fn a_scalar_is_counted_as_a_scalar_and_has_no_answer_mass() {
+    let compute = Arc::new(MockCompute::new());
+    let server = server(compute).with_metrics();
+    let metrics = server.metrics_app().expect("--metrics is on");
+    let app = server.app();
+
+    let (status, body) = decide(&app, SCALAR).await;
+    assert_eq!(status, 200, "{body}");
+
+    let after = scrape(&metrics).await;
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"scalar\""), "1");
+    assert_eq!(sample(&after, "ignis_decisions_total", "type=\"number\""), "0");
+    // The histogram is rendered — the first decision of any kind brings both
+    // series into the exposition — and it is **empty**, which is the claim:
+    // a generated answer stands on no single position's distribution, so
+    // there was nothing to observe. `sum(decisions) - mass_count` is the
+    // number of generated answers, and ADR 0017 says so.
+    assert_eq!(
+        sample(&after, "ignis_decision_answer_mass_count", ""),
+        "0",
+        "{after}"
+    );
+}

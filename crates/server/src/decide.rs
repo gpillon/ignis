@@ -527,8 +527,8 @@ impl<'de> Deserialize<'de> for Criteria {
     }
 }
 
-/// The six primitives: Jev's three, which read one position, and the three
-/// that **generate** one digit at a time (GitHub #242).
+/// The seven primitives: Jev's three, which read one position, and the four
+/// that **generate** (GitHub #242, #255).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionKind {
@@ -539,8 +539,12 @@ pub enum QuestionKind {
     Choice,
     /// A probability-weighted value across ordered levels.
     Score,
-    /// A whole number, read digit by digit.
+    /// A whole number, read digit by digit into a field of fixed width.
     Number,
+    /// A number that decides its own width, and may have a decimal part
+    /// (GitHub #255): the same mechanism with the closing brace in the
+    /// alphabet, so the run ends when the number is complete.
+    Scalar,
     /// Two numbers: a position on the submitted image.
     Point,
     /// Four numbers: a bounding box on the submitted image.
@@ -561,6 +565,7 @@ impl QuestionKind {
             Self::Choice => crate::metrics::Primitive::Choice,
             Self::Score => crate::metrics::Primitive::Score,
             Self::Number => crate::metrics::Primitive::Number,
+            Self::Scalar => crate::metrics::Primitive::Scalar,
             Self::Point => crate::metrics::Primitive::Point,
             Self::Box => crate::metrics::Primitive::Box,
         }
@@ -570,7 +575,10 @@ impl QuestionKind {
     /// readout (GitHub #242).
     fn layout(self) -> Option<crate::numbers::Layout> {
         match self {
-            Self::Noul | Self::Choice | Self::Score => None,
+            // A scalar generates, but not over axes: its plan is
+            // `crate::scalar`'s, so it has no layout here and
+            // `is_constrained` cannot be `layout().is_some()` any more.
+            Self::Noul | Self::Choice | Self::Score | Self::Scalar => None,
             Self::Number => Some(crate::numbers::NUMBER_LAYOUT),
             Self::Point => Some(crate::numbers::POINT_LAYOUT),
             Self::Box => Some(crate::numbers::BOX_LAYOUT),
@@ -586,7 +594,7 @@ impl QuestionKind {
     /// Whether this primitive answers with a **constrained decode**
     /// (`CONTEXT.md`) rather than a readout of one position.
     pub fn is_constrained(self) -> bool {
-        self.layout().is_some()
+        self.layout().is_some() || self == Self::Scalar
     }
 
     /// The system text a question of this primitive is put under:
@@ -605,6 +613,7 @@ impl QuestionKind {
     pub fn system_text(self, digits: u32) -> String {
         match self {
             Self::Number => crate::numbers::number_system(digits),
+            Self::Scalar => crate::scalar::scalar_system(digits),
             Self::Point => crate::numbers::point_system(digits),
             Self::Box => crate::numbers::box_system(digits),
             Self::Noul | Self::Choice | Self::Score => DIRECT_SYSTEM.to_owned(),
@@ -655,7 +664,17 @@ pub struct PreparedQuestion {
     /// and `None` for a readout. `options` and `answers` are then empty: a
     /// program names no options, it forces an alphabet.
     pub plan: Option<std::sync::Arc<crate::numbers::Plan>>,
-    /// Digits per axis, for a constrained question.
+    /// The plan a `scalar` generates under (GitHub #255), and `None` for
+    /// every other primitive.
+    ///
+    /// Beside `plan` rather than inside it: a scalar has one axis, no
+    /// separators and a terminator, so an `Axis` list would be a shape with
+    /// two of its three fields unused and `numbers::read` would grow a
+    /// branch for a run it cannot weight — a digit's place there is not
+    /// known until the decimal point has been seen.
+    pub scalar: Option<std::sync::Arc<crate::scalar::Plan>>,
+    /// Digits per axis for a constrained question, or the **maximum** for a
+    /// scalar.
     pub digits: u32,
 }
 
@@ -716,6 +735,9 @@ fn prepare_one(
             format!("question {id:?} has empty `instructions`"),
         ));
     }
+    if question.kind == QuestionKind::Scalar {
+        return prepare_scalar(id, question, encode);
+    }
     if let Some(layout) = question.kind.layout() {
         return prepare_program(id, question, layout, encode);
     }
@@ -732,9 +754,12 @@ fn prepare_one(
         QuestionKind::Noul => noul_options(id, question.criteria.as_ref())?,
         QuestionKind::Choice => choice_options(id, question.criteria.as_ref())?,
         QuestionKind::Score => score_options(id, question.criteria.as_ref())?,
-        // Unreachable: `prepare_one` returns above for every kind with a
-        // layout, which is exactly these three.
-        QuestionKind::Number | QuestionKind::Point | QuestionKind::Box => Vec::new(),
+        // Unreachable: `prepare_one` returns above for the scalar and for
+        // every kind with a layout, which is exactly these four.
+        QuestionKind::Scalar
+        | QuestionKind::Number
+        | QuestionKind::Point
+        | QuestionKind::Box => Vec::new(),
     };
     if options.len() > MAX_OPTIONS {
         return Err(Refusal::new(
@@ -762,7 +787,56 @@ fn prepare_one(
         options,
         answers: answers.to_vec(),
         plan: None,
+        scalar: None,
         digits: 0,
+    })
+}
+
+/// Validate and plan a `scalar` question (GitHub #255, spec 10).
+///
+/// `digits` is a **maximum** here and not a width, so the default is the
+/// ceiling rather than a guess: a caller who does not know the magnitude is
+/// exactly the caller this primitive exists for, and one who writes nothing
+/// should get the widest answer the run can close early out of.
+fn prepare_scalar(
+    id: &str,
+    question: &Question,
+    encode: Encoder<'_>,
+) -> Result<PreparedQuestion, Refusal> {
+    if question.criteria.is_some() {
+        return Err(Refusal::new(
+            "criteria_unsupported",
+            format!(
+                "question {id:?} is a scalar and declares no options, so `criteria` cannot be honoured"
+            ),
+        ));
+    }
+    let digits = question.digits.unwrap_or(crate::scalar::MAX_DIGITS);
+    if !crate::numbers::DIGITS.contains(&digits) {
+        return Err(Refusal::new(
+            "digits_out_of_range",
+            format!(
+                "question {id:?} allows {digits} digits; {}..={} is the range this endpoint serves — and for a scalar this is a ceiling, not a width, so a caller who does not know the magnitude should leave it out",
+                crate::numbers::DIGITS.start,
+                crate::numbers::DIGITS.end - 1
+            ),
+        ));
+    }
+    let plan = crate::scalar::plan(digits, encode).map_err(|error| {
+        // A property of the load and not of the request: this tokenizer
+        // cannot spell a digit, a point, a sign or a brace as one token, so
+        // this model cannot answer a scalar at all.
+        Refusal::new("digits_unnameable", format!("question {id:?}: {error}"))
+    })?;
+    Ok(PreparedQuestion {
+        id: id.to_owned(),
+        kind: question.kind,
+        instructions: question.instructions.clone(),
+        options: Vec::new(),
+        answers: Vec::new(),
+        plan: None,
+        scalar: Some(std::sync::Arc::new(plan)),
+        digits,
     })
 }
 
@@ -811,6 +885,7 @@ fn prepare_program(
         options: Vec::new(),
         answers: Vec::new(),
         plan: Some(std::sync::Arc::new(plan)),
+        scalar: None,
         digits,
     })
 }
@@ -1211,6 +1286,23 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
+    /// A number that chose its own width (GitHub #255).
+    ///
+    /// `value` is an `f64` and `text` is what the model actually wrote,
+    /// because a caller checking a reading against its trace wants the
+    /// spelling that produced it — `3` and `3.0` are the same number and
+    /// not the same answer.
+    ///
+    /// `uncertainty` is in units of the value, as [`Answer::Number`]'s is,
+    /// but it cannot be computed the same way: with a decimal point a
+    /// digit's place is not known until the point has been seen, so the run
+    /// is parsed before it is weighted.
+    Scalar {
+        value: f64,
+        text: String,
+        uncertainty: f64,
+        digits: Vec<crate::numbers::DigitDraw>,
+    },
     /// A whole number, read digit by digit (GitHub #242).
     ///
     /// `uncertainty` is in units of the number itself — not a 0-1 score —
@@ -1271,6 +1363,33 @@ pub fn constrained_answer_for(
     drawn: &[ignis_core::constrained::Draw],
     pixels: Option<(u32, u32)>,
 ) -> Answer {
+    if question.kind == QuestionKind::Scalar {
+        let Some(plan) = &question.scalar else {
+            return failed("not_a_program", "this scalar question carries no plan".to_owned());
+        };
+        // The length is not the signal here (spec 10): a run that closed its
+        // own object is complete with steps to spare, and only a run that
+        // stopped without closing *and* short of the cap was cut off. The
+        // reader owns that distinction because the reader is what sees the
+        // last token.
+        return match crate::scalar::read(plan, drawn) {
+            Ok(reading) => Answer::Scalar {
+                value: reading.value,
+                text: reading.text,
+                uncertainty: reading.uncertainty,
+                digits: reading.digits,
+            },
+            Err(crate::scalar::ReadError::OffAlphabet) => {
+                failed("run_off_alphabet", crate::scalar::ReadError::OffAlphabet.to_string())
+            }
+            Err(crate::scalar::ReadError::CutShort) => {
+                failed("run_cut_short", crate::scalar::ReadError::CutShort.to_string())
+            }
+            Err(error @ crate::scalar::ReadError::Malformed(_)) => {
+                failed("malformed_scalar", error.to_string())
+            }
+        };
+    }
     let Some(plan) = &question.plan else {
         return failed("not_a_program", "this question generates nothing".to_owned());
     };
@@ -1361,7 +1480,10 @@ pub fn answer_for(question: &PreparedQuestion, readout: &Readout) -> Answer {
         // shape. Answered rather than `unreachable!()` because this is the
         // request path and a wrong route is a bug to report, not a panic on
         // the model's thread.
-        QuestionKind::Number | QuestionKind::Point | QuestionKind::Box => failed(
+        QuestionKind::Scalar
+        | QuestionKind::Number
+        | QuestionKind::Point
+        | QuestionKind::Box => failed(
             "not_a_readout",
             "this question generates its answer and reads no position".to_owned(),
         ),
@@ -1453,7 +1575,7 @@ pub fn score_confidence(probabilities: &[f64]) -> f64 {
     summary = "A typed decision, read rather than generated",
     description = "Evaluates `state` against typed `questions` and answers each one from the model's own readout at a single position (ADR 0034): the decision is read out of the forward pass, not generated, so `usage.output_tokens` is 0 for the readout kinds.
 
-Six primitives. `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them), `score` (a probability-weighted value across ordered levels, which can land between them), and -- generated a digit at a time under a constrained decode -- `number`, `point` and `box`, the last two in the submitted image's own pixels.
+Seven primitives. Read at one position: `noul` (yes/no, answered with the probability of yes), `choice` (one option from a declared set, with the distribution over all of them) and `score` (a probability-weighted value across ordered levels, which can land between them). Generated a digit at a time under a constrained decode: `number`, `point` and `box` -- the last two in the submitted image's own pixels -- and `scalar`, which closes its own object as soon as the number is complete, so `digits` is a ceiling the caller can leave out and the answer may have a decimal part.
 
 Every fault a caller can commit refuses the whole request with a 422 before the first submit: a caller never pays a prefill for nineteen good questions and a refusal on the twentieth. Only an engine fault lands per-answer, as an `error` answer beside its siblings.
 
@@ -1646,17 +1768,30 @@ async fn serve(
 /// The tokens this request's **constrained decodes** generated (GitHub #242): each
 /// answered constrained question's whole schedule, and nothing for a readout.
 ///
-/// The schedule's length rather than a count of emitted tokens, because they
-/// are the same number by construction — a constrained decode ends when its schedule is
-/// spent — and a question that did *not* end that way is an error in its
-/// slot, with nothing to bill for.
+/// The schedule's length for a `number`, a `point` and a `box`, because
+/// there they are the same number by construction — such a run ends when its
+/// schedule is spent — and a question that did *not* end that way is an
+/// error in its slot, with nothing to bill for.
+///
+/// **Not for a `scalar`** (GitHub #255), whose schedule is a ceiling it
+/// usually stops short of: billing its length would charge a caller six
+/// rounds for the two that answered `3`. Its run is exactly the characters
+/// it wrote — digits, a point, a sign — plus the brace that closed it, and
+/// the brace is there unless the run reached the cap instead.
 fn generated(prepared: &[PreparedQuestion], answers: &BTreeMap<String, Answer>) -> u32 {
     prepared
         .iter()
-        .filter(|question| !matches!(answers.get(&question.id), None | Some(Answer::Error { .. })))
-        .filter_map(|question| question.plan.as_ref())
-        .fold(0u32, |total, plan| {
-            total.saturating_add(u32::try_from(plan.schedule.len()).unwrap_or(u32::MAX))
+        .filter_map(|question| match answers.get(&question.id) {
+            None | Some(Answer::Error { .. }) => None,
+            Some(Answer::Scalar { text, .. }) => {
+                let written = text.chars().count();
+                let cap = question.scalar.as_ref().map_or(written, |plan| plan.schedule.len());
+                Some(written + usize::from(written < cap))
+            }
+            _ => question.plan.as_ref().map(|plan| plan.schedule.len()),
+        })
+        .fold(0u32, |total, tokens| {
+            total.saturating_add(u32::try_from(tokens).unwrap_or(u32::MAX))
         })
 }
 
@@ -1797,7 +1932,15 @@ async fn render(
             ),
         ));
     }
-    match &question.plan {
+    // A scalar's prefix and schedule are its own module's (GitHub #255), and
+    // otherwise it is a constrained decode like any other: same forced
+    // opening, same context check, same MRoPE extension.
+    let constrained = match (&question.plan, &question.scalar) {
+        (Some(plan), _) => Some((plan.prefix.as_slice(), plan.schedule.clone())),
+        (None, Some(plan)) => Some((plan.prefix.as_slice(), plan.schedule.clone())),
+        (None, None) => None,
+    };
+    match constrained {
         // GitHub #237/#238: a readout names its answer tokens and ends where
         // its prefill ends.
         None => {
@@ -1809,8 +1952,8 @@ async fn render(
         // forced text the model appears to have written, costing prefill
         // rather than a decode round each — and carries the schedule for
         // everything after it.
-        Some(plan) => {
-            prompt_tokens = prompt_tokens.saturating_add(plan.prefix.len() as u32);
+        Some((prefix, schedule)) => {
+            prompt_tokens = prompt_tokens.saturating_add(prefix.len() as u32);
             if prompt_tokens > server.engine.max_model_len() {
                 return Err(Refusal::new(
                     "context_exceeded",
@@ -1821,14 +1964,14 @@ async fn render(
                     ),
                 ));
             }
-            input.tokens.extend_from_slice(&plan.prefix);
+            input.tokens.extend_from_slice(prefix);
             if let Some(multimodal) = &mut input.multimodal {
                 // The MRoPE positions have to grow with the tokens or the
                 // leaf refuses the chunk outright. A prompt that cannot be
                 // extended is one ending in a placeholder, which no template
                 // renders — refused rather than sent with positions nobody
                 // can check.
-                if !std::sync::Arc::make_mut(multimodal).append_text(plan.prefix.len()) {
+                if !std::sync::Arc::make_mut(multimodal).append_text(prefix.len()) {
                     return Err(Refusal::new(
                         "prompt_not_extendable",
                         format!(
@@ -1838,7 +1981,7 @@ async fn render(
                     ));
                 }
             }
-            input.constrained = Some(std::sync::Arc::new(plan.schedule.clone()));
+            input.constrained = Some(std::sync::Arc::new(schedule));
         }
     }
     Ok(Rendered { input, model, prompt_tokens, media })

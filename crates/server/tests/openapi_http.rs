@@ -150,7 +150,7 @@ fn the_decision_endpoint_carries_its_question_kinds() {
     // so a path entry alone would not be worth much.
     let document = document();
     let text = document["components"]["schemas"]["QuestionKind"].to_string();
-    for kind in ["noul", "choice", "score", "number", "point", "box"] {
+    for kind in ["noul", "choice", "score", "scalar", "number", "point", "box"] {
         assert!(text.contains(kind), "QuestionKind must name {kind}: {text}");
     }
     assert!(document["components"]["schemas"]["DecideResponse"].is_object());

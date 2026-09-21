@@ -110,6 +110,7 @@ pub enum Primitive {
     Noul,
     Choice,
     Score,
+    Scalar,
     Number,
     Point,
     Box,
@@ -117,10 +118,11 @@ pub enum Primitive {
 
 impl Primitive {
     /// Every primitive, in the order their series are rendered.
-    pub const ALL: [Primitive; 6] = [
+    pub const ALL: [Primitive; 7] = [
         Self::Noul,
         Self::Choice,
         Self::Score,
+        Self::Scalar,
         Self::Number,
         Self::Point,
         Self::Box,
@@ -132,7 +134,7 @@ impl Primitive {
     /// The three readouts do: their answer is a restricted softmax over
     /// declared option tokens, and the mass is how much of the real
     /// distribution those options held — the one silent failure the family
-    /// exists to show. The three **constrained decodes** do not: their answer is a run
+    /// exists to show. The four **constrained decodes** do not: their answer is a run
     /// of sampled tokens, each drawn from a permitted set, and there is no
     /// single position whose distribution the answer stands on. A number
     /// reported as mass 1 would be a lie, and one reported as 0 would put a
@@ -149,6 +151,7 @@ impl Primitive {
             Self::Noul => "noul",
             Self::Choice => "choice",
             Self::Score => "score",
+            Self::Scalar => "scalar",
             Self::Number => "number",
             Self::Point => "point",
             Self::Box => "box",

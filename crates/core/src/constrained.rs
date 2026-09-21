@@ -54,14 +54,28 @@ pub type PermittedSet = Arc<[TokenId]>;
 /// The schedule of permitted sets a **constrained request** generates under:
 /// one set per token it will emit, in order.
 ///
-/// Its length is the request's whole generation budget. There is no other
-/// stopping condition: a constrained decode ends when its schedule is exhausted and
-/// **never on EOS**, because a token drawn from a set of digits cannot be
-/// the EOS token, and a constrained decode that could stop early would return a number
-/// with fewer digits than the caller asked for.
+/// Its length is the request's whole generation **budget**, and for a
+/// schedule with no [`Schedule::terminator`] it is also the whole stopping
+/// condition: the run ends when the schedule is spent and **never on EOS**,
+/// because a token drawn from a set of digits cannot be the EOS token.
+///
+/// A schedule **with** a terminator ends on whichever comes first. That is
+/// not EOS by another name and the distinction is the point: EOS is the
+/// model deciding it has nothing more to say, while a terminator is a token
+/// the *caller* put in the alphabet because it closes the shape the caller
+/// asked for. `scalar` (GitHub #255) puts `}` there, so a number that is
+/// complete closes its own object instead of filling a field, and the
+/// length becomes a maximum.
+///
+/// **A short run is then not automatically a fault**, which is the one
+/// thing a reader must get right. Three outcomes, distinguished by the last
+/// token and not by the length: ended on the terminator (complete), spent
+/// its schedule without one (at the cap, complete), or stopped without one
+/// and short (the engine cut it off, an error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
     steps: Vec<PermittedSet>,
+    terminator: Option<TokenId>,
 }
 
 impl Schedule {
@@ -94,10 +108,38 @@ impl Schedule {
         }
         Ok(Self {
             steps: steps.into_iter().map(PermittedSet::from).collect(),
+            terminator: None,
         })
     }
 
-    /// How many tokens this constrained decode emits — its generation budget.
+    /// The same schedule, ending early when `terminator` is drawn.
+    ///
+    /// The token must be permitted by some step, or it could never be drawn
+    /// and the schedule would silently be the one without it — a terminator
+    /// that cannot fire is a caller who believes their run can stop early
+    /// and is wrong about it.
+    pub fn ending_on(mut self, terminator: TokenId) -> Result<Self, String> {
+        if !self.steps.iter().any(|step| step.contains(&terminator)) {
+            return Err(format!(
+                "token {terminator} would end this run, but no step permits it, so it can                  never be drawn"
+            ));
+        }
+        self.terminator = Some(terminator);
+        Ok(self)
+    }
+
+    /// The token that ends this run early, if it has one.
+    pub fn terminator(&self) -> Option<TokenId> {
+        self.terminator
+    }
+
+    /// Whether `token` ends this run.
+    pub fn ends_on(&self, token: TokenId) -> bool {
+        self.terminator == Some(token)
+    }
+
+    /// How many tokens this constrained decode may emit — its generation
+    /// budget, and the exact count only when it has no terminator.
     pub fn len(&self) -> usize {
         self.steps.len()
     }
@@ -109,7 +151,8 @@ impl Schedule {
     }
 
     /// The set step `index` draws from, or `None` past the end — which is
-    /// what the last round is handed, and is the whole stopping condition.
+    /// what the last round is handed, and is the stopping condition for a
+    /// schedule that has no [`Schedule::terminator`].
     pub fn step(&self, index: usize) -> Option<PermittedSet> {
         self.steps.get(index).cloned()
     }

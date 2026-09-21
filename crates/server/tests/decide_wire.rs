@@ -13,7 +13,8 @@ use serde_json::{Value as JsonValue, json};
 
 use ignis_server::decide::{
     Answer, DecideRequest, Evidence, MAX_OPTIONS, Ordered, OrderedValue, PreparedQuestion, Question,
-    QuestionKind, Refusal, answer_for, expected_level, messages_for, prepare, score_confidence,
+    QuestionKind, Refusal, answer_for, constrained_answer_for, expected_level, messages_for,
+    prepare, score_confidence,
 };
 
 /// A tokenizer that names every single character and every uppercase bigram
@@ -908,4 +909,130 @@ fn each_primitive_forces_the_json_shape_its_prompt_declared() {
             );
         }
     }
+}
+
+// ── the scalar (GitHub #255, spec 10) ────────────────────────────────────
+
+fn scalar_body(extra: &str) -> String {
+    format!(
+        r#"{{"state":"s","questions":{{"q":{{"type":"scalar","instructions":"how much?"{extra}}}}}}}"#
+    )
+}
+
+/// A caller who does not know the magnitude writes nothing, and gets the
+/// ceiling rather than a guess (spec 10).
+#[test]
+fn a_scalar_needs_no_width_from_its_caller() {
+    let prepared = prepare_one_wire(&scalar_body("")).expect("a bare scalar is legal");
+    let question = &prepared[0];
+    assert_eq!(question.digits, ignis_server::scalar::MAX_DIGITS);
+    assert!(question.plan.is_none(), "a scalar has no axis layout");
+    let plan = question.scalar.as_ref().expect("its own plan");
+    assert_eq!(plan.prefix, encoder(ignis_server::scalar::PREFIX).expect("the opening"));
+    assert!(plan.schedule.terminator().is_some(), "the run can close itself");
+    assert!(question.options.is_empty(), "a scalar names no options");
+}
+
+/// The first step opens a number and the rest may close it — the difference
+/// between `{"value":-3.5}` and `{"value":.}`.
+#[test]
+fn the_terminator_and_the_point_are_not_permitted_where_they_make_nonsense() {
+    let prepared = prepare_one_wire(&scalar_body(r#","digits":3"#)).expect("a scalar");
+    let plan = prepared[0].scalar.as_ref().expect("a plan");
+    let end = plan.schedule.terminator().expect("a terminator");
+    let opening = plan.schedule.step(0).expect("a first step");
+    assert!(!opening.contains(&end), "a number cannot be nothing at all");
+    let rest = plan.schedule.step(1).expect("a second step");
+    assert!(rest.contains(&end), "and it can end after one digit");
+    assert_eq!(
+        opening.len(),
+        11,
+        "ten digits and a sign: {opening:?}"
+    );
+    assert_eq!(rest.len(), 12, "ten digits, a point and the brace: {rest:?}");
+}
+
+/// A field this primitive cannot honour is refused, never dropped — the
+/// same policy `digits` has everywhere else.
+#[test]
+fn a_scalar_declares_no_options_and_says_so() {
+    let refusal = prepare_one_wire(&scalar_body(r#","criteria":{"a":"b"}"#))
+        .expect_err("a scalar forces an alphabet");
+    assert_eq!(refusal.code, "criteria_unsupported", "{}", refusal.message);
+
+    let wide = prepare_one_wire(&scalar_body(r#","digits":9"#))
+        .expect_err("nine digits is past the range this endpoint serves");
+    assert_eq!(wide.code, "digits_out_of_range", "{}", wide.message);
+    assert!(wide.message.contains("ceiling"), "{}", wide.message);
+}
+
+/// The prompt is the scalar's own: it declares a maximum and asks the model
+/// to close, and it must not carry #254's padding clause, which would tell
+/// the model to fill the very field the terminator exists to avoid.
+#[test]
+fn a_scalar_is_put_under_its_own_system_text() {
+    let prepared = prepare_one_wire(&scalar_body(r#","digits":4"#)).expect("a scalar");
+    let state = Evidence::Json(OrderedValue::String("s".to_owned()));
+    let messages = messages_for(&state, &prepared[0]);
+    let system = match &messages[0].content {
+        ignis_server::template::MessageContent::Text(text) => text.clone(),
+        other => panic!("a system message is text: {other:?}"),
+    };
+    assert!(system.contains("at most 4 digits"), "{system}");
+    assert!(system.contains("close the object"), "{system}");
+    assert!(!system.contains("padded on the left"), "{system}");
+}
+
+/// A terminated run is the number before the brace, and the brace is not a
+/// digit (acceptance 1 and 5).
+#[test]
+fn a_scalar_answers_with_what_it_wrote_and_how_sure_it_was() {
+    let prepared = prepare_one_wire(&scalar_body(r#","digits":4"#)).expect("a scalar");
+    let plan = prepared[0].scalar.as_ref().expect("a plan");
+    let ids = |text: &str| encoder(text).expect("the stand-in tokenizer encodes anything")[0];
+    let draw = |text: &str, probability: f32| ignis_core::constrained::Draw {
+        token: ids(text),
+        probability,
+    };
+    let drawn = [draw("3", 1.0), draw(".", 1.0), draw("5", 0.5), draw("}", 1.0)];
+    let Answer::Scalar { value, text, uncertainty, digits } =
+        constrained_answer_for(&prepared[0], &drawn, None)
+    else {
+        panic!("a scalar answers with a scalar");
+    };
+    assert_eq!(value, 3.5);
+    assert_eq!(text, "3.5");
+    assert_eq!(digits.len(), 2, "the point and the brace are not digits");
+    // Half a unit of doubt one place after the point is 0.05, not 0.5.
+    assert!((uncertainty - 0.05).abs() < 1e-6, "{uncertainty}");
+    let _ = plan;
+}
+
+/// The three ways a run ends, and the one that is an error (spec 10).
+#[test]
+fn only_a_run_the_engine_cut_short_is_an_error() {
+    let prepared = prepare_one_wire(&scalar_body(r#","digits":1"#)).expect("a scalar");
+    let ids = |text: &str| encoder(text).expect("encodable")[0];
+    let draw = |text: &str| ignis_core::constrained::Draw { token: ids(text), probability: 1.0 };
+
+    // Spent its schedule without closing: a number at the cap, not a fault.
+    let at_cap = [draw("1"), draw("2"), draw("3")];
+    assert!(
+        matches!(constrained_answer_for(&prepared[0], &at_cap, None), Answer::Scalar { .. }),
+        "a run that reached its ceiling answered"
+    );
+
+    // Stopped without closing and short: the engine cut it off.
+    let Answer::Error { code, .. } = constrained_answer_for(&prepared[0], &[draw("1")], None)
+    else {
+        panic!("a cut-off run is an error");
+    };
+    assert_eq!(code, "run_cut_short");
+
+    // Allowed by the schedule, not a number: refused and never repaired.
+    let nonsense = [draw("3"), draw("."), draw("}")];
+    let Answer::Error { code, .. } = constrained_answer_for(&prepared[0], &nonsense, None) else {
+        panic!("`3.` is not a number");
+    };
+    assert_eq!(code, "malformed_scalar");
 }
