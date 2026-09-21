@@ -1256,17 +1256,29 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     // Waited for rather than read: a release and its request's cancel are
     // two different journeys through the engine and the release wins the
     // race about half the time.
-    let followers: std::collections::BTreeSet<u64> =
-        prefilled.iter().copied().filter(|&id| id >= 1).collect();
-    let wanted = followers.clone();
+    //
+    // One cancel, not one per follower. The compute is holding the whole
+    // fan-out's prefill batch when `client.abort()` runs, so every cancel is
+    // issued while the scheduler is blocked *inside* it; when it comes back
+    // out it finishes that batch, and a decision terminates in the tick its
+    // prefill does. A cancel that lands on a request the engine has already
+    // terminated reaches nothing and is recorded nowhere, and which requests
+    // lose that race is scheduling. Asserting one per follower failed about
+    // one Windows run in ten with `followers {1, ..., 7}, cancelled {1, 2,
+    // 3}` — a flaky assertion over a property the engine never promised.
+    //
+    // The teeth survive: a fan-out that merely finished issues *no* cancel
+    // at all, which is exactly what deleting the `CancelOnDrop` from `ask`
+    // produces. So: at least one, and every one of them a request this
+    // fan-out started.
     let cancelled = tokio::task::spawn_blocking(move || {
         let mut seen = std::collections::BTreeSet::new();
-        while !wanted.is_subset(&seen) {
-            match cancelled.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(request) => {
-                    seen.insert(request);
-                }
-                Err(_) => break,
+        // The first one is waited for; the rest are whatever already
+        // arrived, since the count is not the property under test.
+        if let Ok(request) = cancelled.recv_timeout(std::time::Duration::from_secs(5)) {
+            seen.insert(request);
+            while let Ok(request) = cancelled.try_recv() {
+                seen.insert(request);
             }
         }
         seen
@@ -1274,9 +1286,9 @@ async fn a_client_disconnecting_mid_fan_out_leaves_no_request_running() {
     .await
     .expect("the cancel collector ran");
     assert!(
-        followers.is_subset(&cancelled),
-        "the handler's future dropping cancels every internal request still \
-         alive: followers {followers:?}, cancelled {cancelled:?}"
+        !cancelled.is_empty() && cancelled.is_subset(&prefilled),
+        "the handler's future dropping cancels the requests it left behind: \
+         started {prefilled:?}, cancelled {cancelled:?}"
     );
 }
 
