@@ -10,12 +10,18 @@
   [constrained digit readout](2026-09-19-constrained-digit-readout-points.md),
   [number width and decide e2e](2026-09-20-number-width-and-decide-e2e.md),
   [GitHub #252](https://github.com/gpillon/ignis/issues/252)
-- Superseded by: the *primitive* is superseded by
-  [a number that closes its own object](2026-09-21-a-number-that-closes-its-own-object.md)
-  (GitHub #255) — the measurement below is not, and is why that one generates
-  rather than reads. Status stays `current` for the finding; what was dropped
-  is the implementation ([spec 08](../specs/decide/08-scalar-readout.md), never
-  merged).
+- Superseded by: none
+
+> **The primitive is superseded; this measurement is not** (GitHub #255,
+> 2026-09-21). The `scalar` that shipped is a constrained decode that closes
+> its own object —
+> [a number that closes its own object](2026-09-21-a-number-that-closes-its-own-object.md)
+> — and the readout measured here was never merged
+> ([spec 08](../specs/decide/08-scalar-readout.md), marked NOT IMPLEMENTED).
+> The status stays `current` because what is below is a result about grids
+> and legend width, and it is the reason the primitive that shipped generates
+> rather than reads. A finding is superseded when later evidence replaces its
+> *conclusion*; here later evidence took its conclusion and acted on it.
 
 ## Question
 
