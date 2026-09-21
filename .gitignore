@@ -6,9 +6,11 @@ kernel/build-b/
 kernel/build-c/
 kernel/build-119/
 
-# the Playground frontend (web/, ADR 0026): dependencies and build output
+# the Playground frontend (web/, ADR 0026): dependencies, build output and
+# the vitest reporter's JSON run record
 node_modules/
 dist/
+.vitest/
 
 # logs
 *.log
