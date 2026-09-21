@@ -426,6 +426,12 @@ pub struct Question {
     /// [`crate::numbers::DEFAULT_DIGITS`] when absent, and refused outside
     /// [`crate::numbers::DIGITS`].
     ///
+    /// For a `scalar` (GitHub #255) it is a **ceiling** rather than a width,
+    /// which is a different quantity with its own range and its own default:
+    /// [`crate::scalar::DIGITS`] and [`crate::scalar::DEFAULT_DIGITS`]. A
+    /// field must be filled and a ceiling need not, so the two cannot share
+    /// a bound.
+    ///
     /// Refused rather than ignored on a readout question, like every other
     /// field this endpoint cannot honour: a caller who wrote `digits` on a
     /// `choice` meant something by it.
@@ -811,14 +817,15 @@ fn prepare_scalar(
             ),
         ));
     }
-    let digits = question.digits.unwrap_or(crate::scalar::MAX_DIGITS);
-    if !crate::numbers::DIGITS.contains(&digits) {
+    let digits = question.digits.unwrap_or(crate::scalar::DEFAULT_DIGITS);
+    if !crate::scalar::DIGITS.contains(&digits) {
         return Err(Refusal::new(
             "digits_out_of_range",
             format!(
-                "question {id:?} allows {digits} digits; {}..={} is the range this endpoint serves — and for a scalar this is a ceiling, not a width, so a caller who does not know the magnitude should leave it out",
-                crate::numbers::DIGITS.start,
-                crate::numbers::DIGITS.end - 1
+                "question {id:?} allows {digits} digits; {}..={} is the range a scalar serves — and this is a ceiling, not a width, so a caller who does not know the magnitude should leave it out and get {}",
+                crate::scalar::DIGITS.start,
+                crate::scalar::DIGITS.end - 1,
+                crate::scalar::DEFAULT_DIGITS
             ),
         ));
     }

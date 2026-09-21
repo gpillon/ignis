@@ -81,6 +81,21 @@ describe("requestBody", () => {
     expect(body).not.toContain("criteria");
   });
 
+  it("sends a scalar's ceiling only when one was written, because absent is what asks for the widest run", () => {
+    const none = requestBody(draft([question("s", "scalar", "How many hours?")]));
+    expect(none).not.toContain("digits");
+    expect(none).not.toContain("criteria");
+    const capped = requestBody(draft([question("s", "scalar", "How many hours?", { ceiling: 2 })]));
+    expect(capped).toContain('"digits": 2');
+  });
+
+  it("does not let a scalar borrow the width a number left on the question", () => {
+    // The two fields are separate on purpose: switching a question from
+    // `number` to `scalar` must not send the field width as a ceiling.
+    const body = requestBody(draft([question("s", "scalar", "How many hours?", { digits: 4 })]));
+    expect(body).not.toContain("digits");
+  });
+
   it("sends a JSON evidence as itself, not as a string", () => {
     const body = requestBody(draft([question("a", "noul")], { mode: "json", text: '{"order":"A-1"}' }));
     expect(body).toContain('"state": {\n    "order": "A-1"\n  }');
@@ -169,6 +184,20 @@ describe("validate", () => {
     }
   });
 
+  it("accepts a scalar with no ceiling, and names one outside the range", () => {
+    expect(codes(draft([question("a", "scalar", "How many hours?")]))).toEqual([]);
+    for (const ceiling of [0, 16, 2.5]) {
+      expect(codes(draft([question("a", "scalar", "How many hours?", { ceiling })])), String(ceiling)).toEqual([
+        "digits_out_of_range",
+      ]);
+    }
+    // Widths a `number` refuses are legal ceilings: a field must be filled
+    // and a ceiling need not.
+    for (const ceiling of [1, 3, 6, 8, 15]) {
+      expect(codes(draft([question("a", "scalar", "How many hours?", { ceiling })])), String(ceiling)).toEqual([]);
+    }
+  });
+
   it("names a point or a box whose evidence carries no image", () => {
     for (const kind of ["point", "box"] as const) {
       expect(codes(draft([question("a", kind, "Where?")])), kind).toEqual(["state_carries_no_image"]);
@@ -210,12 +239,27 @@ describe("readRequest", () => {
       question("b", "choice", "Which?", { options: [{ key: "x", description: "the x" }] }),
       question("c", "score", "How much?", { levels: ["Low", "High"] }),
       question("d", "number", "How many?", { digits: 5 }),
-      question("e", "point", "Where?"),
-      question("f", "box", "Bound it."),
+      question("e", "scalar", "How many hours?", { ceiling: 4 }),
+      question("f", "point", "Where?"),
+      question("g", "box", "Bound it."),
     ]);
     const read = readRequest(requestBody(original));
     if (!read.ok) throw new Error(read.message);
     expect(requestBody(read.draft)).toBe(requestBody(original));
+  });
+
+  it("reads a scalar's digits back as a ceiling, and keeps the absence of one", () => {
+    const capped = readRequest('{"state":"s","questions":{"s":{"type":"scalar","instructions":"How many?","digits":2}}}');
+    if (!capped.ok) throw new Error(capped.message);
+    expect(capped.draft.questions[0].ceiling).toBe(2);
+    // The width a `number` would use is untouched, so switching the type in
+    // the builder does not inherit a ceiling as a field.
+    expect(capped.draft.questions[0].digits).toBe(3);
+
+    const open = readRequest('{"state":"s","questions":{"s":{"type":"scalar","instructions":"How many?"}}}');
+    if (!open.ok) throw new Error(open.message);
+    expect(open.draft.questions[0].ceiling).toBeNull();
+    expect(requestBody(open.draft)).not.toContain("digits");
   });
 
   it("reads our own field names as the aliases decide.rs accepts them as", () => {

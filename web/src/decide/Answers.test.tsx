@@ -206,6 +206,65 @@ describe("Answers", () => {
     expect(html).toContain("not a bound");
   });
 
+  it("shows a scalar's spelling and the number that spelling parsed to, because they are not the same fact", () => {
+    const html = render(
+      [question("s", "scalar")],
+      { s: { type: "scalar", value: 3, text: "3.0", uncertainty: 0.0035, digits: [{ digit: 3, probability: 0.99 }, { digit: 0, probability: 0.9 }] } },
+      undefined,
+      4,
+    );
+    // What it wrote heads the panel; what it parses to reads under it.
+    expect(html).toContain(">3.0");
+    expect(html).toContain(">3</span>");
+  });
+
+  it("prints a scalar's uncertainty in the value's own units, where a fixed decimal place would read 0.0", () => {
+    const html = render(
+      [question("s", "scalar")],
+      { s: { type: "scalar", value: 12.4, text: "12.40", uncertainty: 0.0035, digits: [] } },
+      undefined,
+      6,
+    );
+    expect(html).toContain("0.0035");
+    expect(html).not.toContain("± 0.0<");
+    // Units, never a share: no bar and no percentage anywhere on the panel.
+    expect(html).not.toContain("confidence");
+    expect(html).not.toContain("--fill");
+  });
+
+  it("counts a scalar's rounds as what it wrote plus the brace, beside the field a number would have filled", () => {
+    const html = render(
+      [question("s", "scalar", { ceiling: 6 })],
+      { s: { type: "scalar", value: -0.75, text: "-0.75", uncertainty: 0.0001, digits: [{ digit: 0, probability: 0.99 }, { digit: 7, probability: 0.98 }, { digit: 5, probability: 0.97 }] } },
+      undefined,
+      6,
+    );
+    // `-0.75` is six tokens: five characters and the closing brace.
+    expect(html).toContain(">6</span> rounds");
+    expect(html).toContain("under a ceiling of 6 digits");
+    // The sign and the point were steps of the run and hold no place, so the
+    // trace is three columns against a five-character spelling — right, not
+    // a gap.
+    expect((html.match(/digit-land/g) ?? [])).toHaveLength(3);
+    expect(html).toContain("a trace shorter than the spelling is right");
+  });
+
+  it("reads a scalar with no ceiling against the widest field the endpoint serves", () => {
+    const html = render([question("s", "scalar")], { s: { type: "scalar", value: 3, text: "3", uncertainty: 0, digits: [] } }, undefined, 2);
+    expect(html).toContain(">2</span> rounds");
+    // Nothing was declared, so the panel reads against the ceiling the server
+    // applies when the caller says nothing — which is not its maximum.
+    expect(html).toContain("under a ceiling of 8 digits");
+  });
+
+  it("renders a scalar's own per-answer errors as errors, not as a blank card", () => {
+    for (const code of ["malformed_scalar", "too_many_digits"]) {
+      const html = render([question("s", "scalar")], { s: { type: "error", code, message: "the run is not a number" } });
+      expect(html, code).toContain(code);
+      expect(html, code).toContain("the run is not a number");
+    }
+  });
+
   it("draws a point at the answer's pixels, on the image the request submitted", () => {
     const html = render(
       [question("p", "point")],

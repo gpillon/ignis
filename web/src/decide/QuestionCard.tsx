@@ -5,7 +5,9 @@ import { asText, jsonString, writeOrdered } from "./json.ts";
 import {
   emptyOption,
   type Fault,
-  isConstrained,
+  DEFAULT_CEILING,
+  hasFixedWidth,
+  MAX_CEILING,
   MAX_DIGITS,
   MIN_DIGITS,
   type Option,
@@ -124,26 +126,31 @@ export function QuestionCard({
 
       {question.kind === "score" && <LevelList levels={question.levels} stem={question.uid} onChange={(levels) => set("levels", levels)} />}
 
-      {isConstrained(question.kind) && (
-        <div className="mt-2 flex items-end gap-3">
-          <Labelled label="Digits per number">
-            <input
-              type="number"
-              min={MIN_DIGITS}
-              max={MAX_DIGITS}
-              value={question.digits}
-              onChange={(e) => set("digits", Number(e.target.value))}
-              name={`${question.uid}-digits`}
-              aria-label="Digits per number"
-              className={`${fieldLook} w-20 tabular-nums`}
-            />
-          </Labelled>
-          <p className="pb-2 text-[12px] leading-snug text-ash">
-            {question.kind === "number"
-              ? `Up to ${"9".repeat(Math.max(1, Math.min(MAX_DIGITS, question.digits)))}.`
-              : `The prompt declares a 0–${"9".repeat(Math.max(1, Math.min(MAX_DIGITS, question.digits)))} scale on each axis.`}
-          </p>
-        </div>
+      {hasFixedWidth(question.kind) && (
+        <DigitField label="Digits per number" value={question.digits} max={MAX_DIGITS} name={`${question.uid}-digits`} onChange={(digits) => set("digits", digits ?? 0)}>
+          {question.kind === "number"
+            ? `Up to ${nines(question.digits)}.`
+            : `The prompt declares a 0–${nines(question.digits)} scale on each axis.`}
+        </DigitField>
+      )}
+
+      {/* A scalar's field is a **ceiling**, so blank is its default and blank
+          is a legal request: the run closes itself when the number is
+          complete, and the caller who does not know the magnitude is the one
+          this primitive exists for. */}
+      {question.kind === "scalar" && (
+        <DigitField
+          label="Digits at most"
+          value={question.ceiling}
+          max={MAX_CEILING}
+          name={`${question.uid}-ceiling`}
+          placeholder={String(DEFAULT_CEILING)}
+          onChange={(ceiling) => set("ceiling", ceiling)}
+        >
+          A ceiling, not a width — the answer ends as soon as the number is complete, and may have a decimal part or a sign. Leave
+          it empty when you do not know the magnitude and it asks for {DEFAULT_CEILING}; {MAX_CEILING} is the most you can ask for,
+          which is where an f64 stops.
+        </DigitField>
       )}
 
       <label className="mt-3 flex items-baseline gap-2">
@@ -283,6 +290,54 @@ function LevelList({ levels, stem, onChange }: { levels: string[]; stem: string;
     </div>
   );
 }
+
+/**
+ * How many digits, and what that buys, side by side.
+ *
+ * `null` is a field left empty, which only a scalar's ceiling may be. A fixed
+ * width emptied reads as zero and is reported as the refusal it is, rather
+ * than being quietly rewritten to a width nobody typed.
+ */
+function DigitField({
+  label,
+  value,
+  max,
+  name,
+  placeholder,
+  onChange,
+  children,
+}: {
+  label: string;
+  value: number | null;
+  /** A width stops at `MAX_DIGITS`; a ceiling reaches further, and says so. */
+  max: number;
+  name: string;
+  placeholder?: string;
+  onChange: (value: number | null) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mt-2 flex items-end gap-3">
+      <Labelled label={label}>
+        <input
+          type="number"
+          min={MIN_DIGITS}
+          max={max}
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value.trim() === "" ? null : Number(e.target.value))}
+          name={name}
+          aria-label={label}
+          placeholder={placeholder}
+          className={`${fieldLook} w-20 tabular-nums`}
+        />
+      </Labelled>
+      <p className="pb-2 text-[12px] leading-snug text-ash">{children}</p>
+    </div>
+  );
+}
+
+/** The widest number a field that wide can hold, which is what a reader wants to see. */
+const nines = (digits: number) => "9".repeat(Math.max(1, Math.min(MAX_DIGITS, digits)));
 
 function Labelled({ label, children }: { label: string; children: React.ReactNode }) {
   return (

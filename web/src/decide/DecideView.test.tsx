@@ -44,7 +44,7 @@ describe("DecideView", () => {
 
   it("offers every primitive as a starting point", () => {
     const html = renderToStaticMarkup(<DecideView ready drawer={null} onDrawer={() => {}} />);
-    for (const kind of ["noul", "choice", "score", "number", "point", "box"]) expect(html, kind).toContain(`>${kind}</button>`);
+    for (const kind of ["noul", "choice", "score", "number", "scalar", "point", "box"]) expect(html, kind).toContain(`>${kind}</button>`);
   });
 
   it("gives every form field an id or a name, as the browser asks", () => {
@@ -54,6 +54,7 @@ describe("DecideView", () => {
       card(ask("choice", { options: [{ key: "a", description: "the a" }] })) +
       card(ask("score", { levels: ["Low", "High"] })) +
       card(ask("number")) +
+      card(ask("scalar")) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "text", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "json", text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />) +
       renderToStaticMarkup(<EvidenceEditor evidence={{ mode: "image", images: [], text: "" }} spare={EMPTY_SPARE} onChange={() => {}} onSpare={() => {}} />);

@@ -919,13 +919,19 @@ fn scalar_body(extra: &str) -> String {
     )
 }
 
-/// A caller who does not know the magnitude writes nothing, and gets the
-/// ceiling rather than a guess (spec 10).
+/// A caller who does not know the magnitude writes nothing, and gets a
+/// ceiling wide enough not to have to (spec 10).
 #[test]
 fn a_scalar_needs_no_width_from_its_caller() {
     let prepared = prepare_one_wire(&scalar_body("")).expect("a bare scalar is legal");
     let question = &prepared[0];
-    assert_eq!(question.digits, ignis_server::scalar::MAX_DIGITS);
+    assert_eq!(question.digits, ignis_server::scalar::DEFAULT_DIGITS);
+    // The default is not the maximum: saying nothing is "I do not know the
+    // magnitude", not "give me the widest run you serve".
+    assert!(
+        ignis_server::scalar::DEFAULT_DIGITS < ignis_server::scalar::DIGITS.end - 1,
+        "a caller who needs more than the default must have somewhere to go"
+    );
     assert!(question.plan.is_none(), "a scalar has no axis layout");
     let plan = question.scalar.as_ref().expect("its own plan");
     assert_eq!(plan.prefix, encoder(ignis_server::scalar::PREFIX).expect("the opening"));
@@ -960,10 +966,25 @@ fn a_scalar_declares_no_options_and_says_so() {
         .expect_err("a scalar forces an alphabet");
     assert_eq!(refusal.code, "criteria_unsupported", "{}", refusal.message);
 
-    let wide = prepare_one_wire(&scalar_body(r#","digits":9"#))
-        .expect_err("nine digits is past the range this endpoint serves");
+    let wide = prepare_one_wire(&scalar_body(r#","digits":16"#))
+        .expect_err("sixteen digits is past what an f64 carries exactly");
     assert_eq!(wide.code, "digits_out_of_range", "{}", wide.message);
     assert!(wide.message.contains("ceiling"), "{}", wide.message);
+}
+
+/// A ceiling is not a field, so it is not bounded like one: every width a
+/// `number` refuses past its own six is legal here, and the schedule grows
+/// with it while the spend does not.
+#[test]
+fn a_scalar_is_allowed_ceilings_a_number_refuses_as_widths() {
+    for digits in (ignis_server::numbers::DIGITS.end)..ignis_server::scalar::DIGITS.end {
+        let body = scalar_body(&format!(r#","digits":{digits}"#));
+        let prepared = prepare_one_wire(&body).unwrap_or_else(|e| panic!("{digits}: {}", e.message));
+        let plan = prepared[0].scalar.as_ref().expect("a plan");
+        // The sign, the point and the brace, on top of the digits allowed.
+        assert_eq!(plan.schedule.len(), digits as usize + 3, "{digits}");
+        assert!(plan.schedule.terminator().is_some(), "{digits}: it can still close itself");
+    }
 }
 
 /// The prompt is the scalar's own: it declares a maximum and asks the model

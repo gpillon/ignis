@@ -60,6 +60,30 @@ describe("mockDecide", () => {
     expect(body.usage.output_tokens).toBe(4);
   });
 
+  it("lets a scalar choose its own width under the ceiling, and bills the brace that closed it", () => {
+    const { body } = send({ state: "s", questions: { s: { type: "scalar", instructions: "How many hours?", digits: 4 } } });
+    const answer = body.answers.s as { type: string; value: number; text: string; uncertainty: number; digits: { digit: number }[] };
+    expect(answer.type).toBe("scalar");
+    expect(answer.value).toBe(Number(answer.text));
+    // The trace is the digits alone: the point and the sign were steps of the
+    // run and hold no place.
+    // The trace and the spelling are the same digits in the same order: a
+    // column the text does not carry is the one fault this card exists to
+    // show, so the mock must never manufacture one.
+    expect(answer.text.replace(/[-.]/g, "")).toBe(answer.digits.map((d) => d.digit).join(""));
+    expect(answer.digits.length).toBeLessThanOrEqual(4);
+    expect(body.usage.output_tokens).toBe(answer.text.length + 1);
+  });
+
+  it("answers a scalar with no ceiling at all, which is the request this primitive exists for", () => {
+    const { body } = send({ state: "s", questions: { s: { type: "scalar", instructions: "How much?" } } });
+    const answer = body.answers.s as { type: string; digits: unknown[] };
+    expect(answer.type).toBe("scalar");
+    // Nothing declared asks for the server's default ceiling, which is 8 and
+    // not the 15 it would serve on request.
+    expect(answer.digits.length).toBeLessThanOrEqual(8);
+  });
+
   it("refuses a point when the state carried no image, on that question alone", () => {
     const { body } = send({
       state: "just words",

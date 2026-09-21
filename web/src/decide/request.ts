@@ -17,6 +17,13 @@ export type Answer =
   | { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number }
   | { type: "score"; score: number; legend: Record<string, string>; probabilities: Record<string, number>; confidence: number }
   | { type: "number"; number: number; uncertainty: number; digits: DigitDraw[] }
+  // A `scalar` closes its own object (GitHub #255), so `text` is what the
+  // model actually wrote and `value` is what that spelling parsed to — `3`
+  // and `3.0` are the same number and not the same answer. `uncertainty` is
+  // in units of the value, and the trace carries the digits alone: the
+  // decimal point, the sign and the closing brace were steps of the run but
+  // hold no place, so a trace shorter than `text` is right.
+  | { type: "scalar"; value: number; text: string; uncertainty: number; digits: DigitDraw[] }
   | { type: "point" | "box"; pixels: Record<string, number>; normalized: Record<string, number>; uncertainty: Record<string, number>; digits: Record<string, DigitDraw[]> }
   | { type: "error"; code: string; message: string };
 
