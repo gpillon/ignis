@@ -9,8 +9,45 @@
   `docs/specs/decide/12-the-coordinate-in-the-latent.md`,
   `2026-09-21-the-point-is-assembled-as-it-is-written.md`,
   `2026-09-21-a-declared-grid-is-read-to-one-part-in-ten.md`,
-  `2026-09-19-constrained-digit-readout-points.md`
+  `2026-09-19-constrained-digit-readout-points.md`,
+  [`2026-09-21-qwen-vl-grounding-primary-sources.md`](2026-09-21-qwen-vl-grounding-primary-sources.md) (corrects four claims below)
 - Superseded by: none
+
+> **Corrected 2026-09-21, and not superseded.** This was a first pass, read
+> largely through a web summarizer; the primary-source reading that followed
+> it the same day ([`2026-09-21-qwen-vl-grounding-primary-sources.md`](2026-09-21-qwen-vl-grounding-primary-sources.md)) went back to the papers,
+> the released code and the model card, and four claims below do not
+> survive it. The rest stands — the trained `point_2d`/`bbox_2d` format on
+> 0-1000, set-of-mark demoted, `mrope_interleaved: true`, attention rather
+> than the residual as the one-pass signal, and the 16-of-64 fact (whether
+> it *blocks* a one-pass readout is now for the C5 measurement to say, not
+> for this argument) — so the finding stays `current` and the four are marked where they sit
+> rather than silently rewritten.
+>
+> 1. **TAG is not a one-pass method.** Its §3.3 prompts the model to
+>    *first generate a description* of the relevant elements and reads
+>    attention from those **generated** tokens. The one-pass, tuning-free
+>    precedents are the direct stage of Trifuse, ViCrop and GUI-AIMA.
+>    The summary this was written from already said so ("the model
+>    generates element descriptions, and attention from those descriptive
+>    tokens is extracted"); it was a **misreading**, not a missing source.
+> 2. **GUI-Actor does not read the backbone's attention.** It trains a *new*
+>    attention module (`VisionHead_MultiPatch`): its query is the final-layer
+>    hidden state of an `<ACTOR>` token, its keys are the merged vision
+>    embeddings as they enter the LLM, before any decoder layer. So it has no
+>    16-of-64 problem at all — and needs a trained head. "Trains a head on
+>    exactly that signal" was extrapolated from an ambiguous summary, not
+>    read from the code.
+> 3. **The numbers were conflated.** The lightweight variant (backbone
+>    frozen, 19M/103M trainable) scores **25.4 / 22.9** on ScreenSpot-Pro
+>    (34.0/35.8 with its verifier). The 40.7 and 44.6 quoted next to it
+>    below are **full-training** numbers.
+> 4. **The architecture was cited from a blog.** It is now cited from the
+>    HF model card and this artifact's own config.
+>
+> The method lesson is the one the primary-source reading also paid for:
+> the summarizer misread two benchmark tables there too, so numbers are
+> taken from the paper's own tables or not at all.
 
 ## Question
 
@@ -66,15 +103,19 @@ like from the outside.
 
 This is the important one, and it is the signal spec 12 did not try.
 
-**GUI-Actor** adds an `<ACTOR>` token whose **attention over visual patch
-tokens** is the answer: one forward pass produces the whole spatial
+**GUI-Actor** *(corrected — see the note at the top: a new trained module,
+not the backbone's attention; the lightweight numbers are 25.4/22.9)* adds
+an `<ACTOR>` token whose **attention over visual patch tokens** is the
+answer: one forward pass produces the whole spatial
 distribution and several candidate regions at no extra cost. It is trained —
 supervision is every patch covered by the ground-truth box — but it has a
 lightweight variant that **freezes the backbone** and trains only the action
 head and special tokens, 19-103M parameters. ScreenSpot-Pro 40.7% on
 Qwen2-VL and 44.6% on Qwen2.5-VL, against UI-TARS-72B at 38.1%.
 
-**TAG** (`arXiv:2412.10840`) is the **tuning-free** cousin: no training at
+**TAG** (`arXiv:2412.10840`) *(corrected — see the note at the top: not one
+pass, it reads attention from tokens it first generates)* is the
+**tuning-free** cousin: no training at
 all. It reads the self-attention from selected *text* tokens to the visual
 tokens, keeps the top-K heads (K=10) by attention magnitude, propagates to
 image patches, thresholds the relevance map and takes the centre of the
