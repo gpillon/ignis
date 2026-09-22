@@ -41,8 +41,10 @@ actually reads): **227 of 240 inside at 1024 px, 236 at 4096 px**, against the
 chain's 212 and 169.
 
 The head's point is **coarse** — its resolution is one image token (32 px of
-the image), and a hit lands a median 28-39/999 from the target's centre where
-the chain's lands 2-10. So the chain stays, **opt-in**, for what it is still
+the image), and a hit lands a median 28-40/999 from the target's centre where
+the chain's lands 2-10: the head marks the **start of the target's label**
+(27-32% across a button), not its centre
+(`docs/findings/2026-09-22-how-the-head-map-is-read.md`). So the chain stays, **opt-in**, for what it is still
 better at: `"method": "chain"` gives the digit-precise point, targets smaller
 than a token, and the per-digit trace. A load whose artifact has no calibrated
 head answers `point` with the chain, and every answer says which method
@@ -70,8 +72,9 @@ produced it.
 7. As a caller, I want the head's answer in the same **pixels of the
    submitted image** as the chain's, with the model-scale reading beside it,
    so that switching method changes no code on my side.
-8. As a caller, I want the head's `uncertainty` in pixels per axis, so that I
-   know how coarse the point is and can decide whether to re-ask with the
+8. As a caller, I want the head's `uncertainty` in pixels per axis — its
+   resolution — so that I know how coarse the point is and can decide
+   whether to re-ask with the
    chain.
 9. As a caller, I want to see how concentrated the head's attention was (the
    region's size and share), so that I can treat a diffuse map as a weaker
@@ -185,16 +188,24 @@ produced it.
   the image's token grid (h × w merged tokens): min-max normalize, keep
   cells at or above 0.5, take the **4-connected region with the highest mean
   score**, return its score-weighted centre. That is the rule every number in
-  the findings was measured with (TAG's), and it is not re-tuned here. The
+  the findings was measured with (TAG's), and a pre-registered comparison
+  against six other readings of the same map kept it: 28 of the head's 30
+  misses are the map's own (its peak is not on the target), so no reading
+  recovers them, and on this head the region is one cell on most scenes.
+  The
   centre maps to the submitted image's pixels through the processor's own
   grid-to-pixel scale on each axis, and to the question's `digits` scale
   (0-999 at 3) for `normalized`.
 
 - **The answer's evidence for a head point**: `pixels`, `normalized`,
-  `uncertainty` in pixels per axis (the region's score-weighted spread, not
-  a probability), and `region` — its size in cells and its share of the
-  softmax mass over the image span. No `digits`. The chain answer is
-  unchanged apart from `method`.
+  `uncertainty` in pixels per axis — **one token cell**, the map's
+  resolution, not the region's spread (which is zero on most answers and
+  does not separate hits from misses) — and `region`: its size in cells and
+  its **share** of the softmax mass over the image span, which does
+  (AUC 0.65-0.84 on the synthetic sets) and is the confidence to expose,
+  not a calibrated probability. The documentation says where the point
+  sits: on the start of the target's label, not its centre. No `digits`.
+  The chain answer is unchanged apart from `method`.
 
 - **The pointing head is a calibrated constant keyed to the artifact.** A
   compiled-in table maps an artifact **content hash** to (GQA ordinal, query
@@ -285,6 +296,13 @@ device path to an **independent** oracle rather than to itself.
   that chose L39.h10 exists and is the tool.
 - **The Playground's Decide tab** showing `method` and the region.
 - **A `method` label on the decision metrics** (ADR 0017).
+- **Several heads read together (X4)**: the mean of L39.h10, L43.h9,
+  L35.h6 and L35.h16's maps is better than L39.h10 alone on every 1024 px
+  set (inside +1 to +3, distance from the centre 24-27 instead of 36-40) and
+  unmeasured at 4096 px. It is the next pre-registered check — one GPU run
+  of the harness with those layers armed at 4096 px, then a fresh set — and
+  would change the readout from one GEMV to four in three layers, still one
+  pass.
 - **Reading the digit logits at the same position** as extra evidence (the
   chain's first-digit probability flags its wrong-element failures): free
   through the existing readout, and a separate question.

@@ -1,14 +1,15 @@
 # How the head's map is read: where its error comes from
 
 - Kind: experiment
-- Status: draft — pre-registration written before any number below it
+- Status: current (pre-registration committed in da587d2, before any number below)
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: serving / decision primitives, one-pass pointing, `/v1/decide` `point` (spec 13)
 - Related: `docs/specs/decide/13-point-by-attention-head.md` (#260),
   `2026-09-22-the-codec-costs-the-head-its-read.md`,
   `2026-09-21-one-attention-head-points.md`,
-  `.scratch/latent-probe/map_reading.py` and `results/engine*/` (raw, on disk)
+  `.scratch/latent-probe/map_reading.py`, `map_explore.py`, `results/engine*/`,
+  `results/map-reading.{log,json}`, `results/map-explore.log` (raw, on disk)
 - Superseded by: none
 
 ## Question
@@ -79,3 +80,129 @@ background. And: is the target shorter than one cell.
 **Confidence (development sets only).** Does the region's weighted spread,
 or its mass share, separate hits from misses (AUC) — i.e. can spec 13's
 `uncertainty` be read as confidence, or only as size.
+
+## Evidence
+
+**Step 0 holds.** From the raw scores, T50 reproduces the recorded totals on
+every set — A 235, B 232, C 227, C4096 236 — and the harness's own point on
+239-240 of 240 per set.
+
+### The candidates
+
+Inside the target, of 240; median max-axis distance from the target's
+centre (0-999, all scenes); median signed x and y error:
+
+| | A | B | C | C4096 |
+|---|---|---|---|---|
+| **T50** (baseline) | **235** · 36.1 · x −36 | **232** · 37.6 · x −37 | **227** · 40.5 · x −39 | **236** · 28.8 · x −26 |
+| T30 | 237 · 36.3 | 233 · 37.1 | 225 · 40.0 | 234 · 28.2 |
+| T70 | 235 · 37.1 | 232 · 38.0 | 222 · 41.0 | 236 · 28.9 |
+| ARG | 233 · 37.1 | 228 · 38.0 | 220 · 41.0 | 236 · 29.0 |
+| SMC | 36 · 88.2 | 36 · 93.6 | 27 · 89.3 | 44 · 66.8 |
+| BBC | 234 · 36.1 | 231 · 37.1 | 227 · 40.0 | 236 · 29.0 |
+| X4 | **238** · **26.3** · x −23 | **233** · **24.5** · x −23 | **229** · **27.3** · x −23 | — (not in the dump) |
+| L3 | 216 · 42.9 | 215 · 42.9 | 207 · 45.9 | 233 · 33.8 |
+
+The y error is within ±4 for every reading of L39.h10 alone, on every set. L39's
+top three heads on A+B are h10, h7 and h11 (461, 363 and 351 of 480 by
+argmax).
+
+**The pre-registered decision: T50 stays.** X4 wins the development sets
+(471 of 480 against T50's 467) and holds on C (229 against 227), but it is
+a 1024 px candidate — the 4096 px dumps hold only L39 — and the rule
+written before scoring says a candidate that cannot be checked at both
+sizes cannot win. T30, second on A+B (470), falls below T50 on C and C4096
+(225, 234).
+
+### Where the misses come from: the map
+
+T50's misses, per set, split by where the map's own argmax lands:
+
+| | misses | argmax inside (rule miss) | on another element | adjacent to the target | background | target shorter than a cell |
+|---|---|---|---|---|---|---|
+| A | 5 | 0 | 1 | 4 | 0 | 4 |
+| B | 8 | 1 | 1 | 4 | 2 | 5 |
+| C | 13 | 1 | 5 | 5 | 2 | 7 |
+| C4096 | 4 | 0 | 4 | 0 | 0 | 0 |
+
+**28 of the 30 misses are the map's**: its peak is outside the target, and
+on those the target holds a median 0-21% of the image softmax mass at
+1024 px (38% at 4096 px) against 44-64% on a hit. Only 2 are the rule's, so no reading of this map can
+recover more than 2 of 30. At 1024 px the map misses are mostly **small
+targets** — 16 of 26 are shorter than one token cell (32 px), and 13 of
+26 have the peak on a cell adjacent to the target; at 4096 px, where the generator draws
+every target many cells tall, the 4 misses are all **another element**.
+
+### Where the imprecision comes from: the map again
+
+*Exploratory from here to the end of Evidence — not pre-registered.*
+
+- **The region is one cell.** `exp(s − max)` is so peaked that the cells at
+  or above half its maximum are a single cell on 132-166 of 240 scenes, and
+  at most three on 226-240. TAG's rule is, on this head, an argmax with a
+  little smoothing; a threshold, a weighted centre or a bounding box have
+  almost nothing to work with — which is why T30, T70, BBC and ARG land
+  within a unit of each other in distance and a few scenes in count.
+- **The peak sits on the start of the target's label.** Where the argmax is
+  inside the target, it lies at **27-32% of the button's width** (medians) (quartiles
+  0.22-0.36 across all four sets) and near its vertical middle, and — with
+  the label's extent recomputed from the generator — a median **half a cell
+  before the label's first letter**, at both sizes. That is the whole of
+  the x offset (−26 to −39): the head finds the label's beginning, and the
+  button's centre is half a label further right. The y error is nil because
+  the label is vertically centred.
+- **The pre-softmax scores are no better map**: TAG on min-max raw scores
+  lands inside on 2-4 of 240 (the raw map is broad and its top half is
+  elsewhere).
+- **Other heads peak elsewhere**, which is what X4 buys: averaging four
+  maps moves the point a third of the way toward the centre (x −23) and
+  gains 1-3 scenes, without changing where L39.h10 looks.
+
+### Confidence (development sets, pre-registered)
+
+With a one-cell region its spread is zero on most scenes, and it does not
+separate hits from misses (AUC 0.37 and 0.33 on A and B for "smaller spread
+means a hit"; C and C4096 agree, 0.44 and 0.40). **The region's share of the
+image softmax mass does**: AUC **0.83 and 0.69** on A and B (0.84 and 0.65
+on C and C4096).
+
+## Finding
+
+- **The head's misses are the map's, not the rule's**: 28 of 30, with the
+  peak on an adjacent cell (small targets, at 1024 px) or on another
+  element. The rule can recover at most 2 of 30; TAG's rule stays, and the
+  pre-registered comparison says so.
+- **The head's imprecision is the map's too, and it is systematic**: L39.h10
+  marks the **start of the target's label**, not its centre — 27-32% across
+  the button, half a cell before the first letter. No reading of that one
+  map can move a point it does not contain.
+- **The region's mass share is a confidence, its spread is not.** Spec 13's
+  `uncertainty` as "the region's weighted spread" would be zero on most
+  answers and uninformative; the share (AUC 0.65-0.84) is the signal to
+  expose.
+- **Several heads read together are the only lever found**: X4 is better
+  than T50 on every 1024 px set, inside and in precision, and is unmeasured
+  at 4096 px.
+
+## Implications
+
+- **Spec 13 keeps T50**, and changes what it exposes: `uncertainty` is the
+  map's resolution (one token cell per axis in pixels), not a spread, and
+  the answer documents that the point sits on the start of the target's
+  label; `region.share` is the confidence to report.
+- **X4 is the next pre-registered check**, not a change now: it needs the
+  4096 px maps of L35, L43 and L39 (one GPU run of the harness with those
+  layers armed at 4096 px), then a decision on a fresh set. In the engine it
+  is four GEMVs in three layers instead of one — still one pass.
+- For a caller who needs the button's centre, the head is the wrong tool on
+  its own: the chain (opt-in) or X4.
+
+## Limits and unknowns
+
+- **Synthetic buttons with a centred label.** "The peak is the label's
+  start" is measured on one generator whose targets are labelled buttons;
+  an icon with no text, a link, a text field — nothing says where the head
+  peaks on those.
+- **X4 at 4096 px is unmeasured**; the dumps there carry only L39.
+- The confidence AUCs are for separating inside from outside on these
+  sets; they are not calibrated probabilities.
