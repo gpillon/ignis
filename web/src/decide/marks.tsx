@@ -308,6 +308,7 @@ export function PointGlyph({
   sigmaX,
   sigmaY,
   span,
+  cell = false,
 }: {
   x: number;
   y: number;
@@ -315,6 +316,16 @@ export function PointGlyph({
   sigmaY: number;
   /** The image's shorter side: what the crosshair is sized against. */
   span: number;
+  /**
+   * Draw the extent as the **rectangle** it is rather than as a halo
+   * (GitHub #260).
+   *
+   * A head point's uncertainty is the map's resolution — one image token,
+   * the same for every answer — and an ellipse would draw that as a spread
+   * that falls off from the centre, which is a claim the answer does not
+   * make. A chain point's does fall off, and keeps the halo.
+   */
+  cell?: boolean;
 }) {
   const arm = span * 0.09;
   const gap = span * 0.02;
@@ -326,7 +337,21 @@ export function PointGlyph({
   ].join(" ");
   return (
     <>
-      <ellipse cx={x} cy={y} rx={Math.max(sigmaX, 1)} ry={Math.max(sigmaY, 1)} fill="var(--ember)" opacity="0.22" />
+      {cell ? (
+        <rect
+          x={x - Math.max(sigmaX, 1) / 2}
+          y={y - Math.max(sigmaY, 1) / 2}
+          width={Math.max(sigmaX, 1)}
+          height={Math.max(sigmaY, 1)}
+          fill="var(--ember)"
+          opacity="0.22"
+          stroke="var(--ember)"
+          strokeWidth={1}
+          vectorEffect="non-scaling-stroke"
+        />
+      ) : (
+        <ellipse cx={x} cy={y} rx={Math.max(sigmaX, 1)} ry={Math.max(sigmaY, 1)} fill="var(--ember)" opacity="0.22" />
+      )}
       <path d={cross} stroke="#000" strokeWidth={4.5} strokeLinecap="round" fill="none" opacity="0.7" vectorEffect="non-scaling-stroke" />
       <path d={cross} stroke="#fff" strokeWidth={2} strokeLinecap="round" fill="none" vectorEffect="non-scaling-stroke" />
       <circle cx={x} cy={y} r={gap} fill="none" stroke="#000" strokeWidth={3.5} opacity="0.7" vectorEffect="non-scaling-stroke" />

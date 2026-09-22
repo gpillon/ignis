@@ -128,6 +128,25 @@ describe("QuestionCard", () => {
     expect(card(ask("noul"))).not.toContain("Digits per number");
   });
 
+  it("offers a point its two methods, and a default that is the load's and not the tab's", () => {
+    // GitHub #260. The empty value is the load's own choice — head where the
+    // artifact has a calibrated pointing head, chain where it has none — and
+    // the tab cannot resolve it, so it must not present one of the two as if
+    // it had.
+    const html = card(ask("point"));
+    expect(html).toContain("Answered by");
+    expect(html).toContain("this load&#x27;s own</option>");
+    expect(html).toContain('<option value="head">head</option>');
+    expect(html).toContain('<option value="chain">chain</option>');
+    expect(html).toContain("calibrated pointing head");
+    // What each one is for, once it has been chosen.
+    expect(card(ask("point", { method: "head" }))).toContain("no decode round");
+    expect(card(ask("point", { method: "chain" }))).toContain("one decode round per digit");
+    // Not a box's: the head's region is not a box, and the endpoint refuses it.
+    expect(card(ask("box"))).not.toContain("Answered by");
+    expect(card(ask("number"))).not.toContain("Answered by");
+  });
+
   it("shows a question's own faults on the question", () => {
     const html = card(ask("choice", { options: [] }));
     expect(html).toContain("declares no options");

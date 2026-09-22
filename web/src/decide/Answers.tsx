@@ -52,12 +52,18 @@ function Cost({ run, anyGenerated }: { run: Run; anyGenerated: boolean }) {
       </p>
       <p className="mt-1.5 text-[12px] leading-snug text-ash">
         {anyGenerated
-          ? "A number, point or box generates a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none."
-          : "Nothing was generated: every answer was read from the logits of one position, out of a single prefill of the evidence."}
+          ? "A number, a box and a point answered by the digit chain generate a digit per step, and a scalar generates until its number is complete, so those tokens are real. The readouts beside them generated none, and neither did a point read off the pointing head."
+          : "Nothing was generated: out of a single prefill of the evidence, every answer was read from the logits of one position — or, for a point off the pointing head, from that head's attention over the image."}
       </p>
     </div>
   );
 }
+
+/** What each method did, for the chip that names it. */
+const METHOD_TITLE: Record<"head" | "chain", string> = {
+  head: "Read in one pass off the calibrated pointing head's attention over the image — no decode round ran",
+  chain: "Written one digit at a time under a constrained decode — one decode round per digit",
+};
 
 function AnswerPanel({ question, answer, draft }: { question: Question; answer: Answer | undefined; draft: Draft }) {
   // What was asked is the heading. The name is how the answer is *keyed*,
@@ -73,6 +79,14 @@ function AnswerPanel({ question, answer, draft }: { question: Question; answer: 
             {question.id}
           </span>
           <span className="cut bg-surface px-2 py-0.5 [--cut-size:5px]">{question.kind}</span>
+          {/* Which method actually answered (GitHub #260) — the answer's fact
+              and not the question's, because a point sent with no `method`
+              is answered by whichever the load serves. */}
+          {answer?.type === "point" && answer.method && (
+            <span className="cut bg-surface px-2 py-0.5 text-ember [--cut-size:5px]" title={METHOD_TITLE[answer.method]}>
+              {answer.method}
+            </span>
+          )}
         </span>
       </header>
       <div className="mt-3">
@@ -257,12 +271,21 @@ function sigma(value: number): string {
  * A point or a box: the picture and its figures side by side, because they are
  * one answer read two ways — the drawing says where, the table says how
  * precisely.
+ *
+ * A head point (GitHub #260) is the same answer with a different second
+ * reading: its extent is the map's **resolution**, one image token, the same
+ * on every answer — not a spread that falls off from the centre — and what
+ * varies between a strong answer and a weak one is the share of the head's
+ * attention the region held. So the extent draws as the rectangle it is, the
+ * column that reports it is named for what it is, and the share reads
+ * underneath the way a confidence does.
  */
 function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point" | "box" }>; draft: Draft }) {
   const image = evidenceImage(draft.evidence);
   const axes = AXES[answer.type];
-  // A head point (GitHub #260) is read in one pass and has no digit trace.
+  // A head point is read in one pass and has no digit trace.
   const digits = answer.digits;
+  const head = answer.type === "point" && answer.method === "head";
   return (
     <div className="grid items-start gap-5 sm:grid-cols-2">
       <div className="flex justify-center">
@@ -276,6 +299,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
                   sigmaX={answer.uncertainty.x ?? 0}
                   sigmaY={answer.uncertainty.y ?? 0}
                   span={Math.min(natural.width, natural.height)}
+                  cell={head}
                 />
               ) : (
                 <BoxGlyph pixels={answer.pixels} sigma={answer.uncertainty} />
@@ -293,7 +317,9 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             <tr className="font-display text-[11px] text-ash">
               <th className="w-10 text-left font-medium">axis</th>
               <th className="text-right font-medium">pixels</th>
-              <th className="text-right font-medium">± px</th>
+              <th className="text-right font-medium" title={head ? "One image token on this axis: the map's resolution" : "The model's own uncertainty on this axis"}>
+                {head ? "cell px" : "± px"}
+              </th>
               <th className="text-right font-medium">on the 0–scale</th>
             </tr>
           </thead>
@@ -308,6 +334,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             ))}
           </tbody>
         </table>
+        {answer.region && <Region region={answer.region} />}
         {digits && <details className="text-[12px] text-ash">
           <summary className="cursor-pointer font-display text-ink">Digit trace per axis</summary>
           {/* Two to a row: a box has four axes, and a column of four traces is
@@ -324,8 +351,37 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
       </div>
 
       <p className="text-[12px] leading-snug text-ash sm:col-span-2">
-        The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound.
+        {head
+          ? "The rectangle is one image token — what the head's map can resolve, the same on every answer — and not a spread. On a labelled target the point marks where the label begins rather than its centre; on an unlabelled one that is unmeasured. Ask for the chain when you need finer than a token."
+          : "The halo is the model's own uncertainty on each axis, in pixels. It is a self-report, not a bound."}
       </p>
+    </div>
+  );
+}
+
+/**
+ * How concentrated the head's attention was (GitHub #260).
+ *
+ * The share is the confidence to act on — a diffuse map is a weaker answer —
+ * and it is not a calibrated probability, which is why it does not read as
+ * one: the number is beside its bar and the cells it was taken over are
+ * beside that, because a large share over many cells is not the same answer
+ * as the same share over one.
+ */
+function Region({ region }: { region: { cells: number; share: number } }) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="font-display text-[11px] text-ash">attention</span>
+      <span className="w-14 shrink-0">
+        <Bar value={region.share} dim />
+      </span>
+      <span className="font-display text-[13px] tabular-nums text-ink">{region.share.toFixed(3)}</span>
+      <span
+        className="min-w-0 truncate text-[12px] text-ash"
+        title="The share of the head's attention over the image that the cells the point was read from held. It separates hits from misses on the measured scenes; it is not a calibrated probability."
+      >
+        over {region.cells} cell{region.cells === 1 ? "" : "s"}
+      </span>
     </div>
   );
 }

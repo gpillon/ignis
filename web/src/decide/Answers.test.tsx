@@ -91,7 +91,7 @@ describe("Answers", () => {
 
   it("says the generated tokens are real when a constrained decode was asked", () => {
     const html = render([question("n", "number")], { n: { type: "number", number: 12, uncertainty: 1.4, digits: [] } }, undefined, 3);
-    expect(html).toContain("generates a digit per step");
+    expect(html).toContain("generate a digit per step");
   });
 
   it("leads a noul with the option that won, in the caller's own words, and reads the confidence under it", () => {
@@ -289,26 +289,86 @@ describe("Answers", () => {
     expect(html).toContain("not a bound");
   });
 
+  /** A head point as `/v1/decide` answers one (GitHub #260): a region, and no digits. */
+  const headPoint = (): Answer => ({
+    type: "point",
+    method: "head",
+    pixels: { x: 120, y: 64 },
+    normalized: { x: 300, y: 320 },
+    uncertainty: { x: 12.5, y: 25 },
+    region: { cells: 1, share: 0.29 },
+  });
+
   it("draws a head point, which carries no digit trace, without a trace section", () => {
     // GitHub #260: `/v1/decide` answers a point in one pass off the pointing
     // head by default, and that answer has a region instead of digits.
+    const html = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(html).toContain('cx="120"');
+    expect(html).toContain(">120<");
+    expect(html).not.toContain("Digit trace");
+  });
+
+  it("names the method that answered a point, which the question need not have asked for", () => {
+    // The request may carry no `method` at all — the load's default decides —
+    // so the chip reads off the answer and not off the draft beside it.
+    const sent = question("p", "point");
+    expect(sent.method).toBeNull();
+    const head = render([sent], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    expect(head).toContain(">head</span>");
+    expect(head).toContain("no decode round ran");
+
+    const chain = render(
+      [sent],
+      { p: { ...headPoint(), method: "chain", region: undefined, digits: { x: [], y: [] } } },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(chain).toContain(">chain</span>");
+    expect(chain).toContain("one decode round per digit");
+  });
+
+  it("draws a head point's extent as the token cell it is, and reports the attention its region held", () => {
+    const html = render([question("p", "point")], { p: headPoint() }, { mode: "image", images: [image], text: "" });
+    // A rectangle of one cell centred on the point, not an ellipse: the extent
+    // is the map's resolution and the same on every answer, so drawing it as a
+    // spread that falls off from the centre would be a claim the answer does
+    // not make.
+    expect(html).not.toContain("<ellipse");
+    expect(html).toContain('width="12.5"');
+    expect(html).toContain('height="25"');
+    expect(html).toContain('x="113.75"');
+    expect(html).toContain('y="51.5"');
+    // The share is the figure that separates a strong answer from a weak one,
+    // and the cells it was taken over are beside it.
+    expect(html).toContain("0.290");
+    expect(html).toContain("over 1 cell<");
+    // The column is named for what it holds, and the note says what the
+    // rectangle means — not the chain's self-reported sigma.
+    expect(html).toContain(">cell px<");
+    expect(html).not.toContain("not a bound");
+    expect(html).toContain("where the label begins");
+  });
+
+  it("keeps the halo and the self-report for a chain point", () => {
     const html = render(
       [question("p", "point")],
       {
         p: {
           type: "point",
-          method: "head",
+          method: "chain",
           pixels: { x: 120, y: 64 },
           normalized: { x: 300, y: 320 },
-          uncertainty: { x: 12.5, y: 12.5 },
-          region: { cells: 1, share: 0.29 },
+          uncertainty: { x: 4.5, y: 6 },
+          digits: { x: [{ digit: 3, probability: 0.9 }], y: [{ digit: 3, probability: 0.9 }] },
         },
       },
       { mode: "image", images: [image], text: "" },
+      6,
     );
-    expect(html).toContain('cx="120"');
-    expect(html).toContain(">120<");
-    expect(html).not.toContain("Digit trace");
+    expect(html).toContain("<ellipse");
+    expect(html).toContain(">± px<");
+    expect(html).toContain("not a bound");
+    expect(html).toContain("Digit trace");
+    expect(html).not.toContain("attention");
   });
 
   it("draws a box and its per-edge uncertainty band", () => {

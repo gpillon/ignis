@@ -11,6 +11,9 @@ import {
   MAX_DIGITS,
   MIN_DIGITS,
   type Option,
+  POINT_METHOD_BLURB,
+  POINT_METHODS,
+  type PointMethod,
   PRIMITIVE_BLURB,
   PRIMITIVES,
   type Primitive,
@@ -132,6 +135,36 @@ export function QuestionCard({
             ? `Up to ${nines(question.digits)}.`
             : `The prompt declares a 0–${nines(question.digits)} scale on each axis.`}
         </DigitField>
+      )}
+
+      {/* Which way a `point` is answered (GitHub #260). The empty value is not
+          a missing choice: it is the load's own default, which the tab cannot
+          resolve — a load with a calibrated pointing head answers by head and
+          one without answers by chain — and the answer says which ran. */}
+      {question.kind === "point" && (
+        <div className="mt-2 flex items-start gap-3">
+          <Labelled label="Answered by">
+            <select
+              value={question.method ?? ""}
+              onChange={(e) => set("method", e.target.value === "" ? null : (e.target.value as PointMethod))}
+              name={`${question.uid}-method`}
+              aria-label="How this point is answered"
+              className={`${fieldLook} w-[8.5rem] font-display text-[13px]`}
+            >
+              <option value="">this load's own</option>
+              {POINT_METHODS.map((method) => (
+                <option key={method} value={method}>
+                  {method}
+                </option>
+              ))}
+            </select>
+          </Labelled>
+          <p className="pb-1 text-[12px] leading-snug text-ash">
+            {question.method === null
+              ? "The head where the loaded artifact has a calibrated pointing head, and the chain where it has none. Asking for head on a load that has none is refused rather than answered by the chain."
+              : POINT_METHOD_BLURB[question.method]}
+          </p>
+        </div>
       )}
 
       {/* A scalar's field is a **ceiling**, so blank is its default and blank

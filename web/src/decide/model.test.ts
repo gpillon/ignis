@@ -330,3 +330,52 @@ describe("freeId", () => {
     expect(freeId([question("answer", "noul"), question("answer_2", "noul")], "answer")).toBe("answer_3");
   });
 });
+
+// How a point is answered (GitHub #260). Absent is not a missing choice: it
+// is the load's own default — the head where the artifact has a calibrated
+// pointing head, the chain where it has none — which this tab cannot resolve
+// and must therefore not guess at.
+describe("a point's method", () => {
+  const withImage = (questions: Question[]) => draft(questions, { mode: "image", images: [image], text: "" });
+
+  it("sends nothing when none was chosen, and the name when one was", () => {
+    expect(requestBody(withImage([question("p", "point", "Where?")]))).not.toContain("method");
+    const asked = requestBody(withImage([question("p", "point", "Where?", { method: "chain" })]));
+    expect(asked).toContain('"method": "chain"');
+  });
+
+  it("is a point's alone: the field is kept on the question but never sent by another primitive", () => {
+    // Switching a question's type is not a destructive control, so a method
+    // written while it was a point survives a trip through `box` — and is not
+    // sent from there, where the endpoint would refuse it.
+    const box = requestBody(withImage([question("b", "box", "Where?", { method: "head" })]));
+    expect(box).not.toContain("method");
+  });
+
+  it("round-trips without doubling the field", () => {
+    const body = '{"state":"s","questions":{"p":{"type":"point","instructions":"Where?","digits":3,"method":"head"}}}';
+    const read = readRequest(body);
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0].method).toBe("head");
+    expect(read.draft.questions[0].extras).toEqual([]);
+    expect(requestBody(read.draft).match(/"method"/g)).toHaveLength(1);
+  });
+
+  it("refuses a method on a primitive that has one way of being answered", () => {
+    expect(codes(withImage([question("b", "box", "Where?", { method: "head" })]))).toContain("method_unsupported");
+    expect(codes(draft([question("n", "noul", "Well?", { method: "chain" })]))).toContain("method_unsupported");
+    expect(codes(withImage([question("p", "point", "Where?", { method: "head" })]))).not.toContain("method_unsupported");
+  });
+
+  it("keeps a spelling neither method covers, and refuses it naming both", () => {
+    const read = readRequest('{"state":"s","questions":{"p":{"type":"point","instructions":"Where?","method":"attention"}}}');
+    if (!read.ok) throw new Error(read.message);
+    expect(read.draft.questions[0].method).toBeNull();
+    // The body still carries what was written, so the server still answers the
+    // 422 this fault is the mirror of.
+    expect(requestBody(read.draft)).toContain('"method": "attention"');
+    const faults = validate(read.draft);
+    expect(faults.map((f) => f.code)).toContain("method_unknown");
+    expect(faults.find((f) => f.code === "method_unknown")?.message).toContain('"head" and "chain"');
+  });
+});
