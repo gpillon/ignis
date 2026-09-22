@@ -28,6 +28,19 @@ const QUALITY = 0.85;
 /** What a picked file may weigh before it is refused, ahead of any decoding. */
 const MAX_FILE_BYTES = 32 << 20;
 
+/**
+ * The type to build a `File` with, out of what a fetch reported (GitHub #256).
+ *
+ * A `Blob` whose type says nothing useful is not the empty string: a server
+ * with no branch for the extension answers `application/octet-stream`, which
+ * is truthy and is not an image type -- so `blob.type || fallback` keeps the
+ * wrong one and `imageFromFile` refuses a picture it could have read. Only a
+ * type that actually names an image is trusted; everything else falls back to
+ * what the caller knows the bytes are.
+ */
+export const imageMime = (declared: string | undefined, fallback: string): string =>
+  declared?.startsWith("image/") ? declared : fallback;
+
 /** A picked file as a prompt image, or why it cannot be one. */
 export async function imageFromFile(file: File): Promise<{ ok: true; image: PromptImage } | { ok: false; error: string }> {
   const named = file.name || "The image";

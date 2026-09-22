@@ -74,6 +74,15 @@ fn respond(assets: Assets, path: &str) -> Response {
     }
 }
 
+/// The media type an asset is served as.
+///
+/// Every extension `web/dist` can hold has a branch, and an image's branch is
+/// not a nicety: the page reads its own bundled pictures back with `fetch` and
+/// hands them to the browser's decoder, which goes by the type the server
+/// declared -- so a picture served as `application/octet-stream` is refused as
+/// "not an image" on the embedded build while working under Vite, which sends
+/// the right one (GitHub #256). The image types are therefore every one Vite
+/// treats as an asset, not only the one the brand mark happens to use today.
 fn content_type(path: &str) -> &'static str {
     match path.rsplit_once('.').map(|(_, ext)| ext) {
         Some("html") => "text/html; charset=utf-8",
@@ -82,8 +91,14 @@ fn content_type(path: &str) -> &'static str {
         Some("json" | "map") => "application/json",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("avif") => "image/avif",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -120,5 +135,37 @@ mod tests {
         assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
         assert_eq!(content_type("assets/a.js"), "text/javascript; charset=utf-8");
         assert_eq!(content_type("no-extension"), "application/octet-stream");
+    }
+
+    /// A picture is served as a picture (GitHub #256).
+    ///
+    /// The page fetches its own bundled images back and hands them to the
+    /// browser's decoder, which reads the type this table wrote: the brand
+    /// example refused its own mark as "not an image" for as long as `webp`
+    /// fell through to `application/octet-stream`.
+    #[test]
+    fn a_picture_is_served_as_a_picture() {
+        for name in ["assets/flame-a1b2c3.webp", "shot.jpg", "shot.jpeg", "anim.gif", "photo.avif", "mark.png"] {
+            let served = content_type(name);
+            assert!(served.starts_with("image/"), "{name} was served as {served}");
+        }
+    }
+
+    /// Every extension the embedded build actually holds is named.
+    ///
+    /// The table is a list, so it falls behind whatever `web/` starts
+    /// importing next; this fails on the asset kind nobody added a branch
+    /// for rather than shipping it as an opaque download. `map` is exempt:
+    /// a source map is not served to anyone who cares about its type.
+    #[test]
+    fn every_embedded_extension_is_named() {
+        for (name, _) in EMBEDDED.iter() {
+            let Some((_, ext)) = name.rsplit_once('.') else { continue };
+            assert_ne!(
+                content_type(name),
+                "application/octet-stream",
+                "web/dist holds a .{ext} and `content_type` has no branch for it"
+            );
+        }
     }
 }
