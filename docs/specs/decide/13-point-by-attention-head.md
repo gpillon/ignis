@@ -284,6 +284,43 @@ device path to an **independent** oracle rather than to itself.
   nothing and launches nothing new; measured as the decode and prefill
   benchmarks already measure a change to the prefill path.
 
+## Acceptance
+
+Closed against these, in one piece of work: the seam, the leaf under both KV
+formats, the host rule and the endpoint are one design and are not split.
+
+1. **The leaf's scores are the attention's.** Under BF16 and under hq-e8-2b
+   (residual window on), on the committed 4096 px pointing fixture and on at
+   least a handful of 1024 px scenes, the attention readout equals the
+   test-only tap's host-side `q · k / 16` for the same layer, head and
+   position to within float accumulation, and the region rule gives the same
+   point from both.
+2. **`/v1/decide` over the mock:** no `method` gives a head point, in pixels
+   of the submitted image, with `method: "head"`, `uncertainty` of one token
+   cell per axis and `region.share`, after **zero decode rounds**;
+   `"method": "chain"` gives today's answer plus `method: "chain"`; an
+   artifact with no calibrated head makes the default `chain` and an explicit
+   `head` a 422 before any prefill; `box` with `method` and an unknown
+   `method` are 422s; no image gives `state_carries_no_image`; a fan-out
+   mixing head points and readouts over one image answers all of them. The
+   region rule has its own table-driven CPU tests.
+3. **The head is keyed to the artifact:** the calibration table is looked up
+   by the loaded artifact's content hash; a GPU-profile test asserts the
+   served artifact is in it and fails, naming the recalibration procedure,
+   when it is not. The load logs which method `point` will use.
+4. **Nothing for everyone else:** a prefill job that asks for no attention
+   readout allocates nothing and launches nothing new.
+5. **The pre-registered acceptance holds** (Testing Decisions): sets D
+   (1024 px, seed 20260925) and D4096 (seed 20260926), 240 varied scenes
+   each, asked through `/v1/decide` with no `method`, served artifact,
+   hq-e8-2b with the residual window — inside on **at least 221 and 230 of
+   240**. Reported beside it: the chain on the same scenes, both methods'
+   distance from the target's centre, and the wall time of a head point and
+   a chain point on the same prompt. Recorded as a finding with a README row.
+6. ADR (the attention readout as the third thing the `Compute` seam
+   carries), `CONTEXT.md` (*Attention readout*, *Pointing head*) and the
+   OpenAPI document are updated.
+
 ## Out of Scope
 
 - **`box` in two passes** with the head as pass 1: the next spec, built on
