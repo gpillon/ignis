@@ -42,6 +42,18 @@ const DFLASH2_CONV_PROJ_ROWS: u64 = 1280;
 const DFLASH2_SELECTOR_RANK: u64 = 256;
 const DFLASH2_SELECTOR_TOP_K: u64 = 16;
 
+/// The row-split partials of the drafter's top-k (`ignis_dflash2_topk_workspace_bytes`,
+/// `kernel/src/dflash2_topk.cu`): the vocabulary is cut into splits of this
+/// many rows, at most this many splits, each keeping one `(value, row)` pair
+/// per candidate. Nonzero only because [`DFLASH2_SELECTOR_TOP_K`] is the one k
+/// that kernel specializes; any other k forwards to the vendored op and takes
+/// none. Rows per split (`kRowsPerSplit`).
+const DFLASH2_TOPK_ROWS_PER_SPLIT: u64 = 2048;
+/// The cap on splits (`kMaxSplits`).
+const DFLASH2_TOPK_MAX_SPLITS: u64 = 1024;
+/// One candidate: an FP32 value and an I32 row (`Entry`).
+const DFLASH2_TOPK_ENTRY_BYTES: u64 = 8;
+
 /// The leaf's fixed allowance for the vendored workspaces inside the
 /// drafter's forward (`kDflash2RoundWorkspaceBytes`, `kernel/src/model.cu`).
 const DFLASH2_ROUND_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
@@ -174,9 +186,10 @@ impl Speculation {
     /// (P5-05, GitHub #155; `kernel/src/model.cu`): the feature taps of every
     /// verify column of the widest round, one append count per lane, and the
     /// round scratch -- the larger of the drafter's forward activations and
-    /// the round's context append, each rounded to the arena's alignment,
-    /// plus the fixed allowance for the vendored workspaces the forward calls
-    /// into.
+    /// the round's context append, each rounded to the arena's alignment
+    /// (the top-k's row-split partials excepted, added as the leaf adds
+    /// them), plus the fixed allowance for the vendored workspaces the
+    /// forward calls into.
     pub fn round_scratch_bytes(&self) -> u64 {
         match self.backend {
             // The fake drafter proposes from the host: nothing to reserve.
@@ -189,6 +202,11 @@ impl Speculation {
                 let drafts = u64::from(self.draft_tokens) * lanes;
                 let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
                 let hidden_columns = bf16(HIDDEN * columns);
+                // Added unrounded, as the leaf adds it (GitHub #259: this
+                // term was missing since the top-k was replaced, 5dcfade).
+                let topk_splits = VOCAB.div_ceil(DFLASH2_TOPK_ROWS_PER_SPLIT).min(DFLASH2_TOPK_MAX_SPLITS);
+                let topk_partials =
+                    topk_splits * drafts * DFLASH2_SELECTOR_TOP_K * DFLASH2_TOPK_ENTRY_BYTES;
 
                 let forward = 2 * wide(columns)
                     + hidden_columns
@@ -206,6 +224,7 @@ impl Speculation {
                     + bf16(VOCAB * drafts)
                     + wide(DFLASH2_SELECTOR_TOP_K * drafts)
                     + bf16(DFLASH2_SELECTOR_TOP_K * drafts)
+                    + topk_partials
                     + 2 * wide(DFLASH2_SELECTOR_TOP_K * drafts)
                     + bf16(DFLASH2_SELECTOR_RANK * drafts)
                     + wide(DFLASH2_SELECTOR_RANK * drafts)
@@ -293,17 +312,18 @@ mod tests {
     fn the_dflash2_round_scratch_is_the_widest_rounds_forward_plus_the_allowance() {
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         // Window 7, eight lanes: 64 columns, 56 draft columns, worked by hand.
-        // Forward 40,321,792: ids and positions 512, residual 655,360, the
+        // Forward 41,196,288: ids and positions 512, residual 655,360, the
         // attention block 5,537,792 (normed, conv 1,310,720; dynamic 163,840;
         // qkv 786,432; query_raw, query, attention 1,572,864; key_raw, value,
         // key 393,216; projected, conv 1,310,720), the MLP block 5,013,504
         // (normed, conv_hidden 1,310,720; dynamic 163,840; intermediate
-        // 2,228,224; projected, conv 1,310,720), the head 29,114,624 (packed,
+        // 2,228,224; projected, conv 1,310,720), the head 29,989,120 (packed,
         // proposal 1,146,880; logits 27,811,840; ids 3,584 + values 1,792;
+        // top-k partials 874,496 (122 row splits x 56 x 16 x 8 bytes);
         // unary 3,584 + predecessors 3,584; hidden_proj 28,672 + its FP32
         // 57,344; scores 57,344). The append (2,490,368) is smaller. Taps
         // 3,276,800, counts 32, allowance 33,554,432.
-        assert_eq!(spec.round_scratch_bytes(), 77_153_056);
+        assert_eq!(spec.round_scratch_bytes(), 78_027_552);
         // A narrower window reserves less; the window pool does not change.
         let narrow = Speculation::new(SpeculativeBackend::Dflash2, 3).unwrap();
         assert!(narrow.round_scratch_bytes() < spec.round_scratch_bytes());

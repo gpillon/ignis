@@ -894,6 +894,12 @@ std::vector<std::uint16_t> leading_columns(const std::vector<std::uint16_t> &out
 //
 // So the bounds sit ~3.5x and ~4.3x above what an exact window measures and
 // 26x (the masked arm's median) to 600x below what the clobbered ring does.
+//
+// GitHub #259: the same bound holds every arm whose whole history fits the
+// window -- the first chunk, the decode round over 200 keys and two chunks
+// after a history shorter than the ring. A short prompt is read entirely
+// exact, and these are the arms that say so rather than the codec's bound
+// (measured 2026-09-22: median 0.0022..0.0033, max 0.0040..0.0056).
 constexpr double kExactMedianRelL2 = 0.01;
 constexpr double kExactRowRelL2    = 0.05;
 
@@ -1010,6 +1016,7 @@ int main() {
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq");
     check(bf16.size() == hq.size(), "prefill: both routes wrote the same output extent");
     check_agreement("prefill W=200 B=1", compare(bf16, hq));
+    check_exact_window("prefill W=200 B=1", compare(bf16, hq));
     check_workspace_independent(
         "prefill W=200 B=1", hq,
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq hostile",
@@ -1063,7 +1070,9 @@ int main() {
   // declares a valid prefix of 150. The banded form puts the chunk across the
   // 262,144-key scratch band, so both bands run the fresh pass; its history
   // is too long to hold a BF16 twin cheaply, and the causality check needs
-  // none.
+  // none. The last two start inside the ring's first lap (GitHub #259): a
+  // short prompt's tail after a claimed prefix, at a Prompt width and at the
+  // narrowest one, where the ring's bound before the chunk is negative.
   {
     struct HistoryArm {
       const char *name;
@@ -1079,6 +1088,8 @@ int main() {
         {"prefill W=512 at 512", 512, 512, 0, 255, true},
         {"prefill W=200 at 512 masked 150", 200, 512, 150, 99, true},
         {"prefill W=200 across the band", 200, kBand - 64, 0, 99, false},
+        {"prefill W=40 at 60", 40, 60, 0, 19, true},
+        {"prefill W=12 at 100", 12, 100, 0, 5, true},
     };
     for (const HistoryArm &arm : arms) {
       Inputs in;
@@ -1134,6 +1145,7 @@ int main() {
     check(lanes_differ(hq, call.width, batch),
          "decode hq B=" + std::to_string(batch) + ": every lane produced the identical output");
     check_agreement(("decode W=1 B=" + std::to_string(batch)).c_str(), compare(bf16, hq));
+    check_exact_window("decode W=1 B=" + std::to_string(batch), compare(bf16, hq));
     check_agreement(("decode W=1 B=" + std::to_string(batch) + " codec only").c_str(),
                     compare(bf16, run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in,
                                             (hq_label + " codec only").c_str(), WorkspaceFill::Zero,

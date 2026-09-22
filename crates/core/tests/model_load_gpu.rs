@@ -165,7 +165,11 @@ fn the_real_artifact_loads_and_its_program_scratch_tracks_the_prefill_chunk() {
         // ~19 GiB-resident 27B weights. max_context_tokens is set to match (P2-01,
         // GitHub #83: prefill_chunk_tokens must not exceed max_context_tokens) so
         // the load fails on the memory budget, not on that unrelated precondition.
-        const HUGE_CHUNK: u32 = 8 * 1024 * 1024;
+        // No wider than the BF16 attention's visible-key cap either
+        // (`kGqaAttentionMaximumLinearVisibleKeys`, 524,288): past it the load
+        // still fails, but in #210's reservation sizing, before the memory
+        // check this section is about is ever reached (GitHub #259).
+        const HUGE_CHUNK: u32 = 512 * 1024;
         let err = match load_qwen38_27b(&reader, &artifact, &handles, HUGE_CHUNK, HUGE_CHUNK, ignis_core::KvFormat::Bf16) {
             Ok(_) => panic!("an unaffordable chunk width must fail the load"),
             Err(e) => e,
@@ -174,6 +178,15 @@ fn the_real_artifact_loads_and_its_program_scratch_tracks_the_prefill_chunk() {
             err.contains("bytes are free") || err.contains("scratch"),
             "the error should name the shortfall: {err}"
         );
+
+        // Past the cap the load still fails, not the first prompt -- in the
+        // sizing, before any allocation (GitHub #259).
+        const PAST_THE_CAP: u32 = 8 * 1024 * 1024;
+        let err = match load_qwen38_27b(&reader, &artifact, &handles, PAST_THE_CAP, PAST_THE_CAP, ignis_core::KvFormat::Bf16) {
+            Ok(_) => panic!("a chunk past the attention's visible-key cap must fail the load"),
+            Err(e) => e,
+        };
+        assert!(err.contains("reservation sizing failed"), "the sizing should refuse it: {err}");
     }
 
     // A `MaterializedArtifact` has no `Drop` of its own (its arena needs the
