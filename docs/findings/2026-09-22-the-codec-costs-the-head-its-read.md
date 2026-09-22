@@ -69,8 +69,9 @@ The two controls were run after the failure, to attribute it:
   targets under one token tall (< 32 px at 1024 px) — 11 of the 51 such
   targets in the set, against 10 of the other 189.
 
-The guard falls with the head: 17 of its 18 failures are the head overriding
-a correct chain from a region the codec moved.
+The guard falls with the head: 17 of its 18 failures are the head's region,
+moved by the codec, taken over the chain — 12 of them over a chain that was
+inside.
 
 ### Set C4096 — reported, not evaluated
 
@@ -223,6 +224,11 @@ faithful to it.
   is centred on 0 — not to price the drift to the unit. The reference
   server (ninfer) was not run.
 - **Synthetic scenes from one generator family**, two seeds, two sizes.
+  The generator scales the content with the side: a 4096 px scene is a
+  1024 px scene drawn four times larger (buttons 4.5% of the side tall at
+  both sizes), not a 4K screen with 1x UI elements. So "the model at its
+  largest grid" is here confounded with "the model on scaled-up content";
+  whether the chain drifts on a real 4K screenshot is unmeasured.
 - **The exact-copy design is measured by proxy**: "keys before the codec" is
   those keys scored on the host, not a copy in the engine.
 - **The consumed-key capture runs one layer's scratch per query chunk**, and
