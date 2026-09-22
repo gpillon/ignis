@@ -1,11 +1,11 @@
-# The hq residual window was most of the tool-call gap, and the prompt route reads it after its own append
+# The hq residual window was most of the tool-call gap, and the prompt route read it after its own append (until #258)
 
 - Kind: experiment
 - Status: current
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: kernel / hq-e8-2b attention, residual window, sequence state; serving / tool-call decisions
-- Related: [#257](https://github.com/gpillon/ignis/issues/257), [#173](https://github.com/gpillon/ignis/issues/173), [#160](https://github.com/gpillon/ignis/issues/160), [#161](https://github.com/gpillon/ignis/issues/161); spec [runtime/06](../specs/runtime/06-hq-residual-window.md); [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [the codec costs the head its read](2026-09-22-the-codec-costs-the-head-its-read.md)
+- Related: [#257](https://github.com/gpillon/ignis/issues/257), [#173](https://github.com/gpillon/ignis/issues/173), [#160](https://github.com/gpillon/ignis/issues/160), [#161](https://github.com/gpillon/ignis/issues/161); spec [runtime/06](../specs/runtime/06-hq-residual-window.md); [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [the codec costs the head its read](2026-09-22-the-codec-costs-the-head-its-read.md), [hq prefill reads the ring before the append](2026-09-22-hq-prefill-reads-the-ring-before-the-append.md) (#258)
 - Superseded by: none
 
 ## Question
@@ -102,8 +102,8 @@ of this one (2.33 against 2.58 tokens per round).
    one is within what a single near-tie moves (see *Limits*). Reading the 512
    most recent keys and the sinks through the codec was enough to change the
    greedy decision of a 24K-token agentic turn.
-2. **The ring is served after the chunk's own append — a read of the
-   future.** For a prefill chunk `[p0, p0 + w)`, the keys `[p0 - 512, p0 - 512
+2. **The ring was served after the chunk's own append — a read of the
+   future** (#257's build, and the reference; ignis attends first since #258). For a prefill chunk `[p0, p0 + w)`, the keys `[p0 - 512, p0 - 512
    + min(w, 512))` are read as the exact rows of the chunk keys 512 positions
    later that share their ring slots. A query early in the chunk thus attends,
    at a past position the causal mask allows, to the row of a key up to ~1,000
@@ -112,6 +112,11 @@ of this one (2.33 against 2.58 tokens per round).
    pre-chunk ring this way; a short last chunk loses `w` of it. Decode is not
    affected (its window ends at the round's own last append). The reference
    does the same, so the #173 comparison above is like for like.
+   **Update (#258, 2026-09-22):** this describes ignis as #257 built it and
+   the reference as it still is. ignis now attends a chunk before it appends
+   it (an Ignis-patched behaviour, ADR 0037), and its ring window is served
+   its own rows — see [hq prefill reads the ring before the
+   append](2026-09-22-hq-prefill-reads-the-ring-before-the-append.md).
 3. **The window is slot state, not page state.** It survives a prefix claim, a
    checkpoint claim, a snapshot and a KV-RAM restore only because it is a CLONE
    section of the state table; and a verify round's rejected columns leave
@@ -128,7 +133,9 @@ of this one (2.33 against 2.58 tokens per round).
   launches in `gqa_attention_prompt_launch` when the window is on would serve
   the 512 pre-chunk keys their own rows; it is a patch to a vendored file that
   ADR 0031's bottleneck exemption does not cover, and it would make ignis read
-  differently from the reference it is compared against.
+  differently from the reference it is compared against. **Done in #258**
+  under ADR 0037, which admits a correctness patch; comparisons with the
+  reference now cross that departure.
 - Codec coverage inside attention now needs a history longer than the window
   (or the codec-only arm the route agreement test keeps).
 
@@ -137,7 +144,9 @@ of this one (2.33 against 2.58 tokens per round).
 - 20 prompts, one reference build, greedy only. 17/20 against 18/20 is within
   what one different near-tie moves.
 - What the clobbered ring costs in quality is not measured here: that needs a
-  build with the launch order swapped, measured the same way.
+  build with the launch order swapped, measured the same way. (Measured in
+  #258's finding: 16/20 against 17/20, within the near-tie noise, and the
+  count itself turned out not to measure correctness.)
 - The decode route has no tap; its reads are observed only through the ring
   words and through the tokens the lifecycle tests compare.
 - The byte-identical codec check needs a capture from a build without the
@@ -148,7 +157,8 @@ of this one (2.33 against 2.58 tokens per round).
 
 - The launch order: the owner decided to patch it (ADR 0037, a recorded
   vendored patch with a test that fails without it) — GitHub #258, spec
-  runtime/07.
+  runtime/07; patched, see [hq prefill reads the ring before the
+  append](2026-09-22-hq-prefill-reads-the-ring-before-the-append.md).
 - #160 and #161: re-measure their hq cells with the window on (both issues
   track it; #173 carries the numbers above).
 - The pointing study's hq arms (set C, C4096): its own follow-up, per the spec.

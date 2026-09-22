@@ -30,10 +30,11 @@ With the window on:
   (`launcher/gqa_attention_prefill_hq_routes.cuh:70`); the current chunk's
   rows are rotated straight into the scratch, and the ring then serves the 512
   keys *before* the chunk (`gqa_attention_prefill_hq.cuh:160-215`).
-  **But it reads the ring after the chunk's own append** (see *As built*):
-  `gqa_attention_prompt_launch` enqueues the append before the attention, so
-  a key before the chunk whose ring slot the chunk just rewrote is served the
-  chunk's row, bit set. Same in the reference.
+  **The reference reads the ring after the chunk's own append** (see *As
+  built*): its `gqa_attention_prompt_launch` enqueues the append before the
+  attention, so a key before the chunk whose ring slot the chunk just
+  rewrote is served the chunk's row, bit set. ignis attends first since
+  GitHub #258 — an Ignis-patched behaviour (ADR 0037, spec runtime/07).
 - Everything else: `hq_decode_row_group`, the codec.
 - **Writes are already there.** The hq fill (append) kernel dual-writes every
   appended row that can still be recent — rotated, one BF16 rounding — into
@@ -180,12 +181,13 @@ another cause. G5 is not required for this change.
 
 Wired as the seam says; what building it found, and where it departs:
 
-- **The prompt route reads the ring after its chunk's append.** For a chunk
-  `[p0, p0 + w)` the vendored `gqa_attention_prompt_launch` runs the append
-  (which dual-writes the chunk's last `min(w, 512)` keys into their ring slots
-  and sets their bits) before the scratch decode that serves `[p0 - 512, p0)`
-  from the ring. So the keys `[p0 - 512, p0 - 512 + min(w, 512))` are served
-  the rows of the chunk keys that share their slots — exact rows, of the wrong
+- **The prompt route read the ring after its chunk's append — until #258.**
+  For a chunk `[p0, p0 + w)` the vendored `gqa_attention_prompt_launch` ran
+  the append (which dual-writes the chunk's last `min(w, 512)` keys into their
+  ring slots and sets their bits) before the scratch decode that serves
+  `[p0 - 512, p0)` from the ring. So the keys
+  `[p0 - 512, p0 - 512 + min(w, 512))` were served the rows of the chunk keys
+  that share their slots — exact rows, of the wrong
   key, and of a *later* one: a query early in the chunk attends, at a past
   position the causal mask allows, to a key up to ~1,000 positions ahead of it.
   hq prefill with the window is not causal there. The reference (ninfer
@@ -195,12 +197,13 @@ Wired as the seam says; what building it found, and where it departs:
   the 512 ring rows come back exact **to the chunk key 512 positions later**
   (rel. L2 0.0019-0.0020 to it), the other 390 exact to their own. At the
   serving chunk of 1,024, every full chunk after the first loses the whole
-  ring this way. Kept as the reference has it — `kernel/vendor/` is unchanged
-  and #173 compares against a reference that does the same — and written down
-  as `ignis_core::hq_ring::PromptSource::Clobbered`. Swapping the two launches
-  when the window is on gives the rule this spec first described; it is a
-  vendored-file patch, which ADR 0037 (owner decision, 2026-09-22) now admits
-  for a correctness bug — GitHub #258, spec runtime/07.
+  ring this way. #257 kept it as the reference has it — `kernel/vendor/`
+  unchanged, and #173 compares against a reference that does the same — and
+  wrote it down as `ignis_core::hq_ring::PromptSource::Clobbered`. **#258
+  patched it** (ADR 0037, spec runtime/07): with the window on, the prompt
+  route attends before it appends, which is the rule this spec first
+  described. The reference still appends first, so `Clobbered` now names the
+  reference's behaviour, not ignis's.
 - **AC 1 as measured.** Fresh 122, sink 32, ring 390, clobbered 122, codec the
   rest (96.3% of the image at 4096 px, 40.1% at 1024 px); every exact row within
   0.0020. "Codec rows byte-identical to the capture before this change" holds
@@ -208,7 +211,9 @@ Wired as the seam says; what building it found, and where it departs:
   only GDN layers above it, 15,840 of 15,840 codec positions (480 of 480 at
   1024 px) have the baseline's key bit for bit and decode to the baseline's
   bytes. At L39 no key is the baseline's — the GQA layers above it now attend
-  over exact rows — so the check does not apply there.
+  over exact rows — so the check does not apply there. Re-measured after #258:
+  fresh 122, sink 32, **ring 512, clobbered 0**, the same codec rows, and L3's
+  codec rows byte-identical to the #257 build's capture.
 - **No revalidation call site, and the rule is not ported.** ignis never
   trims a live sequence back: a prefix is published at exactly its end, a
   checkpoint captured at exactly its opener, a snapshot taken at a chunk

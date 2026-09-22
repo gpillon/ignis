@@ -135,10 +135,12 @@ When output names a domain concept, use the term as defined here.
   recent keys, and the prefill chunk being attended. Per slot, not per page,
   so it is a **state section** a clone or a restore carries; a ring bit names
   no position, so appended columns a sequence does not keep (a verify round's
-  rejected drafts) must have theirs cleared. **Clobbered** ring rows: in a
-  prefill chunk, the keys before it whose ring slots the chunk's own append
-  rewrote, served those later keys' rows — a read of the future the reference
-  makes too (spec runtime/06, GitHub #257).
+  rejected drafts) must have theirs cleared. A prefill chunk reads the ring
+  before its own append writes it, so every key before the chunk is served its
+  own row — **Ignis patched** (ADR 0037, spec runtime/07, GitHub #258). The
+  reference appends first and so serves **clobbered** ring rows: the keys
+  before the chunk whose ring slots the chunk's own append rewrote, read as
+  those later keys' rows, a read of the future.
 - **KV format** — which of the two KV cache formats a load runs: **hq-e8-2b**,
   the serving default from G4, or **BF16**, retained as the format every
   correctness oracle runs against. A model-load option, fixed for the life of

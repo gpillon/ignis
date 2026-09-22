@@ -129,6 +129,71 @@ reference parity, reference 18/20), re-run with the patch; the numbers go on
 #173. Any comparison with the reference from here on names this departure
 (ADR 0037).
 
+## As built (2026-09-22)
+
+Built as the constraints say; the finding is
+`docs/findings/2026-09-22-hq-prefill-reads-the-ring-before-the-append.md`.
+
+- **The patch** swaps the two launches in `gqa_attention_prompt_launch` when
+  the cache is U8 and carries `residual_k` — the route's own `has_fresh`, less
+  the `new_k`/`new_v` terms the wrapper already guarantees on this route. One
+  predicate in one lambda, so the dense and masked forms and both head
+  geometries take it, and the banded form does too: its bands all run inside
+  the attention route, before the append. Recorded with `record-patch`
+  (`kernel/vendor/patches/src/ops/launcher/gqa_attention_prefill.cu.diff`), its
+  `reason` naming the bug and the test; `verify` is green against the pinned
+  reference.
+- **The test is four arms of `test_hq_route_agreement.cu`**, not a file of its
+  own: that test already had the pool, the production views and a history
+  appended through A2. Chunks at 512 after a 512-key history — W=200, W=512
+  and W=200 masked to 150 — are held to an **exact-window** bound against
+  BF16 (every key they see is a sink, a ring row or fresh, so hq must agree to
+  one rotated rounding) and to **bit-exact causality** (the chunk's rows after
+  token `t` replaced; columns up to `t` must not move a bit). The banded arm
+  (a chunk straddling the 262,144-key band after a 262,080-key history) takes
+  the causality check only: a BF16 twin of that history costs more than it
+  tells. The fixture's 256 positions are walked on through its four layers to
+  give 1,024 distinct real rows.
+- **Red, then green**, measured 2026-09-22: on the reference's order all four
+  arms fail — the three with a BF16 twin at median relative L2 0.26-1.96,
+  worst row 3.9-30, and all four on causality, 108,320 to 1,488,400 elements
+  of columns that must not move having moved; patched, median 0.0028, worst
+  0.0110-0.0115, and 0 elements moved, identical over two runs. The whole
+  CTest suite is 63/63. Only the 27B head geometry is tested: the patch's
+  35B branch is the same two lines and runs on no model ignis serves.
+- **The fixture walk changes one old input.** `fill_kv` now maps a position
+  past the fixture's 256 rows onto its next layer; before, the verify arm's
+  B=8 case (positions 200-263) read rows 256-263 past the end of the block,
+  into the next head's rows. That arm checks workspace independence and zero
+  columns only, so no bound moved.
+- **Row level (AC 2)**: the tap reads fresh 122, sink 32, ring 512,
+  clobbered 0 on both pointing inputs, every exact row within 0.0020, and L3's
+  codec rows byte-identical to #257's capture (15,840 of 15,840; 480 of 480).
+  At L39 exactly the first chunk's codec rows are still #257's (992 of 15,840
+  at 4096 px, 480 of 480 at 1024 px): a first chunk has nothing before it, so
+  the patch cannot move it. `hq_ring::ring_before_chunk` is the rule; the tap
+  tests count a clobbered row as off it.
+- **No regression (AC 3)**: `make ci` green, CTest 63/63, and the GPU
+  profile's serialized sweep (run with `--no-fail-fast`) 78 passed, 3 failed —
+  every runtime/06 lifecycle test among the passes (`prompt_checkpoint_gpu`,
+  `retained_prefix_gpu`, `retained_slots_gpu`, `seq_snapshot_gpu`,
+  `dflash2_round_gpu`, `dflash2_window_gpu`, `vram_plan_gpu`). The three
+  failures are not this patch's: each fails identically with the launcher put
+  back to the reference's file on the same tree (`model_load_gpu`'s oversized
+  chunk now errors in #210's reservation sizing before the memory check;
+  `speculative_load_gpu`'s drafter VRAM delta is 874,496 B over its formula on
+  a BF16 load; `decide_number_width_gpu` reads 47 as 4 at two digits, first
+  digit at p = 0.676).
+- **Prefill time**: per request on the twenty tool prompts — the same tokens
+  in the same chunks, so per chunk too — patched over #257's build, median
+  0.9945 (0.94-1.16), 7,253 against 7,315 tokens/s in total: the same work
+  reordered.
+- **#173, measured after**: 16/20 end in a tool call (#257's build at reference
+  parity 17/20, reference 18/20), five prompts flipping in both directions.
+  The same prompts on ignis's BF16 KV — the oracle format, lossless — end in a
+  tool call on **7/20**, so the count is not a measure of how right the hq
+  path is; see the finding.
+
 ## Out of scope
 
 - Upstreaming the fix to the reference: an owner decision, separate from this.
