@@ -319,7 +319,16 @@ describe("Answers", () => {
 
     const chain = render(
       [sent],
-      { p: { ...headPoint(), method: "chain", region: undefined, digits: { x: [], y: [] } } },
+      {
+        p: {
+          type: "point",
+          method: "chain",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          uncertainty: { x: 12.5, y: 25 },
+          digits: { x: [], y: [] },
+        },
+      },
       { mode: "image", images: [image], text: "" },
     );
     expect(chain).toContain(">chain</span>");
