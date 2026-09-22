@@ -97,7 +97,7 @@ it is looking at (ADR 0037).
 
 | Behaviour | The reference | ignis | Test that tells them apart | Issue |
 |---|---|---|---|---|
-| none yet | | | | |
+| none yet — the first is pending: the hq-e8-2b prompt route's residual ring (spec runtime/07) | | | | #258 |
 
 Anything that is not a verbatim vendored file — including a file we edit
 beyond a recorded patch — is our own implementation and carries no provenance

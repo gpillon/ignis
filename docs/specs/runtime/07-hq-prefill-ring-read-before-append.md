@@ -1,7 +1,6 @@
 # runtime 07 — hq-e8-2b: the prefill reads its residual ring before the chunk overwrites it
 
-GitHub: see the issue titled "hq-e8-2b: prefill residual ring is overwritten
-before attention" (filed from #257).
+GitHub: #258 (filed from #257)
 
 With the hq-e8-2b residual window wired (#257, spec runtime/06), the vendored
 prompt route serves some keys *before* a prefill chunk the exact rows of keys

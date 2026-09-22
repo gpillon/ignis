@@ -146,8 +146,9 @@ of this one (2.33 against 2.58 tokens per round).
 
 ## Follow-ups
 
-- The launch order: patch it (a recorded vendored patch and an ADR) or keep
-  the reference's behaviour. An owner decision, not yet filed as an issue.
+- The launch order: the owner decided to patch it (ADR 0037, a recorded
+  vendored patch with a test that fails without it) — GitHub #258, spec
+  runtime/07.
 - #160 and #161: re-measure their hq cells with the window on (both issues
   track it; #173 carries the numbers above).
 - The pointing study's hq arms (set C, C4096): its own follow-up, per the spec.

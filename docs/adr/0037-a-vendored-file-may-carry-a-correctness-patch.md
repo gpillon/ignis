@@ -82,4 +82,4 @@ names it.
   no longer the like-for-like baseline for it; the test that tells the two
   apart is how a reader reproduces either side.
 - First case: the hq-e8-2b prompt route reading its residual ring after the
-  chunk's own append (the issue filed from #257).
+  chunk's own append — GitHub #258, spec `docs/specs/runtime/07-hq-prefill-ring-read-before-append.md`.

@@ -198,8 +198,9 @@ Wired as the seam says; what building it found, and where it departs:
   ring this way. Kept as the reference has it — `kernel/vendor/` is unchanged
   and #173 compares against a reference that does the same — and written down
   as `ignis_core::hq_ring::PromptSource::Clobbered`. Swapping the two launches
-  when the window is on would give the rule this spec first described; that
-  is a vendored-file patch outside ADR 0031, the owner's call.
+  when the window is on gives the rule this spec first described; it is a
+  vendored-file patch, which ADR 0037 (owner decision, 2026-09-22) now admits
+  for a correctness bug — GitHub #258, spec runtime/07.
 - **AC 1 as measured.** Fresh 122, sink 32, ring 390, clobbered 122, codec the
   rest (96.3% of the image at 4096 px, 40.1% at 1024 px); every exact row within
   0.0020. "Codec rows byte-identical to the capture before this change" holds
