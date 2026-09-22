@@ -673,7 +673,12 @@
     },
     {
       "path": "src/ops/launcher/gqa_attention_prefill.cu",
-      "sha256": "fe225e841d72cc53d96656d5baa92a8623d24c407ea391cccd6732249b416b96"
+      "sha256": "fe225e841d72cc53d96656d5baa92a8623d24c407ea391cccd6732249b416b96",
+      "patch": {
+        "diff": "patches/src/ops/launcher/gqa_attention_prefill.cu.diff",
+        "sha256": "a68ea652757840ef6a13c026f4c31e8c5a9ca97fd0196165ec33d0b7b58e028a",
+        "reason": "ADR 0037 correctness patch (GitHub #258, spec runtime/07): with the hq-e8-2b residual window on, the reference appends a prefill chunk before it attends, and the append rewrites the ring slots (key & 511) of the 512 keys before the chunk with the chunk's own rows, so a query is served keys up to ~1,000 positions after it. The hq route with the window on attends first and appends after (it never reads the chunk's codes: the fresh pass stages them); every other route keeps the reference's order. Fails without it: ignis_kernel_hq_route_agreement_test, the prefill-after-history arms (exact-window agreement with BF16 and bit-exact causality, dense, masked and banded)."
+      }
     },
     {
       "path": "src/ops/launcher/gqa_attention_prefill_bf16.cu",

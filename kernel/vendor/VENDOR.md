@@ -97,7 +97,7 @@ it is looking at (ADR 0037).
 
 | Behaviour | The reference | ignis | Test that tells them apart | Issue |
 |---|---|---|---|---|
-| none yet — the first is pending: the hq-e8-2b prompt route's residual ring (spec runtime/07) | | | | #258 |
+| The hq-e8-2b prompt route's residual ring, with the window on (`src/ops/launcher/gqa_attention_prefill.cu`, spec runtime/07) | Appends the chunk, then attends: the append rewrites the ring slots of the 512 keys before the chunk, so those keys are served the rows of chunk keys up to ~1,000 positions later | Attends, then appends: every key before the chunk is served its own ring row; after the call the ring and the codes are what the reference leaves | `ignis_kernel_hq_route_agreement_test`, the prefill-after-history arms (exact-window agreement with BF16, bit-exact causality; dense, masked, banded) | #258 |
 
 Anything that is not a verbatim vendored file — including a file we edit
 beyond a recorded patch — is our own implementation and carries no provenance
@@ -349,7 +349,9 @@ ticket):
   `gqa_attention_decode_hq_{27,35}.cu` + `_decode_hq_routes.cuh`,
   `gqa_attention_prefill_{bf16,i8}.cu`, `gqa_attention_prefill_hq_{27,35}.cu`
   + `_prefill_hq_routes.cuh`; the wrapper `ops/wrapper/gqa_attention.cpp` and
-  public header `include/ninfer/ops/gqa_attention.h`. Unlike
+  public header `include/ninfer/ops/gqa_attention.h`.
+  (`gqa_attention_prefill.cu` is **patched** since GitHub #258 — the first
+  Ignis-patched behaviour, in the table above.) Unlike
   `attn_input_proj`/`linear_add` (P1-11), the vendored wrapper *is* the
   complete public API — every cache dtype (BF16, I8, hq-e8-2b/U8) is
   vendored and compiles, so no leaf-side dispatcher (`kernel/src/*.cu`) is

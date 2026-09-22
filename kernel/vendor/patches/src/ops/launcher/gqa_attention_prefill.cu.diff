@@ -1,0 +1,51 @@
+diff --git a/reference/src/ops/launcher/gqa_attention_prefill.cu b/vendor/src/ops/launcher/gqa_attention_prefill.cu
+index d78c2db..c6e1fee 100644
+--- a/reference/src/ops/launcher/gqa_attention_prefill.cu
++++ b/vendor/src/ops/launcher/gqa_attention_prefill.cu
+@@ -124,6 +124,14 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
+                                  const Tensor& partial_acc, const Tensor& partial_m,
+                                  const Tensor& partial_l, std::int32_t split_count, Tensor& out,
+                                  cudaStream_t stream) {
++    // Ignis patch (ADR 0037, GitHub #258): with the hq residual window on, the
++    // attention serves the 512 keys before the chunk from the recent ring, and
++    // the chunk's append rewrites those keys' ring slots (slot = key & 511)
++    // with the chunk's own rows, so appending first serves a query keys from
++    // its future. That route never reads the chunk's own codes (the fresh
++    // pass stages its rows), so it attends first and appends after. Every
++    // other route reads the chunk's keys from the cache and appends first.
++    const bool attend_first = cache.dtype == DType::U8 && cache.residual_k.data != nullptr;
+     const auto launch = [&]<bool Masked>() {
+         const GqaPrefillBatchMetadata<Masked> metadata{
+             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
+@@ -133,19 +141,29 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
+             .table_stride = cache.block_tables.ne[0],
+         };
+         if (q.ne[1] == Gqa27Geometry::QHeads) {
+-            gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
++            if (!attend_first) {
++                gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
++            }
+             gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, k, v,
+                                                        scratch_k, scratch_v, carry_acc, carry_m,
+                                                        carry_l, visible_keys, partial_acc,
+                                                        partial_m, partial_l, split_count, out,
+                                                        stream);
++            if (attend_first) {
++                gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
++            }
+             return;
+         }
+-        gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
++        if (!attend_first) {
++            gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
++        }
+         gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, k, v,
+                                                    scratch_k, scratch_v, carry_acc, carry_m,
+                                                    carry_l, visible_keys, partial_acc, partial_m,
+                                                    partial_l, split_count, out, stream);
++        if (attend_first) {
++            gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
++        }
+     };
+     if (valid_columns.data == nullptr) {
+         launch.template operator()<false>();

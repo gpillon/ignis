@@ -32,10 +32,12 @@
  * **The exact sources are on since GitHub #257.** They exist only when the
  * cache view carries the residual side planes, and `ignis_kv_batch_layer_view`
  * fills `residual_k` / `residual_v` / `ring_valid` on an hq pool. Which row
- * came from where -- including a key before the chunk whose ring slot the
- * chunk's own append rewrote, served that later key's row -- is
- * `ignis_core::hq_ring::prompt_source`; crates/server/tests/
- * attn_tap_hq_consumed_gpu.rs holds every captured row to it.
+ * came from where is `ignis_core::hq_ring::prompt_source`, over the ring as
+ * it stood before the query's chunk: ignis attends a chunk before it appends it
+ * (GitHub #258), where the reference appends first and serves a key before
+ * the chunk the row of the chunk key that rewrote its ring slot.
+ * crates/server/tests/attn_tap_hq_consumed_gpu.rs holds every captured row
+ * to it.
  *
  * Positions are **cache positions** (the sequence index `run_gqa_layer`
  * appends at, `seq->gqa_positions`), not rotary positions. A multimodal

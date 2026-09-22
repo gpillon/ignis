@@ -41,13 +41,14 @@
 //!
 //! The consumed capture verifies itself, and a run that fails the check is
 //! not a measurement. Every prompt row on the armed head's KV head is
-//! classified by `ignis_core::hq_ring::prompt_source` — the vendored prompt
-//! route's rule with the residual window wired (GitHub #257), replayed over
-//! this prompt's own chunks — and compared with the rotated pre-codec key: a
+//! classified by `ignis_core::hq_ring::prompt_source` — the prompt route's
+//! rule with the residual window wired (GitHub #257) and the ring read before
+//! the chunk's own append (GitHub #258, Ignis patched), replayed over this
+//! prompt's own chunks — and compared with the rotated pre-codec key: a
 //! fresh, sink or ring row must be exact (relative L2 under
-//! [`EXACT_ROW_REL_ERR`]), a clobbered one exact to the key whose append
-//! rewrote its ring slot, a codec row not exact, and the codec rows' median
-//! must sit in the codec's own band, [`CODEC_ROW_MIN_MEDIAN`] to
+//! [`EXACT_ROW_REL_ERR`]), no row may be served another key's (the
+//! reference's clobbered ring), a codec row not exact, and the codec rows'
+//! median must sit in the codec's own band, [`CODEC_ROW_MIN_MEDIAN`] to
 //! [`CODEC_ROW_MAX_MEDIAN`], which a mis-offset or mis-rotated capture
 //! (uncorrelated, ~1.4) cannot.
 //!
@@ -139,7 +140,7 @@ use ignis_artifact::{
     ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
 };
 use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
-use ignis_core::hq_ring::{PromptSource, prompt_source, ring_after_prefill};
+use ignis_core::hq_ring::{PromptSource, prompt_source, ring_before_chunk};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
@@ -854,15 +855,13 @@ fn one_attention_head_points_in_the_engine() {
             }
             let query_chunk_start = captured_start.max(0) as usize;
             // Every row of the prompt on the head's own KV head, classified by
-            // the kernel's rule (GitHub #257: the ring as the chunks up to the
-            // query's appended it, the query chunk's own append included) and
-            // compared with the rotated pre-codec key.
-            let ring = ring_after_prefill(&chunks_through(
-                &prompt,
-                tokens.len() as u32,
-                chunk,
-                query as u32,
-            ));
+            // the kernel's rule (GitHub #257, #258: the ring as it stood before
+            // the query's chunk was appended -- ignis attends a chunk before
+            // it appends it) and compared with the rotated pre-codec key.
+            let ring = ring_before_chunk(
+                &chunks_through(&prompt, tokens.len() as u32, chunk, query as u32),
+                query_chunk_start as u64,
+            );
             let kv_head = HEAD_Q / (Q_HEADS / 4);
             let (mut exact_rows, mut clobbered, mut codec) = (Vec::new(), Vec::new(), Vec::new());
             let mut off_rule = 0usize;
@@ -876,13 +875,15 @@ fn one_attention_head_points_in_the_engine() {
                         exact_rows.push(err);
                     }
                     PromptSource::Clobbered { by } => {
+                        // The reference's order, never ignis's: off the rule
+                        // whatever it measures.
                         let to_by = f64::from(capture.consumed_key_rel_err_to(
                             head_layer,
                             position,
                             kv_head,
                             by as usize,
                         ));
-                        off_rule += usize::from(to_by >= EXACT_ROW_REL_ERR || err < EXACT_ROW_REL_ERR);
+                        off_rule += 1;
                         clobbered.push(to_by);
                     }
                     PromptSource::Codec => {
@@ -915,8 +916,9 @@ fn one_attention_head_points_in_the_engine() {
             hq_stats = serde_json::json!({
                 "query_chunk_start": query_chunk_start,
                 // What the rule puts through the codec, beside what was
-                // measured decoded (a clobbered row is exact to another key,
-                // so it counts as measured-decoded against its own).
+                // measured decoded (a clobbered row -- off the rule, the
+                // reference's order -- would be exact to another key, so it
+                // counts as measured-decoded against its own).
                 "codec_fraction_rule": image_codec_rule as f64 / count as f64,
                 "codec_fraction_measured": image_codec_measured as f64 / count as f64,
                 "rows": {"exact": exact_rows.len(), "clobbered": clobbered.len(), "codec": codec.len()},

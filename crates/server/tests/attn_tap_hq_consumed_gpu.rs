@@ -18,17 +18,22 @@
 //! chunks, and held to it:
 //!
 //! - **fresh, sink, ring**: exact — within [`EXACT_ROW_BOUND`] of the
-//!   rotation of the key the layer produced;
-//! - **clobbered**: a key before the chunk whose ring slot the chunk's own
-//!   append rewrote (the vendored prompt launch appends *before* it decodes
-//!   the scratch) — exact, but to the *rewriting* key's row, not its own;
+//!   rotation of the key the layer produced. The ring is the one before the
+//!   query's chunk was appended ([`ring_before_chunk`]): ignis attends a chunk
+//!   before it appends it (GitHub #258, ADR 0037), so every key of the ring
+//!   window is served its own row;
+//! - **clobbered**: a key served another key's row — what the reference's
+//!   order, appending first, does to up to 512 ring keys. Off the rule here:
+//!   a row classified this way fails, with the row it came back closest to;
 //! - **codec**: at the codec's error, and — on GQA ordinal 0, where nothing
 //!   upstream reads the KV cache, so the key the codec is given is the same
-//!   bit for bit as before — byte-identical to the capture of a build without
-//!   the window (`IGNIS_TAP_BASELINE`). The codec is deterministic (its dither
-//!   seed is `(kv_head, position, role)`), so a byte that moved there means the
-//!   write path changed. On ordinal 9 (L39) the earlier GQA layers now attend
-//!   over exact rows, so its keys — and their codes — legitimately move.
+//!   bit for bit as before — byte-identical to an earlier build's capture
+//!   (`IGNIS_TAP_BASELINE`): the one without the window, or #257's with the
+//!   reference's order. The codec is deterministic (its dither seed is
+//!   `(kv_head, position, role)`), so a byte that moved there means the write
+//!   path changed. On ordinal 9 (L39) the earlier GQA layers attend over
+//!   other rows than either baseline did, so its keys — and their codes —
+//!   legitimately move.
 //!
 //! The measured exact set must be the predicted one exactly: a row the rule
 //! calls codec that comes back exact, or the reverse, fails.
@@ -55,7 +60,7 @@ use ignis_artifact::{
 use ignis_core::attn_tap::{AttnTapCapture, KV_HEADS, with_attn_tap_hq};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
-use ignis_core::hq_ring::{PromptSource, prompt_source, ring_after_prefill};
+use ignis_core::hq_ring::{PromptSource, prompt_source, ring_before_chunk};
 use ignis_core::model_load::load_qwen38_27b_with_options;
 use ignis_core::seq::{SeqPool, SeqPoolBudget};
 use ignis_core::step;
@@ -277,14 +282,15 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
         );
 
         // The ring the query chunk's scratch decode read: every chunk's
-        // append up to and including the query chunk's own.
+        // append before the query chunk's own (GitHub #258).
         let chunks = prefill_chunks(&prompt, n as u32, PREFILL_CHUNK);
         let chunk_start = u64::try_from(capture.consumed_chunk_start[0])
             .unwrap_or_else(|_| panic!("{size} px: no chunk start was recorded"));
-        let upto = chunks.iter().position(|&(start, _)| start == chunk_start).unwrap_or_else(|| {
-            panic!("{size} px: the capture's chunk start {chunk_start} is not a chunk of {chunks:?}")
-        });
-        let ring = ring_after_prefill(&chunks[..=upto]);
+        assert!(
+            chunks.iter().any(|&(start, _)| start == chunk_start),
+            "{size} px: the capture's chunk start {chunk_start} is not a chunk of {chunks:?}"
+        );
+        let ring = ring_before_chunk(&chunks, chunk_start);
         let sources: Vec<PromptSource> = (0..n as u64)
             .map(|p| if window_on { prompt_source(p, chunk_start, &ring) } else { PromptSource::Codec })
             .collect();
@@ -306,8 +312,7 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
 
         for (layer, &ordinal) in ORDINALS.iter().enumerate() {
             let label = format!("{size} px, GQA ordinal {ordinal} (L{})", 4 * ordinal + 3);
-            let (mut codec_errors, mut mismatched, mut clobber_worst, mut exact_worst) =
-                (Vec::new(), Vec::new(), 0.0f32, 0.0f32);
+            let (mut codec_errors, mut mismatched, mut exact_worst) = (Vec::new(), Vec::new(), 0.0f32);
             for position in 0..n {
                 for kv_head in 0..KV_HEADS {
                     let own = capture.consumed_key_rel_err(layer, position, kv_head);
@@ -320,12 +325,10 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
                         }
                         PromptSource::Clobbered { by } => {
                             let to_by = capture.consumed_key_rel_err_to(layer, position, kv_head, by as usize);
-                            clobber_worst = clobber_worst.max(to_by);
-                            if to_by >= EXACT_ROW_BOUND || own < EXACT_ROW_BOUND {
-                                mismatched.push(format!(
-                                    "{position}/{kv_head} clobbered by {by}: {to_by:.4} to it, {own:.4} to its own"
-                                ));
-                            }
+                            mismatched.push(format!(
+                                "{position}/{kv_head} the ring holds key {by}'s row: {to_by:.4} to it, {own:.4} \
+                                 to its own"
+                            ));
                         }
                         PromptSource::Codec => {
                             codec_errors.push(own);
@@ -338,8 +341,8 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
             }
             let codec_median = if codec_errors.is_empty() { 0.0 } else { median(&mut codec_errors) };
             eprintln!(
-                "  {label}: exact rows worst {exact_worst:.4}, clobbered rows worst {clobber_worst:.4} to \
-                 the rewriting key, codec rows median {codec_median:.4} ({} rows); {} rows off the rule",
+                "  {label}: exact rows worst {exact_worst:.4}, codec rows median {codec_median:.4} ({} rows); \
+                 {} rows off the rule",
                 codec_errors.len(),
                 mismatched.len()
             );
@@ -386,7 +389,7 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
                 let keyed = codec_positions.iter().filter(|&&p| same_key(p)).count();
                 let identical = codec_positions.iter().filter(|&&p| same_key(p) && same_code(p)).count();
                 eprintln!(
-                    "  {label}: against the pre-#257 build, {keyed} of {} codec positions have the same key \
+                    "  {label}: against the baseline build, {keyed} of {} codec positions have the same key \
                      bit for bit, and {identical} of those decode to the same bytes",
                     codec_positions.len()
                 );

@@ -19,9 +19,10 @@
 //! given, not what it decodes. [`with_attn_tap_hq`] adds the other half: the
 //! keys the hq prompt attention actually consumed, in the codec's rotated
 //! frame, scored with [`AttnTapCapture::consumed_scores`]. Since GitHub #257
-//! the cache view carries the residual window, so the vendored route keeps
-//! the current chunk, the 32 sink keys and the ring exact and decodes the
-//! rest — which key came from where is `crate::hq_ring::prompt_source`, and
+//! the cache view carries the residual window, so the route keeps the
+//! current chunk, the 32 sink keys and the ring exact and decodes the rest —
+//! which key came from where is `crate::hq_ring::prompt_source` over the ring
+//! as it stood before the query's chunk was appended (GitHub #258), and
 //! `attn_tap_hq_consumed_gpu.rs` holds the capture to it row by row.
 
 use std::ffi::{CStr, c_char};
@@ -145,9 +146,10 @@ impl AttnTapCapture {
 
     /// `|R k - kc| / |R k|` with `k` the key the layer produced at
     /// `key_position` and `kc` the row attention consumed at `position`:
-    /// which key a consumed row actually is. The hq ring can serve one key's
-    /// row for another's (`crate::hq_ring::PromptSource::Clobbered`), and
-    /// this is how a test tells that apart from a decoded row.
+    /// which key a consumed row actually is. On the reference's launch order
+    /// the hq ring serves one key's row for another's
+    /// (`crate::hq_ring::PromptSource::Clobbered`, GitHub #258), and this is
+    /// how a test tells that apart from a decoded row.
     pub fn consumed_key_rel_err_to(
         &self,
         layer: usize,

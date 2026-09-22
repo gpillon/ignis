@@ -17,14 +17,17 @@
 //! consumed-key tap classifies each key the prompt route read with
 //! [`prompt_source`]. Pure arithmetic, so its own tests run on the CPU.
 //!
-//! **The prompt route reads the ring after its own chunk's append.** The
-//! vendored `gqa_attention_prompt_launch` enqueues the chunk's append (which
+//! **The prompt route reads the ring before its own chunk's append**
+//! ([`ring_before_chunk`]): an **Ignis-patched** behaviour (ADR 0037, GitHub
+//! #258, spec `docs/specs/runtime/07-hq-prefill-ring-read-before-append.md`).
+//! The reference (ninfer `a00648cb`) enqueues the chunk's append (which
 //! dual-writes the chunk's last 512 keys into their ring slots and sets their
 //! bits) *before* the scratch decode that reads the ring for the 512 keys
-//! before the chunk. A key there whose slot the chunk has just rewritten is
-//! served the chunk's row, with its bit set — [`PromptSource::Clobbered`].
-//! The reference (ninfer `a00648cb`) does the same; this module describes it,
-//! it does not endorse it.
+//! before the chunk, so a key there whose slot the chunk has just rewritten is
+//! served the chunk's row — [`PromptSource::Clobbered`], a key from the
+//! query's future. That is [`prompt_source`] over [`ring_after_prefill`] of
+//! the chunks up to and including the query's; ignis attends first, and
+//! after the call the ring is the same either way.
 
 /// Sink keys the window keeps exact, with no validity bit
 /// (`kGqaHqSinkKeys`).
@@ -131,17 +134,21 @@ pub enum PromptSource {
     /// One of the [`RECENT_KEYS`] keys before the chunk, served its own
     /// exact row from the ring.
     Ring,
-    /// One of the keys before the chunk whose ring slot the chunk's own
-    /// append rewrote: served key `by`'s exact row instead of its own.
+    /// One of the keys before the chunk served key `by`'s exact row instead
+    /// of its own: what the reference's launch order does to the keys whose
+    /// ring slots the chunk's own append rewrote. On ignis's order a ring the
+    /// appends built never holds another key's row there, so a capture
+    /// classified this way is off the rule.
     Clobbered { by: u64 },
     /// Everything else, and a ring key whose bit is clear: the codec.
     Codec,
 }
 
 /// [`PromptSource`] of the key at `position` for the query chunk starting at
-/// `chunk_start`, with `ring` the slot's ring **after** that chunk's append
-/// (the vendored order) — the rule of `gqa_attention_prefill_hq_scratch_kernel`
-/// with the fresh-chunk pass on.
+/// `chunk_start`, with `ring` the slot's ring as that chunk's scratch decode
+/// reads it — the rule of `gqa_attention_prefill_hq_scratch_kernel` with the
+/// fresh-chunk pass on. On ignis's order that ring is [`ring_before_chunk`];
+/// on the reference's it is the ring after the chunk's own append too.
 pub fn prompt_source(position: u64, chunk_start: u64, ring: &HqRing) -> PromptSource {
     if position >= chunk_start {
         PromptSource::Fresh
@@ -168,6 +175,15 @@ pub fn ring_after_prefill(chunks: &[(u64, u64)]) -> HqRing {
     ring
 }
 
+/// The ring the prompt route reads for the chunk starting at `chunk_start`,
+/// of a prefill run as `chunks` (`(start, len)` in order): the ring every
+/// chunk before it left, since ignis attends a chunk before it appends it
+/// (ADR 0037, GitHub #258).
+pub fn ring_before_chunk(chunks: &[(u64, u64)], chunk_start: u64) -> HqRing {
+    let before = chunks.iter().take_while(|&&(start, _)| start < chunk_start).count();
+    ring_after_prefill(&chunks[..before])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,28 +207,50 @@ mod tests {
         assert_eq!(ring.served(100), Some(612), "slot 100 holds the later key");
     }
 
+    fn tally(chunk_start: u64, total: u64, ring: &HqRing) -> (usize, usize) {
+        let sources: Vec<_> = (0..total).map(|p| prompt_source(p, chunk_start, ring)).collect();
+        let clobbered = sources.iter().filter(|s| matches!(s, PromptSource::Clobbered { .. })).count();
+        let ring_rows = sources.iter().filter(|s| **s == PromptSource::Ring).count();
+        (clobbered, ring_rows)
+    }
+
     #[test]
-    fn the_prompt_route_reads_the_ring_after_the_chunks_own_append() {
+    fn the_prompt_route_reads_the_ring_the_chunks_before_it_left() {
         // Two chunks, the second 122 wide at 1024 -- the 1024 px pointing
         // prompt's shape: 1146 tokens, the query chunk from 1024.
+        let chunks = [(0, 1024), (1024, 122)];
+        let ring = ring_before_chunk(&chunks, 1024);
+        assert_eq!(ring, ring_after_prefill(&chunks[..1]), "the query chunk's own append is not in it");
+        // Every key of the ring window [512, 1024) is served its own row.
+        assert_eq!(prompt_source(512, 1024, &ring), PromptSource::Ring);
+        assert_eq!(prompt_source(633, 1024, &ring), PromptSource::Ring);
+        assert_eq!(prompt_source(1023, 1024, &ring), PromptSource::Ring);
+        assert_eq!(prompt_source(1024, 1024, &ring), PromptSource::Fresh);
+        assert_eq!(prompt_source(31, 1024, &ring), PromptSource::Sink);
+        assert_eq!(prompt_source(32, 1024, &ring), PromptSource::Codec);
+        assert_eq!(prompt_source(511, 1024, &ring), PromptSource::Codec);
+        assert_eq!(tally(1024, 1146, &ring), (0, 512));
+        // A full-width chunk after the first keeps the whole window too.
+        let chunks = [(0, 1024), (1024, 1024)];
+        assert_eq!(tally(1024, 2048, &ring_before_chunk(&chunks, 1024)), (0, 512));
+        // The first chunk has nothing before it: no ring row at all.
+        assert_eq!(tally(0, 1024, &ring_before_chunk(&chunks, 0)), (0, 0));
+    }
+
+    #[test]
+    fn the_references_order_serves_ring_keys_the_chunks_own_rows() {
+        // The reference appends the query chunk before it attends, so the
+        // ring it reads includes that append (spec runtime/07).
         let ring = ring_after_prefill(&[(0, 1024), (1024, 122)]);
         // The first 122 keys of the ring window [512, 1024) share their slots
         // with the chunk's keys [1024, 1146) and are served those.
         assert_eq!(prompt_source(512, 1024, &ring), PromptSource::Clobbered { by: 1024 });
         assert_eq!(prompt_source(633, 1024, &ring), PromptSource::Clobbered { by: 1145 });
         assert_eq!(prompt_source(634, 1024, &ring), PromptSource::Ring);
-        assert_eq!(prompt_source(1023, 1024, &ring), PromptSource::Ring);
-        assert_eq!(prompt_source(1024, 1024, &ring), PromptSource::Fresh);
-        assert_eq!(prompt_source(31, 1024, &ring), PromptSource::Sink);
-        assert_eq!(prompt_source(32, 1024, &ring), PromptSource::Codec);
-        assert_eq!(prompt_source(511, 1024, &ring), PromptSource::Codec);
-        let sources: Vec<_> = (0..1146).map(|p| prompt_source(p, 1024, &ring)).collect();
-        let clobbered = sources.iter().filter(|s| matches!(s, PromptSource::Clobbered { .. })).count();
-        let ring_rows = sources.iter().filter(|s| **s == PromptSource::Ring).count();
-        assert_eq!((clobbered, ring_rows), (122, 390));
+        assert_eq!(tally(1024, 1146, &ring), (122, 390));
         // A full-width chunk after the first clobbers the whole window.
         let ring = ring_after_prefill(&[(0, 1024), (1024, 1024)]);
-        assert!((512..1024).all(|p| matches!(prompt_source(p, 1024, &ring), PromptSource::Clobbered { .. })));
+        assert_eq!(tally(1024, 2048, &ring), (512, 0));
     }
 
     #[test]
