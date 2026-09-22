@@ -42,8 +42,9 @@ chain's 212 and 169.
 
 The head's point is **coarse** — its resolution is one image token (32 px of
 the image), and a hit lands a median 28-40/999 from the target's centre where
-the chain's lands 2-10: the head marks the **start of the target's label**
-(27-32% across a button), not its centre
+the chain's lands 2-10: on the synthetic labelled buttons measured, the head
+marks **where the target's label begins** (27-32% across a button), not its
+centre
 (`docs/findings/2026-09-22-how-the-head-map-is-read.md`). So the chain stays, **opt-in**, for what it is still
 better at: `"method": "chain"` gives the digit-precise point, targets smaller
 than a token, and the per-digit trace. A load whose artifact has no calibrated
@@ -204,7 +205,8 @@ produced it.
   its **share** of the softmax mass over the image span, which does
   (AUC 0.65-0.84 on the synthetic sets) and is the confidence to expose,
   not a calibrated probability. The documentation says where the point
-  sits: on the start of the target's label, not its centre. No `digits`.
+  sits on labelled targets: where the label begins, not the target's
+  centre; on unlabelled targets it is unmeasured. No `digits`.
   The chain answer is unchanged apart from `method`.
 
 - **The pointing head is a calibrated constant keyed to the artifact.** A

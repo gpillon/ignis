@@ -150,7 +150,15 @@ every target many cells tall, the 4 misses are all **another element**.
   before the label's first letter**, at both sizes. That is the whole of
   the x offset (−26 to −39): the head finds the label's beginning, and the
   button's centre is half a label further right. The y error is nil because
-  the label is vertically centred.
+  the label is vertically centred. Label start and "a fixed ~30% of the
+  button" coincide on centred labels, so they were told apart
+  (`label_start_check.py`): within one size the correlation with the label's
+  start is weak (r 0.18-0.30, slopes +0.57 to +1.03), because labels fill a
+  similar fraction of every button (start at 28-43%) and the cells quantize
+  it; across sizes it is decisive — the peak sits **half a cell** before the
+  label's start at both, which is 0.085 of a button at 1024 px and 0.026 at
+  4096 px, where the same scene is drawn four times larger and a fixed
+  fraction of the button would not have moved.
 - **The pre-softmax scores are no better map**: TAG on min-max raw scores
   lands inside on 2-4 of 240 (the raw map is broad and its top half is
   elsewhere).
