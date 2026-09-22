@@ -102,6 +102,7 @@ fn a_dflash2_leaf_drafts_inside_the_round_and_reports_each_rounds_counters() {
             shared_prefix: None,
             publish_prefix: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

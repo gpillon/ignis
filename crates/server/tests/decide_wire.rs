@@ -84,7 +84,7 @@ fn parse(body: &str) -> DecideRequest {
 }
 
 fn prepared(body: &str) -> Vec<PreparedQuestion> {
-    prepare(&parse(body).questions, &alphabet(), &encoder).expect("a valid request prepares")
+    prepare(&parse(body).questions, &alphabet(), &encoder, None).expect("a valid request prepares")
 }
 
 /// [`prepared`] for a body built with `json!`, where no declared order is
@@ -399,7 +399,7 @@ fn system_block_for(state: &str) -> String {
         r#"{{"state":{state},"questions":{{"q":{{"type":"noul","instructions":"Is it?"}}}}}}"#
     );
     let request: DecideRequest = serde_json::from_str(&body).expect("a valid request");
-    let questions = prepare(&request.questions, &alphabet(), &encoder).expect("a valid decision");
+    let questions = prepare(&request.questions, &alphabet(), &encoder, None).expect("a valid decision");
     messages_for(&Evidence::read(&request.state), &questions[0])[0].content.text()
 }
 
@@ -447,7 +447,7 @@ fn a_number_keeps_the_spelling_the_caller_gave_it() {
 fn an_object_instruction_keeps_its_order() {
     let body = r#"{"state":"s","questions":{"q":{"type":"noul","instructions":{"ask":"is it?","about":"the order"}}}}"#;
     let request: DecideRequest = serde_json::from_str(body).expect("a valid request");
-    let questions = prepare(&request.questions, &alphabet(), &encoder).expect("a valid decision");
+    let questions = prepare(&request.questions, &alphabet(), &encoder, None).expect("a valid decision");
     let user = messages_for(&Evidence::read(&request.state), &questions[0])[1].content.text();
     assert!(
         user.find(r#""ask""#).unwrap() < user.find(r#""about""#).unwrap(),
@@ -486,13 +486,13 @@ fn wide_choice(count: usize) -> String {
 
 #[test]
 fn the_measured_ceiling_is_served_and_one_past_it_is_refused() {
-    let at_ceiling = prepare(&parse(&wide_choice(MAX_OPTIONS)).questions, &alphabet(), &encoder);
+    let at_ceiling = prepare(&parse(&wide_choice(MAX_OPTIONS)).questions, &alphabet(), &encoder, None);
     assert!(
         at_ceiling.is_ok(),
         "{MAX_OPTIONS} options is measured and served: {:?}",
         at_ceiling.err()
     );
-    let past = prepare(&parse(&wide_choice(MAX_OPTIONS + 1)).questions, &alphabet(), &encoder)
+    let past = prepare(&parse(&wide_choice(MAX_OPTIONS + 1)).questions, &alphabet(), &encoder, None)
         .expect_err("one past the ceiling is refused");
     assert_eq!(past.code, "too_many_options");
     assert!(
@@ -525,7 +525,7 @@ fn a_model_whose_tokenizer_cannot_name_the_options_refuses_rather_than_collides(
     }
     let narrow = AnswerAlphabet::from_tokenizer(&OnlyTwo);
     assert_eq!(narrow.len(), 2);
-    let refusal = prepare(&parse(&wide_choice(3)).questions, &narrow, &encoder)
+    let refusal = prepare(&parse(&wide_choice(3)).questions, &narrow, &encoder, None)
         .expect_err("three options do not fit a two-label alphabet");
     assert_eq!(refusal.code, "alphabet_exhausted");
 }
@@ -581,7 +581,7 @@ fn a_malformed_question_refuses_the_whole_request() {
             all.insert(id.clone(), question.clone());
         }
         let body = json!({ "state": "s", "questions": all }).to_string();
-        let refusal = prepare(&parse(&body).questions, &alphabet(), &encoder)
+        let refusal = prepare(&parse(&body).questions, &alphabet(), &encoder, None)
             .err()
             .unwrap_or_else(|| panic!("{code}: expected a refusal"));
         assert_eq!(refusal.code, code, "{}", refusal.message);
@@ -595,7 +595,7 @@ fn a_malformed_question_refuses_the_whole_request() {
 
 #[test]
 fn a_request_with_no_questions_is_refused() {
-    let refusal = prepare(&Ordered(Vec::<(String, Question)>::new()), &alphabet(), &encoder)
+    let refusal = prepare(&Ordered(Vec::<(String, Question)>::new()), &alphabet(), &encoder, None)
         .expect_err("nothing to decide");
     assert_eq!(refusal.code, "no_questions");
 }
@@ -608,7 +608,7 @@ fn a_duplicate_question_id_is_refused_rather_than_silently_halved() {
     )
     .expect("parses");
     assert_eq!(body.questions.len(), 2, "both copies survive the parse");
-    let refusal = prepare(&body.questions, &alphabet(), &encoder).expect_err("ambiguous");
+    let refusal = prepare(&body.questions, &alphabet(), &encoder, None).expect_err("ambiguous");
     assert_eq!(refusal.code, "duplicate_question");
 }
 
@@ -802,7 +802,7 @@ fn a_structured_instruction_reaches_the_prompt_whole() {
 
 /// Prepare one question from raw JSON text, or the refusal it earned.
 fn prepare_one_wire(body: &str) -> Result<Vec<PreparedQuestion>, Refusal> {
-    prepare(&parse(body).questions, &alphabet(), &encoder)
+    prepare(&parse(body).questions, &alphabet(), &encoder, None)
 }
 
 fn program_body(kind: &str, extra: &str) -> String {

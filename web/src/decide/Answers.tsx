@@ -261,6 +261,8 @@ function sigma(value: number): string {
 function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point" | "box" }>; draft: Draft }) {
   const image = evidenceImage(draft.evidence);
   const axes = AXES[answer.type];
+  // A head point (GitHub #260) is read in one pass and has no digit trace.
+  const digits = answer.digits;
   return (
     <div className="grid items-start gap-5 sm:grid-cols-2">
       <div className="flex justify-center">
@@ -306,7 +308,7 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             ))}
           </tbody>
         </table>
-        <details className="text-[12px] text-ash">
+        {digits && <details className="text-[12px] text-ash">
           <summary className="cursor-pointer font-display text-ink">Digit trace per axis</summary>
           {/* Two to a row: a box has four axes, and a column of four traces is
               taller than the picture they belong to. */}
@@ -314,11 +316,11 @@ function SpatialBody({ answer, draft }: { answer: Extract<Answer, { type: "point
             {axes.map((axis, index) => (
               <li key={axis} className="flex items-end gap-3">
                 <span className="w-6 font-display text-ash">{axis}</span>
-                <DigitTrace digits={answer.digits[axis] ?? []} offset={index * (answer.digits[axis]?.length ?? 0)} />
+                <DigitTrace digits={digits[axis] ?? []} offset={index * (digits[axis]?.length ?? 0)} />
               </li>
             ))}
           </ol>
-        </details>
+        </details>}
       </div>
 
       <p className="text-[12px] leading-snug text-ash sm:col-span-2">

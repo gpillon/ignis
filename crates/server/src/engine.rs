@@ -106,6 +106,9 @@ pub struct Engine {
     model_id: String,
     /// The scheduler's per-sequence context, captured the same way.
     max_model_len: u32,
+    /// The content hash of the artifact the backend runs on (GitHub #260),
+    /// captured the same way: what the pointing head is keyed on.
+    artifact: ignis_core::ArtifactHash,
     commands: std_mpsc::Sender<Command>,
     facts: UnboundedSender<TelemetryFact>,
     /// The latest interval counters, published wait-free by the telemetry
@@ -119,6 +122,7 @@ impl Clone for Engine {
         Self {
             model_id: self.model_id.clone(),
             max_model_len: self.max_model_len,
+            artifact: self.artifact,
             commands: self.commands.clone(),
             facts: self.facts.clone(),
             counters: Arc::clone(&self.counters),
@@ -159,6 +163,7 @@ impl Engine {
     ) -> (Self, std::thread::JoinHandle<()>) {
         let model_id = scheduler.model_id().to_string();
         let max_model_len = scheduler.max_sequence_tokens();
+        let artifact = scheduler.artifact();
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
@@ -180,6 +185,7 @@ impl Engine {
             Self {
                 model_id,
                 max_model_len,
+                artifact,
                 commands: command_tx,
                 facts: facts_tx,
                 counters,
@@ -214,6 +220,13 @@ impl Engine {
     /// tokens (for `GET /v1/models`) — immutable like the model id.
     pub fn max_model_len(&self) -> u32 {
         self.max_model_len
+    }
+
+    /// The content hash of the artifact this engine's backend runs on
+    /// (GitHub #260) — immutable like the model id;
+    /// [`ignis_core::ArtifactHash::UNKNOWN`] for a backend that opened none.
+    pub fn artifact(&self) -> ignis_core::ArtifactHash {
+        self.artifact
     }
 
     /// The latest interval counters, published wait-free by the telemetry
@@ -439,6 +452,9 @@ async fn telemetry_task(
                     // GitHub #242: and a run's trace, for the same
                     // reason — its tokens were already counted one by one.
                     readout: _,
+                    // GitHub #260: and a head point's scores, for the same
+                    // reason as the readout.
+                    attention: _,
                     drawn: _,
                 } => telemetry.on_done(request, tokens, reason, spec),
                 SchedEvent::PrefillChunk {
@@ -534,6 +550,29 @@ pub async fn collect_readout(
             }
             // Every other event for this request — its admission, its
             // prefill chunks, a restore — says nothing about the answer.
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
+        }
+    }
+}
+
+/// Drive a submitted head point to its answer (GitHub #260): wait for its
+/// [`SchedEvent::Done`] and hand back the **attention readout** it finished
+/// with.
+///
+/// The mirror of [`collect_readout`], with one difference that is the
+/// point: a `Done` without scores is not a request that never finished but
+/// one the leaf could not read — keys the layer's attention never
+/// materialized for it — and it comes back as `Ok(None)` so the caller can
+/// say so instead of reporting a timeout that did not happen.
+pub async fn collect_attention(
+    rx: &mut EventStream,
+    timeout: Duration,
+) -> Result<Option<Arc<[f32]>>, CollectError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(SchedEvent::Done { attention, .. })) => return Ok(attention),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => return Err(CollectError::NotCompleted),
         }
@@ -743,6 +782,7 @@ mod tests {
                     tokens: 1,
                     reason: FinishReason::Stop,
                     spec: None,
+                    attention: None,
                 },
             ]
         }
@@ -814,6 +854,7 @@ mod tests {
                     tokens: 1,
                     reason: FinishReason::Stop,
                     spec: None,
+                    attention: None,
                 },
             ]
         }
@@ -1007,6 +1048,7 @@ mod tests {
             commands: command_tx,
             facts: consumer_tx.clone(),
             counters,
+            artifact: ignis_core::ArtifactHash::UNKNOWN,
         };
         let recorder = tokio::spawn(async move {
             let mut ticks = Vec::new();
@@ -1070,6 +1112,7 @@ mod tests {
             commands: command_tx,
             facts: consumer_tx.clone(),
             counters,
+            artifact: ignis_core::ArtifactHash::UNKNOWN,
         };
         // With metrics on, a scraper renders the projection for as long as
         // the workload runs (GitHub #90): scraping must not change the facts

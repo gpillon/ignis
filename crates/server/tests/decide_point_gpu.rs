@@ -29,6 +29,13 @@
 //! question is a ~16K-token prefill of roughly two seconds. Three scenes at
 //! two shapes is six of them.
 //!
+//! **GitHub #260 moved the default.** A `point` with no `method` is now read
+//! off the served artifact's calibrated pointing head in one pass, so the
+//! chain tests here ask for `"method": "chain"` by name — they are the
+//! chain's regression guard and stay one — and a third test puts the same
+//! scenes to the default, the head, and holds it to the same bar with zero
+//! decode rounds.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38).
 
 #![cfg(feature = "cuda")]
@@ -187,29 +194,33 @@ async fn decide(app: &axum::Router, body: String) -> (u16, JsonValue) {
 }
 
 /// Put one `point` question to the server over one scene, and report where
-/// it landed.
-async fn point_at(app: &axum::Router, image: &[u8]) -> JsonValue {
+/// it landed. `method` is sent as given, or left out for the default.
+async fn point_at(app: &axum::Router, image: &[u8], method: Option<&str>) -> JsonValue {
+    let method = method.map(|m| format!(r#","method":"{m}""#)).unwrap_or_default();
     let body = format!(
         r#"{{"state":[{{"type":"image_url","image_url":{{"url":"{}"}}}}],"model":"{MODEL}",
-            "questions":{{"where":{{"type":"point","instructions":"{INSTRUCTION}"}}}}}}"#,
+            "questions":{{"where":{{"type":"point","instructions":"{INSTRUCTION}"{method}}}}}}}"#,
         data_uri(image)
     );
     let (status, response) = decide(app, body).await;
     assert_eq!(status, 200, "the decide request was served: {response}");
     let answer = response["answers"]["where"].clone();
     assert_eq!(answer["type"], "point", "{response}");
-    // A constrained decode generates, and the usage says so: three digits, the forced
-    // separator, three more digits.
-    assert!(
-        response["usage"]["output_tokens"].as_u64().expect("a count") >= 6,
-        "a point generates its digits: {response}"
-    );
+    let generated = response["usage"]["output_tokens"].as_u64().expect("a count");
+    match answer["method"].as_str() {
+        // A constrained decode generates, and the usage says so: three
+        // digits, the forced separator, three more digits.
+        Some("chain") => assert!(generated >= 6, "a chain point generates its digits: {response}"),
+        // GitHub #260: one prefill and no decode round.
+        Some("head") => assert_eq!(generated, 0, "a head point generates nothing: {response}"),
+        _ => panic!("every point answer names its method: {response}"),
+    }
     answer
 }
 
 /// Run every scene through `shape` and assert each answer lands inside its
 /// own button.
-async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str) {
+async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str, method: Option<&str>) {
     let dir = fixture_dir();
     let Ok(manifest_text) = std::fs::read_to_string(dir.join("manifest.json")) else {
         if gpu_profile::skip_or_fail(&format!("the pointing fixture is absent: {}", dir.display())) {
@@ -224,7 +235,7 @@ async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str) {
     for scene in &manifest.scenes {
         let bytes = std::fs::read(dir.join(&scene.image))
             .unwrap_or_else(|e| panic!("{}: read image: {e}", scene.id));
-        let answer = point_at(h.app(), &bytes).await;
+        let answer = point_at(h.app(), &bytes, method).await;
 
         let (x, y) = (
             answer["pixels"]["x"].as_i64().expect("an x in pixels"),
@@ -251,6 +262,14 @@ async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str) {
             scene.blue_box
         );
 
+        // GitHub #260: a head point's uncertainty is one image token per
+        // axis and it carries no trace; the rest of this loop is the chain's.
+        if answer["method"] == "head" {
+            let cell = answer["uncertainty"]["x"].as_f64().expect("an uncertainty");
+            assert!(cell > 0.0, "[{label}] {}: one token cell, in pixels: {answer}", scene.id);
+            assert!(answer["region"]["share"].as_f64().is_some(), "{answer}");
+            continue;
+        }
         // Acceptance 4, on the card: the reported uncertainty is the
         // trace's own place-weighted sum, rescaled onto this axis.
         for axis in ["x", "y"] {
@@ -293,7 +312,15 @@ async fn every_scene_lands_inside_its_button(shape: EngineShape, label: &str) {
 #[tokio::test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn a_point_lands_inside_the_blue_button_on_every_scene() {
-    every_scene_lands_inside_its_button(vision_shape(), "default").await;
+    every_scene_lands_inside_its_button(vision_shape(), "chain", Some("chain")).await;
+}
+
+/// GitHub #260: the default — the served artifact's calibrated pointing head,
+/// read in one pass — held to the same bar on the same scenes.
+#[tokio::test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+async fn a_point_with_no_method_is_read_off_the_head_inside_the_button() {
+    every_scene_lands_inside_its_button(vision_shape(), "head", None).await;
 }
 
 /// The same, on a **drafter** load — the only shape that exercises
@@ -316,5 +343,5 @@ async fn a_point_is_served_on_a_drafter_load_too() {
         ),
         ..vision_shape()
     };
-    every_scene_lands_inside_its_button(shape, "dflash2-7").await;
+    every_scene_lands_inside_its_button(shape, "dflash2-7", Some("chain")).await;
 }

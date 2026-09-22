@@ -111,6 +111,7 @@ pub fn prefill_prompt(
                 }),
             },
             if last { Some(&mut *logits) } else { None },
+            None,
         )
         .map(|_unconstrained| ())?;
         start += len;

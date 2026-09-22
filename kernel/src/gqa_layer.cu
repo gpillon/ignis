@@ -4,6 +4,7 @@
 // context: input norm -> fused Q/K/gate/V projection -> q/k norm + RoPE ->
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
+#include "attention_readout.h"
 #include "ignis_attn_tap.h"
 #include "ignis_gqa_layer.h"
 
@@ -50,7 +51,7 @@ ninfer::Tensor weight_tensor(const ninfer::Weight &weight, ninfer::DType dtype,
 int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                       uint32_t layer, void *in_residual, void *out_residual,
                       uint32_t gqa_layer, uint64_t num_tokens, LinearPolicyMode mode,
-                      const void *rope_positions) {
+                      const void *rope_positions, const AttentionReadoutTarget *attention_readout) {
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
@@ -248,6 +249,33 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
             stream) != 0) {
       set_error(std::string("ignis_gqa_layer: ") + ignis_attn_tap_last_error());
       return -1;
+    }
+
+    // GitHub #260 (ADR 0038): the attention readout, scored here and nowhere
+    // else -- after this layer's attention and inside its scope, while the
+    // keys that attention read are still where it read them (the hq prompt
+    // route's planes die with this scope; the BF16 pages were appended
+    // before the read). The route is asked of the same resolver the
+    // workspace was sized by, exactly as the test-only tap above asks it,
+    // and a single band is required: a banded prompt keeps only its last.
+    if (attention_readout != nullptr) {
+      const bool hq_prompt_scratch =
+          batch_cache.dtype == ninfer::DType::U8 &&
+          ninfer::ops::detail::gqa_attention_resolve_route(kQHeads, tokens, 1, batch_cache.dtype,
+                                                           envelope) ==
+              ninfer::ops::detail::GqaAttentionRoute::Prompt &&
+          envelope.max_visible_keys <= ninfer::ops::kGqaHqPromptScratchBandKeys;
+      const char *readout_error = nullptr;
+      if (ignis_attention_readout_run(
+              *attention_readout, rotated_query.data, kQHeads, kKvHeads, tokens,
+              static_cast<std::int64_t>(envelope.max_visible_keys), batch_cache,
+              hq_prompt_scratch, attention_workspace_storage.data,
+              static_cast<std::int64_t>(std::min<std::uint32_t>(
+                  envelope.max_visible_keys, ninfer::ops::kGqaHqPromptScratchBandKeys)),
+              attention_scale, stream, &readout_error) != 0) {
+        set_error(std::string("ignis_gqa_layer: ") + readout_error);
+        return -1;
+      }
     }
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
@@ -557,7 +585,8 @@ bool gqa_format_matches_load(ignis_model *model, ignis_seq_pool *pool, const cha
 int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                  uint32_t layer, const void *in_residual, void *out_residual,
                                  uint64_t num_tokens, LinearPolicyMode mode,
-                                 const void *rope_positions) {
+                                 const void *rope_positions,
+                                 const AttentionReadoutTarget *attention_readout) {
   // Errors here are prefixed `ignis_gqa_layer` (not `..._step`): this body
   // is now dispatched both by `ignis_gqa_layer_step` and directly by a
   // chunk loop (kernel/src/step.cu), so a message naming the ABI wrapper
@@ -590,7 +619,7 @@ int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis
     return -1;
   }
   return run_gqa_layer(model, pool, seq, layer, const_cast<void *>(in_residual), out_residual,
-                       gqa_layer, num_tokens, mode, rope_positions);
+                       gqa_layer, num_tokens, mode, rope_positions, attention_readout);
 }
 
 // P2-03 (GitHub #85): `ignis_gqa_layer_step`'s synchronous contract (body +

@@ -38,6 +38,10 @@
 // (GitHub #85's acceptance).
 enum class LinearPolicyMode { kEngineDefault, kA16Only };
 
+// GitHub #260: the attention readout a GQA layer body may be handed
+// (kernel/src/attention_readout.h).
+struct AttentionReadoutTarget;
+
 // The policy a `qtype` weight is dispatched under a `mode` (P2-03, GitHub
 // #85): `kA16Only` forces the A16 route everywhere it is registered (the
 // one op whose A16 registration domain is width-capped — `linear_swiglu`,
@@ -95,10 +99,15 @@ inline ninfer::ops::LinearPolicy ignis_linear_swiglu_policy_for(ninfer::QType qt
 // rotates at -- a multimodal chunk's three axes -- or null, where the span
 // rotates at its cache positions shifted by the sequence's rope delta (0,
 // the cache positions themselves, for a text sequence).
+//
+// `attention_readout` (GitHub #260) is the readout this layer scores after
+// its attention, or null -- which is every call but the one GQA layer a
+// head point's last chunk names (kernel/src/attention_readout.h).
 int32_t ignis_gqa_layer_run_body(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                                   uint32_t layer, const void *in_residual, void *out_residual,
                                   uint64_t num_tokens, LinearPolicyMode mode,
-                                  const void *rope_positions = nullptr);
+                                  const void *rope_positions = nullptr,
+                                  const AttentionReadoutTarget *attention_readout = nullptr);
 
 // The same body + one stream synchronization + the deferred
 // `gqa_positions` advance, for a caller that wants `ignis_gqa_layer_step`'s

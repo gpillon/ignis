@@ -57,6 +57,11 @@ pub struct Request {
     /// that reports it. `None` on every request that is not a **decision**,
     /// and on a decision whose last chunk has not landed yet.
     pub readout: Option<crate::decision::Readout>,
+    /// The **attention readout** this request's last prefill chunk produced
+    /// (GitHub #260, ADR 0038), held the same way and for the same reason as
+    /// [`Request::readout`]: from the chunk that read it to the completion
+    /// that reports it.
+    pub attention: Option<std::sync::Arc<[f32]>>,
     /// The **trace** a **constrained decode** has built so far (GitHub #242): one draw
     /// per token it has emitted, in order, each with the probability it held
     /// inside its own step's permitted set.
@@ -202,6 +207,7 @@ impl Request {
             tokens: 0,
             spec: None,
             readout: None,
+            attention: None,
             drawn: Vec::new(),
             resources,
             remaining_work,
@@ -365,9 +371,16 @@ impl Request {
         if page_tokens == 0 {
             return 0;
         }
+        // Never past what the request may publish at all (GitHub #260): a
+        // head point holds back an attention readout's tail, and a retained
+        // head published inside it would both be an entry no head point can
+        // claim and cut this request's own reading chunk below what the leaf
+        // can read. `publish_reach` is the whole prompt for every request
+        // that holds nothing back, so for them this is the block itself.
+        let reach = u32::try_from(self.input.publish_reach()).unwrap_or(u32::MAX);
         self.input
             .system_block_tokens
-            .map_or(0, |block| self.input.prefix_floor(block, page_tokens))
+            .map_or(0, |block| self.input.prefix_floor(block.min(reach), page_tokens))
     }
 
     /// The **capture point** (GitHub #186, ADR 0029): the prefill position at

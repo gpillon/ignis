@@ -1132,6 +1132,12 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   if (options.vision_max_tokens > 0) {
     const auto tokens =
         static_cast<std::int32_t>(std::min(options.vision_max_tokens, max_context_tokens));
+    // GitHub #260 (ADR 0038): a head point's attention readout scores one
+    // image's placeholder span from the prefill chunk's own scope -- one F32
+    // per key, and an image holds at most the envelope's tokens. Only a
+    // vision load can be asked one (the span is an image's), so a text load
+    // reserves nothing for it.
+    sizes.prefill_scratch += fp32_bytes(tokens);
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
     sizes.media_embedding =

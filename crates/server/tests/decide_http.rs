@@ -1818,3 +1818,283 @@ async fn a_scalar_is_counted_as_a_scalar_and_has_no_answer_mass() {
         "{after}"
     );
 }
+
+// ── point in one pass: the pointing head (GitHub #260, spec 13) ─────────
+//
+// The mock's attention readout is deterministic with its peak at a
+// documented key (`MockCompute::attention_peak`), so everything above the
+// seam — the default method, the refusals, the region rule, the rescaling
+// onto the submitted image, the rounds that do not run — is testable here.
+// Whether the head points at the right button is the GPU acceptance's.
+
+/// A mock whose backend reports the served artifact's hash, so the server's
+/// own lookup finds a calibrated pointing head — the same path a real load
+/// takes, not a field set by hand.
+fn calibrated_compute() -> Arc<MockCompute> {
+    let served = ignis_core::pointing::calibrated_artifacts()
+        .next()
+        .expect("the calibration table names at least the served artifact");
+    Arc::new(MockCompute::with_blob_identity(ignis_core::BlobIdentity {
+        artifact: served,
+        ..ignis_core::BlobIdentity::UNSET
+    }))
+}
+
+fn point_over_image(width: u32, height: u32, questions: &str) -> String {
+    use support::media::{data_uri, png};
+    format!(
+        r#"{{"state":[{{"type":"image_url","image_url":{{"url":"{}"}}}}],"questions":{{{questions}}}}}"#,
+        data_uri(&png(width, height))
+    )
+}
+
+/// Spec 13 acceptance 2, the default: no `method` on a calibrated load is a
+/// head point, in pixels of the submitted image, with one token cell of
+/// uncertainty and the region's share — after zero decode rounds.
+#[tokio::test]
+async fn a_point_with_no_method_is_read_off_the_pointing_head_in_one_pass() {
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 360;
+    let compute = calibrated_compute();
+    let server = seeing_server(compute.clone());
+    assert_eq!(
+        server.pointing_head,
+        Some(ignis_core::pointing::PointingHead {
+            gqa_ordinal: 9,
+            query_head: 10
+        }),
+        "the server found the head by the artifact's hash"
+    );
+    let body = point_over_image(
+        WIDTH,
+        HEIGHT,
+        r#""where":{"type":"point","instructions":"click the blue button"}"#,
+    );
+    let (status, response) = decide(&server.app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["where"];
+    assert_eq!(answer["type"], "point", "{response}");
+    assert_eq!(answer["method"], "head", "{response}");
+    assert!(answer.get("digits").is_none(), "a head point has no digit trace: {answer}");
+
+    // Where the mock's peak is, on the image's own grid.
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let last = jobs.last().expect("the question was prefilled");
+    let query = last.attention.expect("its last chunk asked for the attention readout");
+    let item = &last.multimodal.as_ref().expect("an image prompt").media[0];
+    assert_eq!(
+        (query.key_begin as usize, query.key_count as usize),
+        (item.token_span.begin, item.token_span.count),
+        "the readout names the image's placeholder span"
+    );
+    assert_eq!((query.head.gqa_ordinal, query.head.query_head), (9, 10));
+    let (rows, cols) = ((item.grid.h / 2) as usize, (item.grid.w / 2) as usize);
+    assert!(rows != cols, "a non-square grid, so a swapped axis cannot pass: {rows}x{cols}");
+    let peak = MockCompute::attention_peak(query.key_count);
+    let (row, col) = (peak / cols, peak % cols);
+    let x = (col as f64 + 0.5) * f64::from(WIDTH) / cols as f64;
+    let y = (row as f64 + 0.5) * f64::from(HEIGHT) / rows as f64;
+    assert_eq!(answer["pixels"]["x"].as_i64(), Some(x.round() as i64), "{answer}");
+    assert_eq!(answer["pixels"]["y"].as_i64(), Some(y.round() as i64), "{answer}");
+    let normalized = |fraction: f64| (fraction * 999.0).round() as u64;
+    assert_eq!(
+        answer["normalized"]["x"].as_u64(),
+        Some(normalized((col as f64 + 0.5) / cols as f64)),
+        "{answer}"
+    );
+    assert_eq!(
+        answer["normalized"]["y"].as_u64(),
+        Some(normalized((row as f64 + 0.5) / rows as f64)),
+        "{answer}"
+    );
+    let cell = |side: u32, n: usize| f64::from(side) / n as f64;
+    let uncertainty = |axis: &str| answer["uncertainty"][axis].as_f64().expect("an uncertainty");
+    assert!((uncertainty("x") - cell(WIDTH, cols)).abs() < 1e-9, "{answer}");
+    assert!((uncertainty("y") - cell(HEIGHT, rows)).abs() < 1e-9, "{answer}");
+    assert_eq!(answer["region"]["cells"], 1, "{answer}");
+    let gap = f64::from(MockCompute::ATTENTION_PEAK_SCORE - MockCompute::ATTENTION_BACKGROUND_SCORE);
+    let share = 1.0 / (1.0 + (query.key_count as f64 - 1.0) * (-gap).exp());
+    let reported = answer["region"]["share"].as_f64().expect("a share");
+    assert!((reported - share).abs() < 1e-9, "{answer}");
+
+    // One pass: nothing decoded, nothing billed, and the prompt still ends
+    // in the chain's forced opening, where the head was measured.
+    assert!(compute.decode_calls().is_empty(), "zero decode rounds ran");
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+    let prompt: Vec<u32> = jobs.iter().flat_map(|job| job.tokens.iter().copied()).collect();
+    let opening: Vec<u32> = "{\"x\":".chars().map(|c| c as u32).collect();
+    assert!(prompt.ends_with(&opening), "the query sits after the forced opening");
+}
+
+/// The chain on request: today's answer, now saying which method made it.
+#[tokio::test]
+async fn a_point_asking_for_the_chain_is_answered_digit_by_digit() {
+    let compute = calibrated_compute();
+    let body = point_over_image(
+        640,
+        360,
+        r#""where":{"type":"point","instructions":"click the blue button","method":"chain"}"#,
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answer = &response["answers"]["where"];
+    assert_eq!(answer["method"], "chain", "{response}");
+    assert_eq!(answer["digits"]["x"].as_array().map(Vec::len), Some(3), "{answer}");
+    assert!(answer.get("region").is_none(), "{answer}");
+    assert!(!compute.decode_calls().is_empty(), "the chain decodes its digits");
+    assert!(
+        compute.prefill_calls().iter().flatten().all(|job| job.attention.is_none()),
+        "and reads no attention"
+    );
+    assert_eq!(response["usage"]["output_tokens"], 11);
+}
+
+/// Head and chain are one prompt byte for byte, so a mixed request's
+/// questions share their prefix and the head is read where it was measured.
+#[tokio::test]
+async fn a_head_point_and_a_chain_point_put_the_same_prompt() {
+    let compute = calibrated_compute();
+    let body = point_over_image(
+        640,
+        360,
+        r#""head":{"type":"point","instructions":"the blue button"},
+           "chain":{"type":"point","instructions":"the blue button","method":"chain"}"#,
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["head"]["method"], "head");
+    assert_eq!(response["answers"]["chain"]["method"], "chain");
+    let jobs: Vec<_> = compute.prefill_calls().into_iter().flatten().collect();
+    let requests: std::collections::BTreeSet<u64> = jobs.iter().map(|job| job.request).collect();
+    assert_eq!(requests.len(), 2, "two questions, two requests");
+    // Whatever the second claimed of the first, each request's prompt is the
+    // tokens before its first chunk plus those it prefilled: compare the
+    // lengths, and the tails both prefilled themselves.
+    let mine = |request: u64| jobs.iter().filter(move |job| job.request == request);
+    let prompt_len = |request: u64| {
+        mine(request).next().map_or(0, |job| job.start_position as usize)
+            + mine(request).map(|job| job.tokens.len()).sum::<usize>()
+    };
+    let tail = |request: u64| {
+        let tokens: Vec<u32> = mine(request).flat_map(|job| job.tokens.iter().copied()).collect();
+        tokens[tokens.len().saturating_sub(16)..].to_vec()
+    };
+    let (first, second) = (*requests.first().unwrap(), *requests.last().unwrap());
+    assert_eq!(prompt_len(first), prompt_len(second), "the same number of prompt tokens");
+    assert_eq!(tail(first), tail(second), "and the same tokens where both prefilled them");
+    let positions = |request: u64| {
+        mine(request).find_map(|job| job.multimodal.clone()).expect("an image prompt").positions.clone()
+    };
+    assert_eq!(positions(first), positions(second), "and the same MRoPE positions throughout");
+}
+
+/// Spec 13: an artifact with no calibrated head answers `point` by chain,
+/// and refuses an explicit `head` before any prefill.
+#[tokio::test]
+async fn a_load_without_a_calibrated_head_points_by_chain_and_refuses_head() {
+    let compute = Arc::new(MockCompute::new());
+    let server = seeing_server(compute.clone());
+    assert_eq!(server.pointing_head, None, "an unknown artifact has no head");
+    let app = server.app();
+
+    let body = point_over_image(640, 360, r#""where":{"type":"point","instructions":"the button"}"#);
+    let (status, response) = decide(&app, &body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["where"]["method"], "chain", "{response}");
+
+    let before = compute.prefill_calls().len();
+    let body = point_over_image(
+        640,
+        360,
+        r#""where":{"type":"point","instructions":"the button","method":"head"}"#,
+    );
+    let (status, response) = decide(&app, &body).await;
+    assert_eq!(status, 422, "{response}");
+    assert_eq!(response["error"]["code"], "pointing_head_unavailable", "{response}");
+    assert_eq!(compute.prefill_calls().len(), before, "refused before any prefill");
+}
+
+#[tokio::test]
+async fn a_method_on_a_box_or_a_readout_and_an_unknown_method_are_refused() {
+    let compute = calibrated_compute();
+    let app = seeing_server(compute.clone()).app();
+    for (question, code) in [
+        (r#""f":{"type":"box","instructions":"the button","method":"head"}"#, "method_unsupported"),
+        (r#""f":{"type":"box","instructions":"the button","method":"chain"}"#, "method_unsupported"),
+        (
+            r#""f":{"type":"noul","instructions":"is there a button?","method":"head"}"#,
+            "method_unsupported",
+        ),
+        (r#""f":{"type":"point","instructions":"the button","method":"Head"}"#, "method_unknown"),
+        (r#""f":{"type":"point","instructions":"the button","method":"attention"}"#, "method_unknown"),
+    ] {
+        let (status, response) = decide(&app, &point_over_image(64, 64, question)).await;
+        assert_eq!(status, 422, "{question}: {response}");
+        assert_eq!(response["error"]["code"], code, "{question}: {response}");
+        if code == "method_unknown" {
+            let message = response["error"]["message"].as_str().expect("a message");
+            assert!(
+                message.contains("\"head\"") && message.contains("\"chain\""),
+                "the refusal names the accepted values: {message}"
+            );
+        }
+    }
+    assert!(compute.prefill_calls().is_empty(), "nothing reached the engine");
+}
+
+/// No image: the same per-answer failure the chain gives, whichever method
+/// runs — and a head point spends nothing finding that out.
+#[tokio::test]
+async fn a_head_point_over_a_text_state_is_the_chains_error_and_costs_nothing() {
+    let compute = calibrated_compute();
+    let body = r#"{"state":"a paragraph of text",
+        "questions":{"where":{"type":"point","instructions":"the button"}}}"#;
+    let (status, response) = decide(&app(compute.clone()), body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["where"]["type"], "error", "{response}");
+    assert_eq!(response["answers"]["where"]["code"], "state_carries_no_image");
+    assert!(compute.prefill_calls().is_empty(), "no span to read, so nothing was submitted");
+    assert_eq!(response["usage"]["output_tokens"], 0);
+}
+
+/// A head point whose keys the leaf could not read fails as its own
+/// question, and says why — never a point read off something else.
+#[tokio::test]
+async fn a_head_point_the_leaf_could_not_read_is_a_failed_question() {
+    let compute = calibrated_compute();
+    compute.refuse_attention(0);
+    let body = point_over_image(640, 360, r#""where":{"type":"point","instructions":"the button"}"#);
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    assert_eq!(response["answers"]["where"]["type"], "error", "{response}");
+    assert_eq!(response["answers"]["where"]["code"], "attention_unread", "{response}");
+}
+
+/// A fan-out mixing head points and readouts over one image answers every
+/// question, each by its own kind.
+#[tokio::test]
+async fn a_fan_out_mixing_head_points_and_readouts_over_one_image_answers_all() {
+    let compute = calibrated_compute();
+    let body = point_over_image(
+        640,
+        360,
+        r#""blue":{"type":"point","instructions":"the blue button"},
+           "red":{"type":"point","instructions":"the red button"},
+           "any":{"type":"noul","instructions":"is there a button?"},
+           "which":{"type":"choice","instructions":"which colour dominates?",
+                    "criteria":{"blue":"mostly blue","red":"mostly red"}},
+           "exact":{"type":"point","instructions":"the blue button","method":"chain"}"#,
+    );
+    let (status, response) = decide(&seeing_server(compute.clone()).app(), &body).await;
+    assert_eq!(status, 200, "{response}");
+    let answers = &response["answers"];
+    assert_eq!(answers["blue"]["method"], "head", "{response}");
+    assert_eq!(answers["red"]["method"], "head", "{response}");
+    assert_eq!(answers["exact"]["method"], "chain", "{response}");
+    assert_eq!(answers["any"]["type"], "noul", "{response}");
+    assert_eq!(answers["which"]["type"], "choice", "{response}");
+    assert_eq!(
+        response["usage"]["output_tokens"], 11,
+        "only the chain point generated: {response}"
+    );
+}

@@ -18,7 +18,9 @@ use ignis_core::types::{
     ComputeError, DecodeParams, RequestClass, RequestId, RequestInput, RequestState, SchedEvent,
     SubmitError, TokenId,
 };
-use ignis_core::{ConcreteScheduler, FinishReason, MockCompute, Scheduler, SchedulerConfig};
+use ignis_core::{
+    ConcreteScheduler, DecisionRead, FinishReason, MockCompute, Scheduler, SchedulerConfig,
+};
 
 const MODEL: &str = "qwen3.8-27b";
 /// The answer tokens of a three-option decision.
@@ -47,7 +49,7 @@ fn decision(prompt: Vec<TokenId>, max_tokens: Option<u32>) -> RequestInput {
         opener_tokens: Some(opener),
         user_turn_tokens: None,
         system_block_tokens: None,
-        decision: Some(Arc::from(ANSWERS.to_vec())),
+        decision: Some(DecisionRead::Answers(Arc::from(ANSWERS.to_vec()))),
         constrained: None,
     }
 }

@@ -156,6 +156,33 @@ fn the_decision_endpoint_carries_its_question_kinds() {
     assert!(document["components"]["schemas"]["DecideResponse"].is_object());
 }
 
+/// GitHub #260 (ADR 0036): a `point`'s `method` and the head answer's
+/// fields are part of the contract, readable without the source.
+#[test]
+fn the_decision_endpoint_documents_how_a_point_is_answered() {
+    let document = document();
+    let schemas = &document["components"]["schemas"];
+    let method = schemas["PointMethod"].to_string();
+    for value in ["head", "chain"] {
+        assert!(method.contains(value), "PointMethod must name {value}: {method}");
+    }
+    assert!(
+        schemas["Question"]["properties"]["method"].is_object(),
+        "a question documents its `method`: {}",
+        schemas["Question"]
+    );
+    let answer = schemas["Answer"].to_string();
+    for field in ["method", "region", "HeadRegion"] {
+        assert!(answer.contains(field), "the point answer documents `{field}`: {answer}");
+    }
+    let region = schemas["HeadRegion"].to_string();
+    for field in ["cells", "share"] {
+        assert!(region.contains(field), "HeadRegion documents `{field}`: {region}");
+    }
+    let description = document["paths"]["/v1/decide"]["post"]["description"].to_string();
+    assert!(description.contains("one pass") && description.contains("chain"), "{description}");
+}
+
 // ── the routes ───────────────────────────────────────────────────────────
 
 #[tokio::test]

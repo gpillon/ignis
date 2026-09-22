@@ -51,6 +51,7 @@ pub mod kv_format;
 pub mod mock;
 #[cfg(feature = "cuda")]
 pub mod model_load;
+pub mod pointing;
 pub mod prefix;
 pub mod constrained;
 pub mod request;
@@ -109,7 +110,7 @@ pub use vision::{
 };
 pub use vram::{VramLines, VramMode, VramPlan, VramPlanError, VramRequest, plan_vram};
 pub use types::{
-    BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
+    BackfillClass, ComputeError, DecisionRead, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SpecCounters, SubmitError,
     TokenId,
 };

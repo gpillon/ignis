@@ -142,7 +142,8 @@ use crate::scheduler::{
     RetainedAt, Scheduler, SharedPrefixClaim,
 };
 use crate::types::{
-    BackfillClass, ComputeError, DecodeParams, EngineMode, FinishReason, LaneId, N_DECODE_LANES,
+    BackfillClass, ComputeError, DecisionRead, DecodeParams, EngineMode, FinishReason, LaneId,
+    N_DECODE_LANES,
     RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
 };
 
@@ -261,12 +262,28 @@ fn media_keys(input: &RequestInput) -> Vec<MediaKey> {
 /// The prompt tokens `r`'s next prefill chunk carries: its remaining span up
 /// to `serving_chunk` tokens, cut where a second media item would begin
 /// (GitHub #178: one media item per chunk).
+///
+/// And cut short, when it would leave a last chunk narrower than the
+/// request's [`RequestInput::prefill_tail`], so that the last chunk keeps
+/// that many (GitHub #260): an attention readout is read where the layer's
+/// prompt route materialized its keys, and a chunk of eight tokens or fewer
+/// takes a route that materializes none. A tail that cannot be kept — a
+/// remainder already narrower than it — is left as it is, and the leaf fails
+/// that question loudly.
 fn chunk_take(r: &Request, serving_chunk: u32) -> u32 {
     let start = r.prefill_progress;
-    let take = (r.input.tokens.len() as u32 - start).min(serving_chunk);
-    match &r.input.multimodal {
+    let remaining = r.input.tokens.len() as u32 - start;
+    let take = remaining.min(serving_chunk);
+    let take = match &r.input.multimodal {
         Some(multimodal) => multimodal.cap_chunk(start, take),
         None => take,
+    };
+    let tail = r.input.prefill_tail() as u32;
+    let left = remaining - take;
+    if left > 0 && left < tail && remaining > tail {
+        remaining - tail
+    } else {
+        take
     }
 }
 
@@ -1757,6 +1774,8 @@ impl ConcreteScheduler {
         // reaped, and an answer left behind on it would be a second copy of
         // the only thing this event exists to carry.
         let readout = self.requests[idx].readout.take();
+        // GitHub #260: an attention readout's scores, moved out likewise.
+        let attention = self.requests[idx].attention.take();
         // GitHub #242: a run's answer, moved out for the same reason —
         // and `None` rather than an empty vector for a request that never
         // had one, so a reader can tell "this was not a constrained decode" from "this
@@ -1772,6 +1791,7 @@ impl ConcreteScheduler {
             reason,
             spec,
             readout,
+            attention,
             drawn,
         });
     }
@@ -3010,7 +3030,9 @@ impl Scheduler for ConcreteScheduler {
                     readout: r
                         .input
                         .decision
-                        .clone()
+                        .as_ref()
+                        .and_then(DecisionRead::answers)
+                        .cloned()
                         .filter(|_| start + take >= r.input.tokens.len() as u32),
                     // GitHub #242: and the run's first step, on the same
                     // chunk and for a related reason — this prefill draws the
@@ -3023,6 +3045,14 @@ impl Scheduler for ConcreteScheduler {
                         .as_ref()
                         .filter(|_| start + take >= r.input.tokens.len() as u32)
                         .and_then(|schedule| schedule.step(0)),
+                    // GitHub #260: the attention readout, on the same chunk
+                    // and for the same reason as the readout — its query is
+                    // the prompt's last position. `prefill_tail` is what
+                    // keeps that chunk wide enough for the leaf to read.
+                    attention: r
+                        .input
+                        .attention()
+                        .filter(|_| start + take >= r.input.tokens.len() as u32),
                 }
             })
             .collect();
@@ -3070,6 +3100,9 @@ impl Scheduler for ConcreteScheduler {
                         // for it to ride.
                         if outcome.readout.is_some() {
                             r.readout = outcome.readout.clone();
+                        }
+                        if outcome.attention.is_some() {
+                            r.attention = outcome.attention.clone();
                         }
                         // P3-01 / ADR 0018: every completed chunk boundary
                         // is a GDN resumable boundary, whether or not it
@@ -3379,7 +3412,18 @@ impl Scheduler for ConcreteScheduler {
             // answer — that is a decision answered by nothing, dressed as a
             // decision answered. It ends with `Error`, which is what a
             // request that could not be served ends with everywhere else.
-            let reason = match self.requests[idx].readout.is_some() {
+            //
+            // GitHub #260: a head point is answered by its attention
+            // readout, and *that* one can be missing without anything being
+            // wrong upstream — a leaf that could not read the keys the
+            // layer's attention read returns none, and the question fails
+            // here rather than being pointed from some other copy of them.
+            let request = &self.requests[idx];
+            let answered = match &request.input.decision {
+                Some(DecisionRead::Attention(_)) => request.attention.is_some(),
+                _ => request.readout.is_some(),
+            };
+            let reason = match answered {
                 true => FinishReason::Stop,
                 false => {
                     // hotpath-lint-allow: failure-only path (a decision that cannot be answered ends here), reviewed exception (GitHub #238).
@@ -3631,6 +3675,11 @@ impl Scheduler for ConcreteScheduler {
             kv_pool_pages: self.capacity.kv_pages,
             kv_ram_used_bytes: self.host.used_bytes(),
         }
+    }
+
+    /// The backend's own answer (GitHub #260): the artifact its leaf opened.
+    fn artifact(&self) -> crate::identity::ArtifactHash {
+        self.compute.blob_identity().artifact
     }
 }
 

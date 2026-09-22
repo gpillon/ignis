@@ -110,21 +110,24 @@ pub struct RequestInput {
     /// published there, rather than a prefix published at a point the
     /// tokenizer disagrees about.
     pub system_block_tokens: Option<u32>,
-    /// The **answer tokens** this request is a **decision** over (GitHub
-    /// #238, ADR 0034), or `None` for every ordinary request.
+    /// What this request is a **decision** over (GitHub #238, ADR 0034): the
+    /// **answer tokens** whose logits it reads, or — a `point` answered in
+    /// one pass (GitHub #260, ADR 0038) — the one attention head it reads
+    /// over an image span. `None` for every ordinary request.
     ///
-    /// Carrying them here is what makes a decision a *kind* of request
+    /// Carrying it here is what makes a decision a *kind* of request
     /// rather than a mode of the engine: the scheduler reads this to decide
     /// that the request ends where its prefill ends. A decision never takes
     /// a decode lane, never enters [`RequestState::Running`], generates
-    /// nothing, and finishes with the **readout** of these tokens' logits
-    /// at its prompt's last position.
+    /// nothing, and finishes with what it read at its prompt's last
+    /// position: the **readout** of the answer tokens' logits, or the
+    /// **attention readout**'s scores.
     ///
     /// It also changes what the request reserves. [`DecodeParams::max_tokens`]
     /// is meaningless here — nothing is generated — so the whole-sequence
     /// reservation is the prompt alone, and a decision is admitted on a
     /// prompt that fits however large a `max_tokens` came with it.
-    pub decision: Option<std::sync::Arc<[TokenId]>>,
+    pub decision: Option<DecisionRead>,
     /// The **constrained decode** this request generates under (GitHub #242, ADR
     /// 0034), or `None` for every request that generates freely.
     ///
@@ -144,11 +147,69 @@ pub struct RequestInput {
     pub constrained: Option<std::sync::Arc<crate::constrained::Schedule>>,
 }
 
+/// What a **decision** reads at its prompt's last position — the two
+/// readout-class things the `Compute` seam carries in (ADR 0034, ADR 0038).
+///
+/// One or the other, never both: a decision is answered by one reading, and
+/// the request kind is the same either way — it ends where its prefill ends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecisionRead {
+    /// The logits of these **answer tokens**: the **readout** (GitHub #237,
+    /// #238).
+    Answers(std::sync::Arc<[TokenId]>),
+    /// One head's attention over one span of the prompt: the **attention
+    /// readout** a `point` is answered from in one pass (GitHub #260).
+    Attention(crate::pointing::AttentionQuery),
+}
+
+impl DecisionRead {
+    /// The answer tokens, for a readout.
+    pub fn answers(&self) -> Option<&std::sync::Arc<[TokenId]>> {
+        match self {
+            Self::Answers(answers) => Some(answers),
+            Self::Attention(_) => None,
+        }
+    }
+
+    /// The attention query, for an attention readout.
+    pub fn attention(&self) -> Option<crate::pointing::AttentionQuery> {
+        match self {
+            Self::Answers(_) => None,
+            Self::Attention(query) => Some(*query),
+        }
+    }
+}
+
 impl RequestInput {
     /// Whether this request is a **decision** (GitHub #238): it reads its
-    /// answer tokens out at the end of prefill and generates nothing.
+    /// answer out at the end of prefill and generates nothing.
     pub fn is_decision(&self) -> bool {
         self.decision.is_some()
+    }
+
+    /// The attention readout this request is a decision over, if it is one
+    /// (GitHub #260).
+    pub fn attention(&self) -> Option<crate::pointing::AttentionQuery> {
+        self.decision.as_ref().and_then(DecisionRead::attention)
+    }
+
+    /// The fewest prompt tokens this request must leave itself to prefill:
+    /// what [`RequestInput::reuse_reach`] and [`RequestInput::publish_reach`]
+    /// hold back, and what the scheduler keeps its last chunk above.
+    ///
+    /// One token for any request that reads or draws at its last position
+    /// (see [`RequestInput::reuse_reach`]); an **attention readout** needs
+    /// more, [`crate::pointing::ATTENTION_MIN_CHUNK_TOKENS`], because the
+    /// leaf reads the keys where the layer's prompt route materialized them
+    /// and a chunk narrower than that takes a route that materializes none.
+    pub fn prefill_tail(&self) -> usize {
+        if self.attention().is_some() {
+            crate::pointing::ATTENTION_MIN_CHUNK_TOKENS as usize
+        } else if self.is_decision() || self.is_constrained() || self.multimodal.is_some() {
+            1
+        } else {
+            0
+        }
     }
 
     /// Whether this request is a **constrained decode** (GitHub #242,
@@ -159,8 +220,9 @@ impl RequestInput {
     }
 
     /// How many leading prompt tokens this request may **match** retained
-    /// state over: all of them, or one short of the prompt for a request
-    /// that must be left something to prefill.
+    /// state over: all of them, or [`RequestInput::prefill_tail`] short of
+    /// the prompt for a request that must be left something to prefill —
+    /// one token, except an attention readout's nine.
     ///
     /// Two kinds of request must, for the same shape of reason. A
     /// **multimodal** claimant learns its own rope delta only from a prefill
@@ -190,15 +252,12 @@ impl RequestInput {
     /// answers the other half of the same picture and does **not** have the
     /// same membership.
     pub fn reuse_reach(&self) -> usize {
-        match self.is_decision() || self.is_constrained() || self.multimodal.is_some() {
-            true => self.tokens.len().saturating_sub(1),
-            false => self.tokens.len(),
-        }
+        self.tokens.len().saturating_sub(self.prefill_tail())
     }
 
     /// How many leading prompt tokens this request may **publish** as a
-    /// shared prefix: all of them, or one short of the prompt for a
-    /// **decision** (GitHub #238).
+    /// shared prefix: all of them, or [`RequestInput::prefill_tail`] short of
+    /// the prompt for a **decision** (GitHub #238) or a constrained decode.
     ///
     /// The same arithmetic as [`RequestInput::reuse_reach`] over a
     /// deliberately different set, which is why they are two functions. A
@@ -214,7 +273,7 @@ impl RequestInput {
     /// prompt.
     pub fn publish_reach(&self) -> usize {
         match self.is_decision() || self.is_constrained() {
-            true => self.tokens.len().saturating_sub(1),
+            true => self.tokens.len().saturating_sub(self.prefill_tail()),
             false => self.tokens.len(),
         }
     }
@@ -536,6 +595,12 @@ pub enum SchedEvent {
         /// field its completion would carry nothing at all — which is why
         /// the readout rides the finish event rather than a second one.
         readout: Option<crate::decision::Readout>,
+        /// The **attention readout** a head-point decision finished with
+        /// (GitHub #260, ADR 0038): one pre-softmax score per key of the span
+        /// it named, in order, and `None` for every other request — and for
+        /// a head point whose leaf could not read the keys, which then
+        /// finishes with [`FinishReason::Error`].
+        attention: Option<std::sync::Arc<[f32]>>,
         /// The **trace** a **constrained decode** finished with (GitHub #242, ADR
         /// 0034), and `None` for every other request: one
         /// [`crate::constrained::Draw`] per emitted token, in order, each with

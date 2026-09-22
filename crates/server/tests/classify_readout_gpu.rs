@@ -194,7 +194,7 @@ fn shipped_messages(row: &Row, alphabet: &AnswerAlphabet) -> Result<Vec<ChatMess
     // No program here (GitHub #242): these are readout rows, and a readout
     // forces no alphabet — an encoder that refuses everything would do.
     let encode = |_: &str| None;
-    let prepared = prepare(&request.questions, alphabet, &encode)
+    let prepared = prepare(&request.questions, alphabet, &encode, None)
         .map_err(|refusal| format!("prepare: {}", refusal.message))?;
     Ok(messages_for(&Evidence::read(&request.state), &prepared[0]))
 }

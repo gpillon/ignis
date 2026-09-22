@@ -167,6 +167,7 @@ fn a_real_load_names_itself_and_refuses_a_blob_from_any_other() {
                 multimodal: None,
                 readout: None,
                 permitted: None,
+                attention: None,
 }])
             .unwrap_or_else(|e| panic!("prefill_step {request}: {e}"));
     }

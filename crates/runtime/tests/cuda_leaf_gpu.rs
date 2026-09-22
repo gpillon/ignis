@@ -85,6 +85,7 @@ fn the_cuda_leaf_prefills_and_decodes_a_real_prompt_through_the_compute_trait() 
             shared_prefix: None,
             publish_prefix: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap_or_else(|e| panic!("prefill_step: {e}"));
 

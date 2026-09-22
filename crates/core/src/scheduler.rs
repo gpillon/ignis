@@ -165,6 +165,22 @@ pub struct PrefillJob {
     /// path it would have taken. The measured claim is only that — no
     /// allocation and no device work — not that the field is free to name.
     pub permitted: Option<crate::constrained::PermittedSet>,
+    /// The **attention readout** this chunk asks for (GitHub #260, ADR 0038),
+    /// if this is a head-point decision's last chunk: one query head of one
+    /// GQA layer, at the chunk's last position, over the keys of one span.
+    ///
+    /// The third thing this seam carries, beside [`PrefillJob::readout`] and
+    /// [`PrefillJob::permitted`], set on the same chunk for the same reason —
+    /// the query sits at the prompt's last position — and shaped like the
+    /// readout: the job names what to read, [`PrefillOutcome::attention`]
+    /// carries back one score per key of the span and nothing else.
+    ///
+    /// Only a multimodal job may carry one (the span is an image's), and the
+    /// chunk carries at least [`crate::pointing::ATTENTION_MIN_CHUNK_TOKENS`]
+    /// tokens, which [`crate::types::RequestInput::prefill_tail`] keeps.
+    /// `None` on every other job, and such a job costs nothing for it: no
+    /// allocation, and no device work the leaf would not have done anyway.
+    pub attention: Option<crate::pointing::AttentionQuery>,
 }
 
 /// One decode job: a single lane step for a running request.
@@ -248,6 +264,17 @@ pub struct PrefillOutcome {
     /// a megabyte per decision, gathered on the backend's side and dropped
     /// there.
     pub readout: Option<Readout>,
+    /// The **attention readout** this job asked for (GitHub #260, ADR 0038):
+    /// one `q · k / sqrt(head_dim)` per key of its
+    /// [`PrefillJob::attention`] span, in order, before any softmax.
+    ///
+    /// `None` when the job asked for none — and when it asked and the leaf
+    /// could not read the keys the layer's attention read (a route that
+    /// materialized none, a span outside the band it materialized). The
+    /// scheduler then ends the request with [`crate::types::FinishReason::Error`]:
+    /// a head point the leaf could not read is a failed question, never a
+    /// point read off some other copy of the keys.
+    pub attention: Option<std::sync::Arc<[f32]>>,
 }
 
 impl PrefillOutcome {
@@ -369,6 +396,16 @@ pub const NO_HOST_ROOM: i32 = -6;
 /// [`FinishReason::Error`], which is the right end for a request that can
 /// never be served. GitHub #238 owes the trim that keeps it from arising.
 pub const READOUT_WITHOUT_TOKENS: i32 = -1001;
+
+/// The code a backend fails a batch with when a job asks for an
+/// **attention readout** without a multimodal span (GitHub #260): the span
+/// it reads is an image's, and the leaf's text path has no way to carry one.
+///
+/// Incoherent in the same way as [`READOUT_WITHOUT_TOKENS`], and numbered
+/// beside it: the server never renders such a job (a head point over a state
+/// with no image is refused before it is submitted), so meeting one is a bug
+/// upstream, failed loudly rather than answered.
+pub const ATTENTION_WITHOUT_IMAGE: i32 = -1002;
 
 /// The compute seam the scheduler drives for actual token generation.
 ///
@@ -620,6 +657,17 @@ pub trait Scheduler: Send {
     /// and carries the answer along the fact channel it already sends after
     /// every step, so nothing downstream ever reaches across a thread for it.
     fn occupancy(&self) -> Occupancy;
+
+    /// The content hash of the artifact this scheduler's backend runs on
+    /// (GitHub #260) — what the server keys the **pointing head** on.
+    ///
+    /// [`crate::identity::ArtifactHash::UNKNOWN`] for a scheduler whose
+    /// backend opened no artifact, which no calibration names: `point` then
+    /// answers with the digit chain, as it does on any load nobody
+    /// calibrated a head for.
+    fn artifact(&self) -> crate::identity::ArtifactHash {
+        crate::identity::ArtifactHash::UNKNOWN
+    }
 }
 
 /// What a scheduler has occupied, at one instant (GitHub #216, ADR 0030).

@@ -129,6 +129,7 @@ fn a_readout_crosses_the_real_compute_seam() {
         multimodal: None,
         readout: readout.map(Arc::from),
         permitted: None,
+        attention: None,
 };
 
     // ── the readout itself ───────────────────────────────────────────────

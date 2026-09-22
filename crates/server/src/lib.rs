@@ -94,6 +94,11 @@ pub struct Server {
     /// way to serving a prompt of 132. Empty on a provider with no real
     /// tokenizer, and `/v1/decide` refuses rather than guessing.
     pub alphabet: std::sync::Arc<ignis_core::decision::AnswerAlphabet>,
+    /// The head `/v1/decide` reads to answer a `point` in one pass (GitHub
+    /// #260), looked up once from the calibration table by the loaded
+    /// artifact's content hash — or `None` on a load nobody calibrated a
+    /// head for, and then `point` answers with the digit chain.
+    pub pointing_head: Option<ignis_core::pointing::PointingHead>,
 }
 
 impl Server {
@@ -101,6 +106,7 @@ impl Server {
     pub fn new(engine: Engine, template: Box<dyn TemplateProvider>) -> Self {
         let template: std::sync::Arc<dyn TemplateProvider> = std::sync::Arc::from(template);
         Self {
+            pointing_head: ignis_core::pointing::calibrated_head(engine.artifact()),
             engine,
             alphabet: std::sync::Arc::new(template.answer_alphabet()),
             template,

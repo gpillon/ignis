@@ -38,7 +38,9 @@ use ignis_core::{
 
 use ignis_core::vision::MediaItem;
 
-use crate::{DecodeLane, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf};
+use crate::{
+    AttentionRead, DecodeLane, LaneRun, MultimodalSpan, ReservedBytes, RuntimeStats, StepLeaf,
+};
 
 /// Sizing knobs for the leaf's sequence-state pool and program scratch.
 #[derive(Debug, Clone, Copy)]
@@ -417,10 +419,23 @@ impl StepLeaf for CudaLeaf {
         permitted: &[TokenId],
         span: MultimodalSpan<'_, Self::Media>,
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let permitted_ids: Vec<i32> = permitted.iter().map(|&t| t as i32).collect();
-        step::prefill_program_multimodal(
+        let (readout, read) = match attention {
+            Some(AttentionRead { query, scores, read }) => (
+                Some(step::AttentionReadout {
+                    gqa_ordinal: query.head.gqa_ordinal,
+                    query_head: query.head.query_head,
+                    key_begin: query.key_begin,
+                    scores: scores.as_mut_slice(),
+                }),
+                Some(read),
+            ),
+            None => (None, None),
+        };
+        let (probability, was_read) = step::prefill_program_multimodal(
             &model.model,
             &model.pool,
             sequence,
@@ -438,8 +453,13 @@ impl StepLeaf for CudaLeaf {
                 }),
             },
             out_logits,
+            readout,
         )
-        .map_err(|e| leaf_error("prefill", e))
+        .map_err(|e| leaf_error("prefill", e))?;
+        if let Some(read) = read {
+            *read = was_read;
+        }
+        Ok(probability)
     }
 
     fn load_model(&self) -> Result<Self::Model, i32> {

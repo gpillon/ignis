@@ -193,6 +193,29 @@ struct ignis_prefill_options {
    * a logits row -- the first digit of a constrained run is drawn here, and
    * its confidence has to come back with it (ADR 0034). */
   float *out_permitted_prob;
+  /* GitHub #260 (ADR 0038): the attention readout, or none when
+   * `attention_gqa_ordinal` is negative (or `out_attention_scores` NULL) --
+   * a call that asks for none allocates nothing and launches nothing new.
+   * Read on the span's last chunk, at its last position: query head
+   * `attention_query_head` of GQA layer `attention_gqa_ordinal`, after its
+   * norm and rotary embedding, dotted with the keys at absolute positions
+   * [attention_key_begin, attention_key_begin + attention_key_count) exactly
+   * as that layer's attention read them -- the cache's pages under BF16, the
+   * prompt route's materialized planes under hq-e8-2b -- and scaled by
+   * 1/sqrt(head_dim): one pre-softmax score per key into
+   * `out_attention_scores` (host, `attention_key_count` floats). No full
+   * attention row and no logits row crosses. `*out_attention_read` is set to
+   * 1 when every score was written from those keys and to 0 when the keys
+   * were not there to read (a small-T route, which materializes none; a span
+   * outside the one band the hq prompt route materializes; a span past the
+   * history) -- the prefill itself still succeeds, and the caller fails the
+   * question rather than answering from any other copy of the keys. */
+  int32_t attention_gqa_ordinal;
+  int32_t attention_query_head;
+  int64_t attention_key_begin;
+  int64_t attention_key_count;
+  float *out_attention_scores;
+  int32_t *out_attention_read;
 };
 
 /* The media encode step (GitHub #178): one media item's BF16 patch rows plus

@@ -84,7 +84,7 @@ fn a_decisions_prompt_ends_where_its_answer_is_read() {
         serde_json::from_str(BODY).expect("the request parses");
     let encode = |text: &str| provider.encode_literal(text);
     let prepared =
-        prepare(&request.questions, &alphabet, &encode).expect("a valid decision");
+        prepare(&request.questions, &alphabet, &encode, None).expect("a valid decision");
 
     let messages = messages_for(&Evidence::read(&request.state), &prepared[0]);
     // Exactly what the endpoint asks for.

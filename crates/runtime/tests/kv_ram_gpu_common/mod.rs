@@ -553,6 +553,7 @@ pub fn a_turn_from_a_retained_slot_generates_what_a_split_cold_prefill_generates
         multimodal: None,
         readout: None,
         permitted: None,
+        attention: None,
 };
 
     // Turn N: publish the block and the chained link, capture at the opener,

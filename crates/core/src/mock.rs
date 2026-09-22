@@ -72,6 +72,9 @@ struct Inner {
     /// decline (`refuse_capture`) — a leaf with no room in its own image
     /// pool, or a sequence it will not capture.
     capture_refusals: std::collections::HashSet<RequestId>,
+    /// Requests whose next attention readout the leaf "could not read"
+    /// (GitHub #260): the chunk lands and the outcome carries no scores.
+    attention_refusals: std::collections::HashSet<RequestId>,
     /// The leaf's KV-RAM arena, modelled (GitHub #213), or `None` for a
     /// backend whose blobs are ordinary allocations — today's default, and
     /// what every scenario that is not about placement wants.
@@ -323,6 +326,30 @@ impl MockCompute {
         self.inner.lock().unwrap().capture_refusals.insert(request);
     }
 
+    /// Make the backend fail to read `request`'s next attention readout
+    /// (GitHub #260): the chunk lands normally and carries no scores, which
+    /// is how a real leaf reports keys the layer's attention never
+    /// materialized for it to read.
+    pub fn refuse_attention(&self, request: RequestId) {
+        self.inner.lock().unwrap().attention_refusals.insert(request);
+    }
+
+    /// Where the mock's attention map peaks, among `count` keys: the key a
+    /// third of the way into the span. Public so a test can say where the
+    /// point must land without restating the mock — and a third, rather than
+    /// the middle, so a non-square grid tells a row from a column.
+    pub fn attention_peak(count: u32) -> usize {
+        (count / 3) as usize
+    }
+
+    /// The pre-softmax score the mock gives the peak key, and every other
+    /// key's: eight nats apart, so the map is as peaked as a real pointing
+    /// head's (the region is one cell) without being a delta — its share is
+    /// just under one, not one.
+    pub const ATTENTION_PEAK_SCORE: f32 = 6.0;
+    /// See [`MockCompute::ATTENTION_PEAK_SCORE`].
+    pub const ATTENTION_BACKGROUND_SCORE: f32 = -2.0;
+
     /// Force `request` to stop after `n` generated tokens, regardless of
     /// its learned `max_tokens` (for driving streams of requests submitted
     /// without a token cap).
@@ -389,6 +416,13 @@ impl Compute for MockCompute {
                     .readout
                     .as_deref()
                     .map(|answers| Self::readout(self.seed, job.request, answers)),
+                // GitHub #260 / ADR 0038: the seam's third answer, which a
+                // mock must produce for the same reason — deterministic, one
+                // score per key of the span, peaked at a documented key.
+                attention: job
+                    .attention
+                    .filter(|_| !g.attention_refusals.remove(&job.request))
+                    .map(|query| Self::attention(query.key_count)),
             })
             .collect())
     }
@@ -637,6 +671,18 @@ impl MockCompute {
         }
     }
 
+    /// The deterministic attention readout (GitHub #260): one score per key,
+    /// the peak at [`MockCompute::attention_peak`].
+    fn attention(count: u32) -> std::sync::Arc<[f32]> {
+        let peak = Self::attention_peak(count);
+        (0..count as usize)
+            .map(|key| match key == peak {
+                true => Self::ATTENTION_PEAK_SCORE,
+                false => Self::ATTENTION_BACKGROUND_SCORE,
+            })
+            .collect()
+    }
+
     /// The mock's **constrained** draw (GitHub #242): a member of
     /// `permitted`, picked deterministically, with a probability inside it.
     ///
@@ -749,6 +795,10 @@ impl GatedCompute {
 impl Compute for GatedCompute {
     fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
         self.inner.prefill_step(jobs)
+    }
+
+    fn blob_identity(&self) -> crate::identity::BlobIdentity {
+        self.inner.blob_identity()
     }
 
     fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {

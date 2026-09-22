@@ -246,6 +246,37 @@ pub struct SpanMedia<'a, M> {
     pub scatter_indices: &'a [i32],
 }
 
+/// One **attention readout** a multimodal prefill span is asked for (GitHub
+/// #260, ADR 0038): what to read in, the scores out, and whether the leaf
+/// could read them.
+///
+/// Allocated by [`RuntimeCompute`] only for a job that asked, with one score
+/// slot per key of the query's span; every other span passes `None` and pays
+/// nothing for it. The leaf sets `read` only when it wrote every score from
+/// the keys the layer's attention itself read — a leaf that met a route or a
+/// band it cannot read leaves it `false`, the prefill still succeeds, and the
+/// question is failed above it rather than answered from anything else.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionRead {
+    /// What to read: the layer, the query head, the span of keys.
+    pub query: ignis_core::pointing::AttentionQuery,
+    /// One pre-softmax score per key of the span, in order.
+    pub scores: Vec<f32>,
+    /// Whether the leaf wrote `scores` from the keys attention read.
+    pub read: bool,
+}
+
+impl AttentionRead {
+    /// An unread readout for `query`, its scores zeroed.
+    pub fn new(query: ignis_core::pointing::AttentionQuery) -> Self {
+        Self {
+            query,
+            scores: vec![0.0; query.key_count as usize],
+            read: false,
+        }
+    }
+}
+
 /// The replaceable step-ABI leaf seam.
 ///
 /// The FFI implementation will map these calls to ADR 0009. Its opaque
@@ -449,6 +480,12 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// reason the text path has it: the evidence a decision is put to may
     /// be an image, and a readout wired only to the text path would return
     /// nothing at all for one rather than failing (GitHub #237).
+    ///
+    /// `attention` is the **attention readout** (GitHub #260), on this path
+    /// only: the span it reads is an image's, so the text path has nothing
+    /// to carry. Read at the span's last position; see [`AttentionRead`]
+    /// for what the leaf owes it.
+    #[allow(clippy::too_many_arguments)]
     fn prefill_multimodal(
         &self,
         _model: &Self::Model,
@@ -459,6 +496,7 @@ pub trait StepLeaf: Send + Sync + 'static {
         _permitted: &[TokenId],
         _span: MultimodalSpan<'_, Self::Media>,
         _out_logits: Option<&mut [f32]>,
+        _attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
         Err(-1)
     }
@@ -851,6 +889,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
         job: &PrefillJob,
         multimodal: &Multimodal,
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<(u64, f32), i32> {
         let (start, len) = (job.start_position, job.tokens.len() as u32);
         let chunk = multimodal.chunk_media(start, len);
@@ -898,6 +937,7 @@ impl<L: StepLeaf> RuntimeCompute<L> {
                 media: span_media,
             },
             out_logits,
+            attention,
         )?;
         if chunk.is_some_and(|chunk| chunk.completes_item) {
             media.release(job.request);
@@ -1117,6 +1157,19 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                     .readout
                     .as_ref()
                     .map(|_| vec![0f32; self.model.leaf.vocab(self.model.handle()) as usize]);
+                // GitHub #260: the attention readout's score slots, likewise
+                // only for a job that asked — one f32 per key of its span.
+                let mut attention = job.attention.map(AttentionRead::new);
+                if attention.is_some() && job.multimodal.is_none() {
+                    // hotpath-lint-allow: failure-only path (the batch returns `Err` on the next line), reviewed exception (GitHub #260).
+                    tracing::error!(
+                        name: "ignis.runtime.attention_without_image",
+                        request_id = job.request,
+                        start_position = job.start_position,
+                        "an attention readout job carries no multimodal span to read"
+                    );
+                    unwind!(RuntimeError::Leaf(ignis_core::scheduler::ATTENTION_WITHOUT_IMAGE).into());
+                }
                 let warmed = match &job.multimodal {
                     None => self
                         .model
@@ -1141,6 +1194,7 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                         job,
                         multimodal,
                         logits.as_deref_mut(),
+                        attention.as_mut(),
                     ),
                 };
                 match warmed {
@@ -1158,7 +1212,25 @@ impl<L: StepLeaf> Compute for RuntimeCompute<L> {
                 if let (Some(answers), Some(logits)) = (&job.readout, &logits) {
                     outcomes[index].readout = Some(Readout::gather(logits, answers));
                 }
-            } else if job.readout.is_some() {
+                // Only what the leaf says it read crosses the seam. An
+                // unread readout leaves the outcome's `None`, the chunk
+                // itself stands, and the scheduler fails the question.
+                if let Some(read) = attention {
+                    match read.read {
+                        true => outcomes[index].attention = Some(read.scores.into()),
+                        false => {
+                            // hotpath-lint-allow: failure-only path (a head point the leaf could not read), reviewed exception (GitHub #260).
+                            tracing::error!(
+                                name: "ignis.runtime.attention_unread",
+                                request_id = job.request,
+                                start_position = job.start_position,
+                                chunk_tokens = job.tokens.len(),
+                                "the leaf could not read the keys this attention readout names"
+                            );
+                        }
+                    }
+                }
+            } else if job.readout.is_some() || job.attention.is_some() {
                 // A chunk with nothing to prefill runs no forward pass, so
                 // there are no logits at this position to read — an exact
                 // repeat of a decision, whose reuse claim covered its whole

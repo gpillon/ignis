@@ -52,6 +52,7 @@ fn prefill_job(program: &Schedule) -> PrefillJob {
         multimodal: None,
         readout: None,
         permitted: program.step(0),
+        attention: None,
     }
 }
 

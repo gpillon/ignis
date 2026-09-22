@@ -110,6 +110,19 @@ pub(crate) mod ffi {
         /// drawn here — a decode round returns the successor the previous
         /// call made ready — so this is where its confidence comes back.
         pub out_permitted_prob: *mut f32,
+        /// GitHub #260 (ADR 0038): the attention readout — none when the
+        /// ordinal is negative. One query head of one GQA layer at the
+        /// span's last position, over the keys of
+        /// `[attention_key_begin, + attention_key_count)` as that layer's
+        /// attention read them; one pre-softmax score per key into
+        /// `out_attention_scores`, and `*out_attention_read` 1 when the leaf
+        /// could read them, 0 when it could not.
+        pub attention_gqa_ordinal: i32,
+        pub attention_query_head: i32,
+        pub attention_key_begin: i64,
+        pub attention_key_count: i64,
+        pub out_attention_scores: *mut f32,
+        pub out_attention_read: *mut i32,
     }
 
     /// Opaque `struct ignis_media_embedding` (GitHub #178).
@@ -550,6 +563,12 @@ impl PrefillRoute {
             media_scatter_indices: std::ptr::null(),
             media_first_column: 0,
             out_permitted_prob: std::ptr::null_mut(),
+            attention_gqa_ordinal: -1,
+            attention_query_head: 0,
+            attention_key_begin: 0,
+            attention_key_count: 0,
+            out_attention_scores: std::ptr::null_mut(),
+            out_attention_read: std::ptr::null_mut(),
         }
     }
 }
@@ -1207,6 +1226,19 @@ pub struct MultimodalPrefill<'a> {
     pub media: Option<SpanMediaColumns<'a>>,
 }
 
+/// One **attention readout** a multimodal span asks for (GitHub #260, ADR
+/// 0038): what to read, and where the scores go.
+pub struct AttentionReadout<'a> {
+    /// The GQA layer, counted among GQA layers only.
+    pub gqa_ordinal: u32,
+    /// The query head within that layer.
+    pub query_head: u32,
+    /// The absolute prompt position of the first key read.
+    pub key_begin: u32,
+    /// One score slot per key read.
+    pub scores: &'a mut [f32],
+}
+
 /// A media item's columns placed over a span's placeholder rows.
 #[derive(Clone, Copy)]
 pub struct SpanMediaColumns<'a> {
@@ -1227,6 +1259,12 @@ pub struct SpanMediaColumns<'a> {
 /// is a screenshot and a question, and a constrained run wired only to the
 /// text path could not answer one. Empty for an ordinary prefill, and the
 /// returned probability is then 0.
+///
+/// `attention` is the **attention readout** (GitHub #260), read at the span's
+/// last position; `None` asks for none and costs nothing. The returned flag
+/// is whether the leaf could read the keys it names — `false` (and `false`
+/// for no readout) leaves the scores unwritten and the prefill standing.
+#[allow(clippy::too_many_arguments)]
 pub fn prefill_program_multimodal(
     model: &Model,
     pool: &SeqPool,
@@ -1237,7 +1275,8 @@ pub fn prefill_program_multimodal(
     permitted: &[i32],
     span: MultimodalPrefill<'_>,
     out_logits: Option<&mut [f32]>,
-) -> Result<f32, String> {
+    attention: Option<AttentionReadout<'_>>,
+) -> Result<(f32, bool), String> {
     let params = permitted_params("prefill_program_multimodal", sampling, permitted)?;
     if span.positions.len() != 3 * token_ids.len() {
         return Err(format!(
@@ -1256,7 +1295,8 @@ pub fn prefill_program_multimodal(
         None => (std::ptr::null(), std::ptr::null(), 0, 0),
     };
     let mut probability = 0f32;
-    let options = ffi::IgnisPrefillOptions {
+    let mut read = 0i32;
+    let mut options = ffi::IgnisPrefillOptions {
         mrope_positions: span.positions.as_ptr(),
         rope_delta: span.rope_delta,
         media_column_count: count,
@@ -1266,6 +1306,14 @@ pub fn prefill_program_multimodal(
         out_permitted_prob: &mut probability,
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
+    if let Some(readout) = attention {
+        options.attention_gqa_ordinal = readout.gqa_ordinal as i32;
+        options.attention_query_head = readout.query_head as i32;
+        options.attention_key_begin = i64::from(readout.key_begin);
+        options.attention_key_count = readout.scores.len() as i64;
+        options.out_attention_scores = readout.scores.as_mut_ptr();
+        options.out_attention_read = &mut read;
+    }
     let logits_ptr = match out_logits {
         Some(buf) => buf.as_mut_ptr(),
         None => std::ptr::null_mut(),
@@ -1286,7 +1334,7 @@ pub fn prefill_program_multimodal(
     if rc != 0 {
         return Err(last_error());
     }
-    Ok(probability)
+    Ok((probability, read == 1))
 }
 
 /// Read full-program telemetry without exposing a device pointer or stream.

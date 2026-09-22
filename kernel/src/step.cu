@@ -10,9 +10,11 @@
 
 #include "ignis_step.h"
 
+#include "attention_readout.h"
 #include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
+#include "ignis_gqa_workspace.h"
 #include "ignis_hq_ring.h"
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
@@ -745,6 +747,17 @@ struct SpanMultimodal {
   uint32_t first_column = 0;
 };
 
+// GitHub #260 (ADR 0038): an attention readout armed by the entry point for
+// the span's last chunk, read off its options.
+struct ArmedAttentionReadout {
+  int32_t gqa_ordinal = -1;
+  int32_t query_head = 0;
+  int64_t key_begin = 0;
+  int64_t key_count = 0;
+  float *host_scores = nullptr; // [key_count]
+  int32_t *host_read = nullptr; // 1 read, 0 not
+};
+
 bool validate_span_multimodal(const ignis_model *model, int32_t route, const SpanMultimodal &span) {
   const auto refuse = [](const std::string &why) {
     set_error("ignis_program_prefill: " + why);
@@ -809,7 +822,8 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
                           uint64_t dflash2_tap_from, bool compute_output,
                           const ignis_sampling_params &sampling, int32_t *out_token_id,
                           float *out_logits, LinearPolicyMode mode,
-                          const SpanMultimodal &multimodal, float *permitted_prob_out) {
+                          const SpanMultimodal &multimodal, float *permitted_prob_out,
+                          const ArmedAttentionReadout *attention_readout) {
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   const auto T = static_cast<std::int32_t>(num_tokens);
@@ -935,12 +949,34 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
 
+    // GitHub #260: the attention readout's scores, at this chunk's scope so
+    // they outlive the layer that writes them and reach the copy below. Only
+    // for the chunk that asks -- no allocation and no launch otherwise, and
+    // the reservation for it is the prefill plan's (`plan_load_sizes`).
+    AttentionReadoutTarget readout_target;
+    bool readout_read = false;
+    ninfer::Tensor readout_scores;
+    if (attention_readout != nullptr) {
+      readout_scores = model->scratch->alloc(
+          ninfer::DType::FP32, {static_cast<std::int32_t>(attention_readout->key_count), 1, 1, 1});
+      readout_target.query_head = attention_readout->query_head;
+      readout_target.key_begin = attention_readout->key_begin;
+      readout_target.key_count = attention_readout->key_count;
+      readout_target.device_scores = static_cast<float *>(readout_scores.data);
+      readout_target.read = &readout_read;
+    }
+
     uint64_t dispatches = 0;
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       profiler.record_layer_begin(layer, model->stream);
+      const bool reads_attention =
+          attention_readout != nullptr && model->layers[layer].kind == IGNIS_LAYER_GQA &&
+          static_cast<std::int32_t>(ignis_gqa_relative_layer(layer)) ==
+              attention_readout->gqa_ordinal;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
           ? ignis_gqa_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
-                                     mode, rope_positions)
+                                     mode, rope_positions,
+                                     reads_attention ? &readout_target : nullptr)
           : ignis_gdn_layer_run_body(model, pool, seq, layer, left.data, right.data, num_tokens,
                                      mode);
       if (rc != 0) {
@@ -1021,6 +1057,20 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       }
     }
 
+    // GitHub #260: the scores the readout layer wrote, one float per key and
+    // nothing else, copied out beside the logits row and confirmed by the
+    // same synchronization.
+    if (readout_read) {
+      err = cudaMemcpyAsync(attention_readout->host_scores, readout_scores.data,
+                            static_cast<std::size_t>(attention_readout->key_count) * sizeof(float),
+                            cudaMemcpyDeviceToHost, model->stream);
+      if (err != cudaSuccess) {
+        set_error(std::string("ignis_program_prefill: cudaMemcpyAsync(attention scores) failed: ") +
+                  cudaGetErrorString(err));
+        return -1;
+      }
+    }
+
     // One synchronization for the whole chunk (P2-02, GitHub #84): every
     // layer's body above only enqueues work, and (when present) so does the
     // output head, so this confirms the entire chunk -- not one layer --
@@ -1050,6 +1100,9 @@ int32_t run_program_chunk(ignis_model *model, ignis_seq_pool *pool, ignis_seq *s
       for (std::int32_t v = 0; v < vocab; ++v) {
         out_logits[v] = bf16_to_f32(host_logits_bits[static_cast<std::size_t>(v)]);
       }
+    }
+    if (attention_readout != nullptr) {
+      *attention_readout->host_read = readout_read ? 1 : 0;
     }
     // Only advance every layer's position counter once the synchronize above
     // confirms the whole chunk's device work actually completed (mirrors
@@ -1098,7 +1151,8 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
                                     const int32_t *token_ids, uint64_t num_tokens,
                                     const ignis_sampling_params &sampling, float *out_logits,
                                     LinearPolicyMode mode, const SpanMultimodal &multimodal,
-                                    float *permitted_prob) {
+                                    float *permitted_prob,
+                                    const ArmedAttentionReadout *attention_readout) {
   const uint64_t chunk_width = model->prefill_chunk_tokens;
   ChunkProfiler::instance().begin_span(num_tokens, model->prefill_chunk_tokens);
   const uint64_t tap_from = dflash2_tap_from(seq->position, num_tokens);
@@ -1110,7 +1164,8 @@ int32_t run_program_prefill_chunked(ignis_model *model, ignis_seq_pool *pool, ig
     float *slot_logits = is_last_chunk ? out_logits : nullptr;
     if (run_program_chunk(model, pool, seq, token_ids + offset, chunk_len, offset, tap_from,
                           is_last_chunk, sampling, &successor, slot_logits, mode, multimodal,
-                          is_last_chunk ? permitted_prob : nullptr) != 0) {
+                          is_last_chunk ? permitted_prob : nullptr,
+                          is_last_chunk ? attention_readout : nullptr) != 0) {
       return -1;
     }
     seq->position += chunk_len;
@@ -1238,6 +1293,45 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   if (!validate_span_multimodal(model, route, multimodal)) {
     return -1;
   }
+  // GitHub #260 (ADR 0038): the attention readout. A negative ordinal or a
+  // null score buffer asks for none. What is refused here is only what the
+  // host can never mean -- a head or layer the model does not have, a span
+  // wider than the load reserved room to score -- and keys that turn out not
+  // to be there to read are the unread flag's business, not an error.
+  ArmedAttentionReadout attention_readout;
+  const bool reads_attention = options != nullptr && options->attention_gqa_ordinal >= 0 &&
+                               options->out_attention_scores != nullptr;
+  if (reads_attention) {
+    const std::uint64_t capacity =
+        std::min<std::uint64_t>(model->vision_max_tokens, model->max_context_tokens);
+    bool has_layer = false;
+    for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
+      has_layer = has_layer || (model->layers[layer].kind == IGNIS_LAYER_GQA &&
+                                static_cast<std::int32_t>(ignis_gqa_relative_layer(layer)) ==
+                                    options->attention_gqa_ordinal);
+    }
+    if (route != IGNIS_PREFILL_ROUTE_CHUNKED || options->out_attention_read == nullptr ||
+        !has_layer || options->attention_query_head < 0 ||
+        options->attention_query_head >= kIgnisGqaQHeads || options->attention_key_begin < 0 ||
+        options->attention_key_count <= 0 ||
+        static_cast<std::uint64_t>(options->attention_key_count) > capacity) {
+      set_error("ignis_program_prefill: an attention readout of GQA layer " +
+                std::to_string(options->attention_gqa_ordinal) + ", head " +
+                std::to_string(options->attention_query_head) + ", over " +
+                std::to_string(options->attention_key_count) +
+                " keys cannot be armed on this load (the chunked route, a GQA layer and query "
+                "head the model has, and at most " + std::to_string(capacity) +
+                " keys -- the vision envelope the load reserved scores for)");
+      return -1;
+    }
+    attention_readout.gqa_ordinal = options->attention_gqa_ordinal;
+    attention_readout.query_head = options->attention_query_head;
+    attention_readout.key_begin = options->attention_key_begin;
+    attention_readout.key_count = options->attention_key_count;
+    attention_readout.host_scores = options->out_attention_scores;
+    attention_readout.host_read = options->out_attention_read;
+    *attention_readout.host_read = 0;
+  }
 
   const auto began = std::chrono::steady_clock::now();
   // GitHub #242: where the span's own draw reports its restricted
@@ -1264,7 +1358,8 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
     }
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
-                                     out_logits, mode, multimodal, permitted_prob);
+                                     out_logits, mode, multimodal, permitted_prob,
+                                     reads_attention ? &attention_readout : nullptr);
   }
   if (rc != 0) {
     return rc;

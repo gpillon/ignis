@@ -111,6 +111,7 @@ fn prefill_multimodal_and_decode<'p>(
         &[],
         MultimodalPrefill { positions, rope_delta, media: None },
         None,
+        None,
     )
     .unwrap_or_else(|e| panic!("{label}: multimodal prefill: {e}"));
     let head = decode_n(model, pool, &mut sequence, GENERATED, label);

@@ -9,8 +9,10 @@ use ignis_core::{
 use ignis_core::checkpoint::ReuseSource;
 use ignis_core::scheduler::CheckpointClaim;
 use ignis_core::vision::{Grid, MediaItem, Multimodal, TokenSpan};
+use ignis_core::pointing::{AttentionQuery, PointingHead};
 use ignis_runtime::{
-    DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats, StepLeaf,
+    AttentionRead, DecodeLane, LaneRun, Model, MultimodalSpan, RuntimeCompute, RuntimeStats,
+    StepLeaf,
 };
 
 /// The stub's output-head width (GitHub #237). Small enough to write out in
@@ -78,6 +80,12 @@ struct Calls {
     /// what lets it answer `MEDIA_ENCODE_POOL_FULL`.
     media_live: std::collections::HashMap<u32, u64>,
     multimodal_spans: Vec<SpanCall>,
+    /// GitHub #260: the attention readout each multimodal span was handed,
+    /// `None` for a span that asked for none.
+    attention_asked: Vec<Option<AttentionQuery>>,
+    /// GitHub #260: the leaf cannot read the keys while set — it leaves the
+    /// readout unread, as a real leaf does on a route that materialized none.
+    attention_unreadable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +257,22 @@ impl StepLeaf for StubLeaf {
         permitted: &[u32],
         span: MultimodalSpan<'_, Self::Media>,
         out_logits: Option<&mut [f32]>,
+        attention: Option<&mut AttentionRead>,
     ) -> Result<f32, i32> {
+        {
+            let mut calls = self.calls.lock().unwrap();
+            calls.attention_asked.push(attention.as_ref().map(|read| read.query));
+            // A deterministic map the test can predict: each key scores its
+            // own absolute position.
+            if let Some(read) = attention
+                && !calls.attention_unreadable
+            {
+                for (k, score) in read.scores.iter_mut().enumerate() {
+                    *score = (read.query.key_begin + k as u32) as f32;
+                }
+                read.read = true;
+            }
+        }
         self.calls.lock().unwrap().multimodal_spans.push(SpanCall {
             start: start_position,
             positions: span.positions.to_vec(),
@@ -578,6 +601,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 shared_prefix: None,
                 publish_prefix: None,
                 permitted: None,
+                attention: None,
             },
             PrefillJob {
                 checkpoint: None,
@@ -592,6 +616,7 @@ fn runtime_threads_each_requests_sampling_params_to_the_leaf_batch() {
                 shared_prefix: None,
                 publish_prefix: None,
                 permitted: None,
+                attention: None,
             },
         ])
         .unwrap();
@@ -731,6 +756,7 @@ fn prefill(request: u64, max_tokens: Option<u32>) -> PrefillJob {
         shared_prefix: None,
         publish_prefix: None,
         permitted: None,
+        attention: None,
     }
 }
 
@@ -1339,6 +1365,7 @@ fn a_spill_the_leaf_fails_leaves_the_device_image_to_discard() {
             multimodal: None,
             readout: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap();
 
@@ -1374,6 +1401,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
             multimodal: None,
             readout: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().capture_slots, vec![2], "the slot the job named");
@@ -1398,6 +1426,7 @@ fn a_kv_ram_checkpoint_restores_repeatedly_without_consuming_its_blob() {
                 multimodal: None,
                 readout: None,
                 permitted: None,
+                attention: None,
 }])
             .unwrap();
     }
@@ -1669,6 +1698,7 @@ fn multimodal_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) 
         multimodal: Some(prompt.clone()),
         readout: None,
         permitted: None,
+        attention: None,
     }
 }
 
@@ -1974,6 +2004,7 @@ fn a_request_that_publishes_a_block_and_chains_over_it_keeps_both_heads_claimabl
         multimodal: None,
         readout: None,
         permitted: None,
+        attention: None,
 };
     compute.prefill_step(&[job(1, vec![1, 2, 3, 4], 0, Some(4))]).unwrap();
     compute.prefill_step(&[job(1, vec![5, 6, 7, 8], 4, Some(8))]).unwrap();
@@ -2015,6 +2046,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             multimodal: None,
             readout: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap();
     compute.release(1);
@@ -2053,6 +2085,7 @@ fn a_spilled_prefix_comes_back_under_its_own_name_and_keeps_its_blob() {
             multimodal: None,
             readout: None,
             permitted: None,
+            attention: None,
 }])
         .unwrap();
     assert_eq!(leaf.calls.lock().unwrap().claimed_prefixes, vec![4], "claimable by name");
@@ -2201,4 +2234,101 @@ fn an_answer_token_past_the_output_head_does_not_take_the_prefill_down() {
         readout.logits
     );
     assert_eq!(readout.winner(), Some(0));
+}
+
+// ── GitHub #260: the attention readout ───────────────────────────────────
+
+const HEAD: PointingHead = PointingHead {
+    gqa_ordinal: 9,
+    query_head: 10,
+};
+
+fn attention_job(request: u64, prompt: &Arc<Multimodal>, start: u32, len: u32) -> PrefillJob {
+    PrefillJob {
+        attention: Some(AttentionQuery {
+            head: HEAD,
+            key_begin: 10,
+            key_count: 20,
+        }),
+        ..multimodal_job(request, prompt, start, len)
+    }
+}
+
+#[test]
+fn an_attention_readout_comes_back_as_one_score_per_key_of_its_span() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    let outcomes = compute
+        .prefill_step(&[multimodal_job(1, &prompt, 0, 30), attention_job(2, &prompt, 0, 40)])
+        .expect("a batch with a head point succeeds");
+
+    assert_eq!(outcomes[0].attention, None, "the job that asked for none gets none");
+    let scores = outcomes[1].attention.as_deref().expect("the head point's scores come back");
+    assert_eq!(scores, (10..30).map(|k| k as f32).collect::<Vec<_>>().as_slice());
+    assert_eq!(outcomes[1].readout, None, "and no logits readout rides with it");
+    let calls = leaf.calls.lock().unwrap();
+    assert_eq!(
+        calls.attention_asked,
+        [
+            None,
+            Some(AttentionQuery {
+                head: HEAD,
+                key_begin: 10,
+                key_count: 20
+            })
+        ],
+        "only the job that asked hands the leaf a readout"
+    );
+    assert_eq!(calls.prefill_logit_buffers, [None, None], "a head point asks for no logits row");
+}
+
+/// Spec 13 acceptance 4, the host's half: a span that asks for no attention
+/// readout is handed no score buffer at all.
+#[test]
+fn a_span_that_asks_for_no_attention_readout_is_handed_nothing() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    compute.prefill_step(&[multimodal_job(1, &prompt, 0, 40)]).unwrap();
+    assert_eq!(leaf.calls.lock().unwrap().attention_asked, [None]);
+}
+
+/// A leaf that could not read the keys the layer's attention read leaves
+/// the readout unread. The chunk stands — the sequence really did prefill —
+/// and no scores cross the seam, so the scheduler fails the question.
+#[test]
+fn an_attention_readout_the_leaf_could_not_read_crosses_nothing() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    leaf.calls.lock().unwrap().attention_unreadable = true;
+    let prompt = multimodal(40, vec![image(10, 20)]);
+    let outcomes = compute
+        .prefill_step(&[attention_job(1, &prompt, 0, 40)])
+        .expect("an unread readout does not fail the batch");
+    assert_eq!(outcomes[0].attention, None);
+    assert_eq!(compute.live_sequences(), 1, "the prefilled sequence is kept");
+}
+
+/// The span an attention readout reads is an image's, so a job without a
+/// multimodal span asking for one is incoherent — the server never renders
+/// one — and the batch fails with its own code rather than answering.
+#[test]
+fn an_attention_readout_without_an_image_fails_loudly() {
+    let (leaf, compute) = stub_compute(StubLeaf::with_tokens([]));
+    let job = PrefillJob {
+        attention: Some(AttentionQuery {
+            head: HEAD,
+            key_begin: 0,
+            key_count: 2,
+        }),
+        ..prefill(1, None)
+    };
+    let error = compute.prefill_step(&[job]).expect_err("refused");
+    assert!(
+        matches!(
+            error,
+            ComputeError::Kernel(code) if code == ignis_core::scheduler::ATTENTION_WITHOUT_IMAGE
+        ),
+        "{error}"
+    );
+    assert_eq!(compute.live_sequences(), 0);
+    assert!(leaf.calls.lock().unwrap().prefill_positions.is_empty(), "the leaf was never called");
 }

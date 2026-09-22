@@ -457,6 +457,26 @@ async fn main() {
         );
     }
 
+    // GitHub #260: how a `point` with no `method` will be answered, said once
+    // at load and before the first request. The head is keyed to the
+    // artifact's content hash, so a load nobody calibrated one for says
+    // "chain" here instead of being found out from its answers.
+    match server.pointing_head {
+        Some(head) => tracing::info!(
+            name: "ignis.decide.pointing_head",
+            point_method = "head",
+            head = %head,
+            artifact = %server.engine.artifact(),
+            "`point` answers in one pass off the calibrated pointing head"
+        ),
+        None => tracing::info!(
+            name: "ignis.decide.pointing_head",
+            point_method = "chain",
+            artifact = %server.engine.artifact(),
+            "no calibrated pointing head for this artifact: `point` answers with the digit chain"
+        ),
+    }
+
     // A default the loaded template cannot honour is a refused start (a
     // model swap must not silently change behaviour), matching how the
     // server already treats a missing EOS token or an unclean checksum.

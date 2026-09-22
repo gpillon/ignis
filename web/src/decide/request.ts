@@ -24,7 +24,19 @@ export type Answer =
   // decimal point, the sign and the closing brace were steps of the run but
   // hold no place, so a trace shorter than `text` is right.
   | { type: "scalar"; value: number; text: string; uncertainty: number; digits: DigitDraw[] }
-  | { type: "point" | "box"; pixels: Record<string, number>; normalized: Record<string, number>; uncertainty: Record<string, number>; digits: Record<string, DigitDraw[]> }
+  // A `point` says which method answered it (GitHub #260): a `head` point is
+  // read in one pass off the pointing head and carries no digit trace, only
+  // the `region` it was read from; a `chain` point, and every `box`, carries
+  // the trace.
+  | {
+      type: "point" | "box";
+      method?: "head" | "chain";
+      pixels: Record<string, number>;
+      normalized: Record<string, number>;
+      uncertainty: Record<string, number>;
+      region?: { cells: number; share: number };
+      digits?: Record<string, DigitDraw[]>;
+    }
   | { type: "error"; code: string; message: string };
 
 export type DecideResponse = {
