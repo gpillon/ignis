@@ -179,11 +179,14 @@ Built as the constraints say; the finding is
   `retained_prefix_gpu`, `retained_slots_gpu`, `seq_snapshot_gpu`,
   `dflash2_round_gpu`, `dflash2_window_gpu`, `vram_plan_gpu`). The three
   failures are not this patch's: each fails identically with the launcher put
-  back to the reference's file on the same tree (`model_load_gpu`'s oversized
-  chunk now errors in #210's reservation sizing before the memory check;
+  back to the reference's file on the same tree. Two are main's — built and
+  run on main `57fbef4` they fail the same way: `model_load_gpu`'s oversized
+  chunk now errors in #210's reservation sizing before the memory check, and
   `speculative_load_gpu`'s drafter VRAM delta is 874,496 B over its formula on
-  a BF16 load; `decide_number_width_gpu` reads 47 as 4 at two digits, first
-  digit at p = 0.676).
+  a BF16 load. The third came with this branch before #258:
+  `decide_number_width_gpu` passes on main (47 at two digits, first digit at
+  p = 0.907) and on this branch reads 4 there (p = 0.676) with or without the
+  patch — an hq-served test whose near-tie the residual window (#257) moves.
 - **Prefill time**: per request on the twenty tool prompts — the same tokens
   in the same chunks, so per chunk too — patched over #257's build, median
   0.9945 (0.94-1.16), 7,253 against 7,315 tokens/s in total: the same work
