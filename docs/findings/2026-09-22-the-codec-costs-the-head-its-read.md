@@ -9,8 +9,8 @@
   `crates/server/tests/attn_tap_hq_consumed_gpu.rs`,
   `kernel/include/ignis_attn_tap.h`, `crates/core/src/attn_tap.rs`,
   `.scratch/latent-probe/results/engine/` and `engine-runs4.log`,
-  `engine-runs5.log`, `vehicle4096.py` and `results/vehicle4096.json`
-  (raw, on disk),
+  `engine-runs5.log`, `vehicle4096.py` and `results/vehicle4096.json`,
+  `results/engine-window/` (raw, on disk),
   `2026-09-21-the-head-points-in-the-engine.md` (the arms this completes),
   `2026-09-12-hq-attention-route-agreement.md`, ADR 0030 (VRAM plan)
 - Superseded by: none
@@ -169,19 +169,51 @@ On the first 20 scenes of C4096 (BF16 engine arm):
 The drift is the model's, at its largest grid. The engine's chain is
 faithful to it.
 
+### Re-measured with the residual window (#257, #258)
+
+Everything above describes the engine before the residual window was wired.
+After #257 (the window: 32 sinks, the 512 keys before the query's chunk and
+the chunk itself read exact) and #258 (the chunk attended before it is
+appended), the same harness on merged `main` (`a6b3791`), served render,
+consumed hq keys, same scenes. The self-check now holds the capture to the
+three-source rule: 666 exact rows at a median relative L2 of 0.0016, the rest
+at the codec's 0.369, none clobbered, at both sizes.
+
+| set, served, hq consumed | image keys from the codec | head | chain | guard |
+|---|---|---|---|---|
+| C, before the window | 100% | 212 | 211 | 222 |
+| **C, with the window** | **40%** | **227** | 212 | **233** |
+| C, BF16 | 0% | 232 | 211 | 236 |
+| C4096, before the window | 100% | 235 | 175 | 206 |
+| C4096, with the window | 96% | 236 | 169 | 201 |
+| C4096, BF16 | 0% | 238 | 170 | 203 |
+
+- **At 1024 px the window gives back 15 of the 20** — the head regains 21
+  scenes and loses 6 — and set C's floors are met on the fixed engine:
+  head 227 against 224, guard 233 against 233, the guard exactly on its
+  floor. The pre-registered verdict stays what it was: it was taken once, on
+  the engine of the time. This is the same criterion on a changed engine,
+  with the head and `d` unchanged and set C used for no tuning.
+- **At 4096 px nothing moves**: 96% of the image is still older than the
+  window, and the head was already within 3 of BF16.
+- **What an exact copy of L39's KV head would still buy** is the rest of
+  the gap to BF16: 5 scenes at 1024 px (227 → 232, the guard 233 → 236-237)
+  and 2 at 4096 px.
+- The chain moves by a few units with the window (inside agreement 237 of
+  240 at 1024 px, 220 at 4096 px) and keeps its 4096 px drift.
+
 ## Finding
 
 - **Set C fails its pre-registered criterion, and the failure is the codec
   on the head's own read.** Everything else in production — the served
   render, hq in the other 63 layers, new scenes — leaves the head at 232,
   its BF16 number.
-- **The fix is not the residual window.** The window keeps exact only the
-  32 sinks, the 512 keys before the chunk and the chunk itself; an image
-  prompt's image is almost all older than that (at 4096 px all but ~512 of
-  16,384 positions, at 1024 px about half). Wiring the window in ignis is its
-  own question — a divergence from the vendored route, a candidate in the
-  hq/BF16 gap — and would not give the head its keys.
-- **What gives the head its keys is an exact copy of one KV head.** The
+- **The residual window gives most of it back at 1024 px, and nothing at
+  4096 px.** This bullet first said the window would not give the head its
+  keys; at 1024 px that was wrong — it keeps 60% of the image exact, and
+  the head went from 212 to 227 once #257 wired it. At 4096 px the image is
+  96% older than the window, and there it holds.
+- **What gives the head all its keys is an exact copy of one KV head.** The
   head reads one KV head of one layer (L39, KV head 1 = query head 10 / 6)
   over the image span. The exact rows exist in `run_gqa_layer` right after
   `qk_norm_rope`, before the append — the point the tap already reads —
@@ -200,8 +232,9 @@ faithful to it.
 
 ## Implications
 
-- **A one-pass or guarded point in production needs the exact key copy**
-  before anything else; without it the 1024 px floors are not met.
+- **With the window wired, the 1024 px floors are met without the exact
+  key copy** — the guard only just. The copy is now worth 5 scenes of 240
+  at 1024 px and 2 at 4096 px: a margin, not a precondition.
 - **At 4096 px the head alone is the better point** on this set (238 against
   the chain's 170). Whether the product answer at 4096 is the head, the
   chain with a drift-aware guard, or a chain run at a smaller grid is a
@@ -239,3 +272,5 @@ faithful to it.
   every hq number here describes the engine without it. At the query's chunk
   the window keeps 59.9% of a 1,024 px prompt's image exact and 3.7% of the
   4,096 px fixture's, so the 1,024 px arms are the ones to re-measure first.
+  Re-measured the same day on set C and C4096: see *Re-measured with the
+  residual window* above.
