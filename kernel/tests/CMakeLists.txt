@@ -286,6 +286,14 @@ add_executable(ignis_kernel_seq_alloc_test test_seq_alloc.cpp)
 target_link_libraries(ignis_kernel_seq_alloc_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_seq_alloc_test COMMAND ignis_kernel_seq_alloc_test)
 
+# GitHub #257 (spec runtime/06): OURS -- the hq recent ring's validity-word
+# masks (host arithmetic, the reference's rule) -- and the vendored kernel
+# that applies them. Its last block runs on the device, so the
+# no-SKIP_RETURN_CODE rule above applies.
+add_executable(ignis_kernel_hq_ring_test test_hq_ring.cpp)
+target_link_libraries(ignis_kernel_hq_ring_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_hq_ring_test COMMAND ignis_kernel_hq_ring_test)
+
 # P4-03 (GitHub #119): the hq-e8-2b row codec's own op-level oracle. It was
 # FOUND in the reference at `tools/test_kv/`, not `tests/ops/` — that is why
 # no hq arm existed in the vendored `test_gqa_attention.cpp` (P1-15, GitHub

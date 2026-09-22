@@ -146,6 +146,17 @@ void dirty_state(ignis_seq_pool &pool, ignis_seq &seq, std::uint32_t own_pages,
     fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
     seq.dflash2_position = seq.position;
   }
+  // GitHub #257: an hq pool's residual window -- every layer's side planes
+  // and the ring words.
+  if (pool.has_hq_residual()) {
+    for (const bool role_v : {false, true}) {
+      for (std::int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+        fill_device(pool.hq_residual_plane(role_v, layer, seq.slot),
+                    static_cast<std::size_t>(pool.hq_residual_plane_bytes()), ++salt);
+      }
+    }
+    fill_device(pool.hq_ring_words(seq.slot), kIgnisHqRingWords * sizeof(std::uint32_t), ++salt);
+  }
 }
 
 std::vector<std::int32_t> row_of(const ignis_seq_pool &pool, std::int32_t slot,
@@ -159,15 +170,22 @@ std::vector<std::int32_t> row_of(const ignis_seq_pool &pool, std::int32_t slot,
   return ids;
 }
 
-// A slot's whole mutable state, as one host image.
+// A slot's whole mutable state, as one host image -- on an hq pool its
+// residual window included (GitHub #257), so a claim that dropped the window
+// shows up as a changed image.
 std::vector<unsigned char> mutable_image_of(const ignis_seq_pool &pool, std::int32_t slot) {
   const std::size_t conv_bytes   = pool.gdn_pool.conv_host_image_bytes();
   const std::size_t rec_bytes    = pool.gdn_pool.recurrent_host_image_bytes();
   const std::size_t counts_bytes = static_cast<std::size_t>(pool.vocab) * sizeof(std::int32_t);
-  std::vector<unsigned char> image(conv_bytes + rec_bytes + counts_bytes);
+  const std::size_t window_bytes = static_cast<std::size_t>(pool.hq_residual_slot_bytes());
+  std::vector<unsigned char> image(conv_bytes + rec_bytes + counts_bytes + window_bytes);
   pool.gdn_pool.pack_slot_to_host(slot, image.data(), image.data() + conv_bytes, nullptr);
   CUDA_CHECK(cudaMemcpyAsync(image.data() + conv_bytes + rec_bytes, pool.token_counts_for(slot),
                              counts_bytes, cudaMemcpyDeviceToHost, nullptr));
+  if (window_bytes != 0) {
+    ignis_seq_copy_hq_residual(pool, slot, image.data() + conv_bytes + rec_bytes + counts_bytes,
+                               cudaMemcpyDeviceToHost);
+  }
   CUDA_CHECK(cudaStreamSynchronize(nullptr));
   return image;
 }

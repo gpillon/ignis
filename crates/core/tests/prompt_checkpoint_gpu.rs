@@ -33,7 +33,11 @@
 //! at the same boundaries generates.
 //!
 //! BF16 is asked for by name: it is the oracle format (ADR 0022), and every
-//! correctness check in the profile runs against it.
+//! correctness check in the profile runs against it. The same run repeats
+//! under hq-e8-2b (GitHub #257): the residual window is slot-indexed, so a
+//! checkpoint's image must carry it for a claimant -- or a KV-RAM restore --
+//! to stand where the split control stands, and the whole snapshot after the
+//! same tail is compared byte for byte, window included.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing GPU or artifact is a **skip**; under the profile it is a **hard
@@ -42,14 +46,23 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/snapshot_blob.rs"]
+mod snapshot_blob;
+
 use std::path::Path;
 
-use ignis_artifact::{CudaDevice, FrontendSet, Reader, bind_text_scope_27b, materialize};
+use ignis_artifact::{
+    CudaDevice, FrontendSet, MaterializedArtifact, ObjectHandle, Reader, bind_text_scope_27b,
+    materialize,
+};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{decode_program_batch, prefill_program};
+use ignis_core::KvFormat;
+
+use snapshot_blob::hq_window;
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 1024;
@@ -81,9 +94,17 @@ fn first_divergence(a: &[i32], b: &[i32]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
+/// BF16, then (GitHub #257) the same turns under hq-e8-2b, whose residual
+/// window rides every checkpoint image and every KV-RAM blob. One test over
+/// one materialized artifact: a second materialization in the same process
+/// finds the card still full.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_generates() {
+    checkpoint_claims_match_the_split_control(&[KvFormat::Bf16, KvFormat::HqE8_2b]);
+}
+
+fn checkpoint_claims_match_the_split_control(formats: &[KvFormat]) {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
@@ -179,20 +200,62 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    // BF16 by name: the oracle format (ADR 0022).
-    let model = load_qwen38_27b(
-        &reader,
-        &artifact,
-        &handles,
-        MAX_CONTEXT,
-        MAX_CONTEXT,
-        ignis_core::KvFormat::Bf16,
-    )
+    for &kv_format in formats {
+        turns_against_the_split_control(
+            &reader,
+            &frontend,
+            &artifact,
+            &handles,
+            &turn_n_plus_1,
+            &head,
+            &prompt,
+            kv_format,
+        );
+    }
+}
+
+/// One format's turns against the split control, over the artifact the
+/// caller materialized.
+#[allow(clippy::too_many_arguments)]
+fn turns_against_the_split_control(
+    reader: &Reader,
+    frontend: &FrontendSet,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    turn_n_plus_1: &[ignis_artifact::ChatMessage],
+    head: &[i32],
+    prompt: &[i32],
+    kv_format: KvFormat,
+) {
+    let hq = kv_format == KvFormat::HqE8_2b;
+    println!("prompt_checkpoint_gpu: {kv_format:?}");
+    let render = |messages: &[ignis_artifact::ChatMessage]| {
+        frontend
+            .chat_template()
+            .render_with_thinking_and_tools(
+                messages,
+                ignis_artifact::ChatRenderOptions::default(),
+                Some(&[]),
+            )
+            .unwrap_or_else(|e| panic!("render: {e}"))
+    };
+    let encode = |text: &str| -> Vec<i32> {
+        frontend
+            .tokenizer()
+            .encode(text)
+            .unwrap_or_else(|e| panic!("tokenize: {e}"))
+            .into_iter()
+            .map(|id| i32::try_from(id).expect("token id fits i32"))
+            .collect()
+    };
+    let opener = head.len() as u32;
+    let publish_at = (opener / PAGE) * PAGE;
+    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
     .unwrap_or_else(|e| panic!("load model: {e}"));
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
-            kv_format: ignis_core::KvFormat::Bf16,
+            kv_format,
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
@@ -205,7 +268,14 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
     let free_at_rest = pool.stats().kv_free_pages;
     let image_bytes = pool.stats().slot_state_bytes;
-    println!("prompt_checkpoint_gpu: one retained slot holds {image_bytes} bytes");
+    // GitHub #257: under hq-e8-2b the image also carries the slot's residual
+    // window, which the plan counts on its own line.
+    println!(
+        "prompt_checkpoint_gpu: one retained slot holds {image_bytes} bytes of state, plus {} of \
+         hq residual window",
+        pool.stats().hq_residual_bytes
+            / u64::from(pool.stats().slot_count + pool.stats().retained_slot_count)
+    );
     assert!(image_bytes > 0, "a real pool's slot holds state");
     // A checkpoint keeps the page its opener ends inside as a page of the
     // pool (GitHub #215).
@@ -230,6 +300,12 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         None,
     )
     .unwrap_or_else(|e| panic!("publisher opener prefill: {e}"));
+    // GitHub #257: the publisher's window at the opener, which the capture
+    // must keep for every claimant.
+    let window_at_opener = hq.then(|| {
+        let blob = publisher.snapshot().unwrap_or_else(|e| panic!("publisher snapshot: {e:?}"));
+        hq_window(&blob).to_vec()
+    });
     let checkpoint = publisher
         .capture_checkpoint(opener, 1)
         .unwrap_or_else(|e| panic!("capture: {e}"));
@@ -271,6 +347,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         prefill_program(&model, &pool, &mut control, span, start, None)
             .unwrap_or_else(|e| panic!("split control prefill at {start}: {e}"));
     }
+    let control_after_tail = control.snapshot().unwrap_or_else(|e| panic!("control snapshot: {e:?}"));
     let expected = decode_n(&model, &pool, &mut control, GENERATED, "split control");
 
     // ---- the reuser: stand up on the checkpoint, prefill only the tail.
@@ -282,8 +359,20 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         u64::from(opener),
         "the reuser stands at the opener before it prefills anything"
     );
+    if let Some(window) = &window_at_opener {
+        let blob = reuser.snapshot().unwrap_or_else(|e| panic!("reuser snapshot: {e:?}"));
+        assert!(
+            hq_window(&blob) == window.as_slice(),
+            "the claimant's slot holds the capture's window at the opener, every row and every \
+             ring bit"
+        );
+    }
     prefill_program(&model, &pool, &mut reuser, &prompt[opener as usize..], u64::from(opener), None)
         .unwrap_or_else(|e| panic!("reuser tail prefill: {e}"));
+    assert!(
+        reuser.snapshot().unwrap_or_else(|e| panic!("reuser snapshot: {e:?}")) == control_after_tail,
+        "a checkpoint's claimant after its tail is the split control after the same tail, byte for byte"
+    );
     let reused = decode_n(&model, &pool, &mut reuser, GENERATED, "reuser");
 
     assert_eq!(
@@ -325,6 +414,11 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
         None,
     )
     .unwrap_or_else(|e| panic!("KV-RAM reuser tail prefill: {e}"));
+    assert!(
+        host_restored.snapshot().unwrap_or_else(|e| panic!("KV-RAM reuser snapshot: {e:?}"))
+            == control_after_tail,
+        "a KV-RAM restore after its tail is the split control after the same tail, byte for byte"
+    );
     let host_reused = decode_n(&model, &pool, &mut host_restored, GENERATED, "KV-RAM reuser");
     assert_eq!(
         host_reused, expected,
@@ -381,7 +475,7 @@ fn turn_n_plus_1_reusing_a_checkpoint_generates_what_a_split_cold_prefill_genera
          this section exists to exercise never happens (turn N+1's opener page floor is \
          {publish_at_2}, turn N's is {publish_at}) — lengthen the messages"
     );
-    let mut turn_n_plus_2 = turn_n_plus_1.clone();
+    let mut turn_n_plus_2 = turn_n_plus_1.to_vec();
     turn_n_plus_2.push(ignis_artifact::ChatMessage::text(
         ignis_artifact::Role::Assistant,
         "The block table is one row per sequence: logical page index in, physical page id \

@@ -1118,7 +1118,7 @@ mod tests {
         });
 
         let text = metrics.render();
-        // The eleven lines are the plan's, in the plan's order and spelling.
+        // The twelve lines are the plan's, in the plan's order and spelling.
         let exported: Vec<String> = samples(&text)
             .into_iter()
             .filter(|(name, _, _)| name == "ignis_vram_reserved_bytes")

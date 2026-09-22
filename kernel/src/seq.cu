@@ -39,6 +39,7 @@
 #include "ignis_seq_sections.h"
 
 #include "core/arena.h"
+#include "ninfer/ops/gqa_attention.h"
 #include "ops/kernel/hq_codec.cuh"
 
 #include <cuda_runtime.h>
@@ -53,6 +54,10 @@ static_assert(kIgnisHqMetaRowBytes == ninfer::ops::kHqMetaBytes,
               "kIgnisHqMetaRowBytes has drifted from the vendored kHqMetaBytes");
 static_assert(kIgnisHqHeadDim == ninfer::ops::kHqHeadDim,
               "kIgnisHqHeadDim has drifted from the vendored kHqHeadDim");
+static_assert(kIgnisHqSinkKeys == static_cast<int32_t>(ninfer::ops::kGqaHqSinkKeys),
+              "kIgnisHqSinkKeys has drifted from the vendored kGqaHqSinkKeys");
+static_assert(kIgnisHqRecentKeys == static_cast<int32_t>(ninfer::ops::kGqaHqRecentKeys),
+              "kIgnisHqRecentKeys has drifted from the vendored kGqaHqRecentKeys");
 
 #include <array>
 #include <atomic>
@@ -159,6 +164,61 @@ void checked_memcpy_async(void *dst, const void *src, std::size_t bytes, cudaMem
   }
 }
 
+} // namespace
+
+// GitHub #257: slot `slot`'s residual window against `host`, laid out as the
+// IGNIS_SEQ_SECTION_HQ_RESIDUAL payload -- every GQA layer's K plane, then
+// every layer's V plane, then the ring words. One 2D copy per role: a slot's
+// plane sits at the same offset of every layer's run, one layer pitch apart.
+// On the default stream, like every other section copy here.
+void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, void *host,
+                                cudaMemcpyKind kind) {
+  const bool to_host        = kind == cudaMemcpyDeviceToHost;
+  const std::size_t plane   = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
+  const std::size_t pitch   = pool.hq_residual_layer_pitch();
+  auto *image               = static_cast<unsigned char *>(host);
+  for (const bool role_v : {false, true}) {
+    void *device        = pool.hq_residual_plane(role_v, 0, slot);
+    unsigned char *here = image + (role_v ? kIgnisGqaLayerCount * plane : 0);
+    const cudaError_t err =
+        to_host ? cudaMemcpy2DAsync(here, plane, device, pitch, plane, kIgnisGqaLayerCount, kind, nullptr)
+                : cudaMemcpy2DAsync(device, pitch, here, plane, plane, kIgnisGqaLayerCount, kind, nullptr);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemcpy2DAsync(hq residual ") +
+                               (role_v ? "v" : "k") + ") failed: " + cudaGetErrorString(err));
+    }
+  }
+  unsigned char *ring    = image + 2 * kIgnisGqaLayerCount * plane;
+  const std::size_t ring_bytes = kIgnisHqRingWords * sizeof(std::uint32_t);
+  checked_memcpy_async(to_host ? static_cast<void *>(ring) : static_cast<void *>(pool.hq_ring_words(slot)),
+                       to_host ? static_cast<const void *>(pool.hq_ring_words(slot)) : ring, ring_bytes,
+                       kind, "hq ring words");
+}
+
+void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
+  if (!pool.has_hq_residual()) {
+    return;
+  }
+  const std::size_t plane = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
+  const std::size_t pitch = pool.hq_residual_layer_pitch();
+  for (const bool role_v : {false, true}) {
+    const cudaError_t err =
+        cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane, kIgnisGqaLayerCount);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemset2D(hq residual) failed: ") +
+                               cudaGetErrorString(err));
+    }
+  }
+  const cudaError_t err =
+      cudaMemset(pool.hq_ring_words(slot), 0, kIgnisHqRingWords * sizeof(std::uint32_t));
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemset(hq ring words) failed: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+namespace {
+
 // The KV_PAGES payload of a snapshot of `seq`: its first `count` logical
 // pages.
 //
@@ -218,6 +278,9 @@ bool pack_slot_section_to_host(const ignis_seq_pool &pool, std::int32_t slot,
     return true;
   case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
     pool.dflash2_checkpoint->copy_lane_to_host(slot, at, nullptr);
+    return true;
+  case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
+    ignis_seq_copy_hq_residual(pool, slot, at, cudaMemcpyDeviceToHost);
     return true;
   default:
     return false;
@@ -511,6 +574,10 @@ struct PoolLayout {
   /* One slot's share of the GDN arena, the penalty counts and the drafter
    * arena (GitHub #211). */
   std::uint64_t slot_state_bytes = 0;
+  /* The hq residual window (GitHub #257): every state slot's K planes, then
+   * their V planes, then their ring words, in one buffer. 0 on a BF16 pool. */
+  std::size_t hq_residual_bytes = 0;
+  std::size_t hq_residual_plane_bytes = 0;
 };
 
 // Every slot the state arenas hold: the lanes, then the retained slots past
@@ -589,6 +656,19 @@ PoolLayout plan_pool_layout(const struct ignis_seq_pool_spec &spec) {
     out.slot_state_bytes += cyclic_lane_bytes(out.dflash2_window_layout) +
                             cyclic_lane_bytes(out.dflash2_checkpoint_layout);
   }
+  // GitHub #257 (spec runtime/06): the hq residual window, for every state
+  // slot. Reserved here, at load, like every other line of the plan (ADR
+  // 0030): its bytes come off the KV pool's budget, never out of a request.
+  // Each (layer, slot) plane is 1.06 MiB at 4 KV heads, a multiple of the
+  // 256-byte alignment, so the three regions pack without padding.
+  if (spec.kv_format == IGNIS_KV_FORMAT_HQ_E8_2B) {
+    out.hq_residual_plane_bytes = static_cast<std::size_t>(kIgnisHqHeadDim) * spec.num_kv_heads *
+                                  kIgnisHqResidualRows * sizeof(std::uint16_t);
+    const std::size_t planes = static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slots;
+    out.hq_residual_bytes = 2 * planes * out.hq_residual_plane_bytes +
+                            static_cast<std::size_t>(state_slots) * kIgnisHqRingWords *
+                                sizeof(std::uint32_t);
+  }
   return out;
 }
 
@@ -639,6 +719,7 @@ extern "C" int32_t ignis_seq_pool_plan(const struct ignis_seq_pool_spec *spec,
     out->lane_state_bytes = lane_state_bytes_of(layout, *spec);
     out->slot_state_bytes = layout.slot_state_bytes;
     out->retained_state_bytes = spec->retained_slot_count * layout.slot_state_bytes;
+    out->hq_residual_bytes = layout.hq_residual_bytes;
     return 0;
   } catch (const std::exception &e) {
     set_error(std::string("ignis_seq_pool_plan: ") + e.what());
@@ -687,6 +768,24 @@ extern "C" int32_t ignis_seq_pool_create(const struct ignis_seq_pool_spec *spec,
     pool->slot_state_bytes    = layout.slot_state_bytes;
     pool->retained_held.assign(spec->retained_slot_count, false);
 
+    if (layout.hq_residual_bytes != 0) {
+      const std::size_t planes =
+          static_cast<std::size_t>(kIgnisGqaLayerCount) * state_slot_count(*spec);
+      pool->hq_residual = std::make_unique<ninfer::DeviceBuffer>(layout.hq_residual_bytes);
+      // Zeroed once here and per slot at every alloc: no bit is set and no
+      // side row holds anything until an append writes it.
+      pool->hq_residual->fill(0);
+      auto *base              = static_cast<unsigned char *>(pool->hq_residual->p);
+      pool->hq_residual_k     = base;
+      pool->hq_residual_v     = base + planes * layout.hq_residual_plane_bytes;
+      pool->hq_ring           = reinterpret_cast<std::uint32_t *>(
+          base + 2 * planes * layout.hq_residual_plane_bytes);
+      pool->hq_residual_slots = static_cast<std::int32_t>(state_slot_count(*spec));
+      if (pool->hq_residual_plane_bytes() != layout.hq_residual_plane_bytes) {
+        throw std::logic_error("the hq residual plane the pool addresses is not the one it planned");
+      }
+    }
+
     pool->free_slots.reserve(spec->slot_count);
     for (std::uint32_t i = 0; i < spec->slot_count; ++i) {
       pool->free_slots.push_back(static_cast<std::int32_t>(i));
@@ -731,6 +830,7 @@ extern "C" int32_t ignis_seq_pool_stats(const struct ignis_seq_pool *pool,
   out_stats->lane_state_bytes = pool->gdn_arena.capacity() + pool->sampling_counts.bytes +
                                 (pool->has_dflash2() ? pool->dflash2_arena->capacity() : 0) -
                                 out_stats->retained_state_bytes;
+  out_stats->hq_residual_bytes = pool->has_hq_residual() ? pool->hq_residual->bytes : 0;
   return 0;
 }
 
@@ -783,6 +883,10 @@ extern "C" int32_t ignis_seq_alloc(struct ignis_seq_pool *pool, uint32_t context
                                cudaGetErrorString(err));
     }
     zero_dflash2_lane(*pool, slot);
+    // GitHub #257: nothing of the slot's previous occupant stays readable as
+    // an exact row -- neither a ring bit, which names no position, nor a sink
+    // row, which the kernels read with no bit at all.
+    ignis_seq_zero_hq_residual(*pool, slot);
     seq->slot = slot;
 
     pool->free_slots.pop_back();
@@ -1019,6 +1123,13 @@ extern "C" int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_s
       case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
         pool->dflash2_checkpoint->copy_lane_from_host(at, seq->slot, nullptr);
         break;
+      case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
+        // GitHub #257: the blob's own rows and bits over the target slot's,
+        // whatever sequence held that slot before (the reference's
+        // program_impl.h:1126 records the bug a restore without this is).
+        ignis_seq_copy_hq_residual(*pool, seq->slot, const_cast<unsigned char *>(at),
+                                   cudaMemcpyHostToDevice);
+        break;
       case IGNIS_SEQ_SECTION_PROGRESS:
         std::memcpy(&image, at, sizeof(image));
         break;
@@ -1123,6 +1234,25 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
           copy(to.data, from.data, from.bytes(), what);
         }
       }
+      break;
+    }
+    case IGNIS_SEQ_SECTION_HQ_RESIDUAL: {
+      // GitHub #257: the window is slot-indexed, so a claimant does not see
+      // the rows of the image it cloned unless they are copied to its own
+      // slot. One 2D copy per role, as for the GDN sections, plus the words.
+      const std::size_t plane = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
+      const std::size_t pitch = pool.hq_residual_layer_pitch();
+      for (const bool role_v : {false, true}) {
+        const cudaError_t err = cudaMemcpy2DAsync(
+            pool.hq_residual_plane(role_v, 0, dst), pitch, pool.hq_residual_plane(role_v, 0, src),
+            pitch, plane, kIgnisGqaLayerCount, cudaMemcpyDeviceToDevice, nullptr);
+        if (err != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpy2DAsync(") + what +
+                                   ", slot to slot) failed: " + cudaGetErrorString(err));
+        }
+      }
+      copy(pool.hq_ring_words(dst), pool.hq_ring_words(src),
+           kIgnisHqRingWords * sizeof(std::uint32_t), what);
       break;
     }
     default:

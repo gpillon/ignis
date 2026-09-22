@@ -50,8 +50,11 @@
  * geometry.
  * 3 (GitHub #194): the progress image's reserved word is the sequence's
  * multimodal `rope_delta`. Same size, new meaning: a version-2 blob has 0
- * there, so it is refused rather than restored at a delta it never recorded. */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 3;
+ * there, so it is refused rather than restored at a delta it never recorded.
+ * 4 (GitHub #257): an hq-e8-2b pool's residual-window section. A version-3
+ * hq blob carries no exact rows and no ring words, and a sequence restored
+ * from one would read whatever its slot's previous occupant left there. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 4;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
@@ -94,7 +97,17 @@ enum ignis_seq_section_kind {
    * order. Mutable: the drafter rewrites it every round. */
   IGNIS_SEQ_SECTION_DFLASH_WINDOW = 5,
   /* That window's rewrite checkpoint, in the same layout. */
-  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT = 6
+  IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT = 6,
+  /* The hq-e8-2b residual window of this slot (GitHub #257, spec
+   * runtime/06): every GQA layer's exact K side plane, then every layer's V
+   * side plane (`ignis_seq_pool::hq_residual_plane_bytes` each, sink rows
+   * then ring rows), then the 16 ring validity words. Listed only by an hq
+   * pool, and placed before the progress section in blob order. Mutable:
+   * every append rewrites ring rows and bits. Slot-indexed, not
+   * page-indexed, which is why it is a CLONE section rather than riding the
+   * shareable KV pages -- a claimant or a restored sequence addresses its
+   * own slot row, never the one the image was taken from. */
+  IGNIS_SEQ_SECTION_HQ_RESIDUAL = 7
 };
 
 /* How a second sequence may come to hold a section (ADR 0024).
@@ -122,14 +135,17 @@ struct ignis_seq_section {
 };
 
 /* How many rows `ignis_seq_section_table` returns: every pool's sections,
- * plus the drafter's two on a pool built with it. Named so a caller can
+ * plus the drafter's two on a pool built with it, plus the residual window's
+ * one on an hq-e8-2b pool (GitHub #257). Named so a caller can
  * reserve for it and a test can assert against it, and so that adding a
  * section is one edit in one place rather than a literal to chase. */
 inline constexpr std::size_t kIgnisSeqSectionCount = 5;
 inline constexpr std::size_t kIgnisSeqDflash2SectionCount = 2;
+inline constexpr std::size_t kIgnisSeqHqResidualSectionCount = 1;
 
 inline std::size_t ignis_seq_section_count(const ignis_seq_pool &pool) {
-  return kIgnisSeqSectionCount + (pool.has_dflash2() ? kIgnisSeqDflash2SectionCount : 0);
+  return kIgnisSeqSectionCount + (pool.has_dflash2() ? kIgnisSeqDflash2SectionCount : 0) +
+         (pool.has_hq_residual() ? kIgnisSeqHqResidualSectionCount : 0);
 }
 
 /* The progress scalars, as the IGNIS_SEQ_SECTION_PROGRESS payload. Fixed
@@ -438,6 +454,16 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
     push(IGNIS_SEQ_SECTION_DFLASH_WINDOW, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
     push(IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT, IGNIS_SEQ_SECTION_CLONE, pool.dflash2_lane_bytes());
   }
+  // GitHub #257: the hq residual window. Consistent with the sections above
+  // at a completed chunk boundary for the same reason the KV pages are: the
+  // append that writes a side row and its ring bit is the same launch that
+  // writes the row's code, inside the chunk the one synchronize confirms. A
+  // verify round clears the bits of its rejected columns before it returns
+  // (kernel/src/step.cu), so no boundary a snapshot can see holds a bit for
+  // a position the sequence did not keep.
+  if (pool.has_hq_residual()) {
+    push(IGNIS_SEQ_SECTION_HQ_RESIDUAL, IGNIS_SEQ_SECTION_CLONE, pool.hq_residual_slot_bytes());
+  }
   push(IGNIS_SEQ_SECTION_PROGRESS, IGNIS_SEQ_SECTION_CLONE, sizeof(ignis_seq_progress_image));
   assert(sections.size() == ignis_seq_section_count(pool) &&
          "ignis_seq_section_count has drifted from the table above");
@@ -448,8 +474,9 @@ inline std::vector<ignis_seq_section> ignis_seq_section_table(const ignis_seq_po
   // would outgrow a plain one's by more than its two lanes (P5-03, GitHub
   // #152). The unused records' bytes are zeroed like any other gap.
   std::uint64_t cursor = ignis_seq_align_up(
-      sizeof(ignis_seq_snapshot_header) +
-          (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount) * sizeof(ignis_seq_section),
+      sizeof(ignis_seq_snapshot_header) + (kIgnisSeqSectionCount + kIgnisSeqDflash2SectionCount +
+                                           kIgnisSeqHqResidualSectionCount) *
+                                              sizeof(ignis_seq_section),
       kIgnisSeqSectionAlign);
   for (ignis_seq_section &section : sections) {
     section.offset = cursor;
@@ -489,6 +516,8 @@ inline const char *ignis_seq_section_name(std::int32_t kind) {
     return "dflash_window";
   case IGNIS_SEQ_SECTION_DFLASH_CHECKPOINT:
     return "dflash_checkpoint";
+  case IGNIS_SEQ_SECTION_HQ_RESIDUAL:
+    return "hq_residual";
   default:
     return "unknown";
   }

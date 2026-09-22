@@ -25,6 +25,13 @@
 //            a row-to-slot mix-up shows up as a changed output rather than
 //            passing by symmetry.
 //
+// Plus the Prompt route for a chunk that starts past the 512-key residual
+// ring, every shape of it (GitHub #258, spec runtime/07): the arms that fail
+// on the reference's launch order, which appends a chunk before it reads the
+// ring and so serves the keys before the chunk the rows of keys inside it.
+// That order is the reference's and ignis patches it (ADR 0037); these arms
+// are the test that tells the two apart.
+//
 // Rows are the committed real-activation fixture from P4-03
 // (kernel/tests/fixtures/hq_kv_rows_27b.bin, captured from a real prefill of
 // the 27B artifact): the tolerance below is derived from the codec error
@@ -228,13 +235,17 @@ constexpr std::uint32_t kMaxContext   = 512;
 // kMaxLanes of them at once.
 constexpr std::uint32_t kPoolPages = 8 * kMaxLanes;
 
-ignis_seq_pool_spec pool_spec(int32_t kv_format) {
+// `max_context` is the arms' own 512 unless a call asks for more (the
+// prefill-after-history arms below); the pool then grows to hold that many
+// tokens for each of `lanes` sequences.
+ignis_seq_pool_spec pool_spec(int32_t kv_format, std::uint32_t max_context, std::uint32_t lanes) {
+  constexpr auto page = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
   ignis_seq_pool_spec spec{};
   spec.num_kv_heads        = kKvHeads;
   spec.head_dim            = kHeadDim;
   spec.kv_format           = kv_format;
-  spec.kv_page_group_count = kPoolPages;
-  spec.max_context_tokens  = kMaxContext;
+  spec.kv_page_group_count = std::max(kPoolPages, (max_context + page - 1) / page * lanes);
+  spec.max_context_tokens  = max_context;
   spec.slot_count          = kMaxLanes;
   // A small GDN/vocab geometry: this test never steps a layer, it only needs
   // the pool to build.
@@ -269,7 +280,11 @@ struct Inputs {
   std::vector<std::uint16_t> gate;
 };
 
-// K and V for `tokens` fresh rows, straight from the fixture's GQA layer 0.
+// K and V for `tokens` fresh rows, straight from the fixture. Positions below
+// its `rows_per_block` come from its first GQA layer; later ones walk on
+// through its other layers, so `rows_per_block * layer_count` positions (the
+// committed fixture's 1,024) are distinct real rows, and past that they
+// repeat.
 void fill_kv(const Fixture &fx, std::int32_t tokens, std::int32_t first_position,
              std::vector<std::uint16_t> &k, std::vector<std::uint16_t> &v) {
   k.assign(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens, 0);
@@ -278,10 +293,12 @@ void fill_kv(const Fixture &fx, std::int32_t tokens, std::int32_t first_position
     for (std::int32_t h = 0; h < kKvHeads; ++h) {
       const std::size_t dst =
           (static_cast<std::size_t>(t) * kKvHeads + static_cast<std::size_t>(h)) * kHeadDim;
-      const auto position = static_cast<std::uint32_t>(first_position + t);
-      std::memcpy(k.data() + dst, fx.row(0, 0, static_cast<std::uint32_t>(h), position),
+      const auto absolute = static_cast<std::uint32_t>(first_position + t);
+      const auto layer    = (absolute / fx.rows_per_block) % fx.layer_count;
+      const auto position = absolute % fx.rows_per_block;
+      std::memcpy(k.data() + dst, fx.row(layer, 0, static_cast<std::uint32_t>(h), position),
                  static_cast<std::size_t>(kHeadDim) * 2);
-      std::memcpy(v.data() + dst, fx.row(0, 1, static_cast<std::uint32_t>(h), position),
+      std::memcpy(v.data() + dst, fx.row(layer, 1, static_cast<std::uint32_t>(h), position),
                  static_cast<std::size_t>(kHeadDim) * 2);
     }
   }
@@ -414,9 +431,9 @@ struct Agreement {
 // codec's own accuracy, not to re-measure the codec.
 //
 // What the routes actually deliver, measured 2026-09-12 on this machine's
-// RTX 5090 at the 27B geometry (the report below prints all of it every run,
-// pass or fail -- 80x of unused slack sat unnoticed in GitHub #96 precisely
-// because nobody printed the headroom):
+// RTX 5090 at the 27B geometry, with every key decoded (the report below
+// prints all of it every run, pass or fail -- 80x of unused slack sat
+// unnoticed in GitHub #96 precisely because nobody printed the headroom):
 //
 //   prefill W=200 B=1  median relL2 0.227955  cosine 0.959193  SNR 10.73 dB
 //                      0.229% of 4800 rows past the 0.90 codec row bound
@@ -424,6 +441,17 @@ struct Agreement {
 //                      SNR 7.95..8.17 dB
 //   decode  W=1 B=1..8 median relL2 0.174..0.190  cosine 0.9686..0.9775
 //                      SNR 11.85..13.27 dB  0% of rows past 0.90
+//
+// GitHub #257 wires the residual window, and every history here is shorter
+// than it: the current chunk, the 32 sinks and the 512-key ring cover all
+// 200 keys, so the production view reads none of them through the codec and
+// the arms agree with BF16 to one rotated BF16 rounding (measured 2026-09-22:
+// prefill W=200 0.0023, W=9..16 0.0028-0.0029, decode 0.0032-0.0033). That
+// alone would leave the codec's read path inside attention -- still what
+// every key outside the window takes -- with no arm at all, so the prefill
+// W=200 and decode arms run a second time over a view with the window taken
+// off ("codec only"), which is the 2026-09-12 measurement above and is held
+// to the same bounds.
 //
 // The narrow prefill widths are the tightest arm, at 84% of the median
 // ceiling, and that is the derivation working rather than failing. Agreement
@@ -550,7 +578,8 @@ struct Call {
   // The absolute position of each lane's first fresh token.
   std::int32_t first_position = 0;
   // Rows appended into every lane's cache before the measured call (the
-  // decode arm's history). Zero for the prefill arm, whose own call is the
+  // decode arm's history, and the earlier chunks of the prefill-after-history
+  // arms). Zero for the first-chunk prefill arms, whose own call is the
   // append.
   std::int32_t history = 0;
   // The envelope's key bound, when it is not this call's own visible history.
@@ -566,6 +595,9 @@ struct Call {
   // lane's accepted extent is not known to be the full width, so the round
   // declares each lane's prefix and the op writes exact zero past it.
   std::vector<std::int32_t> valid;
+  // Each lane's context reservation, which sizes the pool too: the arms' own
+  // 512 unless the history and the chunk need more.
+  std::uint32_t max_context = kMaxContext;
 };
 
 // What the transient workspace holds when A1 is handed it.
@@ -592,31 +624,43 @@ struct Call {
 // one history is not the ground to overrule a vendored contract on.
 enum class WorkspaceFill { Zero, Hostile };
 
+// Whether the measured call's view carries the residual window (GitHub
+// #257): the production view does; `CodecOnly` takes it off, so every key the
+// call reads goes through the codec, as it did before the window was wired.
+enum class Window { Production, CodecOnly };
+
 // Runs `call` against a freshly built pool in `kv_format` and returns the
 // BF16 output rows, host-side. Everything device-side is torn down before
 // returning, so the two arms never hold two pools at once.
 std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const Call &call,
                                      const Inputs &in, const char *label,
-                                     WorkspaceFill fill = WorkspaceFill::Zero) {
-  const ignis_seq_pool_spec spec = pool_spec(kv_format);
+                                     WorkspaceFill fill = WorkspaceFill::Zero,
+                                     Window window = Window::Production) {
+  const ignis_seq_pool_spec spec =
+      pool_spec(kv_format, call.max_context, static_cast<std::uint32_t>(call.batch));
   ignis_seq_pool *pool           = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, (std::string(label) + " pool create").c_str());
   if (pool == nullptr) { std::exit(EXIT_FAILURE); }
 
   std::vector<ignis_seq *> lanes(static_cast<std::size_t>(call.batch), nullptr);
   for (std::int32_t b = 0; b < call.batch; ++b) {
-    expect_rc(ignis_seq_alloc(pool, kMaxContext, &lanes[static_cast<std::size_t>(b)]), 0,
+    expect_rc(ignis_seq_alloc(pool, call.max_context, &lanes[static_cast<std::size_t>(b)]), 0,
              (std::string(label) + " seq alloc").c_str());
   }
 
   // The history every lane shares, appended through A2 -- the same op and the
-  // same production view builder both formats' real prefill path uses.
-  if (call.history > 0) {
+  // same production view builder both formats' real prefill path uses. In
+  // pieces, so the banded arm's quarter-million keys never sit on the host
+  // at once; each A2 call dual-writes its own last 512 keys into the hq ring,
+  // so the ring ends up holding the history's last 512 either way.
+  constexpr std::int32_t kHistoryPiece = 8192;
+  for (std::int32_t start = 0; start < call.history; start += kHistoryPiece) {
+    const std::int32_t tokens = std::min(kHistoryPiece, call.history - start);
     std::vector<std::uint16_t> hk;
     std::vector<std::uint16_t> hv;
-    fill_kv(fx, call.history, 0, hk, hv);
-    std::vector<std::int32_t> positions(static_cast<std::size_t>(call.history));
-    for (std::int32_t t = 0; t < call.history; ++t) { positions[static_cast<std::size_t>(t)] = t; }
+    fill_kv(fx, tokens, start, hk, hv);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = start + t; }
 
     DeviceBytes hk_device(hk.size() * 2);
     DeviceBytes hv_device(hv.size() * 2);
@@ -625,11 +669,9 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
     CUDA_FATAL(cudaMemcpy(hv_device.p, hv.data(), hv.size() * 2, cudaMemcpyHostToDevice));
     CUDA_FATAL(cudaMemcpy(pos_device.p, positions.data(), positions.size() * sizeof(std::int32_t),
                           cudaMemcpyHostToDevice));
-    const ninfer::Tensor hk_t(hk_device.p, ninfer::DType::BF16,
-                             {kHeadDim, kKvHeads, call.history, 1});
-    const ninfer::Tensor hv_t(hv_device.p, ninfer::DType::BF16,
-                             {kHeadDim, kKvHeads, call.history, 1});
-    const ninfer::Tensor pos_t(pos_device.p, ninfer::DType::I32, {call.history, 1, 1, 1});
+    const ninfer::Tensor hk_t(hk_device.p, ninfer::DType::BF16, {kHeadDim, kKvHeads, tokens, 1});
+    const ninfer::Tensor hv_t(hv_device.p, ninfer::DType::BF16, {kHeadDim, kKvHeads, tokens, 1});
+    const ninfer::Tensor pos_t(pos_device.p, ninfer::DType::I32, {tokens, 1, 1, 1});
     for (ignis_seq *seq : lanes) {
       ninfer::ops::gqa_kv_append(hk_t, hv_t, pos_t, ignis_kv_layer_view(pool, seq, kGqaOrdinal),
                                  /*stream=*/nullptr);
@@ -705,7 +747,12 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
   // The production batched view: the pool-wide block-table matrix, with each
   // lane's own row selected by `rows` above -- exactly what
   // kernel/src/gqa_layer.cu's decode round hands A1.
-  const ninfer::PagedKVBatchLayerView cache = ignis_kv_batch_layer_view(pool, kGqaOrdinal);
+  ninfer::PagedKVBatchLayerView cache = ignis_kv_batch_layer_view(pool, kGqaOrdinal);
+  if (window == Window::CodecOnly) {
+    cache.residual_k = {};
+    cache.residual_v = {};
+    cache.ring_valid = {};
+  }
   // The envelope the layer would declare: every key this call can see.
   const ninfer::ops::GqaExecutionEnvelope envelope{
       /*min_visible_keys=*/1,
@@ -810,6 +857,124 @@ bool lanes_differ(const std::vector<std::uint16_t> &out, std::int32_t width, std
   return false;
 }
 
+// ---- a prefill chunk after a history (GitHub #258) -------------------------
+//
+// The hq prompt route serves the 512 keys before a chunk from the residual
+// ring. The reference's launcher appends the chunk before it attends, and the
+// append rewrites the ring slots of those very keys (slot = key mod 512) with
+// the chunk's own rows: a query is then served keys up to ~1,000 positions
+// after it (spec runtime/07). ignis attends first (ADR 0037, Ignis patched).
+// Two checks tell the orders apart, and each needs the chunk to start past
+// the ring, at 512 or later -- the first chunk of a prompt has nothing before
+// it to clobber, which is why no arm above could see this.
+
+// One output column: every q head's 256 elements of one token, batch row 0.
+constexpr std::size_t kColumnElements = static_cast<std::size_t>(kHeadDim) * kQHeads;
+
+// The first `columns` output columns of a B=1 run.
+std::vector<std::uint16_t> leading_columns(const std::vector<std::uint16_t> &out,
+                                           std::int32_t columns) {
+  const auto end = kColumnElements * static_cast<std::size_t>(columns);
+  return {out.begin(), out.begin() + static_cast<std::ptrdiff_t>(end)};
+}
+
+// With a 512-key history and the chunk at 512, the residual window holds
+// every key the chunk can see -- the 32 sinks, the ring over [32, 512) and
+// the chunk itself through the fresh pass -- so no key goes through the codec
+// and the hq route must agree with BF16 to one rotated BF16 rounding, as the
+// first-chunk arms above do (0.0023). The reference's order serves ring keys
+// the rows of later chunk keys instead, and those output rows are not a
+// rounding away from BF16's.
+//
+// Measured 2026-09-22 on the 5090, identical over two runs:
+//
+//   ignis (attend, then append)   median 0.0028  max 0.0110..0.0115
+//   the reference's order         median 0.260 (masked) .. 1.958 (W=512)
+//                                 max 3.92 .. 30.2
+//
+// So the bounds sit ~3.5x and ~4.3x above what an exact window measures and
+// 26x (the masked arm's median) to 600x below what the clobbered ring does.
+constexpr double kExactMedianRelL2 = 0.01;
+constexpr double kExactRowRelL2    = 0.05;
+
+void check_exact_window(const std::string &arm, const Agreement &a) {
+  std::printf("[%s] rows %zu  median relL2 %.6f (bound %.3f)  max %.6f (bound %.3f)  cosine %.6f  "
+              "SNR %.2f dB\n",
+              arm.c_str(), a.rel_l2.size(), a.median(), kExactMedianRelL2, a.worst(), kExactRowRelL2,
+              a.cosine(), a.snr_db());
+  const std::string prefix = arm + ": ";
+  check(a.signal > 0.0, prefix + "the BF16 route wrote an all-zero output");
+  check(a.noise > 0.0, prefix + "the two routes produced bit-identical output, so the hq cache view "
+                                "never selected the hq kernels");
+  check(a.median() <= kExactMedianRelL2,
+        prefix + "every key this chunk sees is in the residual window, yet the hq route's median "
+                 "row is further from BF16 than one rotated BF16 rounding: a ring key was not "
+                 "served its own row");
+  check(a.worst() <= kExactRowRelL2,
+        prefix + "an output row is further from BF16 than an all-exact history allows: a ring key "
+                 "was not served its own row");
+}
+
+// A copy of `in` whose chunk rows after token `last_same` are other real rows
+// (the fixture's, 333 positions on), so the two calls ask every query up to
+// `last_same` the same question over the same visible keys.
+Inputs perturb_after(const Fixture &fx, const Inputs &in, std::int32_t width,
+                     std::int32_t first_position, std::int32_t last_same) {
+  Inputs out = in;
+  std::vector<std::uint16_t> k;
+  std::vector<std::uint16_t> v;
+  fill_kv(fx, width, first_position + 333, k, v);
+  const std::size_t row  = static_cast<std::size_t>(kHeadDim) * kKvHeads;
+  const std::size_t from = row * static_cast<std::size_t>(last_same + 1);
+  std::copy(k.begin() + static_cast<std::ptrdiff_t>(from), k.end(),
+            out.k.begin() + static_cast<std::ptrdiff_t>(from));
+  std::copy(v.begin() + static_cast<std::ptrdiff_t>(from), v.end(),
+            out.v.begin() + static_cast<std::ptrdiff_t>(from));
+  return out;
+}
+
+// Causality, bit for bit. `same` and `later` are two B=1 runs whose chunks
+// differ only after token `last_same`. Columns up to it must be identical:
+// the prompt kernel masks a score to -inf before the row maximum, so a key a
+// query cannot see cannot move one bit of its answer. A later valid column
+// must differ, or the perturbation never reached the op. Unlike the bound
+// above this needs no BF16 twin and no exact window, so it is the one check
+// the banded arm can afford. Measured 2026-09-22: 0 elements moved on every
+// arm; the reference's order moved 108,320 (banded) to 1,488,400 (W=512) of
+// the columns that must not move.
+void check_causal(const std::string &arm, const std::vector<std::uint16_t> &same,
+                  const std::vector<std::uint16_t> &later, std::int32_t last_same,
+                  std::int32_t valid) {
+  const std::string prefix = arm + " (causal): ";
+  check(same.size() == later.size(), prefix + "the two runs wrote different output extents");
+  if (same.size() != later.size()) { return; }
+  std::size_t moved        = 0;
+  std::int32_t first_moved = -1;
+  for (std::int32_t c = 0; c <= last_same; ++c) {
+    for (std::size_t e = 0; e < kColumnElements; ++e) {
+      const std::size_t i = static_cast<std::size_t>(c) * kColumnElements + e;
+      if (same[i] != later[i]) {
+        ++moved;
+        if (first_moved < 0) { first_moved = c; }
+      }
+    }
+  }
+  std::size_t reached = 0;
+  for (std::size_t i = static_cast<std::size_t>(last_same + 1) * kColumnElements;
+       i < static_cast<std::size_t>(valid) * kColumnElements; ++i) {
+    if (same[i] != later[i]) { ++reached; }
+  }
+  std::printf("  %-34s causal: %zu elements of columns 0..%d moved (first column %d); %zu of the "
+              "later columns' elements moved\n",
+              arm.c_str(), moved, last_same, first_moved, reached);
+  check(moved == 0,
+        prefix + "changing only the keys and values after token " + std::to_string(last_same) +
+            " changed the output of a query at or before it: the route served a query a key from "
+            "its future");
+  check(reached > 0, prefix + "the later columns did not move either, so the perturbation never "
+                              "reached the op and the check above proves nothing");
+}
+
 } // namespace
 
 int main() {
@@ -849,6 +1014,10 @@ int main() {
         "prefill W=200 B=1", hq,
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq hostile",
                   WorkspaceFill::Hostile));
+    check_agreement("prefill W=200 B=1 codec only",
+                    compare(bf16, run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in,
+                                            "prefill hq codec only", WorkspaceFill::Zero,
+                                            Window::CodecOnly)));
   }
 
   // ---- prefill at the narrow Prompt widths ---------------------------------
@@ -885,6 +1054,58 @@ int main() {
                   WorkspaceFill::Hostile));
   }
 
+  // ---- prefill after a history: the chunk reads the ring before it writes it
+  //
+  // GitHub #258 (spec runtime/07, ADR 0037): every shape of the hq prompt
+  // route, each chunk starting past the ring. W=200 rewrites the first 200
+  // ring slots under the reference's order, W=512 all of them -- what every
+  // full 1,024-wide serving chunk after the first does. The masked form
+  // declares a valid prefix of 150. The banded form puts the chunk across the
+  // 262,144-key scratch band, so both bands run the fresh pass; its history
+  // is too long to hold a BF16 twin cheaply, and the causality check needs
+  // none.
+  {
+    struct HistoryArm {
+      const char *name;
+      std::int32_t width;
+      std::int32_t first_position;
+      std::int32_t valid;  // 0: the dense form
+      std::int32_t last_same;
+      bool exact_window;
+    };
+    constexpr auto kBand = static_cast<std::int32_t>(ninfer::ops::kGqaHqPromptScratchBandKeys);
+    const HistoryArm arms[] = {
+        {"prefill W=200 at 512", 200, 512, 0, 99, true},
+        {"prefill W=512 at 512", 512, 512, 0, 255, true},
+        {"prefill W=200 at 512 masked 150", 200, 512, 150, 99, true},
+        {"prefill W=200 across the band", 200, kBand - 64, 0, 99, false},
+    };
+    for (const HistoryArm &arm : arms) {
+      Inputs in;
+      fill_kv(fx, arm.width, arm.first_position, in.k, in.v);
+      fill_q(fx, arm.width, 1, in.q);
+      fill_gate(in.q.size(), in.gate);
+      Call call{arm.width, /*batch=*/1, arm.first_position, /*history=*/arm.first_position};
+      if (arm.valid > 0) { call.valid.push_back(arm.valid); }
+      call.max_context = static_cast<std::uint32_t>(arm.first_position + arm.width);
+      const std::int32_t valid = arm.valid > 0 ? arm.valid : arm.width;
+      const std::string name   = arm.name;
+
+      const std::vector<std::uint16_t> hq =
+          run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, (name + " hq").c_str());
+      if (arm.exact_window) {
+        const std::vector<std::uint16_t> bf16 =
+            run_route(fx, IGNIS_KV_FORMAT_BF16, call, in, (name + " bf16").c_str());
+        check_exact_window(name, compare(leading_columns(bf16, valid), leading_columns(hq, valid)));
+      }
+      check_causal(name, hq,
+                   run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call,
+                             perturb_after(fx, in, arm.width, arm.first_position, arm.last_same),
+                             (name + " hq later keys changed").c_str()),
+                   arm.last_same, valid);
+    }
+  }
+
   // ---- decode: the SmallT route at every exact batch width 1..8 ------------
   //
   // One token per lane over a shared 200-token history, which is the decode
@@ -913,6 +1134,10 @@ int main() {
     check(lanes_differ(hq, call.width, batch),
          "decode hq B=" + std::to_string(batch) + ": every lane produced the identical output");
     check_agreement(("decode W=1 B=" + std::to_string(batch)).c_str(), compare(bf16, hq));
+    check_agreement(("decode W=1 B=" + std::to_string(batch) + " codec only").c_str(),
+                    compare(bf16, run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in,
+                                            (hq_label + " codec only").c_str(), WorkspaceFill::Zero,
+                                            Window::CodecOnly)));
 
     // The same round as the decode graph declares it: the envelope is the
     // pool's whole context, not this call's 201 visible keys, so the launch

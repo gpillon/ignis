@@ -31,7 +31,12 @@
 //! stay out of the pool while nothing live holds it, and come back in full
 //! when the retention is finally released.
 //!
-//! BF16 by name: the oracle format (ADR 0022).
+//! BF16 by name: the oracle format (ADR 0022). And again under hq-e8-2b
+//! (GitHub #257): the residual window is indexed by slot, not by page, so a
+//! claimant addresses the shared pages through its own row but reads its sink
+//! and ring rows from its own slot. Only a clone that carries the window makes
+//! it stand where the split control stands -- checked on the window itself,
+//! on the whole snapshot after the tail, and on the tokens.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing GPU or artifact is a **skip**; under the profile it is a **hard
@@ -40,17 +45,24 @@
 
 #![cfg(feature = "cuda")]
 
+#[path = "support/snapshot_blob.rs"]
+mod snapshot_blob;
+
 use std::path::Path;
 
 use ignis_artifact::{
-    ChatMessage, ChatRenderOptions, ChatTemplate, CudaDevice, FrontendSet, Reader, Role,
-    bind_text_scope_27b, materialize,
+    ChatMessage, ChatRenderOptions, ChatTemplate, CudaDevice, FrontendSet, MaterializedArtifact,
+    ObjectHandle, Reader, Role, bind_text_scope_27b, materialize,
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
+use ignis_core::hq_ring::ring_after_prefill;
 use ignis_core::model_load::load_qwen38_27b;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{decode_program_batch, prefill_program};
+use ignis_core::KvFormat;
+
+use snapshot_blob::{hq_ring_words, hq_window};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 1024;
@@ -82,9 +94,16 @@ fn first_divergence(a: &[i32], b: &[i32]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
+/// BF16, then (GitHub #257) the same claim under hq-e8-2b, whose residual
+/// window rides the clone. One test over one materialized artifact: a second
+/// materialization in the same process finds the card still full.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates() {
+    claimant_matches_the_split_control(&[KvFormat::Bf16, KvFormat::HqE8_2b]);
+}
+
+fn claimant_matches_the_split_control(formats: &[KvFormat]) {
     let path = Path::new(ARTIFACT);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
@@ -181,20 +200,30 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    // BF16 by name: the oracle format (ADR 0022).
-    let model = load_qwen38_27b(
-        &reader,
-        &artifact,
-        &handles,
-        MAX_CONTEXT,
-        MAX_CONTEXT,
-        ignis_core::KvFormat::Bf16,
-    )
+    for &kv_format in formats {
+        claim_and_compare(&reader, &artifact, &handles, &first, &second, publish_at, kv_format);
+    }
+}
+
+/// One format's claim against the split control, over the artifact the caller
+/// materialized.
+fn claim_and_compare(
+    reader: &Reader,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    first: &[i32],
+    second: &[i32],
+    publish_at: u32,
+    kv_format: KvFormat,
+) {
+    let hq = kv_format == KvFormat::HqE8_2b;
+    println!("retained_prefix_gpu: {kv_format:?}");
+    let model = load_qwen38_27b(reader, artifact, handles, MAX_CONTEXT, MAX_CONTEXT, kv_format)
     .unwrap_or_else(|e| panic!("load model: {e}"));
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
-            kv_format: ignis_core::KvFormat::Bf16,
+            kv_format,
             kv_page_group_count: 80,
             max_context_tokens: MAX_CONTEXT,
             slot_count: 4,
@@ -214,6 +243,18 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
         .unwrap_or_else(|e| panic!("alloc publisher: {e}"));
     prefill_program(&model, &pool, &mut publisher, &first[..publish_at as usize], 0, None)
         .unwrap_or_else(|e| panic!("publisher head prefill: {e}"));
+    // GitHub #257: the publisher's window at the prefix's end -- what every
+    // claimant must receive -- and its ring words, which one chunk of
+    // `publish_at` keys sets exactly as the host rule says.
+    let window_at_publish = hq.then(|| {
+        let blob = publisher.snapshot().unwrap_or_else(|e| panic!("publisher snapshot: {e:?}"));
+        assert_eq!(
+            hq_ring_words(&blob),
+            ring_after_prefill(&[(0, u64::from(publish_at))]).words(),
+            "the publisher's ring words after its head prefill are the rule's"
+        );
+        hq_window(&blob).to_vec()
+    });
     let prefix = publisher
         .publish_prefix(publish_at, 0)
         .unwrap_or_else(|e| panic!("publish: {e}"));
@@ -252,6 +293,7 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
         prefill_program(&model, &pool, &mut control, span, start, None)
             .unwrap_or_else(|e| panic!("split control prefill at {start}: {e}"));
     }
+    let control_after_tail = control.snapshot().unwrap_or_else(|e| panic!("control snapshot: {e:?}"));
     let expected = decode_n(&model, &pool, &mut control, GENERATED, "split control");
 
     // ---- subagent 2: stand up on the retained prefix, prefill only its own
@@ -267,6 +309,14 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
         prefix.stats().pages,
         "the claimant's shared pages are exactly the retained block's"
     );
+    if let Some(window) = &window_at_publish {
+        let blob = reuser.snapshot().unwrap_or_else(|e| panic!("claimant snapshot: {e:?}"));
+        assert!(
+            hq_window(&blob) == window.as_slice(),
+            "the claimant's slot holds the publisher's window at the prefix's end, every row and \
+             every ring bit -- long after the publisher itself was dropped"
+        );
+    }
     prefill_program(
         &model,
         &pool,
@@ -276,6 +326,14 @@ fn a_claimant_of_a_retained_prefix_generates_what_a_split_cold_prefill_generates
         None,
     )
     .unwrap_or_else(|e| panic!("reuser tail prefill: {e}"));
+    // The strongest statement at this level: after the same tail, the
+    // claimant's whole state is the split control's, byte for byte -- the
+    // shared pages materialized, the cloned sections, the window.
+    assert!(
+        reuser.snapshot().unwrap_or_else(|e| panic!("claimant snapshot: {e:?}"))
+            == control_after_tail,
+        "a claimant after its tail prefill is the split control after the same tail, byte for byte"
+    );
     let reused = decode_n(&model, &pool, &mut reuser, GENERATED, "reuser");
 
     assert_eq!(

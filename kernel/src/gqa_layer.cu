@@ -4,6 +4,7 @@
 // context: input norm -> fused Q/K/gate/V projection -> q/k norm + RoPE ->
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
+#include "ignis_attn_tap.h"
 #include "ignis_gqa_layer.h"
 
 #include "ignis_gqa_workspace.h"
@@ -126,6 +127,14 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
                               rotation_positions, rope, rotated_query_heads, rotated_key_heads,
                               stream);
 
+    // Test-only attention-input tap (kernel/include/ignis_attn_tap.h): one
+    // flag load when disarmed, which is the only way production ever runs.
+    if (ignis_attn_tap_record(gqa_layer, start_position, tokens, rotated_query.data,
+                              rotated_key.data, stream) != 0) {
+      set_error(std::string("ignis_gqa_layer: ") + ignis_attn_tap_last_error());
+      return -1;
+    }
+
     // P2-04 (GitHub #86): the fused append-and-attend entry point (A1)
     // replaces the two-pass A2 (gqa_kv_append) + A3 (gqa_attention_cached)
     // composition: the chunk's keys and values are appended to the paged
@@ -160,6 +169,11 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         ignis_kv_batch_layer_view(pool, static_cast<std::int32_t>(gqa_layer));
     const ninfer::Tensor seq_block_table = seq->kv.block_table();
     batch_cache.block_tables = seq_block_table.view({seq_block_table.ne[0], 1});
+    // GitHub #257: the hq residual window narrows the same way. It is indexed
+    // by the table row the kernels select, and that row is 0 of this
+    // one-row table, so the window is pre-sliced to the sequence's own slot:
+    // a chunk reads and writes its own sink and ring rows, never lane 0's.
+    ignis_kv_fill_residual(batch_cache, pool, static_cast<std::int32_t>(gqa_layer), seq->slot, 1);
     // The B=1 table-row selector: one device I32 holding 0, bumped from the
     // load-time reservation (an arena bump like every other per-layer
     // buffer here, not an allocation; the arena scope resets after the
@@ -218,6 +232,23 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         /*valid_columns=*/ninfer::Tensor{}, kv_table_rows,
         gate.view({kHeadDim, kQHeads, tokens, 1}), attention_scale, batch_cache, envelope,
         attention_workspace, attention_heads, stream);
+
+    // Test-only: the keys the hq prompt route actually consumed
+    // (kernel/include/ignis_attn_tap.h). The route is asked of the same
+    // resolver the workspace was sized by, never inferred from a width.
+    if (ignis_attn_tap_record_consumed(
+            gqa_layer, start_position, tokens,
+            batch_cache.dtype == ninfer::DType::U8 &&
+                ninfer::ops::detail::gqa_attention_resolve_route(kQHeads, tokens, 1,
+                                                                 batch_cache.dtype, envelope) ==
+                    ninfer::ops::detail::GqaAttentionRoute::Prompt,
+            attention_workspace_storage.data,
+            static_cast<std::int64_t>(std::min<std::uint32_t>(
+                envelope.max_visible_keys, ninfer::ops::kGqaHqPromptScratchBandKeys)),
+            stream) != 0) {
+      set_error(std::string("ignis_gqa_layer: ") + ignis_attn_tap_last_error());
+      return -1;
+    }
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, tokens, 1, 1});
     error = cudaMemcpyAsync(out_residual, in_residual,

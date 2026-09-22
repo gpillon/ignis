@@ -650,6 +650,7 @@ const LINE_LABEL: Record<VramLine, string> = {
   drafter_round: "Drafter round",
   lane_state: "Lane state",
   retained_slots: "Retained slots",
+  hq_residual_window: "hq residual window",
   residual: "Residual",
 };
 
@@ -673,14 +674,14 @@ const SKIP_LABEL: Record<SlotSkipReason, string> = {
 
 /**
  * A plan line's colour: the four series hues, each cycle mixed a step further
- * into the ground, so eleven lines stay apart without inventing a palette.
+ * into the ground, so twelve lines stay apart without inventing a palette.
  */
 const planColor = (i: number) => `color-mix(in oklab, var(--series-${(i % 4) + 1}) ${100 - 20 * Math.floor(i / 4)}%, var(--ground))`;
 
 type PlanSegment = { key: string; label: string; bytes: number; color: string; note?: string };
 
 /**
- * The plan's segments in budget order: the eleven lines, the pool the rest
+ * The plan's segments in budget order: the twelve lines, the pool the rest
  * bought, and the budget neither took. The bytes come from `deriveMemory`;
  * what this adds is only how each one is drawn and what it is called.
  */

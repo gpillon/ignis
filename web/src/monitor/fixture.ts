@@ -87,7 +87,8 @@ ignis_vram_reserved_bytes{line="decode_graph"} 16777216
 ignis_vram_reserved_bytes{line="verify_round"} 268435456
 ignis_vram_reserved_bytes{line="drafter_round"} 134217728
 ignis_vram_reserved_bytes{line="lane_state"} 1073741824
-ignis_vram_reserved_bytes{line="retained_slots"} 2415919104
+ignis_vram_reserved_bytes{line="retained_slots"} 1845491712
+ignis_vram_reserved_bytes{line="hq_residual_window"} 570427392
 ignis_vram_reserved_bytes{line="residual"} 268435456
 # HELP ignis_vram_budget_bytes The device budget the plan was laid out inside.
 # TYPE ignis_vram_budget_bytes gauge

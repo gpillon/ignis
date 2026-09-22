@@ -162,6 +162,26 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
     fill_lane(*pool.dflash2_checkpoint, seq.slot, ++salt);
     seq.dflash2_position = tokens;
   }
+  // GitHub #257: an hq pool's residual window -- every layer's side planes
+  // and the ring words.
+  if (pool.has_hq_residual()) {
+    for (const bool role_v : {false, true}) {
+      for (std::int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+        fill_device(pool.hq_residual_plane(role_v, layer, seq.slot),
+                    static_cast<std::size_t>(pool.hq_residual_plane_bytes()), ++salt);
+      }
+    }
+    fill_device(pool.hq_ring_words(seq.slot), kIgnisHqRingWords * sizeof(std::uint32_t), ++salt);
+  }
+}
+
+// Slot `slot`'s hq residual window as its state section lays it out
+// (GitHub #257).
+std::vector<unsigned char> hq_window_of(const ignis_seq_pool &pool, std::int32_t slot) {
+  std::vector<unsigned char> image(static_cast<std::size_t>(pool.hq_residual_slot_bytes()));
+  ignis_seq_copy_hq_residual(pool, slot, image.data(), cudaMemcpyDeviceToHost);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  return image;
 }
 
 // The whole blob for `seq`, sized by the leaf's own query.
@@ -577,6 +597,7 @@ void check_both_formats() {
   std::uint64_t page_bytes[2] = {0, 0};
   const int32_t formats[2]    = {IGNIS_KV_FORMAT_BF16, IGNIS_KV_FORMAT_HQ_E8_2B};
 
+  std::uint64_t hq_window_section = 0;
   for (int i = 0; i < 2; ++i) {
     const ignis_seq_pool_spec spec = qwen38_27b_spec(formats[i], context, 1);
     ignis_seq_pool *pool           = nullptr;
@@ -598,17 +619,33 @@ void check_both_formats() {
     expect(stats.kv_bytes_per_token * context == sections[0].bytes,
           "formats: the KV section matches the reported per-token cost");
 
+    // GitHub #257: an hq pool's blob carries its residual window as one more
+    // CLONE section, just before the progress scalars; a BF16 pool's none.
+    const bool hq = formats[i] == IGNIS_KV_FORMAT_HQ_E8_2B;
+    expect(sections.size() == kIgnisSeqSectionCount + (hq ? kIgnisSeqHqResidualSectionCount : 0),
+           "formats: the hq window is a section of an hq pool only");
+    if (hq) {
+      const ignis_seq_section &window = sections[sections.size() - 2];
+      expect(window.kind == IGNIS_SEQ_SECTION_HQ_RESIDUAL && window.transfer == IGNIS_SEQ_SECTION_CLONE,
+             "formats: the hq window is a CLONE section before the progress scalars");
+      expect(window.bytes == pool->hq_residual_slot_bytes() &&
+                 window.bytes == 2ull * kIgnisGqaLayerCount * 256 * 4 * kIgnisHqResidualRows * 2 + 64,
+             "formats: the hq window section is every layer's K and V planes and the ring words");
+      hq_window_section = ignis_seq_align_up(window.bytes, kIgnisSeqSectionAlign);
+    }
+
     ignis_seq_release(pool, seq);
     ignis_seq_pool_free(pool);
   }
 
-  // Everything but KV is identical between the two, so the whole difference
-  // in snapshot size is the KV image -- 7.11x denser under hq-e8-2b.
+  // Everything but KV and the hq window is identical between the two, so the
+  // whole difference in snapshot size is the KV image -- 7.11x denser under
+  // hq-e8-2b -- less the window hq carries and BF16 does not (GitHub #257).
   const std::uint64_t pages     = ninfer::pages_for_tokens(context);
   const std::uint64_t kv_delta  = pages * (page_bytes[0] - page_bytes[1]);
   expect(sizes[0] > sizes[1], "formats: a BF16 snapshot is the larger one");
-  expect(sizes[0] - sizes[1] == kv_delta,
-        "formats: the size difference is exactly the KV image difference");
+  expect(sizes[0] + hq_window_section - sizes[1] == kv_delta,
+        "formats: the size difference is exactly the KV image difference less the hq window");
   expect(page_bytes[0] == 65536ULL * ninfer::kPagedKVPageSize,
         "formats: BF16 costs 65,536 bytes per sequence-token");
   expect(page_bytes[1] == 9216ULL * ninfer::kPagedKVPageSize,
@@ -617,6 +654,47 @@ void check_both_formats() {
   std::printf("snapshot size at %u tokens (27B geometry): bf16 %llu B, hq-e8-2b %llu B\n", context,
               static_cast<unsigned long long>(sizes[0]),
               static_cast<unsigned long long>(sizes[1]));
+}
+
+// ---- 4b. the hq window goes to the target's own slot (GitHub #257) --------
+//
+// The window is indexed by slot, not by page, so a restore into a sequence
+// standing on another slot must write that slot's rows and bits -- and every
+// one of them, whatever the slot's previous occupant left. The reference hit
+// exactly this (program_impl.h:1126: "a restore left the destination row
+// holding whatever sequence used it last").
+void check_hq_window_restore_into_another_slot() {
+  const ignis_seq_pool_spec spec = qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2);
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "hq window restore: pool create");
+  ignis_seq *source = nullptr;
+  ignis_seq *target = nullptr;
+  expect_rc(ignis_seq_alloc(pool, 256, &source), 0, "hq window restore: alloc source");
+  expect_rc(ignis_seq_alloc(pool, 256, &target), 0, "hq window restore: alloc target");
+  expect(source->slot != target->slot, "hq window restore: two slots");
+  give_history(*pool, *source, 200, 0x77u);
+  give_history(*pool, *target, 64, 0x99u);
+  const std::vector<unsigned char> window = hq_window_of(*pool, source->slot);
+  const std::vector<unsigned char> blob   = snapshot_of(*pool, *source, "hq window restore: snapshot");
+
+  // The blob's section is the source slot's window, byte for byte.
+  const std::vector<ignis_seq_section> sections =
+      ignis_seq_section_table(*pool, ignis_seq_snapshot_page_count(*source));
+  const ignis_seq_section &section = sections[sections.size() - 2];
+  expect(section.kind == IGNIS_SEQ_SECTION_HQ_RESIDUAL &&
+             std::memcmp(blob.data() + section.offset, window.data(), window.size()) == 0,
+         "hq window restore: the blob carries the source slot's window");
+
+  expect(hq_window_of(*pool, target->slot) != window, "hq window restore: the target differs first");
+  expect_rc(ignis_seq_restore(pool, target, blob.data(), blob.size()), 0,
+            "hq window restore: restore into the other slot");
+  expect(hq_window_of(*pool, target->slot) == window,
+         "hq window restore: the target's slot now holds the source's rows and bits, every byte");
+  expect(hq_window_of(*pool, source->slot) == window, "hq window restore: the source is untouched");
+
+  ignis_seq_release(pool, source);
+  ignis_seq_release(pool, target);
+  ignis_seq_pool_free(pool);
 }
 
 // ---- 5. the measured transfer cost -----------------------------------------
@@ -1012,6 +1090,7 @@ int main() {
   // and metadata rows rather than two of raw values. A round trip that packs
   // and unpacks one correctly says nothing about the other.
   check_round_trip(small_spec(), 128, 100, "bf16, small geometry");
+  check_hq_window_restore_into_another_slot();
   check_round_trip(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2), 256, 200,
                    "hq-e8-2b, 27B geometry");
   check_round_trip(with_drafter(qwen38_27b_spec(IGNIS_KV_FORMAT_HQ_E8_2B, 256, 2)), 256, 200,

@@ -7,10 +7,13 @@ must be diffable, so "we ported the reference's kernel" means *this exact file
 is the reference's file*, and a script proves it.
 
 - Policy: `docs/adr/0010-vendored-reference-kernels.md`
-- The one exemption: `docs/adr/0031-vendored-kernel-bottleneck-exemption.md` —
-  a kernel *measured* as the bottleneck may carry a recorded patch, or be
-  replaced by our own implementation in `kernel/src/` and leave the subtree.
-  Read it before editing anything here; nothing below changes.
+- The exemptions: `docs/adr/0031-vendored-kernel-bottleneck-exemption.md` — a
+  kernel *measured* as the bottleneck may carry a recorded patch, or be
+  replaced by our own implementation in `kernel/src/` and leave the subtree —
+  and `docs/adr/0037-a-vendored-file-may-carry-a-correctness-patch.md` — a file
+  with a *demonstrated* correctness bug may carry a recorded patch, with a test
+  that fails without it. Read both before editing anything here; nothing below
+  changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
   vendored alongside the code)
 - Spec: `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36)
@@ -79,6 +82,22 @@ change, it is **recorded**, never silently applied:
 From then on `verify` expects the *patched* hash locally and the *reference's*
 hash upstream, so both an unrecorded edit and upstream drift are caught. `sync`
 will not overwrite a patched file unless it is told to.
+
+A patch is admitted for one of two reasons, and its `reason` says which: a
+measured bottleneck (ADR 0031), or a demonstrated correctness bug (ADR 0037),
+in which case the `reason` also names the test that fails without the patch.
+
+### Ignis-patched behaviours
+
+A correctness patch makes the behaviour it changes **Ignis patched**: ignis
+deliberately computes something the reference does not. Every other vendored
+behaviour is **reference parity**. Each Ignis-patched behaviour is one row
+here, so a comparison with the reference can tell which side of a difference
+it is looking at (ADR 0037).
+
+| Behaviour | The reference | ignis | Test that tells them apart | Issue |
+|---|---|---|---|---|
+| The hq-e8-2b prompt route's residual ring, with the window on (`src/ops/launcher/gqa_attention_prefill.cu`, spec runtime/07) | Appends the chunk, then attends: the append rewrites the ring slots of the 512 keys before the chunk, so those keys are served the rows of chunk keys up to ~1,000 positions later | Attends, then appends: every key before the chunk is served its own ring row; after the call the ring and the codes are what the reference leaves | `ignis_kernel_hq_route_agreement_test`, the prefill-after-history arms (exact-window agreement with BF16, bit-exact causality; dense, masked, banded) | #258 |
 
 Anything that is not a verbatim vendored file — including a file we edit
 beyond a recorded patch — is our own implementation and carries no provenance
@@ -330,7 +349,9 @@ ticket):
   `gqa_attention_decode_hq_{27,35}.cu` + `_decode_hq_routes.cuh`,
   `gqa_attention_prefill_{bf16,i8}.cu`, `gqa_attention_prefill_hq_{27,35}.cu`
   + `_prefill_hq_routes.cuh`; the wrapper `ops/wrapper/gqa_attention.cpp` and
-  public header `include/ninfer/ops/gqa_attention.h`. Unlike
+  public header `include/ninfer/ops/gqa_attention.h`.
+  (`gqa_attention_prefill.cu` is **patched** since GitHub #258 — the first
+  Ignis-patched behaviour, in the table above.) Unlike
   `attn_input_proj`/`linear_add` (P1-11), the vendored wrapper *is* the
   complete public API — every cache dtype (BF16, I8, hq-e8-2b/U8) is
   vendored and compiles, so no leaf-side dispatcher (`kernel/src/*.cu`) is

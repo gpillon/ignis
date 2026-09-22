@@ -184,8 +184,9 @@ struct ignis_seq_pool_spec {
   int32_t speculative_backend;
   /* Retained slots beside the lanes (GitHub #211, ADR 0030): places for one
    * mutable-state image each -- a lane's own state, GDN conv and recurrent
-   * state, penalty counts and, under DFLASH2, the drafter's window and
-   * checkpoint -- with no KV block-table row. `ignis_seq_alloc` never hands
+   * state, penalty counts, under DFLASH2 the drafter's window and checkpoint,
+   * and under hq-e8-2b the residual window (GitHub #257) -- with no KV
+   * block-table row. `ignis_seq_alloc` never hands
    * one to a sequence; `ignis_seq_retained_store` / `_load` move a lane's
    * state in and out. 0 reserves none. */
   uint32_t retained_slot_count;
@@ -224,6 +225,12 @@ struct ignis_seq_pool_stats {
   uint32_t retained_slot_count;
   uint64_t slot_state_bytes;
   uint64_t retained_state_bytes;
+  /* The hq-e8-2b residual window (GitHub #257, spec runtime/06): the exact
+   * sink and recent-ring K/V rows and the ring's validity words of every
+   * slot, lanes and retained slots alike -- its own plan line, in none of the
+   * lines above (`slot_state_bytes` leaves it out, so nothing counts it
+   * twice). 0 on a BF16 pool. */
+  uint64_t hq_residual_bytes;
 };
 
 /* What a pool built from a spec occupies, planned without building it
@@ -237,6 +244,9 @@ struct ignis_seq_pool_plan {
    * the built pool (GitHub #211). */
   uint64_t slot_state_bytes;
   uint64_t retained_state_bytes;
+  /* = ignis_seq_pool_stats::hq_residual_bytes of the built pool (GitHub
+   * #257). */
+  uint64_t hq_residual_bytes;
 };
 
 struct ignis_seq_stats {
@@ -412,7 +422,8 @@ struct ignis_seq_prefix_stats {
   uint32_t refcount;
   /* Device-resident bytes of the cloned (mutable) state image: the GDN
    * recurrent state, the conv taps and the penalty-count row, in one retained
-   * slot (GitHub #215). Paid once per prefix, not per claimant; 0 once the
+   * slot (GitHub #215) -- and on an hq-e8-2b pool the slot's residual window
+   * (GitHub #257). Paid once per prefix, not per claimant; 0 once the
    * handle is released and the slot with it. */
   uint64_t clone_image_bytes;
   /* Claims served (ignis_seq_alloc_shared calls that cloned from this
@@ -542,8 +553,9 @@ struct ignis_seq_checkpoint_stats {
   /* Whole KV pages below the opener, owned by the shared prefix underneath
    * and charged to the pool once. */
   uint32_t pages;
-  /* Device bytes this checkpoint holds of its own: one retained slot's state,
-   * plus one KV page when the opener ends inside a page. */
+  /* Device bytes this checkpoint holds of its own: one retained slot's state
+   * (its hq residual window included, GitHub #257), plus one KV page when the
+   * opener ends inside a page. */
   uint64_t image_bytes;
   /* Claims served (ignis_seq_alloc_from_checkpoint calls), and the wall time
    * the most recent one took, in microseconds -- the device-to-device cost

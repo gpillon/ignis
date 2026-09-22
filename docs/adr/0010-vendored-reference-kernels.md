@@ -10,6 +10,10 @@ what a port claim means.
 bullet below is exercisable now, per op, when a measurement identifies a
 vendored kernel as the bottleneck — by a recorded patch or by our own
 implementation replacing the call. The provenance rules below are unchanged.
+**Extended by ADR 0037** (2026-09-22): a vendored file with a demonstrated
+correctness bug may also carry a recorded patch, with a test that fails
+without it; the behaviour it changes is **Ignis patched**, everything else
+**reference parity**.
 
 Sources: `docs/REVIEW-2026-09-05.md` §3.2, §4.2, §5.4; spec
 `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36).

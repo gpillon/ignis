@@ -272,7 +272,13 @@ impl CudaLeafConfig {
         )?;
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
-            reserved: reserved_bytes(model, pool.lane_state_bytes, pool.retained_state_bytes, 0),
+            reserved: reserved_bytes(
+                model,
+                pool.lane_state_bytes,
+                pool.retained_state_bytes,
+                pool.hq_residual_bytes,
+                0,
+            ),
         })
     }
 
@@ -307,6 +313,7 @@ fn reserved_bytes(
     model: model_load::IgnisModelReservations,
     lane_state: u64,
     retained_slots: u64,
+    hq_residual_window: u64,
     kv_pool: u64,
 ) -> ReservedBytes {
     ReservedBytes {
@@ -318,6 +325,7 @@ fn reserved_bytes(
         drafter_round: model.drafter_round_bytes,
         lane_state,
         retained_slots,
+        hq_residual_window,
         kv_pool,
     }
 }
@@ -576,6 +584,7 @@ impl StepLeaf for CudaLeaf {
                 reserved,
                 pool_stats.lane_state_bytes,
                 pool_stats.retained_state_bytes,
+                pool_stats.hq_residual_bytes,
                 pool_stats.kv_arena_bytes,
             ),
         })

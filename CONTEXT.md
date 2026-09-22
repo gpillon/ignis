@@ -21,7 +21,18 @@ When output names a domain concept, use the term as defined here.
   Anything hand-written is not one, and carries no port claim (ADR 0010).
   A vendored op that a measurement identifies as the bottleneck may carry a
   recorded patch, or be replaced by our own implementation — which is then not
-  a vendored op and makes no port claim (ADR 0031).
+  a vendored op and makes no port claim (ADR 0031). One with a demonstrated
+  correctness bug may carry a recorded patch too, with a test that fails
+  without it (ADR 0037).
+- **Reference parity** — a behaviour ignis computes exactly as the
+  **reference** does. The default for every vendored op, and not a claim of
+  correctness: the reference can be wrong (ADR 0037).
+  _Avoid_: faithful, reference behaviour (for a behaviour ignis has changed).
+- **Ignis patched** — a behaviour ignis deliberately computes differently from
+  the **reference**, because the reference is wrong there; each is a recorded
+  patch with a test that tells the two apart. A difference from the reference
+  it causes is a declared departure, not a regression (ADR 0037).
+  _Avoid_: fork, divergence.
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
 - **Lane tag** — the request's own statement of its class, carried as an ignis
   extension field on the request and echoed in the request log. Two classes,
@@ -119,6 +130,17 @@ When output names a domain concept, use the term as defined here.
   metadata bytes per (token, KV head). Fixed bytes per token, so page
   addressing and CUDA-graph address stability are unchanged. 9,216 bytes per
   sequence-token against BF16's 65,536 — a factor of 7.11.
+- **Residual window** — the keys hq-e8-2b attention reads exact instead of
+  decoding: a sequence's first 32 keys (the **sinks**), a 512-slot **ring** of
+  recent keys, and the prefill chunk being attended. Per slot, not per page,
+  so it is a **state section** a clone or a restore carries; a ring bit names
+  no position, so appended columns a sequence does not keep (a verify round's
+  rejected drafts) must have theirs cleared. A prefill chunk reads the ring
+  before its own append writes it, so every key before the chunk is served its
+  own row — **Ignis patched** (ADR 0037, spec runtime/07, GitHub #258). The
+  reference appends first and so serves **clobbered** ring rows: the keys
+  before the chunk whose ring slots the chunk's own append rewrote, read as
+  those later keys' rows, a read of the future.
 - **KV format** — which of the two KV cache formats a load runs: **hq-e8-2b**,
   the serving default from G4, or **BF16**, retained as the format every
   correctness oracle runs against. A model-load option, fixed for the life of
@@ -173,7 +195,8 @@ When output names a domain concept, use the term as defined here.
   `ignis_seq_alloc` like every other slot section.
 - **State section** — one part of what a sequence is made of: its KV pages, its
   GDN slot, its conv taps, its position and last token, its penalty-count row,
-  and on a pool built with DFlash2 its **drafter window** and checkpoint.
+  on a pool built with DFlash2 its **drafter window** and checkpoint, and on an
+  hq-e8-2b pool its **residual window**.
   Each is either shareable read-only (KV pages) or must be cloned per sequence
   (everything mutable). The table of them lives inside the leaf, and adding one
   is the act that re-earns the **snapshot point** permission rather than
@@ -254,7 +277,9 @@ When output names a domain concept, use the term as defined here.
   **retained slots**, never beside them.
 - **Retained slot** — a place reserved at load for one mutable-state image of
   a **shared prefix** (retained, chained or still claimed) or of a **prompt
-  checkpoint**, the same size as a **lane**'s own state. There is one per lane
+  checkpoint**, the same size as a **lane**'s own state (under hq-e8-2b that
+  includes its **residual window**, which the VRAM plan counts on a line of its
+  own). There is one per lane
   unless the operator says otherwise. When none is free, the lowest-ranked
   **retained state** gives its slot up; when nothing can, the publish or
   capture is skipped and the request runs without leaving reuse behind.

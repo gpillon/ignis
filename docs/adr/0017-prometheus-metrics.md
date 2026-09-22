@@ -211,7 +211,7 @@ The initial stable metric contract is:
 | `ignis_decision_answer_mass` | histogram | none | Share of the next-token distribution held by a **readout's** declared options. **Readout-only**, so its `_count` is deliberately below the counter's sum — see below. **Absent until the first one** |
 
 ADR 0030 §Observability adds the memory gauges to this contract: the plan's
-eleven reserved lines, the budget, the KV pool's pages and page bytes, the
+reserved lines (eleven, twelve since #257 added `hq_residual_window`), the budget, the KV pool's pages and page bytes, the
 pages occupied of it, the KV-RAM arena's capacity and use, the retained slots'
 capacity and use, and the retained-slot skips. Every one is bytes, pages or
 slots; no percentage is exported.

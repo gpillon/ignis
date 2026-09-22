@@ -619,7 +619,7 @@ async fn labels_stay_within_the_bounded_sets() {
     .collect();
     assert_eq!(names, expected, "{text}");
 
-    /// The plan's eleven lines, as ADR 0030 §Observability spells them.
+    /// The plan's twelve lines, as ADR 0030 §Observability spells them.
     const VRAM_LINES: &[&str] = &[
         "weights",
         "cuda_context",
@@ -631,6 +631,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "drafter_round",
         "lane_state",
         "retained_slots",
+        "hq_residual_window",
         "residual",
     ];
     const TTFT_LE: &[&str] =

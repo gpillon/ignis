@@ -214,7 +214,7 @@ extern "C" int32_t ignis_seq_prefix_publish(struct ignis_seq_pool *pool, struct 
     // the pool exactly as they were, and the slot still free.
     auto entry           = std::make_unique<ignis_seq_prefix>();
     entry->tokens        = prefix_tokens;
-    entry->image_bytes   = pool->slot_state_bytes;
+    entry->image_bytes   = pool->retained_image_bytes();
     timed([&] { ignis_seq_capture_state(*pool, *seq, retained_slot, entry->progress); });
 
     // From here the steps are balanced against each other and cannot fail:
@@ -324,6 +324,11 @@ int32_t ignis_seq_alloc_against_prefix(struct ignis_seq_pool *pool, uint32_t con
     // claims -- zeroing them would erase the very thing this call exists to
     // hand over, and they belong to other holders besides.
     pool->kv_pool.zero_pages(seq->kv.page_ids());
+    // GitHub #257: the slot's hq residual window too, before any clone. Both
+    // callers clone an image over it a moment later, so this is not what
+    // makes a claimant's rows right -- it is what makes "never the previous
+    // occupant's" hold even on a claim that fails between the two.
+    ignis_seq_zero_hq_residual(*pool, slot);
     seq->slot         = slot;
     seq->prefix       = prefix;
     seq->shared_pages = shared;

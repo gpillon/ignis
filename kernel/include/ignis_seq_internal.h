@@ -68,6 +68,17 @@ inline constexpr int32_t kIgnisHqMetaRowBytes = 8;
 inline constexpr int32_t kIgnisHqHeadDim      = 256;
 inline constexpr int32_t kIgnisHqQuantGroup   = 32;
 
+/* The hq-e8-2b residual window's geometry (GitHub #257, spec runtime/06):
+ * the vendored `kGqaHqSinkKeys` sink rows and `kGqaHqRecentKeys` recent-ring
+ * rows one slot keeps exact per (GQA layer, KV head), and the ring's
+ * validity words -- one bit per ring slot, `kGqaHqRecentKeys / 32` words per
+ * slot row. Restated like the codec's byte budgets above and checked against
+ * the vendored constants in kernel/src/seq.cu. */
+inline constexpr int32_t kIgnisHqSinkKeys     = 32;
+inline constexpr int32_t kIgnisHqRecentKeys   = 512;
+inline constexpr int32_t kIgnisHqResidualRows = kIgnisHqSinkKeys + kIgnisHqRecentKeys;
+inline constexpr int32_t kIgnisHqRingWords    = kIgnisHqRecentKeys / 32;
+
 /* Planes one GQA layer's K/V history occupies, per format: BF16 stores one
  * plane per role, hq-e8-2b a code plane and a metadata plane per role. The
  * plane order is (K..., V...) in both, so a layer's planes are a contiguous
@@ -169,6 +180,70 @@ struct ignis_seq_pool {
   std::uint64_t dflash2_lane_bytes() const {
     return has_dflash2() ? static_cast<std::uint64_t>(dflash2_window->lane_host_bytes()) : 0;
   }
+
+  // GitHub #257 (spec runtime/06): the hq-e8-2b residual window -- the exact
+  // BF16 sink and recent-ring rows the vendored hq attention kernels read
+  // instead of decoding, in the codec's rotated frame, plus the ring's
+  // validity words. Present only on an hq pool; a BF16 pool leaves all three
+  // null, which is what keeps its views on the plain route.
+  //
+  // Indexed by **slot**, not by page, exactly like the reference's
+  // `decoder_state.cpp`: plane (layer, slot) is dim-3 index
+  // `layer * hq_residual_slots + slot` of `[256, kv_heads, 544, 16 *
+  // hq_residual_slots]`, and the ring is `[16, hq_residual_slots]` words shared
+  // by every layer (an append is position-driven, so the layers agree). The
+  // slots are every state slot -- the lanes, then the retained slots past them
+  // (GitHub #211) -- so a retained image carries its rows like any other CLONE
+  // section; the views name only the lanes' leading rows. One cudaMalloc,
+  // sized at create and never per request (ADR 0030).
+  std::unique_ptr<ninfer::DeviceBuffer> hq_residual;
+  void *hq_residual_k       = nullptr;
+  void *hq_residual_v       = nullptr;
+  std::uint32_t *hq_ring    = nullptr;
+  std::int32_t hq_residual_slots = 0;
+
+  bool has_hq_residual() const { return hq_residual != nullptr; }
+
+  // One (layer, slot) side plane: every KV head's 544 rows.
+  std::uint64_t hq_residual_plane_bytes() const {
+    return static_cast<std::uint64_t>(kIgnisHqHeadDim) * static_cast<std::uint64_t>(kv_num_kv_heads) *
+           kIgnisHqResidualRows * 2u;
+  }
+
+  // The distance between one layer's plane of a slot and the next layer's:
+  // every slot's plane of a layer sits between them. What a slot's 16 planes
+  // are copied or zeroed with, as one 2D transfer.
+  std::size_t hq_residual_layer_pitch() const {
+    return static_cast<std::size_t>(hq_residual_plane_bytes()) * static_cast<std::size_t>(hq_residual_slots);
+  }
+
+  // Slot `slot`'s side plane of GQA layer `gqa_layer`, role K or V.
+  void *hq_residual_plane(bool role_v, std::int32_t gqa_layer, std::int32_t slot) const {
+    auto *base = static_cast<unsigned char *>(role_v ? hq_residual_v : hq_residual_k);
+    return base + (static_cast<std::uint64_t>(gqa_layer) * static_cast<std::uint64_t>(hq_residual_slots) +
+                   static_cast<std::uint64_t>(slot)) *
+                      hq_residual_plane_bytes();
+  }
+
+  // Slot `slot`'s ring validity words.
+  std::uint32_t *hq_ring_words(std::int32_t slot) const {
+    return hq_ring + static_cast<std::ptrdiff_t>(slot) * kIgnisHqRingWords;
+  }
+
+  // Bytes one slot's window occupies, on the device and in its host image
+  // alike: every layer's K plane, then every layer's V plane, then its ring
+  // words. 0 on a BF16 pool.
+  std::uint64_t hq_residual_slot_bytes() const {
+    return has_hq_residual() ? 2u * kIgnisGqaLayerCount * hq_residual_plane_bytes() +
+                                   kIgnisHqRingWords * sizeof(std::uint32_t)
+                             : 0;
+  }
+
+  // What one retained image holds on the device: a slot's state and, on an
+  // hq pool, its residual window (GitHub #257) -- the window rides every
+  // clone, but the VRAM plan counts it on its own line rather than in
+  // `slot_state_bytes`.
+  std::uint64_t retained_image_bytes() const { return slot_state_bytes + hq_residual_slot_bytes(); }
 
   ignis_seq_pool(std::size_t kv_bytes, const ninfer::PagedKVPoolLayout &kv_layout,
                  std::size_t gdn_bytes, const ninfer::LinearAttentionStatePoolLayout &gdn_layout,
@@ -317,6 +392,21 @@ inline std::string ignis_seq_retained_slot_refusal(const ignis_seq_pool &pool,
  * kernel/src/seq.cu. */
 void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int32_t dst);
 
+/* GitHub #257: pool slot `slot`'s hq residual window to (`kind` =
+ * cudaMemcpyDeviceToHost) or from (cudaMemcpyHostToDevice) `host`, laid out
+ * as the IGNIS_SEQ_SECTION_HQ_RESIDUAL payload. Enqueued on the default
+ * stream; the caller synchronizes. Throws on a failed copy. Defined in
+ * kernel/src/seq.cu. */
+void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, void *host,
+                                cudaMemcpyKind kind);
+
+/* Zero pool slot `slot`'s hq residual window -- every side row and every ring
+ * bit -- so a slot handed to a new sequence never serves its previous
+ * occupant's rows: the ring bits because they carry no position, and the
+ * sink rows because the kernels read them with no bit at all. A no-op on a
+ * BF16 pool. Throws on a failed memset. */
+void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot);
+
 /* The leaf's thread-local last-error slot -- the one `ignis_seq_last_error`
  * reports. Defined in kernel/src/seq.cu and written by kernel/src/seq_prefix.cu
  * too, so one error surface answers for every sequence entry point rather
@@ -384,11 +474,9 @@ inline const char *ignis_kv_format_name(std::int32_t kv_format) {
  * the same `paged_kv_element_offset` in both formats; only a plane's leading
  * extent differs, which is what keeps capacity math format-independent.
  *
- * The residual planes stay empty in both. The hq residual window (the exact
- * BF16 sink + recent rows `ninfer/ops/gqa_attention.h` describes) is a
- * separate per-slot side store this engine has not opted into; every hq
- * kernel guards it on a null pointer, so leaving it empty selects the
- * codec-only path rather than reading uninitialized memory. */
+ * The residual window is not filled here: it is indexed by slot row rather
+ * than by page, so the two builders name it differently
+ * (`ignis_kv_fill_residual` below). */
 template <class View>
 inline void ignis_kv_fill_layer_planes(View &view, ignis_seq_pool *pool, std::int32_t gqa_layer) {
   view.k_pages =
@@ -405,6 +493,33 @@ inline void ignis_kv_fill_layer_planes(View &view, ignis_seq_pool *pool, std::in
   view.quant_group  = ignis_kv_quant_group(pool->kv_format);
   view.head_dim     = pool->kv_head_dim;
   view.num_kv_heads = pool->kv_num_kv_heads;
+}
+
+/* The hq-e8-2b residual window (GitHub #257, spec runtime/06) of GQA layer
+ * `gqa_layer` over `slots` consecutive slot rows from `first_slot`: the
+ * exact side planes `[256, kv_heads, 544, slots]` and the ring words `[16,
+ * slots]` the vendored hq kernels read when a view carries them. Every hq
+ * kernel guards the window on a null pointer, so a BF16 pool -- which
+ * allocates none -- leaves all three empty and keeps the plain route.
+ *
+ * The tensors are built over the pool's own storage rather than sliced from
+ * a whole-pool tensor: the ring words of `slots` rows are `slots * 64`
+ * contiguous bytes, and a slice of a wider `[16, state_slots]` tensor would
+ * keep the wider row stride the vendored contiguity check refuses. */
+template <class View>
+inline void ignis_kv_fill_residual(View &view, const ignis_seq_pool *pool, std::int32_t gqa_layer,
+                                   std::int32_t first_slot, std::int32_t slots) {
+  if (!pool->has_hq_residual()) {
+    return;
+  }
+  const std::initializer_list<std::int32_t> plane = {kIgnisHqHeadDim, pool->kv_num_kv_heads,
+                                                     kIgnisHqResidualRows, slots};
+  view.residual_k = ninfer::Tensor(pool->hq_residual_plane(false, gqa_layer, first_slot),
+                                   ninfer::DType::BF16, plane);
+  view.residual_v = ninfer::Tensor(pool->hq_residual_plane(true, gqa_layer, first_slot),
+                                   ninfer::DType::BF16, plane);
+  view.ring_valid = ninfer::Tensor(pool->hq_ring_words(first_slot), ninfer::DType::I32,
+                                   {kIgnisHqRingWords, slots, 1, 1});
 }
 
 /* The single-sequence cache view, for the ops that take one: A2
@@ -426,6 +541,9 @@ inline ninfer::PagedKVLayerView ignis_kv_layer_view(ignis_seq_pool *pool, ignis_
                                                     std::int32_t gqa_layer) {
   ninfer::PagedKVLayerView view;
   ignis_kv_fill_layer_planes(view, pool, gqa_layer);
+  // A layer view arrives pre-sliced to its sequence's slot row (the vendored
+  // `GqaPrefillDirectMetadata::residual_slot` is 0).
+  ignis_kv_fill_residual(view, pool, gqa_layer, seq->slot, 1);
   view.block_table = seq->kv.block_table();
   return view;
 }
@@ -440,6 +558,11 @@ inline ninfer::PagedKVBatchLayerView ignis_kv_batch_layer_view(ignis_seq_pool *p
                                                                std::int32_t gqa_layer) {
   ninfer::PagedKVBatchLayerView view;
   ignis_kv_fill_layer_planes(view, pool, gqa_layer);
+  // Every lane's row, in block-table order: the kernels offset the window by
+  // the table row they already selected, and `validate_residual` wants
+  // exactly as many rows as the block tables have. The retained slots past
+  // the lanes hold images, never a row a round names.
+  ignis_kv_fill_residual(view, pool, gqa_layer, 0, pool->kv_pool.table_row_count());
   view.block_tables = pool->kv_pool.block_tables();
   return view;
 }

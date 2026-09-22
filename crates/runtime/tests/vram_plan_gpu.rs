@@ -62,6 +62,8 @@ fn the_planned_reservations_are_what_the_load_holds() {
         ("drafter_round", planned.reserved.drafter_round),
         ("lane_state", planned.reserved.lane_state),
         ("retained_slots", planned.reserved.retained_slots),
+        // GitHub #257: an hq-e8-2b load keeps the residual window.
+        ("hq_residual_window", planned.reserved.hq_residual_window),
     ] {
         assert!(bytes > 0, "{line} is planned at 0 bytes on a load that reserves it");
     }
