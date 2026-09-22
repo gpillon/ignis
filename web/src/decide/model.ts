@@ -309,7 +309,14 @@ function methodFaults(question: Question, name: string): Fault[] {
       question.kind === "box"
         ? "a box cannot come out of the pointing head — its region is not a box — so a box is always the chain's"
         : "`method` chooses how a point is answered, and this primitive has one way";
-    faults.push({ code: "method_unsupported", message: `${name} is a ${question.kind}: ${why}.`, uid: question.uid });
+    // Where to clear it is part of the fault: only a point's card carries the
+    // control, so a method that reached a box did so through the JSON editor
+    // and that is the one place it can be taken off again.
+    faults.push({
+      code: "method_unsupported",
+      message: `${name} is a ${question.kind}: ${why}. Remove \`method\` in the JSON view.`,
+      uid: question.uid,
+    });
   }
   return faults;
 }

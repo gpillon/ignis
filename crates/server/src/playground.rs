@@ -155,8 +155,7 @@ mod tests {
     ///
     /// The table is a list, so it falls behind whatever `web/` starts
     /// importing next; this fails on the asset kind nobody added a branch
-    /// for rather than shipping it as an opaque download. `map` is exempt:
-    /// a source map is not served to anyone who cares about its type.
+    /// for rather than shipping it as an opaque download.
     #[test]
     fn every_embedded_extension_is_named() {
         for (name, _) in EMBEDDED.iter() {

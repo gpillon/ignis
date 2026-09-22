@@ -74,10 +74,11 @@ against the 2-50% the in-process acceptance measured on synthetic scenes at
 is a larger share of a smaller total.
 
 The chain is *slower on the smaller image* (200 against 174 ms) while the
-head is faster (60 against 83), which is the shape to expect: the head's cost
-is the prefill and follows the token count, the chain's is nine decode rounds
-whose count does not, and whose drafter acceptance varies with how confident
-the digits are.
+head is faster (60 against 83). The head's half of that is the shape to
+expect -- its cost is the prefill and follows the token count -- and the
+chain's is not explained here: nine decode rounds whose count does not follow
+the prompt, and the digits it writes differ between the two images, so
+drafter acceptance is a plausible cause and is not measured.
 
 **Cost against size**, head only, the same frame re-encoded at eight widths,
 median of six warm requests each:
@@ -94,7 +95,8 @@ median of six warm requests each:
 | 426 | 229 | 44 ms |
 
 Roughly 0.1 ms a prompt token over a ~20 ms floor. The head found the face at
-every one of those widths.
+seven of those eight widths; at 512 px it sits about 3 px left of the face's
+edge, on the panel bezel -- a tenth of a cell out, and outside all the same.
 
 ## Where the points land
 
@@ -125,7 +127,8 @@ the bezel beside it.
   resolution.** It saves 20-30 ms of prefill and shrinks the target in cells
   one for one, because a cell is a fixed ~32 px of whatever was submitted. An
   agent should send the screenshot it has.
-- **The first question about an image is 5-8x the ones after it**, so a
+- **The first question about an image is 5-6x the ones after it** (506 ms
+  against 83-92 ms, the one row that is a true first sight), so a
   caller with several questions about one screenshot should send them as one
   fan-out, or at least over one retained prefix, rather than as separate
   requests.
