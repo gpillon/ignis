@@ -175,7 +175,7 @@ void ignis_seq_copy_hq_residual(const ignis_seq_pool &pool, std::int32_t slot, v
                                 cudaMemcpyKind kind) {
   const bool to_host        = kind == cudaMemcpyDeviceToHost;
   const std::size_t plane   = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
-  const std::size_t pitch   = plane * static_cast<std::size_t>(pool.hq_residual_slots);
+  const std::size_t pitch   = pool.hq_residual_layer_pitch();
   auto *image               = static_cast<unsigned char *>(host);
   for (const bool role_v : {false, true}) {
     void *device        = pool.hq_residual_plane(role_v, 0, slot);
@@ -200,7 +200,7 @@ void ignis_seq_zero_hq_residual(ignis_seq_pool &pool, std::int32_t slot) {
     return;
   }
   const std::size_t plane = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
-  const std::size_t pitch = plane * static_cast<std::size_t>(pool.hq_residual_slots);
+  const std::size_t pitch = pool.hq_residual_layer_pitch();
   for (const bool role_v : {false, true}) {
     const cudaError_t err =
         cudaMemset2D(pool.hq_residual_plane(role_v, 0, slot), pitch, 0, plane, kIgnisGqaLayerCount);
@@ -1241,7 +1241,7 @@ void ignis_seq_copy_slot_state(ignis_seq_pool &pool, std::int32_t src, std::int3
       // the rows of the image it cloned unless they are copied to its own
       // slot. One 2D copy per role, as for the GDN sections, plus the words.
       const std::size_t plane = static_cast<std::size_t>(pool.hq_residual_plane_bytes());
-      const std::size_t pitch = plane * static_cast<std::size_t>(pool.hq_residual_slots);
+      const std::size_t pitch = pool.hq_residual_layer_pitch();
       for (const bool role_v : {false, true}) {
         const cudaError_t err = cudaMemcpy2DAsync(
             pool.hq_residual_plane(role_v, 0, dst), pitch, pool.hq_residual_plane(role_v, 0, src),

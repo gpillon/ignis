@@ -234,3 +234,8 @@ faithful to it.
 - **The consumed-key capture runs one layer's scratch per query chunk**, and
   its self-check holds it to "no exact row"; the day the residual window is
   wired, that test fails on purpose and these hq numbers need re-running.
+  That day was 2026-09-22 ([the residual window was the tool-call
+  gap](2026-09-22-the-residual-window-was-the-tool-call-gap.md), GitHub #257):
+  every hq number here describes the engine without it. At the query's chunk
+  the window keeps 59.9% of a 1,024 px prompt's image exact and 3.7% of the
+  4,096 px fixture's, so the 1,024 px arms are the ones to re-measure first.

@@ -210,6 +210,13 @@ struct ignis_seq_pool {
            kIgnisHqResidualRows * 2u;
   }
 
+  // The distance between one layer's plane of a slot and the next layer's:
+  // every slot's plane of a layer sits between them. What a slot's 16 planes
+  // are copied or zeroed with, as one 2D transfer.
+  std::size_t hq_residual_layer_pitch() const {
+    return static_cast<std::size_t>(hq_residual_plane_bytes()) * static_cast<std::size_t>(hq_residual_slots);
+  }
+
   // Slot `slot`'s side plane of GQA layer `gqa_layer`, role K or V.
   void *hq_residual_plane(bool role_v, std::int32_t gqa_layer, std::int32_t slot) const {
     auto *base = static_cast<unsigned char *>(role_v ? hq_residual_v : hq_residual_k);

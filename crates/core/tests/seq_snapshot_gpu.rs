@@ -45,15 +45,15 @@ mod snapshot_blob;
 use std::path::Path;
 
 use ignis_artifact::{
-    CudaDevice, Device, FrontendSet, MaterializedArtifact, ModelScope, ObjectHandle, Reader,
-    bind_model_scope_27b_with, materialize,
+    CudaDevice, Device, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, bind_text_scope_27b,
+    materialize,
 };
 use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::gqa_layer::run_gqa_layer;
 use ignis_core::hq_ring::HqRing;
-use ignis_core::model_load::{Model, load_qwen38_27b_with_options};
+use ignis_core::model_load::{Model, load_qwen38_27b, load_qwen38_27b_with_options};
 use ignis_core::RopeScaling;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
 use ignis_core::step::{
@@ -146,7 +146,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let artifact = match materialize(&reader, &plan, &mut device, None) {
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
         Ok(artifact) => artifact,
         Err(e) => {
             if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
@@ -399,13 +399,11 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
         "the rope delta must change the decoded tokens, or this leg proves nothing about it"
     );
 
-    // ---- GitHub #257: the same claim under hq-e8-2b ---------------------------
-    //
-    // Over the artifact already on the card: a second materialization in the
-    // same process finds the card still full.
+    // The arena outlives a drop: without the release, the next test in this
+    // process finds the card still full.
     drop(pool);
     drop(model);
-    hq_sequence_restored_into_another_slot(&reader, &frontend, &artifact, &handles);
+    let _ = artifact.release_arena(&mut device);
 }
 
 /// GitHub #257 (spec runtime/06): a sequence restored under hq-e8-2b into a
@@ -415,14 +413,36 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
 /// with them. The ring words the source holds after its prefill and a run of
 /// one-token decode rounds are read out of the blob and held to the host rule
 /// (the decode route has no tap: this is its observation).
-fn hq_sequence_restored_into_another_slot(
-    reader: &Reader,
-    frontend: &FrontendSet,
-    artifact: &MaterializedArtifact,
-    handles: &[ObjectHandle],
-) {
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn an_hq_sequence_restored_into_another_slot_continues_to_the_same_tokens() {
     const CONTEXT: u32 = 1024;
     const CHUNK: u32 = 256;
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let (plan, handles) = bind_text_scope_27b(&reader).unwrap_or_else(|e| panic!("bind: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
     let encode = |text: &str| -> Vec<i32> {
         frontend
             .tokenizer()
@@ -448,18 +468,8 @@ fn hq_sequence_restored_into_another_slot(
         prompt.len()
     );
 
-    let model = load_qwen38_27b_with_options(
-        reader,
-        artifact,
-        handles,
-        CHUNK,
-        CONTEXT,
-        ignis_core::KvFormat::HqE8_2b,
-        None,
-        Some(Vision::default()),
-        RopeScaling::NONE,
-    )
-    .unwrap_or_else(|e| panic!("load hq model: {e}"));
+    let model = load_qwen38_27b(&reader, &artifact, &handles, CHUNK, CONTEXT, ignis_core::KvFormat::HqE8_2b)
+        .unwrap_or_else(|e| panic!("load hq model: {e}"));
     let pool = SeqPool::create(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
@@ -526,4 +536,8 @@ fn hq_sequence_restored_into_another_slot(
         "an hq sequence restored into another slot continues to the same tokens it would have \
          produced unevicted"
     );
+    drop(restored);
+    drop(pool);
+    drop(model);
+    let _ = artifact.release_arena(&mut device);
 }

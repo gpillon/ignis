@@ -1,11 +1,11 @@
-# The hq residual window was the tool-call gap, and the prompt route reads it after its own append
+# The hq residual window was most of the tool-call gap, and the prompt route reads it after its own append
 
 - Kind: experiment
 - Status: current
 - Observed: 2026-09-22
 - Last verified: 2026-09-22
 - Scope: kernel / hq-e8-2b attention, residual window, sequence state; serving / tool-call decisions
-- Related: GitHub #257, #173, #160, #161; spec `docs/specs/runtime/06-hq-residual-window.md`; `docs/findings/2026-09-12-hq-attention-route-agreement.md`, `docs/findings/2026-09-22-the-codec-costs-the-head-its-read.md`
+- Related: [#257](https://github.com/gpillon/ignis/issues/257), [#173](https://github.com/gpillon/ignis/issues/173), [#160](https://github.com/gpillon/ignis/issues/160), [#161](https://github.com/gpillon/ignis/issues/161); spec [runtime/06](../specs/runtime/06-hq-residual-window.md); [hq attention route agreement](2026-09-12-hq-attention-route-agreement.md), [the codec costs the head its read](2026-09-22-the-codec-costs-the-head-its-read.md)
 - Superseded by: none
 
 ## Question
@@ -67,8 +67,10 @@ a KV-RAM restore of the materialized checkpoint blob and a chained turn
 sequence used continues to the same tokens, the re-allocated slot's window
 reading all zero first (`seq_snapshot_gpu.rs`); and the ring words read out of
 the snapshot after a prefill, after six one-token decode rounds, and after
-every one of 11 DFlash2 verify rounds over 4 lanes (65 rejected columns) are
-exactly the host rule's (`seq_snapshot_gpu.rs`, `dflash2_round_gpu.rs`).
+every one of 15 DFlash2 verify rounds over 4 lanes — two of them on prompts
+longer than the ring, so 82 of the 114 rejected columns cleared a slot an
+older key inside the window named — are exactly the host rule's
+(`seq_snapshot_gpu.rs`, `dflash2_round_gpu.rs`).
 
 **#173, re-run** (`.scratch/diag-160/twenty/`: the recorded 20 prompts with
 tools, greedy, thinking off, `max_tokens` 1024, served with the Makefile's
@@ -94,16 +96,21 @@ of this one (2.33 against 2.58 tokens per round).
 
 ## Finding
 
-1. **The residual window is the #173 gap.** On the same code in the same
-   session, wiring it takes the prompts that end in a tool call from 4 to 17 of
-   20, against the reference's 18. Reading the 512 most recent keys and the
-   sinks through the codec was enough to change the greedy decision of a
-   24K-token agentic turn.
-2. **The ring is served after the chunk's own append.** For a prefill chunk
-   `[p0, p0 + w)`, the keys `[p0 - 512, p0 - 512 + min(w, 512))` are read as
-   the exact rows of the chunk keys that share their ring slots. At the
-   serving chunk of 1,024 every full chunk after the first reads its whole
-   pre-chunk ring this way; a short last chunk loses `w` of it. The reference
+1. **The residual window accounts for almost all of the #173 gap.** On the
+   same code in the same session, wiring it takes the prompts that end in a
+   tool call from 4 to 17 of 20, against the reference's 18 — the remaining
+   one is within what a single near-tie moves (see *Limits*). Reading the 512
+   most recent keys and the sinks through the codec was enough to change the
+   greedy decision of a 24K-token agentic turn.
+2. **The ring is served after the chunk's own append — a read of the
+   future.** For a prefill chunk `[p0, p0 + w)`, the keys `[p0 - 512, p0 - 512
+   + min(w, 512))` are read as the exact rows of the chunk keys 512 positions
+   later that share their ring slots. A query early in the chunk thus attends,
+   at a past position the causal mask allows, to the row of a key up to ~1,000
+   positions *ahead* of it: hq prefill with the window is not causal there. At
+   the serving chunk of 1,024 every full chunk after the first reads its whole
+   pre-chunk ring this way; a short last chunk loses `w` of it. Decode is not
+   affected (its window ends at the round's own last append). The reference
    does the same, so the #173 comparison above is like for like.
 3. **The window is slot state, not page state.** It survives a prefix claim, a
    checkpoint claim, a snapshot and a KV-RAM restore only because it is a CLONE
@@ -116,11 +123,12 @@ of this one (2.33 against 2.58 tokens per round).
   #160's first-token divergence, #161's spec-on/spec-off gap, the pointing
   study's set C and C4096 hq arms, and G5's hq cells. They are candidates for
   re-measurement, not results about the format.
-- The clobbered ring is a correctness gap the reference shares. Swapping the
-  two launches in `gqa_attention_prompt_launch` when the window is on would
-  serve the 512 pre-chunk keys their own rows; it is a patch to a vendored file
-  that ADR 0031's bottleneck exemption does not cover, and it would make ignis
-  read differently from the reference it is compared against.
+- The clobbered ring is a correctness gap — a causality leak inside every
+  prefill chunk after the first — that the reference shares. Swapping the two
+  launches in `gqa_attention_prompt_launch` when the window is on would serve
+  the 512 pre-chunk keys their own rows; it is a patch to a vendored file that
+  ADR 0031's bottleneck exemption does not cover, and it would make ignis read
+  differently from the reference it is compared against.
 - Codec coverage inside attention now needs a history longer than the window
   (or the codec-only arm the route agreement test keeps).
 
@@ -132,9 +140,14 @@ of this one (2.33 against 2.58 tokens per round).
   build with the launch order swapped, measured the same way.
 - The decode route has no tap; its reads are observed only through the ring
   words and through the tokens the lifecycle tests compare.
+- The byte-identical codec check needs a capture from a build without the
+  window (`IGNIS_TAP_BASELINE`); it is a measurement taken once, recorded
+  above, not something the GPU profile re-checks.
 
 ## Follow-ups
 
-- Owner's call: patch the launch order (a recorded vendored patch and an ADR),
-  or keep the reference's behaviour.
-- Re-measure #160/#161 and the pointing study's hq arms with the window on.
+- The launch order: patch it (a recorded vendored patch and an ADR) or keep
+  the reference's behaviour. An owner decision, not yet filed as an issue.
+- #160 and #161: re-measure their hq cells with the window on (both issues
+  track it; #173 carries the numbers above).
+- The pointing study's hq arms (set C, C4096): its own follow-up, per the spec.

@@ -882,7 +882,7 @@ fn one_attention_head_points_in_the_engine() {
                             kv_head,
                             by as usize,
                         ));
-                        off_rule += usize::from(to_by >= EXACT_ROW_REL_ERR);
+                        off_rule += usize::from(to_by >= EXACT_ROW_REL_ERR || err < EXACT_ROW_REL_ERR);
                         clobbered.push(to_by);
                     }
                     PromptSource::Codec => {

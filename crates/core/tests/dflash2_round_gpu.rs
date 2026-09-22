@@ -570,9 +570,6 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         assert_eq!(evicted, never_evicted, "the restored sequence continued differently from the one never evicted");
     }
 
-    // --- GitHub #257: under hq-e8-2b, the rounds' rejected columns -------
-    hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft(&reader, &artifact, &handles, &canaries, &stop_ids);
-
     let _ = artifact.release_arena(&mut device);
 }
 
@@ -585,83 +582,157 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
 /// out of its snapshot, must be the host rule's (`ignis_core::hq_ring`): the
 /// prefill's appends, every round's columns, the clear of every column it did
 /// not commit.
-fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft(
-    reader: &Reader,
-    artifact: &MaterializedArtifact,
-    handles: &[ObjectHandle],
-    prompts: &[Vec<i32>],
-    stop_ids: &[i32],
-) {
-    let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
-    let model = load_qwen38_27b_with_speculation(
-        reader,
-        artifact,
-        handles,
-        MAX_CONTEXT,
-        MAX_CONTEXT,
-        KvFormat::HqE8_2b,
-        Some(spec),
-    )
-    .unwrap_or_else(|e| panic!("model load (hq, dflash2, window {WINDOW}): {e}"));
-    let width = prompts.len();
-    let pool = SeqPool::create_with_speculation(
-        &ModelConfig::qwen38_27b(),
-        &SeqPoolBudget {
-            kv_format: KvFormat::HqE8_2b,
-            kv_page_group_count: MAX_CONTEXT.div_ceil(64) * width as u32,
-            max_context_tokens: MAX_CONTEXT,
-            slot_count: width as u32,
-            retained_slot_count: 0,
-        },
-        Some(SpeculativeBackend::Dflash2),
-    )
-    .unwrap_or_else(|e| panic!("seq pool create: {e}"));
-    let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
-
-    let mut lanes: Vec<Seq<'_>> =
-        prompts.iter().map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
-    prefill_all(&model, &pool, &mut lanes, prompts);
-    // Each canary is shorter than a prefill chunk: one append each.
-    let mut rings: Vec<HqRing> = prompts.iter().map(|p| ring_after_prefill(&[(0, p.len() as u64)])).collect();
-    let mut frontier: Vec<u64> = prompts.iter().map(|p| p.len() as u64).collect();
-    for (lane, ring) in lanes.iter().zip(&rings) {
-        let blob = lane.snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
-        assert_eq!(hq_ring_words(&blob), ring.words(), "the ring words after the prefill are the rule's");
+///
+/// Two lanes carry prompts longer than the ring, so their slots have wrapped
+/// and a cleared bit is one an older key inside the window named -- the case
+/// the clear exists for; the two canaries have not wrapped.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft() {
+    const CONTEXT: u32 = 1024;
+    const CHUNK: u32 = 128;
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
     }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let encode = |text: &str| -> Vec<i32> {
+        frontend
+            .tokenizer()
+            .encode(text)
+            .unwrap_or_else(|e| panic!("tokenize: {e}"))
+            .into_iter()
+            .map(|id| i32::try_from(id).expect("token id fits i32"))
+            .collect()
+    };
+    let stop_ids: Vec<i32> = ["<|im_end|>", "<|endoftext|>"].iter().flat_map(|marker| encode(marker)).collect();
+    let turn = |text: &str| encode(&format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    let long = |topic: &str| {
+        format!(
+            "{}Now answer in one sentence: {topic}",
+            "A paged KV cache keeps each sequence's keys and values in fixed-size pages, and a block \
+             table maps every logical page to a physical one, so many sequences share one pool. "
+                .repeat(16)
+        )
+    };
+    let prompts: Vec<Vec<i32>> = vec![
+        turn(CANARY_PROMPTS[0]),
+        turn(CANARY_PROMPTS[2]),
+        turn(&long("what does the block table map?")),
+        turn(&long("why do pages make many sequences fit?")),
+    ];
+    assert!(
+        prompts[2].len() > 544 && prompts[3].len() > 544,
+        "the long prompts must wrap the ring past the sinks: {} and {} tokens",
+        prompts[2].len(),
+        prompts[3].len()
+    );
+    assert!(prompts.iter().all(|p| p.len() + TOTAL < CONTEXT as usize), "a prompt outgrows the context");
+    assert_eq!(snapshot_format_version(), 4, "this test reads the version-4 blob layout");
 
-    let mut emitted = vec![0usize; width];
-    let mut done = vec![false; width];
-    let (mut rounds, mut rejected) = (0usize, 0u64);
-    while done.iter().any(|d| !d) {
-        let active: Vec<usize> = (0..width).filter(|&i| !done[i]).collect();
-        let budgets: Vec<u32> = active.iter().map(|&i| (TOTAL - emitted[i]) as u32).collect();
-        let mut remaining: Vec<Option<&mut Seq<'_>>> = lanes.iter_mut().map(Some).collect();
-        let mut refs: Vec<&mut Seq<'_>> =
-            active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
-        let results = round(&model, &pool, &mut refs, &budgets, stop_ids);
-        for (&i, result) in active.iter().zip(results) {
-            let written = u64::from(result.extent) + 1;
-            let kept = result.tokens.len() as u64;
-            rings[i].append_decode(frontier[i], written);
-            rings[i].invalidate(frontier[i] + kept, frontier[i] + written);
-            rejected += written - kept;
-            frontier[i] += kept;
-            done[i] = result.tokens.iter().any(|t| stop_ids.contains(t));
-            emitted[i] += result.tokens.len();
-            done[i] |= emitted[i] >= TOTAL;
+    let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
+        .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
         }
-        for &i in &active {
-            let blob = lanes[i].snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
-            assert_eq!(
-                hq_ring_words(&blob),
-                rings[i].words(),
-                "lane {i}, round {rounds}: the ring words are the rule's -- every rejected column's \
-                 bit cleared, every committed one's set"
-            );
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
         }
-        rounds += 1;
-        assert!(rounds <= TOTAL, "the run does not converge");
+    };
+    {
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
+        let model =
+            load_qwen38_27b_with_speculation(&reader, &artifact, &handles, CHUNK, CONTEXT, KvFormat::HqE8_2b, Some(spec))
+                .unwrap_or_else(|e| panic!("model load (hq, dflash2, window {WINDOW}): {e}"));
+        let width = prompts.len();
+        let pool = SeqPool::create_with_speculation(
+            &ModelConfig::qwen38_27b(),
+            &SeqPoolBudget {
+                kv_format: KvFormat::HqE8_2b,
+                kv_page_group_count: CONTEXT.div_ceil(64) * width as u32,
+                max_context_tokens: CONTEXT,
+                slot_count: width as u32,
+                retained_slot_count: 0,
+            },
+            Some(SpeculativeBackend::Dflash2),
+        )
+        .unwrap_or_else(|e| panic!("seq pool create: {e}"));
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+
+        let mut lanes: Vec<Seq<'_>> =
+            prompts.iter().map(|_| pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+        prefill_all(&model, &pool, &mut lanes, &prompts);
+        // Each prompt in the model's prefill chunks, each chunk appended as the
+        // fill kernel appends it.
+        let mut rings: Vec<HqRing> = prompts
+            .iter()
+            .map(|p| {
+                let chunks: Vec<(u64, u64)> = (0..p.len() as u64)
+                    .step_by(CHUNK as usize)
+                    .map(|start| (start, u64::from(CHUNK).min(p.len() as u64 - start)))
+                    .collect();
+                ring_after_prefill(&chunks)
+            })
+            .collect();
+        let mut frontier: Vec<u64> = prompts.iter().map(|p| p.len() as u64).collect();
+        for (lane, ring) in lanes.iter().zip(&rings) {
+            let blob = lane.snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
+            assert_eq!(hq_ring_words(&blob), ring.words(), "the ring words after the prefill are the rule's");
+        }
+
+        let mut emitted = vec![0usize; width];
+        let mut done = vec![false; width];
+        let (mut rounds, mut rejected, mut rejected_wrapped) = (0usize, 0u64, 0u64);
+        while done.iter().any(|d| !d) {
+            let active: Vec<usize> = (0..width).filter(|&i| !done[i]).collect();
+            let budgets: Vec<u32> = active.iter().map(|&i| (TOTAL - emitted[i]) as u32).collect();
+            let mut remaining: Vec<Option<&mut Seq<'_>>> = lanes.iter_mut().map(Some).collect();
+            let mut refs: Vec<&mut Seq<'_>> =
+                active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
+            let results = round(&model, &pool, &mut refs, &budgets, &stop_ids);
+            for (&i, result) in active.iter().zip(results) {
+                let written = u64::from(result.extent) + 1;
+                let kept = result.tokens.len() as u64;
+                rings[i].append_decode(frontier[i], written);
+                rings[i].invalidate(frontier[i] + kept, frontier[i] + written);
+                rejected += written - kept;
+                if frontier[i] >= 512 + 32 {
+                    rejected_wrapped += written - kept;
+                }
+                frontier[i] += kept;
+                done[i] = result.tokens.iter().any(|t| stop_ids.contains(t));
+                emitted[i] += result.tokens.len();
+                done[i] |= emitted[i] >= TOTAL;
+            }
+            for &i in &active {
+                let blob = lanes[i].snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
+                assert_eq!(
+                    hq_ring_words(&blob),
+                    rings[i].words(),
+                    "lane {i}, round {rounds}: the ring words are the rule's -- every rejected column's \
+                     bit cleared, every committed one's set"
+                );
+            }
+            rounds += 1;
+            assert!(rounds <= TOTAL, "the run does not converge");
+        }
+        println!(
+            "hq verify rounds: {rounds} rounds over {width} lanes, {rejected} rejected columns cleared, \
+             {rejected_wrapped} of them on a wrapped ring"
+        );
+        assert!(rejected_wrapped > 0, "no round rejected a column on a wrapped ring: the clear this test exists for never ran");
     }
-    println!("hq verify rounds: {rounds} rounds over {width} lanes, {rejected} rejected columns cleared");
-    assert!(rejected > 0, "no round rejected a column: the clear this test exists for never ran");
+    let _ = artifact.release_arena(&mut device);
 }

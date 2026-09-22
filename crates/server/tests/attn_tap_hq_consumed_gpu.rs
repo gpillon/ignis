@@ -279,7 +279,8 @@ fn the_consumed_capture_reads_what_hq_attention_read() {
         // The ring the query chunk's scratch decode read: every chunk's
         // append up to and including the query chunk's own.
         let chunks = prefill_chunks(&prompt, n as u32, PREFILL_CHUNK);
-        let chunk_start = capture.consumed_chunk_start[0] as u64;
+        let chunk_start = u64::try_from(capture.consumed_chunk_start[0])
+            .unwrap_or_else(|_| panic!("{size} px: no chunk start was recorded"));
         let upto = chunks.iter().position(|&(start, _)| start == chunk_start).unwrap_or_else(|| {
             panic!("{size} px: the capture's chunk start {chunk_start} is not a chunk of {chunks:?}")
         });

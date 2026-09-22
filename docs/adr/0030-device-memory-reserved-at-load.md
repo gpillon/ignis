@@ -15,6 +15,12 @@ reserved one item's encoder output and now reserves the embedding *pool*
 (`--vision-embedding-pool-mib`, defaulting to one envelope-wide item, so the
 number it carries at the default is unchanged). The line's name, its place in
 the layout order and its refusal rule are untouched.
+**Amended 2026-09-22 by spec runtime/06** (GitHub #257, whose acceptance asks
+for the reservation as "its own named line"): a twelfth plan line,
+`hq_residual_window` — the hq-e8-2b residual window of every lane and every
+retained slot, 34 MiB a slot, 0 on a BF16 load — placed after the retained
+slots. A retained image now carries the window too; its bytes are counted on
+the new line, not on `retained_slots`.
 Amended 2026-09-18 (#216, owner decision) where building it settled three
 readings this section had left to the source column — the retained slots'
 capacity, what the KV pool's occupancy counts, and what the KV-RAM arena's
@@ -91,7 +97,9 @@ The load lays out, in order:
 3. the round and sampling buffers;
 4. every lane's state;
 5. the **retained slots**;
-6. the KV pool, which takes the rest.
+6. under hq-e8-2b, the **residual window** of every lane and retained slot
+   (#257);
+7. the KV pool, which takes the rest.
 
 The minimum is those fixed reservations plus the KV of one sequence at
 `--max-context`, and one KV page per retained slot for a checkpoint's partial
@@ -137,7 +145,7 @@ again. They add no serving work of any kind.
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|residual` | the plan's eleven lines, the same set and spelling the `ignis.runtime.vram_plan` event carries |
+| `ignis_vram_reserved_bytes` | gauge | `line=weights\|cuda_context\|workspace\|media_embedding\|sampling\|decode_graph\|verify_round\|drafter_round\|lane_state\|retained_slots\|hq_residual_window\|residual` | the plan's twelve lines (`hq_residual_window` since #257), the same set and spelling the `ignis.runtime.vram_plan` event carries |
 | `ignis_vram_budget_bytes` | gauge | none | the budget the plan was laid out inside, derived or explicit |
 | `ignis_kv_pool_pages` | gauge | none | the pool's page count, leaf-verified at load |
 | `ignis_kv_page_bytes` | gauge | none | one page's bytes |
@@ -309,7 +317,8 @@ unexported.
   loop stops leaving reuse once its chain holds every slot, and it runs on
   without it.
 - **The metric surface grows by ten series and one label set.** Every one is
-  bounded and constant in cardinality: eleven plan lines, three skip reasons,
+  bounded and constant in cardinality: eleven plan lines (twelve since #257),
+  three skip reasons,
   and two `state` values reused across two families.
 - **The six retained-state families double**, from twelve series to
   twenty-four, and a dashboard that sums them without aggregating away `kind`

@@ -57,9 +57,9 @@ pub fn hq_window(blob: &[u8]) -> &[u8] {
 }
 
 /// The ring validity words the hq window section ends with, as the device
-/// holds them (`ignis_core::hq_ring::RingWords`).
-pub fn hq_ring_words(blob: &[u8]) -> [u32; 16] {
+/// holds them.
+pub fn hq_ring_words(blob: &[u8]) -> ignis_core::hq_ring::RingWords {
     let window = hq_window(blob);
-    let ring = &window[window.len() - 64..];
+    let ring = &window[window.len() - ignis_core::hq_ring::RING_WORDS * 4..];
     std::array::from_fn(|i| read_u32(ring, i * 4))
 }

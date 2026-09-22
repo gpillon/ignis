@@ -1352,10 +1352,10 @@ struct UncommittedRingColumns {
     }
     for (std::size_t i = 0; i < slots->size(); ++i) {
       const auto first = static_cast<std::uint64_t>((*base_positions)[i]);
-      (void)ignis_hq_ring_apply(
+      ninfer::apply_kv_ring_valid_words(
           pool->hq_ring_words((*slots)[i]),
           ignis_hq_ring_invalidate_mask(first, first + static_cast<std::uint64_t>((*extents)[i]) + 1),
-          ignis_hq_ring_words{}, stream);
+          ninfer::KvRingWords{}, kIgnisHqRingWords, stream);
     }
     (void)cudaStreamSynchronize(stream);
   }
@@ -1599,8 +1599,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
     // bits come off and those keys fall back to the codec until their
     // positions are appended again. The pass appends all `extent + 1`
     // columns whatever it accepts, so that is the range, not the licensed
-    // run. Host masks on the round's stream, outside the verify graph -- they
-    // change every round -- and confirmed by the fold's synchronize below.
+    // run. Host masks on the round's stream, applied by the vendored kernel
+    // (core/kv_ring_bits.h) outside the verify graph -- they change every
+    // round -- and confirmed by the fold's synchronize below.
     // The reference does the same at its commit (program_impl.h:~960).
     if (pool->has_hq_residual()) {
       for (uint64_t i = 0; i < batch_size; ++i) {
@@ -1609,9 +1610,10 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
         if (kept >= written) {
           continue;
         }
-        err = ignis_hq_ring_apply(pool->hq_ring_words(slots[i]),
-                                  ignis_hq_ring_invalidate_mask(kept, written),
-                                  ignis_hq_ring_words{}, model->stream);
+        ninfer::apply_kv_ring_valid_words(pool->hq_ring_words(slots[i]),
+                                          ignis_hq_ring_invalidate_mask(kept, written),
+                                          ninfer::KvRingWords{}, kIgnisHqRingWords, model->stream);
+        err = cudaGetLastError();
         if (err != cudaSuccess) {
           set_error(std::string("ignis_program_decode: hq ring invalidation failed: ") +
                     cudaGetErrorString(err));

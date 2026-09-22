@@ -186,7 +186,10 @@ Wired as the seam says; what building it found, and where it departs:
   and sets their bits) before the scratch decode that serves `[p0 - 512, p0)`
   from the ring. So the keys `[p0 - 512, p0 - 512 + min(w, 512))` are served
   the rows of the chunk keys that share their slots — exact rows, of the wrong
-  key. The reference (ninfer `a00648cb`) launches the same order. Measured
+  key, and of a *later* one: a query early in the chunk attends, at a past
+  position the causal mask allows, to a key up to ~1,000 positions ahead of it.
+  hq prefill with the window is not causal there. The reference (ninfer
+  `a00648cb`) launches the same order; decode is unaffected. Measured
   through the tap (`attn_tap_hq_consumed_gpu.rs`, GPU run 2026-09-22): on both
   pointing inputs the query chunk is 122 wide at 16,384 / 1,024, and 122 of
   the 512 ring rows come back exact **to the chunk key 512 positions later**
@@ -205,17 +208,27 @@ Wired as the seam says; what building it found, and where it departs:
   1024 px) have the baseline's key bit for bit and decode to the baseline's
   bytes. At L39 no key is the baseline's — the GQA layers above it now attend
   over exact rows — so the check does not apply there.
-- **No revalidation call site.** ignis never trims a live sequence back: a
-  prefix is published at exactly its end, a checkpoint captured at exactly its
-  opener, a snapshot taken at a chunk boundary, and a claimant or a restore
-  resumes at exactly that point. The clone and the blob carry the window as a
-  CLONE state section (`IGNIS_SEQ_SECTION_HQ_RESIDUAL`, snapshot format 4), so
-  there is nothing to revalidate. The reference's rule is kept host-side
-  (`ignis_hq_ring_revalidate_mask`, `kernel/include/ignis_hq_ring.h`) for tests.
+- **No revalidation call site, and the rule is not ported.** ignis never
+  trims a live sequence back: a prefix is published at exactly its end, a
+  checkpoint captured at exactly its opener, a snapshot taken at a chunk
+  boundary, and a claimant or a restore resumes at exactly that point. The
+  clone and the blob carry the window as a CLONE state section
+  (`IGNIS_SEQ_SECTION_HQ_RESIDUAL`, snapshot format 4), so there is nothing to
+  revalidate. The lifecycle tests hold the device to the invalidate rule and to
+  the append rule (`ignis_core::hq_ring::HqRing`), which is what every
+  transition here reduces to.
+- **The clear uses the vendored kernel.** `ninfer::apply_kv_ring_valid_words`
+  (`core/kv_ring_bits.{h,cu}`, already vendored) applies the masks
+  `ignis_hq_ring_invalidate_mask` computes on the host
+  (`kernel/include/ignis_hq_ring.h`).
 - **A failed verify round clears its columns too**, not only a committed one:
-  a retry at a smaller extent would otherwise read a failed round's rows as
-  older keys'. A guard in `run_verify_round` clears `[p, p + extent + 1)` of
-  every lane on any failure after the pass is enqueued.
+  the runtime puts a failed round's sequences back, so a retry at a smaller
+  extent would otherwise read a failed round's rows as older keys'. A guard in
+  `run_verify_round` clears `[p, p + extent + 1)` of every lane on any failure
+  after the pass is enqueued. It has no test: nothing can make a round fail
+  after its pass from outside the leaf. A failed *prefill* chunk needs no guard
+  — its retry appends the same keys, the same rows, before anything reads
+  them.
 - **The prefill view narrows the window to the sequence's slot.** The layer's
   prefill path hands A1 the sequence's own block-table row as a one-row table,
   so the window is pre-sliced to that slot; before this, an hq prefill on any
@@ -229,7 +242,8 @@ Wired as the seam says; what building it found, and where it departs:
 - **Lifecycle** (AC 2): `retained_prefix_gpu.rs`, `prompt_checkpoint_gpu.rs`
   (checkpoint claim, KV-RAM restore of the materialized blob, chained turn),
   `seq_snapshot_gpu.rs` (restore into the slot another sequence used) and
-  `dflash2_round_gpu.rs` (11 rounds over 4 lanes, 65 rejected columns) run
+  `dflash2_round_gpu.rs` (15 rounds over 4 lanes, two of them on prompts
+  longer than the ring: 114 rejected columns, 82 of them on a wrapped ring) run
   under hq as well as BF16: the claimant's window is the publisher's at the
   prefix's end, the whole snapshot after the same tail is the split control's
   byte for byte, the continuation tokens match, and the ring words read out of

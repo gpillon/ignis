@@ -268,7 +268,14 @@ fn turns_against_the_split_control(
     .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
     let free_at_rest = pool.stats().kv_free_pages;
     let image_bytes = pool.stats().slot_state_bytes;
-    println!("prompt_checkpoint_gpu: one retained slot holds {image_bytes} bytes");
+    // GitHub #257: under hq-e8-2b the image also carries the slot's residual
+    // window, which the plan counts on its own line.
+    println!(
+        "prompt_checkpoint_gpu: one retained slot holds {image_bytes} bytes of state, plus {} of \
+         hq residual window",
+        pool.stats().hq_residual_bytes
+            / u64::from(pool.stats().slot_count + pool.stats().retained_slot_count)
+    );
     assert!(image_bytes > 0, "a real pool's slot holds state");
     // A checkpoint keeps the page its opener ends inside as a page of the
     // pool (GitHub #215).
