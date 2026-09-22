@@ -21,7 +21,18 @@ When output names a domain concept, use the term as defined here.
   Anything hand-written is not one, and carries no port claim (ADR 0010).
   A vendored op that a measurement identifies as the bottleneck may carry a
   recorded patch, or be replaced by our own implementation — which is then not
-  a vendored op and makes no port claim (ADR 0031).
+  a vendored op and makes no port claim (ADR 0031). One with a demonstrated
+  correctness bug may carry a recorded patch too, with a test that fails
+  without it (ADR 0037).
+- **Reference parity** — a behaviour ignis computes exactly as the
+  **reference** does. The default for every vendored op, and not a claim of
+  correctness: the reference can be wrong (ADR 0037).
+  _Avoid_: faithful, reference behaviour (for a behaviour ignis has changed).
+- **Ignis patched** — a behaviour ignis deliberately computes differently from
+  the **reference**, because the reference is wrong there; each is a recorded
+  patch with a test that tells the two apart. A difference from the reference
+  it causes is a declared departure, not a regression (ADR 0037).
+  _Avoid_: fork, divergence.
 - **Lane** — a concurrent decode slot. Requests hold a lane while decoding.
 - **Lane tag** — the request's own statement of its class, carried as an ignis
   extension field on the request and echoed in the request log. Two classes,

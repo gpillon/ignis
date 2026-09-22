@@ -7,10 +7,13 @@ must be diffable, so "we ported the reference's kernel" means *this exact file
 is the reference's file*, and a script proves it.
 
 - Policy: `docs/adr/0010-vendored-reference-kernels.md`
-- The one exemption: `docs/adr/0031-vendored-kernel-bottleneck-exemption.md` —
-  a kernel *measured* as the bottleneck may carry a recorded patch, or be
-  replaced by our own implementation in `kernel/src/` and leave the subtree.
-  Read it before editing anything here; nothing below changes.
+- The exemptions: `docs/adr/0031-vendored-kernel-bottleneck-exemption.md` — a
+  kernel *measured* as the bottleneck may carry a recorded patch, or be
+  replaced by our own implementation in `kernel/src/` and leave the subtree —
+  and `docs/adr/0037-a-vendored-file-may-carry-a-correctness-patch.md` — a file
+  with a *demonstrated* correctness bug may carry a recorded patch, with a test
+  that fails without it. Read both before editing anything here; nothing below
+  changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
   vendored alongside the code)
 - Spec: `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36)
@@ -79,6 +82,22 @@ change, it is **recorded**, never silently applied:
 From then on `verify` expects the *patched* hash locally and the *reference's*
 hash upstream, so both an unrecorded edit and upstream drift are caught. `sync`
 will not overwrite a patched file unless it is told to.
+
+A patch is admitted for one of two reasons, and its `reason` says which: a
+measured bottleneck (ADR 0031), or a demonstrated correctness bug (ADR 0037),
+in which case the `reason` also names the test that fails without the patch.
+
+### Ignis-patched behaviours
+
+A correctness patch makes the behaviour it changes **Ignis patched**: ignis
+deliberately computes something the reference does not. Every other vendored
+behaviour is **reference parity**. Each Ignis-patched behaviour is one row
+here, so a comparison with the reference can tell which side of a difference
+it is looking at (ADR 0037).
+
+| Behaviour | The reference | ignis | Test that tells them apart | Issue |
+|---|---|---|---|---|
+| none yet | | | | |
 
 Anything that is not a verbatim vendored file — including a file we edit
 beyond a recorded patch — is our own implementation and carries no provenance

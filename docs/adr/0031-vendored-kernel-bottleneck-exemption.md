@@ -7,7 +7,9 @@ last Decision bullet ("our own kernels come after G4, one op family at a time,
 each justified by a measurement"), per op rather than per family, and says what
 that measurement has to show before anyone may touch a vendored file. It is not
 a reversal: every provenance rule in 0010 stands unchanged, and the default is
-still that vendored files are not hand-edited.
+still that vendored files are not hand-edited. **Extended by ADR 0037**
+(2026-09-22): a demonstrated correctness bug is the second reason a vendored
+file may carry a recorded patch; the performance terms below are unchanged.
 
 Sources: owner statement 2026-09-18 ("i kernel sono intoccabili ma se troviamo
 delle ottimizzazioni per cui ci rendiamo conto che i kernel vendor sono *il
