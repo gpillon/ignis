@@ -38,7 +38,8 @@ fn the_served_artifact_has_a_calibrated_pointing_head() {
             "the served artifact {ARTIFACT} (content hash {}) has no calibrated pointing head, \
              so `/v1/decide` would answer every `point` with the digit chain. The table knows \
              {known:?}. Recalibrate before shipping this artifact: the procedure is \
-             docs/specs/decide/13-point-by-attention-head.md § Further Notes (run \
+             tools/pointing-scenes/README.md and docs/specs/decide/13-point-by-attention-head.md \
+             § Further Notes (run \
              crates/server/tests/attention_head_point_gpu.rs over the labelled scene sets with \
              every GQA layer armed, choose the head by cross-validation on the region rule's \
              inside rate, add the hash to crates/core/src/pointing.rs, re-run spec 13's \

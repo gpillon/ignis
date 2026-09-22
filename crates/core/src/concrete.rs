@@ -143,8 +143,7 @@ use crate::scheduler::{
 };
 use crate::types::{
     BackfillClass, ComputeError, DecisionRead, DecodeParams, EngineMode, FinishReason, LaneId,
-    N_DECODE_LANES,
-    RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
+    N_DECODE_LANES, RequestClass, RequestId, RequestInput, RequestState, SchedEvent, SubmitError,
 };
 
 /// Knobs for the concrete scheduler (v1 defaults; the KV-RAM host tier

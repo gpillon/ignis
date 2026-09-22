@@ -1,0 +1,112 @@
+{
+  "side": 1024,
+  "seed": 20260923,
+  "source": "the first five scenes of set C (scenes.py --varied --seed 20260923, 1024 px), copied for the attention readout's leaf-equivalence test (GitHub #260); set C is development data, never an acceptance set",
+  "scenes": [
+    {
+      "id": "scene0000",
+      "image": "scene0000.png",
+      "blue_box": [
+        823,
+        658,
+        985,
+        696
+      ],
+      "blue_centre": [
+        904,
+        677
+      ],
+      "blue_size": [
+        162,
+        38
+      ],
+      "blue_fraction_of_side": 0.1582,
+      "instruction": "click the Reset button",
+      "kind": "label"
+    },
+    {
+      "id": "scene0001",
+      "image": "scene0001.png",
+      "blue_box": [
+        426,
+        611,
+        608,
+        661
+      ],
+      "blue_centre": [
+        517,
+        636
+      ],
+      "blue_size": [
+        182,
+        50
+      ],
+      "blue_fraction_of_side": 0.1777,
+      "instruction": "click the Cancel button",
+      "kind": "label"
+    },
+    {
+      "id": "scene0002",
+      "image": "scene0002.png",
+      "blue_box": [
+        577,
+        302,
+        705,
+        340
+      ],
+      "blue_centre": [
+        641,
+        321
+      ],
+      "blue_size": [
+        128,
+        38
+      ],
+      "blue_fraction_of_side": 0.125,
+      "instruction": "click the purple button",
+      "kind": "colour"
+    },
+    {
+      "id": "scene0003",
+      "image": "scene0003.png",
+      "blue_box": [
+        216,
+        485,
+        385,
+        534
+      ],
+      "blue_centre": [
+        300,
+        509
+      ],
+      "blue_size": [
+        169,
+        49
+      ],
+      "blue_fraction_of_side": 0.165,
+      "instruction": "click the purple button",
+      "kind": "colour"
+    },
+    {
+      "id": "scene0004",
+      "image": "scene0004.png",
+      "blue_box": [
+        523,
+        302,
+        717,
+        353
+      ],
+      "blue_centre": [
+        620,
+        327
+      ],
+      "blue_size": [
+        194,
+        51
+      ],
+      "blue_fraction_of_side": 0.1895,
+      "instruction": "click the Cancel button",
+      "kind": "label"
+    }
+  ]
+}

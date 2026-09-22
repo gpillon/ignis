@@ -62,8 +62,8 @@ const SERVED_NVFP4_27B: [u8; 32] = [
 /// picked it) and checked on sets it was never chosen on
 /// (`docs/findings/2026-09-21-one-attention-head-points.md`,
 /// `2026-09-21-the-head-points-in-the-engine.md`). Recalibrating for a new
-/// artifact is the procedure in `docs/specs/decide/13-point-by-attention-head.md`
-/// § Further Notes, run with `crates/server/tests/attention_head_point_gpu.rs`.
+/// artifact is the procedure in `tools/pointing-scenes/README.md` (spec 13
+/// § Further Notes), run with `crates/server/tests/attention_head_point_gpu.rs`.
 const CALIBRATED: &[([u8; 32], PointingHead)] = &[(
     SERVED_NVFP4_27B,
     PointingHead {

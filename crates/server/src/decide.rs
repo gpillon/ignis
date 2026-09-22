@@ -2294,7 +2294,7 @@ async fn ask(
                     guard.completed();
                     failed(
                         "attention_unread",
-                        "the engine could not read the pointing head's attention over this image (keys outside what the layer's attention materialized); ask again with `\"method\": \"chain\"`".to_owned(),
+                        "the engine finished this question without the pointing head's attention over the image: the keys were not where the layer's attention materialized them, or the prefill itself failed".to_owned(),
                     )
                 }
                 Err(_) => failed(

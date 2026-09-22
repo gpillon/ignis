@@ -572,7 +572,9 @@ When output names a domain concept, use the term as defined here.
   could not forbid, which is a parse of a known alphabet and not of free
   text. These are the decision primitives that generate tokens.
   The wire exposes it as `number`, `point` and `box` (GitHub #242) — a number
-  read digit by digit into a field of fixed width, and two or four of those —
+  read digit by digit into a field of fixed width, and two or four of those;
+  since GitHub #260 a `point` is a chain only when asked for by
+  `"method": "chain"` or on a load with no **pointing head** —
   and as `scalar` (GitHub #255), which adds the closing brace to the alphabet
   so the number chooses its own width and may carry a decimal point.
 - **Permitted set** — the vocabulary entries one step of a **constrained
@@ -615,6 +617,28 @@ When output names a domain concept, use the term as defined here.
   what says whether a restricted softmax is reading the model or renormalizing
   noise: a **decision** whose answer mass is near zero has an argmax that
   means nothing.
+- **Attention readout** — reading one attention head's pre-softmax scores
+  (`q · k / sqrt(head_dim)`) at a prefill's last position over one span of
+  its keys — an image's placeholders — instead of the logits of answer
+  tokens (GitHub #260, ADR 0038). The third thing the `Compute` seam carries,
+  beside the **readout** and the **permitted set**: the job names the layer,
+  the head and the span, and one score per key comes back, never a full
+  attention row. The keys are the ones the layer's attention read, as it read
+  them — the hq prompt route's codec-decoded and window-exact rows, or the
+  BF16 pages — so a leaf that cannot read them fails the question rather
+  than scoring some other copy. A `point` answered this way is a
+  **decision**: one prefill, no decode round, no lane.
+- **Pointing head** — the one attention head a `point` is read from in one
+  pass: L39.h10 (GQA ordinal 9, query head 10) on the served 27B, which at
+  the position after the forced `{"x":` attends to the image token where the
+  target's label **begins** (about 30% across a labelled button), not to its
+  centre. A **calibrated constant keyed to the artifact's content hash**:
+  chosen on labelled scenes by cross-validation, never computed at load, and
+  never read on an artifact nobody calibrated it for — such a load answers
+  `point` with the digit chain. Its map is read by TAG's region rule
+  (min-max over `exp(s - max s)`, cells at or above 0.5, the 4-connected
+  region with the highest mean, its weighted centre), and the region's share
+  of the head's attention over the image is the answer's confidence.
 
 ## Observability
 

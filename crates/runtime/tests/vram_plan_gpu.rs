@@ -160,11 +160,12 @@ fn the_vision_encoder_workspace_is_the_prefill_scratch_not_beside_it() {
     assert!(with_vision.media_embedding > 0, "the media embedding keeps its own reservation");
 
     // A short context caps the envelope below the prefill scratch: vision
-    // then grows the arena not at all.
+    // then grows the arena by the attention readout's scores alone (GitHub
+    // #260) — one f32 per envelope token, the envelope capped by the context.
     const SHORT_CONTEXT: u32 = 2048;
     assert_eq!(
         reserved(1024, SHORT_CONTEXT, Some(vision)).workspace,
-        reserved(1024, SHORT_CONTEXT, None).workspace,
-        "the prefill scratch already fits the encoder"
+        reserved(1024, SHORT_CONTEXT, None).workspace + u64::from(SHORT_CONTEXT) * 4,
+        "the prefill scratch already fits the encoder, and a head point's scores beside it"
     );
 }

@@ -169,7 +169,8 @@ produced it.
   `q · k / sqrt(head_dim)` for the query at the chunk's last position, before
   any softmax. At 1024 px that is 1,024 floats, at 4096 px 16,384 (64 KB).
   No full attention row and no logits row crosses. A new ADR records this
-  as an extension of ADR 0034's rule, the way ADR 0034 recorded the readout.
+  as an extension of ADR 0034's rule, the way ADR 0034 recorded the readout
+  (ADR 0038).
 
 - **The keys are the ones attention read, as attention read them.** Under
   hq-e8-2b that is the prompt route's own materialized key planes for that
@@ -364,4 +365,6 @@ formats, the host rule and the endpoint are one design and are not split.
 - **Recalibration** for a new artifact: run the attention-head harness over
   the labelled scene sets with every GQA layer armed, choose the head by
   cross-validation on the region rule's inside rate, add the artifact's
-  content hash to the table, and re-run this spec's acceptance.
+  content hash to the table, and re-run this spec's acceptance. Step by
+  step, with the generator and the scorer that were run:
+  `tools/pointing-scenes/README.md`.
