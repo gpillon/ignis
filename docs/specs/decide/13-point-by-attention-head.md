@@ -1,5 +1,7 @@
 # 13 - point in one pass, read from an attention head
 
+GitHub: #260
+
 The study (`11-point-in-one-pass.md`) and its findings
 (`docs/findings/2026-09-21-one-attention-head-points.md`,
 `2026-09-21-the-head-points-in-the-engine.md`,
