@@ -119,6 +119,16 @@ When output names a domain concept, use the term as defined here.
   metadata bytes per (token, KV head). Fixed bytes per token, so page
   addressing and CUDA-graph address stability are unchanged. 9,216 bytes per
   sequence-token against BF16's 65,536 — a factor of 7.11.
+- **Residual window** — the keys hq-e8-2b attention reads exact instead of
+  decoding: a sequence's first 32 keys (the **sinks**), a 512-slot **ring** of
+  recent keys, and the prefill chunk being attended. Kept per slot, not per
+  page — BF16 rows in the codec's rotated frame, ~34 MiB per slot, its own
+  line of the VRAM plan — so a clone or a restore must carry it, and its ring
+  bits name no position, so whatever leaves appended columns uncommitted (a
+  verify round's rejected drafts) must clear theirs. The prompt route reads the
+  ring after its own chunk's append, as the reference does, so the keys before
+  a chunk that share a ring slot with the chunk's are served the chunk's rows
+  (spec runtime/06, GitHub #257).
 - **KV format** — which of the two KV cache formats a load runs: **hq-e8-2b**,
   the serving default from G4, or **BF16**, retained as the format every
   correctness oracle runs against. A model-load option, fixed for the life of

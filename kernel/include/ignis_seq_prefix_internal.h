@@ -82,7 +82,8 @@ struct ignis_seq_prefix {
    * the slot goes back, while the pages live on under the sequences still
    * standing on them. -1 once released. */
   std::int32_t retained_slot = -1;
-  /* What that image occupies: one slot's state, `ignis_seq_pool::slot_state_bytes`. */
+  /* What that image occupies: one slot's state and its hq residual window,
+   * `ignis_seq_pool::retained_image_bytes`. */
   std::uint64_t image_bytes = 0;
   /* The IGNIS_SEQ_SECTION_PROGRESS payload: host scalars, so they live here
    * rather than in the retained slot above (the snapshot path writes them

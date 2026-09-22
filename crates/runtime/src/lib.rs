@@ -102,6 +102,9 @@ pub struct ReservedBytes {
     pub lane_state: u64,
     /// The sequence pool's retained slots (GitHub #211).
     pub retained_slots: u64,
+    /// The sequence pool's hq-e8-2b residual window, every slot's (GitHub
+    /// #257); 0 on a BF16 load.
+    pub hq_residual_window: u64,
     /// The KV pool's arena, planes and block tables.
     pub kv_pool: u64,
 }

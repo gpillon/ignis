@@ -29,12 +29,13 @@
  * The rotated frame is orthonormal (R = H * diag(signs) / 16), so a query
  * rotated the same way gives the same dot products.
  *
- * **In ignis the exact sources are off.** They exist only when the cache view
- * carries the residual side planes, and `ignis_kv_batch_layer_view` never
- * fills `residual_k` / `residual_v` / `ring_valid` -- so under hq-e8-2b every
- * key attention reads, the current chunk's included, is the codec's decode.
- * Measured, not assumed: crates/server/tests/attn_tap_hq_consumed_gpu.rs
- * finds every row at the codec's own error and fails if one comes back exact.
+ * **The exact sources are on since GitHub #257.** They exist only when the
+ * cache view carries the residual side planes, and `ignis_kv_batch_layer_view`
+ * fills `residual_k` / `residual_v` / `ring_valid` on an hq pool. Which row
+ * came from where -- including a key before the chunk whose ring slot the
+ * chunk's own append rewrote, served that later key's row -- is
+ * `ignis_core::hq_ring::prompt_source`; crates/server/tests/
+ * attn_tap_hq_consumed_gpu.rs holds every captured row to it.
  *
  * Positions are **cache positions** (the sequence index `run_gqa_layer`
  * appends at, `seq->gqa_positions`), not rotary positions. A multimodal

@@ -18,11 +18,11 @@
 //! exactly what attention reads; under hq-e8-2b they are what the codec was
 //! given, not what it decodes. [`with_attn_tap_hq`] adds the other half: the
 //! keys the hq prompt attention actually consumed, in the codec's rotated
-//! frame, scored with [`AttnTapCapture::consumed_scores`]. The vendored route
-//! *can* keep the current chunk, the 32 sink keys and the 512-key ring exact
-//! ([`hq_source`] is its rule), but only with residual side planes on the
-//! cache view, which ignis never supplies: in this engine every consumed key
-//! is the codec's decode, and `attn_tap_hq_consumed_gpu.rs` holds it to that.
+//! frame, scored with [`AttnTapCapture::consumed_scores`]. Since GitHub #257
+//! the cache view carries the residual window, so the vendored route keeps
+//! the current chunk, the 32 sink keys and the ring exact and decodes the
+//! rest — which key came from where is `crate::hq_ring::prompt_source`, and
+//! `attn_tap_hq_consumed_gpu.rs` holds the capture to it row by row.
 
 use std::ffi::{CStr, c_char};
 
@@ -88,7 +88,7 @@ pub struct AttnTapCapture {
     /// Consumed rows each armed layer copied (0 = not captured).
     pub consumed_rows: Vec<i64>,
     /// Where each armed layer's captured chunk began (-1 = not captured):
-    /// the `chunk_start` [`hq_source`] needs.
+    /// the `chunk_start` `crate::hq_ring::prompt_source` needs.
     pub consumed_chunk_start: Vec<i64>,
 }
 
@@ -140,7 +140,22 @@ impl AttnTapCapture {
     /// rotation of the key the layer produced. About one BF16 rounding for
     /// the exact sources, the codec's error for the rest.
     pub fn consumed_key_rel_err(&self, layer: usize, position: usize, kv_head: usize) -> f32 {
-        let k: Vec<f32> = self.key(layer, position, kv_head).iter().map(|&b| bf16_to_f32(b)).collect();
+        self.consumed_key_rel_err_to(layer, position, kv_head, position)
+    }
+
+    /// `|R k - kc| / |R k|` with `k` the key the layer produced at
+    /// `key_position` and `kc` the row attention consumed at `position`:
+    /// which key a consumed row actually is. The hq ring can serve one key's
+    /// row for another's (`crate::hq_ring::PromptSource::Clobbered`), and
+    /// this is how a test tells that apart from a decoded row.
+    pub fn consumed_key_rel_err_to(
+        &self,
+        layer: usize,
+        position: usize,
+        kv_head: usize,
+        key_position: usize,
+    ) -> f32 {
+        let k: Vec<f32> = self.key(layer, key_position, kv_head).iter().map(|&b| bf16_to_f32(b)).collect();
         let rk = hq_rotate(&k);
         let kc = self.consumed_key(layer, position, kv_head);
         let (mut num, mut den) = (0.0f32, 0.0f32);
@@ -294,37 +309,6 @@ fn armed<T>(
     ))
 }
 
-/// Where hq-e8-2b prompt attention takes a key from, for a query chunk that
-/// starts at `chunk_start` — the rule of `gqa_attention_prefill_hq_scratch_kernel`
-/// with the residual window wired and every ring slot valid (a fresh sequence
-/// prefilled in order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HqSource {
-    /// The chunk being prefilled: staged exact.
-    Fresh,
-    /// One of the 32 sink keys or the 512 before the chunk: exact, from the
-    /// residual side planes.
-    Side,
-    /// Everything else: decoded by the codec.
-    Codec,
-}
-
-/// Sink keys the hq residual window keeps exact (`kGqaHqSinkKeys`).
-pub const HQ_SINK_KEYS: usize = 32;
-/// Recent keys the hq residual ring keeps exact (`kGqaHqRecentKeys`).
-pub const HQ_RECENT_KEYS: usize = 512;
-
-/// [`HqSource`] of the key at `position` for a query chunk starting at `chunk_start`.
-pub fn hq_source(position: usize, chunk_start: usize) -> HqSource {
-    if position >= chunk_start {
-        HqSource::Fresh
-    } else if position < HQ_SINK_KEYS || position + HQ_RECENT_KEYS >= chunk_start {
-        HqSource::Side
-    } else {
-        HqSource::Codec
-    }
-}
-
 /// The engine-wide sign of coordinate `d` (`hq_engine_sign`,
 /// kernel/vendor/src/ops/kernel/hq_codec.cuh), bit for bit.
 pub fn hq_engine_sign(d: u32) -> f32 {
@@ -429,19 +413,5 @@ mod tests {
         let plus = signs.iter().filter(|&&s| s == 1.0).count();
         assert!((96..=160).contains(&plus), "{plus} of 256 positive");
         assert_eq!(signs, (0..HEAD_DIM as u32).map(hq_engine_sign).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn hq_sources_follow_the_kernel_rule() {
-        // A query chunk starting at 1024: ring = [512, 1024), sinks = [0, 32).
-        assert_eq!(hq_source(0, 1024), HqSource::Side);
-        assert_eq!(hq_source(31, 1024), HqSource::Side);
-        assert_eq!(hq_source(32, 1024), HqSource::Codec);
-        assert_eq!(hq_source(511, 1024), HqSource::Codec);
-        assert_eq!(hq_source(512, 1024), HqSource::Side);
-        assert_eq!(hq_source(1023, 1024), HqSource::Side);
-        assert_eq!(hq_source(1024, 1024), HqSource::Fresh);
-        // A single-chunk prompt has no codec keys at all.
-        assert_eq!(hq_source(100, 0), HqSource::Fresh);
     }
 }

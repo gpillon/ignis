@@ -631,6 +631,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "drafter_round",
         "lane_state",
         "retained_slots",
+        "hq_residual_window",
         "residual",
     ];
     const TTFT_LE: &[&str] =

@@ -13,6 +13,7 @@
 #include "dflash2_drafter.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
+#include "ignis_hq_ring.h"
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
@@ -1325,6 +1326,41 @@ void advance_frontiers(const ignis_model *model, ignis_seq *seq, std::uint32_t t
   }
 }
 
+// GitHub #257 (spec runtime/06): the ring slots of each lane's appended but
+// uncommitted columns, cleared when the round does not reach its commit.
+//
+// A verify pass appends every lane's `extent + 1` columns, and under
+// hq-e8-2b each append also writes the column's ring slot of the residual
+// window and sets its bit. A round that fails after the pass leaves every
+// lane at its old frontier with those columns written past it; a retry at a
+// smaller extent then reads the stale slots as the exact rows of older keys
+// still inside its window. Armed once the pass is enqueued and disarmed at
+// the commit, which clears only the rejected columns' bits itself. Best
+// effort by construction -- a destructor has nowhere to report to -- and
+// always safe: a cleared bit falls back to the codec.
+struct UncommittedRingColumns {
+  ignis_seq_pool *pool = nullptr;
+  cudaStream_t stream  = nullptr;
+  const std::vector<std::int32_t> *base_positions = nullptr;
+  const std::vector<std::int32_t> *extents        = nullptr;
+  const std::vector<std::int32_t> *slots          = nullptr;
+  bool armed = false;
+
+  ~UncommittedRingColumns() {
+    if (!armed || !pool->has_hq_residual()) {
+      return;
+    }
+    for (std::size_t i = 0; i < slots->size(); ++i) {
+      const auto first = static_cast<std::uint64_t>((*base_positions)[i]);
+      (void)ignis_hq_ring_apply(
+          pool->hq_ring_words((*slots)[i]),
+          ignis_hq_ring_invalidate_mask(first, first + static_cast<std::uint64_t>((*extents)[i]) + 1),
+          ignis_hq_ring_words{}, stream);
+    }
+    (void)cudaStreamSynchronize(stream);
+  }
+};
+
 // P5-04 (GitHub #153): one verify round over `batch_size` lanes at the
 // load's window `k` (spec 05, "The verify round"). The device-side pass is
 // `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu), replayed from
@@ -1478,7 +1514,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       return -1;
     }
 
+    UncommittedRingColumns uncommitted{pool, model->stream, &base_positions, &extents, &slots};
     const bool use_graph = verify.graph_ready[batch_size - 1];
+    // Armed before the launch: a pass that fails part way may still have
+    // appended some of its columns.
+    uncommitted.armed = true;
     if (use_graph) {
       const cudaError_t err = cudaGraphLaunch(verify.graph_exec[batch_size - 1], model->stream);
       if (err != cudaSuccess) {
@@ -1552,6 +1592,32 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
       fold_rows[i] = ninfer::ops::GdnReplayFoldRow{.linear_state_slot = slots[i],
                                                    .commit_columns = c};
       selectors[i] = c - 1;
+    }
+
+    // GitHub #257 (spec runtime/06): the columns past each lane's commit
+    // wrote ring slots that older keys inside the window still name, so their
+    // bits come off and those keys fall back to the codec until their
+    // positions are appended again. The pass appends all `extent + 1`
+    // columns whatever it accepts, so that is the range, not the licensed
+    // run. Host masks on the round's stream, outside the verify graph -- they
+    // change every round -- and confirmed by the fold's synchronize below.
+    // The reference does the same at its commit (program_impl.h:~960).
+    if (pool->has_hq_residual()) {
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        const auto kept    = static_cast<std::uint64_t>(base_positions[i] + committed[i]);
+        const auto written = static_cast<std::uint64_t>(base_positions[i] + extents[i] + 1);
+        if (kept >= written) {
+          continue;
+        }
+        err = ignis_hq_ring_apply(pool->hq_ring_words(slots[i]),
+                                  ignis_hq_ring_invalidate_mask(kept, written),
+                                  ignis_hq_ring_words{}, model->stream);
+        if (err != cudaSuccess) {
+          set_error(std::string("ignis_program_decode: hq ring invalidation failed: ") +
+                    cudaGetErrorString(err));
+          return -1;
+        }
+      }
     }
 
     // The fold: every GDN layer's slot and conv taps rebuilt from the
@@ -1670,6 +1736,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool,
 
     // Only now, with the fold confirmed on the device, does any lane's
     // state move (the decode round's own ordering).
+    uncommitted.armed = false;
     for (uint64_t i = 0; i < batch_size; ++i) {
       sequences[i]->pending_token = next_pending[i];
       advance_frontiers(model, sequences[i], static_cast<std::uint32_t>(committed[i]));

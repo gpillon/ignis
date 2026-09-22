@@ -82,12 +82,12 @@ export type Memory = {
   /** Whether this load laid a plan out at all — the placeholder load has none. */
   planned: boolean;
   budgetBytes: number | null;
-  /** The plan's eleven lines, in plan order. */
+  /** The plan's twelve lines, in plan order. */
   lines: { line: VramLine; bytes: number | null }[];
   /**
-   * The eleven lines added up, or null when the scrape does not carry all
-   * eleven. A partial sum would understate the plan and overstate the room
-   * left beside it, and the server writes the eleven together or not at all.
+   * The twelve lines added up, or null when the scrape does not carry all
+   * twelve. A partial sum would understate the plan and overstate the room
+   * left beside it, and the server writes the twelve together or not at all.
    */
   linesBytes: number | null;
   /** The budget less the lines: the room the plan left the KV pool. Negative on an oversubscribed load. */

@@ -77,6 +77,11 @@ pub struct VramLines {
     /// each, reserved at load beside the lanes, holding every retained prompt
     /// checkpoint's and shared prefix's image.
     pub retained_slots: u64,
+    /// The hq-e8-2b residual window (GitHub #257, spec runtime/06): every
+    /// slot's exact sink and recent-ring K/V rows and its ring validity
+    /// words, lanes and retained slots alike -- about 34 MiB per slot. 0 on a
+    /// BF16 load, which keeps no window.
+    pub hq_residual_window: u64,
     /// What a load holds beyond every line above: allocator rounding, the
     /// decode graph captures, the kernel's lazily created handles. Measured,
     /// not derived.
@@ -86,7 +91,7 @@ pub struct VramLines {
 impl VramLines {
     /// How many lines a plan has. The arity of [`VramLines::entries`], named
     /// so a reader of the plan does not have to write the number out again.
-    pub const LINES: usize = 11;
+    pub const LINES: usize = 12;
 
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
@@ -102,6 +107,7 @@ impl VramLines {
             ("drafter_round", self.drafter_round),
             ("lane_state", self.lane_state),
             ("retained_slots", self.retained_slots),
+            ("hq_residual_window", self.hq_residual_window),
             ("residual", self.residual),
         ]
     }
@@ -388,6 +394,7 @@ mod tests {
             drafter_round: 150 * MIB,
             lane_state: 1800 * MIB,
             retained_slots: 1800 * MIB,
+            hq_residual_window: 272 * MIB,
             residual: 280 * MIB,
         }
     }
@@ -630,6 +637,7 @@ mod tests {
                 "drafter_round",
                 "lane_state",
                 "retained_slots",
+                "hq_residual_window",
                 "residual",
             ]
         );

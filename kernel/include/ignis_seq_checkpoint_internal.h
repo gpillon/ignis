@@ -59,7 +59,8 @@ struct ignis_seq_checkpoint {
    * section, at the opener rather than at the prefix's page boundary (GitHub
    * #215). Held from the capture until the release. */
   std::int32_t retained_slot = -1;
-  /* What that image occupies: one slot's state. */
+  /* What that image occupies: one slot's state and its hq residual window
+   * (`ignis_seq_pool::retained_image_bytes`). */
   std::uint64_t image_bytes = 0;
   /* The page the opener ends inside, copied into one KV page of the pool this
    * entry owns (GitHub #215) -- never bound to a block-table row, and not

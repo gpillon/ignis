@@ -151,6 +151,26 @@ void give_history(ignis_seq_pool &pool, ignis_seq &seq, std::uint64_t tokens,
   }
   fill_device(pool.token_counts_for(seq.slot),
               static_cast<std::size_t>(pool.vocab) * sizeof(std::int32_t), ++salt);
+  // GitHub #257: an hq pool's residual window -- every layer's side planes
+  // and the ring words.
+  if (pool.has_hq_residual()) {
+    for (const bool role_v : {false, true}) {
+      for (std::int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+        fill_device(pool.hq_residual_plane(role_v, layer, seq.slot),
+                    static_cast<std::size_t>(pool.hq_residual_plane_bytes()), ++salt);
+      }
+    }
+    fill_device(pool.hq_ring_words(seq.slot), kIgnisHqRingWords * sizeof(std::uint32_t), ++salt);
+  }
+}
+
+// Slot `slot`'s hq residual window as its state section lays it out
+// (GitHub #257).
+std::vector<unsigned char> hq_window_of(const ignis_seq_pool &pool, std::int32_t slot) {
+  std::vector<unsigned char> image(static_cast<std::size_t>(pool.hq_residual_slot_bytes()));
+  ignis_seq_copy_hq_residual(pool, slot, image.data(), cudaMemcpyDeviceToHost);
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  return image;
 }
 
 // A sequence's block-table row as the kernels read it: `count` physical page
@@ -226,6 +246,15 @@ ignis_seq_pool_spec small_spec() {
   spec.gdn_head_dim        = 4;
   spec.vocab               = 32;
   spec.retained_slot_count = 4;
+  return spec;
+}
+
+// The same pool under hq-e8-2b (GitHub #257): the codec's 256-wide rows, so
+// the pool keeps a residual window, over two KV heads to stay small.
+ignis_seq_pool_spec small_hq_spec() {
+  ignis_seq_pool_spec spec = small_spec();
+  spec.kv_format           = IGNIS_KV_FORMAT_HQ_E8_2B;
+  spec.head_dim            = 256;
   return spec;
 }
 
@@ -403,6 +432,59 @@ void check_a_claimant_receives_the_mutable_state() {
   expect(mutable_image_of(*pool, second->slot) == second_before,
          "clone: releasing one claimant leaves another claimant's state untouched");
   expect(second_before == at_boundary, "clone: the second claimant got the same state");
+
+  ignis_seq_release(pool, second);
+  ignis_seq_release(pool, publisher);
+  ignis_seq_prefix_release(pool, prefix);
+  ignis_seq_pool_free(pool);
+}
+
+// GitHub #257 (spec runtime/06): the hq residual window is slot-indexed, so a
+// claimant addressing the shared pages through its own row would read its
+// own slot's side rows -- zero, or a previous occupant's -- unless the clone
+// carries them. It must receive the publisher's rows and ring words as they
+// stood at the prefix's end, not as the publisher has moved them since.
+void check_a_claimant_receives_the_hq_window() {
+  const ignis_seq_pool_spec spec = small_hq_spec();
+  ignis_seq_pool *pool           = nullptr;
+  expect_rc(ignis_seq_pool_create(&spec, &pool), 0, "hq window clone: pool create");
+  ignis_seq *publisher = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kContext, &publisher), 0, "hq window clone: alloc publisher");
+  give_history(*pool, *publisher, kPrefix, 0x5eu);
+  const std::vector<unsigned char> at_boundary = hq_window_of(*pool, publisher->slot);
+
+  ignis_seq_prefix *prefix = nullptr;
+  expect_rc(ignis_seq_prefix_publish(pool, publisher, kPrefix, 1, &prefix), 0,
+            "hq window clone: publish");
+  expect(hq_window_of(*pool, ignis_seq_retained_pool_slot(*pool, 1)) == at_boundary,
+         "hq window clone: the prefix's retained slot holds the publisher's window");
+
+  // The publisher appends past the prefix: its ring moves on.
+  fill_device(pool->hq_residual_plane(false, 3, publisher->slot),
+              static_cast<std::size_t>(pool->hq_residual_plane_bytes()), 0xF00Du);
+  fill_device(pool->hq_ring_words(publisher->slot), kIgnisHqRingWords * sizeof(std::uint32_t),
+              0xF11Du);
+  expect(hq_window_of(*pool, publisher->slot) != at_boundary,
+         "hq window clone: the publisher has moved past the boundary it published");
+
+  ignis_seq *claimant = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &claimant), 0, "hq window clone: claim");
+  expect(claimant->slot != publisher->slot, "hq window clone: the claimant has its own slot");
+  expect(hq_window_of(*pool, claimant->slot) == at_boundary,
+         "hq window clone: a claimant's rows and ring words are the publisher's at the prefix's end");
+  ignis_seq_release(pool, claimant);
+
+  // A slot another sequence dirtied is overwritten whole by the next claim.
+  ignis_seq *squatter = nullptr;
+  expect_rc(ignis_seq_alloc(pool, kPageTokens, &squatter), 0, "hq window clone: alloc squatter");
+  give_history(*pool, *squatter, kPageTokens, 0x77u);
+  const std::int32_t dirtied = squatter->slot;
+  ignis_seq_release(pool, squatter);
+  ignis_seq *second = nullptr;
+  expect_rc(ignis_seq_alloc_shared(pool, kContext, prefix, &second), 0, "hq window clone: claim again");
+  expect(second->slot == dirtied, "hq window clone: the claim took the dirtied slot");
+  expect(hq_window_of(*pool, second->slot) == at_boundary,
+         "hq window clone: nothing of the slot's previous occupant is left in its window");
 
   ignis_seq_release(pool, second);
   ignis_seq_release(pool, publisher);
@@ -860,8 +942,10 @@ void report_clone_cost() {
 // same bytes, so a burst member that claims it stands exactly where one that
 // claimed the original stood.
 
-void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2) {
-  ignis_seq_pool_spec spec = small_spec();
+void check_a_spilled_prefix_comes_back_as_the_same_prefix(bool dflash2, bool hq = false) {
+  // GitHub #257: under hq-e8-2b the blob carries the residual window too, so
+  // every byte comparison below covers it.
+  ignis_seq_pool_spec spec = hq ? small_hq_spec() : small_spec();
   if (dflash2) {
     spec.speculative_backend = IGNIS_SPECULATIVE_DFLASH2;
   }
@@ -954,10 +1038,12 @@ int main() {
   check_publish_shares_pages_and_charges_once();
   check_a_claimant_receives_the_mutable_state();
   check_a_claimant_receives_the_drafter_window();
+  check_a_claimant_receives_the_hq_window();
   check_the_last_holder_frees_the_pages();
   check_a_chained_publish_extends_a_claimed_head();
   check_a_spilled_prefix_comes_back_as_the_same_prefix(false);
   check_a_spilled_prefix_comes_back_as_the_same_prefix(true);
+  check_a_spilled_prefix_comes_back_as_the_same_prefix(false, true);
   check_refusals();
   check_the_image_lives_in_a_retained_slot();
   report_clone_cost();

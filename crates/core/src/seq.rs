@@ -117,6 +117,9 @@ pub(crate) mod ffi {
         pub retained_slot_count: u32,
         pub slot_state_bytes: u64,
         pub retained_state_bytes: u64,
+        /// The hq-e8-2b residual window of every slot (GitHub #257): its own
+        /// plan line, in none of the three above. 0 on a BF16 pool.
+        pub hq_residual_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_seq_pool_plan` (GitHub #210): what a pool
@@ -129,6 +132,8 @@ pub(crate) mod ffi {
         /// One slot's state and every retained slot's (GitHub #211).
         pub slot_state_bytes: u64,
         pub retained_state_bytes: u64,
+        /// The hq-e8-2b residual window of every slot (GitHub #257).
+        pub hq_residual_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_alloc_count` (GitHub #211).

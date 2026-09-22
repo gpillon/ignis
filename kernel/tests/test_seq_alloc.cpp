@@ -107,6 +107,44 @@ bool slot_is_zero(ignis_seq_pool &pool, std::uint32_t layers, std::int32_t slot)
   return true;
 }
 
+// GitHub #257: fill slot `slot`'s whole hq residual window -- every layer's
+// K and V planes and its ring words -- with `byte`.
+void fill_hq_window(ignis_seq_pool &pool, std::int32_t slot, int byte) {
+  for (const bool role_v : {false, true}) {
+    for (std::int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+      CUDA_CHECK(cudaMemset(pool.hq_residual_plane(role_v, layer, slot), byte,
+                            static_cast<std::size_t>(pool.hq_residual_plane_bytes())));
+    }
+  }
+  CUDA_CHECK(cudaMemset(pool.hq_ring_words(slot), byte, kIgnisHqRingWords * sizeof(std::uint32_t)));
+}
+
+// Whether every byte of slot `slot`'s hq residual window is `byte`.
+bool hq_window_is(ignis_seq_pool &pool, std::int32_t slot, unsigned char byte) {
+  std::vector<unsigned char> host(static_cast<std::size_t>(pool.hq_residual_plane_bytes()));
+  for (const bool role_v : {false, true}) {
+    for (std::int32_t layer = 0; layer < kIgnisGqaLayerCount; ++layer) {
+      CUDA_CHECK(cudaMemcpy(host.data(), pool.hq_residual_plane(role_v, layer, slot), host.size(),
+                            cudaMemcpyDeviceToHost));
+      for (unsigned char b : host) {
+        if (b != byte) {
+          return false;
+        }
+      }
+    }
+  }
+  std::uint32_t words[kIgnisHqRingWords];
+  CUDA_CHECK(cudaMemcpy(words, pool.hq_ring_words(slot), sizeof(words), cudaMemcpyDeviceToHost));
+  for (std::uint32_t word : words) {
+    for (int shift = 0; shift < 32; shift += 8) {
+      if (((word >> shift) & 0xffu) != byte) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -325,6 +363,75 @@ int main() {
   expect_rc(ignis_seq_stats(hq_seq, &hq_seq_stats), 0, "hq seq stats");
   expect(hq_seq_stats.token_capacity == 128, "hq: a 128-token sequence maps 128 tokens");
   ignis_seq_release(hq_pool, hq_seq);
+
+  // ---- the hq residual window (GitHub #257, spec runtime/06) --------------
+  //
+  // An hq pool keeps every state slot's exact sink and recent-ring rows --
+  // 544 per (GQA layer, KV head, role) -- and 16 ring validity words; a BF16
+  // pool keeps none, and its views carry none, which is what keeps it on the
+  // plain route.
+  {
+    expect(!bf16_pool->has_hq_residual() && bf16_stats.hq_residual_bytes == 0,
+           "bf16: no residual window");
+    expect(hq_pool->has_hq_residual(), "hq: the pool keeps a residual window");
+    const std::uint64_t plane = 256ull * hq_spec.num_kv_heads * kIgnisHqResidualRows * 2ull;
+    const std::uint64_t slots = hq_spec.slot_count + hq_spec.retained_slot_count;
+    const std::uint64_t window =
+        2ull * kIgnisGqaLayerCount * slots * plane + slots * kIgnisHqRingWords * 4ull;
+    expect(hq_pool->hq_residual_plane_bytes() == plane, "hq: one side plane is 256 x heads x 544");
+    expect(hq_stats.hq_residual_bytes == window,
+           "hq: the window is every state slot's K and V planes and ring words");
+    struct ignis_seq_pool_plan hq_plan{};
+    expect_rc(ignis_seq_pool_plan(&hq_spec, &hq_plan), 0, "hq pool plan");
+    expect(hq_plan.hq_residual_bytes == hq_stats.hq_residual_bytes,
+           "hq: the plan's window line is the built pool's");
+    struct ignis_seq_pool_plan bf16_plan{};
+    expect_rc(ignis_seq_pool_plan(&bf16_spec, &bf16_plan), 0, "bf16 pool plan");
+    expect(bf16_plan.hq_residual_bytes == 0, "bf16: the plan has no window line");
+
+    // The batched view names the lanes' rows, in block-table order, over the
+    // pool's own storage -- contiguous, as the vendored validation requires.
+    const std::int32_t rows = hq_pool->kv_pool.table_row_count();
+    const ninfer::PagedKVBatchLayerView batch = ignis_kv_batch_layer_view(hq_pool, 5);
+    expect(batch.residual_k.dtype == ninfer::DType::BF16 && batch.residual_k.ne[0] == 256 &&
+               batch.residual_k.ne[1] == static_cast<std::int32_t>(hq_spec.num_kv_heads) &&
+               batch.residual_k.ne[2] == kIgnisHqResidualRows && batch.residual_k.ne[3] == rows,
+           "hq batch view: residual k is [256, heads, 544, lanes]");
+    expect(batch.residual_v.ne[3] == rows && batch.residual_k.is_contiguous() &&
+               batch.residual_v.is_contiguous(),
+           "hq batch view: both side planes are contiguous over the lanes");
+    expect(batch.ring_valid.dtype == ninfer::DType::I32 && batch.ring_valid.ne[0] == kIgnisHqRingWords &&
+               batch.ring_valid.ne[1] == rows && batch.ring_valid.is_contiguous(),
+           "hq batch view: the ring is [16, lanes] contiguous words");
+    expect(batch.residual_k.data == hq_pool->hq_residual_plane(false, 5, 0) &&
+               batch.residual_v.data == hq_pool->hq_residual_plane(true, 5, 0) &&
+               batch.ring_valid.data == hq_pool->hq_ring_words(0),
+           "hq batch view: layer 5's planes, from lane 0");
+    expect(ignis_kv_batch_layer_view(bf16_pool, 5).residual_k.data == nullptr &&
+               ignis_kv_batch_layer_view(bf16_pool, 5).ring_valid.data == nullptr,
+           "bf16 batch view: no window");
+
+    // A slot's window is zeroed at alloc: a new sequence never serves its
+    // previous occupant's rows, bits or sinks. The slot list is LIFO, so a
+    // release and an alloc hand back the same slot.
+    ignis_seq *first = nullptr;
+    expect_rc(ignis_seq_alloc(hq_pool, 128, &first), 0, "hq window: alloc");
+    expect(hq_window_is(*hq_pool, first->slot, 0), "hq window: a fresh slot's window is zero");
+    const std::int32_t slot = first->slot;
+    const ninfer::PagedKVLayerView layer = ignis_kv_layer_view(hq_pool, first, 7);
+    expect(layer.residual_k.data == hq_pool->hq_residual_plane(false, 7, slot) &&
+               layer.residual_k.ne[3] == 1 && layer.ring_valid.data == hq_pool->hq_ring_words(slot) &&
+               layer.ring_valid.ne[1] == 1,
+           "hq layer view: pre-sliced to the sequence's slot row");
+    fill_hq_window(*hq_pool, slot, 0xab);
+    ignis_seq_release(hq_pool, first);
+    ignis_seq *second = nullptr;
+    expect_rc(ignis_seq_alloc(hq_pool, 128, &second), 0, "hq window: re-alloc");
+    expect(second->slot == slot, "hq window: the released slot came back");
+    expect(hq_window_is(*hq_pool, slot, 0),
+           "hq window: a re-allocated slot's rows and ring words are zero");
+    ignis_seq_release(hq_pool, second);
+  }
 
   ignis_seq_pool_free(hq_pool);
   ignis_seq_pool_free(bf16_pool);

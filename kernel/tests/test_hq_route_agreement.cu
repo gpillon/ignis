@@ -414,9 +414,9 @@ struct Agreement {
 // codec's own accuracy, not to re-measure the codec.
 //
 // What the routes actually deliver, measured 2026-09-12 on this machine's
-// RTX 5090 at the 27B geometry (the report below prints all of it every run,
-// pass or fail -- 80x of unused slack sat unnoticed in GitHub #96 precisely
-// because nobody printed the headroom):
+// RTX 5090 at the 27B geometry, with every key decoded (the report below
+// prints all of it every run, pass or fail -- 80x of unused slack sat
+// unnoticed in GitHub #96 precisely because nobody printed the headroom):
 //
 //   prefill W=200 B=1  median relL2 0.227955  cosine 0.959193  SNR 10.73 dB
 //                      0.229% of 4800 rows past the 0.90 codec row bound
@@ -424,6 +424,17 @@ struct Agreement {
 //                      SNR 7.95..8.17 dB
 //   decode  W=1 B=1..8 median relL2 0.174..0.190  cosine 0.9686..0.9775
 //                      SNR 11.85..13.27 dB  0% of rows past 0.90
+//
+// GitHub #257 wires the residual window, and every history here is shorter
+// than it: the current chunk, the 32 sinks and the 512-key ring cover all
+// 200 keys, so the production view reads none of them through the codec and
+// the arms agree with BF16 to one rotated BF16 rounding (measured 2026-09-22:
+// prefill W=200 0.0023, W=9..16 0.0028-0.0029, decode 0.0032-0.0033). That
+// alone would leave the codec's read path inside attention -- still what
+// every key outside the window takes -- with no arm at all, so the prefill
+// W=200 and decode arms run a second time over a view with the window taken
+// off ("codec only"), which is the 2026-09-12 measurement above and is held
+// to the same bounds.
 //
 // The narrow prefill widths are the tightest arm, at 84% of the median
 // ceiling, and that is the derivation working rather than failing. Agreement
@@ -592,12 +603,18 @@ struct Call {
 // one history is not the ground to overrule a vendored contract on.
 enum class WorkspaceFill { Zero, Hostile };
 
+// Whether the measured call's view carries the residual window (GitHub
+// #257): the production view does; `CodecOnly` takes it off, so every key the
+// call reads goes through the codec, as it did before the window was wired.
+enum class Window { Production, CodecOnly };
+
 // Runs `call` against a freshly built pool in `kv_format` and returns the
 // BF16 output rows, host-side. Everything device-side is torn down before
 // returning, so the two arms never hold two pools at once.
 std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const Call &call,
                                      const Inputs &in, const char *label,
-                                     WorkspaceFill fill = WorkspaceFill::Zero) {
+                                     WorkspaceFill fill = WorkspaceFill::Zero,
+                                     Window window = Window::Production) {
   const ignis_seq_pool_spec spec = pool_spec(kv_format);
   ignis_seq_pool *pool           = nullptr;
   expect_rc(ignis_seq_pool_create(&spec, &pool), 0, (std::string(label) + " pool create").c_str());
@@ -705,7 +722,12 @@ std::vector<std::uint16_t> run_route(const Fixture &fx, int32_t kv_format, const
   // The production batched view: the pool-wide block-table matrix, with each
   // lane's own row selected by `rows` above -- exactly what
   // kernel/src/gqa_layer.cu's decode round hands A1.
-  const ninfer::PagedKVBatchLayerView cache = ignis_kv_batch_layer_view(pool, kGqaOrdinal);
+  ninfer::PagedKVBatchLayerView cache = ignis_kv_batch_layer_view(pool, kGqaOrdinal);
+  if (window == Window::CodecOnly) {
+    cache.residual_k = {};
+    cache.residual_v = {};
+    cache.ring_valid = {};
+  }
   // The envelope the layer would declare: every key this call can see.
   const ninfer::ops::GqaExecutionEnvelope envelope{
       /*min_visible_keys=*/1,
@@ -849,6 +871,10 @@ int main() {
         "prefill W=200 B=1", hq,
         run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in, "prefill hq hostile",
                   WorkspaceFill::Hostile));
+    check_agreement("prefill W=200 B=1 codec only",
+                    compare(bf16, run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in,
+                                            "prefill hq codec only", WorkspaceFill::Zero,
+                                            Window::CodecOnly)));
   }
 
   // ---- prefill at the narrow Prompt widths ---------------------------------
@@ -913,6 +939,10 @@ int main() {
     check(lanes_differ(hq, call.width, batch),
          "decode hq B=" + std::to_string(batch) + ": every lane produced the identical output");
     check_agreement(("decode W=1 B=" + std::to_string(batch)).c_str(), compare(bf16, hq));
+    check_agreement(("decode W=1 B=" + std::to_string(batch) + " codec only").c_str(),
+                    compare(bf16, run_route(fx, IGNIS_KV_FORMAT_HQ_E8_2B, call, in,
+                                            (hq_label + " codec only").c_str(), WorkspaceFill::Zero,
+                                            Window::CodecOnly)));
 
     // The same round as the decode graph declares it: the envelope is the
     // pool's whole context, not this call's 201 visible keys, so the launch

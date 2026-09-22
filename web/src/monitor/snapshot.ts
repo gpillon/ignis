@@ -16,7 +16,7 @@ export const REJECT_REASONS = ["full", "unknown_model", "oversized"] as const;
 export type RejectReason = (typeof REJECT_REASONS)[number];
 
 /**
- * The plan's eleven lines, in the order `VramLines::entries()` lays them out
+ * The plan's twelve lines, in the order `VramLines::entries()` lays them out
  * — which is the order the load itself reserves them in, so the panel reads
  * down the plan rather than down an alphabet.
  */
@@ -31,6 +31,7 @@ export const VRAM_LINES = [
   "drafter_round",
   "lane_state",
   "retained_slots",
+  "hq_residual_window",
   "residual",
 ] as const;
 export type VramLine = (typeof VRAM_LINES)[number];

@@ -149,6 +149,7 @@ pub fn vram_lines(
         drafter_round: reserved.drafter_round,
         lane_state: reserved.lane_state,
         retained_slots: reserved.retained_slots,
+        hq_residual_window: reserved.hq_residual_window,
         residual: ignis_runtime::LOAD_RESIDUAL_BYTES,
     }
 }
@@ -179,6 +180,7 @@ pub fn log_vram_plan(plan: &ignis_core::VramPlan) {
                 drafter_round_bytes = lines.drafter_round,
                 lane_state_bytes = lines.lane_state,
                 retained_slots_bytes = lines.retained_slots,
+                hq_residual_window_bytes = lines.hq_residual_window,
                 residual_bytes = lines.residual,
                 kv_pool_bytes = plan.kv_pool_bytes,
                 kv_page_count = plan.kv_page_count,
@@ -590,6 +592,7 @@ mod tests {
             drafter_round: 7,
             lane_state: 8,
             retained_slots: 10,
+            hq_residual_window: 11,
             kv_pool: 1 << 40,
         };
         let lines = vram_lines(100, reserved);
@@ -606,6 +609,7 @@ mod tests {
                 7,
                 8,
                 10,
+                11,
                 ignis_runtime::LOAD_RESIDUAL_BYTES,
             ],
             "every line in plan order, and never the KV pool the plan sizes itself"

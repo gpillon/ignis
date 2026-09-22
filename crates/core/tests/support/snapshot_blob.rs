@@ -1,8 +1,9 @@
-//! The version-3 snapshot blob layout (`kernel/include/ignis_seq_sections.h`),
+//! The version-4 snapshot blob layout (`kernel/include/ignis_seq_sections.h`),
 //! for the GPU tests that read what a snapshot carries (P5-03, GitHub #152;
-//! P5-05, GitHub #155; GitHub #194). The layout is leaf internal (ADR 0024): a
-//! test asserts `snapshot_format_version() == 3` before trusting these offsets,
-//! so a format change fails that assertion rather than misreading bytes.
+//! P5-05, GitHub #155; GitHub #194; GitHub #257). The layout is leaf internal
+//! (ADR 0024): a test asserts `snapshot_format_version() == 4` before trusting
+//! these offsets, so a format change fails that assertion rather than
+//! misreading bytes.
 
 // Each including test reads the sections it needs.
 #![allow(dead_code)]
@@ -12,6 +13,9 @@ pub const RECORD_BYTES: usize = 24;
 pub const SECTION_PROGRESS: i32 = 4;
 pub const SECTION_DFLASH_WINDOW: i32 = 5;
 pub const SECTION_DFLASH_CHECKPOINT: i32 = 6;
+/// An hq-e8-2b pool's residual window (GitHub #257): every GQA layer's K side
+/// plane, then every layer's V side plane, then the 16 ring words.
+pub const SECTION_HQ_RESIDUAL: i32 = 7;
 
 /// The progress image's offset of the multimodal rope delta (GitHub #194).
 pub const PROGRESS_ROPE_DELTA: usize = 12;
@@ -43,4 +47,19 @@ pub fn section(blob: &[u8], kind: i32) -> (usize, usize) {
         }
     }
     panic!("the snapshot lists no section of kind {kind}");
+}
+
+/// The hq residual window section of `blob` (GitHub #257): every layer's K and
+/// V side planes, then the 16 ring words.
+pub fn hq_window(blob: &[u8]) -> &[u8] {
+    let (at, bytes) = section(blob, SECTION_HQ_RESIDUAL);
+    &blob[at..at + bytes]
+}
+
+/// The ring validity words the hq window section ends with, as the device
+/// holds them (`ignis_core::hq_ring::RingWords`).
+pub fn hq_ring_words(blob: &[u8]) -> [u32; 16] {
+    let window = hq_window(blob);
+    let ring = &window[window.len() - 64..];
+    std::array::from_fn(|i| read_u32(ring, i * 4))
 }

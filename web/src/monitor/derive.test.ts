@@ -139,9 +139,9 @@ describe("deriveMemory", () => {
     expect(m.oversubscribed).toBe(false);
   });
 
-  it("will not add a plan up unless the scrape carries all eleven lines", () => {
+  it("will not add a plan up unless the scrape carries all twelve lines", () => {
     // A partial sum would understate the plan and overstate the room beside
-    // it; the server writes the eleven together or not at all.
+    // it; the server writes the twelve together or not at all.
     const partial = { ...emptySnapshot().memory.reserved, weights: 600, workspace: 300 };
     const m = deriveMemory([memoryAt(0, { reserved: partial, budgetBytes: 2000 })], 0);
     expect(m.linesBytes).toBeNull();
@@ -154,9 +154,9 @@ describe("deriveMemory", () => {
     // was laid out in, and the panel has to be able to say so.
     const reserved = Object.fromEntries(Object.keys(emptySnapshot().memory.reserved).map((line) => [line, 100]));
     const m = deriveMemory([memoryAt(0, { reserved: reserved as MemorySeries["reserved"], budgetBytes: 900, kvPoolPages: 2, kvPageBytes: 50 })], 0);
-    expect(m.linesBytes).toBe(1100);
-    expect(m.kvRoomBytes).toBe(-200);
-    expect(m.spareBytes).toBe(-300);
+    expect(m.linesBytes).toBe(1200);
+    expect(m.kvRoomBytes).toBe(-300);
+    expect(m.spareBytes).toBe(-400);
     expect(m.oversubscribed).toBe(true);
   });
 

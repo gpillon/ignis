@@ -169,6 +169,11 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
         ignis_kv_batch_layer_view(pool, static_cast<std::int32_t>(gqa_layer));
     const ninfer::Tensor seq_block_table = seq->kv.block_table();
     batch_cache.block_tables = seq_block_table.view({seq_block_table.ne[0], 1});
+    // GitHub #257: the hq residual window narrows the same way. It is indexed
+    // by the table row the kernels select, and that row is 0 of this
+    // one-row table, so the window is pre-sliced to the sequence's own slot:
+    // a chunk reads and writes its own sink and ring rows, never lane 0's.
+    ignis_kv_fill_residual(batch_cache, pool, static_cast<std::int32_t>(gqa_layer), seq->slot, 1);
     // The B=1 table-row selector: one device I32 holding 0, bumped from the
     // load-time reservation (an arena bump like every other per-layer
     // buffer here, not an allocation; the arena scope resets after the

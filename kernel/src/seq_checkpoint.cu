@@ -248,7 +248,7 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
     // checkpoint.
     auto entry         = std::make_unique<ignis_seq_checkpoint>();
     entry->tokens      = opener_tokens;
-    entry->image_bytes = pool->slot_state_bytes;
+    entry->image_bytes = pool->retained_image_bytes();
     if (partial) {
       entry->tail = pool->kv_pool.reserve(1);
       entry->tail.materialize_pages(1);

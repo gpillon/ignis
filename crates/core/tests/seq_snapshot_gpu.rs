@@ -26,6 +26,12 @@
 //! which it cannot unless the blob carried the delta. The model is loaded
 //! with vision for it — a multimodal span is refused on a load without.
 //!
+//! GitHub #257 adds hq-e8-2b's residual window: indexed by slot, not by page,
+//! so a sequence restored into a slot another sequence used decodes its own
+//! history only if the blob carried the window. The same claim, under hq, into
+//! the other slot — plus the ring words a prefill and a run of decode rounds
+//! leave, read out of the blob, against the host rule (`ignis_core::hq_ring`).
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing GPU or artifact is a **skip**; under the profile it is a **hard
 //! failure**. Run via `scripts/gpu-profile.ps1` (stops the reference
@@ -39,12 +45,14 @@ mod snapshot_blob;
 use std::path::Path;
 
 use ignis_artifact::{
-    CudaDevice, Device, FrontendSet, ModelScope, Reader, bind_model_scope_27b_with, materialize,
+    CudaDevice, Device, FrontendSet, MaterializedArtifact, ModelScope, ObjectHandle, Reader,
+    bind_model_scope_27b_with, materialize,
 };
 use ignis_core::Vision;
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::gqa_layer::run_gqa_layer;
+use ignis_core::hq_ring::HqRing;
 use ignis_core::model_load::{Model, load_qwen38_27b_with_options};
 use ignis_core::RopeScaling;
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget, snapshot_format_version};
@@ -328,7 +336,7 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
     // Even at that delta the first dozen greedy tokens agree with delta 0's;
     // the tail after the restore is long enough to part company.
     const MULTIMODAL_TAIL: usize = 34;
-    assert_eq!(snapshot_format_version(), 3, "this leg reads the version-3 blob layout");
+    assert_eq!(snapshot_format_version(), 4, "this leg reads the version-4 blob layout");
     let long_prompt: Vec<i32> = frontend
         .tokenizer()
         .encode(
@@ -389,5 +397,133 @@ fn a_restored_sequence_continues_to_the_same_tokens() {
     assert_ne!(
         multimodal_control, unrotated_tail,
         "the rope delta must change the decoded tokens, or this leg proves nothing about it"
+    );
+
+    // ---- GitHub #257: the same claim under hq-e8-2b ---------------------------
+    //
+    // Over the artifact already on the card: a second materialization in the
+    // same process finds the card still full.
+    drop(pool);
+    drop(model);
+    hq_sequence_restored_into_another_slot(&reader, &frontend, &artifact, &handles);
+}
+
+/// GitHub #257 (spec runtime/06): a sequence restored under hq-e8-2b into a
+/// slot another sequence used continues to the tokens it would have produced
+/// unevicted -- which it cannot unless the blob carried its residual window,
+/// since the target slot's own rows were zeroed at alloc and its ring bits
+/// with them. The ring words the source holds after its prefill and a run of
+/// one-token decode rounds are read out of the blob and held to the host rule
+/// (the decode route has no tap: this is its observation).
+fn hq_sequence_restored_into_another_slot(
+    reader: &Reader,
+    frontend: &FrontendSet,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+) {
+    const CONTEXT: u32 = 1024;
+    const CHUNK: u32 = 256;
+    let encode = |text: &str| -> Vec<i32> {
+        frontend
+            .tokenizer()
+            .encode(text)
+            .unwrap_or_else(|e| panic!("tokenize: {e}"))
+            .into_iter()
+            .map(|id| i32::try_from(id).expect("token id fits i32"))
+            .collect()
+    };
+    // Long enough for the ring to hold keys past the sinks, short enough that
+    // it does not wrap: every bit then names one position, and a wrong one
+    // shows.
+    let paragraph = "A paged KV cache stores each sequence's keys and values in fixed-size \
+         pages, and a block table maps every logical page to a physical one. ";
+    let prompt = encode(&format!(
+        "<|im_start|>user\n{}Summarise that in one line.<|im_end|>\n<|im_start|>assistant\n",
+        paragraph.repeat(4)
+    ));
+    let squatter_prompt = encode("<|im_start|>user\nName three rivers in Europe.<|im_end|>\n<|im_start|>assistant\n");
+    assert!(
+        prompt.len() > 64 && prompt.len() + 2 * GENERATED < 512,
+        "the prompt must fill the ring past the sinks without wrapping it: {} tokens",
+        prompt.len()
+    );
+
+    let model = load_qwen38_27b_with_options(
+        reader,
+        artifact,
+        handles,
+        CHUNK,
+        CONTEXT,
+        ignis_core::KvFormat::HqE8_2b,
+        None,
+        Some(Vision::default()),
+        RopeScaling::NONE,
+    )
+    .unwrap_or_else(|e| panic!("load hq model: {e}"));
+    let pool = SeqPool::create(
+        &ModelConfig::qwen38_27b(),
+        &SeqPoolBudget {
+            kv_format: ignis_core::KvFormat::HqE8_2b,
+            kv_page_group_count: 2 * CONTEXT / 64,
+            max_context_tokens: CONTEXT,
+            slot_count: 2,
+            retained_slot_count: 0,
+        },
+    )
+    .unwrap_or_else(|e| panic!("ignis_seq_pool_create: {e}"));
+    assert_eq!(snapshot_format_version(), 4, "this test reads the version-4 blob layout");
+
+    let mut source = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc source: {e}"));
+    let source_slot = source.stats().slot;
+    prefill_program(&model, &pool, &mut source, &prompt, 0, None).unwrap_or_else(|e| panic!("prefill: {e}"));
+    let _head = decode_n(&model, &pool, &mut source, GENERATED, "source head");
+    let blob = source.snapshot().unwrap_or_else(|e| panic!("snapshot: {e}"));
+
+    // The ring the prefill's chunks and the decode rounds left: each chunk
+    // appended its keys, each round the one column it committed.
+    let mut ring = HqRing::new();
+    let mut start = 0u64;
+    while start < prompt.len() as u64 {
+        let len = u64::from(CHUNK).min(prompt.len() as u64 - start);
+        ring.append_prefill(start, len);
+        start += len;
+    }
+    ring.append_decode(prompt.len() as u64, GENERATED as u64);
+    assert_eq!(
+        snapshot_blob::hq_ring_words(&blob),
+        ring.words(),
+        "the ring words after the prefill and {GENERATED} decode rounds are the host rule's"
+    );
+
+    let control = decode_n(&model, &pool, &mut source, GENERATED, "control tail");
+
+    // Another sequence takes the other slot and writes a window of its own.
+    let mut squatter = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc squatter: {e}"));
+    let squatter_slot = squatter.stats().slot;
+    assert_ne!(squatter_slot, source_slot, "two live sequences, two slots");
+    prefill_program(&model, &pool, &mut squatter, &squatter_prompt, 0, None)
+        .unwrap_or_else(|e| panic!("squatter prefill: {e}"));
+    let _ = decode_n(&model, &pool, &mut squatter, GENERATED, "squatter");
+    // Released in this order, the next alloc takes the squatter's slot.
+    drop(source);
+    drop(squatter);
+
+    let mut restored = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("alloc restore target: {e}"));
+    assert_eq!(restored.stats().slot, squatter_slot, "the restore lands in the slot the squatter used");
+    let fresh = restored.snapshot().unwrap_or_else(|e| panic!("fresh snapshot: {e}"));
+    assert!(
+        snapshot_blob::hq_window(&fresh).iter().all(|&b| b == 0),
+        "a re-allocated slot holds nothing of its previous occupant's window"
+    );
+    restored.restore(&blob).unwrap_or_else(|e| panic!("restore: {e}"));
+    assert!(
+        restored.snapshot().unwrap_or_else(|e| panic!("re-snapshot: {e}")) == blob,
+        "a restored hq sequence snapshots to the same bytes as its source, window included"
+    );
+    let tail = decode_n(&model, &pool, &mut restored, GENERATED, "restored tail");
+    assert_eq!(
+        tail, control,
+        "an hq sequence restored into another slot continues to the same tokens it would have \
+         produced unevicted"
     );
 }

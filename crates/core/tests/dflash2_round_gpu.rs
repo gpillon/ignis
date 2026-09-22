@@ -50,6 +50,7 @@ use ignis_artifact::{
 };
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
+use ignis_core::hq_ring::{ring_after_prefill, HqRing};
 use ignis_core::model_load::{load_qwen38_27b, load_qwen38_27b_with_speculation, Model};
 use ignis_core::seq::{snapshot_format_version, Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
@@ -59,7 +60,7 @@ use ignis_core::step::{
 use ignis_core::{KvFormat, Speculation, SpeculativeBackend};
 
 use near_tie::assert_equivalent;
-use snapshot_blob::{section, read_u64, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_WINDOW, SECTION_PROGRESS};
+use snapshot_blob::{hq_ring_words, section, read_u64, PROGRESS_DRAFTER_FRONTIER, SECTION_DFLASH_WINDOW, SECTION_PROGRESS};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const MAX_CONTEXT: u32 = 128;
@@ -309,7 +310,7 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
     // Width 8 carries the four canaries twice: the suite has four prompts.
     let prompts8: Vec<Vec<i32>> = canaries.iter().chain(&canaries).cloned().collect();
     assert!(prompts8.iter().all(|p| p.len() + TOTAL <= MAX_CONTEXT as usize), "a canary outgrows the context");
-    assert_eq!(snapshot_format_version(), 3, "this test reads the version-3 blob layout");
+    assert_eq!(snapshot_format_version(), 4, "this test reads the version-4 blob layout");
 
     let (plan, handles) = bind_model_scope_27b(&reader, Some(DraftModule::Dflash2))
         .unwrap_or_else(|e| panic!("bind with dflash2: {e}"));
@@ -569,5 +570,98 @@ fn the_drafter_proposes_from_its_window_and_the_text_stays_the_spec_off_text() {
         assert_eq!(evicted, never_evicted, "the restored sequence continued differently from the one never evicted");
     }
 
+    // --- GitHub #257: under hq-e8-2b, the rounds' rejected columns -------
+    hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft(&reader, &artifact, &handles, &canaries, &stop_ids);
+
     let _ = artifact.release_arena(&mut device);
+}
+
+/// GitHub #257 (spec runtime/06): under hq-e8-2b a verify pass appends every
+/// lane's `extent + 1` columns, and each append also rewrites the column's
+/// ring slot of the residual window and sets its bit -- a slot an older key
+/// still inside the window named. The columns past the commit are not the
+/// sequence's, so the round must clear their bits (`kernel/src/step.cu`),
+/// outside the captured graph. After every round each lane's ring words, read
+/// out of its snapshot, must be the host rule's (`ignis_core::hq_ring`): the
+/// prefill's appends, every round's columns, the clear of every column it did
+/// not commit.
+fn hq_verify_rounds_clear_the_ring_bits_of_every_rejected_draft(
+    reader: &Reader,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    prompts: &[Vec<i32>],
+    stop_ids: &[i32],
+) {
+    let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW).unwrap();
+    let model = load_qwen38_27b_with_speculation(
+        reader,
+        artifact,
+        handles,
+        MAX_CONTEXT,
+        MAX_CONTEXT,
+        KvFormat::HqE8_2b,
+        Some(spec),
+    )
+    .unwrap_or_else(|e| panic!("model load (hq, dflash2, window {WINDOW}): {e}"));
+    let width = prompts.len();
+    let pool = SeqPool::create_with_speculation(
+        &ModelConfig::qwen38_27b(),
+        &SeqPoolBudget {
+            kv_format: KvFormat::HqE8_2b,
+            kv_page_group_count: MAX_CONTEXT.div_ceil(64) * width as u32,
+            max_context_tokens: MAX_CONTEXT,
+            slot_count: width as u32,
+            retained_slot_count: 0,
+        },
+        Some(SpeculativeBackend::Dflash2),
+    )
+    .unwrap_or_else(|e| panic!("seq pool create: {e}"));
+    let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+
+    let mut lanes: Vec<Seq<'_>> =
+        prompts.iter().map(|_| pool.alloc(MAX_CONTEXT).unwrap_or_else(|e| panic!("alloc: {e}"))).collect();
+    prefill_all(&model, &pool, &mut lanes, prompts);
+    // Each canary is shorter than a prefill chunk: one append each.
+    let mut rings: Vec<HqRing> = prompts.iter().map(|p| ring_after_prefill(&[(0, p.len() as u64)])).collect();
+    let mut frontier: Vec<u64> = prompts.iter().map(|p| p.len() as u64).collect();
+    for (lane, ring) in lanes.iter().zip(&rings) {
+        let blob = lane.snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
+        assert_eq!(hq_ring_words(&blob), ring.words(), "the ring words after the prefill are the rule's");
+    }
+
+    let mut emitted = vec![0usize; width];
+    let mut done = vec![false; width];
+    let (mut rounds, mut rejected) = (0usize, 0u64);
+    while done.iter().any(|d| !d) {
+        let active: Vec<usize> = (0..width).filter(|&i| !done[i]).collect();
+        let budgets: Vec<u32> = active.iter().map(|&i| (TOTAL - emitted[i]) as u32).collect();
+        let mut remaining: Vec<Option<&mut Seq<'_>>> = lanes.iter_mut().map(Some).collect();
+        let mut refs: Vec<&mut Seq<'_>> =
+            active.iter().map(|&i| remaining[i].take().expect("each active lane once")).collect();
+        let results = round(&model, &pool, &mut refs, &budgets, stop_ids);
+        for (&i, result) in active.iter().zip(results) {
+            let written = u64::from(result.extent) + 1;
+            let kept = result.tokens.len() as u64;
+            rings[i].append_decode(frontier[i], written);
+            rings[i].invalidate(frontier[i] + kept, frontier[i] + written);
+            rejected += written - kept;
+            frontier[i] += kept;
+            done[i] = result.tokens.iter().any(|t| stop_ids.contains(t));
+            emitted[i] += result.tokens.len();
+            done[i] |= emitted[i] >= TOTAL;
+        }
+        for &i in &active {
+            let blob = lanes[i].snapshot().unwrap_or_else(|e| panic!("snapshot: {e:?}"));
+            assert_eq!(
+                hq_ring_words(&blob),
+                rings[i].words(),
+                "lane {i}, round {rounds}: the ring words are the rule's -- every rejected column's \
+                 bit cleared, every committed one's set"
+            );
+        }
+        rounds += 1;
+        assert!(rounds <= TOTAL, "the run does not converge");
+    }
+    println!("hq verify rounds: {rounds} rounds over {width} lanes, {rejected} rejected columns cleared");
+    assert!(rejected > 0, "no round rejected a column: the clear this test exists for never ran");
 }

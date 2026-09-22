@@ -30,6 +30,10 @@ With the window on:
   (`launcher/gqa_attention_prefill_hq_routes.cuh:70`); the current chunk's
   rows are rotated straight into the scratch, and the ring then serves the 512
   keys *before* the chunk (`gqa_attention_prefill_hq.cuh:160-215`).
+  **But it reads the ring after the chunk's own append** (see *As built*):
+  `gqa_attention_prompt_launch` enqueues the append before the attention, so
+  a key before the chunk whose ring slot the chunk just rewrote is served the
+  chunk's row, bit set. Same in the reference.
 - Everything else: `hq_decode_row_group`, the codec.
 - **Writes are already there.** The hq fill (append) kernel dual-writes every
   appended row that can still be recent — rotated, one BF16 rounding — into
@@ -171,6 +175,70 @@ In this order — each catches a wrong fix before the next costs a GPU run.
 re-run with the window on. If the 7/20 vs 18/20 split moves, comment the
 numbers on #173; if it does not, the window is still correct and #173 has
 another cause. G5 is not required for this change.
+
+## As built (2026-09-22)
+
+Wired as the seam says; what building it found, and where it departs:
+
+- **The prompt route reads the ring after its chunk's append.** For a chunk
+  `[p0, p0 + w)` the vendored `gqa_attention_prompt_launch` runs the append
+  (which dual-writes the chunk's last `min(w, 512)` keys into their ring slots
+  and sets their bits) before the scratch decode that serves `[p0 - 512, p0)`
+  from the ring. So the keys `[p0 - 512, p0 - 512 + min(w, 512))` are served
+  the rows of the chunk keys that share their slots — exact rows, of the wrong
+  key. The reference (ninfer `a00648cb`) launches the same order. Measured
+  through the tap (`attn_tap_hq_consumed_gpu.rs`, GPU run 2026-09-22): on both
+  pointing inputs the query chunk is 122 wide at 16,384 / 1,024, and 122 of
+  the 512 ring rows come back exact **to the chunk key 512 positions later**
+  (rel. L2 0.0019-0.0020 to it), the other 390 exact to their own. At the
+  serving chunk of 1,024, every full chunk after the first loses the whole
+  ring this way. Kept as the reference has it — `kernel/vendor/` is unchanged
+  and #173 compares against a reference that does the same — and written down
+  as `ignis_core::hq_ring::PromptSource::Clobbered`. Swapping the two launches
+  when the window is on would give the rule this spec first described; that
+  is a vendored-file patch outside ADR 0031, the owner's call.
+- **AC 1 as measured.** Fresh 122, sink 32, ring 390, clobbered 122, codec the
+  rest (96.3% of the image at 4096 px, 40.1% at 1024 px); every exact row within
+  0.0020. "Codec rows byte-identical to the capture before this change" holds
+  where the key the codec is given is unchanged: at GQA ordinal 0 (L3), with
+  only GDN layers above it, 15,840 of 15,840 codec positions (480 of 480 at
+  1024 px) have the baseline's key bit for bit and decode to the baseline's
+  bytes. At L39 no key is the baseline's — the GQA layers above it now attend
+  over exact rows — so the check does not apply there.
+- **No revalidation call site.** ignis never trims a live sequence back: a
+  prefix is published at exactly its end, a checkpoint captured at exactly its
+  opener, a snapshot taken at a chunk boundary, and a claimant or a restore
+  resumes at exactly that point. The clone and the blob carry the window as a
+  CLONE state section (`IGNIS_SEQ_SECTION_HQ_RESIDUAL`, snapshot format 4), so
+  there is nothing to revalidate. The reference's rule is kept host-side
+  (`ignis_hq_ring_revalidate_mask`, `kernel/include/ignis_hq_ring.h`) for tests.
+- **A failed verify round clears its columns too**, not only a committed one:
+  a retry at a smaller extent would otherwise read a failed round's rows as
+  older keys'. A guard in `run_verify_round` clears `[p, p + extent + 1)` of
+  every lane on any failure after the pass is enqueued.
+- **The prefill view narrows the window to the sequence's slot.** The layer's
+  prefill path hands A1 the sequence's own block-table row as a one-row table,
+  so the window is pre-sliced to that slot; before this, an hq prefill on any
+  slot but 0 was refused by the vendored shape check (the lifecycle tests
+  found it on slot 3).
+- **The route agreement test keeps a codec-only arm.** Its histories fit the
+  window, so the production view now agrees with BF16 to one rounding (prefill
+  W=200 0.0023, decode 0.0032-0.0033); the same arms over a view with the
+  window taken off reproduce the 2026-09-12 numbers exactly (0.227955,
+  0.174-0.190) and keep the codec's read path inside attention under test.
+- **Lifecycle** (AC 2): `retained_prefix_gpu.rs`, `prompt_checkpoint_gpu.rs`
+  (checkpoint claim, KV-RAM restore of the materialized blob, chained turn),
+  `seq_snapshot_gpu.rs` (restore into the slot another sequence used) and
+  `dflash2_round_gpu.rs` (11 rounds over 4 lanes, 65 rejected columns) run
+  under hq as well as BF16: the claimant's window is the publisher's at the
+  prefix's end, the whole snapshot after the same tail is the split control's
+  byte for byte, the continuation tokens match, and the ring words read out of
+  the blob after the prefill, after one-token decode rounds and after every
+  verify round are the host rule's (`ignis_core::hq_ring::HqRing`).
+- **VRAM plan** (AC 4): `hq_residual_window`, its own line —
+  `ignis_seq_pool_plan::hq_residual_bytes`, read back off the pool and held
+  equal by `vram_plan_gpu.rs`; 34 MiB per slot, lanes and retained slots alike.
+  The retained image's `image_bytes` includes it; `slot_state_bytes` does not.
 
 ## Out of scope
 

@@ -41,18 +41,22 @@
 //!
 //! The consumed capture verifies itself, and a run that fails the check is
 //! not a measurement. Every prompt row on the armed head's KV head is
-//! compared with the rotated pre-codec key: **no row may be exact** (relative
-//! L2 under [`EXACT_ROW_REL_ERR`]) — one would mean the residual window has
-//! been switched on, the three-source rule now applies, and this test's
-//! expectation is out of date — and the rows' median must sit in the codec's
-//! own band, [`CODEC_ROW_MIN_MEDIAN`] to [`CODEC_ROW_MAX_MEDIAN`], which a
-//! mis-offset or mis-rotated capture (uncorrelated, ~1.4) cannot. The JSON
-//! also carries what the three-source rule *would* have kept exact, so the
-//! day the window is wired the difference is already on record.
+//! classified by `ignis_core::hq_ring::prompt_source` — the vendored prompt
+//! route's rule with the residual window wired (GitHub #257), replayed over
+//! this prompt's own chunks — and compared with the rotated pre-codec key: a
+//! fresh, sink or ring row must be exact (relative L2 under
+//! [`EXACT_ROW_REL_ERR`]), a clobbered one exact to the key whose append
+//! rewrote its ring slot, a codec row not exact, and the codec rows' median
+//! must sit in the codec's own band, [`CODEC_ROW_MIN_MEDIAN`] to
+//! [`CODEC_ROW_MAX_MEDIAN`], which a mis-offset or mis-rotated capture
+//! (uncorrelated, ~1.4) cannot.
 //!
-//! **Geometry.** With every key decoded, the codec fraction is 100% at every
-//! image size, so a 1024 px hq number is not flattered by exact rows the
-//! 4096 px prompt would lack. Set C4096 still exists for the resolution.
+//! **Geometry.** Before #257 every key was decoded, so the codec fraction was
+//! 100% at every image size and every hq number above was measured that way.
+//! With the window the image's codec fraction depends on where the query's
+//! chunk starts — 40.1% on a 1146-token 1024 px prompt, 96.3% on the 4096 px
+//! fixture — and the JSON records it per scene. Set C4096 still exists for
+//! the resolution.
 //!
 //! **Two renders, because the vehicle did not measure the served prompt.**
 //! The vehicle rendered with `enable_thinking` undefined, which in this
@@ -134,7 +138,8 @@ use ignis_artifact::{
     ChatMessage, ChatRenderOptions, ContentPart, CudaDevice, FrontendSet, MessageContent,
     ModelScope, Reader, Role, bind_model_scope_27b_with, materialize,
 };
-use ignis_core::attn_tap::{GQA_LAYERS, HqSource, Q_HEADS, hq_source, with_attn_tap, with_attn_tap_hq};
+use ignis_core::attn_tap::{GQA_LAYERS, Q_HEADS, with_attn_tap, with_attn_tap_hq};
+use ignis_core::hq_ring::{PromptSource, prompt_source, ring_after_prefill};
 use ignis_core::compute::ModelConfig;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::load_qwen38_27b_with_options;
@@ -209,10 +214,9 @@ const CRITERION_C_HEAD: usize = 224;
 const CRITERION_C_GUARD: usize = 233;
 
 /// Under this relative L2 against the rotated pre-codec key a row was read
-/// exact, i.e. not through the codec; this engine reads none that way. The
-/// same bound as `attn_tap_hq_consumed_gpu.rs`: exact rows sit near 0.004,
-/// the codec's lowest row on a 4096 px prompt at 0.333, so 0.1 is far from
-/// both.
+/// exact, i.e. not through the codec. The same bound as
+/// `attn_tap_hq_consumed_gpu.rs`: exact rows sit near 0.002-0.004, the
+/// codec's lowest row on a 4096 px prompt at 0.333, so 0.1 is far from both.
 const EXACT_ROW_REL_ERR: f64 = 0.1;
 /// The codec's own per-row error band on real rows: median ~0.37, max
 /// ~0.77 (`docs/findings/2026-09-12-hq-attention-route-agreement.md`). A
@@ -375,6 +379,23 @@ fn chunk_start_of(prompt: &Multimodal, total: u32, chunk: u32, position: u32) ->
         let len = prompt.cap_chunk(start, chunk.min(total - start));
         if position < start + len {
             return start;
+        }
+        start += len;
+    }
+    panic!("position {position} is past the prompt's {total} tokens")
+}
+
+/// The `(start, len)` chunks up to and including the one holding `position`,
+/// cut as `chunk_start_of` cuts them: what the hq ring saw appended by the
+/// time that chunk's attention read it.
+fn chunks_through(prompt: &Multimodal, total: u32, chunk: u32, position: u32) -> Vec<(u64, u64)> {
+    let mut chunks = Vec::new();
+    let mut start = 0u32;
+    while start < total {
+        let len = prompt.cap_chunk(start, chunk.min(total - start));
+        chunks.push((u64::from(start), u64::from(len)));
+        if position < start + len {
+            return chunks;
         }
         start += len;
     }
@@ -833,40 +854,59 @@ fn one_attention_head_points_in_the_engine() {
             }
             let query_chunk_start = captured_start.max(0) as usize;
             // Every row of the prompt on the head's own KV head, classified by
-            // the kernel's rule and compared with the rotated pre-codec key.
+            // the kernel's rule (GitHub #257: the ring as the chunks up to the
+            // query's appended it, the query chunk's own append included) and
+            // compared with the rotated pre-codec key.
+            let ring = ring_after_prefill(&chunks_through(
+                &prompt,
+                tokens.len() as u32,
+                chunk,
+                query as u32,
+            ));
             let kv_head = HEAD_Q / (Q_HEADS / 4);
-            let (mut fresh, mut side, mut codec) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut exact_rows, mut clobbered, mut codec) = (Vec::new(), Vec::new(), Vec::new());
+            let mut off_rule = 0usize;
             let (mut image_codec_rule, mut image_codec_measured) = (0usize, 0usize);
             for position in 0..tokens.len() {
                 let err = f64::from(capture.consumed_key_rel_err(head_layer, position, kv_head));
-                let source = hq_source(position, query_chunk_start);
+                let source = prompt_source(position as u64, query_chunk_start as u64, &ring);
                 match source {
-                    HqSource::Fresh => fresh.push(err),
-                    HqSource::Side => side.push(err),
-                    HqSource::Codec => codec.push(err),
+                    PromptSource::Fresh | PromptSource::Sink | PromptSource::Ring => {
+                        off_rule += usize::from(err >= EXACT_ROW_REL_ERR);
+                        exact_rows.push(err);
+                    }
+                    PromptSource::Clobbered { by } => {
+                        let to_by = f64::from(capture.consumed_key_rel_err_to(
+                            head_layer,
+                            position,
+                            kv_head,
+                            by as usize,
+                        ));
+                        off_rule += usize::from(to_by >= EXACT_ROW_REL_ERR);
+                        clobbered.push(to_by);
+                    }
+                    PromptSource::Codec => {
+                        off_rule += usize::from(err < EXACT_ROW_REL_ERR);
+                        codec.push(err);
+                    }
                 }
                 if (begin..begin + count).contains(&position) {
-                    image_codec_rule += usize::from(matches!(source, HqSource::Codec));
+                    image_codec_rule += usize::from(source == PromptSource::Codec);
                     image_codec_measured += usize::from(err >= EXACT_ROW_REL_ERR);
                 }
             }
-            // This engine wires no residual window, so every row is decoded:
-            // an exact one means that changed.
-            let mut all: Vec<f64> = fresh.iter().chain(&side).chain(&codec).copied().collect();
-            let exact = all.iter().filter(|&&e| e < EXACT_ROW_REL_ERR).count();
-            if exact > 0 {
+            if off_rule > 0 {
                 verify_failures.push(format!(
-                    "{}: {exact} of {} rows were read exact — the hq residual window is on in this \
-                     build, the kernel's three-source rule applies, and this harness's expectation \
-                     (every key decoded) is out of date",
+                    "{}: {off_rule} of {} rows are not what the hq prompt route's rule says (exact \
+                     where it keeps a row, decoded where it does not)",
                     scene.id,
-                    all.len()
+                    tokens.len()
                 ));
             }
-            let all_median = median(&mut all).unwrap_or(f64::NAN);
-            if !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&all_median) {
+            let codec_median = median(&mut codec.clone()).unwrap_or(f64::NAN);
+            if !(CODEC_ROW_MIN_MEDIAN..=CODEC_ROW_MAX_MEDIAN).contains(&codec_median) {
                 verify_failures.push(format!(
-                    "{}: the captured keys sit at median rel L2 {all_median:.4} from the rotated \
+                    "{}: the decoded keys sit at median rel L2 {codec_median:.4} from the rotated \
                      pre-codec keys, outside the codec's band [{CODEC_ROW_MIN_MEDIAN}, \
                      {CODEC_ROW_MAX_MEDIAN}] — the capture is not the keys attention consumed",
                     scene.id
@@ -874,15 +914,15 @@ fn one_attention_head_points_in_the_engine() {
             }
             hq_stats = serde_json::json!({
                 "query_chunk_start": query_chunk_start,
-                // What the three-source rule would put through the codec if
-                // the residual window were wired, beside what was measured.
-                "codec_fraction_if_window_on": image_codec_rule as f64 / count as f64,
+                // What the rule puts through the codec, beside what was
+                // measured decoded (a clobbered row is exact to another key,
+                // so it counts as measured-decoded against its own).
+                "codec_fraction_rule": image_codec_rule as f64 / count as f64,
                 "codec_fraction_measured": image_codec_measured as f64 / count as f64,
-                "rows": {"fresh": fresh.len(), "side": side.len(), "codec": codec.len()},
-                "median_rel_err_all": all_median,
+                "rows": {"exact": exact_rows.len(), "clobbered": clobbered.len(), "codec": codec.len()},
                 "median_rel_err_by_rule_class": {
-                    "fresh": median(&mut fresh),
-                    "side": median(&mut side),
+                    "exact": median(&mut exact_rows),
+                    "clobbered_to_rewriting_key": median(&mut clobbered),
                     "codec": median(&mut codec),
                 },
             });
