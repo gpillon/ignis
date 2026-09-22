@@ -79,10 +79,10 @@ codec-only engine read 47 by the same chance.
 
 ## Implications
 
-- `decide_number_width_gpu` fails on a correct engine: it asserts an exact
+- `decide_number_width_gpu` failed on a correct engine: it asserted an exact
   answer on a cell whose margin is smaller than two roundings. Making it
-  green is a decision about the test or the prompt, not a kernel fix — #259
-  stops there for the owner.
+  green was a decision about the test or the prompt, not a kernel fix; the
+  owner chose the test (Follow-ups).
 - #254's alignment clause does hold on this cell (BF16, both reuse modes;
   hq with reuse off). What it does not have is margin: where 47 wins, the
   other first digits together still take 0.06–0.25, and in the failing shape
@@ -102,6 +102,7 @@ codec-only engine read 47 by the same chance.
 
 ## Follow-ups
 
-- #259 item 1: the owner's call — accept the cell as a tie (drop it from the
-  assertion, or assert a first-digit floor instead of the value), or change
-  the `number` prompt's wording (a behaviour change, #254's territory).
+- #259 item 1, decided by the owner 2026-09-22: the test keeps the served
+  shape (hq, prompt reuse) and asserts #254's signature instead of every
+  cell's value - no fitting cell wrong with its first digit at p >= 0.9, at
+  most 2 of 21 wrong in all. The prompt is unchanged.
