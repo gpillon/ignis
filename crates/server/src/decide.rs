@@ -2103,10 +2103,13 @@ struct Rendered {
     prompt_tokens: u32,
     media: Option<crate::media::MediaStats>,
     /// A head point's image grid, `(rows, cols)` of merged tokens (GitHub
-    /// #260) — `None` for every other question, and for a head point whose
-    /// `state` carried no image, which is then answered
-    /// `state_carries_no_image` without being submitted.
+    /// #260), and `None` for every other question.
     grid: Option<(usize, usize)>,
+    /// The answer a question already has without being submitted — a head
+    /// point with no image to point on, or one whose image is not a grid the
+    /// region rule can read (GitHub #260). `None` for every question the
+    /// engine is asked.
+    answered: Option<Answer>,
 }
 
 /// Build one question's prompt. Refuses the whole request on failure: a
@@ -2196,23 +2199,29 @@ async fn render(
                 // decoded from: a decision over the pointing head's
                 // attention across the image's placeholder span.
                 Some(head) => {
-                    let Some((query, grid)) = head_query(&input, head) else {
-                        // No image to point on: the same answer the chain
-                        // gives, and nothing is submitted for it.
-                        return Ok(Rendered { input, model, prompt_tokens, media, grid: None });
+                    // An image the head cannot point on is answered here, and
+                    // nothing is submitted for it.
+                    let (grid, answered) = match head_query(&input, head) {
+                        Ok((query, grid)) => {
+                            input.decision = Some(ignis_core::DecisionRead::Attention(query));
+                            (Some(grid), None)
+                        }
+                        Err(answer) => (None, Some(answer)),
                     };
-                    input.decision = Some(ignis_core::DecisionRead::Attention(query));
-                    return Ok(Rendered { input, model, prompt_tokens, media, grid: Some(grid) });
+                    return Ok(Rendered { input, model, prompt_tokens, media, grid, answered });
                 }
             }
         }
     }
-    Ok(Rendered { input, model, prompt_tokens, media, grid: None })
+    Ok(Rendered { input, model, prompt_tokens, media, grid: None, answered: None })
 }
 
 /// The attention readout a head point asks for over `input`'s image, and
-/// that image's merged token grid `(rows, cols)` (GitHub #260) — or `None`
-/// when the prompt carries no image to point on.
+/// that image's merged token grid `(rows, cols)` (GitHub #260) — or the
+/// answer it gets instead: `state_carries_no_image` when there is no image,
+/// the chain's own failure for the same state, and `image_not_a_grid` when
+/// the item's placeholders are not one frame's merged grid, row by row, which
+/// is the only map the region rule reads.
 ///
 /// The **first** image, as the chain's pixels are the first image's: a
 /// `point` answers about the submitted image, and a multi-image state is
@@ -2220,23 +2229,27 @@ async fn render(
 fn head_query(
     input: &ignis_core::types::RequestInput,
     head: ignis_core::pointing::PointingHead,
-) -> Option<(ignis_core::pointing::AttentionQuery, (usize, usize))> {
-    let item = input.multimodal.as_ref()?.media.first()?;
+) -> Result<(ignis_core::pointing::AttentionQuery, (usize, usize)), Answer> {
+    let item = input
+        .multimodal
+        .as_ref()
+        .and_then(|multimodal| multimodal.media.first())
+        .ok_or_else(no_image)?;
     let merge = ignis_artifact::vision::MERGE as u32;
     let (rows, cols) = ((item.grid.h / merge) as usize, (item.grid.w / merge) as usize);
-    // An image is one frame, and its placeholders are its merged grid, row
-    // by row; anything else is not a map this rule can read.
-    if item.grid.t != 1 || rows * cols != item.token_span.count {
-        return None;
+    let span = (u32::try_from(item.token_span.begin), u32::try_from(item.token_span.count));
+    match span {
+        (Ok(key_begin), Ok(key_count)) if item.grid.t == 1 && rows * cols == item.token_span.count => {
+            Ok((ignis_core::pointing::AttentionQuery { head, key_begin, key_count }, (rows, cols)))
+        }
+        _ => Err(failed(
+            "image_not_a_grid",
+            format!(
+                "the image's {} placeholders are not one frame's {rows}x{cols} merged grid, so the pointing head's map cannot be read over it",
+                item.token_span.count
+            ),
+        )),
     }
-    Some((
-        ignis_core::pointing::AttentionQuery {
-            head,
-            key_begin: u32::try_from(item.token_span.begin).ok()?,
-            key_count: u32::try_from(item.token_span.count).ok()?,
-        },
-        (rows, cols),
-    ))
 }
 
 /// Put one rendered question to the model and shape its answer.
@@ -2248,13 +2261,13 @@ fn head_query(
 async fn ask(
     server: &crate::Server,
     question: &PreparedQuestion,
-    ready: Rendered,
+    mut ready: Rendered,
     class: ignis_core::types::RequestClass,
 ) -> Attempt {
     // GitHub #260: a head point over a state with no image fails as the
     // chain's does, and costs nothing — there is no span to read.
-    if question.head.is_some() && ready.grid.is_none() {
-        return Attempt::Answered(no_image());
+    if let Some(answer) = ready.answered.take() {
+        return Attempt::Answered(answer);
     }
     // Cloned because `submit_with_media` consumes what it takes and a
     // `Full` has to be retriable: a prompt's worth of token ids beside a

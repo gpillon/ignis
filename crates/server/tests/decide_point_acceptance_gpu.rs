@@ -19,7 +19,11 @@
 //! that always gave one method the warm cache would be measuring the cache.
 //!
 //! `IGNIS_POINT_SCENES=<dir with manifest.json>` names the set (generate it
-//! with the command above into `.scratch/`, which git does not track);
+//! with the command above into `.scratch/`, which git does not track).
+//! Without it the test runs the committed five 1024 px scenes
+//! (`fixtures/pointing/1024`, the first of set C), which is what the GPU
+//! profile exercises: the whole path, both methods, no floor — the floor is
+//! asserted only on a full set D or D4096, recognized by its seed;
 //! `IGNIS_POINT_OUT=<dir>` is where the per-scene JSON goes (default the OS
 //! temp dir); `IGNIS_POINT_LIMIT=<n>` is a smoke run. The load is the one
 //! `make start` serves by default: vision on, hq-e8-2b, a 1024-token prefill
@@ -61,9 +65,9 @@ const MODEL: &str = "qwen3.8-27b";
 const FLOOR_1024: usize = 221;
 const FLOOR_4096: usize = 230;
 const FULL_SET: usize = 240;
-/// Scenes per model load (see the module docs): 40 scenes are 80 image
-/// questions, ~16 GB of retained patch rows at 4096 px.
-const SCENES_PER_LOAD: usize = 40;
+/// Scenes per model load (see the module docs): 20 scenes are 40 image
+/// questions, ~8 GB of retained patch rows at 4096 px.
+const SCENES_PER_LOAD: usize = 20;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -81,6 +85,18 @@ struct Scene {
     instruction: String,
     #[serde(default)]
     kind: Option<String>,
+}
+
+/// The pre-registered floor of a set, if it is one of spec 13's: set D
+/// (1024 px, seed 20260925) or D4096 (seed 20260926), whole. Any other set —
+/// C, a fixture, a partial run — is reported and never judged: the floor was
+/// written for scenes never used to choose the head or the rule.
+fn floor_of(side: u32, seed: u64, scenes: usize) -> Option<usize> {
+    match (side, seed, scenes) {
+        (1024, 20_260_925, FULL_SET) => Some(FLOOR_1024),
+        (4096, 20_260_926, FULL_SET) => Some(FLOOR_4096),
+        _ => None,
+    }
 }
 
 fn data_uri(bytes: &[u8]) -> String {
@@ -158,11 +174,13 @@ fn median(values: &mut [f64]) -> Option<f64> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1 (and IGNIS_POINT_SCENES)"]
 async fn a_point_with_no_method_meets_the_preregistered_floor() {
-    let Ok(dir) = std::env::var("IGNIS_POINT_SCENES") else {
-        eprintln!("SKIP: IGNIS_POINT_SCENES names no scene set (generate D or D4096 first)");
-        return;
-    };
-    let dir = PathBuf::from(dir);
+    let dir = std::env::var("IGNIS_POINT_SCENES").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("pointing")
+            .join("1024")
+    });
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_else(|e| panic!("{}: {e}", dir.display())),
     )
@@ -295,18 +313,11 @@ async fn a_point_with_no_method_meets_the_preregistered_floor() {
         let _ = driver.join();
     }
 
-    if n == FULL_SET {
-        let floor = match manifest.side {
-            1024 => Some(FLOOR_1024),
-            4096 => Some(FLOOR_4096),
-            _ => None,
-        };
-        if let Some(floor) = floor {
-            assert!(
-                head_inside >= floor,
-                "the pre-registered floor at {} px is {floor} of {FULL_SET}; the head landed inside on {head_inside}",
-                manifest.side
-            );
-        }
+    if let Some(floor) = floor_of(manifest.side, manifest.seed, n) {
+        assert!(
+            head_inside >= floor,
+            "the pre-registered floor at {} px is {floor} of {FULL_SET}; the head landed inside on {head_inside}",
+            manifest.side
+        );
     }
 }

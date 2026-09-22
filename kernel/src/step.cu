@@ -1299,9 +1299,12 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   // wider than the load reserved room to score -- and keys that turn out not
   // to be there to read are the unread flag's business, not an error.
   ArmedAttentionReadout attention_readout;
-  const bool reads_attention = options != nullptr && options->attention_gqa_ordinal >= 0 &&
-                               options->out_attention_scores != nullptr;
-  if (reads_attention) {
+  const bool arms_readout = options != nullptr && options->attention_gqa_ordinal >= 0 &&
+                            options->out_attention_scores != nullptr;
+  if (arms_readout) {
+    // The room `plan_load_sizes` (kernel/src/model.cu) reserved for the
+    // scores: one F32 per token of the vision envelope, capped by the
+    // context -- the same two terms, or a readout could outgrow its arena.
     const std::uint64_t capacity =
         std::min<std::uint64_t>(model->vision_max_tokens, model->max_context_tokens);
     bool has_layer = false;
@@ -1359,7 +1362,7 @@ extern "C" int32_t ignis_program_prefill(struct ignis_model *model,
   } else {
     rc = run_program_prefill_chunked(model, pool, seq, token_ids, num_tokens, *sampling,
                                      out_logits, mode, multimodal, permitted_prob,
-                                     reads_attention ? &attention_readout : nullptr);
+                                     arms_readout ? &attention_readout : nullptr);
   }
   if (rc != 0) {
     return rc;

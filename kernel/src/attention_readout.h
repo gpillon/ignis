@@ -49,7 +49,8 @@ struct AttentionReadoutTarget {
 //
 // Returns 0 and sets `*target.read` when it launched the scores; returns 0
 // with `*target.read` untouched when the keys were not there to read; a
-// negative value (with `error` set) only for a launch failure.
+// negative value (with `error` set) for a layer whose head geometry is not
+// the one it was built for, or a launch failure.
 int32_t ignis_attention_readout_run(const AttentionReadoutTarget &target,
                                     const void *rotated_query, int32_t q_heads, int32_t kv_heads,
                                     int32_t tokens, int64_t visible_keys,

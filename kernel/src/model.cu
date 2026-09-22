@@ -1070,6 +1070,11 @@ void check_dflash2_round_workspace(const ignis_model &model, const Geometry &g,
 // reports it, run. Throws on a sizing failure.
 struct LoadSizes {
   std::size_t prefill_scratch = 0;
+  // GitHub #260 (ADR 0038): the attention readout's scores, which a prefill
+  // chunk takes from the same arena beside `prefill_scratch`. Kept apart from
+  // it because only a vision load has any: what vision adds to the arena is
+  // counted as vision's (`vision_reserved_bytes`), readout included.
+  std::size_t attention_readout = 0;
   std::size_t vision_workspace = 0;
   std::size_t media_embedding = 0;
   std::size_t sampling_workspace = 0;
@@ -1083,7 +1088,9 @@ struct LoadSizes {
   // media encode runs between prefill steps, never inside one, so the two
   // are never live at once -- ninfer sizes its single workspace the same
   // way.
-  std::size_t workspace() const { return std::max(prefill_scratch, vision_workspace); }
+  std::size_t workspace() const {
+    return std::max(prefill_scratch + attention_readout, vision_workspace);
+  }
 
   ignis_model_reservations reservations() const {
     const std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -1137,7 +1144,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // per key, and an image holds at most the envelope's tokens. Only a
     // vision load can be asked one (the span is an image's), so a text load
     // reserves nothing for it.
-    sizes.prefill_scratch += fp32_bytes(tokens);
+    sizes.attention_readout = fp32_bytes(tokens);
     sizes.vision_workspace =
         ignis_vision_workspace_bytes(tokens, std::min(tokens, kVisionMaxSegments));
     sizes.media_embedding =

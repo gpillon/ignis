@@ -1227,15 +1227,10 @@ pub struct MultimodalPrefill<'a> {
 }
 
 /// One **attention readout** a multimodal span asks for (GitHub #260, ADR
-/// 0038): what to read, and where the scores go.
+/// 0038): what to read, and where the scores go — one slot per key of the
+/// query's span.
 pub struct AttentionReadout<'a> {
-    /// The GQA layer, counted among GQA layers only.
-    pub gqa_ordinal: u32,
-    /// The query head within that layer.
-    pub query_head: u32,
-    /// The absolute prompt position of the first key read.
-    pub key_begin: u32,
-    /// One score slot per key read.
+    pub query: crate::pointing::AttentionQuery,
     pub scores: &'a mut [f32],
 }
 
@@ -1307,10 +1302,17 @@ pub fn prefill_program_multimodal(
         ..PrefillRoute::Chunked.to_options(ComputePolicy::EngineDefault)
     };
     if let Some(readout) = attention {
-        options.attention_gqa_ordinal = readout.gqa_ordinal as i32;
-        options.attention_query_head = readout.query_head as i32;
-        options.attention_key_begin = i64::from(readout.key_begin);
-        options.attention_key_count = readout.scores.len() as i64;
+        if readout.scores.len() != readout.query.key_count as usize {
+            return Err(format!(
+                "prefill_program_multimodal: {} score slots for an attention readout of {} keys",
+                readout.scores.len(),
+                readout.query.key_count
+            ));
+        }
+        options.attention_gqa_ordinal = readout.query.head.gqa_ordinal as i32;
+        options.attention_query_head = readout.query.head.query_head as i32;
+        options.attention_key_begin = i64::from(readout.query.key_begin);
+        options.attention_key_count = i64::from(readout.query.key_count);
         options.out_attention_scores = readout.scores.as_mut_ptr();
         options.out_attention_read = &mut read;
     }

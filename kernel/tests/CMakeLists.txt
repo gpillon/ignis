@@ -436,6 +436,18 @@ add_executable(ignis_kernel_dflash2_topk_test test_dflash2_topk.cu)
 target_link_libraries(ignis_kernel_dflash2_topk_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_topk_test COMMAND ignis_kernel_dflash2_topk_test)
 
+# GitHub #260 (ADR 0038): OURS, not vendored -- the attention readout
+# (kernel/src/attention_readout.h, a leaf-internal header, hence the include
+# of kernel/src). One query head's scores over a span of keys, from BF16 pages
+# through a block table and from the hq prompt route's rotated-frame plane,
+# against a double-precision host restatement of `q . k / 16`, plus every
+# guard that leaves a readout unread. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_attention_readout_test test_attention_readout.cu)
+target_include_directories(ignis_kernel_attention_readout_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_attention_readout_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_attention_readout_test COMMAND ignis_kernel_attention_readout_test)
+
 add_executable(ignis_kernel_hq_route_agreement_test test_hq_route_agreement.cu)
 target_compile_definitions(ignis_kernel_hq_route_agreement_test PRIVATE
   IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")

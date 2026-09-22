@@ -235,14 +235,15 @@ fn a_developer_policy_that_rerenders_history_warns_at_start() {
 }
 
 /// GitHub #260: the load says how `point` will be answered before the first
-/// request. A load with no artifact has no calibrated pointing head, so it
-/// says `chain`; the served artifact's `head` is the GPU profile's to see.
+/// request. A load with no artifact binds no vision, so it says neither
+/// method; `chain` and the served artifact's `head` need a `--vision` load,
+/// which is the GPU profile's to see.
 #[test]
 fn the_load_says_which_method_point_will_use() {
     let records = run_until(&[], &[], &["ignis.process.started"]);
     let method = find(&records, "ignis.decide.pointing_head");
     assert_eq!(method["severity_text"], "INFO");
-    assert_eq!(method["attributes"]["point_method"], "chain", "{method}");
+    assert_eq!(method["attributes"]["point_method"], "none", "{method}");
     assert!(method["attributes"]["artifact"].as_str().is_some(), "{method}");
 }
 

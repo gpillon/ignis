@@ -460,16 +460,23 @@ async fn main() {
     // GitHub #260: how a `point` with no `method` will be answered, said once
     // at load and before the first request. The head is keyed to the
     // artifact's content hash, so a load nobody calibrated one for says
-    // "chain" here instead of being found out from its answers.
-    match server.pointing_head {
-        Some(head) => tracing::info!(
+    // "chain" here instead of being found out from its answers — and a load
+    // without `--vision` says neither, since it takes no image to point on.
+    match (server.pointing_head, server.media.is_some()) {
+        (_, false) => tracing::info!(
+            name: "ignis.decide.pointing_head",
+            point_method = "none",
+            artifact = %server.engine.artifact(),
+            "loaded without --vision: `point` has no image to answer on"
+        ),
+        (Some(head), true) => tracing::info!(
             name: "ignis.decide.pointing_head",
             point_method = "head",
             head = %head,
             artifact = %server.engine.artifact(),
             "`point` answers in one pass off the calibrated pointing head"
         ),
-        None => tracing::info!(
+        (None, true) => tracing::info!(
             name: "ignis.decide.pointing_head",
             point_method = "chain",
             artifact = %server.engine.artifact(),

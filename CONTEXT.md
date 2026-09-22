@@ -638,7 +638,9 @@ When output names a domain concept, use the term as defined here.
   `point` with the digit chain. Its map is read by TAG's region rule
   (min-max over `exp(s - max s)`, cells at or above 0.5, the 4-connected
   region with the highest mean, its weighted centre), and the region's share
-  of the head's attention over the image is the answer's confidence.
+  of the head's attention over the image is the answer's confidence — one
+  that separates hits from misses on the measured scenes, not a calibrated
+  probability.
 
 ## Observability
 

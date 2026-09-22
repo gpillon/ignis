@@ -289,6 +289,28 @@ describe("Answers", () => {
     expect(html).toContain("not a bound");
   });
 
+  it("draws a head point, which carries no digit trace, without a trace section", () => {
+    // GitHub #260: `/v1/decide` answers a point in one pass off the pointing
+    // head by default, and that answer has a region instead of digits.
+    const html = render(
+      [question("p", "point")],
+      {
+        p: {
+          type: "point",
+          method: "head",
+          pixels: { x: 120, y: 64 },
+          normalized: { x: 300, y: 320 },
+          uncertainty: { x: 12.5, y: 12.5 },
+          region: { cells: 1, share: 0.29 },
+        },
+      },
+      { mode: "image", images: [image], text: "" },
+    );
+    expect(html).toContain('cx="120"');
+    expect(html).toContain(">120<");
+    expect(html).not.toContain("Digit trace");
+  });
+
   it("draws a box and its per-edge uncertainty band", () => {
     const html = render(
       [question("b", "box")],
