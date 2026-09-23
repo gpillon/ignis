@@ -116,6 +116,41 @@ them again:
   picking the better of the two methods per scene would get 230 of 240, so
   the information exists — just not in the extent.
 
+## The owner's screenshots (reported, not floored)
+
+The owner's seven Doom and Wolfenstein captures
+(`.scratch/vision-study/doom/screenshot`, the study's s1-s7 with their
+eyeballed boxes) and their 34 questions, through the same harness in one run:
+
+| | spec 14 | spec 15 | chain |
+|---|---|---|---|
+| `point` inside | 33 of 34 | **34 of 34** | 32 |
+| head `box` IoU >= 0.5 | 22 of 34 | 21 of 34 | 27 |
+| median box IoU | 0.539 | 0.550 | 0.774 |
+
+**The point becomes perfect on the owner's own images** — 34 of 34, where
+spec 14 missed the 26 px vase and the pointing head alone gets 30. **The box
+does not move**: 17 questions improve and 17 worsen, seven cross 0.5 upwards
+and eight downwards, and the mean IoU goes 0.535 to 0.538. The whole box gain
+this spec measured was in the synthetic regimes.
+
+That is consistent rather than surprising: a screenshot's target is 2.6 cells
+tall at the median, so cell quantisation — the thing the sub-cell peak fixes
+— was never what limited it. What limits it here is the other half of the
+finding: on a photograph the heads pile onto **one distinctive part**, so the
+span under-covers the object (target / span 1.3 to 2.5 against ~1.0 on
+synthetic scenes), and an allowance keyed on the distinct cells cannot
+recover a size nobody observed. By the target's height in cells, where the
+buckets are big enough to read at all: 2-4 cells goes 12 -> 14 of 16 and
+beats the chain's 12; over 4 cells goes 5 -> 3 of 7 against the chain's 6 —
+the large objects (a 142x368 soldier, a 410x436 monster) whose span reaches
+one part of them.
+
+A head point on these costs 142 ms asked first and **52 ms** asked second,
+against the chain point's 216 and 199.
+
+Raw: `.scratch/subcell-264/acceptance/point-acceptance-screens.json`.
+
 ## The pieces below the endpoint
 
 - **The leaf's peaks and neighbours are the attention's.** With the tap armed
