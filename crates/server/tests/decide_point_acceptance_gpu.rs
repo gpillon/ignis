@@ -36,6 +36,16 @@
 //! | E3 | `rectangles.py --seed 20260942 --n 120` | >= 108 | >= 84 |
 //! | E4 | `rectangles.py --side 4096 --seed 20260943 --n 60` | >= 54 | >= 42 |
 //!
+//! and spec 15's, which floors the head box on every set because that is
+//! what it changes:
+//!
+//! | set | command | `point` inside | head `box` IoU >= 0.5 |
+//! |---|---|---|---|
+//! | F1 | `scenes.py --varied --seed 20260950` (240) | >= 225 | >= 180 |
+//! | F2 | `scenes.py --varied --side 4096 --seed 20260951` (240) | >= 230 | >= 230 |
+//! | F3 | `rectangles.py --seed 20260952 --n 120` | >= 108 | >= 108 |
+//! | F4 | `rectangles.py --side 4096 --seed 20260953 --n 60` | >= 54 | >= 48 |
+//!
 //! **`box`'s default** is decided across E1-E4 by the rule spec 14 wrote
 //! first: `head` if and only if the head box's IoU >= 0.5 rate is at least
 //! the chain box's on every one of them. Each run prints its set's verdict
@@ -127,6 +137,17 @@ fn floors_of(manifest: &Manifest, scenes: usize) -> Option<Floors> {
         (false, 4096, 20_260_941, 240) => floors("E2", 230, None),
         (true, 1024, 20_260_942, 120) => floors("E3", 108, Some(84)),
         (true, 4096, 20_260_943, 60) => floors("E4", 54, Some(42)),
+        // Spec 15 (GitHub #264): the head box floored on every set, because
+        // that is what the spec changes. F1's 180 is 75% -- the 81.2% held
+        // out on T1' minus the slack of six points every earlier floor used,
+        // and above the chain's 79.2% on E1 only if the measurement repeats.
+        // F2, F3 and F4 are spec 14's own measured rates minus the same
+        // slack, so F1 may not be paid for out of them. The point floors are
+        // spec 14's.
+        (false, 1024, 20_260_950, 240) => floors("F1", 225, Some(180)),
+        (false, 4096, 20_260_951, 240) => floors("F2", 230, Some(230)),
+        (true, 1024, 20_260_952, 120) => floors("F3", 108, Some(108)),
+        (true, 4096, 20_260_953, 60) => floors("F4", 54, Some(48)),
         _ => None,
     }
 }

@@ -12,7 +12,7 @@ and not a new study.
 | `engine_score.py` | Scores a dump of `crates/server/tests/attention_head_point_gpu.rs`: every GQA head's map through TAG's region rule, and which head cross-validation picks. |
 | `c5_score.py` | The region rule, the argmax reading and the cross-validation `engine_score.py` imports (first written for the PyTorch vehicle's maps). Needs NumPy. |
 | `rectangles.py` | Large coloured rectangles among one to three distractors of other colours, asked for by colour -- the regime where an object's corner and its centre are different image tokens (spec 14). `--blank` writes five blank priors instead (grey, black, white, noise, gradient) for the fallback cells. Deterministic per `--seed`; sizes scale with `--side`. |
-| `ensemble_score.py` | Spec 14's head set: `select` chooses it (and the fallback cells) from harness dumps; `score` reads every scene with the anchored ensemble beside the anchor alone and the chain; `golden` writes the golden cases `crates/core/tests/fixtures/anchored_reading.json` holds the host rule to. Its `read_anchored` is the reading rule spec 14 ships (`ignis_core::pointing::read_anchored`). Needs NumPy. |
+| `ensemble_score.py` | Spec 14's head set: `select` chooses it (and the fallback cells) from harness dumps; `score` reads every scene with the anchored ensemble beside the anchor alone and the chain; `golden` writes the golden cases `crates/core/tests/fixtures/anchored_reading.json` holds the host rule to. Its `read_anchored` is the reading rule the server ships (`ignis_core::pointing::read_anchored`) — spec 14's, reading inside the image cell and with spec 15's allowance. Needs NumPy. |
 | `pointing-heads-4bdc7b13.json` | The head set chosen for the served NVFP4 27B (content hash `4bdc7b13...6542513`): anchor L39.h10, 96 heads over L31-L63, the fallback cells measured on the 32x32 and 128x128 grids. `ensemble_score.py select` reproduces it from the dumps named inside; it is compiled into `crates/core/src/pointing.rs` (`SERVED_NVFP4_27B_SET`). |
 | `bench_readout.cu` | Microbenchmark of the attention readout for spec 14: the engine's single-head kernel, the same kernel launched once per head, and a fused per-layer kernel with the per-head argmax on the device (the prototype spec 14's kernel decision comes from). Standalone `nvcc -O3 -arch=sm_120a`. |
 
@@ -49,6 +49,15 @@ Spec 14's acceptance (GitHub #263), each used once, through
 | E2 | `scenes.py --varied --side 4096 --seed 20260941` | buttons, 4096 px |
 | E3 | `rectangles.py --seed 20260942 --n 120` | large objects among distractors, 1024 px |
 | E4 | `rectangles.py --side 4096 --seed 20260943 --n 60` | the same, 4096 px |
+
+Spec 15's acceptance (GitHub #264), each used once, through the same test:
+
+| Set | Command | Role |
+|---|---|---|
+| F1 | `scenes.py --varied --seed 20260950` | buttons, 1024 px |
+| F2 | `scenes.py --varied --side 4096 --seed 20260951` | buttons, 4096 px |
+| F3 | `rectangles.py --seed 20260952 --n 120` | large objects among distractors, 1024 px |
+| F4 | `rectangles.py --side 4096 --seed 20260953 --n 60` | the same, 4096 px |
 
 Spent on calibration: `rectangles.py --blank --side 4096 --seed 20260944`,
 the 128x128 grid's blank priors (only the first and the last cell reach the

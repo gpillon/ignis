@@ -12,11 +12,16 @@
 //! from the leaf's own chunk profile (`IGNIS_CHUNK_PROFILE`, GitHub #92), with
 //! prompt reuse off so every run prefills the same chunks.
 //!
-//! Asserted: arming the set adds at most **0.5 ms** to the reading chunk at
-//! 1024 px and at most **1 ms** at 4096 px over the pointing head alone (the
-//! microbenchmark measured 0.14-0.19 and 0.38-0.40 ms). Reported: the
-//! pointing head alone over no readout, and the same deltas over the nine
-//! armed layers' own spans (`IGNIS_CHUNK_PROFILE_LAYERS`).
+//! Since spec 15 (GitHub #264, ADR 0040) the set's shape is two launches a
+//! layer: the fused reduction, and the gather that scores the four keys
+//! around each of that layer's argmaxes. What this measures is both together
+//! — there is no build with one and not the other — so the bound is spec
+//! 14's plus spec 15's allowance for the gather: at most **0.8 ms** at
+//! 1024 px and **1.6 ms** at 4096 px over the pointing head alone. The
+//! gather's own cost is the difference from spec 14's recorded measurement
+//! on the same path (0.15 ms and 0.21 ms), printed beside the total.
+//! Reported: the pointing head alone over no readout, and the same deltas
+//! over the nine armed layers' own spans (`IGNIS_CHUNK_PROFILE_LAYERS`).
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38). The leaf reads the profile
 //! variables through the C runtime, whose copy of the environment is taken at
@@ -122,7 +127,7 @@ fn in_a_profiled_child(test: &str) -> Option<()> {
     Some(())
 }
 
-fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64) {
+fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64, spec14_ms: f64) {
     if in_a_profiled_child(test).is_some() {
         return;
     }
@@ -243,6 +248,10 @@ fn the_set_costs_under(test: &str, image: &str, instruction: &str, bound_ms: f64
         armed.len(),
         paired(&gpu[1], &gpu[0]),
     );
+    eprintln!(
+        "set cost [{image}]: spec 14 measured {spec14_ms:.2} ms for the fused launches alone on          this path, so the gather is about {:+.3} ms of the {added:+.3} ms total",
+        added - spec14_ms,
+    );
     assert!(
         added <= bound_ms,
         "[{image}] arming the head set added {added:.3} ms to the reading chunk; the bound is {bound_ms} ms"
@@ -256,12 +265,19 @@ fn the_head_set_costs_under_half_a_millisecond_at_1024_px() {
         "the_head_set_costs_under_half_a_millisecond_at_1024_px",
         "1024/scene0000.png",
         "click the blue button",
-        0.5,
+        0.8,
+        0.15,
     );
 }
 
 #[test]
 #[ignore = "GPU profile only: run alone, --test-threads=1"]
 fn the_head_set_costs_under_a_millisecond_at_4096_px() {
-    the_set_costs_under("the_head_set_costs_under_a_millisecond_at_4096_px", "large.png", "click the blue button", 1.0);
+    the_set_costs_under(
+        "the_head_set_costs_under_a_millisecond_at_4096_px",
+        "large.png",
+        "click the blue button",
+        1.6,
+        0.21,
+    );
 }

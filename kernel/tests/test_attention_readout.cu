@@ -42,6 +42,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -345,7 +346,13 @@ struct SetRun {
   bool read = false;
   std::vector<float> scores;             // the pointing head's row, if asked
   std::vector<unsigned long long> best;  // packed, one per head of `heads`
+  std::vector<float> neighbours;         // GitHub #264: four per head, NaN off the grid
 };
+
+// GitHub #264: the image grid the span is walked as. 1000 keys over 32
+// columns is 31 full rows and a short one of 8 -- so the last row's keys have
+// nothing below them, which is a case the grid has to get right.
+constexpr std::int32_t kGridCols = 32;
 
 // One fused launch: `heads` with slots 0.., the pointing head's row when
 // `row_head` >= 0, `excluded` span-relative.
@@ -355,6 +362,7 @@ SetRun run_set(const Scene &scene, const std::vector<int> &heads, int row_head,
   Device<std::uint16_t> query(scene.query);
   Device<float> scores(static_cast<std::size_t>(scene.key_count));
   Device<unsigned long long> best(heads.size());
+  Device<float> neighbours(4 * heads.size());
   SetRun out;
   AttentionReadoutTarget target;
   target.query_head = row_head;
@@ -367,6 +375,8 @@ SetRun run_set(const Scene &scene, const std::vector<int> &heads, int row_head,
     target.set_slot[i] = static_cast<int32_t>(i);
   }
   target.device_set_best = best.p;
+  target.device_set_neighbours = neighbours.p;
+  target.grid_cols = kGridCols;
   target.excluded_count = static_cast<int32_t>(excluded.size());
   std::copy(excluded.begin(), excluded.end(), target.excluded);
   target.read = &out.read;
@@ -377,6 +387,7 @@ SetRun run_set(const Scene &scene, const std::vector<int> &heads, int row_head,
   CUDA_FATAL(cudaDeviceSynchronize());
   out.scores = scores.read();
   out.best = best.read();
+  out.neighbours = neighbours.read();
   return out;
 }
 
@@ -426,6 +437,39 @@ void check_set(const Scene &scene, const SetRun &got, const std::vector<int> &he
     check(at >= top - 1e-4 * std::max(1.0, std::fabs(top)),
           label + ": head " + std::to_string(heads[i]) + " peaks at key " + std::to_string(index) +
               " scoring " + std::to_string(at) + ", the maximum is " + std::to_string(top));
+
+    // GitHub #264: the peak's own score, and the four keys around it in the
+    // image grid -- against the same double-precision restatement. A
+    // neighbour the grid does not have is NaN, never a score.
+    const float peak = ignis_attention_unpack_score(static_cast<std::uint32_t>(packed >> 32));
+    const auto close = [&](float got, double expected, const std::string &what) {
+      const double diff = std::fabs(static_cast<double>(got) - expected);
+      check(diff <= 1e-3 * std::max(1.0, std::fabs(expected)),
+            label + ": head " + std::to_string(heads[i]) + " " + what + ": read " +
+                std::to_string(got) + ", the host says " + std::to_string(expected));
+    };
+    close(peak, at, "peak score");
+    const std::int64_t col = index % kGridCols;
+    const std::int64_t row = index / kGridCols;
+    const std::int64_t grid_rows = (scene.key_count + kGridCols - 1) / kGridCols;
+    const std::array<std::int64_t, 4> neighbour = {
+        col > 0 ? index - 1 : -1,
+        col + 1 < kGridCols ? index + 1 : -1,
+        row > 0 ? index - kGridCols : -1,
+        row + 1 < grid_rows ? index + kGridCols : -1,
+    };
+    for (std::size_t j = 0; j < neighbour.size(); ++j) {
+      const float read = got.neighbours[4 * i + j];
+      const std::int64_t k = neighbour[j] < scene.key_count ? neighbour[j] : -1;
+      if (k < 0) {
+        check(std::isnan(read), label + ": head " + std::to_string(heads[i]) + " neighbour " +
+                                    std::to_string(j) + " is off the grid, read " +
+                                    std::to_string(read));
+      } else {
+        close(read, want[static_cast<std::size_t>(k)],
+              "neighbour " + std::to_string(j) + " (key " + std::to_string(k) + ")");
+      }
+    }
   }
 }
 
